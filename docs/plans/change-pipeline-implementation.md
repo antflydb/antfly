@@ -7417,3 +7417,41 @@ new routed observation checks through its native owner. Generation and contract/
 whitespace checks passed. This proves the read foundation and owner fencing,
 not authenticated node RPC completion, producer drainage, source activation or
 public feed/bootstrap/pgoutput/client acceptance.
+
+### Authenticated producer-closure observation RPC (in progress)
+
+Spec-first adds POST /internal/v1/groups/{group_id}/tables/{table_name}/
+source-producers/observe-v1 with bounded query/state/observation schemas, explicit
+internal-service authority, complete owner/catalog fence and non-ACK semantics.
+The handler, typed client, native callback port and DataServer local/remote
+routing now use the qualified read foundation. Request/reply limits are 4/8 KiB;
+the client rejects absent/duplicate route acknowledgements, wrong media type,
+unknown-outcome markers, oversized/forged replies and lost reads without mutation
+retry. API ABI 38 fences the new server-config callback layout.
+
+Ingress tests bind full route/owner state and reject forged or cancelled results.
+Client tests exercise positive closure values and malformed/ambiguous replies;
+auth checks require service credentials even in legacy unauthenticated mode.
+The real native Raft fixture additionally reads through the routed port/HTTP
+path, refuses stale generation and checks cancellation. Standard test selections
+explicitly include the new client, ingress and auth cases. A scripted edit used
+an incorrect existing helper name before writing its client changes; the current
+helper was inspected and edits completed using fetchGroupSourcePlan.
+Generation passed (`source-producer-closure-observation-rpc-generate.log`) and
+unrelated explorer files were restored. Wire/ingress, auth and real Raft routing
+qualification is running (`source-producer-closure-observation-rpc-test.log`).
+This endpoint is read-only: authenticated closure proposal, original pending
+work recovery, cohort drainage and source activation remain required.
+
+Observation RPC qualification passed 13 local/33 wire-control cases, three
+explicit handler auth cases and six local/41 linked native/real-Raft cases,
+zero failures/skips/leaks (`source-producer-closure-observation-rpc-test.log`).
+Actual selected names include new ingress, client, legacy-mode auth and closure
+entry checks; the native submission fixture calls the new routed observation
+port through the real handler/client/native-owner path. Forged owners, duplicate
+ACKs, stale reads, ambiguity markers, oversized/lost replies and cancellation
+are rejected. Generation, catalog/error/OpenAPI and whitespace checks passed.
+This completes authenticated observation only. Producer-close proposal and
+trusted original-decision drainage remain necessary before first-strict source
+activation, and the original destination/feed/bootstrap/retention/pgoutput/
+existing-client requirements are unchanged.

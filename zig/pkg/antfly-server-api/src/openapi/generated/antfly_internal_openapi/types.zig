@@ -1301,6 +1301,57 @@ pub const NativeSourcePlanStatus = struct {
     reclamation: NativeHistoryDigest,
 };
 
+/// One native snapshot of actual applied cut and optional producer intake closure. Absence grants no transaction outcome, replay, drainage or source activation authority. Validate the complete owner and minimum cut; source/checkpoint/feed/LSN positions remain distinct.
+pub const NativeSourceProducerClosureObservation = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    cut: NativeHistoryPublicationCut,
+    closure: ?NativeSourceProducerClosureState,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "owner", "owner", false },
+        .{ "cut", "cut", false },
+        .{ "closure", "closure", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        try jw.objectField("cut");
+        try jw.write(self.cut);
+        try jw.objectField("closure");
+        try jw.write(self.closure);
+        try jw.endObject();
+    }
+};
+
+/// Read-only physical producer-intake closure query. Requires current catalog ownership and leader ReadIndex; a nonzero minimum is a read bound, never an acknowledgement.
+pub const NativeSourceProducerClosureQuery = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    minimum_applied_index: u64,
+};
+
+/// Immutable cumulative intake closure for one original physical root. This cut proves no old transaction drainage, global source ACK, or first-strict activation.
+pub const NativeSourceProducerClosureState = struct {
+    version: i64,
+    root: NativeSourceScopeBasis,
+    first_closed_at: NativeHistoryPublicationCut,
+};
+
 pub const NativeSourceRetirementOutcome = std.json.Value;
 
 /// Read-only exact retirement recovery. Minimum must cover the entry. Entire original command including coordinator read cut is immutable.

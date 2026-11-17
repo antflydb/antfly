@@ -40,7 +40,8 @@ pub const StatusDetail = error_abi.Detail;
 // Version 35 fences routed legacy completion producer layouts.
 // Version 36 fences table transaction origin layouts and capability guards.
 // Version 37 fences producer pre-decision context layouts.
-pub const abi_version: u32 = 37;
+// Version 38 includes the qualified producer-closure observation port.
+pub const abi_version: u32 = 38;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 

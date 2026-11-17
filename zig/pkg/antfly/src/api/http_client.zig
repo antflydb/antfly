@@ -3115,6 +3115,7 @@ pub const ApiHttpClient = struct {
     const SourcePlanWire = @import("../data/source_plan_http_wire.zig");
     const CheckpointRead = @import("antfly_local_sources").storage_source_checkpoint_read;
     const ScopeRead = @import("antfly_local_sources").storage_source_scope_control;
+    const ProducerRead = @import("antfly_local_sources").storage_source_producer_policy;
     const RetirementWire = @import("../data/source_retirement_http_wire.zig");
     pub fn fetchGroupSourceRetirementControl(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, input: RetirementWire.Request, fence: route_metadata_api.CatalogRouteFence, original: @import("antfly_local_sources").api_operation.RequestContext) !RetirementWire.OwnedReply {
         var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
@@ -3164,13 +3165,14 @@ pub const ApiHttpClient = struct {
     }
 
     const ScopeControlWire = @import("../data/source_scope_http_wire.zig");
-    const SourcePlanOperation = enum { control, observe, chunk, checkpoint, scope, scope_control };
+    const SourcePlanOperation = enum { control, observe, chunk, checkpoint, scope, scope_control, producer_closure };
     fn sourcePlanInput(comptime kind: SourcePlanOperation) type {
         return switch (kind) {
             .control => SourcePlanWire.ControlRequest,
             .scope_control => ScopeControlWire.Request,
             .observe => SourcePlanWire.ObserveRequest,
             .scope => ScopeRead.Query,
+            .producer_closure => ProducerRead.Query,
             .checkpoint => CheckpointRead.Request,
             .chunk => SourcePlanWire.ChunkRequest,
         };
@@ -3181,6 +3183,7 @@ pub const ApiHttpClient = struct {
             .scope_control => ScopeControlWire.Reply,
             .observe => SourcePlanWire.control.Observation,
             .scope => ScopeRead.Observation,
+            .producer_closure => ProducerRead.Observation,
             .checkpoint => CheckpointRead.Reply,
             .chunk => SourcePlanWire.control.Read,
         };
@@ -3190,6 +3193,9 @@ pub const ApiHttpClient = struct {
     }
     pub fn fetchGroupSourceScopeControl(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, input: ScopeControlWire.Request, fence: route_metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !ScopeControlWire.Reply {
         return self.fetchGroupSourcePlan(base_uri, group_id, table, .scope_control, input, fence, context);
+    }
+    pub fn fetchGroupSourceProducerClosureObservation(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, input: ProducerRead.Query, fence: route_metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !ProducerRead.Observation {
+        return self.fetchGroupSourcePlan(base_uri, group_id, table, .producer_closure, input, fence, context);
     }
     pub fn fetchGroupSourceScopeObservation(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, input: ScopeRead.Query, fence: route_metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !ScopeRead.Observation {
         return self.fetchGroupSourcePlan(base_uri, group_id, table, .scope, input, fence, context);
@@ -3214,7 +3220,7 @@ pub const ApiHttpClient = struct {
         try fence.validate();
         if (group_id == 0 or group_id != fence.route.group_id or table_name.len == 0 or table_name.len > 1024) return error.InvalidCatalogRouteFence;
         if (comptime kind == .control) try input.validate(self.alloc) else try input.validate();
-        const owner = if (kind == .scope) input.owner else if (kind == .scope_control) input.owner() else input.source_owner;
+        const owner = if (kind == .scope or kind == .producer_closure) input.owner else if (kind == .scope_control) input.owner() else input.source_owner;
         const identity = fence.route.identity_namespace;
         const incarnation = fence.metadata_incarnation orelse return error.InvalidCatalogRouteFence;
         if (owner.group_id != group_id or owner.metadata_group_id != fence.metadata_group_id or owner.topology_epoch != fence.topology_epoch or
@@ -3231,6 +3237,7 @@ pub const ApiHttpClient = struct {
             .scope_control => routes.Routes.source_scope_control_suffix,
             .observe => routes.Routes.source_plan_observe_suffix,
             .scope => routes.Routes.source_scope_observe_suffix,
+            .producer_closure => routes.Routes.source_producer_closure_observe_suffix,
             .checkpoint => routes.Routes.source_checkpoint_observe_suffix,
             .chunk => routes.Routes.source_plan_chunk_suffix,
         };
@@ -3241,6 +3248,7 @@ pub const ApiHttpClient = struct {
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
         if (kind == .scope_control and body.len > ScopeControlWire.max_request_bytes) return error.InvalidSourceAdmission;
+        if (kind == .producer_closure and body.len > ProducerRead.max_query_bytes) return error.InvalidSourceAdmission;
         if (kind == .scope and body.len > ScopeRead.max_bytes) return error.InvalidSourceAdmission;
         if (kind == .checkpoint and body.len > CheckpointRead.max_request_bytes) return error.InvalidSourceAdmission;
         if (body.len > SourcePlanWire.max_bytes) return error.InvalidSourcePlanWire;
@@ -3251,7 +3259,7 @@ pub const ApiHttpClient = struct {
         var timeout_buffer: [10]u8 = undefined;
         const timeout_text = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{timeout});
         var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
-        const max_reply = if (kind == .scope_control) ScopeControlWire.max_reply_bytes else if (kind == .chunk) SourcePlanWire.max_bytes else if (kind == .scope) ScopeRead.max_bytes else if (kind == .checkpoint) CheckpointRead.max_reply_bytes else SourcePlanWire.max_control_reply_bytes;
+        const max_reply = if (kind == .scope_control) ScopeControlWire.max_reply_bytes else if (kind == .chunk) SourcePlanWire.max_bytes else if (kind == .producer_closure) ProducerRead.max_observation_bytes else if (kind == .scope) ScopeRead.max_bytes else if (kind == .checkpoint) CheckpointRead.max_reply_bytes else SourcePlanWire.max_control_reply_bytes;
         try context.ensureActive();
         // A mutation has one transport attempt. Any post-dispatch ambiguity
         // preserves only original recovery authority; callers must not replay.
@@ -3288,6 +3296,13 @@ pub const ApiHttpClient = struct {
             if (comptime is_control) return unknown;
             return error.InvalidRemoteResponse;
         }
+        if (comptime kind == .producer_closure) {
+            var route_acknowledgements: usize = 0;
+            for (response.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, route_metadata_api.catalog_route_fence_ack_header)) {
+                route_acknowledgements += 1;
+            };
+            if (route_acknowledgements != 1) return error.InvalidRemoteResponse;
+        }
         if (comptime is_control) {
             if (comptime kind == .scope_control) {
                 var acknowledgements: usize = 0;
@@ -3308,6 +3323,7 @@ pub const ApiHttpClient = struct {
             const result = switch (kind) {
                 .observe => try SourcePlanWire.native.decodeObservation(self.alloc, input.query, response.body),
                 .scope => try ScopeRead.decodeObservation(self.alloc, response.body, input),
+                .producer_closure => try ProducerRead.decodeObservation(self.alloc, response.body, input),
                 .checkpoint => try CheckpointRead.decodeReply(self.alloc, input, response.body),
                 .chunk => try SourcePlanWire.native.decodeChunkReply(self.alloc, input.request, response.body),
                 .control, .scope_control => unreachable,
@@ -8358,6 +8374,72 @@ test "source scope HTTP client rejects unqualified forged expired and ambiguous 
             else => error.InvalidRemoteResponse,
         };
         try std.testing.expectError(expected, client.fetchGroupSourceScopeObservation("http://node:8080", 17, "docs", query, fence, .{}));
+        try std.testing.expectEqual(before + 1, fake.calls);
+    }
+}
+
+test "source producer closure HTTP client rejects unqualified forged expired and ambiguous read replies" {
+    const a = std.testing.allocator;
+    const wire = @import("antfly_local_sources").storage_source_producer_policy;
+    const Fake = struct {
+        const Mode = enum { good, wrong_owner, future, missing_ack, duplicate_ack, wrong_type, marker, lost, too_large };
+        mode: Mode = .good,
+        query: wire.Query,
+        calls: usize = 0,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/source-producers/observe-v1"));
+            try std.testing.expectEqual(@as(?usize, wire.max_observation_bytes), request.max_response_bytes);
+            if (self.mode == .lost) return error.ConnectionResetByPeer;
+            var observed: wire.Observation = .{ .version = 1, .owner = self.query.owner, .cut = .{ .term = 1, .index = self.query.minimum_applied_index }, .closure = .{ .root = try @import("antfly_local_sources").storage_source_scope.Basis.fromOwner(self.query.owner), .first_closed_at = .{ .term = 1, .index = self.query.minimum_applied_index } } };
+            if (self.mode == .wrong_owner) observed.owner.root_generation += 1;
+            if (self.mode == .future) observed.cut.index -= 1;
+            const body = if (self.mode == .too_large) try alloc.alloc(u8, wire.max_observation_bytes + 1) else try std.json.Stringify.valueAlloc(alloc, observed, .{});
+            defer alloc.free(body);
+            if (self.mode == .too_large) @memset(body, ' ');
+            const Header = @typeInfo(@typeInfo(@TypeOf(http_route_helpers.textResponseWithHeaders)).@"fn".param_types[3].?).pointer.child;
+            var headers: [4]Header = undefined;
+            var count: usize = 0;
+            if (self.mode != .missing_ack) {
+                headers[count] = .{ .name = route_metadata_api.catalog_route_fence_ack_header, .value = route_metadata_api.catalog_route_fence_ack_value };
+                count += 1;
+            }
+            if (self.mode == .duplicate_ack) {
+                headers[count] = .{ .name = route_metadata_api.catalog_route_fence_ack_header, .value = route_metadata_api.catalog_route_fence_ack_value };
+                count += 1;
+            }
+            headers[count] = .{ .name = "Content-Type", .value = if (self.mode == .wrong_type) "text/plain" else "application/json" };
+            count += 1;
+            if (self.mode == .marker) {
+                headers[count] = .{ .name = internal_batch_forwarding.outcome_header, .value = "" };
+                count += 1;
+            }
+            return http_route_helpers.textResponseWithHeaders(alloc, 200, body, headers[0..count]);
+        }
+    };
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 17, .big);
+    std.mem.writeInt(u64, namespace[16..24], 19, .big);
+    const query: wire.Query = .{ .version = 1, .owner = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .namespace = namespace, .table_binding = @splat(2), .root_generation = 0, .group_id = 17, .topology_epoch = 1 }, .minimum_applied_index = 2 };
+    const fence: route_metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = query.owner.metadata_incarnation, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
+    var fake: Fake = .{ .query = query };
+    var client = ApiHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    try std.testing.expectError(error.Unauthorized, client.fetchGroupSourceProducerClosureObservation("http://node:8080", 17, "docs", query, fence, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    _ = client.withInternalServiceAuth("producer-closure-client-test-secret-long-enough", "producer-closure-test");
+    const observed = try client.fetchGroupSourceProducerClosureObservation("http://node:8080", 17, "docs", query, fence, .{});
+    try std.testing.expect(observed.closure != null);
+    for ([_]Fake.Mode{ .wrong_owner, .future, .missing_ack, .duplicate_ack, .wrong_type, .marker, .lost, .too_large }) |mode| {
+        fake.mode = mode;
+        const before = fake.calls;
+        const expected: anyerror = switch (mode) {
+            .wrong_owner, .future => error.SourceAdmissionCorrupt,
+            .lost => error.ReadUnavailable,
+            else => error.InvalidRemoteResponse,
+        };
+        try std.testing.expectError(expected, client.fetchGroupSourceProducerClosureObservation("http://node:8080", 17, "docs", query, fence, .{}));
         try std.testing.expectEqual(before + 1, fake.calls);
     }
 }

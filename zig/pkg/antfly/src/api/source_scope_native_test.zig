@@ -218,6 +218,27 @@ fn readQualified(a: std.mem.Allocator, owner: anytype, fence: metadata.CatalogRo
     return error.TestReadFenceUnavailable;
 }
 
+pub fn verifyProducerClosureRouted(a: std.mem.Allocator, port: @import("source_producer_closure_operations.zig").Port, fence: metadata.CatalogRouteFence, source_owner: @FieldType(completion.Intent, "owner")) !void {
+    const policy = @import("antfly_local_sources").storage_source_producer_policy;
+    const query: policy.Query = .{ .version = 1, .owner = source_owner, .minimum_applied_index = 1 };
+    const observed = try port.read(a, fence, "docs", query, .{});
+    try observed.validate(query);
+    try std.testing.expect(observed.closure == null);
+    const again = try port.read(a, fence, "docs", query, .{});
+    try std.testing.expect(again.closure == null);
+    try std.testing.expect(again.cut.index >= observed.cut.index);
+    var changed = query;
+    changed.owner.root_generation += 1;
+    if (port.read(a, fence, "docs", changed, .{})) |_| {
+        return error.TestExpectedStaleOwnerRejection;
+    } else |err| switch (err) {
+        error.TopologyChanged, error.HistoryResynchronizationRequired => {},
+        else => return err,
+    }
+    var cancelled: std.atomic.Value(bool) = .init(true);
+    try std.testing.expectError(error.Canceled, port.read(a, fence, "docs", query, .{ .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled) }));
+}
+
 pub fn verifyRouted(a: std.mem.Allocator, port: @import("source_scope_operations.zig").Port, fence: metadata.CatalogRouteFence, source_owner: @FieldType(completion.Intent, "owner")) !void {
     const query: wire.Query = .{ .version = 1, .owner = source_owner, .domain = @splat(71), .minimum_applied_index = 1 };
     const observed = try port.read(a, fence, "docs", query, .{});

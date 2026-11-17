@@ -7239,6 +7239,7 @@ pub const DataServer = struct {
         api_server_cfg.native_source_scope_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = sourceScopeControlOperation } else null;
         api_server_cfg.native_source_retirement_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = sourceRetirementControlOperation } else null;
         api_server_cfg.native_source_scope_observe = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = sourceScopeObserveOperation } else null;
+        api_server_cfg.native_source_producer_closure_observe = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = sourceProducerClosureObserveOperation } else null;
         api_server_cfg.native_source_checkpoint_observe = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = sourceCheckpointObserveOperation } else null;
         api_server_cfg.native_source_plan_chunk = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = sourcePlanChunkOperation } else null;
         api_server_cfg.native_history_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = historyControlOperation } else null;
@@ -13638,7 +13639,7 @@ pub const DataServer = struct {
         return .{ .ptr = self, .read_fn = historyPublicationRoutedOperation };
     }
 
-    const HistoryOperation = enum { control, page, grant, resolution, publication, owner, decision, source_plan_control, source_plan_observe, source_plan_chunk, source_checkpoint_observe, source_scope_observe, source_scope_control, source_retirement_control };
+    const HistoryOperation = enum { control, page, grant, resolution, publication, owner, decision, source_plan_control, source_plan_observe, source_plan_chunk, source_checkpoint_observe, source_scope_observe, source_producer_closure_observe, source_scope_control, source_retirement_control };
     fn historyRequestType(comptime kind: HistoryOperation) type {
         return switch (kind) {
             .control => @import("../api/history_control_operations.zig").wire.Request,
@@ -13651,6 +13652,7 @@ pub const DataServer = struct {
             .source_plan_control => SourcePlanHttp.ControlRequest,
             .source_plan_observe => SourcePlanHttp.ObserveRequest,
             .source_scope_observe => ScopeRead.Query,
+            .source_producer_closure_observe => ProducerRead.Query,
             .source_scope_control => ScopeControlHttp.Request,
             .source_retirement_control => RetirementHttp.Request,
             .source_checkpoint_observe => CheckpointRead.Request,
@@ -13669,6 +13671,7 @@ pub const DataServer = struct {
             .source_plan_control => SourcePlanHttp.ControlReply,
             .source_plan_observe => SourcePlanHttp.control.Observation,
             .source_scope_observe => ScopeRead.Observation,
+            .source_producer_closure_observe => ProducerRead.Observation,
             .source_scope_control => ScopeControlHttp.Reply,
             .source_retirement_control => RetirementHttp.OwnedReply,
             .source_checkpoint_observe => CheckpointRead.Reply,
@@ -13708,12 +13711,12 @@ pub const DataServer = struct {
         std.mem.writeInt(u64, namespace[16..24], original_fence.route.identity_namespace.range_id, .big);
         if (comptime kind == .source_plan_control) {
             try input.validate(alloc);
-        } else if (comptime kind == .source_plan_observe or kind == .source_plan_chunk or kind == .source_checkpoint_observe or kind == .source_scope_observe or kind == .source_scope_control or kind == .source_retirement_control) {
+        } else if (comptime kind == .source_plan_observe or kind == .source_plan_chunk or kind == .source_checkpoint_observe or (kind == .source_scope_observe or kind == .source_producer_closure_observe) or kind == .source_scope_control or kind == .source_retirement_control) {
             try input.validate();
         } else try input.validate(namespace);
-        if (comptime kind == .source_plan_control or kind == .source_plan_observe or kind == .source_plan_chunk or kind == .source_checkpoint_observe or kind == .source_scope_observe or kind == .source_scope_control or kind == .source_retirement_control) {
+        if (comptime kind == .source_plan_control or kind == .source_plan_observe or kind == .source_plan_chunk or kind == .source_checkpoint_observe or (kind == .source_scope_observe or kind == .source_producer_closure_observe) or kind == .source_scope_control or kind == .source_retirement_control) {
             const incarnation = original_fence.metadata_incarnation orelse return error.InvalidCatalogRouteFence;
-            const source_owner = if (kind == .source_scope_observe) input.owner else if ((kind == .source_scope_control or kind == .source_retirement_control)) input.owner() else input.source_owner;
+            const source_owner = if ((kind == .source_scope_observe or kind == .source_producer_closure_observe)) input.owner else if ((kind == .source_scope_control or kind == .source_retirement_control)) input.owner() else input.source_owner;
             if (source_owner.group_id != original_fence.route.group_id or
                 source_owner.metadata_group_id != original_fence.metadata_group_id or
                 source_owner.topology_epoch != original_fence.topology_epoch or
@@ -13751,6 +13754,7 @@ pub const DataServer = struct {
             .source_plan_control => sourcePlanControlOperation(self, alloc, fence, table, input, context),
             .source_plan_observe => sourcePlanObserveOperation(self, alloc, fence, table, input, context),
             .source_scope_observe => sourceScopeObserveOperation(self, alloc, fence, table, input, context),
+            .source_producer_closure_observe => sourceProducerClosureObserveOperation(self, alloc, fence, table, input, context),
             .source_scope_control => sourceScopeControlOperation(self, alloc, fence, table, input, context),
             .source_retirement_control => sourceRetirementControlOperation(self, alloc, fence, table, input, context),
             .source_checkpoint_observe => sourceCheckpointObserveOperation(self, alloc, fence, table, input, context),
@@ -13769,7 +13773,7 @@ pub const DataServer = struct {
         var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(context.cancellation);
         var lane = try self.acquireDataRaftForwardLaneUntil(group, clock.deadline_ns.?, .{ .discovery = .cached, .cancellation = &cancellation });
         defer lane.release();
-        var executor = antfly.common.http.IoHttpExecutor.init(alloc, lane.io(), .{ .max_response_bytes = if (kind == .page) @import("../api/history_page_operations.zig").wire.prefix_bytes + @as(usize, input.request.max_bytes) else if (kind == .decision) @import("../api/history_decision_operations.zig").max_reply_bytes else if (kind == .source_retirement_control) RetirementHttp.max_reply_bytes else if (kind == .source_scope_control) ScopeControlHttp.max_reply_bytes else if (kind == .source_scope_observe) ScopeRead.max_bytes else if (kind == .source_plan_chunk) SourcePlanHttp.max_bytes else @import("../api/history_control_operations.zig").wire.max_bytes });
+        var executor = antfly.common.http.IoHttpExecutor.init(alloc, lane.io(), .{ .max_response_bytes = if (kind == .page) @import("../api/history_page_operations.zig").wire.prefix_bytes + @as(usize, input.request.max_bytes) else if (kind == .decision) @import("../api/history_decision_operations.zig").max_reply_bytes else if (kind == .source_retirement_control) RetirementHttp.max_reply_bytes else if (kind == .source_scope_control) ScopeControlHttp.max_reply_bytes else if (kind == .source_producer_closure_observe) ProducerRead.max_observation_bytes else if (kind == .source_scope_observe) ScopeRead.max_bytes else if (kind == .source_plan_chunk) SourcePlanHttp.max_bytes else @import("../api/history_control_operations.zig").wire.max_bytes });
         defer executor.deinit();
         var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
         _ = client.withInternalServiceAuth(self.api_server_cfg.internal_service_secret, self.api_server_cfg.internal_service_issuer);
@@ -13784,6 +13788,7 @@ pub const DataServer = struct {
             .source_plan_control => client.fetchGroupSourcePlanControl(uri, group, table, input, fence, context),
             .source_plan_observe => client.fetchGroupSourcePlanObservation(uri, group, table, input, fence, context),
             .source_scope_observe => client.fetchGroupSourceScopeObservation(uri, group, table, input, fence, context),
+            .source_producer_closure_observe => client.fetchGroupSourceProducerClosureObservation(uri, group, table, input, fence, context),
             .source_scope_control => client.fetchGroupSourceScopeControl(uri, group, table, input, fence, context),
             .source_retirement_control => client.fetchGroupSourceRetirementControl(uri, group, table, input, fence, context),
             .source_checkpoint_observe => client.fetchGroupSourceCheckpointObservation(uri, group, table, input, fence, context),
@@ -13869,7 +13874,7 @@ pub const DataServer = struct {
                 .decision => owner.orderedHistoryDecisionRouted(alloc, fence, table, input.binding()),
                 .owner => captureHistoryOwner(owner, alloc, fence, table, input, context),
                 .publication => owner.orderedHistoryPublicationRouted(alloc, fence, table, input.binding()),
-                .control, .source_plan_control, .source_plan_observe, .source_plan_chunk, .source_checkpoint_observe, .source_scope_observe, .source_scope_control, .source_retirement_control => unreachable,
+                .control, .source_plan_control, .source_plan_observe, .source_plan_chunk, .source_checkpoint_observe, .source_scope_observe, .source_producer_closure_observe, .source_scope_control, .source_retirement_control => unreachable,
             }) catch |err| switch (err) {
                 error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageBusy, error.StorageKernelOwnerTransitionRequired, error.StorageOwnerAdmissionPending, error.ResourceBudgetExceeded => {
                     try self.sleepDataRaftRetry(std.time.ns_per_ms);
@@ -13959,6 +13964,17 @@ pub const DataServer = struct {
             .recover => .{ .request_digest = digest, .receipt = request.receipt, .outcome = try self.recoverSourcePlanControlLocal(a, fence, table, request) },
         };
     }
+    pub fn sourceProducerClosureObservationPort(self: *DataServer) @import("../api/source_producer_closure_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = sourceProducerClosureObserveRoutedOperation };
+    }
+    fn sourceProducerClosureObserveRoutedOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: ProducerRead.Query, context: antfly.public_api.operation.RequestContext) !ProducerRead.Observation {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(a, fence, table, .source_producer_closure_observe, request, context);
+    }
+    fn sourceProducerClosureObserveOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: ProducerRead.Query, context: antfly.public_api.operation.RequestContext) !ProducerRead.Observation {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.sourcePlanLocalRead(a, fence, table, .producer_closure, request, context);
+    }
     pub fn sourceScopeObservationPort(self: *DataServer) @import("../api/source_scope_operations.zig").Port {
         return .{ .ptr = self, .read_fn = sourceScopeObserveRoutedOperation };
     }
@@ -13981,8 +13997,8 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         return self.sourcePlanLocalRead(a, fence, table, .checkpoint, request, context);
     }
-    const SourcePlanReadKind = enum { observe, chunk, checkpoint, scope };
-    fn sourcePlanLocalRead(self: *DataServer, a: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, comptime kind: SourcePlanReadKind, request: if (kind == .observe) SourcePlanHttp.ObserveRequest else if (kind == .scope) ScopeRead.Query else if (kind == .checkpoint) CheckpointRead.Request else SourcePlanHttp.ChunkRequest, original: antfly.public_api.operation.RequestContext) !(if (kind == .observe) SourcePlanHttp.control.Observation else if (kind == .scope) ScopeRead.Observation else if (kind == .checkpoint) CheckpointRead.Reply else SourcePlanHttp.control.Read) {
+    const SourcePlanReadKind = enum { observe, chunk, checkpoint, scope, producer_closure };
+    fn sourcePlanLocalRead(self: *DataServer, a: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, comptime kind: SourcePlanReadKind, request: if (kind == .observe) SourcePlanHttp.ObserveRequest else if (kind == .scope) ScopeRead.Query else if (kind == .producer_closure) ProducerRead.Query else if (kind == .checkpoint) CheckpointRead.Request else SourcePlanHttp.ChunkRequest, original: antfly.public_api.operation.RequestContext) !(if (kind == .observe) SourcePlanHttp.control.Observation else if (kind == .scope) ScopeRead.Observation else if (kind == .producer_closure) ProducerRead.Observation else if (kind == .checkpoint) CheckpointRead.Reply else SourcePlanHttp.control.Read) {
         if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
         const apply = self.data_raft_apply orelse return error.ChangefeedCapabilityUnsupported;
         const owner = apply.kernel_owner_source orelse return error.ChangefeedCapabilityUnsupported;
@@ -14001,6 +14017,7 @@ pub const DataServer = struct {
             const result = (switch (kind) {
                 .observe => owner.sourcePlanObservationRouted(a, fence, table, request),
                 .scope => owner.sourceScopeObservationRouted(a, fence, table, request),
+                .producer_closure => owner.sourceProducerClosureObservationRouted(a, fence, table, request),
                 .checkpoint => owner.sourceCheckpointObservationRouted(a, fence, table, request),
                 .chunk => owner.sourcePlanChunkRouted(a, fence, table, request),
             }) catch |err| switch (err) {
@@ -14040,6 +14057,7 @@ pub const DataServer = struct {
     const ScopeControlHttp = @import("source_scope_http_wire.zig");
     const RetirementHttp = @import("source_retirement_http_wire.zig");
     const ScopeRead = @import("antfly_local_sources").storage_source_scope_control;
+    const ProducerRead = @import("antfly_local_sources").storage_source_producer_policy;
     const CheckpointRead = @import("antfly_local_sources").storage_source_checkpoint_read;
     const NativeControlKind = enum { history, source_plan, source_scope, source_retirement };
     fn NativeControlCommand(comptime kind: NativeControlKind) type {
@@ -44606,7 +44624,7 @@ fn consumerTests() type {
                 };
                 const api_server = try a.create(antfly.public_api.kernel_bridge.ApiHttpServer);
                 defer a.destroy(api_server);
-                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .internal_service_accept_legacy_unauthenticated = true, .routed_raft_batch_writer = server.routedRaftBatchWriter(), .native_source_plan_control = .{ .ptr = server, .execute_fn = DataServer.sourcePlanControlOperation }, .native_source_plan_observe = .{ .ptr = server, .read_fn = DataServer.sourcePlanObserveOperation }, .native_source_scope_control = .{ .ptr = server, .execute_fn = DataServer.sourceScopeControlOperation }, .native_source_retirement_control = .{ .ptr = server, .execute_fn = DataServer.sourceRetirementControlOperation }, .native_source_scope_observe = .{ .ptr = server, .read_fn = DataServer.sourceScopeObserveOperation }, .native_source_checkpoint_observe = .{ .ptr = server, .read_fn = DataServer.sourceCheckpointObserveOperation }, .native_source_plan_chunk = .{ .ptr = server, .read_fn = DataServer.sourcePlanChunkOperation }, .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_decision = .{ .ptr = server, .read_fn = DataServer.historyDecisionOperation }, .native_history_owner = .{ .ptr = server, .read_fn = DataServer.historyOwnerOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
+                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .internal_service_accept_legacy_unauthenticated = true, .routed_raft_batch_writer = server.routedRaftBatchWriter(), .native_source_plan_control = .{ .ptr = server, .execute_fn = DataServer.sourcePlanControlOperation }, .native_source_plan_observe = .{ .ptr = server, .read_fn = DataServer.sourcePlanObserveOperation }, .native_source_scope_control = .{ .ptr = server, .execute_fn = DataServer.sourceScopeControlOperation }, .native_source_retirement_control = .{ .ptr = server, .execute_fn = DataServer.sourceRetirementControlOperation }, .native_source_scope_observe = .{ .ptr = server, .read_fn = DataServer.sourceScopeObserveOperation }, .native_source_producer_closure_observe = .{ .ptr = server, .read_fn = DataServer.sourceProducerClosureObserveOperation }, .native_source_checkpoint_observe = .{ .ptr = server, .read_fn = DataServer.sourceCheckpointObserveOperation }, .native_source_plan_chunk = .{ .ptr = server, .read_fn = DataServer.sourcePlanChunkOperation }, .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_decision = .{ .ptr = server, .read_fn = DataServer.historyDecisionOperation }, .native_history_owner = .{ .ptr = server, .read_fn = DataServer.historyOwnerOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
                 defer api_server.deinit();
                 var handler = try antfly.public_api.kernel_bridge.createHandler(api_server);
                 defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
@@ -45356,6 +45374,7 @@ fn consumerTests() type {
                         try @import("../api/source_checkpoint_native_test.zig").verify(source_alloc, origin_server.sourceCheckpointObservationPort(), source_fence, .{ .version = 1, .source_owner = source_binding, .transaction_id = source_id, .command = source_prepare.transaction.?.prepare.source_checkpoint.?, .minimum_applied_index = 1 });
                         try @import("../api/source_scope_native_test.zig").verify(source_alloc, native_owner, source_fence, source_binding);
                         try @import("../api/source_scope_native_test.zig").verifyRouted(source_alloc, origin_server.sourceScopeObservationPort(), source_fence, source_binding);
+                        try @import("../api/source_scope_native_test.zig").verifyProducerClosureRouted(source_alloc, origin_server.sourceProducerClosureObservationPort(), source_fence, source_binding);
                         try @import("../api/source_scope_native_test.zig").verifySubmission(source_alloc, origin_server, source_fence, source_binding);
                         try @import("../api/source_scope_native_test.zig").verifyControlRpc(source_alloc, origin_server.sourceScopeControlPort(), origin_server.sourceScopeObservationPort(), source_fence, source_binding);
                         try @import("../api/source_scope_native_test.zig").verifyMinimumRecovery(source_alloc, native_server, source_fence, source_binding);
