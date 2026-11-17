@@ -3516,8 +3516,7 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pgwire-retained-spool", .{tmp.sub_path});
         var artifacts = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, path);
         defer artifacts.deinit();
-        var spool_store = artifacts.artifactStore();
-        spool_store.namespace_identity = @splat(6);
+        const spool_store = try artifacts.spoolArtifactStore(.{});
         const registry: CatalogRetainedStream.Registry = .{ .store = spool_store, .io = std.testing.io };
         const start: wire.replication_commands.Start = .{ .slot = "docs_slot", .position = @fromBackingInt(0), .publications = &.{"feed"} };
         try std.testing.expectError(error.PgSpoolStorageUnsupported, CatalogRetainedStream.open(slots, registry, .{}, a, start, authority.request));

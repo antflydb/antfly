@@ -30,7 +30,8 @@ test "pg spool artifact adapter persists verified pages closure and exact replay
     defer fs.deinit();
     var store = fs.artifactStore();
     try std.testing.expectError(error.PgSpoolStorageUnsupported, adapter.Adapter.init(store, .{ .domain = @splat(1), .attempt = @splat(1) }, .write, .{}));
-    store.namespace_identity = @splat(9);
+    store = try fs.spoolArtifactStore(.{});
+    const namespace = store.namespace_identity.?;
     var state = try slot.State.initialize(@splat(1), "slot", @splat(5), 1024 * 1024);
     state = try state.acquire(@splat(2), 0, 100, 150);
     const session = state.session.?;
@@ -47,7 +48,7 @@ test "pg spool artifact adapter persists verified pages closure and exact replay
     const size = 32;
     const bytes = 47 + rows * (size + 13);
     const plan: spool.Plan = .{ .binding = .{ .feed = slot.feedId(state.database, state.name), .epoch = 1, .definition = @splat(2), .projection = @splat(3), .storage = writer.storageIdentity() }, .before = @splat(5), .after = @splat(6), .completion = @splat(7), .start_lsn = state.next_lsn, .bytes = bytes, .commit_offset = bytes - 26, .xid = 42, .commit_time = -1 };
-    const accounting_scope: slot.spool_control.Scope = .{ .namespace = @splat(9), .domain = scope.domain, .attempt = scope.attempt };
+    const accounting_scope: slot.spool_control.Scope = .{ .namespace = namespace, .domain = scope.domain, .attempt = scope.attempt };
     const reserved = try state.reserveSpool(a, session, 101, 1, accounting_scope, slot.spool_control.Spec.fromPlan(plan));
     defer a.free(reserved.spool.records);
     const sealed = try spool.testBuild(a, &writer, plan, rows, size);
@@ -60,8 +61,8 @@ test "pg spool artifact adapter persists verified pages closure and exact replay
     try std.testing.expect(try writer.store.retainedClosure(&id, .{}));
     fs.deinit();
     fs = try FsStore.initExisting(a, path);
-    store = fs.artifactStore();
-    store.namespace_identity = @splat(9);
+    store = try fs.spoolArtifactStore(.{});
+    try std.testing.expectEqual(namespace, store.namespace_identity.?);
     var reader_store = try adapter.Adapter.init(store, scope, .read, .{});
     const reader = try spool.Reader.open(a, &reader_store, sealed.identity, plan.binding);
     const row = (try reader.message(a, &reader_store, 21 + 129 * 45, 1024)).?;
@@ -213,4 +214,34 @@ test "pg spool artifact preflight identity distinguishes message boundaries" {
     try second.add("UD");
     try std.testing.expect(!std.mem.eql(u8, &first.final(), &second.final()));
     try std.testing.expectError(error.InvalidPgSpool, second.add(""));
+}
+
+test "pg spool artifact namespace is durable and rejects a corrupt or replaced inventory" {
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/namespace", .{temp.sub_path});
+    defer a.free(path);
+    const identity_path = try std.fs.path.join(a, &.{ path, ".upload-inventory", ".spool-identity-v1" });
+    defer a.free(identity_path);
+    const original = blk: {
+        var store = try FsStore.init(a, path);
+        defer store.deinit();
+        break :blk (try store.spoolArtifactStore(.{})).namespace_identity.?;
+    };
+    {
+        var reopened = try FsStore.initExisting(a, path);
+        defer reopened.deinit();
+        try std.testing.expectEqual(original, (try reopened.spoolArtifactStore(.{})).namespace_identity.?);
+        try @import("serverless/artifacts/fs_store.zig").writeFileAtomicallyWithCancellation(identity_path, &@as([68]u8, @splat(1)), .{});
+        try std.testing.expectError(error.ArtifactUploadFenceCorrupt, reopened.spoolArtifactStore(.{}));
+    }
+    const retired = try std.fmt.allocPrint(a, "{s}-retired", .{path});
+    defer a.free(retired);
+    const cwd = std.Io.Dir.cwd();
+    try cwd.rename(path, cwd, retired, std.testing.io);
+    defer cwd.deleteTree(std.testing.io, retired) catch {};
+    var replacement = try FsStore.init(a, path);
+    defer replacement.deinit();
+    try std.testing.expect(!std.meta.eql(original, (try replacement.spoolArtifactStore(.{})).namespace_identity.?));
 }

@@ -128,6 +128,58 @@ pub const FsStore = struct {
         };
     }
 
+    /// Qualify an owned spool root. Reopening the same payload and its native
+    /// fencing inventory preserves identity. A fresh root receives a new one.
+    pub fn spoolArtifactStore(self: *FsStore, cancellation: CancellationToken) !artifact_store.ArtifactStore {
+        const expected_inventory = try std.fs.path.join(self.alloc, &.{ self.root_dir, ".upload-inventory" });
+        defer self.alloc.free(expected_inventory);
+        if (!std.mem.eql(u8, expected_inventory, self.inventory_root)) return error.PgSpoolStorageUnsupported;
+        try cancellation.check();
+        var impl = threadedIo();
+        defer impl.deinit();
+        const io = impl.io();
+        var domain: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash("antfly:local-spool-root-identity:v1", &domain, .{});
+        var guard = try self.scopeFenceGuard(io, domain, .exclusive, cancellation);
+        defer guard.deinit();
+
+        // Keep the incarnation with the upload fence inventory. Recreating
+        // the inventory, even if payload bytes survive, invalidates old slots.
+        try self.durable_dirs.ensure(self.alloc, io, self.inventory_root);
+        const path = try std.fs.path.join(self.alloc, &.{ self.inventory_root, ".spool-identity-v1" });
+        defer self.alloc.free(path);
+        var id: [32]u8 = undefined;
+        const dir = std.Io.Dir.cwd();
+        if (dir.openFile(io, path, .{ .follow_symlinks = false })) |file| {
+            defer file.close(io);
+            var encoded: [68]u8 = undefined;
+            if (try file.length(io) != encoded.len or try file.readPositionalAll(io, &encoded, 0) != encoded.len or
+                !std.mem.eql(u8, encoded[0..4], "ASI1")) return error.ArtifactUploadFenceCorrupt;
+            id = encoded[4..36].*;
+            var checksum: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(encoded[0..36], &checksum, .{});
+            if (!std.meta.eql(checksum, encoded[36..68].*) or std.mem.allEqual(u8, &id, 0)) return error.ArtifactUploadFenceCorrupt;
+        } else |err| switch (err) {
+            error.FileNotFound => {
+                while (true) {
+                    try cancellation.check();
+                    io.random(&id);
+                    if (!std.mem.allEqual(u8, &id, 0)) break;
+                }
+                var encoded: [68]u8 = undefined;
+                encoded[0..4].* = "ASI1".*;
+                encoded[4..36].* = id;
+                std.crypto.hash.sha2.Sha256.hash(encoded[0..36], encoded[36..68], .{});
+                try writeFileAtomicallyWithCancellation(path, &encoded, cancellation);
+            },
+            else => return err,
+        }
+        try cancellation.check();
+        var store = self.artifactStore();
+        store.namespace_identity = id;
+        return store;
+    }
+
     pub fn put(self: *FsStore, alloc: Allocator, contents: []const u8) !artifact_store.ArtifactMetadata {
         return try self.putWithCancellation(alloc, contents, .none);
     }
