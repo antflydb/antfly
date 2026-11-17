@@ -705,6 +705,116 @@ pub const ReplicationFactory = struct {
     }
 };
 
+/// Native pgwire session callbacks for a host that supplies the database
+/// bootstrap authority and qualified spool namespace.
+pub const CatalogReplicationFactory = struct {
+    const control = publication_control;
+    const pg = wire.replication_commands;
+
+    server: *http.ApiHttpServer,
+    registry: CatalogRetainedStream.Registry,
+    stream_config: CatalogRetainedStream.retained.Config = .{},
+    bootstrap: Bootstrap,
+
+    pub const System = struct {
+        id: u64,
+        timeline: i32,
+        position: pg.Lsn,
+    };
+
+    pub const Bootstrap = struct {
+        ptr: *anyopaque,
+        identify: *const fn (*anyopaque, CatalogReplicationSlots, std.mem.Allocator, operation.RequestContext) anyerror!System,
+        create: *const fn (*anyopaque, CatalogReplicationSlots, std.mem.Allocator, pg.Create, wire.Request, operation.RequestContext) anyerror!wire.Result,
+    };
+
+    pub fn factory(self: *CatalogReplicationFactory) ReplicationFactory {
+        return .{ .context = self, .open_fn = Session.open };
+    }
+
+    const Session = struct {
+        host: *CatalogReplicationFactory,
+        allocator: std.mem.Allocator,
+        slots: CatalogReplicationSlots,
+        database_name: []u8,
+        owner: control.Digest,
+
+        fn open(raw: *anyopaque, a: std.mem.Allocator, identity: ReplicationIdentity, request: wire.Request) !wire.ReplicationSession {
+            const host: *CatalogReplicationFactory = @ptrCast(@alignCast(raw));
+            const context = try CatalogRetainedStream.Bridge.metadataContext(request);
+            if (host.server.source.changefeeds == null or host.server.source.pg_publications == null)
+                return error.UnsupportedReplicationMode;
+            try host.registry.requireAvailable(host.stream_config.require_shared, context);
+            const self = try a.create(Session);
+            errdefer a.destroy(self);
+            const name = try a.dupe(u8, request.database orelse "default");
+            errdefer a.free(name);
+            const slots = try CatalogReplicationSlots.open(host.server, identity, a, name, context);
+            var authenticated = try identity.read(identity.context, a);
+            defer authenticated.deinit(a);
+            const owner = try @import("changefeed_public.zig").durableOwner(authenticated);
+            self.* = .{ .host = host, .allocator = a, .slots = slots, .database_name = name, .owner = owner };
+            return .{ .context = self, .authorize = authorize, .command = command, .open_stream = openStream, .close = close };
+        }
+
+        fn authorize(raw: *anyopaque, a: std.mem.Allocator, request: wire.Request, _: ?pg.Command) !void {
+            const self: *Session = @ptrCast(@alignCast(raw));
+            try request.check();
+            if (!std.mem.eql(u8, self.database_name, request.database orelse "default")) return error.Forbidden;
+            var identity = try self.slots.identity.read(self.slots.identity.context, a);
+            defer identity.deinit(a);
+            const current = try @import("changefeed_public.zig").durableOwner(identity);
+            if (!std.crypto.timing_safe.eql(control.Digest, current, self.owner)) return error.Forbidden;
+        }
+
+        fn command(raw: *anyopaque, a: std.mem.Allocator, request: wire.Request, input: pg.Command) !wire.Result {
+            const self: *Session = @ptrCast(@alignCast(raw));
+            try authorize(raw, a, request, input);
+            const context = try CatalogRetainedStream.Bridge.metadataContext(request);
+            switch (input) {
+                .start => return error.UnsupportedReplicationMode,
+                .drop_slot => return self.slots.drop(a, input, request, context),
+                .create_slot, .identify_system => {},
+            }
+            const current = try CatalogReplicationSlots.readDatabase(self.host.server, a, self.database_name, context);
+            if (!std.meta.eql(current, self.slots.database)) return error.ChangefeedResynchronizationRequired;
+            const bootstrap = self.host.bootstrap;
+            if (input == .create_slot) return bootstrap.create(bootstrap.ptr, self.slots, a, input.create_slot, request, context);
+            const system = try bootstrap.identify(bootstrap.ptr, self.slots, a, context);
+            if (system.id == 0 or system.timeline <= 0) return error.InvalidResult;
+            const values = try a.dupe(std.json.Value, &.{
+                .{ .string = try std.fmt.allocPrint(a, "{d}", .{system.id}) },
+                .{ .integer = system.timeline },
+                .{ .string = try pg.formatLsn(a, system.position) },
+                .{ .string = self.database_name },
+            });
+            return .{
+                .command_tag = "IDENTIFY_SYSTEM",
+                .columns = &.{
+                    .{ .name = "systemid", .type = .string },
+                    .{ .name = "timeline", .type = .integer },
+                    .{ .name = "xlogpos", .type = .string },
+                    .{ .name = "dbname", .type = .string },
+                },
+                .rows = try a.dupe([]const std.json.Value, &.{values}),
+            };
+        }
+
+        fn openStream(raw: *anyopaque, a: std.mem.Allocator, request: wire.Request, start: pg.Start) !wire.ReplicationStream {
+            const self: *Session = @ptrCast(@alignCast(raw));
+            try authorize(raw, a, request, .{ .start = start });
+            return CatalogRetainedStream.open(self.slots, self.host.registry, self.host.stream_config, a, start, request);
+        }
+
+        fn close(raw: *anyopaque) void {
+            const self: *Session = @ptrCast(@alignCast(raw));
+            const a = self.allocator;
+            a.free(self.database_name);
+            a.destroy(self);
+        }
+    };
+};
+
 pub const Adapter = struct {
     server: *http.ApiHttpServer,
 
@@ -3125,6 +3235,16 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
         scratch: std.mem.Allocator = undefined,
         database_id: u64 = 1,
 
+        fn identify(_: *anyopaque, slots: CatalogReplicationSlots, _: std.mem.Allocator, _: operation.RequestContext) !CatalogReplicationFactory.System {
+            try std.testing.expectEqualStrings("default", slots.database_name);
+            return .{ .id = 719, .timeline = 1, .position = @fromBackingInt(1) };
+        }
+
+        fn createSlot(_: *anyopaque, _: CatalogReplicationSlots, _: std.mem.Allocator, command: wire.replication_commands.Create, _: wire.Request, _: operation.RequestContext) !wire.Result {
+            try std.testing.expectEqualStrings("docs_slot", command.slot);
+            return error.TestExpectedBootstrapCallback;
+        }
+
         fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
             return error.TestUnexpectedResult;
         }
@@ -3278,7 +3398,23 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
         const registry: CatalogRetainedStream.Registry = .{ .store = spool_store, .io = std.testing.io };
         const start: wire.replication_commands.Start = .{ .slot = "docs_slot", .position = @fromBackingInt(0), .publications = &.{"feed"} };
         try std.testing.expectError(error.PgSpoolStorageUnsupported, CatalogRetainedStream.open(slots, registry, .{}, a, start, authority.request));
-        const stream = try CatalogRetainedStream.open(slots, registry, .{ .require_shared = false }, a, start, authority.request);
+        var factory: CatalogReplicationFactory = .{
+            .server = server,
+            .registry = registry,
+            .stream_config = .{ .require_shared = false },
+            .bootstrap = .{ .ptr = &fixture, .identify = Fixture.identify, .create = Fixture.createSlot },
+        };
+        server.cfg = .{ .pgwire_replication = factory.factory() };
+        var adapter: Adapter = .{ .server = server };
+        const backend = adapter.backend();
+        const session = try backend.vtable.open_replication_session.?(backend.context, a, .{ .context = credential, .release = Credential.release }, authority.request);
+        defer session.close(session.context);
+        try session.authorize(session.context, a, authority.request, null);
+        const system = try session.command(session.context, alloc, authority.request, .identify_system);
+        try std.testing.expectEqualStrings("719", system.rows[0][0].string);
+        try std.testing.expectEqualStrings("0/1", system.rows[0][2].string);
+        try std.testing.expectError(error.TestExpectedBootstrapCallback, session.command(session.context, alloc, authority.request, .{ .create_slot = .{ .slot = "docs_slot", .snapshot = .nothing } }));
+        const stream = try session.open_stream.?(session.context, a, authority.request, start);
         defer stream.close(stream.context);
         try std.testing.expectEqual(@as(u64, 1), @backingInt(stream.initial_lsn));
         try std.testing.expect(fixture.slot_state.slot.?.session != null);

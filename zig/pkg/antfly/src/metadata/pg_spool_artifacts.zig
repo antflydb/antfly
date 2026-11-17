@@ -89,10 +89,15 @@ pub const Registry = struct {
         return id;
     }
 
-    pub fn qualify(self: Registry, state: feeds.State, shared: bool, request: anytype) !void {
+    pub fn requireAvailable(self: Registry, shared: bool, request: anytype) !void {
         try request.ensureActive();
-        const id = try self.namespace();
+        _ = try self.namespace();
         if (shared and !self.store.shared_across_owners) return error.PgSpoolStorageUnsupported;
+    }
+
+    pub fn qualify(self: Registry, state: feeds.State, shared: bool, request: anytype) !void {
+        try self.requireAvailable(shared, request);
+        const id = self.store.namespace_identity.?;
         const slot = state.slot orelse return error.ChangefeedCapabilityUnsupported;
         for (slot.spool.records) |record| {
             if (!std.meta.eql(record.scope.namespace, id)) return error.PgSpoolStorageUnsupported;
