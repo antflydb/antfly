@@ -422,6 +422,8 @@ def test_catalog_cluster_backup_retains_scope_and_literal_names(backup_api):
             [
                 api._server.binary,
                 "--no-agent",
+                "--output",
+                "json",
                 "restore",
                 "--backup-id",
                 "catalog-cluster",
