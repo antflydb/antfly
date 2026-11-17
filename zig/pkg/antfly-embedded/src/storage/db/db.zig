@@ -63621,29 +63621,14 @@ fn denseTargetCountFromCoverage(
             // A fresh, untouched artifact-backed generation's target counter
             // is trivially zero before any producer has attempted even its
             // first document -- indistinguishable, by count alone, from a
-            // genuinely empty range. A prior revision of this branch deferred
-            // (returned null, "not yet determined") whenever the range-local
-            // source cardinality was nonzero, to stop a gated/blocked
-            // embedder's never-attempted document from vacuously matching a
-            // zero active count.
-            //
-            // That guard made this read depend on a second, independently
-            // scheduled signal: the generation-scoped outcome row
-            // (produced/skipped/terminal_failed) that marks a document's
-            // enrichment as settled. Every caller of this function
-            // (`canAdvanceDerivedToTargetAfterReplayAsync` in particular)
-            // runs on the async derived-apply executor, so a *forced*,
-            // synchronous repair request -- which has already exhausted its
-            // retry budget and durably parked the failure as repair debt
-            // before this is ever reached -- raced that executor's own
-            // scheduling to see the settled row. Losing that race left the
-            // repair's `preflight` validation permanently waiting on a
-            // watermark that nothing was going to advance for it, so a
-            // forced repair of a retry-exhausted, isolated-failed index could
-            // defer forever instead of completing (see "db shared enrichment
-            // failure parks repair debt for every consumer"). Trust the
-            // already-bootstrapped artifact counter directly, as the
-            // non-dense-vector branch below always has.
+            // genuinely empty range. Apply the same range-local cardinality
+            // check the non-artifact-coverage branch below uses, so a gated
+            // or blocked embedder's never-attempted source material defers
+            // (returns null, "not yet determined") instead of vacuously
+            // matching a zero active count and fast-forwarding past it.
+            if (coverage_counts.source_total) |source_count| {
+                if (source_count != 0) return null;
+            }
             return try coverage_counts.artifactCount();
         }
         // A fresh generation on an empty table has no outcome rows to create
