@@ -31,8 +31,10 @@ delaying a ready decoder for a peer. The general runtime defaults outside this
 deployment profile remain off. Cooperative execution with row batching off
 continues to interleave one request per forward. Row batching alone does
 not opt a model into cooperative sharing. The current envelope remains two
-active requests and two decode rows. Graph, prompt-cache, speculative,
-selected-KV and multimodal requests retain exclusive ownership.
+active requests and two decode rows. Qualified F16 prefix-cache requests in
+`simple` or `block_hash` mode can share these rows, including streaming requests.
+CUDA radix caching remains disabled. Other KV dtypes, graph,
+speculative, selected-KV and multimodal requests retain exclusive ownership.
 
 The backend declares row eligibility from its eager resident weight inventory
 and available kernels. The current implementation targets dense Gemma 4 E4B QAT
@@ -75,8 +77,13 @@ arrival or retirement must not switch
 between a greedy shortcut and the canonical sampled projection. Cooperative
 requests therefore continue through the scheduler even when only one owner is
 active; batching can change the number of rows without changing this policy.
-The output head uses the singleton quantized Q6_K projection for each head row; the backbone
-remains one batched forward. Other checkpoints do not acquire this
+The two-row Q6_K/Q8_1 output head reads each weight tile once for both rows
+while preserving each singleton's integer products, scaling and reduction
+order. Its standalone PTX targets CUDA 13.0 and compute capability 8.0 or later;
+unsupported layouts/drivers retain the per-row projection. The hardware test
+compares every logit bit for bit against independent singleton kernels.
+`ANTFLY_INFERENCE_CUDA_E4B_PAIRED_HEAD=0` restores those kernels for controlled
+comparisons. The backbone remains one batched forward. Other checkpoints do not acquire this
 numerical qualification through matching architecture dimensions alone.
 
 These contracts extend the lane, admission and failed-free recovery invariants
