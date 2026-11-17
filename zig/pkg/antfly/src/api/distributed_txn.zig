@@ -1437,6 +1437,9 @@ fn executeMultiTableCommitOnce(
         }
         for (table.dag_owners) |owner| {
             if (owner.domains.len == 0 or owner.domains.len > 64 or table.restore_staging_scope != null) return error.InvalidTxnRequest;
+            for (owner.domains) |domain| {
+                if (!std.mem.eql(u8, &domain.attempt.transaction, &txn_id)) return error.GraphConstraintAttemptConflict;
+            }
             const fence = owner.fence;
             if (routing.snapshot.status.metadata_group_id != fence.metadata_group_id or
                 !std.meta.eql(routing.snapshot.status.metadata_incarnation, fence.metadata_incarnation) or topology_epoch != fence.topology_epoch)
@@ -2189,11 +2192,6 @@ const PrepareFanoutTask = struct {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
-        const dag_domains = alloc.dupe(db_mod.types.DagDomainPrepare, participant.dag_domains) catch |err| {
-            slot.err = err;
-            return;
-        };
-        for (dag_domains) |*domain| domain.attempt.transaction = txn_id;
         worker.prepareGroup(alloc, participant.group_id, participant.table_name, .{
             .route_fence = participant.route_fence,
             .txn_id = txn_id,
@@ -2213,7 +2211,7 @@ const PrepareFanoutTask = struct {
                 .integrity = participant.integrity.items,
                 .integrity_commands = participant.integrity_commands.items,
                 .range_guards = participant.range_guards.items,
-                .dag_domains = dag_domains,
+                .dag_domains = participant.dag_domains,
                 .relational_activation = participant.relational_activation,
                 .relational_retirement = participant.relational_retirement,
                 .relational_index_maintenance = participant.relational_index_maintenance,

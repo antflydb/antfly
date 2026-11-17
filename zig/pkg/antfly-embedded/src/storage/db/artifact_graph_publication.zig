@@ -81,7 +81,7 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
         const count = (contenders.decodeVisibleCount(raw, producer.coverage_generation) catch |err| return authoredOutputError(err)) orelse return error.InvalidBatchRequest;
         try coverage.append(owned, .{ .index_name = producer.name, .generation = producer.coverage_generation, .document_key = try owned.dupe(u8, source.document_key), .artifact_names = &.{}, .outcome = if (count == 0) .skipped else .produced });
     }
-    return .{ .arena = arena, .batch = .{ .changed_artifact_keys = changed.items, .graph_writes = writes.items, .graph_deletes = deletes.items }, .coverage = coverage.items };
+    return .{ .arena = arena, .graph_publication_digest = command.publication_digest, .batch = .{ .changed_artifact_keys = changed.items, .graph_writes = writes.items, .graph_deletes = deletes.items }, .coverage = coverage.items };
 }
 
 fn authoredOutputError(err: anyerror) anyerror {
@@ -136,6 +136,7 @@ test "ordered artifact inventory graph publication validates guards generations 
         .publication_digest = @splat(0),
     };
     {
+        command.publication_digest = command.digest();
         var result = try prepare(alloc, command, catalogs);
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 1), result.batch.graph_writes.len);
@@ -146,6 +147,18 @@ test "ordered artifact inventory graph publication validates guards generations 
         try std.testing.expectEqual(@as(usize, 1), replacements.len);
         try std.testing.expectEqualStrings("entity", replacements[0].source);
         try std.testing.expectEqualStrings("target", replacements[0].targets[0]);
+        var different = command;
+        different.authority_epoch += 1;
+        different.publication_digest = different.digest();
+        try std.testing.expectError(error.InvalidBatchRequest, result.dagPrepare(different, @splat(2), "links", 1, 0, @splat(3)));
+        const request = (try result.dagPrepare(command, @splat(2), "links", 1, 0, @splat(3))).?;
+        try std.testing.expectEqualDeep(command.publication_digest, request.producer_versions);
+        try std.testing.expectEqualDeep(replacements, request.replacements);
+        const retry = (try result.dagPrepare(command, @splat(2), "links", 2, 1, @splat(3))).?;
+        try std.testing.expectEqualDeep(request.attempt, retry.attempt);
+        const next = (try result.dagPrepare(command, @splat(2), "links", 2, 1, @splat(4))).?;
+        try std.testing.expect(!std.mem.eql(u8, &request.attempt.id, &next.attempt.id));
+        try std.testing.expect((try result.dagPrepare(command, @splat(2), "unknown", 1, 0, @splat(3))) == null);
     }
     const guards = command.mutation_preconditions;
     command.mutation_preconditions = guards[0..1];

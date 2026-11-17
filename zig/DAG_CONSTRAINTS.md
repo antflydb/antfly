@@ -41,8 +41,10 @@ carry an explicitly routed authority participant supplied by the caller. Its
 private HTTP and ordered Raft prepare envelopes have distinct version tags and
 carry binary contribution identifiers. Prepared graph artifact replay can derive
 canonical per-record replacements for a selected index and edge type after the
-publisher has resolved contenders. The publication coordinator still needs to
-enlist the authority under the source and contender guards, and document-derived
+publisher has resolved contenders. The prepared command can construct a
+transaction participant vote bound to the complete publication digest,
+constrained domain and transaction identity. The publication coordinator
+still needs to enlist the authority under the source and contender guards, and document-derived
 and explicit writers still need to supply their final contributions. The authority also stages bounded activation pages into a private
 ledger and persists the pinned snapshot and scan cursor atomically with each
 page. The catalog still needs to fence writes, enumerate the stable snapshot

@@ -1136,6 +1136,7 @@ test "privacy publication callback carries stable backpressure statuses" {
 pub const PreparedEffects = struct {
     arena: std.heap.ArenaAllocator,
     batch: @import("derived/derived_types.zig").DerivedBatch,
+    graph_publication_digest: ?Digest = null,
     coverage: []const Coverage = &.{},
     chunk_fence: ?@import("artifact_chunk_publication.zig").Fence = null,
     chunk_vector_fence: ?@import("artifact_chunk_vector_publication.zig").Fence = null,
@@ -1145,6 +1146,44 @@ pub const PreparedEffects = struct {
     /// effects. The caller supplies the constrained index and edge type.
     pub fn dagReplacements(self: *@This(), index: []const u8, edge_type: []const u8) ![]const @import("../../graph/dag_authority.zig").Contributions.Replacement {
         return @import("dag_graph_effects.zig").collect(self.arena.allocator(), index, edge_type, self.batch.graph_writes, self.batch.graph_deletes);
+    }
+
+    /// Construct the authority vote for this immutable publication and
+    /// reserved domain revision. The coordinator owns the pinned owner route.
+    pub fn dagPrepare(
+        self: *@This(),
+        command: Command,
+        table_identity: [16]u8,
+        edge_type: []const u8,
+        owner_epoch: u64,
+        revision: u64,
+        transaction: @import("../transactions.zig").TxnId,
+    ) !?@import("../transactions.zig").DagDomainPrepare {
+        const dag = @import("../../graph/dag_authority.zig");
+        if (command.mode != .publish or command.producer_kind != .graph) return error.InvalidBatchRequest;
+        const prepared_digest = self.graph_publication_digest orelse return error.InvalidBatchRequest;
+        const versions = command.digest();
+        if (!std.mem.eql(u8, &versions, &command.publication_digest) or
+            !std.mem.eql(u8, &versions, &prepared_digest)) return error.InvalidBatchRequest;
+        const domain_id = try dag.domain(table_identity, command.producer_generation, command.producer_name, edge_type);
+        const replacements = try self.dagReplacements(command.producer_name, edge_type);
+        if (replacements.len == 0) return null;
+        const candidate = dag.Contributions.candidate(versions, replacements);
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly/graph-publication-dag-attempt/v1");
+        hash.update(&domain_id);
+        hash.update(&transaction);
+        hash.update(&candidate);
+        var id: dag.Digest = undefined;
+        hash.final(&id);
+        return .{
+            .domain = domain_id,
+            .epoch = owner_epoch,
+            .revision = revision,
+            .attempt = .{ .id = id, .transaction = transaction, .candidate = candidate },
+            .producer_versions = versions,
+            .replacements = replacements,
+        };
     }
 
     pub fn deinit(self: *@This()) void {
