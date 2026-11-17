@@ -1339,7 +1339,7 @@ pub const NativeSourceScopeBasis = struct {
     group_id: u64,
 };
 
-/// Trusted ordered command constructed from an independently qualified metadata read. Not an HTTP authorization body. Scope mutation and the actual apply marker commit atomically. First strict admission also requires independently verified legacy worker handover and transaction drainage.
+/// Trusted ordered command constructed from an independently qualified metadata read. Never accepted as new-write HTTP authorization. Read-only receipt recovery may carry its exact original command. Scope mutation and the actual apply marker commit atomically. First strict admission also requires independently verified legacy worker handover and transaction drainage.
 pub const NativeSourceScopeControlCommand = struct {
     version: i64,
     intent: NativeSourceScopeControlIntent,
@@ -1353,6 +1353,99 @@ pub const NativeSourceScopeControlIntent = struct {
     spec: NativeSourceScopeSpec,
     minimum_metadata_index: u64,
     action: NativeSourceScopeAction,
+};
+
+/// Private correlated reply, at most 24 KiB. request_digest binds the entire request including request_id and operation. An unknown submit may have null command/receipt/outcome; never replay from that state. Every known accepted entry carries both its exact freshly captured command and positive receipt, even if outcome is null. Recovery preserves its exact original command and entry; changing the metadata cut is not recovery. A superseded receipt confirms neither success nor failure. A known rejection is not an applied effect. Applied evidence must match command, action, physical owner and actual ordered cut. One root receipt proves no all-owner fencing or row transaction outcome.
+pub const NativeSourceScopeControlReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    command: OpenApiOptionalNullable(NativeSourceScopeControlCommand) = .absent,
+    receipt: OpenApiOptionalNullable(NativeHistoryPublicationCut) = .absent,
+    outcome: OpenApiOptionalNullable(NativeSourceScopeOutcome) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        switch (self.command) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("command");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("command");
+                try jw.write(value);
+            },
+        }
+        switch (self.receipt) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("receipt");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("receipt");
+                try jw.write(value);
+            },
+        }
+        switch (self.outcome) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("outcome");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("outcome");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+/// Private lifecycle RPC contract, at most 16 KiB. A fresh nonzero request_id correlates one RPC attempt and grants no replay or transaction outcome authority. submit requires intent and null/absent recovery; the receiving leader independently captures fresh signed metadata authority. recover requires recovery and null/absent intent, and only reads the exact prior command/entry. Caller metadata cuts are never accepted as new-write authorization. These types do not advertise an endpoint or first-activation capability.
+pub const NativeSourceScopeControlRequest = struct {
+    version: i64,
+    request_id: NativeHistoryConsumerId,
+    operation: []const u8,
+    intent: OpenApiOptionalNullable(NativeSourceScopeControlIntent) = .absent,
+    recovery: OpenApiOptionalNullable(NativeSourceScopeRecovery) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_id");
+        try jw.write(self.request_id);
+        try jw.objectField("operation");
+        try jw.write(self.operation);
+        switch (self.intent) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("intent");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("intent");
+                try jw.write(value);
+            },
+        }
+        switch (self.recovery) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("recovery");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("recovery");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 /// Bounded physical-root registry. The monotonic metadata floor and strict admission survive deletion of the last domain; no unbounded generation tombstones are retained.

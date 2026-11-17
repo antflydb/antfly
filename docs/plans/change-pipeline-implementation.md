@@ -5436,3 +5436,51 @@ criterion are still incomplete. Neither issue can be closed on this evidence.
 Final repository contract checks also exited 0 after the deadline and contention
 fixes (`source-scope-raft-proposal-final-contract-check.log`), including all nine
 schema fragment tests and generated/provenance checks.
+
+### Correlated private source-scope RPC request/reply contract
+
+`source_scope_http_wire.zig` separates submit Intent from exact read-only Recovery.
+The request carries a required nonzero 16-byte request_id for one RPC attempt;
+its digest binds that ID, version, operation and complete payload. Submission
+accepts no caller metadata cut. Known accepted results carry the exact captured
+Command and positive native receipt, even when their outcome remains unknown.
+Unknown submit replies retain no invented command/entry, while unknown recovery
+replies preserve their exact original command and receipt. Superseded receipts
+confirm neither success nor failure. A determinate rejection is not an applied
+effect, and applied responses validate the complete action/owner/state/cut.
+Request JSON is bounded to 16 KiB and replies to 24 KiB, with strict duplicate and
+unknown-field handling and no parsed-buffer ownership escaping the decoder.
+
+`source_scope_control_operations.zig` supplies the callback ABI boundary. It
+binds the immutable route and owner before dispatch, intersects deadlines and
+cancellation, validates the returned request correlation and semantic evidence,
+and preserves known command/receipt authority after late cancellation while
+clearing confirmation. Ambiguous callback failure yields an unknown result;
+forged replies become unresolved, never accepted success. HTTP adapters still
+must authenticate service authority; this operation is not a public endpoint.
+
+The first focused wire/ingress run passed all four selected tests, zero skips,
+failures or leaks (`source-scope-control-ingress-test.log`). A subsequent update
+adds explicit request IDs and corresponding generated private API schemas;
+terminal generation and final validation results follow below. The new schemas
+also clarify that an original captured Command in a recovery body grants only
+read-only lookup, never fresh-write authorization.
+
+Transport route/handler/client wiring, actual metadata-to-data proposal
+qualification, genuine legacy worker handover, retirement transport and cohort/
+checkpoint lifecycle remain unfinished. These internal contracts do not complete
+any of the original full destination/public-history/bootstrap/retention/typed
+pgoutput/real-Antfly-client/recovery/performance acceptance criteria by themselves.
+Both issues stay open and the implementation PR stays draft.
+
+Full `make generate` exited 0 (`source-scope-control-rpc-generate.log`). Only the
+private internal OpenAPI root/types changed for this contract; unrelated generated
+model-explorer artifacts from that run were restored. No endpoint, capability,
+engine/owner/API ABI or data/metadata protocol maximum is advertised or changed.
+Final `source-scope-control-wire-test -Dstrip=true -j1` exited 0: all four selected
+wire/ingress tests passed, zero skipped/failed/leaked
+(`source-scope-control-rpc-final-test.log`). Request-ID substitution and all-zero
+ID rejection are included. Final source-catalog, engine-error and OpenAPI checks
+also exited 0 (`source-scope-control-rpc-contract-check.log`), including nine
+schema-fragment tests. Actual authenticated HTTP route/client integration still
+must be implemented and qualified before this contract is a usable RPC surface.

@@ -17,6 +17,8 @@ test {
     _ = @import("data/history_control_entry.zig");
     _ = @import("data/source_plan_entry.zig");
     _ = @import("data/source_scope_entry.zig");
+    _ = @import("data/source_scope_http_wire.zig");
+    _ = @import("api/source_scope_control_operations.zig");
     _ = @import("data/history_control_wire.zig");
     _ = @import("data/raft_batch.zig").consumer_tests;
 }
