@@ -23216,14 +23216,29 @@ pub const DB = struct {
         // A table-local historical image cannot certify references owned by
         // other tables at a later cut. Keep the candidate unpublished until a
         // cluster-coordinated restore/activation barrier is available.
+        var detach_backup_fence = false;
         if (purpose == .historical_table) {
             const topology_fence = opened_primary.store.get(alloc, @import("relational_integrity_topology.zig").fence_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
             if (topology_fence) |bytes| {
-                alloc.free(bytes);
-                return error.CoordinatedConstraintRestoreRequired;
+                defer alloc.free(bytes);
+                const fence = try @import("relational_integrity_topology.zig").Fence.decode(bytes);
+                if (fence.role != .backup_snapshot) return error.CoordinatedConstraintRestoreRequired;
+                var read = try opened_primary.store.beginReadTxn();
+                defer read.abort();
+                const namespace = (try doc_identity.loadNamespaceTxn(&read)) orelse return error.IdentityNamespaceMismatch;
+                if (!namespace.eql(fence.namespace)) return error.IdentityNamespaceMismatch;
+                const catalog = read.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                portable_backup.requireUncoordinatedIntegrityState(alloc, &read, catalog) catch |err| switch (err) {
+                    error.CoordinatedConstraintPortableBackupUnsupported => return error.CoordinatedConstraintRestoreRequired,
+                    else => return err,
+                };
+                detach_backup_fence = true;
             }
             const retirement = opened_primary.store.get(alloc, @import("relational_integrity_retirement.zig").key) catch |err| switch (err) {
                 error.NotFound => null,
@@ -23252,6 +23267,11 @@ pub const DB = struct {
                 },
             };
         }
+        // Only this unpublished, proven-uncoordinated candidate may discard
+        // its source backup's writer fence. Other topology roles, retirement,
+        // active/historical constraints and integrity records remain rejected.
+        if (detach_backup_fence)
+            try opened_primary.store.delete(@import("relational_integrity_topology.zig").fence_key);
         if (!streaming_store)
             try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
         // The candidate root owns its identity. Creating it while the staged

@@ -923,7 +923,7 @@ pub fn validateAndMaterializeWithCancellation(
         }
     }
 
-    try validateCompleteInventory(alloc, io, snapshot_root, manifest, cancellation);
+    try validateCompleteInventory(alloc, io, snapshot_root, manifest, raw.len, cancellation);
     for (manifest.artifacts) |artifact| {
         try ensureActive(cancellation);
         if (!isGeneratedArtifact(artifact.path)) continue;
@@ -1295,6 +1295,7 @@ fn validateCompleteInventory(
     io: Io,
     root: []const u8,
     manifest: *const Manifest,
+    manifest_bytes: u64,
     cancellation: CancellationToken,
 ) !void {
     var dir = if (std.fs.path.isAbsolute(root))
@@ -1310,6 +1311,23 @@ fn validateCompleteInventory(
             .directory => {},
             .file => {
                 if (std.mem.eql(u8, entry.path, manifest_file_name)) continue;
+                const seal = @import("native_backup_seal.zig");
+                if (std.mem.eql(u8, entry.path, seal.export_receipt_name)) {
+                    // This auxiliary envelope is emitted after the immutable
+                    // generation inventory. It is not installed or accepted
+                    // as cohort authority; all declared artifacts were hashed
+                    // above and every other undeclared file remains rejected.
+                    const receipt_path = try std.fs.path.join(alloc, &.{ root, entry.path });
+                    defer alloc.free(receipt_path);
+                    const receipt = try readFileAlloc(alloc, io, receipt_path, 4096);
+                    defer alloc.free(receipt);
+                    var generation_bytes = manifest_bytes;
+                    for (manifest.artifacts) |artifact|
+                        generation_bytes = try std.math.add(u64, generation_bytes, artifact.size_bytes);
+                    const tree_bytes = try std.math.add(u64, generation_bytes, receipt.len);
+                    try seal.validateExportEnvelope(alloc, receipt, generation_bytes, tree_bytes);
+                    continue;
+                }
                 if (!manifestContainsArtifact(manifest, entry.path))
                     return error.InvalidNativeBackupManifest;
             },

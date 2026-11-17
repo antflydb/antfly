@@ -1447,7 +1447,7 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
 /// schema publication derives its own namespace-bound incarnation. Any retired
 /// generation, CHECK activation, routed claim/reference/job, or orphaned state
 /// still requires the coordinated cohort path.
-fn requireUncoordinatedIntegrityState(alloc: Allocator, scan: *DocStore.Txn, raw_catalog: ?[]const u8) !void {
+pub fn requireUncoordinatedIntegrityState(alloc: Allocator, scan: *DocStore.Txn, raw_catalog: ?[]const u8) !void {
     const catalog_mod = @import("db/relational_integrity_catalog.zig");
     if (raw_catalog) |bytes| {
         var catalog = try catalog_mod.decode(alloc, bytes);
