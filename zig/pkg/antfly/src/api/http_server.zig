@@ -1718,6 +1718,7 @@ pub const ApiHttpServerConfig = struct {
     native_source_retirement_control: ?@import("source_retirement_operations.zig").Port = null,
     native_source_scope_observe: ?@import("source_scope_operations.zig").Port = null,
     native_source_producer_closure_observe: ?@import("source_producer_closure_operations.zig").Port = null,
+    pgwire_replication: ?@import("sql_pgwire.zig").ReplicationFactory = null,
     native_legacy_inventory: ?@import("source_legacy_inventory_operations.zig").Port = null,
     native_legacy_terminal: ?@import("source_legacy_terminal_operations.zig").Port = null,
     native_source_producer_control: ?@import("source_producer_control_operations.zig").Port = null,
@@ -62854,7 +62855,7 @@ test "SQL pgwire native replay routing rejection preserves an earlier unknown ex
         }
     };
     var fixture: Rejected = .{};
-    const writes: table_writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = Rejected.batch, .commit_transaction_with_id = Rejected.commit } };
+    const writes: table_writes.TableWriteSource = .{ .ptr = &fixture, .supports_transaction_producers = true, .vtable = &.{ .batch = Rejected.batch, .commit_transaction_with_id = Rejected.commit } };
     var server = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, writes);
     defer server.deinit();
     var completion: @import("../pgwire/completion.zig").Completion = .{};

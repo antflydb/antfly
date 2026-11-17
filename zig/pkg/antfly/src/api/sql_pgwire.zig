@@ -144,11 +144,72 @@ test "SQL pgwire owner rejects unauthenticated and runtime-less startup" {
     try std.testing.expectError(error.PgwireRequiresBackendRuntime, Listener.start(&api, .{ .enabled = true }));
 }
 
+/// The replication owner checks its explicit privilege and publication policy
+/// against the current connection identity at each authorization checkpoint.
+pub const ReplicationIdentity = struct {
+    context: *anyopaque,
+    read: *const fn (*anyopaque, std.mem.Allocator) anyerror!http.AuthenticatedIdentity,
+};
+
+pub const ReplicationFactory = struct {
+    context: *anyopaque,
+    open_fn: *const fn (*anyopaque, std.mem.Allocator, ReplicationIdentity, wire.Request) anyerror!wire.ReplicationSession,
+    boundary_dispatch: Boundary.Dispatch = Boundary.local_dispatch,
+
+    const Boundary = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
+    const VTable = struct { open: @FieldType(ReplicationFactory, "open_fn") };
+
+    fn open(self: ReplicationFactory, alloc: std.mem.Allocator, identity: ReplicationIdentity, request: wire.Request) !wire.ReplicationSession {
+        return Boundary.call("open", self.boundary_dispatch, self.open_fn, .{ self.context, alloc, identity, request });
+    }
+};
+
 pub const Adapter = struct {
     server: *http.ApiHttpServer,
 
     pub fn backend(self: *Adapter) wire.Backend {
-        return .{ .context = self, .vtable = &.{ .native_parameters = true, .authenticate = authenticate, .refresh = refresh, .describe = describe, .execute = execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .evaluate_parameter_cells = evaluateParameterCells, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect, .completion_safe = completionSafe, .pin_completion = pinCompletion, .reserve_completion = reserveCompletion, .completion_ready = completionReady } };
+        return .{ .context = self, .vtable = if (self.server.cfg.pgwire_replication != null) &replication_backend else &sql_backend };
+    }
+
+    const sql_backend: wire.Backend.VTable = .{
+        .native_parameters = true,
+        .authenticate = authenticate,
+        .refresh = refresh,
+        .describe = describe,
+        .execute = execute,
+        .load_settings = loadSettings,
+        .validate_namespace = validateNamespace,
+        .evaluate_parameters = evaluateParameters,
+        .evaluate_parameter_cells = evaluateParameterCells,
+        .fail_transaction = failTransaction,
+        .open_stream = openStream,
+        .disconnect = disconnect,
+        .completion_safe = completionSafe,
+        .pin_completion = pinCompletion,
+        .reserve_completion = reserveCompletion,
+        .completion_ready = completionReady,
+    };
+    const replication_backend: wire.Backend.VTable = blk: {
+        var enabled = sql_backend;
+        enabled.open_replication_session = openReplication;
+        break :blk enabled;
+    };
+
+    fn openReplication(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !wire.ReplicationSession {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        const factory = self.server.cfg.pgwire_replication orelse return error.UnsupportedReplicationMode;
+        const credential: *Credential = @ptrCast(@alignCast(identity.context));
+        try request.check();
+        try credential.validate();
+        const session = try factory.open(alloc, .{ .context = credential, .read = replicationIdentity }, request);
+        errdefer session.close(session.context);
+        try request.check();
+        return session;
+    }
+
+    fn replicationIdentity(raw: *anyopaque, alloc: std.mem.Allocator) anyerror!http.AuthenticatedIdentity {
+        const credential: *Credential = @ptrCast(@alignCast(raw));
+        return credential.identity(alloc);
     }
 
     fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
@@ -1940,9 +2001,21 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
 test "SQL pgwire native adapter admits sessions for principal scoped native validation" {
     // Force semantic compilation of every production callback without needing
     // a listener or a live distributed backend in this owner-layer test.
-    var adapter = Adapter{ .server = undefined };
+    const a = std.testing.allocator;
+    const server = try a.create(http.ApiHttpServer);
+    defer a.destroy(server);
+    server.cfg = .{};
+    var adapter: Adapter = .{ .server = server };
     const callbacks = adapter.backend();
     try std.testing.expect(callbacks.context == @as(*anyopaque, @ptrCast(&adapter)));
+    try std.testing.expect(callbacks.vtable.open_replication_session == null);
+    const Denied = struct {
+        fn open(_: *anyopaque, _: std.mem.Allocator, _: ReplicationIdentity, _: wire.Request) anyerror!wire.ReplicationSession {
+            return error.Forbidden;
+        }
+    };
+    server.cfg.pgwire_replication = .{ .context = server, .open_fn = Denied.open };
+    try std.testing.expect(adapter.backend().vtable.open_replication_session != null);
     var cancelled = std.atomic.Value(bool).init(false);
     const request = wire.Request{
         .statement = "SELECT * FROM docs",

@@ -44,7 +44,8 @@ pub const StatusDetail = error_abi.Detail;
 // Version 39 includes the producer-close submission callback.
 // Version 40 includes authenticated original-terminal recovery callbacks.
 // Version 41 includes authenticated bounded legacy inventory reads.
-pub const abi_version: u32 = 41;
+// Version 42 includes the optional authenticated pgwire replication factory.
+pub const abi_version: u32 = 42;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
