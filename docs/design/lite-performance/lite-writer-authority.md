@@ -164,12 +164,10 @@ background write admission.
   writers wait for the reader slot, and the read serves from `refresh`'s
   in-memory fast paths. A read that needs a replacement open, pending SQL
   recovery or capacity admission takes the writer path instead.
-- W1: a maintenance snapshot's file is marked `forwarding_only`, and Debug
-  builds assert it never begins a transaction. A probe run over the
-  maintenance and concurrency suites and the Go embedded suite found no
-  such write. The snapshot still opens its file writable for allocator
-  bookkeeping, and `enterMaintenanceWriter` keeps its rebase as the
-  cross-process check.
+- W1: a maintenance snapshot's file is read-only (`read_only`) and marked
+  `forwarding_only`; Debug builds assert it never begins a transaction. It
+  still reads, proves and donates allocator state. `enterMaintenanceWriter`
+  keeps its rebase as the cross-process check.
 
 ## 6. Tests
 

@@ -3352,6 +3352,9 @@ pub const Owner = struct {
         // pinned state; its writes are applied by the current root's store.
         store.write_target = .{ .ptr = self, .resolve = resolveWriterStore };
         store.file.forwarding_only = true;
+        // W1: the snapshot reads, proves and donates allocator state, but
+        // never writes its own file; its store forwards every write.
+        store.file.read_only = true;
         if (self.maintenance_snapshot) |old| {
             // Carry the old snapshot's warm, verified ledger as a rebase base,
             // as the serving-runtime refresh does. Otherwise every replacement
