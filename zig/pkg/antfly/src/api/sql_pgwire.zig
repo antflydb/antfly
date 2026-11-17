@@ -168,6 +168,70 @@ pub const ReplicationIdentity = struct {
     }
 };
 
+/// Command completion for a replication owner that has resolved the database,
+/// authorized the publication and captured the exact metadata owner revision.
+pub const SlotCommands = struct {
+    const control = @import("../metadata/changefeed_control.zig");
+    const Metadata = @import("changefeed_metadata.zig").Port;
+
+    pub fn drop(
+        metadata: Metadata,
+        alloc: std.mem.Allocator,
+        command: wire.replication_commands.Command,
+        write: control.Write,
+        context: operation.RequestContext,
+    ) !wire.Result {
+        if (command != .drop_slot or write.mutation != .slot or write.mutation.slot != .drop) return error.InvalidChangefeed;
+        if (!std.mem.eql(u8, command.drop_slot.slot, write.mutation.slot.drop.name)) return error.InvalidChangefeed;
+        try metadata.dropSlot(alloc, write, context);
+        return .{ .command_tag = "DROP_REPLICATION_SLOT", .mutation_outcome = .committed };
+    }
+
+    pub fn create(
+        metadata: Metadata,
+        alloc: std.mem.Allocator,
+        command: wire.replication_commands.Create,
+        write: control.Write,
+        now: u64,
+        snapshot_name: ?[]const u8,
+        context: operation.RequestContext,
+    ) !wire.Result {
+        if (command.temporary) return error.UnsupportedReplicationOption;
+        if (write.mutation != .seal) return error.InvalidChangefeed;
+        const configuration = write.mutation.seal.slot orelse return error.InvalidChangefeed;
+        if (!std.mem.eql(u8, command.slot, configuration.name)) return error.InvalidChangefeed;
+        if ((command.snapshot == .export_snapshot) != (snapshot_name != null)) return error.InvalidChangefeed;
+        if (snapshot_name) |name| {
+            if (name.len == 0 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidChangefeed;
+        }
+        const point = try wire.replication_commands.formatLsn(alloc, @fromBackingInt(configuration.consistent_lsn));
+        errdefer alloc.free(point);
+        const values = try alloc.dupe(std.json.Value, &.{
+            .{ .string = command.slot },
+            .{ .string = point },
+            if (snapshot_name) |name| .{ .string = name } else .null,
+            .{ .string = "pgoutput" },
+        });
+        errdefer alloc.free(values);
+        const rows = try alloc.dupe([]const std.json.Value, &.{values});
+        errdefer alloc.free(rows);
+        // Allocate the wire result before committing so allocation failure has
+        // a definite outcome. The result borrows the command and caller arena.
+        _ = try metadata.sealSlot(alloc, write, now, context);
+        return .{
+            .columns = &.{
+                .{ .name = "slot_name", .type = .string },
+                .{ .name = "consistent_point", .type = .string },
+                .{ .name = "snapshot_name", .type = .string },
+                .{ .name = "output_plugin", .type = .string },
+            },
+            .rows = rows,
+            .command_tag = "CREATE_REPLICATION_SLOT",
+            .mutation_outcome = .committed,
+        };
+    }
+};
+
 pub const ReplicationFactory = struct {
     context: *anyopaque,
     open_fn: *const fn (*anyopaque, std.mem.Allocator, ReplicationIdentity, wire.Request) anyerror!wire.ReplicationSession,

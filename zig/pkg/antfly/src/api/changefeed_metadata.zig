@@ -301,9 +301,12 @@ pub const test_support = if (@import("builtin").is_test) struct {
         try std.testing.expectError(error.MetadataMutationOutcomeUnknown, port.sealSlot(a, write, 101, context));
         try std.testing.expectEqual(@as(usize, 1), fake.mutations);
         fake.commit = true;
-        const start = try port.sealSlot(a, write, 101, context);
-        try std.testing.expectEqual(configuration.consistent_lsn, start.consistent_lsn);
-        try std.testing.expectEqual(sealed.latest_cursor, start.cursor);
+        const commands = @import("sql_pgwire.zig").SlotCommands;
+        const created = try commands.create(port, scratch, .{ .slot = configuration.name }, write, 101, "qualified-snapshot", context);
+        try std.testing.expectEqualStrings("CREATE_REPLICATION_SLOT", created.command_tag);
+        try std.testing.expectEqualStrings("0/2000", created.rows[0][1].string);
+        try std.testing.expectEqualStrings("qualified-snapshot", created.rows[0][2].string);
+        try std.testing.expect(created.mutation_outcome == .committed);
         try std.testing.expectEqual(@as(usize, 2), fake.mutations);
         var drop = write;
         drop.expected_revision = sealed.revision;
@@ -313,7 +316,9 @@ pub const test_support = if (@import("builtin").is_test) struct {
         try std.testing.expectError(error.MetadataMutationOutcomeUnknown, port.dropSlot(a, drop, context));
         try std.testing.expectEqual(@as(usize, 3), fake.mutations);
         fake.commit = true;
-        try port.dropSlot(a, drop, context);
+        const dropped = try commands.drop(port, a, .{ .drop_slot = .{ .slot = configuration.name, .wait = false } }, drop, context);
+        try std.testing.expectEqualStrings("DROP_REPLICATION_SLOT", dropped.command_tag);
+        try std.testing.expect(dropped.mutation_outcome == .committed);
         try std.testing.expectEqual(@as(usize, 4), fake.mutations);
         try std.testing.expectEqual(control.Phase.closing, fake.state.phase);
         var stale = drop;
