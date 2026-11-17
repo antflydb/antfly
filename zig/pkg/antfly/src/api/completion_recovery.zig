@@ -231,6 +231,10 @@ test "data raft ordered history completion recovery retains guard checkpoints an
         capture_epoch_delta: u64 = 0,
         admin_frees: usize = 0,
         omit_admin_ranges: bool = false,
+        source_recovery_mode: bool = false,
+        begins: usize = 0,
+        prepares: usize = 0,
+        lose_prepare_once: bool = false,
         cancelled: std.atomic.Value(bool) = .init(false),
         cancel_final_read: bool = false,
         follower_reads: usize = 0,
@@ -302,7 +306,32 @@ test "data raft ordered history completion recovery retains guard checkpoints an
             }
 
             switch (request.transaction.?) {
+                .begin => |begin| {
+                    try std.testing.expect(self.source_recovery_mode);
+                    try std.testing.expectEqualDeep(self.state.source_scope, begin.source_scope);
+                    try std.testing.expectEqualDeep(self.state.source_purpose, begin.source_purpose);
+                    try std.testing.expectEqual(self.state.created_at_ns, begin.created_at_ns);
+                    self.begins += 1;
+                },
+                .prepare => |prepare| {
+                    try std.testing.expect(self.source_recovery_mode);
+                    try std.testing.expectEqualDeep(self.state.source_scope, prepare.source_scope);
+                    try std.testing.expectEqualDeep(self.state.source_purpose, prepare.source_purpose);
+                    self.prepares += 1;
+                    if (self.lose_prepare_once) {
+                        self.lose_prepare_once = false;
+                        return error.RaftBatchWriteOutcomeUnknown;
+                    }
+                    if (prepare.source_checkpoint != null) self.state.prepared = true;
+                },
                 .resolve => |terminal| {
+                    if (self.source_recovery_mode and self.state.status == .pending and terminal.status == .committed) {
+                        try std.testing.expect(self.state.prepared);
+                        self.state.status = .committed;
+                        self.state.commit_version = terminal.commit_version;
+                        self.state.finalized_at_ns = terminal.commit_version;
+                        self.state.intents_resolved = true;
+                    }
                     try std.testing.expectEqualDeep(self.state.source_purpose, terminal.source_purpose);
                     try std.testing.expectEqual(@as(local.storage_db_selected_root.db.types.TxnStatus, if (self.state.status == .committed) .committed else .aborted), terminal.status);
                     try std.testing.expectEqual(@as(u64, if (self.state.status == .committed) 20 else 30), terminal.commit_version);
@@ -585,4 +614,44 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqual(.complete, try recovery.run(a, owners[0], fence, "docs", admission.transaction_id, .{}));
     try std.testing.expectEqual(source_resolves_before + 1, fake.resolves);
     try std.testing.expectEqual(source_publishes_before + 2, fake.publishes);
+    // A sealed retained source plan may finish its exact positive pending
+    // coordinator. Ordinary admission and mismatched source authority cannot.
+    fake.retention_limit_bytes = 1024 * 1024;
+    fake.admission = prepared.plan.admission;
+    fake.state = .{ .status = .pending, .begin_timestamp = prepared.plan.begin_timestamp, .created_at_ns = prepared.plan.created_at_ns, .commit_version = 0, .finalized_at_ns = 0, .prepared = false, .intents_resolved = false, .digest = @splat(7), .source_purpose = prepared.plan.source_purpose, .source_scope = prepared.plan.source_scope };
+    fake.source_recovery_mode = true;
+    fake.resolved = .{ false, false };
+    fake.published = .{ false, false };
+    try std.testing.expectError(error.CommitDecisionUnknown, coordinator.commitPrepared(a, &prepared, 20, .write, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.begins);
+    fake.state.source_scope.?.token += 1;
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, coordinator.commitSourcePrepared(a, &prepared, 20, .{}));
+    fake.state.source_scope = prepared.plan.source_scope;
+    fake.state.created_at_ns += 1;
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, coordinator.commitSourcePrepared(a, &prepared, 20, .{}));
+    fake.state.created_at_ns = prepared.plan.created_at_ns;
+    try std.testing.expectEqual(@as(usize, 0), fake.begins);
+    fake.lose_prepare_once = true;
+    const source_resolves_before_replay = fake.resolves;
+    try std.testing.expectError(error.CommitDecisionUnknown, coordinator.commitSourcePrepared(a, &prepared, 20, .{}));
+    try std.testing.expectEqual(@as(usize, 2), fake.begins);
+    try std.testing.expectEqual(@as(usize, 1), fake.prepares);
+    try std.testing.expectEqual(source_resolves_before_replay, fake.resolves);
+    const resumed = try coordinator.commitSourcePrepared(a, &prepared, 20, .{});
+    try std.testing.expect(!resumed.propagation_pending);
+    try std.testing.expect(!resumed.visibility_pending);
+    try std.testing.expectEqual(@as(u64, 10), resumed.coordinator_group_id);
+    try std.testing.expectEqual(@as(usize, 4), fake.begins);
+    try std.testing.expectEqual(@as(usize, 3), fake.prepares);
+    const replayed_resolves = fake.resolves;
+    const committed_retry = try coordinator.commitSourcePrepared(a, &prepared, 20, .{});
+    try std.testing.expect(!committed_retry.propagation_pending);
+    try std.testing.expectEqual(@as(usize, 4), fake.begins);
+    try std.testing.expectEqual(@as(usize, 3), fake.prepares);
+    try std.testing.expectEqual(replayed_resolves, fake.resolves);
+    fake.state.status = .aborted;
+    fake.state.commit_version = 0;
+    try std.testing.expectError(error.DecisionConflict, coordinator.commitSourcePrepared(a, &prepared, 20, .{}));
+    try std.testing.expectError(error.UnsupportedOperation, coordinator.commitSourcePrepared(a, &ordinary_prepared, 20, .{}));
+    try std.testing.expectEqual(@as(usize, 4), fake.begins);
 }

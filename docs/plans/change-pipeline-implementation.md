@@ -5710,3 +5710,35 @@ fragment tests. No existing wire format, Raft profile or ABI changes are needed
 for this versioned opaque source manifest. Production destination callback and
 worker integration, real lifecycle handover and the full remaining original
 acceptance criteria remain open.
+
+### Resume an original retained scoped admission after a lost phase reply
+
+`Coordinator.commitSourcePrepared` now supports completing a source transaction
+from its original retained scoped plan. The ordinary prepared-commit path still
+refuses a pending transaction. The source path requires scoped checkpoint receipt
+support and uses durable write synchronization, independently of derived index
+visibility. Before replaying any pending phase it checks the positive retained
+coordinator admission digest, original begin/creation times, source purpose and
+complete scope reference. Every BEGIN/PREPARE uses the original frozen plan and
+captured participant authority. Unknown phase outcomes stop that pass; confirmed
+COMMIT uses terminal recovery without replaying admission. ABORT stays a conflict.
+
+The caller must first observe the exact sealed metadata grant and load its native
+artifact; this method is an internal coordinator primitive, not a substitute for
+those proofs. Native scope fencing remains authoritative at every participant.
+Production actor/destination callback wiring must enforce that handoff.
+
+`history-control-apply-test -Dstrip=true -j1` exited 0
+(`source-retained-admission-recovery-test.log`): all 27 selected linked tests and
+six selected local tests passed, zero skips/failures/leaks. The coordinator-port
+regression models a positive pending source coordinator, lost PREPARE reply and
+restart with the same frozen plan. It checks immediate stop after uncertainty,
+exact pending identity checks before any BEGIN, checkpoint coordinator selection,
+full completion on the later pass, no admission replay after COMMIT, refusal of
+ABORT and ordinary/unscoped input, and no derived visibility wait. This is modeled
+phase recovery inside the linked suite, not qualification of successful real
+source activation/admission through the metadata actor and native registry.
+Source-catalog, engine-error and OpenAPI checks passed
+(`source-retained-admission-recovery-contract-check.log`), including nine schema
+fragment tests. All original outstanding full-scope acceptance criteria remain
+open; no issue is closed and no protocol or ABI changes are introduced.
