@@ -45,3 +45,7 @@ test "history root discovery captures authoritative immutable namespaces and com
 test "history feed metadata port restricts maintenance and recovers durable unknown mutations" {
     try @import("api/changefeed_metadata.zig").test_support.contracts();
 }
+
+test "source scope retirement authority obtains fresh original coordinator evidence" {
+    try @import("api/source_retirement_authority_test.zig").run();
+}

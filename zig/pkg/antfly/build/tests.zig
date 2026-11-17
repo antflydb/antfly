@@ -505,6 +505,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("source-scope-entry-test", "Verify activated native source-scope control envelopes").dependOn(&b.addRunArtifact(source_scope_entry_tests).step);
     const source_scope_control_wire_tests = b.addTest(.{ .root_module = history_control_entry_mod, .filters = &.{ "source scope control wire", "source scope control ingress" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("source-scope-control-wire-test", "Verify correlated source lifecycle submit and recovery contracts").dependOn(&b.addRunArtifact(source_scope_control_wire_tests).step);
+    const source_retirement_authority_tests = b.addTest(.{ .root_module = history_control_entry_mod, .filters = &.{"source scope retirement authority"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("source-retirement-authority-test", "Verify independently read coordinator ABORT and owned retirement commands").dependOn(&b.addRunArtifact(source_retirement_authority_tests).step);
     const run_history_control_entry_tests = b.addRunArtifact(history_control_entry_tests);
     b.step("history-control-entry-test", "Verify bounded fail-closed ordered retention envelopes").dependOn(&run_history_control_entry_tests.step);
     const completion_plan_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/completion_plan_test_root.zig"), .target = target, .optimize = optimize });

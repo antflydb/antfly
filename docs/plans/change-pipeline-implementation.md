@@ -6098,3 +6098,55 @@ inside the existing real source-plan/native-owner apply fixture. Guarded cache
 cleanup completed (`source-retirement-raft-gc.log`). This proves activated trusted
 apply/retry dispatch, not production coordinator observation provenance or end-to-
 end source retirement/release. The full original goal remains active.
+
+
+### Intent-only local retirement proposal authority
+
+The local retirement submission method accepts an intent and original coordinator
+locator, never an observation. Before proposal it verifies the target fence/group
+and local leadership, constructs a bounded routing session for the original
+coordinator owner, and obtains a fresh decision through the qualified history
+decision port. Its original minimum applied index is preserved. The reply must
+prove resolved positive ABORT with the exact source scope, purpose, admission,
+participant ownership and checkpoint coordinator role; the original retained
+coordinator member must name the supplied locator. Missing, pending and committed
+evidence cannot authorize retirement. No presume-abort or metadata-progress
+inference is added.
+
+The owned command keeps the independently read admission arena alive through
+proposal and exact recovery. Accepted submissions retain their actual entry and
+optional outcome. An ambiguous submission without a known index returns the exact
+owned command with no entry/outcome, rather than discarding its observation or
+retrying the mutation. The common native control path now applies protocol-41
+membership activation, routed write admission, immutable owner qualification,
+proposal authority checks, real apply outcome waiting and read-only exact recovery
+to retirement. Coordinator read and proposal share the original bounded deadline
+and cancellation context. Exact recovery never appends a control or barrier.
+
+A focused authority fixture uses authoritative catalog generations and the real
+decision-port boundary to check fresh cuts on repeated capture, owned admission
+locator lifetime, original minimum propagation, absence/pending/COMMIT refusal,
+scope/admission mismatch, unresolved ABORT, route mismatch and cancellation before
+reads. The native leader fixture submits only an intent for an absent coordinator
+transaction and checks that the registry observation/apply cut is unchanged. It
+also instantiates the complete production submission path and rejects wrong-group
+input before dispatch. Successful positive scoped retirement proposal and end-to-
+end source activation remain open; the native fixture does not manufacture ABORT.
+
+Source-catalog, engine-error and OpenAPI checks passed, including schema fragments
+(`source-retirement-authority-contract-check.log`). No schema, protocol or ABI
+changes occur in this step. Final focused/linked results follow below. External
+authenticated retirement transport, all-owner orchestration/release and the entire
+remaining original destination/public feed/bootstrap/retention/pgoutput/actual
+Antfly client qualification scope remain required. Both issues and the full goal
+remain open.
+
+Final `source-retirement-authority-test history-control-apply-test -Dstrip=true
+-j1` exited 0 (`source-retirement-authority-test.log`): the focused authority case
+and its discovery anchor, 28 linked cases and six linked-suite local cases passed,
+plus 12 local discovery anchors; zero reported skips/failures/leaks. An additional
+retained coordinator locator mismatch case passed in a final focused run
+(`source-retirement-authority-final-test.log`). Guarded cache cleanup completed
+(`source-retirement-authority-gc.log`). Successful scoped ABORT submission through
+production Raft and authenticated retirement transport remain required, as do all
+other outstanding original acceptance criteria. The goal remains active.

@@ -13982,12 +13982,13 @@ pub const DataServer = struct {
     const ScopeControlHttp = @import("source_scope_http_wire.zig");
     const ScopeRead = @import("antfly_local_sources").storage_source_scope_control;
     const CheckpointRead = @import("antfly_local_sources").storage_source_checkpoint_read;
-    const NativeControlKind = enum { history, source_plan, source_scope };
+    const NativeControlKind = enum { history, source_plan, source_scope, source_retirement };
     fn NativeControlCommand(comptime kind: NativeControlKind) type {
         return switch (kind) {
             .history => @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Command,
             .source_plan => SourcePlanHttp.ControlRequest,
             .source_scope => ScopeRead.Command,
+            .source_retirement => @import("antfly_local_sources").storage_source_scope_retirement.Command,
         };
     }
     fn NativeControlOutcome(comptime kind: NativeControlKind) type {
@@ -13995,6 +13996,7 @@ pub const DataServer = struct {
             .history => @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Outcome,
             .source_plan => SourcePlanHttp.control.Outcome,
             .source_scope => @import("antfly_local_sources").storage_source_scope_ordered.Outcome,
+            .source_retirement => @import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery,
         };
     }
     fn NativeControlReceipt(comptime kind: NativeControlKind) type {
@@ -14002,6 +14004,7 @@ pub const DataServer = struct {
             .history => @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Entry,
             .source_plan => SourcePlanHttp.control.Entry,
             .source_scope => ScopeRead.scope.Cut,
+            .source_retirement => ScopeRead.scope.Cut,
         };
     }
     fn ControlSubmission(comptime kind: NativeControlKind) type {
@@ -14014,6 +14017,44 @@ pub const DataServer = struct {
         entry: ScopeRead.scope.Cut,
         outcome: ?@import("antfly_local_sources").storage_source_scope_ordered.Outcome,
     };
+
+    pub const SourceRetirementSubmission = struct {
+        authorized: @import("../api/source_retirement_authority.zig").OwnedCommand,
+        entry: ?ScopeRead.scope.Cut,
+        outcome: ?@import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery,
+        pub fn deinit(self: *SourceRetirementSubmission) void {
+            self.authorized.deinit();
+            self.* = undefined;
+        }
+    };
+
+    /// The intent cannot carry coordinator evidence. Keep the independent read
+    /// and its admission alive with every accepted or ambiguous submission.
+    pub fn submitSourceRetirementIntentLocal(self: *DataServer, a: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, intent: @import("antfly_local_sources").storage_source_scope_retirement.Intent, coordinator_locator: []const u8) !SourceRetirementSubmission {
+        try intent.validate();
+        try original_fence.validate();
+        if (intent.owner.group_id != original_fence.route.group_id) return error.HistoryResynchronizationRequired;
+        if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
+        const raft = self.data_raft orelse return error.ChangefeedCapabilityUnsupported;
+        const original: antfly.public_api.operation.RequestContext = .{ .deadline_ns = original_fence.admission_deadline_ns, .deadline_io = original_fence.admission_deadline_io, .cancellation = original_fence.admission_cancellation };
+        var context = try original.platformDeadline();
+        context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), platform_time.monotonicNs() +| 5 * std.time.ns_per_s);
+        try self.lockHistoryRaftOwner(context);
+        const leader = raft.host.http_host.host.isLocalLeader(intent.owner.group_id);
+        self.data_raft_mutex.unlock();
+        if (!leader) return error.GroupLeaderUnavailable;
+        var authorized = try (@import("../api/source_retirement_authority.zig").Authority{ .catalog_source = self.write_source.catalog, .decision_port = self.historyDecisionPort() }).capture(a, intent, coordinator_locator, context);
+        errdefer authorized.deinit();
+        try context.ensureActive();
+        var bounded = original_fence;
+        bounded.admission_deadline_ns = context.deadline_ns;
+        bounded.admission_deadline_io = context.deadline_io;
+        const result = self.submitNativeControlLocal(a, bounded, table, .source_retirement, authorized.command) catch |err| switch (err) {
+            error.RaftBatchWriteOutcomeUnknown => return .{ .authorized = authorized, .entry = null, .outcome = null },
+            else => return err,
+        };
+        return .{ .authorized = authorized, .entry = result.entry, .outcome = result.outcome };
+    }
 
     fn validateHistoryProposalAuthority(expected_term: u64, current_term: u64, expected_membership: u64, current_membership: u64, is_leader: bool) !void {
         if (!is_leader or expected_term == 0 or expected_term != current_term or expected_membership != current_membership) return error.GroupLeaderUnavailable;
@@ -14085,6 +14126,7 @@ pub const DataServer = struct {
             .history => @import("history_control_entry.zig").requiredProtocol(command),
             .source_plan => @import("source_plan_entry.zig").required_protocol_version,
             .source_scope => @import("source_scope_entry.zig").required_protocol_version,
+            .source_retirement => @import("source_retirement_entry.zig").required_protocol_version,
         };
         // Create cache ownership atomically with the hosted-group check, so
         // retirement cannot clean the group just before a stale insertion.
@@ -14127,11 +14169,12 @@ pub const DataServer = struct {
         const expected_identity = fence.route.identity_namespace;
         if (descriptor.identity.table_id != expected_identity.table_id or descriptor.identity.shard_id != expected_identity.shard_id or descriptor.identity.range_id != expected_identity.range_id) return error.HistoryResynchronizationRequired;
         if (comptime kind == .source_plan) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.source_owner, context);
-        if (comptime kind == .source_scope) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.intent.owner, context);
+        if (comptime kind == .source_scope or kind == .source_retirement) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.intent.owner, context);
         const encoded = switch (kind) {
             .history => try @import("history_control_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .history_control = .{ .command = command } }, required),
             .source_plan => try @import("source_plan_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command.source_owner, .source_plan = command.command }, required),
             .source_scope => try @import("source_scope_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command.intent.owner, .source_scope_control = command }, required),
+            .source_retirement => try @import("source_retirement_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command.intent.owner, .source_retirement = command }, required),
         };
         defer alloc.free(encoded);
         const durable = try self.durableDataRaftBatchProtocolVersion(group);
@@ -14202,6 +14245,10 @@ pub const DataServer = struct {
         try recovery.validate();
         return self.recoverNativeControlLocal(alloc, fence, table, .source_scope, recovery.command, recovery.entry, recovery.minimum_applied_index);
     }
+    pub fn recoverSourceRetirementLocal(self: *DataServer, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, query: @import("antfly_local_sources").storage_source_scope_retirement_ordered.Query) !@import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery {
+        try query.validate();
+        return self.recoverNativeControlLocal(a, fence, table, .source_retirement, query.command, query.entry, query.minimum_applied_index);
+    }
     fn recoverNativeControlLocal(self: *DataServer, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table_name: []const u8, comptime kind: NativeControlKind, command: NativeControlCommand(kind), receipt: NativeControlReceipt(kind), minimum_applied_index: u64) !NativeControlOutcome(kind) {
         if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
         const apply_sm = self.data_raft_apply orelse return error.ChangefeedCapabilityUnsupported;
@@ -14221,6 +14268,7 @@ pub const DataServer = struct {
             return (switch (kind) {
                 .history => owner.orderedHistoryOutcomeRouted(alloc, fence, table_name, .{ .command = command, .entry = receipt, .minimum_applied_index = minimum_applied_index }),
                 .source_scope => owner.sourceScopeOutcomeRouted(alloc, fence, table_name, .{ .command = command, .entry = receipt, .minimum_applied_index = minimum_applied_index }),
+                .source_retirement => owner.sourceRetirementOutcomeRouted(alloc, fence, table_name, .{ .command = command, .entry = receipt, .minimum_applied_index = minimum_applied_index }),
                 .source_plan => blk: {
                     var lookup = command;
                     lookup.operation = .recover;
@@ -45197,6 +45245,7 @@ fn consumerTests() type {
                         try @import("../api/source_scope_native_test.zig").verifySubmission(source_alloc, origin_server, source_fence, source_binding);
                         try @import("../api/source_scope_native_test.zig").verifyControlRpc(source_alloc, origin_server.sourceScopeControlPort(), origin_server.sourceScopeObservationPort(), source_fence, source_binding);
                         try @import("../api/source_scope_native_test.zig").verifyMinimumRecovery(source_alloc, native_server, source_fence, source_binding);
+                        try @import("../api/source_scope_native_test.zig").verifyRetirementSubmission(source_alloc, native_server, origin_server.sourceScopeObservationPort(), source_fence, source_binding);
                     }
                 };
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();

@@ -232,3 +232,21 @@ pub fn verifyMinimumRecovery(a: std.mem.Allocator, server: anytype, fence: metad
     };
     return error.TestFutureMinimumWasIgnored;
 }
+
+/// Real native leader/decision read, with no retained coordinator record. The
+/// intent alone cannot authorize a retirement proposal or protocol activation.
+pub fn verifyRetirementSubmission(a: std.mem.Allocator, server: anytype, observations: @import("source_scope_operations.zig").Port, fence: metadata.CatalogRouteFence, source_owner: @FieldType(completion.Intent, "owner")) !void {
+    var fixture: @import("../data/source_retirement_test_fixture.zig").Fixture = .{};
+    try fixture.init(source_owner);
+    var intent = fixture.command.intent;
+    intent.coordinator.transaction_id = @splat(241);
+    const locator = try std.fmt.allocPrint(a, "table2:00000004:docs:{d}", .{source_owner.group_id});
+    defer a.free(locator);
+    const query: wire.Query = .{ .version = 1, .owner = source_owner, .domain = intent.reference.domain, .minimum_applied_index = 1 };
+    const before = try observations.read(a, fence, "docs", query, .{});
+    try std.testing.expectError(error.SourceOutcomeUnresolved, server.submitSourceRetirementIntentLocal(a, fence, "docs", intent, locator));
+    const after = try observations.read(a, fence, "docs", query, .{});
+    try std.testing.expectEqualDeep(before, after);
+    intent.owner.group_id += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, server.submitSourceRetirementIntentLocal(a, fence, "docs", intent, locator));
+}
