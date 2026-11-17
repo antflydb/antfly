@@ -1642,6 +1642,71 @@ pub const TxnManager = struct {
         return std.mem.startsWith(u8, entry.key, intents_prefix);
     }
 
+    /// Private migration work discovery. Each page uses one read snapshot,
+    /// including the immutable physical closure. Pagination is not a coherent
+    /// all-record cut and an empty page is never a drainage certificate.
+    pub const LegacyRecoveryItem = struct {
+        transaction_id: TxnId,
+        record_digest: [32]u8,
+        status: TxnStatus,
+        prepared: bool,
+        prepared_known: bool,
+        coordinator: bool,
+        coordinator_known: bool,
+        intents_resolved: bool,
+        intents_resolved_known: bool,
+    };
+    pub const LegacyRecoveryPage = struct {
+        closure: @import("source_producer_policy.zig").Closure,
+        items: []LegacyRecoveryItem,
+        scanned_records: usize,
+        /// Last inspected record, including ordinary/scoped records omitted
+        /// from items. Resume strictly after it; null only before any record.
+        next_after: ?TxnId,
+        reached_end: bool,
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.items);
+            self.* = undefined;
+        }
+    };
+    pub fn legacyRecoveryPage(self: *TxnManager, alloc: Allocator, root: source_scope.Basis, after: ?TxnId, max_records: usize) !LegacyRecoveryPage {
+        if (max_records == 0 or max_records > 256) return error.InvalidSourceAdmission;
+        var read = try self.store.beginRead();
+        defer read.abort();
+        const closure = (try @import("source_producer_policy.zig").Store.read(alloc, &read, root)) orelse return error.SourcePendingWork;
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var items: std.ArrayListUnmanaged(LegacyRecoveryItem) = .empty;
+        errdefer items.deinit(alloc);
+        var scanned: usize = 0;
+        var bytes: usize = 0;
+        var last = after;
+        const start = if (after) |id| makeRecordKey(id) else makeRecordKey(@splat(0));
+        var entry = try cursor.seekAtOrAfter(&start);
+        if (after != null) if (entry) |kv| {
+            if (std.mem.eql(u8, kv.key, &start)) entry = try cursor.next();
+        };
+        while (entry) |kv| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, kv.key, records_prefix)) break;
+            if (kv.key.len != records_prefix.len + 16) return error.InvalidTxnRecord;
+            // Bound inspected bytes as well as returned items. Oversized or
+            // corrupt records fail closed rather than being skipped forever.
+            if (kv.value.len > 4096) return error.InvalidTxnRecord;
+            if (scanned == max_records or bytes + kv.key.len + kv.value.len > 1024 * 1024) {
+                return .{ .closure = closure, .items = try items.toOwnedSlice(alloc), .scanned_records = scanned, .next_after = last, .reached_end = false };
+            }
+            const record = try decodeRecord(kv.value);
+            scanned += 1;
+            bytes += kv.key.len + kv.value.len;
+            const id: TxnId = kv.key[records_prefix.len..][0..16].*;
+            last = id;
+            if (record.ordinary_producer or record.source_scope != null) continue;
+            if (record.status != .pending and record.intents_resolved_known and record.intents_resolved) continue;
+            try items.append(alloc, .{ .transaction_id = id, .record_digest = completion.bytesDigest(kv.value), .status = record.status, .prepared = record.prepared, .prepared_known = record.prepared_known, .coordinator = record.coordinator, .coordinator_known = record.coordinator_known, .intents_resolved = record.intents_resolved, .intents_resolved_known = record.intents_resolved_known });
+        }
+        return .{ .closure = closure, .items = try items.toOwnedSlice(alloc), .scanned_records = scanned, .next_after = last, .reached_end = true };
+    }
+
     pub fn hasIntents(self: *TxnManager, txn_id: TxnId) !bool {
         const record = try self.loadTransactionRecord(txn_id);
         if (record.intents_resolved_known and record.intents_resolved) return false;
@@ -6634,4 +6699,83 @@ test "transaction source purpose ordinary provenance is explicit immutable and r
     try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(legacy, 10, 11, &.{}, true, true);
     try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(legacy, 10, 11, &.{}, true, true, extra));
     try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(@splat(242), 10, 11, &.{}, true, true, .{ .ordinary_producer = true, .source_purpose = @splat(1) }));
+}
+
+test "transaction source purpose closed legacy recovery inventory is bounded and survives reopen" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-legacy-inventory");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 2, .topology_epoch = 1 };
+    const root = try source_scope.Basis.fromOwner(owner);
+    const policy = @import("source_producer_policy.zig");
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        try std.testing.expectError(error.SourcePendingWork, manager.legacyRecoveryPage(a, root, null, 1));
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(@splat(1), 10, 11, &.{}, true, true, .{ .ordinary_producer = true });
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(@splat(2), 10, 11, &.{}, true, true, .{ .legacy_producer = true });
+        try manager.writeIntentsExtraBatch(@splat(2), &.{.{ .key = "legacy-row", .value = "{}" }}, &.{}, .{ .legacy_producer = true });
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(@splat(3), 10, 11, &.{}, true, true);
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(@splat(4), 10, 11, &.{}, true, true);
+        _ = try manager.resolveIntentsWithExtraBatch(@splat(4), .aborted, 20, .{});
+        // Historic terminal records without a resolution bit, and terminal
+        // decisions with unresolved intents, must both remain discoverable.
+        const terminal = try manager.getAlloc(a, &makeRecordKey(@splat(4)));
+        defer a.free(terminal);
+        try manager.putValue(&makeRecordKey(@splat(5)), terminal[0..txn_record_v5_size]);
+        const unresolved = try a.dupe(u8, terminal);
+        defer a.free(unresolved);
+        unresolved[52] = 0;
+        try manager.putValue(&makeRecordKey(@splat(6)), unresolved);
+        var batch = try store.beginWriteTxn();
+        errdefer batch.abort();
+        _ = try policy.Store.close(a, &batch, root, .{ .term = 1, .index = 7 });
+        try batch.commit();
+    }
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    try std.testing.expectError(error.InvalidSourceAdmission, manager.legacyRecoveryPage(a, root, null, 0));
+    try std.testing.expectError(error.InvalidSourceAdmission, manager.legacyRecoveryPage(a, root, null, 257));
+    var wrong = root;
+    wrong.root_generation += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, manager.legacyRecoveryPage(a, wrong, null, 1));
+    var first = try manager.legacyRecoveryPage(a, root, null, 1);
+    defer first.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), first.items.len);
+    try std.testing.expectEqual(@as(usize, 1), first.scanned_records);
+    try std.testing.expect(!first.reached_end);
+    try std.testing.expectEqualDeep(@as(TxnId, @splat(1)), first.next_after.?);
+    var second = try manager.legacyRecoveryPage(a, root, first.next_after, 1);
+    defer second.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), second.items.len);
+    try std.testing.expectEqualDeep(@as(TxnId, @splat(2)), second.items[0].transaction_id);
+    try std.testing.expect(second.items[0].prepared);
+    const raw = try manager.getAlloc(a, &makeRecordKey(@splat(2)));
+    defer a.free(raw);
+    try std.testing.expectEqualDeep(completion.bytesDigest(raw), second.items[0].record_digest);
+    var third = try manager.legacyRecoveryPage(a, root, second.next_after, 256);
+    defer third.deinit(a);
+    try std.testing.expect(third.reached_end);
+    try std.testing.expectEqual(@as(usize, 4), third.scanned_records);
+    try std.testing.expectEqual(@as(usize, 3), third.items.len);
+    try std.testing.expectEqualDeep(@as(TxnId, @splat(3)), third.items[0].transaction_id);
+    try std.testing.expectEqualDeep(@as(TxnId, @splat(5)), third.items[1].transaction_id);
+    try std.testing.expect(!third.items[1].intents_resolved_known);
+    try std.testing.expectEqualDeep(@as(TxnId, @splat(6)), third.items[2].transaction_id);
+    try std.testing.expect(third.items[2].intents_resolved_known and !third.items[2].intents_resolved);
+    // Discovery cannot authorize either terminal decision through closed ingress.
+    try std.testing.expectError(error.SourcePendingWork, manager.resolveIntentsWithExtraBatch(@splat(2), .aborted, 30, .{}));
+    try std.testing.expect(try manager.hasIntents(@splat(2)));
+    var all = try manager.legacyRecoveryPage(a, root, null, 256);
+    defer all.deinit(a);
+    try std.testing.expectEqual(@as(usize, 4), all.items.len);
+    try std.testing.expectEqual(@as(u64, 7), all.closure.first_closed_at.index);
+    try manager.putValue(&makeRecordKey(@splat(3)), "corrupt");
+    try std.testing.expectError(error.InvalidTxnRecord, manager.legacyRecoveryPage(a, root, null, 256));
 }

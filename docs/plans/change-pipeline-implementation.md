@@ -7543,3 +7543,34 @@ Spec generation, source-catalog/engine-error/OpenAPI contract checks and whitesp
 checks passed. This qualifies the authenticated closure transport foundation;
 legacy drainage, first-strict activation and all original full issue acceptance
 remain outstanding.
+
+### Bounded closed-root legacy recovery inventory
+
+TxnManager now provides private legacyRecoveryPage work discovery from one read
+snapshot containing the persisted physical closure and canonical transaction
+records. Requests bind the exact closure basis, resume strictly after the last
+inspected transaction ID, and inspect at most 256 records and 1 MiB per page.
+The cursor advances over ordinary/scoped records omitted from results, so a page
+with zero returned work can still require continuation. Each unresolved legacy
+item retains its record digest, decision status, prepared/coordinator evidence
+and resolution-known flags. Modern resolved terminal records are omitted;
+pending, terminal-unresolved and historic terminal records with no resolution
+bit remain work. Corrupt/oversized records and stale roots fail closed.
+
+This inventory supplies work locators, not authorization to decide or resolve a
+transaction. Each page has one snapshot; successive pages do not establish a
+coherent drainage cut. No new HTTP/public API, completion evidence, native ABI or
+first-strict admission is introduced, and Handover.requireLegacyDrained remains
+closed. Original coordinator decision recovery, authenticated ordered legacy
+resolution, complete root cohort migration and all issue acceptance remain
+required. Initial real-store/reopen qualification passed 17 cases; final
+qualification adds historic terminal and explicit unresolved-terminal coverage
+(`source-legacy-recovery-inventory-final-test.log`). Contract checks passed
+(`source-legacy-recovery-inventory-contract-check.log`).
+
+Final inventory qualification passed all 17 selected real-store/history cases,
+zero skips/failures/leaks, including actual close/reopen, ordinary-record cursor
+progression, legacy prepared intent retention, digest equality, terminal v5
+unknown-resolution inclusion and modern unresolved-terminal inclusion. The
+existing closed ingress still rejects attempted ABORT and retains its intent.
+Whitespace checks passed. No drainage or full issue completion is claimed.
