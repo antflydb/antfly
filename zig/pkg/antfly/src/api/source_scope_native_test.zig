@@ -32,6 +32,8 @@ pub fn verify(a: std.mem.Allocator, owner: anytype, fence: metadata.CatalogRoute
     changed.owner.root_generation += 1;
     try std.testing.expectError(error.TopologyChanged, owner.sourceScopeObservationRouted(a, fence, "docs", changed));
     try verifyReadFence(a, owner, fence, query, observed.cut.index);
+    try verifyOutcome(a, owner, fence, source_owner, observed.cut);
+    try verifyControlGuards();
 }
 fn verifyReadFence(a: std.mem.Allocator, owner: anytype, fence: metadata.CatalogRouteFence, query: wire.Query, index: u64) !void {
     var future = query;
@@ -41,6 +43,57 @@ fn verifyReadFence(a: std.mem.Allocator, owner: anytype, fence: metadata.Catalog
     var cancelled_fence = fence;
     cancelled_fence.admission_cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled);
     try std.testing.expectError(error.Canceled, owner.sourceScopeObservationRouted(a, cancelled_fence, "docs", query));
+}
+
+fn verifyOutcome(a: std.mem.Allocator, owner: anytype, fence: metadata.CatalogRouteFence, source_owner: @FieldType(completion.Intent, "owner"), cut: wire.scope.Cut) !void {
+    const ordered = @import("antfly_local_sources").storage_source_scope_ordered;
+    // This command is only a recovery query, not metadata authorization or a
+    // proposed mutation. The real root has no ordered control receipt yet.
+    const recovery: ordered.Recovery = .{ .command = .{ .version = 1, .intent = .{ .version = 1, .owner = source_owner, .spec = .{ .actor_table_id = 7, .source_id = @splat(72), .generation = 1, .binding = @splat(73), .checkpoint_owner = try wire.scope.Basis.fromOwner(source_owner) }, .minimum_metadata_index = 1, .action = .bind }, .metadata_cut = .{ .group_id = source_owner.metadata_group_id, .incarnation = source_owner.metadata_incarnation, .index = 1 } }, .entry = cut, .minimum_applied_index = cut.index };
+    for (0..1000) |_| {
+        const outcome = owner.sourceScopeOutcomeRouted(a, fence, "docs", recovery) catch |err| switch (err) {
+            error.ReadUnavailable => {
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        try std.testing.expect(outcome == .superseded);
+        break;
+    } else return error.TestReadFenceUnavailable;
+    // Instantiate the trusted apply wrapper and its typed ABI client, but do
+    // not invent an ordered entry in this live Raft group. Wrong-group calls
+    // must fail before acquiring an owner or attempting mutation dispatch.
+    var descriptor = try owner.loadCompletionDescriptor(a, source_owner.group_id, "docs", .{});
+    defer descriptor.deinit(a);
+    try std.testing.expectError(error.HistoryResynchronizationRequired, owner.applyPreparedOrderedSourceScopeControlGroupLocalAtRaftEntry(a, source_owner.group_id + 1, "docs", descriptor.view(), recovery.command, cut.term, cut.index));
+    var changed = recovery;
+    changed.command.intent.owner.root_generation += 1;
+    try std.testing.expectError(error.TopologyChanged, owner.sourceScopeOutcomeRouted(a, fence, "docs", changed));
+    var future = recovery;
+    future.minimum_applied_index += 1000000;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.sourceScopeOutcomeRouted(a, fence, "docs", future));
+    var cancelled: std.atomic.Value(bool) = .init(true);
+    var cancelled_fence = fence;
+    cancelled_fence.admission_cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled);
+    try std.testing.expectError(error.Canceled, owner.sourceScopeOutcomeRouted(a, cancelled_fence, "docs", recovery));
+}
+fn verifyControlGuards() !void {
+    const abi = @import("kernel_owner_abi");
+    var request: abi.ReplicatedBatchAtRaftEntryRequest = .{ .version = abi.abi_version - 1, .raft_term = 1, .raft_index = 1 };
+    var response: abi.OwnedBytes = .{ .len = 99 };
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_ordered_source_scope_control(null, &request, &response));
+    try std.testing.expectEqual(@as(usize, 0), response.len);
+    request.version = abi.abi_version;
+    request._reserved0 = 1;
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_ordered_source_scope_control(null, &request, &response));
+    request._reserved0 = 0;
+    request.raft_index = 0;
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_ordered_source_scope_control(null, &request, &response));
+    request.raft_index = 1;
+    request.request_json.len = wire.max_bytes + 1;
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_ordered_source_scope_control(null, &request, &response));
+    try std.testing.expectEqual(@as(usize, 0), response.len);
 }
 
 fn readQualified(a: std.mem.Allocator, owner: anytype, fence: metadata.CatalogRouteFence, query: wire.Query) !wire.Observation {

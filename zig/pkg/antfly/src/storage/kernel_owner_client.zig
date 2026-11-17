@@ -631,6 +631,28 @@ pub const Owner = struct {
         return parsed.value;
     }
 
+    pub fn orderedSourceScopeControl(self: *Owner, a: std.mem.Allocator, table: []const u8, command: @import("antfly_local_sources").storage_source_scope_control.Command, term: u64, index: u64) !@import("antfly_local_sources").storage_source_scope_ordered.Outcome {
+        const ordered = @import("antfly_local_sources").storage_source_scope_ordered;
+        if (term == 0 or index == 0) return error.InvalidSourceAdmission;
+        const bytes = try ordered.control.encodeCommand(a, command);
+        defer a.free(bytes);
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_ordered_source_scope_control(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(bytes), .raft_term = term, .raft_index = index }, &response.buffer));
+        defer response.deinit();
+        return ordered.decodeOutcome(a, response.bytes(), command, .{ .term = term, .index = index });
+    }
+    pub fn sourceScopeOutcome(self: *Owner, a: std.mem.Allocator, table: []const u8, recovery: @import("antfly_local_sources").storage_source_scope_ordered.Recovery) !@import("antfly_local_sources").storage_source_scope_ordered.Outcome {
+        const ordered = @import("antfly_local_sources").storage_source_scope_ordered;
+        try recovery.validate();
+        const bytes = try std.json.Stringify.valueAlloc(a, recovery, .{});
+        defer a.free(bytes);
+        if (bytes.len > ordered.max_recovery_bytes) return error.InvalidSourceAdmission;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_ordered_source_scope_outcome(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(bytes) }, &response.buffer));
+        defer response.deinit();
+        return ordered.decodeOutcome(a, response.bytes(), recovery.command, recovery.entry);
+    }
+
     pub fn sourceScopeObservation(self: *Owner, a: std.mem.Allocator, table: []const u8, input: @import("antfly_local_sources").storage_source_scope_control.Query) !@import("antfly_local_sources").storage_source_scope_control.Observation {
         const wire = @import("antfly_local_sources").storage_source_scope_control;
         try input.validate();

@@ -57,6 +57,33 @@ pub const Recovery = struct {
         if (self.entry.term == 0 or self.entry.index == 0 or self.minimum_applied_index < self.entry.index) return error.InvalidSourceAdmission;
     }
 };
+pub const max_recovery_bytes = control.max_bytes + 1024;
+pub fn decodeRecovery(a: A, bytes: []const u8) !Recovery {
+    if (bytes.len == 0 or bytes.len > max_recovery_bytes) return error.InvalidSourceAdmission;
+    var parsed = std.json.parseFromSlice(Recovery, a, bytes, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidSourceAdmission;
+    defer parsed.deinit();
+    try parsed.value.validate();
+    return parsed.value;
+}
+pub fn validateOutcome(command: control.Command, entry: scope.Cut, outcome: Outcome) !void {
+    try command.validate();
+    if (entry.term == 0 or entry.index == 0) return error.InvalidSourceAdmission;
+    if (outcome == .applied) try validateApplied(command, entry, outcome.applied);
+}
+pub fn encodeOutcome(a: A, command: control.Command, entry: scope.Cut, outcome: Outcome) ![]u8 {
+    try validateOutcome(command, entry, outcome);
+    const bytes = try std.json.Stringify.valueAlloc(a, outcome, .{});
+    errdefer a.free(bytes);
+    if (bytes.len > max_record_bytes) return error.SourceAdmissionCorrupt;
+    return bytes;
+}
+pub fn decodeOutcome(a: A, bytes: []const u8, command: control.Command, entry: scope.Cut) !Outcome {
+    if (bytes.len == 0 or bytes.len > max_record_bytes) return error.SourceAdmissionCorrupt;
+    var parsed = std.json.parseFromSlice(Outcome, a, bytes, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.SourceAdmissionCorrupt;
+    defer parsed.deinit();
+    try validateOutcome(command, entry, parsed.value);
+    return parsed.value;
+}
 const Record = struct { root: scope.Basis, entry: scope.Cut, command: scope.Digest, outcome: Outcome };
 const Envelope = struct { record: Record, checksum: scope.Digest };
 fn digest(a: A, domain: []const u8, value: anytype) !scope.Digest {
@@ -211,4 +238,32 @@ test "ordered scope success binds the exact mutation and actual local cut" {
     var wrong_root = close;
     wrong_root.intent.owner.root_generation += 1;
     try std.testing.expectError(error.HistoryResynchronizationRequired, replay(a, &txn, wrong_root, entry));
+}
+
+test "ordered scope boundary codecs reject wrong applied identity and malformed recovery" {
+    const a = std.testing.allocator;
+    const command = fixture();
+    const entry: scope.Cut = .{ .term = 1, .index = 20 };
+    const observed: control.Observation = .{ .version = 1, .owner = command.intent.owner, .domain = command.intent.spec.domain(), .cut = entry, .header = .{ .root = try scope.Basis.fromOwner(command.intent.owner), .strict = true, .metadata_floor = command.metadata_cut.index, .domains = 1 }, .record = .{ .spec = command.intent.spec, .bound_metadata_index = command.metadata_cut.index } };
+    const bytes = try encodeOutcome(a, command, entry, .{ .applied = observed });
+    defer a.free(bytes);
+    try std.testing.expectEqualDeep(observed, (try decodeOutcome(a, bytes, command, entry)).applied);
+    try std.testing.expectError(error.SourceAdmissionCorrupt, decodeOutcome(a, bytes, command, .{ .term = 2, .index = 20 }));
+    var changed = command;
+    changed.intent.spec.binding[0] ^= 1;
+    try std.testing.expectError(error.SourceAdmissionCorrupt, decodeOutcome(a, bytes, changed, entry));
+    try std.testing.expectError(error.SourceAdmissionCorrupt, decodeOutcome(a, "{\"rejected\":\"pending\",\"superseded\":{}}", command, entry));
+    const oversized = try a.alloc(u8, max_record_bytes + 1);
+    defer a.free(oversized);
+    @memset(oversized, ' ');
+    try std.testing.expectError(error.SourceAdmissionCorrupt, decodeOutcome(a, oversized, command, entry));
+    const recovery: Recovery = .{ .command = command, .entry = entry, .minimum_applied_index = entry.index };
+    const encoded = try std.json.Stringify.valueAlloc(a, recovery, .{});
+    defer a.free(encoded);
+    try std.testing.expectEqualDeep(recovery, try decodeRecovery(a, encoded));
+    var future = recovery;
+    future.minimum_applied_index -= 1;
+    const invalid = try std.json.Stringify.valueAlloc(a, future, .{});
+    defer a.free(invalid);
+    try std.testing.expectError(error.InvalidSourceAdmission, decodeRecovery(a, invalid));
 }

@@ -4592,6 +4592,34 @@ pub fn storageOwnerOrderedSourcePlanControl(owner: ?*anyopaque, request: *const 
     const result = handle.db.applyOrderedSourcePlanControl(decoded.request, .{ .term = request.raft_term, .index = request.raft_index }, true) catch |err| return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
     return sourcePlanResponse(out, result);
 }
+fn sourceScopeResponse(out: *kernel_owner_abi.OwnedBytes, command: @import("antfly_local_sources").storage_source_scope_control.Command, entry: @import("antfly_local_sources").storage_source_scope_control.scope.Cut, value: @import("antfly_local_sources").storage_source_scope_ordered.Outcome) kernel_owner_abi.Status {
+    const bytes = @import("antfly_local_sources").storage_source_scope_ordered.encodeOutcome(std.heap.c_allocator, command, entry, value) catch |err| return storageOwnerStatusFromError(err);
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+pub fn storageOwnerOrderedSourceScopeControl(owner: ?*anyopaque, request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    const control = @import("antfly_local_sources").storage_source_scope_control;
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.raft_term == 0 or request.raft_index == 0 or request.request_json.len > control.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const command = control.decodeCommand(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    const entry: db_mod.OrderedApplyReceipt = .{ .term = request.raft_term, .index = request.raft_index };
+    const result = handle.db.applyOrderedSourceScopeControl(command, entry, true) catch |err| return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
+    return sourceScopeResponse(out, command, .{ .term = entry.term, .index = entry.index }, result);
+}
+pub fn storageOwnerOrderedSourceScopeOutcome(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    const ordered = @import("antfly_local_sources").storage_source_scope_ordered;
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len > ordered.max_recovery_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const recovery = ordered.decodeRecovery(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    const result = handle.db.orderedSourceScopeOutcome(recovery) catch |err| return storageOwnerStatusFromError(err);
+    return sourceScopeResponse(out, recovery.command, recovery.entry, result);
+}
 pub fn storageOwnerSourceScopeObservation(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
     const wire = @import("antfly_local_sources").storage_source_scope_control;
     out.* = .{};

@@ -1791,6 +1791,33 @@ pub const ProvisionedKernelOwnerSource = struct {
         return parsed.value;
     }
 
+    pub fn applyPreparedOrderedSourceScopeControlGroupLocalAtRaftEntry(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        command: @import("antfly_local_sources").storage_source_scope_control.Command,
+        raft_term: u64,
+        raft_index: u64,
+    ) !@import("antfly_local_sources").storage_source_scope_ordered.Outcome {
+        try command.validate();
+        if (self.online_source_authority != .raft) return error.HistoryAuthorityRequired;
+        if (command.intent.owner.group_id != group_id) return error.HistoryResynchronizationRequired;
+        var lease = if (!@import("builtin").is_test or self.apply_control_started.load(.acquire))
+            try self.acquireApplyOnlyWithCatalog(group_id, table_name, descriptor, false)
+        else blk: {
+            const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+            defer alloc.free(path);
+            break :blk self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{ .historical_raft_apply = true, .prepare_graph_indexes = false }) catch |err| switch (err) {
+                error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
+                else => return err,
+            };
+        };
+        defer lease.deinit();
+        return lease.owner().orderedSourceScopeControl(alloc, table_name, command, raft_term, raft_index);
+    }
+
     pub fn applyPreparedOrderedSourcePlanControlGroupLocalAtRaftEntry(
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,
@@ -1823,11 +1850,12 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     const source_plan_http = @import("../data/source_plan_http_wire.zig");
-    const SourcePlanReadKind = enum { observation, chunk, outcome, checkpoint, scope };
+    const SourcePlanReadKind = enum { observation, chunk, outcome, checkpoint, scope, scope_outcome };
     fn SourcePlanReadInput(comptime kind: SourcePlanReadKind) type {
         return switch (kind) {
             .observation => source_plan_http.ObserveRequest,
             .scope => @import("antfly_local_sources").storage_source_scope_control.Query,
+            .scope_outcome => @import("antfly_local_sources").storage_source_scope_ordered.Recovery,
             .checkpoint => @import("antfly_local_sources").storage_source_checkpoint_read.Request,
             .chunk => source_plan_http.ChunkRequest,
             .outcome => source_plan_http.ControlRequest,
@@ -1837,10 +1865,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         return switch (kind) {
             .observation => source_plan_http.control.Observation,
             .scope => @import("antfly_local_sources").storage_source_scope_control.Observation,
+            .scope_outcome => @import("antfly_local_sources").storage_source_scope_ordered.Outcome,
             .checkpoint => @import("antfly_local_sources").storage_source_checkpoint_read.Reply,
             .chunk => source_plan_http.control.Read,
             .outcome => source_plan_http.control.Outcome,
         };
+    }
+    pub fn sourceScopeOutcomeRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_scope_ordered.Recovery) !@import("antfly_local_sources").storage_source_scope_ordered.Outcome {
+        return self.sourcePlanReadRouted(a, fence, table, .scope_outcome, request);
     }
     pub fn sourceScopeObservationRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_scope_control.Query) !@import("antfly_local_sources").storage_source_scope_control.Observation {
         return self.sourcePlanReadRouted(a, fence, table, .scope, request);
@@ -1863,7 +1895,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             try request.validate(a);
             if (request.operation != .recover) return error.InvalidSourcePlanWire;
         } else try request.validate();
-        const expected = if (kind == .scope) request.owner else request.source_owner;
+        const expected = if (kind == .scope) request.owner else if (kind == .scope_outcome) request.command.intent.owner else request.source_owner;
         const group = fence.route.group_id;
         if (expected.group_id != group) return error.TopologyChanged;
         const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
@@ -1881,7 +1913,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (proof.incarnation == 0 or proof.term == 0 or proof.applied_index == 0) return error.ReadUnavailable;
         const minimum = switch (kind) {
             .observation => request.query.minimum_applied_index,
-            .checkpoint, .scope => request.minimum_applied_index,
+            .checkpoint, .scope, .scope_outcome => request.minimum_applied_index,
             .chunk => request.request.query.minimum_applied_index,
             .outcome => request.receipt.?.index,
         };
@@ -1895,6 +1927,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const result = switch (kind) {
             .observation => try lease.owner().sourcePlanObservation(a, table, request.query),
             .scope => try lease.owner().sourceScopeObservation(a, table, request),
+            .scope_outcome => try lease.owner().sourceScopeOutcome(a, table, request),
             .checkpoint => try lease.owner().sourceCheckpointObservation(a, table, request),
             .chunk => try lease.owner().sourcePlanChunk(a, table, request.request),
             .outcome => try lease.owner().sourcePlanOutcome(a, table, .{ .command = request.command, .entry = request.receipt.?, .minimum_applied_index = minimum }),

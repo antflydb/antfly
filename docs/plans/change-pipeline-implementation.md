@@ -5316,3 +5316,41 @@ owner or data-Raft/RPC yet. Debug-symbol stripping changes emitted debug data,
 not this run's assertions or selected test surface. The guarded lower-threshold
 collector recovered usable disk space (44 GiB observed before its final shared
 cache phases), protecting active builds and recent outputs.
+
+### Opaque source-scope control boundary and qualified outcome reads
+
+Owner ABI 110 adds bounded ordered source-scope control and read-only exact
+outcome recovery calls. The C boundary checks version/reserved fields, positive
+entry coordinates, table handle and payload size before decoding. Mutation uses
+the DB's actual ordered entry/receipt path; outcome reads use the bounded
+recovery DTO and independently qualified native applied cut. Both serialize
+validated results into explicitly owned buffers. The typed client strictly
+decodes applied observations against the exact command and entry. Superseded
+is a recovery state, never success or authorization to replay effects.
+
+The provisioned owner has a descriptor-pinned trusted apply wrapper and a routed
+recovery method. The latter qualifies full catalog ownership and actual ReadIndex
+before and after the opaque read, with bounded context/cancellation and future
+cut rejection. Wrong-group apply calls fail before owner acquisition/dispatch.
+A local recovery command is not a fresh metadata authorization; the real fixture
+uses it only to query an absent receipt and does not invent a data-Raft entry.
+
+Standalone scope/model/codec tests passed all 23 checks
+(`source-scope-owner-boundary-codec-test.log`). The real linked owner integration
+run passed all 19 selected history/source-scope tests, zero skips/failures/leaks
+(`source-scope-opaque-owner-qualified-test.log`, -Dstrip=true -j1). New checks
+exercise absent-receipt recovery, wrong physical owner, future cut, cancellation,
+wrong-group apply guard and actual ABI rejection of old version, reserved fields,
+zero entry and oversize payload. The initial compile caught an anonymous versus
+named apply-receipt type mismatch at the C boundary; the explicit conversion was
+fixed before this successful run. Repository source-catalog, engine-error and
+OpenAPI checks passed (`source-scope-opaque-owner-contract-check.log`).
+
+No stronger data protocol or public mutation endpoint is advertised by this ABI
+change. Live control mutation qualification still requires an activated dedicated
+Raft envelope, actual metadata authorization at proposal, and genuine legacy
+worker handover before first strict activation. Native ordered retirement DB/RPC
+exposure and durable rejection recovery, hidden checkpoint/cohort lifecycle,
+complete Native/Lake destination integration, public history/bootstrap/retention,
+typed production pgoutput, actual Antfly existing-client qualification and all
+original recovery/performance criteria remain mandatory and incomplete.
