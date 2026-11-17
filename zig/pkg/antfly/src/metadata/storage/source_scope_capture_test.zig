@@ -139,7 +139,7 @@ pub fn run(a: A) !void {
         cancelled: *bool,
         reads: usize = 0,
         cancel_at_projection: bool = false,
-        pub fn ensureLinearizableReadWithContext(self: *@This(), request: Context) !void {
+        pub fn ensureLinearizableReadWithContext(self: *@This(), request: anytype) !void {
             try request.ensureActive();
             self.reads += 1;
         }
@@ -175,6 +175,22 @@ pub fn run(a: A) !void {
     intent.spec = restored.spec;
     intent.minimum_metadata_index = restored.cut.index + 1;
     try std.testing.expectError(error.ReadUnavailable, capture.authorizeOnService(&service, a, intent, context));
+    const metadata_scope = @import("../../api/source_scope_metadata.zig");
+    const scope_port = metadata_scope.Port.fromService(&service);
+    const api_context: @import("antfly_local_sources").api_operation.RequestContext = .{ .principal = .{ .kind = .internal, .subject = "source-scope-maintenance" } };
+    const prior_reads = service.reads;
+    try std.testing.expectError(error.Forbidden, scope_port.read(a, .{ .version = 1, .query = query }, .{}));
+    try std.testing.expectEqual(prior_reads, service.reads);
+    var port_snapshot = try scope_port.read(a, .{ .version = 1, .query = query }, api_context);
+    defer port_snapshot.deinit(a);
+    try std.testing.expectEqual(prior_reads + 1, service.reads);
+    try std.testing.expectEqualDeep(restored.cut, port_snapshot.cut);
+    try std.testing.expectEqualDeep(restored.spec, port_snapshot.spec);
+    const port_encoded = try metadata_scope.wire.encodeReply(a, .{ .version = 1, .query = query }, port_snapshot);
+    defer a.free(port_encoded);
+    var port_decoded = try metadata_scope.wire.decodeReply(a, .{ .version = 1, .query = query }, port_encoded);
+    defer port_decoded.deinit(a);
+    try std.testing.expectEqualDeep(port_snapshot.spec, port_decoded.spec);
     service.cancel_at_projection = true;
     try std.testing.expectError(error.Canceled, capture.readOnService(&service, a, query, context));
     const read_count = service.reads;

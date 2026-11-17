@@ -11,6 +11,11 @@ pub fn parseAccessInternalChangefeedStateBody(allocator: std.mem.Allocator, body
     return std.json.parseFromSlice(types.InternalChangefeedStateRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Parse the JSON request body for captureNativeSourceMetadataScope.
+pub fn parseCaptureNativeSourceMetadataScopeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourceMetadataCaptureRequest) {
+    return std.json.parseFromSlice(types.NativeSourceMetadataCaptureRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Submit a native retention control or recover its exact result
 pub const ControlNativeRetainedHistoryPathParams = struct {
     group_id: []const u8,
@@ -171,6 +176,7 @@ pub const Route = struct {
 
 pub const routes = [_]Route{
     .{ .method = "POST", .path = "/catalog/changefeed-state-v1", .operation_id = "accessInternalChangefeedState", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/catalog/source-scope-capture-v1", .operation_id = "captureNativeSourceMetadataScope", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/control-v1", .operation_id = "controlNativeRetainedHistory", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/decision-v1", .operation_id = "readNativeHistoryCoordinatorDecision", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/grant-v1", .operation_id = "observeNativeRetainedHistoryGrant", .request_body = .buffered, .streaming_response = false },
@@ -201,6 +207,7 @@ pub const routes = [_]Route{
 pub fn ServerRouter(comptime Impl: type) type {
     comptime {
         if (!@hasDecl(Impl, "accessInternalChangefeedState")) @compileError("ServerRouter: Impl missing required method 'accessInternalChangefeedState'");
+        if (!@hasDecl(Impl, "captureNativeSourceMetadataScope")) @compileError("ServerRouter: Impl missing required method 'captureNativeSourceMetadataScope'");
         if (!@hasDecl(Impl, "controlNativeRetainedHistory")) @compileError("ServerRouter: Impl missing required method 'controlNativeRetainedHistory'");
         if (!@hasDecl(Impl, "readNativeHistoryCoordinatorDecision")) @compileError("ServerRouter: Impl missing required method 'readNativeHistoryCoordinatorDecision'");
         if (!@hasDecl(Impl, "observeNativeRetainedHistoryGrant")) @compileError("ServerRouter: Impl missing required method 'observeNativeRetainedHistoryGrant'");
@@ -229,6 +236,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// Register all routes on the server with explicit instance context.
         pub fn register(self: *const @This(), server: anytype) !void {
             try server.post("/catalog/changefeed-state-v1", httpx.Handler.bind(self.impl, accessInternalChangefeedState));
+            try server.post("/catalog/source-scope-capture-v1", httpx.Handler.bind(self.impl, captureNativeSourceMetadataScope));
             try server.post("/groups/:group_id/tables/:table_name/history/control-v1", httpx.Handler.bind(self.impl, controlNativeRetainedHistory));
             try server.post("/groups/:group_id/tables/:table_name/history/decision-v1", httpx.Handler.bind(self.impl, readNativeHistoryCoordinatorDecision));
             try server.post("/groups/:group_id/tables/:table_name/history/grant-v1", httpx.Handler.bind(self.impl, observeNativeRetainedHistoryGrant));
@@ -251,6 +259,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// POST /catalog/changefeed-state-v1
         fn accessInternalChangefeedState(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.accessInternalChangefeedState(ctx);
+        }
+
+        /// Capture a native source lifecycle through metadata ReadIndex
+        /// POST /catalog/source-scope-capture-v1
+        fn captureNativeSourceMetadataScope(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.captureNativeSourceMetadataScope(ctx);
         }
 
         /// Submit a native retention control or recover its exact result
@@ -378,6 +392,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 // Handler interface. Implement these methods on your Impl struct:
 //
 //   fn accessInternalChangefeedState(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn captureNativeSourceMetadataScope(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn controlNativeRetainedHistory(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn readNativeHistoryCoordinatorDecision(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn observeNativeRetainedHistoryGrant(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response

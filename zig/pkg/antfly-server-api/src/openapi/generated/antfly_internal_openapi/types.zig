@@ -970,6 +970,77 @@ pub const NativeSourceCheckpointReadRequest = struct {
     minimum_applied_index: u64,
 };
 
+/// Retained original pending identity. Metadata delivery-plan digest and frozen artifact-plan digest are distinct; neither grants transaction outcome or replay authority.
+pub const NativeSourceMetadataCapturePending = struct {
+    reference: NativeSourceScopeReference,
+    transaction_id: NativeHistoryConsumerId,
+    purpose: NativeHistoryDigest,
+    reservation: NativeHistoryDigest,
+    plan_digest: NativeHistoryDigest,
+    artifact_plan_digest: NativeHistoryDigest,
+};
+
+/// Exact native source actor and metadata incarnation. The service must establish ReadIndex and capture at an actual applied index at or beyond the requested minimum.
+pub const NativeSourceMetadataCaptureQuery = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: []const i64,
+    actor_table_id: u64,
+    source_id: NativeHistoryDigest,
+    minimum_applied_index: u64,
+};
+
+/// Correlated read-only reply, bounded to 8 KiB. The service revalidates metadata identity before returning and the client withholds inconsistent or cancelled replies.
+pub const NativeSourceMetadataCaptureReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    snapshot: NativeSourceMetadataCaptureSnapshot,
+};
+
+/// Private read-only metadata capture. Requires an independently authenticated internal service and shared routing budget.
+pub const NativeSourceMetadataCaptureRequest = struct {
+    version: i64,
+    query: NativeSourceMetadataCaptureQuery,
+};
+
+/// One actual applied metadata snapshot. Binding uses active/live definition; close uses closing or retired; drop uses retired. The trusted destination must independently obtain this capture, compare its exact binding and qualify its own physical root. These bytes alone certify no physical fencing, global outcome or legacy-worker drainage.
+pub const NativeSourceMetadataCaptureSnapshot = struct {
+    cut: NativeSourceScopeMetadataCut,
+    spec: NativeSourceScopeSpec,
+    phase: []const u8,
+    actor_revision: u64,
+    live_definition: bool,
+    checkpoint_table: []const u8,
+    pending: OpenApiOptionalNullable(NativeSourceMetadataCapturePending) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("cut");
+        try jw.write(self.cut);
+        try jw.objectField("spec");
+        try jw.write(self.spec);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("actor_revision");
+        try jw.write(self.actor_revision);
+        try jw.objectField("live_definition");
+        try jw.write(self.live_definition);
+        try jw.objectField("checkpoint_table");
+        try jw.write(self.checkpoint_table);
+        switch (self.pending) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("pending");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("pending");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 pub const NativeSourcePlanChunkQuery = struct {
     root: NativeSourcePlanRoot,
     spec: NativeSourcePlanSpec,

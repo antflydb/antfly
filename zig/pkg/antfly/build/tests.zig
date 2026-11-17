@@ -433,7 +433,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const source_control_service_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[1],
-        .filters = &.{"source control requires its coordinated decoder floor"},
+        .filters = &.{ "source control requires its coordinated decoder floor", "metadata source scope HTTP" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const changefeed_control_tests = b.addTest(.{

@@ -490,6 +490,47 @@ pub const MetadataHttpClient = struct {
         };
     }
 
+    pub fn captureSourceScope(self: *MetadataHttpClient, base_uri: []const u8, input: @import("source_scope_wire.zig").Request, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("source_scope_capture.zig").Snapshot {
+        const scopes = @import("../api/source_scope_metadata.zig");
+        try context.ensureActive();
+        if (self.internal_service == null) return error.Unauthorized;
+        const bytes = try scopes.wire.encodeRequest(self.alloc, input);
+        defer self.alloc.free(bytes);
+        const uri = try join(self.alloc, base_uri, scopes.path);
+        defer self.alloc.free(uri);
+        const timeout = @min(@as(u32, 5000), (try context.remainingTimeoutMs()) orelse 5000);
+        var encoded_budget: [20]u8 = undefined;
+        const headers = [_]http_common.RequestHeader{.{ .name = routes.routing_remaining_ms_header, .value = try std.fmt.bufPrint(&encoded_budget, "{d}", .{timeout}) }};
+        var signal = http_common.RequestCancellation.fromToken(context.cancellation);
+        const budget: RequestBudget = .{ .deadline_ns = platform_time.monotonicNs() +| @as(u64, timeout) * std.time.ns_per_ms, .cancellation = &signal };
+        var response = self.executeWithRetryPolicy(.{ .method = .POST, .uri = uri, .body = bytes, .content_type = "application/json", .headers = &headers, .timeout_ms = timeout, .max_response_bytes = scopes.wire.max_reply_bytes, .cancellation = &signal }, budget, .replay_safe) catch |err| switch (err) {
+            error.ReallocationOutcomeUnknown, error.MetadataMutationOutcomeUnknown, error.Timeout, error.ConnectionTimedOut, error.ConnectionRefused, error.ConnectionResetByPeer, error.BrokenPipe, error.EndOfStream, error.HttpConnectionClosing => return error.ReadUnavailable,
+            else => return err,
+        };
+        defer response.deinit(self.alloc);
+        try context.ensureActive();
+        if (response.status != 200) return switch (response.status) {
+            400 => error.InvalidSourceControl,
+            401 => error.Unauthorized,
+            403 => error.Forbidden,
+            404, 405, 501 => error.ChangefeedCapabilityUnsupported,
+            409 => error.SourceBindingConflict,
+            else => error.StorageReadTemporarilyUnavailable,
+        };
+        if (response.body.len > scopes.wire.max_reply_bytes) return error.SourceControlCorrupt;
+        var ack_count: usize = 0;
+        for (response.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, scopes.ack_header)) {
+            if (!std.mem.eql(u8, header.value, scopes.ack_value)) return error.SourceControlCorrupt;
+            ack_count += 1;
+        };
+        const media_type = response.header("Content-Type") orelse response.content_type orelse return error.SourceControlCorrupt;
+        if (ack_count != 1 or !std.ascii.eqlIgnoreCase(media_type, "application/json") or response.header(routes.Routes.raft_mutation_outcome_header) != null) return error.SourceControlCorrupt;
+        var snapshot = try scopes.wire.decodeReply(self.alloc, input, response.body);
+        errdefer snapshot.deinit(self.alloc);
+        try context.ensureActive();
+        return snapshot;
+    }
+
     pub fn accessChangefeedState(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../api/changefeed_metadata.zig").Request, request: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("../api/changefeed_metadata.zig").Reply) {
         const feeds = @import("../api/changefeed_metadata.zig");
         try request.ensureActive();
@@ -5006,4 +5047,56 @@ test "metadata.lake index owner projection read negotiates older peers without w
     executor.status = 503;
     executor.body = "NotLeader";
     try std.testing.expectError(error.NotLeader, client.readSystemCatalog("http://metadata.invalid", owner, 25, null));
+}
+
+test "metadata source scope HTTP client requires qualified correlated bounded replies" {
+    const a = std.testing.allocator;
+    const scopes = @import("../api/source_scope_metadata.zig");
+    const Fake = struct {
+        const Mode = enum { good, wrong_query, stale_cut, missing_ack, duplicate_ack, marker, wrong_type, lost };
+        mode: Mode = .good,
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.mode == .lost) return error.Timeout;
+            try std.testing.expect(request.header(internal_service_auth.header_name) != null);
+            try std.testing.expect(request.header(routes.routing_remaining_ms_header) != null);
+            try std.testing.expectEqual(@as(?usize, scopes.wire.max_reply_bytes), request.max_response_bytes);
+            const input = try scopes.wire.decodeRequest(alloc, request.body);
+            var reply: scopes.wire.Reply = .{ .version = 1, .request_digest = input.digest(), .snapshot = .{ .cut = .{ .group_id = input.query.metadata_group_id, .incarnation = input.query.metadata_incarnation, .index = input.query.minimum_applied_index }, .spec = .{ .actor_table_id = input.query.actor_table_id, .source_id = input.query.source_id, .generation = 1, .binding = @splat(3), .checkpoint_owner = .{ .metadata_group_id = input.query.metadata_group_id, .metadata_incarnation = input.query.metadata_incarnation, .namespace = @splat(4), .root_generation = 0, .group_id = 17 } }, .phase = .active, .actor_revision = 1, .live_definition = true, .checkpoint_table = "checkpoint" } };
+            if (self.mode == .wrong_query) reply.request_digest[0] ^= 1;
+            if (self.mode == .stale_cut) reply.snapshot.cut.index -= 1;
+            var headers: std.ArrayList(http_common.Header) = .empty;
+            errdefer {
+                for (headers.items) |h| {
+                    alloc.free(h.name);
+                    alloc.free(h.value);
+                }
+                headers.deinit(alloc);
+            }
+            try headers.append(alloc, .{ .name = try alloc.dupe(u8, "Content-Type"), .value = try alloc.dupe(u8, if (self.mode == .wrong_type) "text/plain" else "application/json") });
+            if (self.mode != .missing_ack) try headers.append(alloc, .{ .name = try alloc.dupe(u8, scopes.ack_header), .value = try alloc.dupe(u8, scopes.ack_value) });
+            if (self.mode == .duplicate_ack) try headers.append(alloc, .{ .name = try alloc.dupe(u8, scopes.ack_header), .value = try alloc.dupe(u8, scopes.ack_value) });
+            if (self.mode == .marker) try headers.append(alloc, .{ .name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header), .value = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_committed) });
+            const body = try std.json.Stringify.valueAlloc(alloc, reply, .{});
+            errdefer alloc.free(body);
+            return .{ .status = 200, .headers = try headers.toOwnedSlice(alloc), .body = body };
+        }
+    };
+    var fake: Fake = .{};
+    var client = MetadataHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    const input: scopes.wire.Request = .{ .version = 1, .query = .{ .metadata_group_id = 77, .metadata_incarnation = "11111111111111111111111111111111".*, .actor_table_id = 7, .source_id = @splat(2), .minimum_applied_index = 40 } };
+    try std.testing.expectError(error.Unauthorized, client.captureSourceScope("http://metadata.invalid", input, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    _ = client.withInternalServiceAuth("source-scope-metadata-test-secret-long-enough", "source-scope-metadata-test");
+    var result = try client.captureSourceScope("http://metadata.invalid", input, .{});
+    defer result.deinit(a);
+    try std.testing.expectEqualStrings("checkpoint", result.checkpoint_table);
+    for ([_]Fake.Mode{ .wrong_query, .stale_cut, .missing_ack, .duplicate_ack, .marker, .wrong_type, .lost }) |mode| {
+        fake.mode = mode;
+        const before = fake.calls;
+        try std.testing.expectError(if (mode == .lost) error.ReadUnavailable else error.SourceControlCorrupt, client.captureSourceScope("http://metadata.invalid", input, .{}));
+        try std.testing.expectEqual(before + @as(usize, if (mode == .lost) 2 else 1), fake.calls);
+    }
 }

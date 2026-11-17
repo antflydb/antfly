@@ -1996,6 +1996,14 @@ test "metadata server can expose admin listener endpoints" {
     defer snapshot.deinit();
     try std.testing.expectEqual(@as(usize, 1), snapshot.value.tables.len);
     try std.testing.expectEqualStrings("docs", snapshot.value.tables[0].name);
+    const scope_uri = try std.fmt.allocPrint(std.heap.page_allocator, "{s}{s}", .{ admin_base_uri, @import("../api/source_scope_metadata.zig").path });
+    defer std.heap.page_allocator.free(scope_uri);
+    var forged_scope = try executor.executor().execute(std.heap.page_allocator, .{ .method = .POST, .uri = scope_uri, .headers = &.{.{ .name = @import("../api/internal_service_auth.zig").header_name, .value = wrong_service_token }}, .body = "{}", .content_type = "application/json" });
+    defer forged_scope.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 401), forged_scope.status);
+    var scope_client = metadata_http_client.MetadataHttpClient.init(std.heap.page_allocator, executor.executor());
+    _ = scope_client.withInternalServiceAuth("metadata-service-secret-0123456789abcdef", "metadata-node");
+    try @import("source_scope_http_native_test.zig").verify(std.heap.page_allocator, server.svc, &scope_client, admin_base_uri);
 }
 
 test "metadata admin maps retryable authority loss to service unavailable" {

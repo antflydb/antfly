@@ -205,6 +205,7 @@ test "store-root readiness returns only an exact durable v17 activation" {
 pub const AdminSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    source_scopes: ?@import("../api/source_scope_metadata.zig").Port = null,
     changefeeds: ?@import("../api/changefeed_metadata.zig").Port = null,
 
     pub const VTable = struct {
@@ -643,6 +644,7 @@ pub const AdminSource = struct {
     pub fn fromMetadataService(svc: *service.MetadataService) AdminSource {
         return .{
             .ptr = svc,
+            .source_scopes = @import("../api/source_scope_metadata.zig").Port.fromService(svc),
             .changefeeds = @import("../api/changefeed_metadata.zig").Port.fromService(svc),
             .vtable = &.{
                 .system_catalog = comptime systemCatalogServiceCall(service.MetadataService),
@@ -716,6 +718,7 @@ pub const AdminSource = struct {
     pub fn fromMetadataHttpService(svc: *service.MetadataHttpService) AdminSource {
         return .{
             .ptr = svc,
+            .source_scopes = @import("../api/source_scope_metadata.zig").Port.fromService(svc),
             .changefeeds = @import("../api/changefeed_metadata.zig").Port.fromService(svc),
             .vtable = &.{
                 .system_catalog = comptime systemCatalogServiceCall(service.MetadataHttpService),
@@ -2040,6 +2043,7 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_routing_token, httpx.Handler.bind(self, metadataRoutingToken));
         try server.post(routes.Routes.internal_owner_readiness, httpx.Handler.bind(self, metadataOwnerReadiness));
         try server.post(routes.Routes.internal_privacy_policy_binding, httpx.Handler.bind(self, metadataPrivacyPolicyBinding));
+        try server.postWithBodyLimit(@import("../api/source_scope_metadata.zig").path, @import("../api/source_scope_metadata.zig").wire.max_request_bytes, httpx.Handler.bind(self, metadataSourceScopeCapture));
         try server.postWithBodyLimit(@import("../api/changefeed_metadata.zig").path, @import("../api/changefeed_metadata.zig").max_wire_bytes, httpx.Handler.bind(self, metadataChangefeedState));
         try server.post(routes.Routes.internal_routing_change, httpx.Handler.bind(self, metadataRoutingChange));
         try server.post(routes.Routes.internal_routing_authority, httpx.Handler.bind(self, metadataRoutingChange));
@@ -2625,6 +2629,35 @@ pub const MetadataHttpServer = struct {
         const result = capture(self.source.ptr, parsed.value, request) catch |err| return metadataReadError(ctx, err);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
         return ctx.json(result);
+    }
+
+    fn metadataSourceScopeCapture(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const scopes = @import("../api/source_scope_metadata.zig");
+        if (ctx.header(@import("../api/internal_service_auth.zig").header_name) == null) return ctx.status(403).text("authenticated service required");
+        if (ctx.header(routes.routing_remaining_ms_header) == null) return ctx.status(400).text("shared budget required");
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        const input = scopes.wire.decodeRequest(ctx.allocator, (try ctx.body()) orelse "") catch |err| return if (err == error.OutOfMemory) err else ctx.status(400).text("invalid source scope request");
+        const identity_fn = self.source.vtable.catalog_identity orelse return ctx.status(503).text("metadata identity unavailable");
+        const identity = identity_fn(self.source.ptr) catch |err| return metadataReadError(ctx, err);
+        if (identity.metadata_group_id != input.query.metadata_group_id or !std.meta.eql(identity.metadata_incarnation, input.query.metadata_incarnation)) return ctx.status(409).text("metadata identity mismatch");
+        const port = self.source.source_scopes orelse return ctx.status(503).text("source scope authority unavailable");
+        var request = requestContext(ctx);
+        request.principal = .{ .kind = .internal, .subject = "source-scope-maintenance" };
+        var snapshot = port.read(ctx.allocator, input, request) catch |err| switch (err) {
+            error.SourceBindingConflict, error.InvalidMetadataIncarnation => return ctx.status(409).text("source scope changed"),
+            error.InvalidSourceControl => return ctx.status(400).text("invalid source scope request"),
+            else => return metadataReadError(ctx, err),
+        };
+        defer snapshot.deinit(ctx.allocator);
+        const after = identity_fn(self.source.ptr) catch |err| return metadataReadError(ctx, err);
+        if (!std.meta.eql(identity, after)) return ctx.status(409).text("metadata identity changed during capture");
+        try request.ensureActive();
+        const encoded = try scopes.wire.encodeReply(ctx.allocator, input, snapshot);
+        defer ctx.allocator.free(encoded);
+        try ctx.setHeader(scopes.ack_header, scopes.ack_value);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(encoded);
+        return ctx.response.build();
     }
 
     fn metadataChangefeedState(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -8669,5 +8702,64 @@ test "SQL pgwire native metadata handler distinguishes preflight from accepted f
         defer response.deinit();
         try std.testing.expect(response.status.code >= 400);
         try std.testing.expectEqualStrings(if (mode == .accepted) routes.Routes.raft_mutation_outcome_unknown else routes.Routes.raft_mutation_outcome_not_proposed, response.headers.get(routes.Routes.raft_mutation_outcome_header).?);
+    }
+}
+
+test "metadata source scope HTTP fences identities and refuses unsigned captures" {
+    const scopes = @import("../api/source_scope_metadata.zig");
+    const a = std.testing.allocator;
+    const Fake = struct {
+        calls: usize = 0,
+        changed_after_read: bool = false,
+        fn identity(raw: *anyopaque) !metadata_api.CatalogIdentity {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .metadata_group_id = 77, .metadata_incarnation = if (self.changed_after_read and self.calls != 0) "22222222222222222222222222222222".* else "11111111111111111111111111111111".* };
+        }
+        fn read(raw: *anyopaque, alloc: std.mem.Allocator, input: scopes.wire.Request, request: operation.RequestContext) !scopes.wire.capture.Snapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try request.ensureActive();
+            try std.testing.expectEqualStrings("source-scope-maintenance", request.principal.?.subject);
+            self.calls += 1;
+            return .{ .cut = .{ .group_id = input.query.metadata_group_id, .incarnation = input.query.metadata_incarnation, .index = 42 }, .spec = .{ .actor_table_id = input.query.actor_table_id, .source_id = input.query.source_id, .generation = 1, .binding = @splat(3), .checkpoint_owner = .{ .metadata_group_id = 77, .metadata_incarnation = input.query.metadata_incarnation, .namespace = @splat(4), .root_generation = 0, .group_id = 17 } }, .phase = .active, .actor_revision = 1, .live_definition = true, .checkpoint_table = try alloc.dupe(u8, "checkpoint") };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var fake: Fake = .{};
+    var server = MetadataHttpServer.init(a, .{}, .{ .ptr = &fake, .vtable = &.{ .catalog_identity = Fake.identity, .status = Fake.status, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.free }, .source_scopes = .{ .ptr = &fake, .read_fn = Fake.read } });
+    var unsigned = try server.executeTypedHandlerWithBodyForTest(.POST, scopes.path, &.{}, "{}", MetadataHttpServer.metadataSourceScopeCapture);
+    defer unsigned.deinit();
+    try std.testing.expectEqual(@as(u16, 403), unsigned.status.code);
+    for ([_]u64{ 78, 77, 77 }) |group| {
+        const input: scopes.wire.Request = .{ .version = 1, .query = .{ .metadata_group_id = group, .metadata_incarnation = "11111111111111111111111111111111".*, .actor_table_id = 7, .source_id = @splat(2), .minimum_applied_index = 40 } };
+        const body = try scopes.wire.encodeRequest(a, input);
+        defer a.free(body);
+        var request = try httpx.Request.init(a, .POST, scopes.path);
+        defer request.deinit();
+        try request.setBody(body);
+        // This direct-handler fixture delegates signature verification to host middleware.
+        try request.setHeader(@import("../api/internal_service_auth.zig").header_name, "verified-by-host-fixture");
+        try request.setHeader(routes.routing_remaining_ms_header, "1000");
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        const changed = fake.changed_after_read;
+        var response = try server.metadataSourceScopeCapture(&ctx);
+        defer response.deinit();
+        if (group == 78 or changed) {
+            try std.testing.expectEqual(@as(u16, 409), response.status.code);
+            if (group == 78) try std.testing.expectEqual(@as(usize, 0), fake.calls);
+        } else {
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            var result = try scopes.wire.decodeReply(a, input, response.body.?);
+            defer result.deinit(a);
+            try std.testing.expectEqual(@as(u64, 42), result.cut.index);
+            fake.calls = 0;
+            fake.changed_after_read = true;
+        }
     }
 }

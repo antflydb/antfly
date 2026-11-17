@@ -5096,3 +5096,49 @@ No native ABI, data decoder or metadata durability version changes are introduce
 by this bounded DTO. The actual authenticated metadata endpoint/client and its
 fresh service ReadIndex remain next integration work; these bytes do not grant
 binding/retirement authority on their own. All full issue requirements remain.
+
+### Fresh authenticated metadata source lifecycle RPC
+
+`/internal/v1/catalog/source-scope-capture-v1` now serves the bounded capture
+contract through `api/source_scope_metadata.Port.fromService`. Both production
+metadata-service constructors install it. The port requires an internal maintenance
+principal, invokes the actual service ReadIndex capture, validates its snapshot and
+withholds cancellation. The HTTP handler requires verified service credentials even
+in migration mode plus a shared routing budget, checks metadata identity before and
+after capture, and returns only a bounded correlated reply with an explicit capture
+acknowledgement. The client requires service credentials, shares one five-second
+budget across bounded read retries, validates one acknowledgement, media type,
+identity/cut correlation and absence of mutation markers, and owns its decoded
+Snapshot independently of response buffers. Read transport loss returns unavailable,
+not a mutation outcome or substitute authority.
+
+The private endpoint and request/query/pending/snapshot/reply shapes are declared
+in internal OpenAPI under its existing `/internal/v1` base. `make generate` completed;
+only the owned unrelated model-explorer outputs were restored. No native ABI or
+durable protocol version changes: engine 56, storage owner 109, API kernel 30,
+metadata decoder 104 and data decoder maximum 39 remain current.
+
+Validation: the final combined `source-control-test
+antfly-metadata-sql-sessions-test -j2` exited 0 after code generation
+(`source-scope-metadata-rpc-qualified-test.log`). Service tests passed 5/5, including
+new client/server rejection cases; actual metadata storage/capture regressions
+passed 11/11; real metadata-server tests passed 2/2, all zero skips/failures/leaks.
+The real host fixture rejects a wrongly signed token with 401, creates a source
+actor through actual Raft/service protocol admission, and uses the signed HTTP
+client to observe active, closing and retired states after their corresponding
+commits. Each subsequent requested minimum covers the prior capture, and observed
+cuts increase. Metadata retirement still leaves physical-fencing work outstanding.
+The declared checkpoint-owner basis in this metadata fixture is not a physical data
+root qualification. Unit cases additionally cover unsigned requests, identity
+changes during capture, mismatched queries, stale cuts, missing/duplicate ACKs,
+wrong media type, mutation-marker confusion and exhausted read transport retries.
+The actual applied-store fixture also exercises the service port and owned wire
+roundtrip. Source-catalog, engine-error and OpenAPI checks exited 0, including all
+nine schema fragment tests. Fixture retirement shape and retention predicate compile
+errors were corrected before the final green runs.
+
+Still required: consuming this fresh authority in actual ordered native bind/close/
+drop/retirement controls, real first-bind legacy-worker handover, complete cohort
+root lifecycle coverage and destination integration, plus the original retained
+history/public feed/bootstrap/retention/pgoutput and Antfly existing-client gates.
+This milestone neither proves physical fencing nor finishes either issue.
