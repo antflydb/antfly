@@ -1406,7 +1406,7 @@ pub const NativeSourceScopeControlReply = struct {
     }
 };
 
-/// Private lifecycle RPC contract, at most 16 KiB. A fresh nonzero request_id correlates one RPC attempt and grants no replay or transaction outcome authority. submit requires intent and null/absent recovery; the receiving leader independently captures fresh signed metadata authority. recover requires recovery and null/absent intent, and only reads the exact prior command/entry. Caller metadata cuts are never accepted as new-write authorization. These types do not advertise an endpoint or first-activation capability.
+/// Private lifecycle RPC contract, at most 16 KiB. A fresh nonzero request_id correlates one RPC attempt and grants no replay or transaction outcome authority. submit requires intent and null/absent recovery; the receiving leader independently captures fresh signed metadata authority. recover requires recovery and null/absent intent, and only reads the exact prior command/entry. Caller metadata cuts are never accepted as new-write authorization. First strict activation remains gated on independently proven legacy-worker handover.
 pub const NativeSourceScopeControlRequest = struct {
     version: i64,
     request_id: NativeHistoryConsumerId,

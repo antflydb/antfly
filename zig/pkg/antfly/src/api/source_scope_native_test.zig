@@ -131,3 +131,41 @@ pub fn verifySubmission(a: std.mem.Allocator, server: anytype, fence: metadata.C
     intent.owner.group_id += 1;
     try std.testing.expectError(error.HistoryResynchronizationRequired, server.submitSourceScopeIntentLocal(a, fence, "docs", intent));
 }
+
+pub fn verifyControlRpc(a: std.mem.Allocator, controls: @import("source_scope_control_operations.zig").Port, observations: @import("source_scope_operations.zig").Port, fence: metadata.CatalogRouteFence, source_owner: @FieldType(completion.Intent, "owner")) !void {
+    const rpc = @import("../data/source_scope_http_wire.zig");
+    const intent: wire.Intent = .{ .version = 1, .owner = source_owner, .spec = .{ .actor_table_id = 7, .source_id = @splat(72), .generation = 1, .binding = @splat(73), .checkpoint_owner = try wire.scope.Basis.fromOwner(source_owner) }, .minimum_metadata_index = 1, .action = .bind };
+    const query: wire.Query = .{ .version = 1, .owner = source_owner, .domain = intent.spec.domain(), .minimum_applied_index = 1 };
+    const before = try observations.read(a, fence, "docs", query, .{});
+    // A recovery-only query does not authorize or submit this command. It
+    // returns superseded for the absent receipt through the real HTTP owner.
+    const command: wire.Command = .{ .version = 1, .intent = intent, .metadata_cut = .{ .group_id = source_owner.metadata_group_id, .incarnation = source_owner.metadata_incarnation, .index = 1 } };
+    const request: rpc.Request = .{ .version = 1, .request_id = @splat(91), .operation = .recover, .recovery = .{ .command = command, .entry = before.cut, .minimum_applied_index = before.cut.index } };
+    const reply = try controls.execute(a, fence, "docs", request, .{});
+    try reply.validate(request, try request.digest(a));
+    try std.testing.expect(reply.outcome != null and reply.outcome.? == .superseded);
+    try std.testing.expect(!reply.confirmed());
+    try std.testing.expectEqualDeep(command, reply.command.?);
+    try std.testing.expectEqualDeep(before.cut, reply.receipt.?);
+    const after = try observations.read(a, fence, "docs", query, .{});
+    try std.testing.expectEqualDeep(before.cut, after.cut);
+    try std.testing.expectEqualDeep(before.header, after.header);
+}
+
+pub fn verifyMinimumRecovery(a: std.mem.Allocator, server: anytype, fence: metadata.CatalogRouteFence, source_owner: @FieldType(completion.Intent, "owner")) !void {
+    const intent: wire.Intent = .{ .version = 1, .owner = source_owner, .spec = .{ .actor_table_id = 7, .source_id = @splat(72), .generation = 1, .binding = @splat(73), .checkpoint_owner = try wire.scope.Basis.fromOwner(source_owner) }, .minimum_metadata_index = 1, .action = .bind };
+    const observed = try server.sourceScopeObservationPort().read(a, fence, "docs", .{ .version = 1, .owner = source_owner, .domain = intent.spec.domain(), .minimum_applied_index = 1 }, .{});
+    const command: wire.Command = .{ .version = 1, .intent = intent, .metadata_cut = .{ .group_id = source_owner.metadata_group_id, .incarnation = source_owner.metadata_incarnation, .index = 1 } };
+    var bounded = fence;
+    bounded.admission_deadline_ns = @import("antfly_platform").time.monotonicNs() +| 200 * std.time.ns_per_ms;
+    bounded.admission_deadline_io = null;
+    // The server wrapper must retain this independent read minimum, rather
+    // than silently replacing it with the original receipt's lower index.
+    _ = server.recoverSourceScopeControlLocal(a, bounded, "docs", .{ .command = command, .entry = observed.cut, .minimum_applied_index = observed.cut.index + 1000000 }) catch |err| switch (err) {
+        // Either the outer budget or the real ReadIndex wait may expire first.
+        // Neither permits returning an older receipt as a qualified result.
+        error.DeadlineExceeded, error.Timeout => return,
+        else => return err,
+    };
+    return error.TestFutureMinimumWasIgnored;
+}

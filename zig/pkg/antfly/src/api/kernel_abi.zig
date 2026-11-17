@@ -33,7 +33,8 @@ pub const StatusDetail = error_abi.Detail;
 // Version 27 adds bounded source checkpoint receipt-window batch layouts.
 // Version 28 includes qualified checkpoint observation callback ports.
 // Version 30 adds the qualified source-scope observation callback.
-pub const abi_version: u32 = 30;
+// Version 31 adds the authenticated source-scope lifecycle control port.
+pub const abi_version: u32 = 31;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 

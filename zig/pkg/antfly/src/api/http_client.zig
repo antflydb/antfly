@@ -3115,10 +3115,12 @@ pub const ApiHttpClient = struct {
     const SourcePlanWire = @import("../data/source_plan_http_wire.zig");
     const CheckpointRead = @import("antfly_local_sources").storage_source_checkpoint_read;
     const ScopeRead = @import("antfly_local_sources").storage_source_scope_control;
-    const SourcePlanOperation = enum { control, observe, chunk, checkpoint, scope };
+    const ScopeControlWire = @import("../data/source_scope_http_wire.zig");
+    const SourcePlanOperation = enum { control, observe, chunk, checkpoint, scope, scope_control };
     fn sourcePlanInput(comptime kind: SourcePlanOperation) type {
         return switch (kind) {
             .control => SourcePlanWire.ControlRequest,
+            .scope_control => ScopeControlWire.Request,
             .observe => SourcePlanWire.ObserveRequest,
             .scope => ScopeRead.Query,
             .checkpoint => CheckpointRead.Request,
@@ -3128,6 +3130,7 @@ pub const ApiHttpClient = struct {
     fn sourcePlanResult(comptime kind: SourcePlanOperation) type {
         return switch (kind) {
             .control => SourcePlanWire.ControlReply,
+            .scope_control => ScopeControlWire.Reply,
             .observe => SourcePlanWire.control.Observation,
             .scope => ScopeRead.Observation,
             .checkpoint => CheckpointRead.Reply,
@@ -3136,6 +3139,9 @@ pub const ApiHttpClient = struct {
     }
     pub fn fetchGroupSourcePlanControl(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, input: SourcePlanWire.ControlRequest, fence: route_metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !SourcePlanWire.ControlReply {
         return self.fetchGroupSourcePlan(base_uri, group_id, table, .control, input, fence, context);
+    }
+    pub fn fetchGroupSourceScopeControl(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, input: ScopeControlWire.Request, fence: route_metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !ScopeControlWire.Reply {
+        return self.fetchGroupSourcePlan(base_uri, group_id, table, .scope_control, input, fence, context);
     }
     pub fn fetchGroupSourceScopeObservation(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, input: ScopeRead.Query, fence: route_metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !ScopeRead.Observation {
         return self.fetchGroupSourcePlan(base_uri, group_id, table, .scope, input, fence, context);
@@ -3151,6 +3157,7 @@ pub const ApiHttpClient = struct {
         return self.fetchGroupSourcePlan(base_uri, group_id, table, .chunk, input, fence, context);
     }
     fn fetchGroupSourcePlan(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, comptime kind: SourcePlanOperation, input: sourcePlanInput(kind), fence: route_metadata_api.CatalogRouteFence, original: @import("antfly_local_sources").api_operation.RequestContext) !sourcePlanResult(kind) {
+        const is_control = kind == .control or kind == .scope_control;
         // This scope intersects both original cancellation/deadline authorities.
         var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
         const context = scope.context();
@@ -3159,7 +3166,7 @@ pub const ApiHttpClient = struct {
         try fence.validate();
         if (group_id == 0 or group_id != fence.route.group_id or table_name.len == 0 or table_name.len > 1024) return error.InvalidCatalogRouteFence;
         if (comptime kind == .control) try input.validate(self.alloc) else try input.validate();
-        const owner = if (kind == .scope) input.owner else input.source_owner;
+        const owner = if (kind == .scope) input.owner else if (kind == .scope_control) input.owner() else input.source_owner;
         const identity = fence.route.identity_namespace;
         const incarnation = fence.metadata_incarnation orelse return error.InvalidCatalogRouteFence;
         if (owner.group_id != group_id or owner.metadata_group_id != fence.metadata_group_id or owner.topology_epoch != fence.topology_epoch or
@@ -3167,12 +3174,13 @@ pub const ApiHttpClient = struct {
             std.mem.readInt(u64, owner.namespace[0..8], .big) != identity.table_id or
             std.mem.readInt(u64, owner.namespace[8..16], .big) != identity.shard_id or
             std.mem.readInt(u64, owner.namespace[16..24], .big) != identity.range_id) return error.InvalidCatalogRouteFence;
-        const digest = if (kind == .control) try input.digest(self.alloc) else {};
-        const unknown = if (kind == .control) SourcePlanWire.ControlReply{ .request_digest = digest, .receipt = input.receipt } else {};
+        const digest = if (is_control) try input.digest(self.alloc) else {};
+        const unknown = if (kind == .control) SourcePlanWire.ControlReply{ .request_digest = digest, .receipt = input.receipt } else if (kind == .scope_control) try ScopeControlWire.unknown(self.alloc, input) else {};
         const table = try percentEncodePathComponent(self.alloc, table_name);
         defer self.alloc.free(table);
         const suffix = switch (kind) {
             .control => routes.Routes.source_plan_control_suffix,
+            .scope_control => routes.Routes.source_scope_control_suffix,
             .observe => routes.Routes.source_plan_observe_suffix,
             .scope => routes.Routes.source_scope_observe_suffix,
             .checkpoint => routes.Routes.source_checkpoint_observe_suffix,
@@ -3184,6 +3192,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(uri);
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
+        if (kind == .scope_control and body.len > ScopeControlWire.max_request_bytes) return error.InvalidSourceAdmission;
         if (kind == .scope and body.len > ScopeRead.max_bytes) return error.InvalidSourceAdmission;
         if (kind == .checkpoint and body.len > CheckpointRead.max_request_bytes) return error.InvalidSourceAdmission;
         if (body.len > SourcePlanWire.max_bytes) return error.InvalidSourcePlanWire;
@@ -3194,7 +3203,7 @@ pub const ApiHttpClient = struct {
         var timeout_buffer: [10]u8 = undefined;
         const timeout_text = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{timeout});
         var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
-        const max_reply = if (kind == .chunk) SourcePlanWire.max_bytes else if (kind == .scope) ScopeRead.max_bytes else if (kind == .checkpoint) CheckpointRead.max_reply_bytes else SourcePlanWire.max_control_reply_bytes;
+        const max_reply = if (kind == .scope_control) ScopeControlWire.max_reply_bytes else if (kind == .chunk) SourcePlanWire.max_bytes else if (kind == .scope) ScopeRead.max_bytes else if (kind == .checkpoint) CheckpointRead.max_reply_bytes else SourcePlanWire.max_control_reply_bytes;
         try context.ensureActive();
         // A mutation has one transport attempt. Any post-dispatch ambiguity
         // preserves only original recovery authority; callers must not replay.
@@ -3202,14 +3211,14 @@ pub const ApiHttpClient = struct {
             .{ .name = route_metadata_api.catalog_route_fence_header, .value = route_json },
             .{ .name = route_metadata_api.catalog_route_deadline_ms_header, .value = timeout_text },
         }, .timeout_ms = timeout, .cancellation = &cancellation, .max_response_bytes = max_reply }) catch |err| {
-            if (comptime kind == .control) return unknown;
+            if (comptime is_control) return unknown;
             return switch (err) {
                 error.OutOfMemory, error.Canceled, error.Cancelled, error.DeadlineExceeded => err,
                 else => error.ReadUnavailable,
             };
         };
         defer response.deinit(self.alloc);
-        if (comptime kind == .control) {
+        if (comptime is_control) {
             if (response.status != 200 or response.body.len > max_reply) return unknown;
         } else {
             try context.ensureActive();
@@ -3228,11 +3237,18 @@ pub const ApiHttpClient = struct {
         if (ack == null or !std.mem.eql(u8, ack.?, route_metadata_api.catalog_route_fence_ack_value) or
             content_type == null or !std.ascii.eqlIgnoreCase(content_type.?, "application/json"))
         {
-            if (comptime kind == .control) return unknown;
+            if (comptime is_control) return unknown;
             return error.InvalidRemoteResponse;
         }
-        if (comptime kind == .control) {
-            var result = SourcePlanWire.decodeControlReply(self.alloc, input, response.body) catch return unknown;
+        if (comptime is_control) {
+            if (comptime kind == .scope_control) {
+                var acknowledgements: usize = 0;
+                for (response.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, route_metadata_api.catalog_route_fence_ack_header)) {
+                    acknowledgements += 1;
+                };
+                if (acknowledgements != 1) return unknown;
+            }
+            var result = (if (comptime kind == .scope_control) ScopeControlWire.decodeReply(self.alloc, input, response.body) else SourcePlanWire.decodeControlReply(self.alloc, input, response.body)) catch return unknown;
             if (response.header(internal_batch_forwarding.outcome_header) != null) result.outcome = null;
             context.ensureActive() catch {
                 result.outcome = null;
@@ -3246,7 +3262,7 @@ pub const ApiHttpClient = struct {
                 .scope => try ScopeRead.decodeObservation(self.alloc, response.body, input),
                 .checkpoint => try CheckpointRead.decodeReply(self.alloc, input, response.body),
                 .chunk => try SourcePlanWire.native.decodeChunkReply(self.alloc, input.request, response.body),
-                .control => unreachable,
+                .control, .scope_control => unreachable,
             };
             errdefer if (kind == .chunk) self.alloc.free(result.bytes);
             try context.ensureActive();
@@ -8281,4 +8297,8 @@ test "source scope HTTP client rejects unqualified forged expired and ambiguous 
         try std.testing.expectError(expected, client.fetchGroupSourceScopeObservation("http://node:8080", 17, "docs", query, fence, .{}));
         try std.testing.expectEqual(before + 1, fake.calls);
     }
+}
+
+test "source scope control HTTP client preserves captured authority and never retries ambiguous dispatch" {
+    try @import("source_scope_control_client_test.zig").run(ApiHttpClient);
 }

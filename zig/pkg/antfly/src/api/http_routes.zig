@@ -246,6 +246,7 @@ pub const Routes = struct {
     pub const routed_batch_suffix = "/batch-routed-v1";
     pub const source_plan_control_suffix = "/source-plan/control-v1";
     pub const source_plan_observe_suffix = "/source-plan/observe-v1";
+    pub const source_scope_control_suffix = "/source-scope/control-v1";
     pub const source_scope_observe_suffix = "/source-scope/observe-v1";
     pub const source_checkpoint_observe_suffix = "/source-checkpoint/observe-v1";
     pub const source_plan_chunk_suffix = "/source-plan/chunk-v1";

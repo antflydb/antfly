@@ -2381,6 +2381,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx restore owner accepts bounded rewrite source chunks above legacy control limit",
         "httpx hidden handoff receipt rejects public caller even in legacy internal mode",
         "httpx FK source control rejects missing service token in legacy internal mode",
+        "httpx source scope control",
         "hidden generation handoff receipt requires exact scoped read-index request",
         "hidden generation handoff identity requires exact scoped read-index request",
         "httpx schema patch merges at the authority and accepts version zero ETag",
@@ -2534,6 +2535,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "prefixUpperBoundAlloc",
     };
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
+    const source_scope_http_auth_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{"httpx source scope control"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("source-scope-http-auth-test", "Verify lifecycle RPC service authentication and conservative unknown outcomes").dependOn(&addFilteredTestRunArtifact(b, source_scope_http_auth_tests).step);
     const resolver_adjudication_api_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = &.{ "resolver adjudication public policy", "DistributedCandidateSource", "resolver curation status cloning" },

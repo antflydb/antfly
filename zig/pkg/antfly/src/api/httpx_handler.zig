@@ -1904,6 +1904,10 @@ pub const AntflyApiHandler = struct {
         const group_prefix = routes.internal_groups_prefix ++ ":group_id";
         const table_prefix = group_prefix ++ "/tables/:table_name";
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit"))
+            try server.postWithBodyLimit(table_prefix ++ routes.source_scope_control_suffix, @import("source_scope_control_operations.zig").wire.max_request_bytes, httpx.Handler.bind(self, internalSourceScopeControl))
+        else
+            try server.post(table_prefix ++ routes.source_scope_control_suffix, httpx.Handler.bind(self, internalSourceScopeControl));
         inline for (.{
             .{ routes.source_plan_control_suffix, internalSourcePlanControl },
             .{ routes.source_plan_observe_suffix, internalSourcePlanObserve },
@@ -4203,8 +4207,8 @@ pub const AntflyApiHandler = struct {
         if (mutation) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
         const status: u16 = switch (err) {
             error.ChangefeedCapabilityUnsupported => 501,
-            error.TopologyChanged, error.HistoryResynchronizationRequired, error.SourceReceiptExpired, error.SourcePayloadConflict, error.SourceCheckpointConflict, error.ConflictingOrderedApplyReceipt => 409,
-            error.GroupLeaderUnavailable, error.LeaderUnavailable, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ReadUnavailable, error.ResourceBudgetExceeded, error.Canceled, error.Cancelled, error.DeadlineExceeded, error.CatalogRoutingUnavailable, error.CatalogRoutingSnapshotTimeout => 503,
+            error.TopologyChanged, error.HistoryResynchronizationRequired, error.SourceReceiptExpired, error.SourcePayloadConflict, error.SourceCheckpointConflict, error.SourceBindingConflict, error.ConflictingOrderedApplyReceipt => 409,
+            error.GroupLeaderUnavailable, error.LeaderUnavailable, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ReadUnavailable, error.ResourceBudgetExceeded, error.Canceled, error.Cancelled, error.DeadlineExceeded, error.CatalogRoutingUnavailable, error.CatalogRoutingSnapshotTimeout, error.SourcePendingWork, error.SourceOutcomeUnresolved => 503,
             error.InvalidCatalogRouteFence, error.InvalidSourcePlanWire, error.InvalidSourceAdmission, error.InvalidTxnRecord, error.InvalidCatalogRouteFenceProtocol, error.UnsupportedCatalogRouteFence, error.MissingField, error.UnknownField, error.DuplicateField, error.UnexpectedToken, error.SyntaxError, error.Overflow => 400,
             else => 500,
         };
@@ -4212,6 +4216,25 @@ pub const AntflyApiHandler = struct {
     }
     fn internalSourcePlanControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.internalSourcePlan(ctx, .control);
+    }
+    fn internalSourceScopeControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid source scope path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("source_scope_control_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing source scope request");
+        if (body.len > operations.wire.max_request_bytes) return textResponse(ctx, 413, "source scope request exceeds byte limit");
+        const input = operations.wire.decodeRequest(ctx.allocator, body) catch |err| return sourcePlanError(ctx, err, true);
+        const mutation = input.operation == .submit;
+        const result = operations.execute(self.api_server.cfg.native_source_scope_control, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, mutation);
+        if (mutation and !result.confirmed()) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+        const encoded = operations.wire.encodeReply(ctx.allocator, input, result) catch |err| return sourcePlanError(ctx, err, mutation);
+        defer ctx.allocator.free(encoded);
+        try ctx.setHeader("Content-Type", "application/json");
+        return ctx.response.body(encoded).build();
     }
     fn internalSourceScopeObserve(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.internalSourcePlan(ctx, .scope);
@@ -19167,6 +19190,39 @@ test "httpx hidden handoff receipt rejects public caller even in legacy internal
         var response = try handler.internalGroupLookup(&ctx);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 401), response.status.code);
+    }
+}
+
+test "httpx source scope control refuses missing and invalid authority in legacy mode" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "source-scope-auth-test-secret-long-enough" }) |secret| {
+        var source = AuthStatusSource{};
+        var api_server = ApiHttpServer.init(alloc, .{ .internal_service_secret = secret, .internal_service_issuer = "scope-auth-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+        defer api_server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &api_server };
+        for ([_]?[]const u8{ null, "not-a-valid-service-token" }) |token| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/rows/source-scope/control-v1");
+            defer request.deinit();
+            if (token) |value| try request.setHeader(internal_service_auth.header_name, value);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.internalSourceScopeControl(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
+    }
+}
+
+test "httpx source scope control reports phase conflict and unresolved results conservatively" {
+    inline for (.{ .{ error.SourceBindingConflict, @as(u16, 409) }, .{ error.SourcePendingWork, @as(u16, 503) }, .{ error.SourceOutcomeUnresolved, @as(u16, 503) } }) |case| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "http://node/internal/v1/groups/7/tables/rows/source-scope/control-v1");
+        defer request.deinit();
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try AntflyApiHandler.sourcePlanError(&ctx, case[0], true);
+        defer response.deinit();
+        try std.testing.expectEqual(case[1], response.status.code);
+        try std.testing.expectEqualStrings(internal_batch_forwarding.outcome_unknown_v1, response.headers.get(internal_batch_forwarding.outcome_header).?);
     }
 }
 

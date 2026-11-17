@@ -5484,3 +5484,61 @@ ID rejection are included. Final source-catalog, engine-error and OpenAPI checks
 also exited 0 (`source-scope-control-rpc-contract-check.log`), including nine
 schema-fragment tests. Actual authenticated HTTP route/client integration still
 must be implemented and qualified before this contract is a usable RPC surface.
+
+### Authenticated lifecycle HTTP transport and routed recovery
+
+The private `/internal/v1/groups/{group}/tables/{table}/source-scope/control-v1`
+endpoint now has its schema, strict service-authenticated handler, bounded client,
+production API configuration and routed/local DataServer dispatch. API kernel ABI
+31 fences the new configuration port. Engine 57, owner ABI 110, data profile 40,
+metadata 104 and failure envelope 89 remain unchanged.
+
+HTTP submission sends only the validated Intent. The serving leader uses the
+fresh metadata-authorized submission path and returns its exact captured command
+with every known accepted entry. Recovery only reads the exact original command
+and entry; its independently requested minimum applied index is preserved through
+the leader wrapper, rather than reduced to the old entry index. The handler
+requires an explicitly authenticated internal-service credential even in legacy
+internal mode or when no service secret is configured. Bodies are capped at
+16 KiB and encoded responses at 24 KiB. Phase conflicts and pending/unresolved
+results retain conservative unknown-write classification where appropriate.
+
+The client makes one transport attempt, validates request ID/correlation, owner,
+route acknowledgement (including duplicate rejection), media type, size and
+semantic evidence before returning a result. A valid response carrying an
+unknown marker or late cancellation clears confirmation while preserving the
+captured command/receipt. Lost, malformed, forged, oversized or unacknowledged
+replies never cause automatic mutation replay. Unknown recovery keeps only its
+original recovery authority.
+
+The real forwarding-node/loopback-service/native-owner fixture exercises the new
+recovery RPC and confirms that both the native cut and registry header remain
+unchanged. Client tests cover absent credentials before transport, unknown-marker
+receipt preservation, forged correlation/cut, missing/duplicate acknowledgement,
+size limits and connection loss, with exactly one attempt. Dedicated handler tests
+reject missing/invalid service tokens with legacy mode enabled, with and without
+a configured secret, and verify conservative phase-error classification.
+The first complete linked/handler run passed 27 selected linked tests and both
+handler tests (`source-scope-control-http-final-test.log`), zero skips/failures/
+leaks. Additional future-minimum qualification then reached the real ReadIndex
+wait's Timeout before the outer DeadlineExceeded; the assertion now accepts only
+those two bounded timeout forms and fails if an older result is returned.
+Final generation and rerun evidence follows below.
+
+This qualifies actual authenticated recovery transport, not a successful real
+metadata-host-to-data-leader source activation. Genuine legacy handover remains
+mandatory before first strict bind, and metadata-to-data mutating delivery,
+retirement DB/RPC/rejection recovery, hidden checkpoint/cohort lifecycle and all
+original destination/public-feed/bootstrap/retention/typed-pgoutput/actual-Antfly-
+client/performance acceptance criteria remain unfinished. Both issues remain open.
+
+Final `make generate` exited 0 (`source-scope-control-http-final-generate.log`);
+unrelated model-explorer artifacts from this run were restored. Final
+`history-control-apply-test source-scope-http-auth-test -Dstrip=true -j1` exited
+0 (`source-scope-control-http-final-qualified-test.log`): all 27 selected linked
+tests and both dedicated handler tests passed, zero skips/failures/leaks. This
+includes the leader-wrapper future-minimum regression; returning an older result
+fails the test, and only the outer deadline or inner ReadIndex timeout qualifies
+as bounded unavailability. Final source-catalog, engine-error and OpenAPI checks
+also exited 0 (`source-scope-control-http-final-contract-check.log`), including
+nine schema-fragment tests. These checks do not close the remaining full scope.
