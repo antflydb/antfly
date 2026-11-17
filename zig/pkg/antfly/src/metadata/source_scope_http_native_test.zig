@@ -39,7 +39,8 @@ pub fn verify(a: A, svc: anytype, client: *client_mod.MetadataHttpClient, uri: [
     std.mem.writeInt(u64, namespace[0..8], 77, .big);
     std.mem.writeInt(u64, namespace[8..16], 17, .big);
     std.mem.writeInt(u64, namespace[16..24], 19, .big);
-    try mutate(a, svc, scope, sources, .{ .bind_checkpoint = .{ .binding = scope.identity(), .table_name = "docs", .owner = .{ .metadata_group_id = identity.metadata_group_id, .metadata_incarnation = identity.metadata_incarnation, .namespace = namespace, .table_binding = @splat(74), .root_generation = 0, .group_id = 601, .topology_epoch = 1 } } }, context);
+    const owner: @FieldType(@import("antfly_local_sources").storage_source_scope_control.Intent, "owner") = .{ .metadata_group_id = identity.metadata_group_id, .metadata_incarnation = identity.metadata_incarnation, .namespace = namespace, .table_binding = @splat(74), .root_generation = 0, .group_id = 601, .topology_epoch = 1 };
+    try mutate(a, svc, scope, sources, .{ .bind_checkpoint = .{ .binding = scope.identity(), .table_name = "docs", .owner = owner } }, context);
     try mutate(a, svc, scope, sources, .{ .enable_scope_fencing = {} }, context);
     var input: scopes.wire.Request = .{ .version = 1, .query = .{ .metadata_group_id = identity.metadata_group_id, .metadata_incarnation = identity.metadata_incarnation, .actor_table_id = scope.table_id, .source_id = scope.source_id, .minimum_applied_index = 1 } };
     var active = try client.captureSourceScope(uri, input, context);
@@ -47,6 +48,15 @@ pub fn verify(a: A, svc: anytype, client: *client_mod.MetadataHttpClient, uri: [
     try active.requireBind();
     try std.testing.expectEqual(scope.identity(), active.spec.binding);
     try std.testing.expectEqualStrings("docs", active.checkpoint_table);
+    var intent: @import("antfly_local_sources").storage_source_scope_control.Intent = .{ .version = 1, .owner = owner, .spec = active.spec, .minimum_metadata_index = active.cut.index, .action = .bind };
+    const bind = try client.authorizeSourceScopeIntent(uri, intent, context);
+    try std.testing.expect(bind.metadata_cut.index >= active.cut.index);
+    try std.testing.expectEqualDeep(active.spec, bind.intent.spec);
+    intent.spec.binding[0] ^= 1;
+    try std.testing.expectError(error.SourceBindingConflict, client.authorizeSourceScopeIntent(uri, intent, context));
+    intent.spec = active.spec;
+    intent.action = .close;
+    try std.testing.expectError(error.SourceBindingConflict, client.authorizeSourceScopeIntent(uri, intent, context));
     try mutate(a, svc, scope, sources, .{ .close = {} }, context);
     input.query.minimum_applied_index = active.cut.index + 1;
     var closing = try client.captureSourceScope(uri, input, context);
@@ -55,6 +65,12 @@ pub fn verify(a: A, svc: anytype, client: *client_mod.MetadataHttpClient, uri: [
     try closing.requireBinding(active.spec);
     try std.testing.expect(closing.cut.index > active.cut.index);
     try std.testing.expectError(error.SourceBindingConflict, closing.requireBind());
+    intent.minimum_metadata_index = closing.cut.index;
+    intent.action = .bind;
+    try std.testing.expectError(error.SourceBindingConflict, client.authorizeSourceScopeIntent(uri, intent, context));
+    intent.action = .close;
+    const close = try client.authorizeSourceScopeIntent(uri, intent, context);
+    try std.testing.expect(close.metadata_cut.index >= closing.cut.index);
     try mutate(a, svc, scope, sources, .{ .retire = .{ .receipt = "metadata-only-empty-actor-retirement" } }, context);
     input.query.minimum_applied_index = closing.cut.index + 1;
     var retired = try client.captureSourceScope(uri, input, context);
@@ -62,6 +78,12 @@ pub fn verify(a: A, svc: anytype, client: *client_mod.MetadataHttpClient, uri: [
     try retired.requireDrop();
     try retired.requireBinding(active.spec);
     try std.testing.expect(retired.cut.index > closing.cut.index);
+    intent.minimum_metadata_index = retired.cut.index;
+    intent.action = .{ .drop = .{ .term = 1, .index = 1 } };
+    const drop = try client.authorizeSourceScopeIntent(uri, intent, context);
+    try std.testing.expect(drop.metadata_cut.index >= retired.cut.index);
+    // This command still requires the real physical close cut at native apply;
+    // metadata authorization cannot validate or manufacture that local fact.
     // Metadata retirement does not fabricate a physical fencing certificate.
     const raw = try control.readOnService(svc, a, scope.table_id, scope.source_id, context);
     defer a.free(raw);

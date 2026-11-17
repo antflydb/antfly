@@ -540,7 +540,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const source_control_step = b.step("source-control-test", "Verify durable source reservations, receipt frontiers and metadata recovery");
     const run_source_control_storage_tests = b.addRunArtifact(source_control_storage_tests);
     const run_source_control_service_tests = b.addRunArtifact(source_control_service_tests);
-    const source_scope_control_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/source_scope_ordered.zig"), .target = target, .optimize = optimize });
+    const source_scope_control_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/source_scope_rebind_test.zig"), .target = target, .optimize = optimize });
     const source_scope_control_tests = b.addTest(.{ .root_module = source_scope_control_mod });
     source_control_step.dependOn(&b.addRunArtifact(source_scope_control_tests).step);
     const source_scope_wire_tests = b.addTest(.{ .root_module = b.createModule(.{

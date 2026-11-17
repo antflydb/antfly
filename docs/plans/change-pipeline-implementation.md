@@ -5142,3 +5142,37 @@ drop/retirement controls, real first-bind legacy-worker handover, complete cohor
 root lifecycle coverage and destination integration, plus the original retained
 history/public feed/bootstrap/retention/pgoutput and Antfly existing-client gates.
 This milestone neither proves physical fencing nor finishes either issue.
+
+### Fresh remote command construction and repeated-binding floor regression
+
+`MetadataHttpClient.authorizeSourceScopeIntent` now obtains its own authenticated
+capture, checks the exact source binding and requested active/closing/retired
+phase, and constructs the private command with the actual observed metadata cut.
+It accepts no caller snapshot. Native physical-owner qualification and genuine
+legacy drainage remain independent required checks; metadata authorization also
+cannot manufacture a valid physical close cut for drop.
+
+The real metadata Raft/HTTP lifecycle fixture now exercises this constructor:
+active bind succeeds, altered binding and active close fail, closing bind fails,
+closing close succeeds and retired drop receives only metadata authorization.
+`source-control-test antfly-metadata-sql-sessions-test` exited 0 for these changes
+(`source-scope-remote-authorize-test.log`), including the actual host/server tests.
+Contract checks also passed.
+
+While preparing native integration, a regression test reproduced an existing
+Header.bind bug: a repeated active binding with a newer qualified metadata cut
+left metadata_floor at 10 when 11 was required. This would also make the bounded
+ordered success receipt reject that otherwise valid refresh. The same-spec active
+branch now advances the header floor before returning the original record. It
+preserves the first binding cut, pending slot, sequence/token state and domain
+charge. The regression proves stale allocation is fenced and the refreshed result
+can be staged as an exact ordered receipt. It failed before the fix and all 21
+standalone tests passed afterward (`source-scope-rebind-green-test.log`). The test
+is included in source-control-test, whose final run exited 0; source-catalog,
+engine-error and OpenAPI checks also exited 0. No ABI or protocol maximum changes
+are introduced by this invariant fix.
+
+Actual native ordered controls/retirement RPC, genuine worker migration and the
+remaining full destination/changefeed/bootstrap/retention/pgoutput/client scope
+are still mandatory and incomplete. Neither these checks nor the PostgreSQL
+control baseline constitute full Antfly end-to-end qualification.

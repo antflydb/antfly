@@ -209,7 +209,12 @@ pub const Header = struct {
         if (old) |record| {
             if (!self.strict or self.domains == 0) return error.SourceAdmissionCorrupt;
             if (!same(record.spec.domain(), spec.domain())) return error.SourceAdmissionCorrupt;
-            if (same(record.spec, spec) and record.phase == .active) return record;
+            if (same(record.spec, spec) and record.phase == .active) {
+                // Requalification preserves the original binding and attempt,
+                // but its newer metadata cut must fence delayed older binds.
+                self.metadata_floor = @max(self.metadata_floor, cut.index);
+                return record;
+            }
             if (spec.generation <= record.spec.generation or record.phase != .closed or record.slot != null or cut.index <= record.close_metadata_index) return error.SourceCheckpointConflict;
         } else if (self.domains >= max_domains) return error.SourceAdmissionBackpressure;
         if (old == null) self.domains += 1;
