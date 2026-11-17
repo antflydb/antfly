@@ -543,6 +543,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const source_scope_control_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/source_scope_ordered.zig"), .target = target, .optimize = optimize });
     const source_scope_control_tests = b.addTest(.{ .root_module = source_scope_control_mod });
     source_control_step.dependOn(&b.addRunArtifact(source_scope_control_tests).step);
+    const source_scope_wire_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata/source_scope_wire.zig"),
+        .target = target,
+        .optimize = optimize,
+    }), .filters = &.{"metadata source scope wire"} });
+    source_scope_wire_tests.root_module.addImport("antfly_local_sources", metadata_unit_baseline_mods[8].import_table.get("antfly_local_sources").?);
+    const run_source_scope_wire_tests = b.addRunArtifact(source_scope_wire_tests);
+    source_control_step.dependOn(&run_source_scope_wire_tests.step);
+    b.step("source-scope-metadata-wire-test", "Verify bounded and correlated metadata lifecycle captures").dependOn(&run_source_scope_wire_tests.step);
     source_control_step.dependOn(&run_source_control_tests.step);
     source_control_step.dependOn(&run_source_delivery_tests.step);
     source_control_step.dependOn(&run_source_control_storage_tests.step);

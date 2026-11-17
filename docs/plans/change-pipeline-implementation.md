@@ -5070,3 +5070,29 @@ The metadata lifecycle wire draft remains unreferenced/unverified and is not par
 of this RPC milestone. Fresh qualified metadata capture transport, actual mutating
 scope controls and original-coordinator retirement RPCs, genuine legacy-worker
 handover and all remaining end-to-end issue requirements are still required.
+
+### Bounded metadata lifecycle capture wire contract
+
+`metadata/source_scope_wire.zig` encodes/decodes the independently qualified
+capture already implemented in the metadata store/service wrapper. The request
+fingerprint binds version, metadata group/incarnation, actor table/source and
+minimum applied index. Replies validate that correlation, actual cut, actor
+revision, exact source identity and original checkpoint owner basis, bounded
+checkpoint table name and every retained pending reference/digest. A retired
+actor cannot retain an active pending identity. The two distinct plan digests are
+preserved; no input manifest or transaction outcome is reconstructed from them.
+Request and reply bounds are 2 KiB and 8 KiB respectively. Decoding copies the only
+variable-length field into an independently owned Snapshot, preserving the local
+capture ownership/deinit contract after response/parser buffers are released.
+
+Validation: `source-control-test` and the focused
+`source-scope-metadata-wire-test --summary all` both exited 0; the focused build
+completed all 55 steps. Its two declared regression cases cover strict request
+roundtrip/duplicate refusal, decoded-buffer ownership, altered query/cut/source
+refusal and pending-generation/retired-phase consistency. The combined target
+also passed existing metadata storage/service/capture tests. Source-catalog,
+engine-error and OpenAPI checks exited 0, including nine schema-fragment tests.
+No native ABI, data decoder or metadata durability version changes are introduced
+by this bounded DTO. The actual authenticated metadata endpoint/client and its
+fresh service ReadIndex remain next integration work; these bytes do not grant
+binding/retirement authority on their own. All full issue requirements remain.
