@@ -113,6 +113,91 @@ pub const Source = struct {
         try context.ensureActive();
         return .{ .allocator = a, .session = session, .roots = try roots.toOwnedSlice(a) };
     }
+    /// Assemble a single immutable root-local transaction from authenticated
+    /// retained pages. The current grant and private cursor fence every read.
+    pub fn readRelationalFrame(self: Source, a: A, state: control.State, position: control.Position, now: u64, max_events_per_page: u32, context: Context) !?@import("history_page_operations.zig").pages.Page {
+        const history = @import("history_page_operations.zig");
+        const frame = @import("antfly_local_sources").storage_committed_history.frame;
+        try context.ensureActive();
+        const definition = state.definition orelse return error.ChangefeedConflict;
+        if (state.phase != .streaming or definition.tables.len != 1 or definition.tables[0].contract != .native_relational or
+            state.roots.len != 1 or position.event != 0 or max_events_per_page == 0 or max_events_per_page > 1024)
+            return error.ChangefeedCapabilityUnsupported;
+        if (now == 0 or now >= state.expires_at) return error.ChangefeedLeaseExpired;
+        const item = state.roots[0];
+        if (item.released or item.consumer_epoch == 0) return error.ChangefeedResynchronizationRequired;
+        var captured = try self.capture(a, definition, context);
+        defer captured.deinit();
+        if (captured.roots.len != 1) return error.ChangefeedResynchronizationRequired;
+        const root = try captured.find(item.namespace);
+        var input: history.Request = .{ .version = 1, .request = .{
+            .reference = .{
+                .namespace = root.namespace,
+                .authority = state.authority,
+                .consumer = state.consumerId(),
+                .epoch = item.consumer_epoch,
+                .grant = item.grant_sequence,
+                .definition = definition.identity(),
+            },
+            .after = .{ .sequence = position.sequence },
+            .now_seconds = now,
+            .max_events = max_events_per_page,
+            .max_bytes = history.pages.max_source_bytes,
+        } };
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const scratch = arena.allocator();
+        var header: ?frame.Header = null;
+        var header_digest: control.Digest = undefined;
+        var events: []frame.Event = &.{};
+        var bytes: usize = 0;
+        var latest: u64 = position.sequence;
+        while (true) {
+            try context.ensureActive();
+            var page = try self.pages.read(a, root.fence, root.table_name, input, context);
+            defer page.deinit();
+            try history.wire.validate(page, input.request);
+            if (page.observed_latest < latest) return error.ChangefeedResynchronizationRequired;
+            latest = page.observed_latest;
+            const current = page.header orelse {
+                if (header != null) return error.ChangefeedResynchronizationRequired;
+                arena.deinit();
+                return null;
+            };
+            if (current.transaction_scope != .root_local) return error.ChangefeedCapabilityUnsupported;
+            const digest = control.hash(current);
+            if (header == null) {
+                header = current;
+                header.?.schema_before = try duplicateOptional(scratch, current.schema_before);
+                header.?.schema_after = try duplicateOptional(scratch, current.schema_after);
+                header_digest = digest;
+                events = try scratch.alloc(frame.Event, page.frame_events);
+                bytes = (if (current.schema_before) |value| value.len else 0) +
+                    (if (current.schema_after) |value| value.len else 0);
+            } else if (!std.meta.eql(digest, header_digest) or page.frame_events != events.len) {
+                return error.ChangefeedResynchronizationRequired;
+            }
+            for (page.events, page.first_ordinal..) |event, index| {
+                if (index > 0 and std.mem.order(u8, events[index - 1].key, event.key) != .lt)
+                    return error.HistoryCorrupt;
+                bytes += event.key.len + (if (event.before) |value| value.len else 0) +
+                    (if (event.after) |value| value.len else 0) + 12;
+                if (bytes > history.pages.max_source_bytes) return error.HistoryTooLarge;
+                events[index] = .{
+                    .key = try scratch.dupe(u8, event.key),
+                    .before = try duplicateOptional(scratch, event.before),
+                    .after = try duplicateOptional(scratch, event.after),
+                };
+            }
+            if (page.next.event == 0) {
+                _ = try frame.encodedLength(header.?, events);
+                try self.validate(a, state, root.namespace, root.fence, root.table_name, context);
+                return .{ .arena = arena, .header = header, .events = events, .frame_events = page.frame_events, .next = page.next, .observed_latest = latest, .caught_up = page.caught_up };
+            }
+            input.request.after = page.next;
+        }
+    }
+
     /// Validate an existing intent against the current base incarnation/root.
     /// A changed leader is transport discovery; a changed namespace is resync.
     pub fn validate(self: Source, a: A, state: control.State, namespace: control.Namespace, frozen: metadata.CatalogRouteFence, table_name: []const u8, context: Context) !void {
@@ -124,6 +209,11 @@ pub const Source = struct {
         if (!std.mem.eql(u8, root.table_name, table_name) or !std.meta.eql(root.fence.route, frozen.route) or root.fence.table_id != frozen.table_id or root.fence.metadata_group_id != frozen.metadata_group_id or !std.meta.eql(root.fence.metadata_incarnation, frozen.metadata_incarnation) or root.fence.topology_epoch != frozen.topology_epoch) return error.ChangefeedResynchronizationRequired;
     }
 };
+
+fn duplicateOptional(a: A, value: ?[]const u8) !?[]const u8 {
+    if (value) |bytes| return try a.dupe(u8, bytes);
+    return null;
+}
 
 pub const test_support = if (@import("builtin").is_test) struct {
     const Fixture = struct {

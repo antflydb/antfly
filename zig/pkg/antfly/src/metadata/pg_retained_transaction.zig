@@ -123,12 +123,14 @@ pub fn encode(a: A, state: feeds.State, page: history.Page, relation: relation_v
     return .{ .arena = arena, .messages = messages, .candidate = candidate };
 }
 
-/// Source policy owns route qualification and publication membership. Its read
-/// returns one complete frame after the supplied private retained position.
+/// Source policy authorizes the complete publication and qualifies the relation
+/// for the captured schema. The retained transport owns physical routing.
 pub fn Producer(comptime Policy: type) type {
     return struct {
         policy: *Policy,
         allocator: A,
+        source: @import("../api/history_roots.zig").Source,
+        page_events: u32 = 1024,
         byte_limit: usize,
         const Self = @This();
         const Spec = feeds.pg_slot.spool_control.Spec;
@@ -150,11 +152,11 @@ pub fn Producer(comptime Policy: type) type {
             const positions = try state.rootsAt(a, slot.mapped_cursor);
             defer a.free(positions);
             const position = positions[0].delivered;
-            var page = (try self.policy.read(a, state, position, request)) orelse return null;
+            const now = try self.nowSeconds(request);
+            var page = (try self.source.readRelationalFrame(a, state, position, now, self.page_events, try self.policy.context(request))) orelse return null;
             defer page.deinit();
             const header = page.header orelse return error.InvalidPgSpool;
             const relation = try self.policy.relation(state, header, request);
-            const now = try self.nowSeconds(request);
             if (now >= state.expires_at or now < state.created_at or header.committed_at_ns <= 0)
                 return error.ChangefeedResynchronizationRequired;
             // Preflight runs again before an issue receipt exists. Tie its

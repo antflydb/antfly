@@ -38,7 +38,7 @@ fn checksum(prefix: []const u8, payload: []const u8, request: pages.Request) [32
     hash.update(payload);
     return hash.finalResult();
 }
-fn validate(page: pages.Page, request: pages.Request) !void {
+pub fn validate(page: pages.Page, request: pages.Request) !void {
     if (request.max_events == 0 or request.max_events > 1024 or request.max_bytes == 0 or request.max_bytes > frame.max_bytes) return error.InvalidHistoryAdmission;
     if (page.events.len > request.max_events or page.first_ordinal != request.after.event) return error.HistoryCorrupt;
     if (page.header) |header| {

@@ -271,6 +271,11 @@ pub fn runRetainedUpload() !void {
     const schema_api = local.schema_mod;
     const Rows = local.storage_db_algebraic_relational_row_codec;
     const values = @import("pgwire/values.zig");
+    const routes = @import("api/history_roots.zig");
+    const catalog = @import("api/table_catalog.zig");
+    const operation = @import("api/history_page_operations.zig");
+    const metadata_api = @import("metadata/api.zig");
+    const Context = local.api_operation.RequestContext;
     const schema_json =
         \\{"version":7,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}}}}
     ;
@@ -278,6 +283,30 @@ pub fn runRetainedUpload() !void {
         clock: u64 = 110,
         before: []const u8,
         after: []const u8,
+        generation: *catalog.RoutingGeneration,
+        vary_header: bool = false,
+
+        fn acquire(raw: *anyopaque, budget: catalog.RoutingBudget, authoritative: bool) !*catalog.RoutingGeneration {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try budget.checkpoint();
+            try std.testing.expect(authoritative);
+            self.generation.retain();
+            return self.generation;
+        }
+        fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+        fn source(self: *@This()) routes.Source {
+            return .{
+                .catalog = .{ .ptr = self, .vtable = &.{ .admin_snapshot = admin, .free_admin_snapshot = undefined, .acquire_routing_generation = acquire } },
+                .controls = undefined,
+                .pages = .{ .ptr = self, .read_fn = read },
+                .grants = undefined,
+            };
+        }
+        pub fn context(_: *@This(), _: Request) !Context {
+            return .{};
+        }
 
         pub fn authorize(_: *@This(), state: control.State, request: Request) !void {
             try request.ensureActive();
@@ -286,15 +315,23 @@ pub fn runRetainedUpload() !void {
         pub fn nowSeconds(self: *@This(), _: Request) !u64 {
             return self.clock;
         }
-        pub fn read(self: *@This(), allocator: A, _: control.State, position: control.Position, _: Request) !?history.Page {
-            if (position.sequence == 11) return null;
-            if (position.sequence != 10 or position.event != 0) return error.TestUnexpectedResult;
+        fn read(raw: *anyopaque, allocator: A, fence: metadata_api.CatalogRouteFence, name: []const u8, input: operation.Request, _: Context) !history.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("rows", name);
+            try std.testing.expectEqual(@as(u64, 1), fence.route.group_id);
+            try std.testing.expectEqual(namespace(), input.request.reference.namespace);
+            try std.testing.expectEqual(@as(u64, 1), input.request.reference.epoch);
+            try std.testing.expectEqual(@as(u64, 2), input.request.reference.grant);
+            try std.testing.expectEqual(@as(u32, 1), input.request.max_events);
+            const position = input.request.after;
+            if (position.sequence != 10 or position.event > 1) return error.TestUnexpectedResult;
+            const second = position.event == 1;
             var arena = std.heap.ArenaAllocator.init(allocator);
             errdefer arena.deinit();
             const scratch = arena.allocator();
             const events = try scratch.dupe(@typeInfo(@FieldType(history.Page, "events")).pointer.child, &.{.{
-                .key = "key",
-                .before = try scratch.dupe(u8, self.before),
+                .key = if (second) "key-b" else "key-a",
+                .before = if (second) null else try scratch.dupe(u8, self.before),
                 .after = try scratch.dupe(u8, self.after),
             }});
             return .{
@@ -302,17 +339,18 @@ pub fn runRetainedUpload() !void {
                 .header = .{
                     .namespace = namespace(),
                     .sequence = 11,
-                    .transaction_id = @splat(9),
+                    .transaction_id = if (second and self.vary_header) @splat(8) else @splat(9),
                     .transaction_scope = .root_local,
                     .committed_at_ns = 108 * std.time.ns_per_s,
                     .schema_before = schema_json,
                     .schema_after = schema_json,
                 },
                 .events = events,
-                .frame_events = 1,
-                .next = .{ .sequence = 11 },
+                .first_ordinal = position.event,
+                .frame_events = 2,
+                .next = if (second) .{ .sequence = 11 } else .{ .sequence = 10, .event = 1 },
                 .observed_latest = 11,
-                .caught_up = true,
+                .caught_up = second,
             };
         }
         pub fn relation(_: *@This(), _: control.State, _: anytype, _: Request) !values.HistoricalRelation {
@@ -323,7 +361,24 @@ pub fn runRetainedUpload() !void {
     defer input.deinit();
     const scratch = input.allocator();
     const schema = try schema_api.deriveRuntimeTableSchema(scratch, try schema_api.parseValidatedTableSchema(scratch, schema_json));
+    const table: Table = .{ .table_id = 7, .name = "rows", .schema_json = schema_json };
+    var tables = [_]Table{table};
+    var ranges = [_]@import("metadata/table_manager.zig").RangeRecord{.{
+        .table_id = 7,
+        .group_id = 1,
+        .range_id = 1,
+        .start_key = "",
+        .end_key = null,
+    }};
+    const generation = try catalog.RoutingGeneration.create(a, .{
+        .metadata_group_id = 1,
+        .catalog_revision = 2,
+        .tables = &tables,
+        .ranges = &ranges,
+    }, .{});
+    defer generation.release();
     var policy: Policy = .{
+        .generation = generation,
         .before = try Rows.serializeOrdinal(scratch, schema.version, schema.relational_columns, &.{
             .{ .ordinal = 0, .path = "id", .value_type = .i64_val, .value = .{ .i64_val = 17 } },
         }, @splat(0)),
@@ -331,7 +386,7 @@ pub fn runRetainedUpload() !void {
             .{ .ordinal = 0, .path = "id", .value_type = .i64_val, .value = .{ .i64_val = 18 } },
         }, @splat(0)),
     };
-    var producer: retained.Producer(Policy) = .{ .policy = &policy, .allocator = a, .byte_limit = 1024 };
+    var producer: retained.Producer(Policy) = .{ .policy = &policy, .allocator = a, .source = policy.source(), .page_events = 1, .byte_limit = 1024 };
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -344,7 +399,6 @@ pub fn runRetainedUpload() !void {
     var registry: Registry = .{ .fs = &fs };
     const id = control.pg_slot.feedId(@splat(1), "retained_wire");
     var svc: fixture.Service = .{ .store = &meta, .id = id };
-    const table: Table = .{ .table_id = 7, .name = "rows", .schema_json = schema_json };
     try meta.applyStandaloneCommand(group, .{ .upsert_table = table });
     try svc.mutate(a, .{ .create = .{ .id = id, .definition = .{ .owner = @splat(1), .authorization = @splat(2), .projection = .rows, .tables = &.{.{ .table_id = 7, .binding = control.tableBinding(table), .policy_revision = 1, .contract = .native_relational }} }, .now = 100, .expires_at = 1000 } });
     try svc.mutate(a, .{ .plan_roots = &.{.{ .namespace = namespace(), .ownership_epoch = 1 }} });
@@ -354,6 +408,9 @@ pub fn runRetainedUpload() !void {
     const session: control.pg_slot.Session = .{ .actor = @splat(2), .fence = 1 };
     try svc.mutate(a, .{ .slot = .{ .bind = .{ .session = session, .now = 101, .binding = .{ .publications = &.{"rows_pub"}, .projection = @splat(8) } } } });
     const cfg: upload.Config = .{ .require_shared = false };
+    policy.vary_header = true;
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, upload.drive(&svc, &registry, &producer, a, id, session, cfg, Request{}));
+    policy.vary_header = false;
     try std.testing.expectEqual(.staged, (try upload.drive(&svc, &registry, &producer, a, id, session, cfg, Request{})).status);
     policy.clock = 120;
     try std.testing.expectEqual(.reserved, (try upload.drive(&svc, &registry, &producer, a, id, session, cfg, Request{})).status);
@@ -363,7 +420,7 @@ pub fn runRetainedUpload() !void {
     var state = try svc.load(a);
     defer state.deinit();
     const record = state.value.slot.?.spool.find(published.reservation).?;
-    try std.testing.expectEqual(@as(u32, 4), record.spec.messages);
+    try std.testing.expectEqual(@as(u32, 5), record.spec.messages);
     try std.testing.expectEqual(@as(u64, 100), record.spec.start_lsn);
     try std.testing.expectEqual(record.spec.start_lsn + record.spec.bytes, state.value.slot.?.next_lsn);
     try std.testing.expectEqual(record.spec.after, state.value.slot.?.mapped_cursor);
