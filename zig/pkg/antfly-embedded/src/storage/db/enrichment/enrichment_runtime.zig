@@ -18557,65 +18557,90 @@ fn recordAssetProducerFailure(runtime: *EnrichmentRuntime, window: *GeneratedRep
 /// Bounded map of submitted ordered outputs (see `submitted_outputs`).
 const SubmittedOutputs = struct {
     const max_entries: usize = 256;
+    /// Resubmissions per output before the provider runs again, so an
+    /// output the owner keeps rejecting is regenerated rather than retried
+    /// forever.
+    const max_resubmits: u8 = 3;
+    const Entry = struct { output: []u8, resubmits: u8 = 0 };
     mutex: std.atomic.Mutex = .unlocked,
-    entries: std.AutoHashMapUnmanaged([32]u8, []u8) = .empty,
+    entries: std.AutoHashMapUnmanaged([32]u8, Entry) = .empty,
 
     fn lock(self: *SubmittedOutputs) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
 
-    fn deinit(self: *SubmittedOutputs, alloc: Allocator) void {
+    fn clear(self: *SubmittedOutputs, alloc: Allocator) void {
         var it = self.entries.valueIterator();
-        while (it.next()) |value| alloc.free(value.*);
+        while (it.next()) |entry| alloc.free(entry.output);
+        self.entries.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *SubmittedOutputs, alloc: Allocator) void {
+        self.clear(alloc);
         self.entries.deinit(alloc);
     }
 
-    /// A copy of the output submitted for `key`, if any.
+    /// A copy of the output submitted for `key` to resubmit, if any.
     fn getAlloc(self: *SubmittedOutputs, alloc: Allocator, key: [32]u8) !?[]u8 {
         self.lock();
         defer self.mutex.unlock();
-        const value = self.entries.get(key) orelse return null;
-        return try alloc.dupe(u8, value);
+        const entry = self.entries.getPtr(key) orelse return null;
+        if (entry.resubmits >= max_resubmits) {
+            alloc.free(entry.output);
+            _ = self.entries.remove(key);
+            return null;
+        }
+        entry.resubmits += 1;
+        return try alloc.dupe(u8, entry.output);
     }
 
     fn put(self: *SubmittedOutputs, alloc: Allocator, key: [32]u8, output: []const u8) !void {
-        const owned = try alloc.dupe(u8, output);
-        errdefer alloc.free(owned);
         self.lock();
         defer self.mutex.unlock();
-        if (self.entries.fetchRemove(key)) |old| alloc.free(old.value);
+        // A resubmission of the same bytes keeps its count.
+        if (self.entries.getPtr(key)) |entry| if (std.mem.eql(u8, entry.output, output)) return;
+        const owned = try alloc.dupe(u8, output);
+        errdefer alloc.free(owned);
+        if (self.entries.fetchRemove(key)) |old| alloc.free(old.value.output);
         // Bound memory: a lost entry only costs one extra provider call.
-        if (self.entries.count() >= max_entries) {
-            var it = self.entries.valueIterator();
-            while (it.next()) |value| alloc.free(value.*);
-            self.entries.clearRetainingCapacity();
-        }
-        try self.entries.put(alloc, key, owned);
+        if (self.entries.count() >= max_entries) self.clear(alloc);
+        try self.entries.put(alloc, key, .{ .output = owned });
     }
 
     fn remove(self: *SubmittedOutputs, alloc: Allocator, key: [32]u8) void {
         self.lock();
         defer self.mutex.unlock();
-        if (self.entries.fetchRemove(key)) |old| alloc.free(old.value);
+        if (self.entries.fetchRemove(key)) |old| alloc.free(old.value.output);
     }
 };
 
-/// Exact producer-input identity of an ordered asset item: the catalog
-/// authority, the token's captured inputs, the output key and the rendered
-/// producer text. Null for unordered (local) items.
+/// Producer-input identity of an ordered asset item. Null for unordered
+/// (local) items.
 fn submittedOutputKey(item: *AssetProducerBatchItem) !?[32]u8 {
+    // What the provider output depends on: producer, rendered input, output
+    // and the exact source contents (plus any context identity). Catalog
+    // epochs and guard revisions are excluded: they can advance between
+    // attempts without changing the output, and the owner re-validates every
+    // resubmission against the current catalog.
     const token = if (item.producer_context) |*value| value else return null;
-    const command = try token.command(&.{});
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly-submitted-output-v1\x00");
-    hash.update(&command.catalog_digest);
-    var epoch: [8]u8 = undefined;
-    std.mem.writeInt(u64, &epoch, command.authority_epoch, .little);
-    hash.update(&epoch);
-    hash.update(&command.inputDigest());
-    hash.update(item.artifact_key);
-    hash.update(&.{0});
-    hash.update(item.source_text);
+    hash.update("antfly-submitted-output-v2\x00");
+    var tag: [8]u8 = undefined;
+    std.mem.writeInt(u64, &tag, @intFromEnum(item.producer_type), .little);
+    hash.update(&tag);
+    for ([_][]const u8{ item.config_json, item.artifact_key, item.source_text, if (item.source_parts_json) |parts| parts else "" }) |part| {
+        std.mem.writeInt(u64, &tag, part.len, .little);
+        hash.update(&tag);
+        hash.update(part);
+    }
+    for (token.sources()) |source| {
+        std.mem.writeInt(u64, &tag, source.document_key.len, .little);
+        hash.update(&tag);
+        hash.update(source.document_key);
+        hash.update(&.{@intFromBool(source.exists)});
+        hash.update(&source.content_digest);
+    }
+    if (token.execution_identity) |identity| hash.update(&identity);
     var key: [32]u8 = undefined;
     hash.final(&key);
     return key;
@@ -19849,10 +19874,10 @@ fn applyAssetProducerBatchOutput(
         // rather than invoking the provider again for the same input.
         const submitted = try submittedOutputKey(item);
         if (submitted) |key| try runtime.submitted_outputs.put(runtime.alloc, key, produced);
-        enqueueAssetProducerOutput(runtime, item.request, value, item.artifact_key, validated) catch |err| {
-            if (err != error.ArtifactPublicationPending) if (submitted) |key| runtime.submitted_outputs.remove(runtime.alloc, key);
-            return err;
-        };
+        // Keep the output across retries (pending, catalog activation drift,
+        // owner rejections); only acceptance retires it. The output depends
+        // on the producer input alone, and every resubmission is validated.
+        try enqueueAssetProducerOutput(runtime, item.request, value, item.artifact_key, validated);
         if (submitted) |key| runtime.submitted_outputs.remove(runtime.alloc, key);
         return;
     }
@@ -50824,4 +50849,25 @@ test "commit requirements revision binding rejection is permanent" {
         try std.testing.expect(!isRetryableEnrichmentError(err));
         try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(err));
     }
+}
+
+test "submitted ordered outputs are reused a bounded number of times until retired" {
+    const alloc = std.testing.allocator;
+    var outputs: SubmittedOutputs = .{};
+    defer outputs.deinit(alloc);
+    const key: [32]u8 = @splat(1);
+    try std.testing.expect((try outputs.getAlloc(alloc, key)) == null);
+    try outputs.put(alloc, key, "output");
+    for (0..SubmittedOutputs.max_resubmits) |_| {
+        const reused = (try outputs.getAlloc(alloc, key)).?;
+        defer alloc.free(reused);
+        try std.testing.expectEqualStrings("output", reused);
+        // Resubmitting the same bytes does not reset the count.
+        try outputs.put(alloc, key, reused);
+    }
+    // An output the owner kept rejecting is regenerated.
+    try std.testing.expect((try outputs.getAlloc(alloc, key)) == null);
+    try outputs.put(alloc, key, "fresh");
+    outputs.remove(alloc, key);
+    try std.testing.expect((try outputs.getAlloc(alloc, key)) == null);
 }
