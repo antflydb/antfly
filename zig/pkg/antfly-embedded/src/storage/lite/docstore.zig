@@ -3191,6 +3191,18 @@ pub const Store = struct {
     /// lease at all, or while a maintenance snapshot (a second NativeFile
     /// on the same inode) held the writer and was publishing.
     background_write_admission: ?BackgroundWriteAdmission = null,
+    /// Set by an owner whose writer-lane admission (capi Lite) can be ahead
+    /// of this Store's own commit queue: a caller it has already let through
+    /// `WriterLane.checkout` is validating and staging its write (parsing,
+    /// applying mutations, building the replication payload) before it ever
+    /// reaches `enqueue`. `driveMutationCoordinator` consults this only once
+    /// its own queue has drained to empty, to decide whether to wait briefly
+    /// for that caller instead of going idle -- see its own use for why.
+    pending_admission_hint: ?PendingAdmissionHint = null,
+    /// Duration of the last durable group commit; bounds how long a leader
+    /// waits for a staging writer (`driveMutationCoordinator`). Written by
+    /// the leader only.
+    last_group_sync_ns: i96 = 0,
     /// Set on a maintenance snapshot's store (lite-writer-authority.md
     /// W1, W3): the snapshot computes on its own pinned state, but every
     /// write it makes -- queued commits and direct store maintenance -- is
@@ -5659,6 +5671,16 @@ pub const Store = struct {
         leave: *const fn (*anyopaque) void,
     };
 
+    /// See `pending_admission_hint`. `active` is a racy, best-effort read
+    /// (no lock ordering promised against the admission side): a false
+    /// positive only costs one bounded extra wait below, and a false
+    /// negative only costs a missed sharing opportunity, never a
+    /// correctness problem either way.
+    pub const PendingAdmissionHint = struct {
+        ptr: *anyopaque,
+        active: *const fn (*anyopaque) bool,
+    };
+
     fn enterBackgroundWrite(self: *Store) bool {
         const admission = self.background_write_admission orelse return true;
         return admission.try_enter(admission.ptr);
@@ -6147,8 +6169,25 @@ pub const Store = struct {
     /// the deferred-publication path and never actually fsync.
     fn driveMutationCoordinator(self: *Store, force_durable: bool, own_request: ?*MutationRequest) void {
         const io = self.file.runtime();
+        // Group commit: writers stage one at a time under the writer lane,
+        // so a writer still staging when this leader drains would otherwise
+        // pay its own sync right after this one. Wait for it, but never
+        // longer than one sync costs (the last group's), since past that
+        // it is cheaper for the late writer to lead its own group.
+        const pending_admission_max_wait_ns: i96 = 2 * std.time.ns_per_ms;
+        const pending_admission_poll_ns: i96 = 25 * std.time.ns_per_us;
+        var pending_admission_waited_ns: i96 = 0;
         while (true) {
             self.commit_mutex.lockUncancelable(io);
+            if (self.pending_admission_hint) |hint| {
+                const budget = @min(pending_admission_max_wait_ns, self.last_group_sync_ns);
+                while (pending_admission_waited_ns < budget and self.non_ride_along_pending_count != 0 and hint.active(hint.ptr)) {
+                    self.commit_mutex.unlock(io);
+                    io.sleep(.fromNanoseconds(@intCast(pending_admission_poll_ns)), .awake) catch {};
+                    pending_admission_waited_ns += pending_admission_poll_ns;
+                    self.commit_mutex.lockUncancelable(io);
+                }
+            }
             const batch = self.drainMutationBatchLocked();
             const head = batch.head orelse {
                 self.commit_draining = false;
@@ -6156,6 +6195,7 @@ pub const Store = struct {
                 self.commit_mutex.unlock(io);
                 break;
             };
+            pending_admission_waited_ns = 0;
             self.commit_mutex.unlock(io);
 
             if (@import("builtin").is_test) {
@@ -6431,7 +6471,9 @@ pub const Store = struct {
         // knows whether to relock. Two different commits' gates are never
         // confused with each other, since each owns its own stack frame.
         var sync_gate: SyncExclusiveGate = .{ .store = self };
+        const commit_started = std.Io.Clock.awake.now(self.file.runtime()).nanoseconds;
         try self.file.commitTransactionWithDurability(durable, .{ .context = &sync_gate, .release = releaseStoreMutexForSync, .reacquire = reacquireStoreMutexAfterSync });
+        if (durable) self.last_group_sync_ns = std.Io.Clock.awake.now(self.file.runtime()).nanoseconds - commit_started;
         // Regression-B test hook: stamp every member with the sequence this
         // group's commit just landed at, while `self.mutex` is still held
         // (acquired at this function's top) so no other group can have

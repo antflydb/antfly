@@ -10750,6 +10750,10 @@ test "WS3 writer lane: concurrent public-API writers share group-commit fsyncs" 
     // one fsync in the worst case of zero sharing).
     try std.testing.expect(shared_per_write <= solo_per_write + 0.01);
     try std.testing.expect(separate_per_write <= solo_per_write + 0.01);
+    // Writers on separate handles must actually share syncs: the leader
+    // waits (bounded by one sync) for a writer still staging under the
+    // lane. Measured about 0.5x solo in Debug; 0.9x leaves room for load.
+    try std.testing.expect(separate_per_write <= solo_per_write * 0.9);
 }
 
 /// `connection.owner.current`'s live `Store` (docstore.zig), for the WS3

@@ -1190,6 +1190,10 @@ pub const WriterLane = struct {
     /// checked-out writer; the read takes no kernel lock and leaves a
     /// parked lease parked.
     reading: bool = false,
+    /// Thread that last checked the lane out; meaningful only while
+    /// `checked_out`. Lets the commit leader tell a different writer still
+    /// staging (worth waiting for) from its own unreleased checkout.
+    holder: std.Thread.Id = 0,
     /// Same-process readers currently relying on this lane's kernel
     /// lease staying held through a *synthetic* (kernel-lock-free) lease
     /// of their own -- see `PathGate.pinLocalWriterLeaseForRead` and
@@ -1331,11 +1335,13 @@ pub const WriterLane = struct {
             if (if (self.reading) null else self.parked) |parked| {
                 self.parked = null;
                 self.checked_out = true;
+                self.holder = std.Thread.getCurrentId();
+                self.holder = std.Thread.getCurrentId();
                 const likely_root = self.last_root;
                 self.mutex.unlock(io);
-                if (likely_root != null and likely_root == connection.owner.current and
-                    !mightNeedRefreshAdmission(connection, likely_root.?, intent))
-                {
+                const take_fast_path = likely_root != null and likely_root == connection.owner.current and
+                    !mightNeedRefreshAdmission(connection, likely_root.?, intent);
+                if (take_fast_path) {
                     const root = likely_root.?;
                     connection.current = root;
                     connection.attach(root);
@@ -1376,6 +1382,8 @@ pub const WriterLane = struct {
             }
             if (!self.checked_out and !self.reading) {
                 self.checked_out = true;
+                self.holder = std.Thread.getCurrentId();
+                self.holder = std.Thread.getCurrentId();
                 self.mutex.unlock(io);
                 // Cold path: nothing parked yet. Do the full admission
                 // dance exactly as a non-lane call would, then keep the
@@ -1464,6 +1472,7 @@ pub const WriterLane = struct {
         defer self.mutex.unlock(io);
         if (self.checked_out or self.reading) return .busy;
         self.checked_out = true;
+        self.holder = std.Thread.getCurrentId();
         const lease = self.parked orelse return .fresh;
         self.parked = null;
         self.parked_store = null;
@@ -1940,6 +1949,7 @@ pub const WriterLane = struct {
         self.parked = null;
         self.foreign_release_due = false;
         self.checked_out = true;
+        self.holder = std.Thread.getCurrentId();
         const store = self.parked_store;
         self.parked_store = null;
         self.mutex.unlock(io);
@@ -4799,6 +4809,7 @@ pub const Connection = struct {
         std.debug.assert(!self.attached);
         if (root.owned_lite_backend) |*backend| if (backend.native_docstore) |store| {
             store.background_write_admission = .{ .ptr = &self.owner.writer_lane, .try_enter = backgroundWriteRefused, .leave = backgroundWriteLeave };
+            store.pending_admission_hint = .{ .ptr = &self.owner.writer_lane, .active = pendingAdmissionActive };
         };
         std.debug.assert(root.sql_sessions.count() == 0 and root.sql_cursors.count() == 0);
         root.lite_connection_context = self;
@@ -4826,6 +4837,22 @@ pub const Connection = struct {
     }
 
     fn backgroundWriteLeave(_: *anyopaque) void {}
+
+    /// `Store.PendingAdmissionHint`: whether exactly one writer is
+    /// currently between this lane's `checkout` and the matching
+    /// `checkin` -- admitted to validate and stage its write, but not
+    /// yet enqueued (see `checked_out`'s own doc comment). Reads
+    /// `checked_out` under the lane's own mutex: cheap and never
+    /// contended by this call, since neither `checkout` nor `checkin`
+    /// ever touches a `Store`'s `commit_mutex` (the lock this hint is
+    /// read under), so there is no lock-ordering cycle between them.
+    fn pendingAdmissionActive(ptr: *anyopaque) bool {
+        const lane: *WriterLane = @ptrCast(@alignCast(ptr));
+        const io = h.handleLockIo();
+        lane.mutex.lockUncancelable(io);
+        defer lane.mutex.unlock(io);
+        return lane.checked_out and lane.holder != std.Thread.getCurrentId();
+    }
 
     pub fn detach(self: *Connection) void {
         if (!self.attached) return;
