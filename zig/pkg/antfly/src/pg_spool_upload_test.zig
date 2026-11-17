@@ -162,7 +162,8 @@ fn runImpl(with_stream: bool) !void {
     var fs = try FsStore.init(a, path);
     defer fs.deinit();
     var meta = try Store.init(a, .{ .root_dir = meta_path });
-    defer meta.deinit();
+    var metadata_open = true;
+    defer if (metadata_open) meta.deinit();
     const id = control.pg_slot.feedId(@splat(1), "upload_slot");
     var svc: fixture.Service = .{ .store = &meta, .id = id };
     var registry: Registry = .{ .fs = &fs };
@@ -261,7 +262,7 @@ fn runImpl(with_stream: bool) !void {
     defer collected.deinit();
     try std.testing.expectEqual(@as(u64, 2), collected.value.slot.?.spool.collected_through);
     try std.testing.expectEqual(try control.pg_slot.spool_control.reservationBytes(104), collected.value.slot.?.spool.charged_bytes);
-    if (with_stream) try @import("pg_spool_stream_test.zig").run(&svc, &registry, producer.clock);
+    if (with_stream) try @import("pg_spool_stream_test.zig").run(&svc, &registry, producer.clock, meta_path, &metadata_open);
 }
 
 pub fn runRetainedUpload() !void {

@@ -49,7 +49,7 @@ fn recvLogical(a: A, program: []const u8, dsn: []const u8, start: []const u8) ![
     return child.stdout;
 }
 
-pub fn run(svc: anytype, registry: anytype, clock: u64) !void {
+pub fn run(svc: anytype, registry: anytype, clock: u64, metadata_path: []const u8, metadata_open: *bool) !void {
     const Host = struct {
         service: *const Port,
         registry: @TypeOf(registry),
@@ -74,12 +74,14 @@ pub fn run(svc: anytype, registry: anytype, clock: u64) !void {
             return self.clock;
         }
         pub fn failedOpen(self: *@This()) void {
-            retained.releaseActor(self.service, self, std.testing.allocator, self.id, self.actor, close_context) catch {
+            retained.releaseActor(self.service, self, std.testing.allocator, self.id, self.actor, close_context) catch |err| {
+                std.debug.print("retained stream actor release failed: {s}\n", .{@errorName(err)});
                 self.close_errors += 1;
             };
         }
         pub fn closed(self: *@This(), owner: *retained.Owner) void {
-            owner.release(self.service, self, std.testing.allocator, close_context) catch {
+            owner.release(self.service, self, std.testing.allocator, close_context) catch |err| {
+                std.debug.print("retained stream lease release failed: {s}\n", .{@errorName(err)});
                 self.close_errors += 1;
             };
             self.closes += 1;
@@ -157,13 +159,33 @@ pub fn run(svc: anytype, registry: anytype, clock: u64) !void {
         try std.testing.expectEqual(@as(u8, 'B'), payload[0]);
         try std.testing.expectEqual(@as(u8, 'C'), payload[82]);
 
-        const replay = try recvLogical(a, program, dsn, "--startpos=0/69");
-        defer a.free(replay);
-        try std.testing.expectEqual(@as(usize, 0), replay.len);
         listener.deinit();
-        var acknowledged = try svc.load(a);
-        defer acknowledged.deinit();
-        try std.testing.expectEqual(@as(u64, 105), acknowledged.value.slot.?.confirmed_lsn);
+
+        metadata_open.* = false;
+        svc.store.deinit();
+        const Store = @typeInfo(@TypeOf(svc.store)).pointer.child;
+        svc.store.* = try Store.init(a, .{ .root_dir = metadata_path });
+        metadata_open.* = true;
+        {
+            var acknowledged = try svc.load(a);
+            defer acknowledged.deinit();
+            try std.testing.expectEqual(@as(u64, 105), acknowledged.value.slot.?.confirmed_lsn);
+            try std.testing.expect(acknowledged.value.slot.?.session == null);
+        }
+
+        var restarted: Host = .{ .service = &metadata, .registry = registry, .id = svc.id, .clock = clock + 1, .actor = @splat(4) };
+        var replacement = try server.start(a, .{ .io = std.testing.io, .backend = restarted.source(), .bind_port = 0, .limits = .{ .replication_keepalive_ms = 50 } });
+        defer replacement.deinit();
+        const replacement_dsn = try std.fmt.allocPrint(a, "host=127.0.0.1 port={d} dbname=db user=alice password=pw sslmode=disable gssencmode=disable", .{replacement.address().getPort()});
+        defer a.free(replacement_dsn);
+        const replay = try recvLogical(a, program, replacement_dsn, "--startpos=0/69");
+        defer a.free(replay);
+        if (replay.len != 0) return error.UnexpectedReplay;
+        replacement.deinit();
+        var confirmed = try svc.load(a);
+        defer confirmed.deinit();
+        try std.testing.expectEqual(@as(u64, 105), confirmed.value.slot.?.confirmed_lsn);
+        try std.testing.expect(confirmed.value.slot.?.session == null);
         return;
     }
     // Real CopyBoth reads the actual slot/spool implementation. The wire client
