@@ -511,7 +511,7 @@ pub const Builder = struct {
 
     /// Recover half storage only through exact widening and layout operations.
     /// F32 probabilities/reductions are never silently rounded to fit a GEMM.
-    fn provenBf16(self: *Builder, value: Id) anyerror!?Id {
+    pub fn provenBf16(self: *Builder, value: Id) anyerror!?Id {
         const inst = self.getInst(value).*;
         if (inst.shape.element_type == .bf16) return value;
         if (inst.shape.element_type != .f32) return null;

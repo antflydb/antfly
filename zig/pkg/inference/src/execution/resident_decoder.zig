@@ -56,12 +56,28 @@ pub const Decoder = struct {
     control: ?Control = null,
     reservation: @import("../backends/session.zig").RunPermit,
 
+    /// Decline optional caching only before provider allocation/execution. A
+    /// short request cannot amortize prefill padding, and a denied cache bank
+    /// must not prevent an otherwise admissible full-prefix PJRT request.
+    pub fn initForRequest(a: std.mem.Allocator, source: Session, requested: ?bool, limit: usize, max_tokens: usize, control: ?Control) !?Decoder {
+        if (requested == null and max_tokens <= 1) return null;
+        if (!try select(source, requested)) return null;
+        return init(a, source, limit, control) catch |err| {
+            if (requested == null and err == error.ResourceLimitExceeded) return null;
+            return err;
+        };
+    }
+
     pub fn init(a: std.mem.Allocator, source: Session, limit: usize, control: ?Control) !Decoder {
+        if (control) |active| try active.check();
         const cfg = (source.model_contract.decoder_config orelse return error.UnsupportedResidentDecode).*;
         if (!try select(source, true)) return error.UnsupportedResidentDecode;
         const capacity = try capacityFor(limit, cfg.max_position_embeddings);
         var elements: usize = 0;
+        var banks: usize = 0;
         for (0..cfg.num_hidden_layers) |layer| {
+            if (!cfg.layerUsesQwen35LinearAttention(layer) and cfg.layerSharesKv(layer)) continue;
+            banks = try std.math.add(usize, banks, 2);
             const layer_elements = if (cfg.layerUsesQwen35LinearAttention(layer)) linear: {
                 const channels = try std.math.add(usize, try std.math.mul(usize, 2, try std.math.mul(usize, cfg.qwen35_linear_num_key_heads, cfg.qwen35_linear_key_head_dim)), try std.math.mul(usize, cfg.qwen35_linear_num_value_heads, cfg.qwen35_linear_value_head_dim));
                 if (cfg.qwen35_linear_conv_kernel_dim == 0) return error.InvalidModelConfig;
@@ -72,9 +88,11 @@ pub const Decoder = struct {
             elements = try std.math.add(usize, elements, layer_elements);
         }
         const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
-        // Two non-donated generations coexist through successful publication;
-        // host zero staging is bounded conservatively by one complete bank.
-        const reservation = try source.withAdmissionControl(control).admitRetainedMedia(try std.math.add(usize, bytes, @sizeOf(f32)), try std.math.add(usize, try std.math.mul(usize, bytes, 2), 2 * @sizeOf(f32)));
+        // Two non-donated generations coexist through publication. Initial
+        // state is produced on device; the host retains only buffer headers.
+        const header_size = if (comptime enabled) @sizeOf(@import("pjrt").pjrt.Buffer) else @sizeOf(usize) * 4;
+        const headers = try std.math.mul(usize, try std.math.add(usize, try std.math.mul(usize, banks, 3), 4), header_size);
+        const reservation = try source.withAdmissionControl(control).admitRetainedState(try std.math.add(usize, headers, 2 * @sizeOf(f32)), try std.math.add(usize, try std.math.mul(usize, bytes, 2), 2 * @sizeOf(f32)));
         return .{ .allocator = a, .source = source, .config = cfg, .capacity = capacity, .limit = limit, .bank_bytes = bytes, .reservation = reservation, .control = control };
     }
     pub fn deinit(self: *Decoder) void {

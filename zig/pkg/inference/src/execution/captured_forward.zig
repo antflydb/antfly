@@ -125,7 +125,7 @@ const Entry = struct {
                 const visibility: ?[]const u8 = for (inputs) |input| {
                     if (std.mem.eql(u8, input.tensor.name, "attention_or_mask")) break input.tensor.data;
                 } else null;
-                entry.resident = try @import("../graph/pjrt_executor.zig").createExecutorWithOptions(allocator, &entry.program.graph, &part, &frame.backend, &frame.backend, client, .{ .resident_capacity = forward.resident_capacity, .resident_visibility = visibility, .precision = forward.precision, .mutable_parameters = entry.program.mutable_parameters }, if (context.pjrt_parameter_store) |store| @ptrCast(@alignCast(store)) else null);
+                entry.resident = try @import("../graph/pjrt_executor.zig").createExecutorWithOptions(allocator, &entry.program.graph, &part, &frame.backend, &frame.backend, client, .{ .resident_capacity = forward.resident_capacity, .resident_initial = forward.resident_initial, .resident_visibility = visibility, .precision = forward.precision, .mutable_parameters = entry.program.mutable_parameters }, if (context.pjrt_parameter_store) |store| @ptrCast(@alignCast(store)) else null);
             } else return error.PjrtNotEnabled;
         } else {
             frame.executable = try executable.prepareWithOptions(allocator, &entry.program, &frame.backend, if (provider.compiled_context != null) .compiled_required else .compiled_preferred, options);
@@ -184,6 +184,7 @@ const Entry = struct {
 const Entries = @import("specialization_cache.zig").Cache(Key, *Entry, Entry.keyOf, Entry.equal);
 
 pub const Cache = struct {
+    build_lane: @import("../execution_control.zig").ExecutionLane = .{},
     mutex: std.atomic.Mutex = .unlocked,
     // Use the common bounded shape working set. A four-entry cache evicted
     // ordinary encoder/decoder prefixes before a repeated task could reuse them.
@@ -215,7 +216,7 @@ pub const Cache = struct {
             allocator.destroy(parameters);
         };
     }
-    fn acquire(self: *Cache, allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input) !*Entry {
+    fn acquire(self: *Cache, allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, control: ?Control) !*Entry {
         // Precision belongs to the program specialization, not model/provider
         // identity: F32 task heads can follow a BF16 encoder on one client.
         if (provider.compiled_context) |context| if (context.requested_backend == .pjrt and context.pjrt_precision != forward.precision) return error.ModelProgramPrecisionMismatch;
@@ -258,16 +259,21 @@ pub const Cache = struct {
             return hit;
         }
         self.mutex.unlock();
+        // Bound cold compiler pressure and coalesce equal misses. Hot lookups
+        // never enter this lane, and cancellation can retire a waiting request.
+        const building = try self.build_lane.acquire(control orelse .{ .request_owned = false, .native_call_policy = .in_process });
+        defer building.release();
+        platform.sync.lockYielding(&self.mutex);
+        if (self.entries.get(key)) |hit| {
+            _ = hit.retain();
+            self.mutex.unlock();
+            return hit;
+        }
+        self.mutex.unlock();
         const built = try Entry.create(allocator, resolved_provider, forward, inputs, key);
         errdefer built.release();
         // Compilation/provider calls never run under the cache metadata lock.
         platform.sync.lockYielding(&self.mutex);
-        if (self.entries.peek(key)) |hit| {
-            _ = hit.retain();
-            self.mutex.unlock();
-            built.release();
-            return hit;
-        }
         self.entries.reserve(allocator) catch |err| {
             self.mutex.unlock();
             return err;
@@ -283,7 +289,7 @@ pub const Cache = struct {
         if (control) |active| try active.check();
         for (inputs) |input| _ = try capture.inputShape(input.tensor);
         if (forward.validate) |validate| try validate(forward.context, inputs);
-        const entry = try self.acquire(model_allocator, provider, forward, inputs);
+        const entry = try self.acquire(model_allocator, provider, forward, inputs, control);
         defer entry.release();
         const frame = try entry.acquireFrame();
         defer entry.returnFrame(frame);
@@ -323,7 +329,7 @@ pub const Cache = struct {
         if (control) |active| try active.check();
         for (inputs) |input| _ = try capture.inputShape(input.tensor);
         if (forward.validate) |validate| try validate(forward.context, inputs);
-        const entry = try self.acquire(model_allocator, provider, forward, inputs);
+        const entry = try self.acquire(model_allocator, provider, forward, inputs, control);
         defer entry.release();
         const frame = try entry.acquireFrame();
         defer entry.returnFrame(frame);
@@ -828,4 +834,82 @@ test "captured prefix working set reuses executables across repeated tasks" {
     try std.testing.expectEqual(@as(u64, 13), cache.entries.stats.builds);
     try std.testing.expectEqual(@as(u64, 13), cache.entries.stats.hits);
     try std.testing.expectEqual(@as(u64, 0), cache.entries.stats.evictions);
+}
+
+test "model program cold requests coalesce builds and share one immutable entry" {
+    const a = std.testing.allocator;
+    const Source = struct {
+        base: TestProvider,
+        io: std.Io,
+        started: std.Io.Event = .unset,
+        proceed: std.Io.Event = .unset,
+        creates: std.atomic.Value(usize) = .init(0),
+        fn create(raw: *anyopaque, allocator: std.mem.Allocator) !ops.ComputeBackend {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.creates.fetchAdd(1, .monotonic);
+            self.started.set(self.io);
+            try self.proceed.wait(self.io);
+            return TestProvider.create(&self.base, allocator);
+        }
+        fn forward(_: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const capture.Input) ![]capture.Output {
+            const value = try cb.fromFloat32Shape(inputs[0].tensor.asFloat32(), &.{ 2, 3 });
+            defer cb.free(value);
+            const result = try cb.add(value, value);
+            errdefer cb.free(result);
+            const outputs = try allocator.alloc(capture.Output, 1);
+            outputs[0] = .{ .name = "double", .value = result };
+            return outputs;
+        }
+    };
+    var source = Source{ .base = .{ .weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } }, .io = std.testing.io };
+    defer source.base.weights.deinitOwned();
+    const provider = Provider{ .context = &source, .create = Source.create, .import = TestProvider.import };
+    const forward = capture.Forward{ .context = &source, .fingerprint = 123, .output_names = &.{"double"}, .run = Source.forward };
+    var input = try Tensor.initFloat32(a, "x", &.{ 2, 3 }, &.{ 1, 2, 3, 4, 5, 6 });
+    defer input.deinit();
+    const inputs = [_]capture.Input{.{ .tensor = input }};
+    var cache = Cache{};
+    defer cache.deinit(a);
+    const Worker = struct {
+        cache: *Cache,
+        provider: Provider,
+        forward: capture.Forward,
+        inputs: []const capture.Input,
+        entry: ?*Entry = null,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.entry = self.cache.acquire(std.testing.allocator, self.provider, self.forward, self.inputs, .{ .io = std.testing.io }) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var workers: [4]Worker = undefined;
+    for (&workers) |*worker| worker.* = .{ .cache = &cache, .provider = provider, .forward = forward, .inputs = &inputs };
+    defer for (workers) |worker| if (worker.entry) |entry| entry.release();
+    var group: std.Io.Group = .init;
+    defer group.cancel(std.testing.io);
+    defer source.proceed.set(std.testing.io);
+    for (&workers) |*worker| try group.concurrent(std.testing.io, Worker.run, .{worker});
+    try source.started.wait(std.testing.io);
+    const waiting = Control{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s };
+    while (true) {
+        platform.sync.lockYielding(&cache.build_lane.mutex);
+        var cursor = cache.build_lane.head;
+        var count: usize = 0;
+        while (cursor) |node| : (cursor = node.next) count += 1;
+        cache.build_lane.mutex.unlock();
+        if (count == workers.len - 1) break;
+        try waiting.check();
+        @import("antfly_platform").time.yieldNow();
+    }
+    try std.testing.expectEqual(@as(usize, 1), source.creates.load(.monotonic));
+    source.proceed.set(std.testing.io);
+    try group.await(std.testing.io);
+    for (workers) |worker| {
+        if (worker.failure) |err| return err;
+        try std.testing.expect(worker.entry.? == workers[0].entry.?);
+    }
+    try std.testing.expectEqual(@as(usize, 1), source.creates.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), cache.specializationCount());
 }

@@ -90,6 +90,7 @@ pub const CompileOptions = struct {
     /// Request-private fixed-capacity state. Position is a runtime scalar;
     /// no sequence-length-specialized decode executables or host KV readbacks.
     resident_capacity: usize = 0,
+    resident_initial: bool = false,
     resident_visibility: ?[]const u8 = null,
     /// Emit graph parameter nodes as HLO parameters instead of embedding their
     /// current f32 values as HLO constants. This is host-assisted and mainly
@@ -266,7 +267,7 @@ pub fn compilePartitionWithOptions(
     defer resident.outputs.deinit(allocator);
     defer resident.nodes.deinit(allocator);
     defer resident.kv.deinit(allocator);
-    if (resident.capacity != 0) resident.position = try resident.input(allocator, &b, &input_bindings_list, &next_param, null_node, hlo.Shape.scalar(.f32));
+    if (resident.capacity != 0) resident.position = if (options.resident_initial) try b.constantScalarF32(0) else try resident.input(allocator, &b, &input_bindings_list, &next_param, null_node, hlo.Shape.scalar(.f32));
     // Prebind this control independently of graph scheduling. It also selects
     // the public logits row; changing prompt length cannot specialize its value.
     if (resident.capacity != 0) for (part.node_ids) |node_id| {
@@ -311,7 +312,7 @@ pub fn compilePartitionWithOptions(
             if (ins.len != 3) return error.UnsupportedShape;
             const attrs = n.op.fused_gated_delta;
             if (resident.capacity != 0) try resident.queryRows(attrs.rows);
-            const initial = if (resident.capacity != 0) try resident.input(allocator, &b, &input_bindings_list, &next_param, node_id, hlo.Shape.init(.f32, &.{ attrs.value_heads, attrs.key_dim, attrs.value_dim })) else null;
+            const initial = if (resident.capacity != 0 and !options.resident_initial) try resident.input(allocator, &b, &input_bindings_list, &next_param, node_id, hlo.Shape.init(.f32, &.{ attrs.value_heads, attrs.key_dim, attrs.value_dim })) else null;
             const emitted = try program.emitWithState(allocator, &b, try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1]), try getHloId(node_map, ins[2]), attrs, reducer_comp.id, recurrent_programs.items.len - 1, initial, resident.valid_rows);
             node_map[nid] = emitted.output;
             if (resident.capacity != 0) try resident.output(allocator, node_id, emitted.state);
@@ -332,7 +333,8 @@ pub fn compilePartitionWithOptions(
                 if (xs.dimensions.len == 3) try resident.queryRows(@intCast(xs.dimensions[2]));
                 if (xs.dimensions.len != 3 or ws.dimensions.len != 3 or xs.dimensions[0] != 1 or xs.dimensions[1] != attrs.groups or ws.dimensions[1] != 1 or ws.dimensions[2] != history + 1 or attrs.strides[0] != 1 or attrs.dilations[0] != 1) return error.UnsupportedResidentDecode;
                 const shape = hlo.Shape.init(.f32, &.{ 1, xs.dimensions[1], history });
-                const past = try resident.input(allocator, &b, &input_bindings_list, &next_param, node_id, shape);
+                var past = if (options.resident_initial) try b.broadcast(try b.constantScalarF32(0), &.{}, shape) else try resident.input(allocator, &b, &input_bindings_list, &next_param, node_id, shape);
+                if (options.precision == .bf16 and (try b.provenBf16(x)) != null) past = try roundBf16(&b, past, true);
                 const combined_shape = hlo.Shape.init(.f32, &.{ 1, xs.dimensions[1], history + xs.dimensions[2] });
                 const combined = try b.concatenate(&.{ past, x }, 2, combined_shape);
                 var conv = try convolutionAttrs(attrs);
@@ -570,8 +572,8 @@ pub fn compilePartitionWithOptions(
                     if ((present_k == null) != (present_v == null)) return error.UnsupportedResidentDecode;
                     if (present_k == null) {
                         if (attrs.skip_kv_write) return error.UnsupportedResidentDecode;
-                        const old_k = try resident.input(allocator, &b, &input_bindings_list, &next_param, ins[1], shape);
-                        const old_v = try resident.input(allocator, &b, &input_bindings_list, &next_param, ins[2], shape);
+                        const old_k = if (options.resident_initial) try b.broadcast(try b.constantScalarF32(0), &.{}, shape) else try resident.input(allocator, &b, &input_bindings_list, &next_param, ins[1], shape);
+                        const old_v = if (options.resident_initial) old_k else try resident.input(allocator, &b, &input_bindings_list, &next_param, ins[2], shape);
                         const zero = try b.constantS32(hlo.Shape.scalar(.s32), &.{0});
                         const position = try b.convertType(resident.position.?, .s32);
                         present_k = try b.dynamicUpdateSlice(old_k, k, &.{ position, zero });
@@ -583,7 +585,12 @@ pub fn compilePartitionWithOptions(
                     }
                     var attention_attrs = attrs;
                     attention_attrs.skip_kv_write = false;
-                    const emitted = try emitStaticGqaAttention(allocator, &b, n, q, present_k.?, present_v.?, null, attention_attrs, &reducer_comp, &max_reducer_comp, null, null, resident.position, options.resident_visibility);
+                    // Prefill produces banks; decode consumes them. Attend
+                    // directly to the initial prompt, not unused future slots.
+                    // A widened BF16 carrier retains its exact storage proof.
+                    const attention_k = if (options.resident_initial) k else if (options.precision == .bf16 and (try b.provenBf16(k)) != null) try roundBf16(&b, present_k.?, true) else present_k.?;
+                    const attention_v = if (options.resident_initial) v else present_v.?;
+                    const emitted = try emitStaticGqaAttention(allocator, &b, n, q, attention_k, attention_v, null, attention_attrs, &reducer_comp, &max_reducer_comp, null, null, resident.position, options.resident_visibility);
                     node_map[nid] = emitted.output;
                     needs_reducer = true;
                     needs_max_reducer = true;

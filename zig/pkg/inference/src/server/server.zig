@@ -38442,6 +38442,7 @@ test "whole-model PJRT generation serves real HTTP responses and refunds request
     const model = handle.get();
     try std.testing.expectEqual(backends_mod.BackendType.pjrt, model.session.backend());
     const domain = node.model_manager.resource_domain.?;
+    const retained_before = domain.admission.snapshot();
     var previous: ?[]u8 = null;
     defer if (previous) |bytes| a.free(bytes);
     for ([_]?bool{ false, true, null }) |cached| {
@@ -38466,6 +38467,8 @@ test "whole-model PJRT generation serves real HTTP responses and refunds request
             const amounts = domain.admission.snapshot();
             try std.testing.expectEqual(@as(usize, 0), amounts.host_scratch_bytes);
             try std.testing.expectEqual(@as(usize, 0), amounts.backend_scratch_bytes);
+            try std.testing.expectEqual(retained_before.host_kv_bytes, amounts.host_kv_bytes);
+            try std.testing.expectEqual(retained_before.backend_kv_bytes, amounts.backend_kv_bytes);
         }
     }
     try std.testing.expect(!usesPjrtGenerationSession(try parseGenerateBackendSelection(.xla, "compiled", "partitioned")));

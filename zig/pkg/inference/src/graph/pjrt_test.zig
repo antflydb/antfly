@@ -999,6 +999,15 @@ test "pjrt_executor: element-wise add end-to-end" {
 }
 
 const ResidentFixture = struct {
+    const Cancel = struct {
+        checks: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks == 2) return error.Cancelled;
+        }
+    };
+
     fn graph(a: std.mem.Allocator, rows: usize, recurrent: bool, bf16: bool, cached: bool) !Graph {
         var g = Graph.init(a);
         errdefer g.deinit();
@@ -1035,7 +1044,7 @@ const ResidentFixture = struct {
         defer a.free(nodes);
         for (nodes, 0..) |*node, i| node.* = @intCast(i);
         const part = Partition{ .backend = .pjrt, .node_ids = nodes, .external_inputs = &.{} };
-        return pjrt_executor.createExecutorWithOptions(a, g, &part, cb, cb, client, .{ .parameter_inputs = true, .resident_capacity = if (cached) 8 else 0, .precision = if (bf16) .bf16 else .f32 }, null);
+        return pjrt_executor.createExecutorWithOptions(a, g, &part, cb, cb, client, .{ .parameter_inputs = true, .resident_capacity = if (cached) 8 else 0, .resident_initial = cached and g.node(g.outputs.items[0]).output_shape.dims[0] > 1, .precision = if (bf16) .bf16 else .f32 }, null);
     }
     fn inputs(a: std.mem.Allocator, g: *Graph, cb: *const ComputeBackend, offset: usize) ![]?CT {
         const values = try a.alloc(?CT, g.nodeCount());
@@ -1058,6 +1067,19 @@ const ResidentFixture = struct {
         }
         return values;
     }
+    fn expectPrecision(reference: []const f32, source: []const f32, actual: []const f32, bf16: bool) !void {
+        var source_error: f64 = 0;
+        var actual_error: f64 = 0;
+        var energy: f64 = 0;
+        for (reference, source, actual) |fp32, baseline, cached| {
+            if (!bf16) try std.testing.expectApproxEqAbs(baseline, cached, 2e-5);
+            energy += @as(f64, fp32) * fp32;
+            source_error += @as(f64, baseline - fp32) * (baseline - fp32);
+            actual_error += @as(f64, cached - fp32) * (cached - fp32);
+        }
+        if (bf16) try std.testing.expect(@sqrt(actual_error / @max(energy, 1e-30)) <= @max(@as(f64, 0.003), 1.5 * @sqrt(source_error / @max(energy, 1e-30))));
+    }
+
     fn release(a: std.mem.Allocator, cb: *const ComputeBackend, values: []?CT) void {
         for (values) |value| if (value) |tensor| cb.free(tensor);
         a.free(values);
@@ -1097,30 +1119,43 @@ test "PJRT resident decoder caches attention and recurrent history transactional
         }
         const expected = try full_outputs[0].toFloat32WithShape(a, full_exec.output_shapes[0]);
         defer a.free(expected);
+        var reference_graph = try ResidentFixture.graph(a, 6, recurrent, false, false);
+        defer reference_graph.deinit();
+        const reference_exec = try ResidentFixture.compile(a, &reference_graph, &cb, &client, false, false);
+        defer reference_exec.partitionExecutor().deinitExecutor();
+        const reference_inputs = try ResidentFixture.inputs(a, &reference_graph, &cb, 0);
+        defer ResidentFixture.release(a, &cb, reference_inputs);
+        var reference_outputs = try reference_exec.executeToBuffers(reference_inputs, .{ .backend = &cb }, a);
+        defer {
+            for (reference_outputs) |*buffer| buffer.deinit();
+            a.free(reference_outputs);
+        }
+        const reference = try reference_outputs[0].toFloat32WithShape(a, reference_exec.output_shapes[0]);
+        defer a.free(reference);
         var state = @import("pjrt_decoder_state.zig").State{ .allocator = a, .capacity = 8 };
         defer state.deinit();
         const width: usize = if (recurrent) 2 else 4;
         for (0..2) |_| {
             const prefill_inputs = try ResidentFixture.inputs(a, &prefill, &cb, 0);
             defer ResidentFixture.release(a, &cb, prefill_inputs);
+            state.admitted_bytes = 0;
+            try std.testing.expectError(error.UnadmittedResidentState, state.run(prefill_exec, &cb, prefill_inputs, 8, 3, a, null));
+            try std.testing.expectEqual(@as(usize, 0), state.buffers.len);
+            state.admitted_bytes = std.math.maxInt(usize);
+            var cancelled_prefill = ResidentFixture.Cancel{};
+            try std.testing.expectError(error.Cancelled, state.run(prefill_exec, &cb, prefill_inputs, 8, 3, a, .{ .ptr = &cancelled_prefill, .check_fn = ResidentFixture.Cancel.check }));
+            try std.testing.expectEqual(@as(usize, 0), state.buffers.len);
+            try std.testing.expectEqual(@as(usize, 0), state.position);
             const first = try state.run(prefill_exec, &cb, prefill_inputs, 8, 3, a, null);
             defer a.free(first);
-            for (first[0 .. 3 * width], expected[0 .. 3 * width]) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 2e-5);
+            try ResidentFixture.expectPrecision(reference[0 .. 3 * width], expected[0 .. 3 * width], first[0 .. 3 * width], bf16);
             for (3..6) |position| {
                 std.debug.print("resident step position={d}\n", .{position});
                 const decode_inputs = try ResidentFixture.inputs(a, &decode, &cb, position);
                 defer ResidentFixture.release(a, &cb, decode_inputs);
                 if (position == 3) {
-                    const Cancel = struct {
-                        checks: usize = 0,
-                        fn check(raw: ?*anyopaque) !void {
-                            const self: *@This() = @ptrCast(@alignCast(raw.?));
-                            self.checks += 1;
-                            if (self.checks == 2) return error.Cancelled;
-                        }
-                    };
-                    var cancellation = Cancel{};
-                    try std.testing.expectError(error.Cancelled, state.run(decode_exec, &cb, decode_inputs, 1, 1, a, .{ .ptr = &cancellation, .check_fn = Cancel.check }));
+                    var cancellation = ResidentFixture.Cancel{};
+                    try std.testing.expectError(error.Cancelled, state.run(decode_exec, &cb, decode_inputs, 1, 1, a, .{ .ptr = &cancellation, .check_fn = ResidentFixture.Cancel.check }));
                     try std.testing.expectEqual(position, state.position);
                     var failed = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
                     try std.testing.expectError(error.OutOfMemory, state.run(decode_exec, &cb, decode_inputs, 1, 1, failed.allocator(), null));
@@ -1128,7 +1163,7 @@ test "PJRT resident decoder caches attention and recurrent history transactional
                 }
                 const next = try state.run(decode_exec, &cb, decode_inputs, 1, 1, a, null);
                 defer a.free(next);
-                for (next, expected[position * width ..][0..width]) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 2e-5);
+                try ResidentFixture.expectPrecision(reference[position * width ..][0..width], expected[position * width ..][0..width], next, bf16);
             }
             try std.testing.expectEqual(@as(usize, 6), state.position);
             const empty = try a.alloc(?CT, decode.nodeCount());

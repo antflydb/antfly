@@ -908,7 +908,7 @@ const DecoderQualification = struct {
         }
         const baseline = @sqrt(source_error / @max(energy, 1e-30));
         const candidate = @sqrt(cached_error / @max(energy, 1e-30));
-        std.debug.print("decoder qualification bf16={} source_relative={d} cached_relative={d} max_difference={d}\n", .{ bf16, baseline, candidate, maximum });
+        std.debug.print("decoder qualification bf16={} source_relative={d} cached_relative={d} max_difference={d} source_token={d} cached_token={d}\n", .{ bf16, baseline, candidate, maximum, std.mem.indexOfMax(f32, source), std.mem.indexOfMax(f32, cached) });
         if (bf16) try std.testing.expect(candidate <= @max(@as(f64, 0.003), baseline * 1.5)) else try std.testing.expect(maximum <= 0.003);
         try std.testing.expectEqual(std.mem.indexOfMax(f32, source), std.mem.indexOfMax(f32, cached));
     }
@@ -932,6 +932,7 @@ test "model program resident decoder qualifies context boundaries and longer con
         "Invoice 12345. Total USD 42.00. Record the number and amount exactly. ",
         "Paris is the capital of France. Explain how sunlight helps plants grow. ",
     };
+    var failures: usize = 0;
     for (starts[0..if (stress) @as(usize, 6) else 4], 0..) |first, case| {
         const encoded = try tokenizer.tokenizer().encode(a, documents[case % documents.len]);
         defer a.free(encoded);
@@ -953,10 +954,15 @@ test "model program resident decoder qualifies context boundaries and longer con
             defer a.free(reference);
             const baseline = try DecoderQualification.reference(bf16_session, history[0..rows], a);
             defer a.free(baseline);
-            try DecoderQualification.accuracy(reference, reference, fp32, false);
-            try DecoderQualification.accuracy(reference, baseline, bf16, true);
+            DecoderQualification.accuracy(reference, reference, fp32, false) catch {
+                failures += 1;
+            };
+            DecoderQualification.accuracy(reference, baseline, bf16, true) catch {
+                failures += 1;
+            };
         }
     }
+    try std.testing.expectEqual(@as(usize, 0), failures);
 }
 
 test "model program resident requests isolate concurrent state and refund failures" {
@@ -981,6 +987,21 @@ test "model program resident requests isolate concurrent state and refund failur
     var denied = session;
     denied.run_admission.?.limits = .{ .host_limit_bytes = 1, .backend_limit_bytes = 1, .scratch_limit_bytes = 1 };
     try std.testing.expectError(error.ResourceLimitExceeded, DecoderQualification.Decoder.init(a, denied, 16, DecoderQualification.control));
+    try std.testing.expect((try DecoderQualification.Decoder.initForRequest(a, denied, null, 16, 8, DecoderQualification.control)) == null);
+    try std.testing.expect((try DecoderQualification.Decoder.initForRequest(a, session, null, 16, 1, DecoderQualification.control)) == null);
+    try std.testing.expect((try DecoderQualification.Decoder.initForRequest(a, unsupported, null, 16, 8, DecoderQualification.control)) == null);
+    try std.testing.expectError(error.ResourceLimitExceeded, DecoderQualification.Decoder.initForRequest(a, denied, true, 16, 8, DecoderQualification.control));
+    try std.testing.expectEqualDeep(baseline, accounting.snapshot());
+    {
+        var bounded = session;
+        bounded.run_admission.?.limits = .{ .host_limit_bytes = 96 * 1024 * 1024, .backend_limit_bytes = 96 * 1024 * 1024, .kv_limit_bytes = 64 * 1024 * 1024, .scratch_limit_bytes = 8192 };
+        var decoder = try DecoderQualification.Decoder.init(a, bounded, 16, DecoderQualification.control);
+        defer decoder.deinit();
+        const held = accounting.snapshot();
+        try std.testing.expect(held.host_kv_bytes + held.backend_kv_bytes > 0);
+        try std.testing.expect(held.host_scratch_bytes < 8192);
+        try std.testing.expectEqual(@as(usize, 0), held.backend_scratch_bytes);
+    }
     try std.testing.expectEqualDeep(baseline, accounting.snapshot());
     const Worker = struct {
         session: DecoderQualification.Session,

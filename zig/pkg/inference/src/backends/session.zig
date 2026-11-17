@@ -3118,6 +3118,15 @@ pub const Session = struct {
             null });
     }
 
+    /// Request-retained decoder banks use the KV quota independently of
+    /// transient operator workspace. CPU provider state is physical host KV.
+    pub fn admitRetainedState(self: Session, host_metadata_bytes: usize, state_bytes: usize) !RunPermit {
+        const admission = self.run_admission orelse return self.retainPermit(.{ .session = self, .lease = null });
+        var amounts = memory.AdmissionAmounts{ .host_scratch_bytes = host_metadata_bytes };
+        if (admission.backend_class == .gpu) amounts.backend_kv_bytes = state_bytes else amounts.host_kv_bytes = state_bytes;
+        return self.retainPermit(.{ .session = self, .lease = try admission.acquireAmounts(amounts) });
+    }
+
     pub fn prepareResidentRetirement(self: Session) !?@import("../execution/resource_retirement.zig").PreparedCharge {
         if (self.run_admission == null) return null;
         return try @import("../execution/resource_retirement.zig").PreparedCharge.prepareForBackend(if (self.backend() == .metal) .metal else null, self.outputInfo().len, try @import("../execution/resource_retirement.zig").outputOriginCapacity(if (self.backend() == .metal) .metal else null, self.outputInfo().len));

@@ -33,6 +33,7 @@ pub const Forward = struct {
     /// belongs to its loaded model, never a process-global checkpoint name.
     fingerprint: u64,
     resident_capacity: usize = 0,
+    resident_initial: bool = false,
     precision: @import("precision.zig").Policy = .f32,
     /// Public output ABI names retained by the model, independent of cache entries.
     output_names: []const []const u8 = &.{},
@@ -67,6 +68,7 @@ pub fn specializationKey(forward: Forward, inputs: []const Input) ![32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(std.mem.asBytes(&forward.fingerprint));
     hash.update(std.mem.asBytes(&forward.resident_capacity));
+    hash.update(&.{@intFromBool(forward.resident_initial)});
     hash.update(&.{@backingInt(forward.precision)});
     for (inputs) |input| {
         const shape = try inputShape(input.tensor);

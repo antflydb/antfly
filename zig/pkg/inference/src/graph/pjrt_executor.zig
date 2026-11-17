@@ -116,6 +116,7 @@ pub const PjrtExecutor = struct {
     resident_query_rows: usize = 0,
     resident_dynamic_rows: bool = false,
     resident_prefill_only: bool = false,
+    resident_initial: bool = false,
     parameters_shared: bool = false,
     /// Inline PartitionExecutor for stable pointer access.
     pe: PartitionExecutor = undefined,
@@ -543,7 +544,8 @@ pub fn createExecutorWithOptions(
     executor.resident_capacity = options.resident_capacity;
     executor.resident_query_rows = result.resident_query_rows;
     executor.resident_dynamic_rows = result.resident_dynamic_rows;
-    executor.resident_prefill_only = options.resident_visibility != null;
+    executor.resident_prefill_only = options.resident_initial or options.resident_visibility != null;
+    executor.resident_initial = options.resident_initial;
     errdefer executor.partitionExecutor().deinitExecutor();
     if (options.mutable_parameters) |flags| try executor.retainParameters(graph, cb, flags, shared_parameters);
     return executor;

@@ -7631,6 +7631,7 @@ fn archRunCachedDecoder(ptr: *anyopaque, state: *@import("resident_decoder.zig")
     var forward = @import("decoder_frontend.zig").resolve(&self.arch_config.gpt);
     forward.precision = self.backend_data.pjrt.precision;
     forward.resident_capacity = state.capacity;
+    forward.resident_initial = state.position == 0;
     const declared = try allocator.alloc(@import("capture.zig").Input, inputs.len);
     defer allocator.free(declared);
     for (inputs, declared) |input, *value| {
@@ -8168,7 +8169,7 @@ fn runCapturedProgram(self: *ArchSession, inputs: []const Tensor, allocator: std
     } else false) .image_projection else if (self.arch_config == .gliner_boundary and for (inputs) |input| {
         if (std.mem.startsWith(u8, input.name, "head.")) break true;
     } else false) .readout else if (self.arch_config == .gpt and for (inputs) |input| {
-        if (std.mem.eql(u8, input.name, "input_embeddings")) break true;
+        if (std.mem.eql(u8, input.name, "input_embeddings") or std.mem.eql(u8, input.name, "logits_row")) break true;
     } else false) .decoder else if (pooled) .embedding else .forward;
     var forward = (try handle.model_programs.?.get(stage)) orelse return error.UnsupportedModelProgram;
     // Authored graphs declare their arithmetic dtypes explicitly, including
@@ -9510,7 +9511,7 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
             const count = std.math.mul(usize, (std.math.mul(usize, batch, layout.geometry.tokenCount()) catch return error.ResourceLimitExceeded), layout.hidden) catch return error.ResourceLimitExceeded;
             return .{ .sequence = layout.geometry.grid_x * layout.geometry.grid_y, .output_bytes = (std.math.add(usize, (std.math.mul(usize, count, @sizeOf(f32)) catch return error.ResourceLimitExceeded), 3 * @sizeOf(i64)) catch return error.ResourceLimitExceeded), .workspace_bytes = try projector.imageTensorWorkspace(&metadata.parsed, w, h, batch) };
         }
-        if (inputs.named("input_embeddings") != null) {
+        if (inputs.named("input_embeddings") != null or inputs.named("logits_row") != null) {
             const ids = inputs.named("input_ids") orelse return error.MissingInputs;
             if (ids.shape.len != 2 or ids.shape[0] != 1 or ids.shape[1] <= 0 or batch != 1) return error.InvalidInputShape;
             const cfg = self.arch_config.gpt;

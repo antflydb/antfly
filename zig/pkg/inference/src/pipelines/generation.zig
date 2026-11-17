@@ -3689,11 +3689,13 @@ pub const NativeGenerationPipeline = struct {
             }
             if (compiled_prefix) |*prefix| self.compiled_media_prefix = prefix;
         }
-        if (self.usesPjrtSession() and try selectPjrtDecoderCache(self.session.?, self.pjrt_decoder_cache)) {
+        if (self.usesPjrtSession()) {
             const capacity = @min(try std.math.add(usize, seq_len, max_tokens), self.gpt_config.max_position_embeddings);
-            compiled_decoder = try @import("../execution/resident_decoder.zig").Decoder.init(self.allocator, self.session.?, capacity, self.execution_control);
-            self.compiled_decoder = &compiled_decoder.?;
-            self.pjrt_decoder_cache_used = true;
+            compiled_decoder = try @import("../execution/resident_decoder.zig").Decoder.initForRequest(self.allocator, self.session.?, self.pjrt_decoder_cache, capacity, max_tokens, self.execution_control);
+            if (compiled_decoder) |*decoder| {
+                self.compiled_decoder = decoder;
+                self.pjrt_decoder_cache_used = true;
+            }
         }
         const prefill_output = if (self.compiled_decoder) |decoder|
             PrefillOutput{ .last_logits = if (self.compiled_media_prefix) |prefix| try prefix.runCached(decoder, token_ids[0..seq_len], allocator, self.execution_control) else try decoder.text(token_ids[0..seq_len], allocator, self.execution_control) }
