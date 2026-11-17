@@ -174,6 +174,10 @@ pub fn reconcile(svc: anytype, policy: anytype, port: grants.Port, a: A, id: con
     if (latest_pending.sequence != pending.sequence or !same(latest_pending.actor, pending.actor) or !same(latest_pending.digest, pending.digest)) return error.ChangefeedConflict;
     try policy.validateRoot(latest.value, namespace, route.value, pending.payload.table, request_context);
     const proof = (try observation.resolve(a, latest.value, namespace, observed)) orelse return .{ .status = .unproven };
+    const Policy = @typeInfo(@TypeOf(policy)).pointer.child;
+    if (comptime @hasDecl(Policy, "deferRetirementSettlement")) {
+        if (proof.effect == .released and policy.deferRetirementSettlement()) return .{ .status = .unproven };
+    }
     try mutate(svc, a, latest.value, namespace, .{ .reconciled = proof }, request_context);
     return .{ .status = .reconciled, .reconciliation = proof };
 }
@@ -233,6 +237,12 @@ fn perform(svc: anytype, policy: anytype, port: operations.Port, a: A, state: co
         result.deferred_error = err;
         return result;
     };
+    // Some owners have durable post-retirement work. Leave the accepted
+    // intent available for semantic reconciliation after that work finishes.
+    const Policy = @typeInfo(@TypeOf(policy)).pointer.child;
+    if (comptime @hasDecl(Policy, "deferRetirementSettlement")) {
+        if (settlement.effect == .retired and policy.deferRetirementSettlement()) return result;
+    }
     mutate(svc, a, latest.value, namespace, .{ .settled = settlement }, request) catch |err| {
         result.deferred_error = err;
         return result;

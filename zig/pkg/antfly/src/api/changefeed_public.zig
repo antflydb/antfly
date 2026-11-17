@@ -190,6 +190,7 @@ const RootPolicy = struct {
     source: source_api.Source,
     allocator: A,
     closing: bool = false,
+    retirement_collected: bool = false,
 
     pub fn authorizeRoot(self: *@This(), state: control.State, _: control.Namespace, request: Context) !void {
         if (!self.closing) {
@@ -218,6 +219,10 @@ const RootPolicy = struct {
         var id: control.Id = undefined;
         self.io.random(&id);
         return id;
+    }
+
+    pub fn deferRetirementSettlement(self: *const RootPolicy) bool {
+        return self.closing and !self.retirement_collected;
     }
 
     pub fn context(_: *@This(), request: Context) !Context {
@@ -525,14 +530,38 @@ fn retireOne(client: *config.Client, policy: *RootPolicy, a: A, state: control.S
     const root = try discovered.find(item.namespace);
     if (item.pending_control) |pending| {
         if (pending.stage != .prepared) {
+            const observation = @import("../metadata/root_control_observation.zig");
+            const grant = try observation.request(a, state, item.namespace);
+            const frozen = try std.json.parseFromSlice(metadata_api.CatalogRouteFence, a, pending.payload.fence, .{});
+            defer frozen.deinit();
+            try policy.validateRoot(state, item.namespace, frozen.value, pending.payload.table, request);
+            if (try source.grants.read(a, frozen.value, pending.payload.table, grant, request) == .retired) {
+                // Retaining the pending intent makes a lost collection reply
+                // or process exit discoverable. Collection itself is safe to
+                // repeat and stops at the minimum ACK of the remaining grants.
+                const max_frames = 32;
+                const command: @import("history_control_operations.zig").wire.Request = .{
+                    .version = 1,
+                    .operation = .submit,
+                    .command = .{ .collect = .{ .namespace = item.namespace, .authority = state.authority, .max_frames = max_frames } },
+                };
+                const result = try source.controls.execute(a, frozen.value, pending.payload.table, command, request);
+                try result.validate(command);
+                if (!result.confirmed()) return error.MetadataMutationOutcomeUnknown;
+                if (result.outcome.? == .rejected) return result.outcome.?.rejected.asError();
+                if (result.outcome.?.applied.reclaimed_frames == max_frames) return true;
+                policy.retirement_collected = true;
+            }
+            defer policy.retirement_collected = false;
             const observed = try enrollment.reconcile(client, policy, source.grants, a, state.id, item.namespace, request);
             if (observed.status == .reconciled) return true;
             if (observed.status != .unproven) return error.MetadataMutationOutcomeUnknown;
             try enrollment.prepareRetirementFence(client, policy, a, state.id, item.namespace, request);
         } else {
             const result = try enrollment.drive(client, policy, source.controls, a, state.id, item.namespace, request);
-            if (result.status != .settled and result.status != .cancelled_prepared)
-                return result.deferred_error orelse error.MetadataMutationOutcomeUnknown;
+            if (result.deferred_error) |err| return err;
+            if (result.status != .settled and result.status != .cancelled_prepared and result.status != .accepted)
+                return error.MetadataMutationOutcomeUnknown;
         }
         return true;
     }

@@ -45430,7 +45430,36 @@ fn consumerTests() type {
                             .expected_epoch = active_state.epoch,
                             .mutation = .{ .expire = expiring.expires_at },
                         }, maintenance);
-                        for (0..3) |_| try api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, expiring.id, maintenance);
+                        for (0..2) |_| try api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, expiring.id, maintenance);
+                        const DropCollection = struct {
+                            port: ingress.Port,
+                            calls: usize = 0,
+                            fn execute(raw: *anyopaque, alloc: std.mem.Allocator, selected: antfly.metadata_api.CatalogRouteFence, name: []const u8, input: ingress.wire.Request, request: antfly.public_api.operation.RequestContext) !ingress.wire.Response {
+                                const self: *@This() = @ptrCast(@alignCast(raw));
+                                const response = try self.port.execute(alloc, selected, name, input, request);
+                                if (input.command == .collect) {
+                                    try std.testing.expect(response.confirmed());
+                                    try std.testing.expect(response.outcome.? == .applied);
+                                    self.calls += 1;
+                                    return error.ReadUnavailable;
+                                }
+                                return response;
+                            }
+                        };
+                        var drop_collection: DropCollection = .{ .port = source.controls };
+                        var interrupted = source;
+                        interrupted.controls = .{ .ptr = &drop_collection, .execute_fn = DropCollection.execute };
+                        try std.testing.expectError(error.ReadUnavailable, api.maintainNativeFeed(metadata_port, interrupted, http_api.inferenceIo(), allocator, expiring.id, maintenance));
+                        try std.testing.expectEqual(@as(usize, 1), drop_collection.calls);
+                        {
+                            const pending_bytes = try metadata_port.read(allocator, expiring.id, maintenance);
+                            defer allocator.free(pending_bytes);
+                            var pending = try feed_control.parse(allocator, pending_bytes);
+                            defer pending.deinit();
+                            try std.testing.expect(!pending.value.roots[0].released);
+                            try std.testing.expect(pending.value.roots[0].pending_control != null);
+                        }
+                        try api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, expiring.id, maintenance);
                         const reset_bytes = try metadata_port.read(allocator, expiring.id, maintenance);
                         defer allocator.free(reset_bytes);
                         var reset = try feed_control.parse(allocator, reset_bytes);
