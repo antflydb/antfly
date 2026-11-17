@@ -113,12 +113,12 @@ pub const Witness = struct {
 
 /// Bounds actual allocations, including map capacity, reader scratch overhead,
 /// buffers and realloc overlap. Parent allocation failure remains OutOfMemory.
-const Memory = struct {
+pub const Memory = struct {
     parent: A,
     budget: *Budget,
     used: usize = 0,
     denied: bool = false,
-    fn allocator(self: *Memory) A {
+    pub fn allocator(self: *Memory) A {
         return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
     }
     fn reserve(self: *Memory, count: usize) bool {

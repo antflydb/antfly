@@ -27,7 +27,12 @@ adjacency, owner counts, validation proof and terminal receipts. The proof
 binds the staged adjacency and count updates to the reserved attempt and
 accepted revision across owner changes. The count reconciler takes effective
 changes after source precedence, so an edge remains present when another
-effective owner survives. Production writers do not yet call these adapters. The validator's
+effective owner survives. The contribution adapter diffs complete effective
+owner manifests against accepted storage, binds those replacements and producer
+versions to the attempt, and writes the resulting manifests with the terminal
+receipt. Committed replay recomputes the delta at the reserved accepted revision
+without a new admission deadline. Production writers do not yet call these
+adapters. The validator's
 `validateExisting` entry point requires complete enumeration; it does not provide
 resumable activation or a certificate of enumeration completeness.
 

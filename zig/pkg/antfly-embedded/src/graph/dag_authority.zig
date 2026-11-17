@@ -711,6 +711,198 @@ pub const Membership = struct {
     }
 };
 
+/// Complete replacements for effective logical contributions. The producer
+/// chooses a stable owner identity after applying source precedence.
+pub const Contributions = struct {
+    const validation = @import("dag_validation.zig");
+    const A = std.mem.Allocator;
+    const prefix = "\x00\x00__metadata__:dag-contribution:";
+
+    pub const Replacement = struct {
+        owner: Digest,
+        source: []const u8,
+        targets: []const []const u8,
+    };
+
+    fn key(alloc: A, id: Digest, replacement: Replacement) ![]u8 {
+        return std.mem.concat(alloc, u8, &.{ prefix, &id, &replacement.owner, replacement.source });
+    }
+
+    /// Bind complete replacements and the caller's pinned producer versions
+    /// to the attempt. Replacements are ordered by owner and then source.
+    pub fn candidate(versions: Digest, replacements: []const Replacement) Digest {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly/dag-contribution-replacements/v1");
+        hash.update(&versions);
+        for (replacements) |replacement| {
+            hash.update(&replacement.owner);
+            hashBytes(&hash, replacement.source);
+            var count: [8]u8 = undefined;
+            std.mem.writeInt(u64, &count, replacement.targets.len, .little);
+            hash.update(&count);
+            for (replacement.targets) |target| hashBytes(&hash, target);
+        }
+        return hash.finalResult();
+    }
+
+    fn hashBytes(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, bytes.len, .little);
+        hash.update(&length);
+        hash.update(bytes);
+    }
+
+    const Plan = struct {
+        adjacency: []const validation.Change,
+        membership: []const Membership.Update,
+    };
+
+    fn plan(alloc: A, txn: anytype, id: Digest, replacements: []const Replacement, budget: *validation.Budget) !Plan {
+        var changes: std.ArrayList(validation.Change) = .empty;
+        var previous: ?Replacement = null;
+        for (replacements) |replacement| {
+            if (previous) |prior| {
+                const owner_order = std.mem.order(u8, &prior.owner, &replacement.owner);
+                if (owner_order == .gt or (owner_order == .eq and
+                    std.mem.order(u8, prior.source, replacement.source) != .lt)) return error.InvalidDagMutation;
+            }
+            previous = replacement;
+            try budget.consume(.requests, 1);
+            try budget.consume(.bytes, replacement.source.len);
+            var last: ?[]const u8 = null;
+            for (replacement.targets) |target| {
+                if (last) |prior| if (std.mem.order(u8, prior, target) != .lt) return error.InvalidDagMutation;
+                last = target;
+                try budget.consume(.edges, 1);
+                try budget.consume(.bytes, target.len);
+            }
+            const storage_key = try key(alloc, id, replacement);
+            defer alloc.free(storage_key);
+            const stored = txn.get(storage_key) catch |err| blk: {
+                if (err != error.NotFound) return err;
+                break :blk "";
+            };
+            try budget.consume(.bytes, stored.len);
+            // Storage values may be invalidated by subsequent reads.
+            var remaining: []const u8 = try alloc.dupe(u8, stored);
+            var old = try takeTarget(&remaining);
+            var next: usize = 0;
+            while (old != null or next < replacement.targets.len) {
+                try budget.checkpoint();
+                const order: std.math.Order = if (old == null) .gt else if (next == replacement.targets.len) .lt else std.mem.order(u8, old.?, replacement.targets[next]);
+                if (order != .eq) {
+                    try budget.consume(.edges, 1);
+                    try changes.append(alloc, .{
+                        .source = replacement.source,
+                        .target = if (order == .lt) old.? else replacement.targets[next],
+                        .present = order == .gt,
+                    });
+                }
+                if (order != .gt) {
+                    const prior = old.?;
+                    old = try takeTarget(&remaining);
+                    if (old) |target| if (std.mem.order(u8, prior, target) != .lt) return error.InvalidDagAuthority;
+                }
+                if (order != .lt) next += 1;
+            }
+        }
+
+        std.mem.sort(validation.Change, changes.items, {}, struct {
+            fn lessThan(_: void, a: validation.Change, b: validation.Change) bool {
+                return Membership.order(a, b) == .lt;
+            }
+        }.lessThan);
+        const membership = try alloc.alloc(Membership.Update, changes.items.len);
+        const adjacency = try alloc.alloc(validation.Change, changes.items.len);
+        const counts = try Membership.reconcile(alloc, txn, id, changes.items, membership, adjacency, budget);
+        return .{ .adjacency = adjacency[0..counts.adjacency], .membership = membership[0..counts.updates] };
+    }
+
+    fn takeTarget(remaining: *[]const u8) !?[]const u8 {
+        if (remaining.*.len == 0) return null;
+        if (remaining.*.len < 4) return error.InvalidDagAuthority;
+        const len = std.mem.readInt(u32, remaining.*[0..4], .big);
+        remaining.* = remaining.*[4..];
+        if (len > remaining.*.len) return error.InvalidDagAuthority;
+        const target = remaining.*[0..len];
+        remaining.* = remaining.*[len..];
+        return target;
+    }
+
+    /// Stage the participant's vote in the reserved snapshot.
+    pub fn prepare(alloc: A, txn: anytype, token: Token, versions: Digest, replacements: []const Replacement, budget: *validation.Budget, witness: *validation.Witness) !void {
+        var memory: validation.Memory = .{ .parent = alloc, .budget = budget };
+        const bounded = memory.allocator();
+        var arena = std.heap.ArenaAllocator.init(bounded);
+        defer arena.deinit();
+        const delta = plan(arena.allocator(), txn, token.domain, replacements, budget) catch |err| {
+            if (err == error.OutOfMemory and memory.denied) {
+                budget.exhausted = .memory;
+                return error.GraphConstraintCapacity;
+            }
+            return err;
+        };
+        try requireCandidate(token, versions, replacements);
+        Storage.validate(bounded, txn, token, delta.adjacency, delta.membership, budget, witness) catch |err| {
+            if (err == error.OutOfMemory and memory.denied) {
+                budget.exhausted = .memory;
+                return error.GraphConstraintCapacity;
+            }
+            return err;
+        };
+    }
+
+    /// Stage the committed decision, effective manifests and accepted adjacency
+    /// in one write transaction. The transaction owns rollback on any error.
+    pub fn accept(alloc: A, txn: anytype, token: Token, versions: Digest, replacements: []const Replacement) !Receipt {
+        try requireCandidate(token, versions, replacements);
+        if (try Storage.readReceipt(txn, token.domain, token.attempt)) |_| {
+            return Storage.resolve(txn, token, .accepted);
+        }
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        // A durable commit decision must not be subject to a fresh admission
+        // deadline or to limits changed since the participant voted.
+        const state = try Storage.load(txn, token.domain);
+        try state.require(token);
+        if (!state.pending.?.validated) return error.GraphConstraintNotValidated;
+        var replay_budget: validation.Budget = .{
+            .limits = .{ .edges = std.math.maxInt(usize), .bytes = std.math.maxInt(usize), .requests = std.math.maxInt(usize) },
+            .clock = .{ .context = &arena, .now = replayTime },
+        };
+        const delta = try plan(arena.allocator(), txn, token.domain, replacements, &replay_budget);
+        const receipt = try Storage.accept(alloc, txn, token, delta.adjacency, delta.membership);
+        for (replacements) |replacement| {
+            const storage_key = try key(alloc, token.domain, replacement);
+            defer alloc.free(storage_key);
+            if (replacement.targets.len == 0) {
+                txn.delete(storage_key) catch |err| if (err != error.NotFound) return err;
+                continue;
+            }
+            var encoded: std.ArrayList(u8) = .empty;
+            defer encoded.deinit(alloc);
+            for (replacement.targets) |target| {
+                const len = std.math.cast(u32, target.len) orelse return error.GraphConstraintCapacity;
+                var header: [4]u8 = undefined;
+                std.mem.writeInt(u32, &header, len, .big);
+                try encoded.appendSlice(alloc, &header);
+                try encoded.appendSlice(alloc, target);
+            }
+            try txn.put(storage_key, encoded.items);
+        }
+        return receipt;
+    }
+
+    fn replayTime(_: *anyopaque) u64 {
+        return 0;
+    }
+
+    fn requireCandidate(token: Token, versions: Digest, replacements: []const Replacement) !void {
+        const digest = candidate(versions, replacements);
+        if (!std.mem.eql(u8, &digest, &token.attempt.candidate)) return error.GraphConstraintAttemptConflict;
+    }
+};
+
 test "DAG adjacency source prefixes distinguish arbitrary binary identifiers" {
     const alloc = std.testing.allocator;
     const first = try Adjacency.sourcePrefix(alloc, @splat(7), "a");
@@ -812,4 +1004,114 @@ test "DAG membership emits removal only after the final effective owner leaves" 
     try std.testing.expect(!adjacency[0].present);
     try Membership.stage(alloc, &txn, id, updates[0..third.updates]);
     try std.testing.expectError(error.InvalidDagMutation, Membership.reconcile(alloc, &txn, id, &.{remove}, &updates, &adjacency, &budget));
+}
+
+test "DAG contribution acceptance persists full manifests and fences owner swaps" {
+    const Txn = struct {
+        const alloc = std.testing.allocator;
+        rows: std.StringHashMap([]const u8),
+
+        fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return self.rows.get(key) orelse error.NotFound;
+        }
+        fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            const stored = try alloc.dupe(u8, value);
+            errdefer alloc.free(stored);
+            const slot = try self.rows.getOrPut(key);
+            if (slot.found_existing) {
+                alloc.free(slot.value_ptr.*);
+            } else {
+                slot.key_ptr.* = alloc.dupe(u8, key) catch |err| {
+                    _ = self.rows.remove(key);
+                    return err;
+                };
+            }
+            slot.value_ptr.* = stored;
+        }
+        fn delete(self: *@This(), key: []const u8) !void {
+            const row = self.rows.fetchRemove(key) orelse return error.NotFound;
+            alloc.free(row.key);
+            alloc.free(row.value);
+        }
+        const Cursor = struct {
+            const Entry = struct { key: []const u8 };
+            rows: *const std.StringHashMap([]const u8),
+            current: ?[]const u8 = null,
+
+            fn close(_: *@This()) void {}
+            fn seekAtOrAfter(self: *@This(), key: []const u8) !?Entry {
+                return self.seek(key, false);
+            }
+            fn next(self: *@This()) !?Entry {
+                return self.seek(self.current orelse return null, true);
+            }
+            fn seek(self: *@This(), key: []const u8, exclusive: bool) ?Entry {
+                var keys = self.rows.keyIterator();
+                var best: ?[]const u8 = null;
+                while (keys.next()) |item| {
+                    const order = std.mem.order(u8, item.*, key);
+                    if (order == .lt or (exclusive and order == .eq)) continue;
+                    if (best) |prior| if (std.mem.order(u8, prior, item.*) != .gt) continue;
+                    best = item.*;
+                }
+                self.current = best;
+                return .{ .key = best orelse return null };
+            }
+        };
+        fn openCursor(self: *@This()) !Cursor {
+            return .{ .rows = &self.rows };
+        }
+        fn now(_: *anyopaque) u64 {
+            return 0;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var txn: Txn = .{ .rows = .init(alloc) };
+    defer {
+        var rows = txn.rows.iterator();
+        while (rows.next()) |row| {
+            alloc.free(row.key_ptr.*);
+            alloc.free(row.value_ptr.*);
+        }
+        txn.rows.deinit();
+    }
+    const id: Digest = @splat(1);
+    const versions: Digest = @splat(7);
+    const initial = [_]Contributions.Replacement{
+        .{ .owner = @splat(1), .source = "a", .targets = &.{"b"} },
+    };
+    const transfer = [_]Contributions.Replacement{
+        .{ .owner = @splat(1), .source = "a", .targets = &.{} },
+        .{ .owner = @splat(2), .source = "a", .targets = &.{"b"} },
+    };
+    const remove = [_]Contributions.Replacement{
+        .{ .owner = @splat(2), .source = "a", .targets = &.{} },
+    };
+    try Storage.save(&txn, .{ .domain = id, .owner_epoch = 1, .phase = .active });
+    const edge = try std.mem.concat(alloc, u8, &.{ Adjacency.prefix, &id, "\x00\x00\x00\x01ab" });
+    defer alloc.free(edge);
+    for ([_][]const Contributions.Replacement{ &initial, &transfer, &remove }, 0..) |replacements, revision| {
+        var attempt = testAttempt(@intCast(revision + 1));
+        attempt.candidate = Contributions.candidate(versions, replacements);
+        const token = (try Storage.begin(&txn, id, 1, revision, attempt)).reserved;
+        var budget: Contributions.validation.Budget = .{ .clock = .{ .now = Txn.now, .context = &txn } };
+        var witness: Contributions.validation.Witness = .{};
+        try Contributions.prepare(alloc, &txn, token, versions, replacements, &budget, &witness);
+        try std.testing.expectError(error.GraphConstraintAttemptConflict, Contributions.accept(alloc, &txn, token, @splat(9), replacements));
+        const receipt = try Contributions.accept(alloc, &txn, token, versions, replacements);
+        try std.testing.expectEqual(revision + 1, receipt.revision);
+        try std.testing.expectEqualDeep(receipt, try Contributions.accept(alloc, &txn, token, versions, replacements));
+        try std.testing.expectEqual(revision < 2, txn.rows.contains(edge));
+        if (revision == 1) {
+            const reverse: []const Contributions.Replacement = &.{
+                .{ .owner = @splat(3), .source = "b", .targets = &.{"a"} },
+            };
+            var rejected = testAttempt(9);
+            rejected.candidate = Contributions.candidate(versions, reverse);
+            const reverse_token = (try Storage.begin(&txn, id, 1, 2, rejected)).reserved;
+            try std.testing.expectError(error.GraphCycle, Contributions.prepare(alloc, &txn, reverse_token, versions, reverse, &budget, &witness));
+            try std.testing.expectError(error.GraphConstraintNotValidated, Contributions.accept(alloc, &txn, reverse_token, versions, reverse));
+            _ = try Storage.reject(&txn, reverse_token, .semantic_rejection);
+        }
+    }
 }
