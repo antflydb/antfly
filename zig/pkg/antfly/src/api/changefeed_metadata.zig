@@ -137,13 +137,12 @@ pub const Port = struct {
         const drop = write.mutation.slot.drop;
         if (!std.mem.eql(u8, &write.id, &control.pg_slot.feedId(drop.database, drop.name))) return error.InvalidChangefeed;
         self.mutate(a, write, context) catch |err| {
-            if (err != error.MetadataMutationOutcomeUnknown) return err;
+            if (err != error.MetadataMutationOutcomeUnknown and err != error.ChangefeedConflict) return err;
             const bytes = self.read(a, write.id, context) catch return err;
             defer a.free(bytes);
             var observed = control.parse(a, bytes) catch return err;
             defer observed.deinit();
             const state = observed.value;
-            if (state.phase != .closing and state.phase != .deleted) return err;
             const definition = state.definition orelse return err;
             const slot = state.slot orelse return err;
             if (state.revision < write.expected_revision or state.epoch != write.expected_epoch or
@@ -152,6 +151,10 @@ pub const Port = struct {
                 !std.mem.eql(u8, &definition.authorization, &write.authorization) or
                 !std.mem.eql(u8, &slot.database, &drop.database) or
                 !std.mem.eql(u8, slot.name, drop.name)) return err;
+            if (state.phase == .closing or state.phase == .deleted) return;
+            if (err == error.ChangefeedConflict and (state.phase == .streaming or state.phase == .bootstrap) and
+                slot.session != null and drop.now >= slot.observed_at and drop.now < slot.session_expires_at) return error.ReplicationSlotActive;
+            return err;
         };
     }
 
@@ -285,6 +288,7 @@ pub const test_support = if (@import("builtin").is_test) struct {
             state: control.State,
             sealed: control.State,
             commit: bool = true,
+            reject: bool = false,
             acknowledge: bool = false,
             read_unavailable: bool = false,
             mutations: usize = 0,
@@ -297,6 +301,7 @@ pub const test_support = if (@import("builtin").is_test) struct {
             fn mutate(raw: *anyopaque, _: A, _: control.Write, _: Context) anyerror!void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 self.mutations += 1;
+                if (self.reject) return error.ChangefeedConflict;
                 if (self.commit) self.state = self.sealed;
                 if (self.acknowledge) return;
                 return error.MetadataMutationOutcomeUnknown;
@@ -327,15 +332,23 @@ pub const test_support = if (@import("builtin").is_test) struct {
         var drop = write;
         drop.expected_revision = sealed.revision;
         drop.mutation = .{ .slot = .{ .drop = .{ .database = configuration.database, .name = configuration.name, .now = 102 } } };
+        fake.state = try (control.Mutation{ .slot = .{ .acquire = .{ .actor = @splat(4), .expected = 0, .now = 101, .expires = 150 } } }).apply(scratch, sealed, .{ .incarnation = stamp.incarnation, .sequence = 5 });
+        fake.reject = true;
+        try std.testing.expectError(error.ReplicationSlotActive, port.dropSlot(a, drop, context));
+        var wrong_owner = drop;
+        wrong_owner.owner[0] ^= 1;
+        try std.testing.expectError(error.ChangefeedConflict, port.dropSlot(a, wrong_owner, context));
+        fake.reject = false;
+        fake.state = sealed;
         fake.sealed = try drop.apply(scratch, sealed, 5);
         fake.commit = false;
         try std.testing.expectError(error.MetadataMutationOutcomeUnknown, port.dropSlot(a, drop, context));
-        try std.testing.expectEqual(@as(usize, 4), fake.mutations);
+        try std.testing.expectEqual(@as(usize, 6), fake.mutations);
         fake.commit = true;
         const dropped = try commands.drop(port, a, .{ .drop_slot = .{ .slot = configuration.name, .wait = false } }, drop, context);
         try std.testing.expectEqualStrings("DROP_REPLICATION_SLOT", dropped.command_tag);
         try std.testing.expect(dropped.mutation_outcome == .committed);
-        try std.testing.expectEqual(@as(usize, 5), fake.mutations);
+        try std.testing.expectEqual(@as(usize, 7), fake.mutations);
         try std.testing.expectEqual(control.Phase.closing, fake.state.phase);
         var stale = drop;
         stale.expected_epoch += 1;
