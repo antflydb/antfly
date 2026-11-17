@@ -587,12 +587,13 @@ pub const Mutation = union(enum) {
                     .configure => |configuration| {
                         if (!equal(state.id, pg_slot.feedId(configuration.database, configuration.name))) return error.ChangefeedConflict;
                         if (state.slot) |existing| {
-                            if (!equal(existing.database, configuration.database) or !std.mem.eql(u8, existing.name, configuration.name) or existing.byte_limit != configuration.byte_limit or existing.consistent_lsn != configuration.consistent_lsn) return error.ChangefeedConflict;
+                            if (!equal(existing.database, configuration.database) or !std.mem.eql(u8, existing.name, configuration.name) or existing.byte_limit != configuration.byte_limit or existing.consistent_lsn != configuration.consistent_lsn or !configuration.matchesBinding(existing.binding)) return error.ChangefeedConflict;
                             return state;
                         }
                         if (state.cursors.len != 0) return error.ChangefeedConflict;
                         for (state.roots) |root| if (root.acknowledged.event != 0) return error.ChangefeedConflict;
                         next.slot = try pg_slot.State.initializeAt(configuration.database, configuration.name, state.acknowledged_cursor, configuration.byte_limit, configuration.consistent_lsn);
+                        next.slot.?.binding = configuration.binding;
                     },
                     .drop => |drop| {
                         const slot = state.slot orelse return error.ChangefeedConflict;
@@ -737,6 +738,7 @@ pub const Mutation = union(enum) {
                     try slotDefinition(state.definition.?);
                     if (!equal(state.id, pg_slot.feedId(configuration.database, configuration.name))) return error.ChangefeedConflict;
                     next.slot = try pg_slot.State.initializeAt(configuration.database, configuration.name, next.acknowledged_cursor, configuration.byte_limit, configuration.consistent_lsn);
+                    next.slot.?.binding = configuration.binding;
                 }
             },
             .skip_slot_projection => |skip| {
@@ -987,7 +989,7 @@ pub fn recoverSlotStart(state: State, original: Write, now: u64) !SlotStart {
         !equal(definition.owner, original.owner) or !equal(definition.authorization, original.authorization) or
         !equal(state.cut, seal.cut) or !equal(slot.database, configuration.database) or
         !std.mem.eql(u8, slot.name, configuration.name) or slot.byte_limit != configuration.byte_limit or
-        slot.consistent_lsn != configuration.consistent_lsn) return error.ChangefeedConflict;
+        slot.consistent_lsn != configuration.consistent_lsn or !configuration.matchesBinding(slot.binding)) return error.ChangefeedConflict;
     return .{ .consistent_lsn = slot.consistent_lsn, .cursor = initialCursor(state, state.cut) };
 }
 

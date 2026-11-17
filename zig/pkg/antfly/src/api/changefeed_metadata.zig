@@ -347,7 +347,7 @@ pub const test_support = if (@import("builtin").is_test) struct {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const scratch = arena.allocator();
-        const configuration: control.pg_slot.Configuration = .{ .database = @splat(8), .name = "slot", .consistent_lsn = 8192 };
+        const configuration: control.pg_slot.Configuration = .{ .database = @splat(8), .name = "slot", .consistent_lsn = 8192, .binding = .{ .publications = &.{"rows"}, .projection = @splat(7) } };
         const id = control.pg_slot.feedId(configuration.database, configuration.name);
         const definition: control.Definition = .{
             .owner = @splat(1),
@@ -362,6 +362,10 @@ pub const test_support = if (@import("builtin").is_test) struct {
         state = try (control.Mutation{ .enroll = .{ .namespace = namespace, .ownership_epoch = 1, .grant_sequence = state.roots[0].grant_sequence, .consumer_epoch = 1, .start = 10 } }).apply(scratch, state, .{ .incarnation = stamp.incarnation, .sequence = 3 });
         const write: control.Write = .{ .id = id, .authority = stamp.incarnation, .owner = definition.owner, .authorization = definition.authorization, .expected_revision = state.revision, .expected_epoch = state.epoch, .mutation = .{ .seal = .{ .cut = @splat(7), .slot = configuration } } };
         const sealed = try write.apply(scratch, state, 4);
+        try std.testing.expectEqual(configuration.binding.?.identity(), sealed.slot.?.binding.?.identity());
+        var different = write;
+        different.mutation.seal.slot.?.binding.?.projection = @splat(8);
+        try std.testing.expectError(error.ChangefeedConflict, control.recoverSlotStart(sealed, different, 100));
         const Fake = struct {
             state: control.State,
             sealed: control.State,

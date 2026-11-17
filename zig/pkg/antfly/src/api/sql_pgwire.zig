@@ -705,6 +705,129 @@ pub const ReplicationFactory = struct {
     }
 };
 
+/// Enroll a resolved publication at one native root for a no-snapshot slot.
+/// A host must supply the exact publication set before it offers this mode.
+pub const CatalogSlotEnrollment = struct {
+    const control = publication_control;
+    const roots = @import("history_roots.zig");
+    const metadata = @import("changefeed_metadata.zig");
+
+    const Policy = struct {
+        slots: CatalogReplicationSlots,
+        source: roots.Source,
+        services: *CatalogReplicationPublication,
+        expected: control.pg_slot.Binding,
+        owner: control.Digest,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+
+        pub fn authorizeRoot(self: *Policy, state: control.State, _: control.Namespace, context_value: operation.RequestContext) !void {
+            var scratch = std.heap.ArenaAllocator.init(self.allocator);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            var identity = try self.slots.identity.read(self.slots.identity.context, a);
+            defer identity.deinit(a);
+            const owner = try @import("changefeed_public.zig").durableOwner(identity);
+            if (!std.crypto.timing_safe.eql(control.Digest, owner, self.owner) or
+                !std.crypto.timing_safe.eql(control.Digest, owner, state.definition.?.owner))
+                return error.Forbidden;
+            const current = try self.services.resolve(a, self.slots.database, self.expected.publications, context_value);
+            if (!std.meta.eql((try current.binding()).identity(), self.expected.identity())) return error.ChangefeedResynchronizationRequired;
+        }
+
+        pub fn validateRoot(self: *Policy, state: control.State, namespace: control.Namespace, fence: @import("../metadata/api.zig").CatalogRouteFence, table: []const u8, context_value: operation.RequestContext) !void {
+            try self.source.validate(self.allocator, state, namespace, fence, table, context_value);
+        }
+
+        pub fn newAttempt(self: *Policy, _: control.State, _: control.Namespace, context_value: operation.RequestContext) !control.Id {
+            var id: control.Id = undefined;
+            while (true) {
+                try context_value.ensureActive();
+                self.io.random(&id);
+                if (!std.mem.allEqual(u8, &id, 0)) return id;
+            }
+        }
+
+        pub fn context(_: *Policy, value: operation.RequestContext) !operation.RequestContext {
+            return value;
+        }
+    };
+
+    pub fn create(slots: CatalogReplicationSlots, a: std.mem.Allocator, names: []const []const u8, command: wire.replication_commands.Create, request: wire.Request, context: operation.RequestContext) !wire.Result {
+        if (command.snapshot != .nothing or command.temporary) return error.UnsupportedReplicationOption;
+        if (!control.pg_slot.validName(command.slot)) return error.InvalidReplicationSlotName;
+        const source = slots.server.cfg.native_history_roots orelse return error.ChangefeedCapabilityUnsupported;
+        const port = slots.server.source.changefeeds orelse return error.ChangefeedCapabilityUnsupported;
+        const maintenance = CatalogReplicationSlots.maintenanceContext(context);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var resolver: CatalogReplicationPublication = .{ .server = slots.server, .identity = slots.identity, .database_name = slots.database_name };
+        const publication = try resolver.resolve(scratch, slots.database, names, maintenance);
+        const binding = try publication.binding();
+        var identity = try slots.identity.read(slots.identity.context, scratch);
+        defer identity.deinit(scratch);
+        const owner = try @import("changefeed_public.zig").durableOwner(identity);
+        const tables = try scratch.alloc(control.Table, publication.members.len);
+        for (publication.members, tables) |member, *table| table.* = member.table;
+        const definition: control.Definition = .{
+            .owner = owner,
+            .authorization = binding.identity(),
+            .tables = tables,
+            .projection = .rows,
+        };
+        var captured = try source.capture(scratch, definition, maintenance);
+        defer captured.deinit();
+        if (captured.roots.len != 1) return error.ChangefeedCapabilityUnsupported;
+        const root = captured.roots[0];
+        const authority = try @import("history_policy_provisioning.zig").authority(root.fence);
+        if (try port.authority(scratch, maintenance)) |registered| {
+            if (!std.meta.eql(registered.incarnation, authority)) return error.ChangefeedResynchronizationRequired;
+        }
+        const id = control.pg_slot.feedId(slots.database, command.slot);
+        var client: metadata.Client = .{ .port = port };
+        var policy: Policy = .{ .slots = slots, .source = source, .services = &resolver, .expected = binding, .owner = owner, .allocator = a, .io = request.io };
+        const ns = std.Io.Clock.now(.real, request.io).nanoseconds;
+        if (ns <= 0) return error.ChangefeedResynchronizationRequired;
+        const now = std.math.cast(u64, @divFloor(ns, std.time.ns_per_s)) orelse return error.ChangefeedResynchronizationRequired;
+        for (0..8) |_| {
+            try request.check();
+            var iteration = std.heap.ArenaAllocator.init(a);
+            defer iteration.deinit();
+            const work = iteration.allocator();
+            const bytes = try port.read(work, id, maintenance);
+            var parsed = try control.parse(work, bytes);
+            defer parsed.deinit();
+            const state = parsed.value;
+            if (state.phase != .empty and (!std.meta.eql(state.authority, authority) or
+                !std.meta.eql(state.definition.?.identity(), definition.identity()))) return error.ChangefeedConflict;
+            const current = if (state.phase == .empty) control.State{ .definition = definition } else state;
+            try policy.authorizeRoot(current, root.namespace, maintenance);
+            var write: control.Write = .{ .id = id, .authority = authority, .owner = owner, .authorization = definition.authorization, .expected_revision = state.revision, .expected_epoch = state.epoch, .mutation = undefined };
+            if (state.phase == .empty) {
+                write.mutation = .{ .create = .{ .id = id, .definition = definition, .now = now, .expires_at = now +| 3600 } };
+            } else if (state.phase == .enrolling and now < state.expires_at) {
+                if (state.roots.len == 0) {
+                    write.mutation = .{ .plan_roots = try captured.initialPlans(work) };
+                } else {
+                    if (state.roots.len != 1 or !std.meta.eql(state.roots[0].namespace, root.namespace)) return error.ChangefeedResynchronizationRequired;
+                    const enrolled = state.roots[0];
+                    if (enrolled.consumer_epoch == 0) {
+                        try roots.enrollRoot(&client, &policy, work, state, root, tables[0].policy_revision, maintenance);
+                        continue;
+                    }
+                    try policy.validateRoot(state, root.namespace, root.fence, root.table_name, maintenance);
+                    const cut = control.hash(.{ .domain = "antfly:pg-slot-enrollment:v1", .authority = authority, .definition = definition.identity(), .root = root.namespace, .consumer_epoch = enrolled.consumer_epoch, .start = enrolled.start });
+                    write.mutation = .{ .seal = .{ .cut = cut, .slot = .{ .database = slots.database, .name = command.slot, .binding = binding } } };
+                    return SlotCommands.create(port, a, command, write, now, null, maintenance);
+                }
+            } else return error.ChangefeedConflict;
+            try port.mutate(work, write, maintenance);
+        }
+        return error.MetadataMutationOutcomeUnknown;
+    }
+};
+
 /// Native pgwire session callbacks for a host that supplies the database
 /// bootstrap authority and qualified spool namespace.
 pub const CatalogReplicationFactory = struct {
@@ -3410,6 +3533,7 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
         const session = try backend.vtable.open_replication_session.?(backend.context, a, .{ .context = credential, .release = Credential.release }, authority.request);
         defer session.close(session.context);
         try session.authorize(session.context, a, authority.request, null);
+        try std.testing.expectError(error.ChangefeedCapabilityUnsupported, CatalogSlotEnrollment.create(slots, alloc, &.{"feed"}, .{ .slot = "docs_slot", .snapshot = .nothing }, authority.request, .{}));
         const system = try session.command(session.context, alloc, authority.request, .identify_system);
         try std.testing.expectEqualStrings("719", system.rows[0][0].string);
         try std.testing.expectEqualStrings("0/1", system.rows[0][2].string);

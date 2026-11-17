@@ -83,9 +83,17 @@ pub const Configuration = struct {
     name: []const u8,
     byte_limit: u64 = max_pending_bytes,
     consistent_lsn: u64 = 1,
+    binding: ?Binding = null,
 
     pub fn validate(self: Configuration) !void {
         if (!nz(self.database) or !validName(self.name) or self.consistent_lsn == 0 or self.byte_limit < 47 or self.byte_limit > max_pending_bytes) return error.InvalidChangefeed;
+        if (self.binding) |binding| try binding.validate();
+    }
+
+    pub fn matchesBinding(self: Configuration, existing: ?Binding) bool {
+        const expected = self.binding orelse return true;
+        const actual = existing orelse return false;
+        return std.meta.eql(expected.identity(), actual.identity());
     }
 };
 

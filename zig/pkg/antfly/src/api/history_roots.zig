@@ -210,6 +210,58 @@ pub const Source = struct {
     }
 };
 
+const MetadataClient = @import("changefeed_metadata.zig").Client;
+const enrollment = @import("../metadata/root_control_driver.zig");
+
+/// Persist or drive the next step of an exact enrollment. The caller owns
+/// the complete root plan and decides when its cut can be sealed.
+pub fn enrollRoot(client: *MetadataClient, policy: anytype, a: A, state: control.State, root: Root, policy_revision: u64, context: Context) !void {
+    const item = state.roots[try state.rootIndex(root.namespace)];
+    if (state.phase != .enrolling or item.consumer_epoch != 0) return error.ChangefeedConflict;
+    if (item.pending_control != null) return driveRoot(client, policy, a, state, root.namespace, context);
+    try prepareRoot(client, policy, a, state.id, root, .{
+        .version = 1,
+        .operation = .submit,
+        .command = .{ .enroll = .{
+            .namespace = root.namespace,
+            .authority = state.authority,
+            .consumer = state.consumerId(),
+            .definition = (state.definition orelse return error.ChangefeedConflict).identity(),
+            .sequence = item.grant_sequence,
+            .expires_at_seconds = state.expires_at,
+            .policy_revision = policy_revision,
+        } },
+    }, context);
+}
+
+pub fn prepareRoot(client: *MetadataClient, policy: anytype, a: A, id: control.Id, root: Root, command: @import("history_control_operations.zig").wire.Request, request: Context) !void {
+    const body = try std.json.Stringify.valueAlloc(a, command, .{});
+    defer a.free(body);
+    const fence = try std.json.Stringify.valueAlloc(a, root.fence, .{});
+    defer a.free(fence);
+    try enrollment.prepare(client, policy, a, id, root.namespace, .{ .command = body, .fence = fence, .table = root.table_name }, request);
+}
+
+pub fn driveRoot(client: *MetadataClient, policy: anytype, a: A, state: control.State, namespace: control.Namespace, request: Context) !void {
+    const item = state.roots[try state.rootIndex(namespace)];
+    const result = if (item.pending_control.?.stage == .dispatching)
+        try enrollment.reconcile(client, policy, policy.source.grants, a, state.id, namespace, request)
+    else
+        try enrollment.drive(client, policy, policy.source.controls, a, state.id, namespace, request);
+    switch (result.status) {
+        .settled => {
+            const effect = result.settlement.?.effect;
+            if (effect == .rejected) {
+                const Rejection = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Rejection;
+                const rejection = std.enums.fromInt(Rejection, effect.rejected) orelse return error.ChangefeedCorrupt;
+                return rejection.asError();
+            }
+        },
+        .reconciled => {},
+        else => return result.deferred_error orelse error.MetadataMutationOutcomeUnknown,
+    }
+}
+
 fn duplicateOptional(a: A, value: ?[]const u8) !?[]const u8 {
     if (value) |bytes| return try a.dupe(u8, bytes);
     return null;
