@@ -223,7 +223,7 @@ test "source owner lookup and descriptor admission preserve one cancellable cata
             var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "unused", .{ .ptr = &fixture, .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&catalog_io), .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .table_routing_snapshot = Fixture.capture, .linearizable_table_routing_snapshot = Fixture.confirm, .free_routing_snapshot = Fixture.freeRouting } }, read_gate.alreadyReadSafeBarrier());
             const opts: db_types.LookupOptions = .{ .execution_deadline_ns = fixture.request_now + std.time.ns_per_s, .execution_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&request_io), .cancellation = .fromAtomic(&fixture.canceled) };
             const expected: anyerror = switch (mode) {
-                .confirm => error.TableNotFound,
+                .confirm => error.StorageReadTemporarilyUnavailable,
                 .cancel => error.Canceled,
                 .expire => error.CatalogRoutingSnapshotTimeout,
             };
@@ -245,6 +245,10 @@ test "source owner fenced descriptor disappearance is availability not absence" 
             groups[0] = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } };
             return .{ .found = .{ .metadata_group_id = 1, .metadata_incarnation = null, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .groups = groups } };
         }
+        fn point(_: *anyopaque, _: []const u8, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return .{ .metadata_group_id = 1, .catalog_revision = 1, .tables = &.{}, .ranges = &.{} };
+        }
+        fn freePoint(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
         fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
             return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &.{}, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
         }
@@ -258,6 +262,11 @@ test "source owner fenced descriptor disappearance is availability not absence" 
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, ProvisionedKernelOwnerSource.lookupGroupLocalRouted(&source, std.testing.allocator, fence, 7, "rows", "a", .{}, .read_index));
     // An unfenced physical lookup still identifies a genuinely missing table.
     try std.testing.expectError(error.TableNotFound, ProvisionedKernelOwnerSource.lookupGroupLocal(&source, std.testing.allocator, 7, "rows", "a", .{}, .read_index));
+    var point_vtable = source.catalog.vtable.*;
+    point_vtable.table_routing_snapshot = Fixture.point;
+    point_vtable.free_routing_snapshot = Fixture.freePoint;
+    source.catalog.vtable = &point_vtable;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, ProvisionedKernelOwnerSource.queryGroupLocalRouted(&source, std.testing.allocator, fence, 7, "rows", .{}, .stale));
 }
 
 pub const ProvisionedKernelOwnerSource = struct {
@@ -3087,7 +3096,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         var projection = (if (applied_only)
             try table_catalog.appliedTableGroupDescriptor(alloc, self.catalog, table_name, group_id, budget)
         else
-            try table_catalog.tableGroupDescriptorProjectionControlled(alloc, self.catalog, table_name, group_id, budget)) orelse return error.TableNotFound;
+            try table_catalog.tableGroupDescriptorProjectionControlled(alloc, self.catalog, table_name, group_id, budget)) orelse {
+            // An applied point cut cannot certify absence. Return to the
+            // routing caller so it can retry outside structural admission.
+            return if (applied_only) error.StorageReadTemporarilyUnavailable else error.TableNotFound;
+        };
         errdefer projection.deinit(alloc);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         return .{
@@ -7946,7 +7959,7 @@ test "owner descriptor admission refreshes stale point captures once before exec
             defer lease.deinit();
             try std.testing.expect(lease.entry == &entry);
         } else {
-            try std.testing.expectError(if (mode == 1) error.StorageKernelOwnerStaleDescriptor else if (mode == 2) error.Canceled else error.TableNotFound, source.acquireWithControls(2, "docs", controls));
+            try std.testing.expectError(if (mode == 1) error.StorageKernelOwnerStaleDescriptor else if (mode == 2) error.Canceled else error.StorageReadTemporarilyUnavailable, source.acquireWithControls(2, "docs", controls));
         }
         try std.testing.expectEqual(@as(usize, 2), fixture.captures);
         try std.testing.expectEqual(@as(usize, 0), fixture.confirmations);
