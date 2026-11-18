@@ -1443,7 +1443,7 @@ pub const Store = struct {
         defer alloc.free(pending);
         return try self.updateLocked(alloc, parsed.value, .{
             .phase = .running,
-            .clear_active_table_index = true,
+            .clear_active_table_index = parsed.value.active_table_index == table_index,
             .durability_pending_table_ranges = pending,
             .published_table_ranges = published,
         });
@@ -4878,8 +4878,15 @@ test "restore runtime store persists checkpoints and requeues interrupted work" 
         defer alloc.free(table_restarted);
         const durability_pending = try first_store.recordTableDurabilityPending(alloc, job_id, parsed_running.value.attempt_id, 0);
         defer alloc.free(durability_pending);
+        const next_started = try first_store.recordTableStarted(alloc, job_id, parsed_running.value.attempt_id, 1);
+        defer alloc.free(next_started);
         const published = try first_store.recordTablePublished(alloc, job_id, parsed_running.value.attempt_id, 0);
         defer alloc.free(published);
+        var published_state = try std.json.parseFromSlice(JobState, alloc, published, .{});
+        defer published_state.deinit();
+        try std.testing.expectEqual(@as(?u16, 1), published_state.value.active_table_index);
+        const next_aborted = try first_store.recordTableAborted(alloc, job_id, parsed_running.value.attempt_id, 1);
+        defer alloc.free(next_aborted);
         const completed = try first_store.recordTableCompleted(alloc, job_id, parsed_running.value.attempt_id, 0);
         defer alloc.free(completed);
     }

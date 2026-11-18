@@ -744,10 +744,11 @@ func decodeRestoreJob(resp *http.Response) (*RestoreJob, error) {
 
 // BackupInfo represents metadata about a stored backup
 type BackupInfo struct {
-	BackupID      string
-	Timestamp     string
-	AntflyVersion string
-	Tables        []string
+	BackupID            string
+	Timestamp           string
+	AntflyVersion       string
+	Tables              []string
+	TableDetailsOmitted bool
 }
 
 // BackupPage is one stable manifest-order page of backups.
@@ -798,10 +799,11 @@ func (c *AntflyClient) ListBackupsPage(ctx context.Context, options BackupListOp
 	backups := make([]BackupInfo, len(result.Backups))
 	for i, b := range result.Backups {
 		backups[i] = BackupInfo{
-			BackupID:      b.BackupId,
-			Timestamp:     b.Timestamp.Format("2006-01-02T15:04:05Z07:00"),
-			AntflyVersion: b.AntflyVersion,
-			Tables:        b.Tables,
+			BackupID:            b.BackupId,
+			Timestamp:           b.Timestamp.Format("2006-01-02T15:04:05Z07:00"),
+			AntflyVersion:       b.AntflyVersion,
+			Tables:              b.Tables,
+			TableDetailsOmitted: b.TableDetailsOmitted,
 		}
 	}
 

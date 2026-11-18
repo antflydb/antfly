@@ -294,6 +294,8 @@ manifest binding support. Older workers reject these records during recovery.
 
 For paginated backup listings, keep following `next_cursor` until it is
 absent. A page can be empty if its window contains only skipped manifests.
+When a backup's table details exceed the page size, its entry sets
+`table_details_omitted`. Use the backup ID to restore the entire backup.
 
 For an offline source inventory and compatibility report, use:
 

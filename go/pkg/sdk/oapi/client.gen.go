@@ -19847,6 +19847,9 @@ type BackupInfo struct {
 	// Example: s3://mybucket/antfly-backups/cluster/2025-01-15
 	Location string `json:"location"`
 
+	// TableDetailsOmitted True when the listing returned only backup metadata because table details exceeded the page size.
+	TableDetailsOmitted bool `json:"table_details_omitted,omitempty,omitzero"`
+
 	// TableSelectors Exact restore selectors paired with display names, in the same order as tables. Use selector in ClusterRestoreRequest.table_names to disambiguate identical display names.
 	TableSelectors []struct {
 		// Name Display name of the backed-up table.

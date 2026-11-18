@@ -13550,12 +13550,14 @@ pub const ApiHttpServer = struct {
         ordinals: ?[]const u16,
         children: []const backups_api.TableManifestDigest,
         published_table_ranges: []const restore_jobs.TableIndexRange,
+        reconciled: ?*const std.StaticBitSet(restore_jobs.max_cluster_tables_per_job),
         cancellation: ?RestoreCancellation,
     ) !void {
         // Validate all remaining sources before the next publication.
         // The catalog and restore intent are authoritative after publication.
         for (children, table_names, 0..) |*expected, name, index| {
-            if (restore_jobs.containsTableIndex(published_table_ranges, @intCast(index))) continue;
+            if (restore_jobs.containsTableIndex(published_table_ranges, @intCast(index)) or
+                (if (reconciled) |bits| bits.isSet(index) else false)) continue;
             try self.ensureRestoreActive(cancellation);
             const entry = &manifest.tables[if (ordinals) |selected| selected[index] else index];
             var child = try readLegacyRestoreChild(expected, alloc, location, entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id);
@@ -20177,6 +20179,7 @@ pub const ApiHttpServer = struct {
                 null,
                 &.{},
                 &.{},
+                &.{},
             ),
         };
     }
@@ -21751,6 +21754,7 @@ pub const ApiHttpServer = struct {
         active_table_index: ?u16,
         durability_pending_table_ranges: []const restore_jobs.TableIndexRange,
         published_table_ranges: []const restore_jobs.TableIndexRange,
+        completed_table_ranges: []const restore_jobs.TableIndexRange,
     ) cluster_api_http.ClusterApi.ExecuteRestoreError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const op_alloc = self.alloc;
@@ -21888,10 +21892,6 @@ pub const ApiHttpServer = struct {
             const children = op_alloc.alloc(backups_api.TableManifestDigest, table_names.len) catch return error.InternalFailure;
             errdefer op_alloc.free(children);
             std.base64.standard.Decoder.decode(std.mem.sliceAsBytes(children), encoded) catch return error.BackupIntegrityFailure;
-            self.verifyPendingLegacyRestoreChildren(op_alloc, location, &manifest, table_names, req.admitted_table_ordinals, children, published_table_ranges, cancellation) catch |err| return switch (err) {
-                error.PortableForeignKeyRestoreUnavailable, error.InvalidRequest, error.Cancelled, error.NotLeader, error.InternalFailure => |known| known,
-                else => mapClusterRestoreRepositoryError(err),
-            };
             break :blk children;
         } else if (req.admitted_children_sha256) |expected| blk: {
             if (manifest.cohort_json.len != 0) return error.BackupIntegrityFailure;
@@ -21922,7 +21922,11 @@ pub const ApiHttpServer = struct {
         defer catalog_arena.deinit();
         const ca = catalog_arena.allocator();
         const destinations = ca.alloc([]const u8, table_names.len) catch return error.InternalFailure;
-        for (table_names, destinations) |source_name, *destination| {
+        for (table_names, destinations, 0..) |source_name, *destination, index| {
+            if (restore_jobs.containsTableIndex(completed_table_ranges, @intCast(index))) {
+                destination.* = source_name;
+                continue;
+            }
             const entry = backups_api.findClusterTableByStorageName(&manifest, source_name) orelse {
                 destination.* = source_name;
                 continue;
@@ -21947,6 +21951,36 @@ pub const ApiHttpServer = struct {
                     destination.* = table.name;
                 } else destination.* = hint;
             }
+        }
+
+        const is_overwrite = std.mem.eql(u8, restore_mode, "overwrite");
+        var reconciled: std.StaticBitSet(restore_jobs.max_cluster_tables_per_job) = .empty;
+        if (req.admitted_child_pins != null) {
+            // The metadata publication and the job checkpoint are separate
+            // commits. Resolve an interrupted attempt before opening its source.
+            if (!is_overwrite and !self.cfg.deployment_mode.isStandalone()) {
+                for (destinations, 0..) |destination, index| {
+                    const ordinal: u16 = @intCast(index);
+                    if (ordinal != active_table_index and
+                        !restore_jobs.containsTableIndex(durability_pending_table_ranges, ordinal)) continue;
+                    try self.ensureRestoreActive(cancellation);
+                    const entry = &manifest.tables[if (req.admitted_table_ordinals) |selected| selected[index] else index];
+                    switch (self.distributedRestoreIntentState(destination, req.location, entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id) catch |err| return metadataAccessFailure(err)) {
+                        .pending, .completed => {
+                            self.checkpointRestoreTablePublished(cancellation, ordinal) catch |err| {
+                                if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.NotLeader;
+                                return error.InternalFailure;
+                            };
+                            reconciled.set(index);
+                        },
+                        .missing, .conflicting => {},
+                    }
+                }
+            }
+            self.verifyPendingLegacyRestoreChildren(op_alloc, location, &manifest, table_names, req.admitted_table_ordinals, legacy_children.?, published_table_ranges, &reconciled, cancellation) catch |err| return switch (err) {
+                error.PortableForeignKeyRestoreUnavailable, error.InvalidRequest, error.Cancelled, error.NotLeader, error.InternalFailure => |known| known,
+                else => mapClusterRestoreRepositoryError(err),
+            };
         }
 
         if (std.mem.eql(u8, restore_mode, "fail_if_exists")) {
@@ -21980,6 +22014,11 @@ pub const ApiHttpServer = struct {
             status_name_count += 1;
             statuses[i] = .{ .name = status_name, .status = "failed", .@"error" = null };
 
+            if (restore_jobs.containsTableIndex(completed_table_ranges, @intCast(i))) {
+                statuses[i].status = "committed";
+                continue;
+            }
+
             if (selected_entry == null) {
                 statuses[i].@"error" = "backup does not include table";
                 continue;
@@ -21994,10 +22033,10 @@ pub const ApiHttpServer = struct {
             }
         }
 
-        const is_overwrite = std.mem.eql(u8, restore_mode, "overwrite");
         for (table_names, destinations, 0..) |source_name, table_name, i| {
             try self.ensureRestoreActive(cancellation);
-            if (statuses[i].@"error" != null or std.mem.eql(u8, statuses[i].status, "skipped")) continue;
+            if (statuses[i].@"error" != null or std.mem.eql(u8, statuses[i].status, "skipped") or
+                restore_jobs.containsTableIndex(completed_table_ranges, @intCast(i))) continue;
 
             const cluster_table = backups_api.findClusterTableByStorageName(&manifest, source_name).?;
             const table_backup_id = cluster_table.table_backup_id;
@@ -22008,7 +22047,7 @@ pub const ApiHttpServer = struct {
             // resumed attempt, do not republish or reject the table merely
             // because it now exists; wait for the already-published replica
             // restore intent to drain instead.
-            if (restore_jobs.containsTableIndex(published_table_ranges, @intCast(i))) {
+            if (reconciled.isSet(i) or restore_jobs.containsTableIndex(published_table_ranges, @intCast(i))) {
                 self.authorizePublishedRestoreDestinations(op_alloc, table_name, destination_authorization_principal) catch |err| switch (err) {
                     error.RestoreDestinationReauthorizationRequired,
                     error.StoredDestinationAuthorizationRevoked,
@@ -25953,7 +25992,7 @@ pub const ApiHttpServer = struct {
                         .admitted_manifest_sha256 = if (state.cluster_binding) |binding| binding.manifest_sha256 else null,
                         .admitted_table_ordinals = if (state.cluster_binding) |binding| binding.selected_ordinals else null,
                         .restore_mode = state.restore_mode,
-                    }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
+                    }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}, state.completed_table_ranges orelse &.{}) catch |err| {
                         if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                         if (restoreJobErrorIsRetryable(err)) {
                             const encoded = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(err), restoreRetryDelayNs(err, state.job_id, state.attempt_id));
@@ -26085,7 +26124,7 @@ pub const ApiHttpServer = struct {
                 .admitted_children_sha256 = if (state.cluster_binding) |binding| binding.children_sha256 else null,
                 .admitted_child_pins = if (state.cluster_binding) |binding| binding.child_pins else null,
                 .restore_mode = state.restore_mode,
-            }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
+            }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}, state.completed_table_ranges orelse &.{}) catch |err| {
                 if (restoreJobErrorIsRetryable(err)) {
                     const retry_delay_ns = restoreRetryDelayNs(err, state.job_id, state.attempt_id);
                     const retried = try self.restore_job_store.retryRunning(
@@ -56064,13 +56103,16 @@ test "legacy cluster restore pins child manifests under an unchanged aggregate" 
     try std.testing.expect(!std.mem.eql(u8, &pinned.digest, &fresh.digest));
     try std.testing.expectError(error.BackupArtifactIntegrityMismatch, ApiHttpServer.readLegacyRestoreChild(&pinned.bindings[0], alloc, &location, child.backup_id, child.backup_id));
     const table_names = &.{ "docs", "pending" };
-    try std.testing.expectError(error.BackupArtifactIntegrityMismatch, server.verifyPendingLegacyRestoreChildren(alloc, &location, &after, table_names, null, pinned.bindings, &.{}, null));
+    try std.testing.expectError(error.BackupArtifactIntegrityMismatch, server.verifyPendingLegacyRestoreChildren(alloc, &location, &after, table_names, null, pinned.bindings, &.{}, null, null));
     try std.Io.Dir.cwd().deleteFile(io, path);
-    try server.verifyPendingLegacyRestoreChildren(alloc, &location, &after, table_names, null, pinned.bindings, &.{.{ 0, 0 }}, null);
+    try server.verifyPendingLegacyRestoreChildren(alloc, &location, &after, table_names, null, pinned.bindings, &.{.{ 0, 0 }}, null, null);
+    var reconciled: std.StaticBitSet(restore_jobs.max_cluster_tables_per_job) = .empty;
+    reconciled.set(0);
+    try server.verifyPendingLegacyRestoreChildren(alloc, &location, &after, table_names, null, pinned.bindings, &.{}, &reconciled, null);
     const pending_path = try backups_api.metadataPath(alloc, root, pending.backup_id);
     defer alloc.free(pending_path);
     try std.Io.Dir.cwd().deleteFile(io, pending_path);
-    try std.testing.expectError(error.FileNotFound, server.verifyPendingLegacyRestoreChildren(alloc, &location, &after, table_names, null, pinned.bindings, &.{.{ 0, 0 }}, null));
+    try std.testing.expectError(error.FileNotFound, server.verifyPendingLegacyRestoreChildren(alloc, &location, &after, table_names, null, pinned.bindings, &.{.{ 0, 0 }}, null, null));
 }
 
 test "owned restore verifies declared artifact identity instead of accepting staged bytes" {

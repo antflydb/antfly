@@ -1988,6 +1988,7 @@ pub const BackupInfo = struct {
     timestamp: []const u8,
     tables: []const []const u8,
     table_selectors: []const BackupTableSelector = &.{},
+    table_details_omitted: ?bool = null,
     location: []const u8,
     antfly_version: []const u8,
 };
@@ -10986,19 +10987,33 @@ fn appendBackupListInfo(
     manifest: *const ClusterBackupManifest,
     location: []const u8,
 ) !bool {
-    const info = try backupInfoFromManifest(alloc, manifest, location);
+    var info = try backupInfoFromManifest(alloc, manifest, location);
+    errdefer freeBackupInfo(alloc, info);
+    var cost = backupListInfoSize(info);
+    if (cost > remaining_bytes.*) {
+        if (infos.items.len != 0) {
+            freeBackupInfo(alloc, info);
+            return false;
+        }
+        // Keep the backup discoverable and let its key advance the cursor.
+        // Whole-backup restore by ID remains available for a summary entry.
+        freeBackupTableDetails(alloc, info);
+        info.tables = &.{};
+        info.table_selectors = &.{};
+        info.table_details_omitted = true;
+        cost = backupListInfoSize(info);
+        if (cost > remaining_bytes.*) return error.BackupManifestTooLarge;
+    }
+    remaining_bytes.* -= cost;
+    infos.appendAssumeCapacity(info);
+    return true;
+}
+
+fn backupListInfoSize(info: BackupInfo) usize {
     var buffer: [1024]u8 = undefined;
     var sink = std.Io.Writer.Discarding.init(&buffer);
     sink.writer.print("{f}", .{std.json.fmt(info, .{ .emit_null_optional_fields = false })}) catch unreachable;
-    const cost = sink.fullCount() + 1; // Include a separator for each entry.
-    if (cost > remaining_bytes.*) {
-        freeBackupInfo(alloc, info);
-        if (infos.items.len == 0) return error.BackupManifestTooLarge;
-        return false;
-    }
-    remaining_bytes.* -= @intCast(cost);
-    infos.appendAssumeCapacity(info);
-    return true;
+    return @intCast(sink.fullCount() + 1); // Include a separator.
 }
 
 pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, location: []const u8, options: BackupListOptions) !BackupListPage {
@@ -12248,12 +12263,16 @@ pub fn freeClusterRestoreRequest(alloc: std.mem.Allocator, req: *ClusterRestoreR
 pub fn freeBackupInfo(alloc: std.mem.Allocator, info: BackupInfo) void {
     alloc.free(@constCast(info.backup_id));
     alloc.free(@constCast(info.timestamp));
+    freeBackupTableDetails(alloc, info);
+    alloc.free(@constCast(info.location));
+    alloc.free(@constCast(info.antfly_version));
+}
+
+fn freeBackupTableDetails(alloc: std.mem.Allocator, info: BackupInfo) void {
     for (info.tables) |table| alloc.free(@constCast(table));
     for (info.table_selectors) |entry| alloc.free(entry.selector);
     alloc.free(info.table_selectors);
     alloc.free(info.tables);
-    alloc.free(@constCast(info.location));
-    alloc.free(@constCast(info.antfly_version));
 }
 
 pub fn freeBackupInfos(alloc: std.mem.Allocator, infos: []const BackupInfo) void {
@@ -17841,6 +17860,13 @@ test "filesystem backup listing is bounded and cursor stable" {
         page.next_cursor = null;
         try std.testing.expect((cursor == null) == (i == 2));
     }
+
+    var summarized = try listClusterBackups(alloc, root, "file:///backups", .{ .limit = 1, .items_byte_budget = 230 });
+    defer summarized.deinit(alloc);
+    try std.testing.expectEqualStrings("prod-snap-2", summarized.backups[0].backup_id);
+    try std.testing.expectEqual(@as(?bool, true), summarized.backups[0].table_details_omitted);
+    try std.testing.expectEqual(@as(usize, 0), summarized.backups[0].tables.len);
+    try std.testing.expectEqualStrings("prod-snap-2", summarized.next_cursor.?);
 
     for (0..256) |i| {
         const id = try std.fmt.allocPrint(alloc, "bad-{d:0>3}", .{i});
