@@ -1444,6 +1444,12 @@ const RaftTableApplyStateMachine = struct {
         }
 
         fn forRequest(err: anyerror, req: antfly.db.types.BatchRequest) ?ExpectedApplyFailure {
+            if (err == error.GraphConstraintBusy) {
+                if (req.transaction) |control| {
+                    if (control == .resolve and control.resolve.status == .committed) return null;
+                }
+                return .GraphConstraintBusy;
+            }
             if (req.transaction) |control| if (control == .prepare and control.prepare.dag_domains.len != 0) {
                 inline for (@typeInfo(@import("../api/dag_errors.zig").Error).error_set.error_names.?) |field| {
                     if (err == @field(@import("../api/dag_errors.zig").Error, field)) return @field(ExpectedApplyFailure, field);

@@ -24,6 +24,53 @@ const std = @import("std");
 pub const Digest = [32]u8;
 pub const TransactionId = [16]u8;
 
+/// A fence applies to one physical table root. The activation coordinator
+/// must acquire it on every source root before taking a shared snapshot.
+pub const SourceFence = struct {
+    pub const key = "\x00\x00__metadata__:dag-source-fence";
+    activation: Digest,
+    snapshot: Digest,
+
+    pub fn read(txn: anytype) !?SourceFence {
+        const raw = txn.get(key) catch |err| {
+            if (err == error.NotFound) return null;
+            return err;
+        };
+        if (raw.len != 96) return error.InvalidDagAuthority;
+        var checksum: Digest = undefined;
+        std.crypto.hash.sha2.Sha256.hash(raw[0..64], &checksum, .{});
+        if (!std.mem.eql(u8, &checksum, raw[64..96])) return error.InvalidDagAuthority;
+        return .{ .activation = raw[0..32].*, .snapshot = raw[32..64].* };
+    }
+
+    pub fn acquire(self: SourceFence, txn: anytype) !void {
+        if (try read(txn)) |current| {
+            if (!std.meta.eql(current, self)) return error.GraphConstraintBusy;
+            return;
+        }
+        var raw: [96]u8 = undefined;
+        raw[0..32].* = self.activation;
+        raw[32..64].* = self.snapshot;
+        std.crypto.hash.sha2.Sha256.hash(raw[0..64], raw[64..96], .{});
+        try txn.put(key, &raw);
+    }
+
+    pub fn release(self: SourceFence, txn: anytype) !void {
+        const current = (try read(txn)) orelse return;
+        if (!std.meta.eql(current, self)) return error.GraphConstraintAttemptConflict;
+        try txn.delete(key);
+    }
+
+    pub fn requireWritable(txn: anytype) !void {
+        if (try read(txn) != null) return error.GraphConstraintBusy;
+    }
+
+    fn requireSnapshot(txn: anytype, snapshot: Digest) !void {
+        const fence = (try read(txn)) orelse return error.GraphConstraintNotReady;
+        if (!std.mem.eql(u8, &fence.snapshot, &snapshot)) return error.GraphConstraintRevisionChanged;
+    }
+};
+
 /// Hash the immutable table identity, index incarnation, and declared edge type.
 /// Shard IDs are deliberately absent: splitting cannot create weaker domains.
 pub fn domain(table: [16]u8, index_incarnation: u64, index: []const u8, edge_type: []const u8) !Digest {
@@ -956,6 +1003,7 @@ pub const Contributions = struct {
     /// The catalog must hold the corresponding source-write fence.
     pub fn beginActivation(txn: anytype, id: Digest, epoch: u64, snapshot: Digest) !void {
         _ = try activationState(txn, id, epoch);
+        try SourceFence.requireSnapshot(txn, snapshot);
         if (try readActivationProgress(txn, id)) |progress| {
             if (!std.mem.eql(u8, &progress.snapshot, &snapshot)) return error.GraphConstraintRevisionChanged;
             return;
@@ -986,6 +1034,7 @@ pub const Contributions = struct {
         witness: *validation.Witness,
     ) !void {
         _ = try activationState(txn, id, epoch);
+        try SourceFence.requireSnapshot(txn, snapshot);
         try requireActivationCursor(txn, id, snapshot, expected_after);
         if (replacements.len == 0) return error.InvalidDagMutation;
         const first = replacements[0];
@@ -1097,6 +1146,7 @@ pub const Contributions = struct {
         const proof: ActivationProof = .{ .snapshot = snapshot, .after = after };
         if (state.phase == .active) return requireActivationCertificate(txn, id, proof);
         if (state.phase != .validating or state.revision != 0) return error.GraphConstraintNotReady;
+        try SourceFence.requireSnapshot(txn, snapshot);
         try requireActivationCursor(txn, id, snapshot, if (after.len == 0) null else after);
         try saveActivationCertificate(txn, id, proof);
         try txn.delete(&activationKey(id));
@@ -1562,6 +1612,9 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     }
     const existing_id: Digest = @splat(2);
     try Storage.create(&txn, existing_id, 1);
+    const fence: SourceFence = .{ .activation = @splat(9), .snapshot = versions };
+    try std.testing.expectError(error.GraphConstraintNotReady, Contributions.beginActivation(&txn, existing_id, 1, versions));
+    try fence.acquire(&txn);
     var budget: Contributions.validation.Budget = .{ .clock = .{ .now = Txn.now, .context = &txn } };
     var witness: Contributions.validation.Witness = .{};
     try std.testing.expectError(error.GraphConstraintNotReady, Contributions.seedActivationPage(alloc, &txn, existing_id, 1, versions, null, &initial, &budget, &witness));
@@ -1604,6 +1657,7 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, empty_id, 2));
     try Contributions.finishActivation(&txn, empty_id, 2, versions, "");
     try Contributions.finishActivation(&txn, empty_id, 2, versions, "");
+    try fence.release(&txn);
 
     try Storage.retire(&txn, id, epoch);
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, id, epoch));

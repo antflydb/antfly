@@ -16,6 +16,7 @@
 //! Source input versions are captured at the physical transaction boundary,
 //! including coordinated transaction resolution, rather than at one API path.
 const std = @import("std");
+const DagSourceFence = @import("../graph/dag_authority.zig").SourceFence;
 const keys = @import("internal_keys.zig");
 const publication = @import("db/artifact_publication.zig");
 const authority = @import("source_authority.zig");
@@ -50,6 +51,8 @@ pub const Capture = struct {
     replay_sequence: ?u64 = null,
     replay_next: ?u64 = null,
     replay_ambiguous: bool = false,
+    dag_source_mutation: bool = false,
+    dag_fence_changed: bool = false,
     staging: bool = false,
     staged: bool = false,
     poisoned: bool = false,
@@ -83,6 +86,7 @@ pub const Capture = struct {
         errdefer self.poisoned = true;
         if (self.participant) |participant| if (participant.charge) |charge| try charge(participant.ptr, key, value);
         if (self.staging) return;
+        if (std.mem.eql(u8, key, DagSourceFence.key)) self.dag_fence_changed = true;
         if (self.participant) |participant| participant.observe(participant.ptr, key, value);
         self.allocator = alloc;
         errdefer self.poisoned = true;
@@ -131,7 +135,9 @@ pub const Capture = struct {
             return;
         }
         const artifact = publication.guardedArtifactKey(key);
-        if (!artifact and !keys.isStoredSourceRowKey(key) and !keys.isTtlKey(key)) return;
+        const source = keys.isStoredSourceRowKey(key) or keys.isTtlKey(key);
+        self.dag_source_mutation = self.dag_source_mutation or artifact or source or keys.isInternalUserKey(key);
+        if (!artifact and !source) return;
         if (self.staged) return error.RetainedEffectsMixedControl;
         if (!self.checked) {
             self.selected = try publication.authority(txn);
@@ -186,6 +192,10 @@ pub const Capture = struct {
     pub fn stage(self: *Capture, txn: anytype, retained_advanced: bool) !void {
         if (self.poisoned) return error.RetainedEffectsTransactionFailed;
         if (self.staged) return;
+        if (self.dag_source_mutation) {
+            if (self.dag_fence_changed) return error.GraphConstraintBusy;
+            try DagSourceFence.requireWritable(txn);
+        }
         // Prepared primary writers freeze the retirement footprint too.
         // Background producers may not expand the old postimage after a yes
         // vote. Resolution removes its own intent locks in this same writer,
