@@ -377,6 +377,28 @@ pub const DagDomainPrepare = struct {
     producer_versions: dag.Digest,
     replacements: []const dag.Contributions.Replacement,
 
+    /// Stage a co-located authority decision in the publication writer.
+    /// The caller must abort this writer on any failure and stage the source
+    /// guards and publication effects in the same transaction.
+    pub fn stagePublication(self: DagDomainPrepare, alloc: Allocator, writer: anytype, budget: *dag_validation.Budget, witness: *dag_validation.Witness) !dag.Receipt {
+        witness.* = .{};
+        const authority = dag.Storage.load(writer, self.domain) catch |err| {
+            if (err == error.NotFound) return error.GraphConstraintNotReady;
+            return err;
+        };
+        if (authority.owner_epoch != self.epoch) return error.GraphConstraintOwnerChanged;
+        // A co-located commit may not resolve previously enlisted distributed
+        // work. Only its transaction coordinator owns that terminal decision.
+        if (authority.pending != null) return error.GraphConstraintBusy;
+        switch (try dag.Storage.begin(writer, self.domain, self.epoch, self.revision, self.attempt)) {
+            .terminal => return self.requireAccepted(writer),
+            .reserved => |token| {
+                try dag.Contributions.prepare(alloc, writer, token, self.producer_versions, self.replacements, budget, witness);
+                return dag.Contributions.accept(alloc, writer, token, self.producer_versions, self.replacements);
+            },
+        }
+    }
+
     /// Resolve only against a trusted read of the authority ledger.
     pub fn requireAccepted(self: DagDomainPrepare, authority_txn: anytype) !dag.Receipt {
         const candidate = dag.Contributions.candidate(self.producer_versions, self.replacements);
@@ -5287,6 +5309,72 @@ test "time series source language reserves signed source slots before voting" {
     try std.testing.expectEqual(legacy + 16, try retainedIntentBytesForLanguage(std.testing.allocator, intent, true));
     const deleted: WriteIntent = .{ .key = "row", .value = null };
     try std.testing.expectEqual(try retainedIntentBytes(std.testing.allocator, deleted), try retainedIntentBytesForLanguage(std.testing.allocator, deleted, true));
+}
+
+test "DAG co-located publication rolls back authority and output together" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-dag-publication");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    const domain: dag.Digest = @splat(1);
+    {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        try dag.Storage.create(&writer, domain, 1);
+        try dag.Storage.activateNewIncarnation(&writer, domain, 1);
+        try writer.commit();
+    }
+    const clock = struct {
+        fn now(_: *anyopaque) u64 {
+            return 0;
+        }
+    };
+    const versions: dag.Digest = @splat(2);
+    const replacements: []const dag.Contributions.Replacement = &.{.{ .owner = @splat(3), .source = "left", .targets = &.{"right"} }};
+    const vote: DagDomainPrepare = .{
+        .domain = domain,
+        .epoch = 1,
+        .revision = 0,
+        .producer_versions = versions,
+        .replacements = replacements,
+        .attempt = .{ .id = @splat(4), .transaction = @splat(5), .candidate = dag.Contributions.candidate(versions, replacements) },
+    };
+    {
+        var writer = try store.beginWriteTxn();
+        defer writer.abort();
+        _ = try dag.Storage.begin(&writer, domain, vote.epoch, vote.revision, vote.attempt);
+        var budget: dag_validation.Budget = .{ .clock = .{ .context = &store, .now = clock.now } };
+        var witness: dag_validation.Witness = .{};
+        try std.testing.expectError(error.GraphConstraintBusy, vote.stagePublication(alloc, &writer, &budget, &witness));
+    }
+    const output = "\x00\x00__metadata__:test-publication-output";
+    var witness: dag_validation.Witness = .{};
+    for ([_]bool{ false, true }) |commit| {
+        var writer = try store.beginWriteTxn();
+        var active = true;
+        defer if (active) writer.abort();
+        var budget: dag_validation.Budget = .{ .clock = .{ .context = &store, .now = clock.now } };
+        const receipt = try vote.stagePublication(alloc, &writer, &budget, &witness);
+        try std.testing.expectEqual(@as(u64, 1), receipt.revision);
+        try writer.put(output, "candidate");
+        if (commit) {
+            try writer.commit();
+            active = false;
+        } else {
+            writer.abort();
+            active = false;
+            var after_abort = try store.beginReadTxn();
+            defer after_abort.abort();
+            try std.testing.expectError(error.GraphConstraintNotValidated, vote.requireAccepted(&after_abort));
+            try std.testing.expectError(error.NotFound, after_abort.get(output));
+        }
+    }
+    var reader = try store.beginReadTxn();
+    defer reader.abort();
+    try std.testing.expectEqual(@as(u64, 1), (try vote.requireAccepted(&reader)).revision);
+    try std.testing.expectEqualStrings("candidate", try reader.get(output));
 }
 
 test "DAG transaction prepare and resolution share the primary transaction" {
