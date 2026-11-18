@@ -317,6 +317,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     apply_control_started: std.atomic.Value(bool) = .init(false),
     apply_control_wake: std.Io.Event = .unset,
     apply_control_pending: std.ArrayListUnmanaged(*ApplyOpen) = .empty,
+    apply_control_requests: std.HashMapUnmanaged(ApplyOpenKey, *ApplyOpen, ApplyOpenKey.Context, std.hash_map.default_max_load_percentage) = .empty,
     apply_control_active: ?*ApplyOpen = null,
     apply_control_stopping: bool = false,
     apply_ready_wake: ?ApplyReadyWake = null,
@@ -339,6 +340,21 @@ pub const ProvisionedKernelOwnerSource = struct {
     };
 
     const apply_control_max_pending = 64;
+    const ApplyOpenKey = struct {
+        group_id: u64,
+        table_name: []const u8,
+
+        const Context = struct {
+            pub fn hash(_: Context, key: ApplyOpenKey) u64 {
+                return std.hash.Wyhash.hash(key.group_id, key.table_name);
+            }
+
+            pub fn eql(_: Context, a: ApplyOpenKey, b: ApplyOpenKey) bool {
+                return a.group_id == b.group_id and std.mem.eql(u8, a.table_name, b.table_name);
+            }
+        };
+    };
+
     const ApplyOpen = struct {
         group_id: u64,
         table_name: []u8,
@@ -349,6 +365,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         prepare_graph_indexes: bool = false,
         retry_delay_ms: u32 = 2,
         next_log_ns: u64 = 0,
+
+        fn key(self: *const ApplyOpen) ApplyOpenKey {
+            return .{ .group_id = self.group_id, .table_name = self.table_name };
+        }
 
         fn init(alloc: std.mem.Allocator, replica_root_dir: []const u8, group_id: u64, table_name: []const u8, descriptor: descriptor_contract.Descriptor) !*ApplyOpen {
             const pending = try alloc.create(ApplyOpen);
@@ -587,6 +607,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (self.quiescing) return error.Canceled;
         // Apply admission never grows the queue under the Raft mutex.
         try self.apply_control_pending.ensureTotalCapacity(self.alloc, apply_control_max_pending);
+        try self.apply_control_requests.ensureTotalCapacity(self.alloc, apply_control_max_pending);
         self.apply_control_io = io;
         errdefer self.apply_control_io = null;
         self.apply_control_future = try io.concurrent(applyControlMain, .{self});
@@ -625,6 +646,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         // apply-only release that observed started=true before shutdown may
         // still load it while stop waits for attached apply work to drain.
         self.apply_ready_wake = null;
+        self.apply_control_requests.deinit(self.alloc);
+        self.apply_control_requests = .empty;
         for (self.apply_control_pending.items) |pending| pending.deinit(self.alloc);
         self.apply_control_pending.deinit(self.alloc);
         self.apply_control_pending = .empty;
@@ -686,6 +709,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (opened) {
                 lock(&self.mutex);
                 self.apply_control_active = null;
+                self.forgetApplyOpenLocked(request);
                 const wake = self.apply_ready_wake;
                 if (wake != null) self.apply_ready_wake_inflight += 1;
                 self.mutex.unlock();
@@ -701,6 +725,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             lock(&self.mutex);
             self.apply_control_active = null;
             if (self.apply_control_stopping) {
+                self.forgetApplyOpenLocked(request);
                 self.mutex.unlock();
                 request.deinit(self.alloc);
                 return;
@@ -712,9 +737,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             }
             // A queued group owns one slot until its exact descriptor opens;
             // retrying a transition does not allocate or grow the backlog.
+            const retry_delay_ms = request.retry_delay_ms;
             self.apply_control_pending.appendAssumeCapacity(request);
             self.mutex.unlock();
-            io.sleep(.fromMilliseconds(request.retry_delay_ms), .awake) catch {};
+            io.sleep(.fromMilliseconds(retry_delay_ms), .awake) catch {};
         }
     }
 
@@ -4151,14 +4177,17 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer if (physical) |*projection| projection.deinit();
 
         if (!self.mutex.tryLock()) return error.RaftApplyWriterUnavailable;
-        const initial = self.tryAcquireWarmApplyLocked(group_id, table_name, raw_descriptor, if (physical) |cut| cut.bytes else null, needs_index_catalog);
-        if (initial) |lease| self.claimApplyOpenLocked(lease.entry, entry);
+        var claimed_open: ?*ApplyOpen = null;
+        defer if (claimed_open) |request| request.deinit(self.alloc);
+        if (self.tryAcquireWarmApplyLocked(group_id, table_name, raw_descriptor, if (physical) |cut| cut.bytes else null, needs_index_catalog)) |lease| {
+            claimed_open = self.claimApplyOpenLocked(lease.entry, entry);
+            self.mutex.unlock();
+            return lease;
+        }
+        const key: ApplyOpenKey = .{ .group_id = group_id, .table_name = table_name };
         const may_queue = !self.quiescing and !self.apply_control_stopping and
-            !self.publicationPendingLocked(group_id, table_name) and self.apply_control_io != null and
-            !self.applyRequestPendingLocked(group_id, table_name) and
-            self.apply_control_pending.items.len + @as(usize, @intFromBool(self.apply_control_active != null)) < apply_control_max_pending;
+            !self.publicationPendingLocked(group_id, table_name) and self.canQueueApplyOpenLocked(key);
         self.mutex.unlock();
-        if (initial) |lease| return lease;
         if (!may_queue) return error.RaftApplyWriterUnavailable;
         // A committed descriptor may carry large schema and index JSON. Clone
         // it outside the owner registry mutex, then recheck the exact binding
@@ -4181,43 +4210,45 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (physical == null)
             physical = self.physical_catalogs.lookup(group_id, raw_descriptor.indexes_json) catch null;
         if (self.tryAcquireWarmApplyLocked(group_id, table_name, raw_descriptor, if (physical) |cut| cut.bytes else null, needs_index_catalog)) |lease| {
-            self.claimApplyOpenLocked(lease.entry, entry);
+            claimed_open = self.claimApplyOpenLocked(lease.entry, entry);
             return lease;
         }
-        if (self.apply_control_io == null or self.applyRequestPendingLocked(group_id, table_name) or
-            self.apply_control_pending.items.len + @as(usize, @intFromBool(self.apply_control_active != null)) >= apply_control_max_pending)
-            return error.RaftApplyWriterUnavailable;
+        if (!self.canQueueApplyOpenLocked(key)) return error.RaftApplyWriterUnavailable;
+        self.apply_control_requests.putAssumeCapacityNoClobber(pending.key(), pending);
         self.apply_control_pending.appendAssumeCapacity(pending);
         pending_owned = false;
         self.apply_control_wake.set(self.apply_control_io.?);
         return error.RaftApplyWriterUnavailable;
     }
 
-    fn claimApplyOpenLocked(self: *ProvisionedKernelOwnerSource, owner: *Entry, entry: ?db_types.OrderedApplyReceipt) void {
-        const receipt = entry orelse return;
-        const Match = struct {
-            fn same(request: *const ApplyOpen, expected: *const Entry, position: db_types.OrderedApplyReceipt) bool {
-                const queued = request.entry orelse return false;
-                return request.group_id == expected.group_id and std.mem.eql(u8, request.table_name, expected.table_name) and
-                    queued.term == position.term and queued.index == position.index;
-            }
-        };
-        var claimed = false;
-        if (self.apply_control_active) |active| {
-            if (!active.claimed and Match.same(active, owner, receipt)) {
-                active.claimed = true;
-                claimed = true;
-            }
-        }
-        for (self.apply_control_pending.items) |pending| {
-            if (!pending.claimed and Match.same(pending, owner, receipt)) {
-                pending.claimed = true;
-                claimed = true;
-                break;
-            }
-        }
-        if (claimed and owner.apply_handoff_until_ns.load(.acquire) == 0)
+    fn canQueueApplyOpenLocked(self: *ProvisionedKernelOwnerSource, key: ApplyOpenKey) bool {
+        return self.apply_control_io != null and
+            self.apply_control_requests.count() < apply_control_max_pending and
+            !self.apply_control_requests.contains(key);
+    }
+
+    fn forgetApplyOpenLocked(self: *ProvisionedKernelOwnerSource, request: *ApplyOpen) void {
+        // A claimed active request can finish after its successor is queued.
+        if (self.apply_control_requests.get(request.key()) == request)
+            _ = self.apply_control_requests.remove(request.key());
+    }
+
+    fn claimApplyOpenLocked(self: *ProvisionedKernelOwnerSource, owner: *Entry, entry: ?db_types.OrderedApplyReceipt) ?*ApplyOpen {
+        const receipt = entry orelse return null;
+        const key: ApplyOpenKey = .{ .group_id = owner.group_id, .table_name = owner.table_name };
+        const request = self.apply_control_requests.get(key) orelse return null;
+        const queued = request.entry orelse return null;
+        if (queued.term != receipt.term or queued.index != receipt.index) return null;
+
+        _ = self.apply_control_requests.remove(key);
+        request.claimed = true;
+        if (owner.apply_handoff_until_ns.load(.acquire) == 0)
             owner.apply_handoff_until_ns.store(platform_time.monotonicNs() +| apply_handoff_timeout_ns, .release);
+        if (self.apply_control_active == request) return null;
+        for (self.apply_control_pending.items, 0..) |pending, index| {
+            if (pending == request) return self.apply_control_pending.orderedRemove(index);
+        }
+        unreachable;
     }
 
     const apply_handoff_timeout_ns = 5 * std.time.ns_per_s;
@@ -4252,18 +4283,6 @@ pub const ProvisionedKernelOwnerSource = struct {
             }
         }
         return null;
-    }
-
-    fn applyRequestPendingLocked(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) bool {
-        // The committed log is ordered per group. Keep one exact descriptor
-        // request for that group; later entries retry after it is installed.
-        if (self.apply_control_active) |active| {
-            if (active.group_id == group_id and std.mem.eql(u8, active.table_name, table_name)) return true;
-        }
-        for (self.apply_control_pending.items) |pending| {
-            if (pending.group_id == group_id and std.mem.eql(u8, pending.table_name, table_name)) return true;
-        }
-        return false;
     }
 
     fn acquireDescriptorOnce(
@@ -7346,20 +7365,51 @@ test "committed owner apply consumes an independently opened owner before delaye
         };
         break;
     }
+    var successor = descriptor;
+    successor.schema_json = "{\"version\":1}";
+    while (true) {
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", successor, batch, 2, 2));
+        const queued = blk: {
+            Source.lock(&source.mutex);
+            defer source.mutex.unlock();
+            try std.testing.expect(source.apply_control_active.?.claimed);
+            try std.testing.expectEqual(@as(u64, 0), source.entries.items[0].apply_handoff_until_ns.load(.acquire));
+            const request = source.apply_control_requests.get(.{ .group_id = 1, .table_name = "docs" }) orelse break :blk false;
+            try std.testing.expectEqual(@as(usize, 1), source.apply_control_pending.items.len);
+            try std.testing.expectEqual(request, source.apply_control_pending.items[0]);
+            try std.testing.expectEqual(@as(u64, 2), request.entry.?.index);
+            break :blk true;
+        };
+        if (queued) break;
+        if (platform_time.monotonicNs() >= deadline) return error.TestSuccessorDidNotQueue;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
     gate.proceed.set(io);
     while (true) {
         const done = blk: {
             Source.lock(&source.mutex);
             defer source.mutex.unlock();
             if (source.apply_control_active != null or source.apply_control_pending.items.len != 0) break :blk false;
+            try std.testing.expectEqual(@as(u32, 0), source.apply_control_requests.count());
             try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
-            try std.testing.expectEqual(@as(u64, 0), source.entries.items[0].apply_handoff_until_ns.load(.acquire));
             break :blk true;
         };
         if (done) break;
         if (platform_time.monotonicNs() >= deadline) return error.TestApplyControlDidNotFinish;
         try io.sleep(.fromMilliseconds(1), .awake);
     }
+    while (true) {
+        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", successor, batch, 2, 2) catch |err| {
+            if (err != error.RaftApplyWriterUnavailable) return err;
+            if (platform_time.monotonicNs() >= deadline) return error.TestSuccessorDidNotAdmit;
+            try io.sleep(.fromMilliseconds(1), .awake);
+            continue;
+        };
+        break;
+    }
+    Source.lock(&source.mutex);
+    defer source.mutex.unlock();
+    try std.testing.expectEqual(@as(u64, 0), source.entries.items[0].apply_handoff_until_ns.load(.acquire));
 }
 
 test "owner shutdown joins recovery close while raft progress remains available" {
