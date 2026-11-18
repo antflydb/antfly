@@ -22,16 +22,21 @@ const output_names = names: {
     break :names result;
 };
 
+pub const HiddenOutput = struct {
+    last_row: bool = false,
+    final_norm: bool = true,
+};
+
 pub const Spec = struct {
     config: Config,
     rows: usize,
-    last_row: bool = false,
+    output: HiddenOutput = .{},
 
     pub fn donorLayers(self: *const Spec) usize {
         return self.config.num_hidden_layers - self.config.num_kv_shared_layers;
     }
     pub fn resolve(self: *Spec) capture.Forward {
-        return .{ .context = self, .fingerprint = self.config.fingerprint() ^ 0x70726566696c6c01 ^ @as(u64, @intFromBool(self.last_row)), .optimization = .authored_schedule, .device_inputs = .assigned, .output_abi = abi, .validate = validate, .run = run };
+        return .{ .context = self, .fingerprint = self.config.fingerprint() ^ 0x70726566696c6c01 ^ @as(u64, @intFromBool(self.output.last_row)) ^ (@as(u64, @intFromBool(self.output.final_norm)) << 1), .optimization = .authored_schedule, .device_inputs = .assigned, .output_abi = abi, .validate = validate, .run = run };
     }
 };
 
@@ -70,7 +75,7 @@ fn run(raw: *anyopaque, cb: *const ops.ComputeBackend, a: std.mem.Allocator, inp
     defer if (ple) |value| cb.free(value);
     const context = gpt.DecodeContext{ .total_sequence_len = spec.rows, .query_sequence_len = spec.rows, .kv_sequence_len = spec.rows, .forward_kv_reuse = scope.context() };
     owns_hidden = false;
-    const final = try gpt.forwardFinalHiddenWithSharedKvOutput(cb, a, spec.config, hidden, .{}, 1, spec.rows, &context, ple, null, null, if (spec.last_row) .last else .all);
+    const final = try gpt.forwardFinalHiddenWithSharedKvOutputAndFinalNorm(cb, a, spec.config, hidden, .{}, 1, spec.rows, &context, ple, null, null, if (spec.output.last_row) .last else .all, spec.output.final_norm);
     outputs[0] = .{ .name = names[0], .value = final.hidden };
     initialized = 1;
     for (0..spec.donorLayers()) |layer| {
@@ -91,6 +96,7 @@ test "functional prefix exports KV and preserves ordinary decoder hidden values"
     defer weights.deinitOwned();
     const Item = struct { name: []const u8, shape: []const i64 };
     const inventory = [_]Item{
+        .{ .name = "lm_head.weight", .shape = &.{ 8, 4 } },
         .{ .name = "model.layers.0.input_layernorm.weight", .shape = &.{4} },
         .{ .name = "model.layers.0.post_attention_layernorm.weight", .shape = &.{4} },
         .{ .name = "model.norm.weight", .shape = &.{4} },
@@ -107,7 +113,7 @@ test "functional prefix exports KV and preserves ordinary decoder hidden values"
         for (item.shape) |dim| count *= @intCast(dim);
         const values = try a.alloc(f32, count);
         defer a.free(values);
-        for (values, 0..) |*value, index| value.* = if (item.shape.len == 1) 1 else @as(f32, @floatFromInt(@as(i32, @intCast(index % 7)) - 3)) / 32;
+        for (values, 0..) |*value, index| value.* = if (std.mem.eql(u8, item.name, "model.norm.weight")) @as(f32, @floatFromInt(index + 1)) / 2 else if (item.shape.len == 1) 1 else @as(f32, @floatFromInt(@as(i32, @intCast(index % 7)) - 3)) / 32;
         const name = try a.dupe(u8, item.name);
         var tensor = try Tensor.initFloat32(a, name, item.shape, values);
         errdefer tensor.deinit();
@@ -122,8 +128,11 @@ test "functional prefix exports KV and preserves ordinary decoder hidden values"
     const declared = [_]capture.Input{.{ .tensor = input }};
     var spec = Spec{ .config = config, .rows = 2 };
     var last = spec;
-    last.last_row = true;
+    last.output.last_row = true;
     try std.testing.expect(spec.resolve().fingerprint != last.resolve().fingerprint);
+    var raw_spec = spec;
+    raw_spec.output.final_norm = false;
+    try std.testing.expect(spec.resolve().fingerprint != raw_spec.resolve().fingerprint);
     const Resolve = struct {
         fn shape(raw: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8) !?@import("ml").graph.Shape {
             const backend: *const ops.ComputeBackend = @ptrCast(@alignCast(raw.?));
@@ -155,6 +164,61 @@ test "functional prefix exports KV and preserves ordinary decoder hidden values"
     const actual = try cb.toFloat32(outputs[0].value, a);
     defer a.free(actual);
     for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
+    const raw_outputs = try run(&raw_spec, &cb, a, &declared);
+    defer a.free(raw_outputs);
+    defer for (raw_outputs) |output| cb.free(output.value);
+    const independent_input = try cb.fromFloat32Shape(input.asFloat32(), &.{ 2, 4 });
+    const independent = try gpt.forwardFinalAndPreNormHiddenTensorFromEmbeddingsWithLayer0Overrides(&cb, a, config, independent_input, .{}, 1, 2, &context, null);
+    defer cb.free(independent.final_hidden);
+    defer cb.free(independent.pre_norm_hidden);
+    const pre_norm = try cb.toFloat32(independent.pre_norm_hidden, a);
+    defer a.free(pre_norm);
+    const raw_values = try cb.toFloat32(raw_outputs[0].value, a);
+    defer a.free(raw_values);
+    for (pre_norm, raw_values) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
+    // With no prepared norm slot, the tail must complete from its current raw
+    // hidden value rather than requesting another prefix execution.
+    const raw_last = try cb.sliceRows2D(a, raw_outputs[0].value, 1, 1, config.hidden_size);
+    defer cb.free(raw_last);
+    const token = (try @import("../backends/decoder_tail_runtime.zig").forwardGreedyTokenTensorFromFinalHidden(&cb, a, config, raw_last, .rms, 999)) orelse return error.UnexpectedTailDecline;
+    defer if (token.token_tensor) |value| cb.free(value);
+    const lm_head = try cb.getWeight("lm_head.weight");
+    defer cb.free(lm_head);
+    const all_logits = try cb.linearNoBias(outputs[0].value, lm_head, 2, config.hidden_size, config.vocab_size);
+    defer cb.free(all_logits);
+    const full = try cb.toFloat32(all_logits, a);
+    defer a.free(full);
+    var best: usize = 0;
+    for (full[config.vocab_size..], 0..) |value, index| if (value > full[config.vocab_size + best]) {
+        best = index;
+    };
+    try std.testing.expectEqual(best, token.token_id);
+    var suppressed_config = config;
+    suppressed_config.suppress_token_ids[0] = @intCast(best);
+    suppressed_config.suppress_token_ids_len = 1;
+    var alternate: ?usize = null;
+    for (full[config.vocab_size..], 0..) |value, index| {
+        if (index == best) continue;
+        if (alternate == null or value > full[config.vocab_size + alternate.?]) alternate = index;
+    }
+    const suppressed = (try @import("../backends/decoder_tail_runtime.zig").forwardGreedyTokenTensorFromFinalHidden(&cb, a, suppressed_config, raw_last, .rms, 999)) orelse return error.UnexpectedTailDecline;
+    defer if (suppressed.token_tensor) |value| cb.free(value);
+    try std.testing.expectEqual(alternate.?, suppressed.token_id);
+    const normalized = try gpt.greedyLastTokenTensorFromFinalHiddenRetain(&cb, a, suppressed_config, .{ .hidden = outputs[0].value, .total_rows = 2 });
+    defer if (normalized.token_tensor) |value| cb.free(value);
+    try std.testing.expectEqual(alternate.?, normalized.token_id);
+    const generic = (try @import("../backends/decoder_tail_runtime.zig").forwardGreedyFromFinalHidden(&cb, a, suppressed_config, raw_last, .rms, 999)) orelse return error.UnexpectedTailDecline;
+    try std.testing.expectEqual(@as(i64, @intCast(alternate.?)), generic);
+    inline for (.{ false, true }) |positioned| {
+        const current = try cb.fromFloat32Shape(input.asFloat32(), &.{ 2, 4 });
+        const last_logits = if (positioned)
+            try gpt.forwardLastLogitsFromPositionedEmbeddingsWithLayer0Overrides(&cb, a, config, current, .{}, 1, 2, &context, null)
+        else
+            try gpt.forwardLastLogitsFromEmbeddingsWithLayer0Overrides(&cb, a, config, current, .{}, 1, 2, &context, null);
+        defer a.free(last_logits);
+        try std.testing.expectEqual(@as(usize, config.vocab_size), last_logits.len);
+        for (full[config.vocab_size..], last_logits) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
+    }
     for (outputs[1..]) |output| {
         const values = try cb.toFloat32(output.value, a);
         defer a.free(values);

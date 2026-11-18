@@ -9033,11 +9033,18 @@ pub const CudaCompute = struct {
     /// Functional, model-owned prefill programs publish into the request's
     /// paged cache AFTER execution. No request KV address is captured. Inputs
     /// are borrowed for every outcome; null leaves request state unchanged.
-    pub fn tryCapturedPrefill(cb: *const ops.ComputeBackend, a: std.mem.Allocator, config: gpt_model.Config, input: CT, ple: ?CT, dc: *const @import("../../architectures/gpt.zig").DecodeContext) !?CT {
-        return tryCapturedPrefillRows(cb, a, config, input, ple, dc, true);
+    pub fn capturedPrefillRequested(cb: *const ops.ComputeBackend) bool {
+        if (comptime !cuda_enabled) return false;
+        if (!acceptsPhysicalImplementation(cb.vtable)) return false;
+        const self: *const CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        return if (self.gemma4_native_plan) |plan| plan.capture_prefill else false;
     }
 
-    pub fn tryCapturedPrefillRows(cb: *const ops.ComputeBackend, a: std.mem.Allocator, config: gpt_model.Config, input: CT, ple: ?CT, dc: *const gpt_arch.DecodeContext, last_row: bool) !?CT {
+    pub fn tryCapturedPrefillBeforeFinalNorm(cb: *const ops.ComputeBackend, a: std.mem.Allocator, config: gpt_model.Config, input: CT, ple: ?CT, dc: *const @import("../../architectures/gpt.zig").DecodeContext) !?CT {
+        return tryCapturedPrefillOutput(cb, a, config, input, ple, dc, .{ .last_row = true, .final_norm = false });
+    }
+
+    pub fn tryCapturedPrefillOutput(cb: *const ops.ComputeBackend, a: std.mem.Allocator, config: gpt_model.Config, input: CT, ple: ?CT, dc: *const gpt_arch.DecodeContext, output_contract: @import("../../execution/prefill_frontend.zig").HiddenOutput) !?CT {
         if (comptime !cuda_enabled) return null;
         if (!acceptsPhysicalImplementation(cb.vtable)) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -9061,7 +9068,7 @@ pub const CudaCompute = struct {
         // share this owner without inventing aliases or copying embeddings.
         // An admitted error propagates; it must not retry an eager KV write.
         const rows = dc.query_sequence_len;
-        var spec = @import("../../execution/prefill_frontend.zig").Spec{ .config = config, .rows = rows, .last_row = last_row };
+        var spec = @import("../../execution/prefill_frontend.zig").Spec{ .config = config, .rows = rows, .output = output_contract };
         const hidden_shape = [_]i64{ @intCast(rows), config.hidden_size };
         const ple_shape = [_]i64{ @intCast(rows), @intCast(config.num_hidden_layers * config.ple_hidden_size) };
         const Capture = @import("../../execution/capture.zig");
@@ -9078,8 +9085,9 @@ pub const CudaCompute = struct {
             return err;
         };
         defer result.deinit();
+        if (plan.trace_prefill) std.log.info("native_prefill_program result={s} captures={d} replays={d} final_norm={} last_row={}", .{ @tagName(result.result.stats.physical_replay), result.result.stats.physical_graph_captures, result.result.stats.physical_graph_replays, output_contract.final_norm, output_contract.last_row });
         if (result.result.outputs.len != 1 + 2 * geometry.donor_layers) return error.InvalidShape;
-        const output_rows = if (last_row) 1 else rows;
+        const output_rows = if (output_contract.last_row) 1 else rows;
         const output_count = try checkedMul(output_rows, config.hidden_size);
         const output_bytes = try checkedMul(output_count, 4);
         var output = try OwnedF32Output.fromOwnedShapeBytes(self, try allocShape2(self.allocator, output_rows, config.hidden_size), output_count, output_bytes);
@@ -20674,6 +20682,10 @@ fn copyTensorFromBackendOp(ctx: *anyopaque, src_ctx: *anyopaque, src_kind: ops.B
 fn evalTensorOp(ctx: *anyopaque, _: CT) anyerror!void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     self.stats.eval_requests += 1;
+    // The numerical eval entry already owns this receiver. Optional diagnostic
+    // event collection belongs here, before metadata-only stats publication;
+    // pending event times otherwise never appear in ordinary generation runs.
+    if (self.profile_pool.pending_count != 0 and !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active) _ = try self.collectProfileSnapshot();
     if (!cudaForceEvalSync()) {
         self.stats.eval_skipped_eager += 1;
         return;

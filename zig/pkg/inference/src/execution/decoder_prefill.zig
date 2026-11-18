@@ -1289,6 +1289,12 @@ pub const Forward = struct {
         });
     }
 
+    fn capturePreparedTailPostNormHiddenFromModel(self: *Forward, capture: bool, hidden: ops.CT, norm_slot: usize) !?ops.CT {
+        if (!capture) return null;
+        return (try capturePreparedTailPostNormHidden(self.forward.context.cb, true, hidden, norm_slot, self.forward.context.gpt_config.hidden_size, self.forward.context.gpt_config.norm_eps)) orelse
+            try gpt_arch.applyFinalNorm(self.forward.context.cb, self.forward.context.allocator, self.forward.context.gpt_config.*, hidden);
+    }
+
     pub fn tryCudaPreparedTailPrefillGreedy(
         self: *Forward,
         input_ids: []const i64,
@@ -1309,7 +1315,8 @@ pub const Forward = struct {
         decode_context: *const gpt_arch.DecodeContext,
         capture_last_hidden: bool,
     ) !?Output {
-        if (!decoder_routes.cudaPreparedPrefillGreedyEnabled()) return null;
+        const capture_requested = if (comptime build_options.enable_cuda) cuda_compute.CudaCompute.capturedPrefillRequested(self.forward.context.cb) else false;
+        if (!decoder_routes.cudaPreparedPrefillGreedyEnabled(capture_requested)) return null;
         if (self.forward.context.cb.kind() != .cuda) return null;
         if (decode_context.attention_mode != .paged_prefill or decode_context.query_sequence_len != input_ids.len) return null;
 
@@ -1342,19 +1349,7 @@ pub const Forward = struct {
             greedy.token_tensor = null;
         }
 
-        const last_hidden = try capturePreparedTailPostNormHidden(
-            self.forward.context.cb,
-            capture_last_hidden,
-            tail.final_hidden,
-            tail.final_norm_slot,
-            self.forward.context.gpt_config.*.hidden_size,
-            self.forward.context.gpt_config.*.norm_eps,
-        );
-        if (capture_last_hidden and last_hidden == null) {
-            self.forward.context.cb.free(tail.final_hidden);
-            owns_hidden = false;
-            return null;
-        }
+        const last_hidden = try self.capturePreparedTailPostNormHiddenFromModel(capture_last_hidden, tail.final_hidden, tail.final_norm_slot);
         self.forward.context.cb.free(tail.final_hidden);
         owns_hidden = false;
         debugGenerationStage(
@@ -1431,16 +1426,8 @@ pub const Forward = struct {
         )) orelse return null;
         defer self.forward.context.cb.free(tail.final_hidden);
 
-        const last_hidden = try capturePreparedTailPostNormHidden(
-            self.forward.context.cb,
-            capture_last_hidden,
-            tail.final_hidden,
-            tail.final_norm_slot,
-            self.forward.context.gpt_config.*.hidden_size,
-            self.forward.context.gpt_config.*.norm_eps,
-        );
+        const last_hidden = try self.capturePreparedTailPostNormHiddenFromModel(capture_last_hidden, tail.final_hidden, tail.final_norm_slot);
         errdefer if (last_hidden) |hidden| self.forward.context.cb.free(hidden);
-        if (capture_last_hidden and last_hidden == null) return null;
 
         if (tail.greedy_token_id) |greedy_token| {
             debugGenerationStage(
