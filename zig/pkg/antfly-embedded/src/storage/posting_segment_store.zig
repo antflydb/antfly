@@ -55,7 +55,7 @@ pub fn checkpointWalPathAlloc(alloc: Allocator, root_dir: []const u8, generation
 
 pub const RetainedSegment = union(enum) {
     heap: []u8,
-    mapped: []align(std.heap.page_size_min) u8,
+    mapped: @import("../segment_source.zig").MappedArtifact,
     shared: *Shared,
 
     const Shared = struct {
@@ -109,7 +109,7 @@ pub const RetainedSegment = union(enum) {
     pub fn bytes(self: RetainedSegment) []const u8 {
         return switch (self) {
             .heap => |data| data,
-            .mapped => |data| data,
+            .mapped => |artifact| artifact.bytes,
             .shared => |value| value.payload.bytes(),
         };
     }
@@ -132,7 +132,7 @@ pub const RetainedSegment = union(enum) {
 
     pub fn mappedBytes(self: RetainedSegment) ?[]align(std.heap.page_size_min) u8 {
         return switch (self) {
-            .mapped => |data| data,
+            .mapped => |artifact| artifact.bytes,
             .heap => null,
             .shared => |value| value.payload.mappedBytes(),
         };
@@ -156,10 +156,7 @@ pub const RetainedSegment = union(enum) {
                 }
             },
             .heap => |data| alloc.free(data),
-            .mapped => |data| if (builtin.os.tag != .freestanding and builtin.os.tag != .windows and builtin.os.tag != .wasi)
-                std.posix.munmap(data)
-            else
-                unreachable,
+            .mapped => |*artifact| artifact.deinit(),
         }
         self.* = undefined;
     }
@@ -347,31 +344,42 @@ pub const Store = struct {
     /// This avoids reading and checksumming a large immutable segment twice on
     /// process startup.
     pub fn openWithSegmentAlloc(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !OpenedWithSegment {
-        var retained_segments: ?[]RetainedSegment = null;
-        var store = try openInternal(alloc, storage, root_dir, &retained_segments, .read_serving);
-        errdefer store.deinit();
-        return .{
-            .store = store,
-            .segments = retained_segments orelse return error.MissingPostingCheckpoint,
-        };
-    }
-    pub fn openReadOnlyWithSegmentAlloc(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !OpenedWithSegment {
-        var retained_segments: ?[]RetainedSegment = null;
-        var store = try openInternal(alloc, storage, root_dir, &retained_segments, .read_only);
-        errdefer store.deinit();
-        return .{ .store = store, .segments = retained_segments orelse return error.MissingPostingCheckpoint };
+        return openRetainingSegments(alloc, storage, root_dir, .read_serving);
     }
 
-    const OpenMode = enum { writer, read_serving, read_only };
+    pub fn openReadOnlyWithSegmentAlloc(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !OpenedWithSegment {
+        return openRetainingSegments(alloc, storage, root_dir, .read_only);
+    }
+
+    /// Fence the recovered WAL before its coverage can drive source replay.
+    /// Read-only activation may sync a complete WAL but cannot repair a tail.
+    pub fn openAuthoritativeWithSegmentAlloc(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8, read_only: bool) !OpenedWithSegment {
+        return openRetainingSegments(alloc, storage, root_dir, if (read_only) .authoritative_read_only else .writer);
+    }
+
+    const OpenMode = enum { writer, read_serving, read_only, authoritative_read_only };
+
+    fn openRetainingSegments(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8, mode: OpenMode) !OpenedWithSegment {
+        var retained: ?RetainedOpen = null;
+        var store = try openInternal(alloc, storage, root_dir, &retained, mode);
+        errdefer store.deinit();
+        const snapshot = retained orelse return error.MissingPostingCheckpoint;
+        return .{ .store = store, .segments = snapshot.segments, .wal = snapshot.wal };
+    }
+
+    const RetainedOpen = struct {
+        segments: []RetainedSegment,
+        wal: RecoveredWal,
+    };
 
     fn openInternal(
         alloc: Allocator,
         storage: lsm_backend.Storage,
         root_dir: []const u8,
-        retained_segments: ?*?[]RetainedSegment,
+        retained_open: ?*?RetainedOpen,
         mode: OpenMode,
     ) !Store {
-        const read_only = mode == .read_only;
+        const read_only = mode == .read_only or mode == .authoritative_read_only;
         const owned_root = try alloc.dupe(u8, root_dir);
         if (!read_only) storage.createDirPath(owned_root) catch |err| {
             alloc.free(owned_root);
@@ -426,7 +434,8 @@ pub const Store = struct {
                 return error.PostingSegmentTooLarge;
         }
         var recovered = try store.recoverWal();
-        defer recovered.deinit();
+        var recovered_owned = true;
+        defer if (recovered_owned) recovered.deinit();
         if (recovered.replay.committed_bytes < checkpoint.wal_committed_bytes) {
             return error.PostingWalShorterThanCheckpoint;
         }
@@ -441,10 +450,12 @@ pub const Store = struct {
         if (recovered.bytes.len != recovered.replay.committed_bytes) {
             if (read_only) return error.PostingWalUncommittedTail;
             try store.replaceWal(recovered.bytes[0..recovered.replay.committed_bytes]);
-        } else if (mode == .writer and recovered.replay.committed_bytes > checkpoint.sealedWalBytes()) {
+        } else if ((mode == .writer or mode == .authoritative_read_only) and
+            recovered.replay.committed_bytes > checkpoint.sealedWalBytes())
+        {
             // A complete commit frame may still be in the page cache after
             // an append's failed fsync. Establish durability before making
-            // a recovered writer available to acknowledge or advance it.
+            // recovered coverage available to acknowledge or advance it.
             const wal_path = try store.walPathAlloc(store.wal_generation);
             defer alloc.free(wal_path);
             try storage.syncFileContentsAbsolute(wal_path);
@@ -456,8 +467,9 @@ pub const Store = struct {
             checkpoint.covered_source_sequence,
             recovered.replay.covered_source_sequence,
         );
-        if (retained_segments) |out| {
-            out.* = retained;
+        if (retained_open) |out| {
+            out.* = .{ .segments = retained, .wal = recovered };
+            recovered_owned = false;
             retained_count = 0;
         } else {
             for (retained) |*segment| segment.deinit(alloc);
@@ -1396,23 +1408,23 @@ pub const Store = struct {
     fn readSegmentRetainedFor(self: *Store, descriptor: posting_wal.Checkpoint.Segment) !RetainedSegment {
         const path = try self.segmentPathAlloc(descriptor.generation);
         defer self.alloc.free(path);
-        if (comptime builtin.os.tag != .freestanding and builtin.os.tag != .windows and builtin.os.tag != .wasi) {
-            if (mapSegmentFile(path)) |mapped| {
-                const published_checksum_matches = mapped.len <= max_segment_bytes and (if (descriptor.admission_checksum != 0)
-                    (posting_segment.admissionChecksum(mapped) catch 0) == descriptor.admission_checksum
-                else
-                    @import("antfly_hash").Crc32.hash(mapped) == descriptor.checksum);
-                if (published_checksum_matches) {
-                    if (posting_segment.Reader.init(mapped)) |_| {
-                        std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.RANDOM) catch {};
-                        var payload = RetainedSegment{ .mapped = mapped };
-                        errdefer payload.deinit(self.alloc);
-                        return try RetainedSegment.share(self.alloc, payload, self.root_dir, descriptor);
-                    } else |_| {}
-                }
-                std.posix.munmap(mapped);
-            } else |_| {}
-        }
+        if (self.storage.mapImmutableArtifact(self.alloc, path)) |artifact| {
+            var payload = RetainedSegment{ .mapped = artifact };
+            var payload_owned = true;
+            defer if (payload_owned) payload.deinit(self.alloc);
+            const mapped = artifact.bytes;
+            const published_checksum_matches = mapped.len <= max_segment_bytes and (if (descriptor.admission_checksum != 0)
+                (posting_segment.admissionChecksum(mapped) catch 0) == descriptor.admission_checksum
+            else
+                @import("antfly_hash").Crc32.hash(mapped) == descriptor.checksum);
+            if (published_checksum_matches) {
+                if (posting_segment.Reader.init(mapped)) |_| {
+                    const retained = try RetainedSegment.share(self.alloc, payload, self.root_dir, descriptor);
+                    payload_owned = false;
+                    return retained;
+                } else |_| {}
+            }
+        } else |_| {}
         var payload = RetainedSegment{ .heap = try self.readSegmentAllocFor(descriptor) };
         errdefer payload.deinit(self.alloc);
         return try RetainedSegment.share(self.alloc, payload, self.root_dir, descriptor);
@@ -1463,30 +1475,25 @@ pub const OpenedWithSegment = struct {
     /// Ordered oldest-to-newest: one complete base followed by replacement
     /// deltas. The slice and every retained mmap/heap buffer are owned here.
     segments: []RetainedSegment,
+    wal: ?RecoveredWal = null,
+
+    /// Startup uses the replay validated alongside these segments. Prepared
+    /// checkpoint readers recover their WAL on demand.
+    pub fn takeWal(self: *OpenedWithSegment) !RecoveredWal {
+        const wal = self.wal orelse return self.store.recoverWal();
+        self.wal = null;
+        return wal;
+    }
 
     pub fn deinit(self: *OpenedWithSegment) void {
         const alloc = self.store.alloc;
+        if (self.wal) |*wal| wal.deinit();
         self.store.deinit();
         for (self.segments) |*segment| segment.deinit(alloc);
         alloc.free(self.segments);
         self.* = undefined;
     }
 };
-
-fn mapSegmentFile(path: []const u8) ![]align(std.heap.page_size_min) u8 {
-    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        return error.UnsupportedPlatform;
-    }
-    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
-        .ACCMODE = .RDONLY,
-        .CLOEXEC = true,
-    }, 0);
-    defer _ = std.posix.system.close(fd);
-    const size_raw = std.posix.system.lseek(fd, 0, std.posix.SEEK.END);
-    if (size_raw <= 0) return error.EmptyPostingSegment;
-    const size = std.math.cast(usize, size_raw) orelse return error.PostingSegmentTooLarge;
-    return try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
-}
 
 fn boundedReadLimit(max_bytes: usize) usize {
     return std.math.add(usize, max_bytes, 1) catch std.math.maxInt(usize);
@@ -1630,6 +1637,9 @@ test "storage.posting WAL retries a pre-write descriptor error and fences an amb
     }
     for (0..2) |_| {
         try std.testing.expectError(error.InputOutput, Store.open(alloc, store.storage, "/posting-retry"));
+        for ([_]bool{ false, true }) |read_only| {
+            try std.testing.expectError(error.InputOutput, Store.openAuthoritativeWithSegmentAlloc(alloc, store.storage, "/posting-retry", read_only));
+        }
     }
 
     const syncs_before = memory.sync_contents_calls;
@@ -1640,6 +1650,14 @@ test "storage.posting WAL retries a pre-write descriptor error and fences an amb
     var replay = try reopened.recoverWal();
     defer replay.deinit();
     try std.testing.expectEqualStrings("second update", replay.replay.latest(7, .base).?.payload);
+
+    var startup = try Store.openAuthoritativeWithSegmentAlloc(alloc, memory.storage(), "/posting-retry", true);
+    defer startup.deinit();
+    try reopened.appendBatch(3, &.{.{ .kind = .coverage, .posting_id = 0, .source_sequence = 13, .payload = &.{} }}, 13);
+    var snapshot = try startup.takeWal();
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(u64, 12), startup.store.covered_source_sequence);
+    try std.testing.expectEqual(@as(u64, 12), snapshot.replay.covered_source_sequence);
 }
 
 test "storage.posting segment store poisons ambiguous CURRENT publication" {

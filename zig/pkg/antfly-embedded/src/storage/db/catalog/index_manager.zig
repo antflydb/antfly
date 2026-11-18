@@ -10336,6 +10336,7 @@ pub const IndexManager = struct {
         stats.fd_persistent_descriptors = @max(stats.fd_persistent_descriptors, entry.fd_persistent_descriptors);
         stats.fd_admission_capacity = @max(stats.fd_admission_capacity, entry.fd_admission_capacity);
         stats.fd_persistent_reserve = @max(stats.fd_persistent_reserve, entry.fd_persistent_reserve);
+        stats.fd_mapping_reserve = @max(stats.fd_mapping_reserve, entry.fd_mapping_reserve);
         stats.fd_admission_waiters = @max(stats.fd_admission_waiters, entry.fd_admission_waiters);
         stats.fd_admission_waits = @max(stats.fd_admission_waits, entry.fd_admission_waits);
         stats.fd_persistent_admission_failures = @max(stats.fd_persistent_admission_failures, entry.fd_persistent_admission_failures);

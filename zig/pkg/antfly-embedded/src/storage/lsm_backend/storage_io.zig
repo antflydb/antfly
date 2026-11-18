@@ -54,6 +54,7 @@ pub const NativeStorageStats = struct {
     fd_persistent_descriptors: usize = 0,
     fd_admission_capacity: usize = 0,
     fd_persistent_reserve: usize = 0,
+    fd_mapping_reserve: usize = 0,
     fd_admission_waiters: usize = 0,
     fd_admission_waits: u64 = 0,
     fd_persistent_admission_failures: u64 = 0,
@@ -1385,6 +1386,9 @@ else
         capacity: usize,
         persistent_reserve: usize,
         persistent_open_headroom: usize,
+        mapping_headroom: usize,
+        mapping_mutex: std.Io.Mutex = .init,
+        mapping_descriptor_active: std.atomic.Value(bool) = .init(false),
         admitted_descriptors: std.atomic.Value(usize) = .init(0),
         persistent_descriptors: std.atomic.Value(usize) = .init(0),
         cache_entry_count: std.atomic.Value(usize) = .init(0),
@@ -1416,6 +1420,10 @@ else
                 // Creating one lifetime lock can transiently require both the
                 // newly-created descriptor and the final reopened descriptor.
                 .persistent_open_headroom = if (capacity < 4) 0 else 2,
+                // One short-lived mapping descriptor shares the process
+                // budget without displacing a positional reader. Preserve
+                // multi-descriptor admission at tiny emergency limits.
+                .mapping_headroom = if (capacity < 8) 0 else 1,
             };
         }
 
@@ -1442,10 +1450,12 @@ else
         fn snapshotStats(self: *const FdCache) NativeStorageStats {
             return .{
                 .fd_cache_entries = self.cache_entry_count.load(.monotonic),
-                .fd_admitted_descriptors = self.admitted_descriptors.load(.monotonic),
+                .fd_admitted_descriptors = self.admitted_descriptors.load(.monotonic) +
+                    @intFromBool(self.mapping_descriptor_active.load(.monotonic)),
                 .fd_persistent_descriptors = self.persistent_descriptors.load(.monotonic),
                 .fd_admission_capacity = self.capacity,
                 .fd_persistent_reserve = self.persistent_reserve,
+                .fd_mapping_reserve = self.mapping_headroom,
                 .fd_admission_waiters = self.admission_waiters.load(.monotonic),
                 .fd_admission_waits = self.admission_waits.load(.monotonic),
                 .fd_persistent_admission_failures = self.persistent_admission_failures.load(.monotonic),
@@ -1715,9 +1725,25 @@ else
             if (removed) self.signalAdmissionChanged(io);
         }
 
+        fn ordinaryCapacity(self: *const FdCache) usize {
+            return self.capacity - self.mapping_headroom;
+        }
+
+        fn reserveMappingDescriptor(self: *FdCache, io: std.Io) !void {
+            if (self.mapping_headroom == 0) return self.reserveDescriptors(io, 1);
+            try self.mapping_mutex.lock(io);
+            self.mapping_descriptor_active.store(true, .monotonic);
+        }
+
+        fn releaseMappingDescriptor(self: *FdCache, io: std.Io) void {
+            if (self.mapping_headroom == 0) return self.releaseDescriptors(io, 1);
+            self.mapping_descriptor_active.store(false, .monotonic);
+            self.mapping_mutex.unlock(io);
+        }
+
         fn tryReserveDescriptors(self: *FdCache, io: std.Io, count: usize) bool {
             if (count == 0) return true;
-            if (count > self.capacity - self.persistent_reserve) return false;
+            if (count > self.ordinaryCapacity() - self.persistent_reserve) return false;
             self.admission_mutex.lockUncancelable(io);
             defer self.admission_mutex.unlock(io);
             // Do not bypass a queued operation or retain a partial reservation.
@@ -1728,7 +1754,7 @@ else
 
         fn reserveDescriptors(self: *FdCache, io: std.Io, count: usize) !void {
             if (count == 0) return;
-            if (count > self.capacity - self.persistent_reserve) return error.DescriptorAdmissionCapacityTooSmall;
+            if (count > self.ordinaryCapacity() - self.persistent_reserve) return error.DescriptorAdmissionCapacityTooSmall;
             self.admission_mutex.lockUncancelable(io);
             defer self.admission_mutex.unlock(io);
 
@@ -1777,12 +1803,12 @@ else
             if (admitted != persistent) return false;
 
             const unused_reserve = self.persistent_reserve -| persistent;
-            const remaining_capacity = self.capacity -| persistent;
+            const remaining_capacity = self.ordinaryCapacity() -| persistent;
             const open_headroom = if (remaining_capacity >= self.persistent_open_headroom)
                 self.persistent_open_headroom
             else
                 0;
-            const transient_capacity = self.capacity - @max(unused_reserve, open_headroom);
+            const transient_capacity = self.ordinaryCapacity() - @max(unused_reserve, open_headroom);
             return count > transient_capacity -| admitted;
         }
 
@@ -1795,13 +1821,13 @@ else
             // though the aggregate pool still has unused descriptors.
             const persistent = self.persistent_descriptors.load(.acquire);
             const unused_reserve = self.persistent_reserve -| persistent;
-            const remaining_capacity = self.capacity -| persistent;
+            const remaining_capacity = self.ordinaryCapacity() -| persistent;
             const open_headroom = if (remaining_capacity >= self.persistent_open_headroom)
                 self.persistent_open_headroom
             else
                 0;
             const held_headroom = @max(unused_reserve, open_headroom);
-            const transient_capacity = self.capacity - held_headroom;
+            const transient_capacity = self.ordinaryCapacity() - held_headroom;
             if (count > transient_capacity) return false;
             const available_at = transient_capacity - count;
             while (self.admitted_descriptors.load(.acquire) > available_at and self.evictOne()) {}
@@ -1815,11 +1841,11 @@ else
         /// table startup, restore, or shutdown coordination.
         fn reservePersistentDescriptors(self: *FdCache, io: std.Io, count: usize) !void {
             if (count == 0) return;
-            if (count > self.capacity) return error.DescriptorAdmissionCapacityTooSmall;
+            if (count > self.ordinaryCapacity()) return error.DescriptorAdmissionCapacityTooSmall;
 
             self.admission_mutex.lockUncancelable(io);
             defer self.admission_mutex.unlock(io);
-            const available_at = self.capacity - count;
+            const available_at = self.ordinaryCapacity() - count;
             while (self.admitted_descriptors.load(.acquire) > available_at and self.evictOne()) {}
             if (self.admitted_descriptors.load(.acquire) > available_at) {
                 _ = self.persistent_admission_failures.fetchAdd(1, .monotonic);
@@ -3515,8 +3541,8 @@ const NativeMappedArtifact = struct {
 
             // The mapping owns the inode after mmap. A cold mapping does
             // not populate the positional descriptor cache.
-            try cache.reserveDescriptors(io, 1);
-            defer cache.releaseDescriptors(io, 1);
+            try cache.reserveMappingDescriptor(io);
+            defer cache.releaseMappingDescriptor(io);
             const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
                 .ACCMODE = .RDONLY,
                 .CLOEXEC = true,
@@ -3806,7 +3832,7 @@ fn nativeColdSequentialReaderCapacity(state: *const NativeStorageState) usize {
     if (comptime !supports_posix_fd_cache) return 0;
     const cache = state.fdCacheConst();
     const unavailable = cache.persistent_reserve +| 1; // atomic output writer
-    return cache.capacity -| unavailable;
+    return cache.ordinaryCapacity() -| unavailable;
 }
 
 const NativeColdSequentialReader = struct {
@@ -5412,8 +5438,8 @@ test "persistent path locks use reserved headroom under transient saturation" {
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    try pool.fd_cache.reserveDescriptors(io, 6);
-    const held_descriptors: usize = 6;
+    const held_descriptors = pool.fd_cache.ordinaryCapacity() - pool.fd_cache.persistent_reserve;
+    try pool.fd_cache.reserveDescriptors(io, held_descriptors);
     defer pool.fd_cache.releaseDescriptors(io, held_descriptors);
 
     const nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
@@ -5429,7 +5455,7 @@ test "persistent path locks use reserved headroom under transient saturation" {
     );
     defer lock_file.close();
     const stats = pool.snapshotStats();
-    try std.testing.expectEqual(@as(usize, 7), stats.fd_admitted_descriptors);
+    try std.testing.expectEqual(held_descriptors + 1, stats.fd_admitted_descriptors);
     try std.testing.expectEqual(@as(usize, 1), stats.fd_persistent_descriptors);
     try std.testing.expectEqual(@as(usize, 2), stats.fd_persistent_reserve);
 }
@@ -5527,6 +5553,50 @@ test "native fd cache keeps cold mappings out of the read working set" {
     try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_cache_entries);
 }
 
+test "native fd cache preserves saturated positional readers during cold mappings" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var temp = try TestDirectory.init("mapping-saturated");
+    defer temp.cleanup();
+
+    var pool = NativeStoragePool.initWithCapacityForTest(alloc, 8);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(alloc, .threaded, &pool);
+    defer native.deinit();
+    const storage = native.storage();
+    const hot_count = pool.fd_cache.ordinaryCapacity() - pool.fd_cache.persistent_reserve;
+    const hot = try alloc.alloc([]u8, hot_count);
+    defer alloc.free(hot);
+    var created: usize = 0;
+    defer for (hot[0..created]) |path| alloc.free(path);
+    for (hot, 0..) |*path, i| {
+        path.* = try std.fmt.allocPrint(alloc, "{s}-hot-{d}", .{ temp.path(), i });
+        created += 1;
+        try storage.writeFileAbsolute(path.*, "hot");
+    }
+    const cold = try std.fmt.allocPrint(alloc, "{s}-cold", .{temp.path()});
+    defer alloc.free(cold);
+    try storage.writeFileAbsolute(cold, "cold");
+    var bytes: [3]u8 = undefined;
+    for (hot) |path| try storage.readFileRangeInto(alloc, path, 0, &bytes);
+
+    const saturated = pool.snapshotStats();
+    try std.testing.expectEqual(hot_count, saturated.fd_cache_entries);
+    try std.testing.expectEqual(hot_count, saturated.fd_admitted_descriptors);
+
+    // A failed open must also release the mapping slot.
+    const missing = try std.fmt.allocPrint(alloc, "{s}-missing", .{temp.path()});
+    defer alloc.free(missing);
+    try std.testing.expectError(error.FileNotFound, storage.mapImmutableArtifact(alloc, missing));
+    for (0..3) |_| {
+        var artifact = try storage.mapImmutableArtifact(alloc, cold);
+        defer artifact.deinit();
+        try std.testing.expectEqualStrings("cold", artifact.bytes);
+        try std.testing.expectEqual(hot_count, pool.snapshotStats().fd_cache_entries);
+        try std.testing.expectEqual(hot_count, pool.snapshotStats().fd_admitted_descriptors);
+    }
+}
+
 test "native fd cache rejects mismatched layouts" {
     if (comptime !shared_fd_cache_supported) return error.SkipZigTest;
     const A = extern struct { admitted: usize, persistent: usize };
@@ -5610,7 +5680,7 @@ test "persistent path locks honor an explicitly configured pool" {
 test "persistent locks consume reserved headroom without stranding transient capacity" {
     if (!supports_posix_fd_cache) return error.SkipZigTest;
 
-    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 42);
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 43);
     defer pool.deinit();
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -5646,7 +5716,7 @@ test "shared native fd cache blocks before opening more than 64 files across sto
     const store_count = 3;
     var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, capacity);
     defer pool.deinit();
-    const transient_capacity = capacity - pool.snapshotStats().fd_persistent_reserve;
+    const transient_capacity = pool.fd_cache.ordinaryCapacity() - pool.fd_cache.persistent_reserve;
     var stores: [store_count]NativeStorage = undefined;
     var stores_initialized: usize = 0;
     defer while (stores_initialized > 0) {

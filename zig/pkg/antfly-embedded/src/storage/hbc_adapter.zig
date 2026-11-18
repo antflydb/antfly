@@ -6404,7 +6404,7 @@ pub const HBCIndex = struct {
         var current_bytes = current orelse return error.MissingHbcNativeMetadata;
         var owned: ?[]u8 = null;
         defer if (owned) |bytes| alloc.free(bytes);
-        var wal = try opened.store.recoverWal();
+        var wal = try opened.takeWal();
         defer wal.deinit();
         for (wal.replay.records.items) |record| {
             if (record.posting_id != 0) continue;
@@ -9579,7 +9579,7 @@ pub const HBCIndex = struct {
         return try posting_segment_store_mod.Store.open(self.alloc, location.storage, posting_root);
     }
 
-    fn openExperimentalPostingStoreWithSegment(self: *HBCIndex) !posting_segment_store_mod.OpenedWithSegment {
+    fn openExperimentalPostingStoreWithSegment(self: *HBCIndex, authoritative: bool) !posting_segment_store_mod.OpenedWithSegment {
         const location: struct { storage: lsm_backend.Storage, root_dir: []const u8 } = switch (self.env_owner) {
             .lsm => |handle| .{
                 .storage = handle.backend.storage orelse return error.MissingStorageBackend,
@@ -9589,7 +9589,9 @@ pub const HBCIndex = struct {
         };
         const posting_root = try std.fs.path.join(self.alloc, &.{ location.root_dir, "posting-segments" });
         defer self.alloc.free(posting_root);
-        if (self.env_owner == .native and self.env_owner.native.read_only) return try posting_segment_store_mod.Store.openReadOnlyWithSegmentAlloc(self.alloc, location.storage, posting_root);
+        const read_only = self.env_owner == .native and self.env_owner.native.read_only;
+        if (authoritative) return posting_segment_store_mod.Store.openAuthoritativeWithSegmentAlloc(self.alloc, location.storage, posting_root, read_only);
+        if (read_only) return posting_segment_store_mod.Store.openReadOnlyWithSegmentAlloc(self.alloc, location.storage, posting_root);
         return try posting_segment_store_mod.Store.openWithSegmentAlloc(self.alloc, location.storage, posting_root);
     }
 
@@ -12624,7 +12626,7 @@ pub const HBCIndex = struct {
     }
 
     fn loadExperimentalPostingState(self: *HBCIndex, expected_source_sequence: ?u64) !*ExperimentalPostingReadState {
-        return self.loadExperimentalPostingStateFromOpened(try self.openExperimentalPostingStoreWithSegment(), expected_source_sequence);
+        return self.loadExperimentalPostingStateFromOpened(try self.openExperimentalPostingStoreWithSegment(false), expected_source_sequence);
     }
 
     /// Consumes the owned store and mappings, including on failure. Prepared
@@ -12656,6 +12658,7 @@ pub const HBCIndex = struct {
     ) !*ExperimentalPostingReadState {
         var opened = source;
         defer opened.store.deinit();
+        defer if (opened.wal) |*wal| wal.deinit();
         var retained_segments_owned = true;
         errdefer if (retained_segments_owned) {
             for (opened.segments) |*retained| retained.deinit(alloc);
@@ -12689,7 +12692,7 @@ pub const HBCIndex = struct {
         }
         const metadata_bytes = encoded_metadata orelse return error.MissingHbcNativeMetadata;
         _ = try decodeExperimentalPostingMetadataForConfig(metadata_config, metadata_bytes);
-        var wal = if (replay_wal) try opened.store.recoverWal() else empty: {
+        var wal = if (replay_wal) try opened.takeWal() else empty: {
             const bytes = try alloc.alloc(u8, 0);
             errdefer alloc.free(bytes);
             break :empty posting_segment_store_mod.RecoveredWal{
@@ -12785,7 +12788,8 @@ pub const HBCIndex = struct {
     /// old generations remain valid for transactions already in flight.
     pub fn activateExperimentalPostingReads(self: *HBCIndex, expected_source_sequence: u64) !void {
         if (self.experimentalPostingReadGenerationLoaded()) return error.ExperimentalPostingReadsAlreadyLoaded;
-        const state = try self.loadExperimentalPostingState(expected_source_sequence);
+        const opened = try self.openExperimentalPostingStoreWithSegment(self.experimentalPostingWalAuthoritative());
+        const state = try self.loadExperimentalPostingStateFromOpened(opened, expected_source_sequence);
         try self.activateExperimentalPostingReadState(state);
     }
 
@@ -12795,7 +12799,7 @@ pub const HBCIndex = struct {
     /// is valid prepared state. Falling behind the catalog is never valid.
     pub fn activateExperimentalPostingReadsAtOrAfter(self: *HBCIndex, minimum_source_sequence: u64) !u64 {
         if (self.experimentalPostingReadGenerationLoaded()) return error.ExperimentalPostingReadsAlreadyLoaded;
-        const state = try self.loadExperimentalPostingState(null);
+        const state = try self.loadExperimentalPostingStateFromOpened(try self.openExperimentalPostingStoreWithSegment(true), null);
         const covered_source_sequence = state.covered_source_sequence;
         if (covered_source_sequence < minimum_source_sequence) {
             state.deinit();
@@ -27017,6 +27021,55 @@ test "posting WAL pre-write descriptor pressure retains the HBC writer" {
     try std.testing.expect(retain_writer);
     try idx.appendExperimentalPostingBatchDurably(batch_id, records, 2, .{}, null);
     try std.testing.expectEqual(@as(u64, 2), idx.experimental_posting_write_store.?.covered_source_sequence);
+}
+
+test "posting WAL authoritative startup fences recovered coverage before publication" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    const config: HBCConfig = .{ .dims = 2, .leaf_size = 8, .storage_backend = .lsm };
+
+    {
+        var idx = try HBCIndex.open(alloc, path, config);
+        defer idx.close();
+        try idx.insertWithMetadata(1, &.{ 1.0, 0.0 }, "doc:1");
+        try idx.finalizeExperimentalPostingGenerationAtAppliedSequence(1, .{ .flatten = false });
+        var store = try idx.openExperimentalPostingStore();
+        defer store.deinit();
+        try store.appendBatch(try store.nextBatchId(), &.{.{
+            .kind = .coverage,
+            .posting_id = 0,
+            .source_sequence = 2,
+            .payload = &.{},
+        }}, 2);
+    }
+
+    var idx = try HBCIndex.open(alloc, path, config);
+    defer idx.close();
+    idx.experimental_posting_wal_authoritative.store(true, .release);
+    const storage = if (idx.env_owner.lsm.backend.storage) |*storage| storage else return error.TestUnexpectedResult;
+    {
+        const Fault = struct {
+            fn sync(_: *anyopaque, _: []const u8) !void {
+                return error.InputOutput;
+            }
+        };
+        const original_vtable = storage.vtable;
+        var fault_vtable = original_vtable.*;
+        fault_vtable.sync_contents_absolute = Fault.sync;
+        storage.vtable = &fault_vtable;
+        defer storage.vtable = original_vtable;
+
+        try std.testing.expectError(error.InputOutput, idx.activateExperimentalPostingReads(2));
+        try std.testing.expectError(error.InputOutput, idx.activateExperimentalPostingReadsAtOrAfter(1));
+        try std.testing.expectEqual(@as(?u64, null), idx.experimentalPostingDurableAppliedSequence());
+    }
+
+    try std.testing.expectEqual(@as(u64, 2), try idx.activateExperimentalPostingReadsAtOrAfter(1));
+    try std.testing.expectEqual(@as(?u64, 2), idx.experimentalPostingDurableAppliedSequence());
 }
 
 test "posting WAL capacity rejection starts mandatory checkpoint recovery" {

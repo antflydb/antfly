@@ -7025,7 +7025,7 @@ test "vector block mapped descriptors share process admission with foreign artif
     var pool = storage_io.NativeStoragePool.init(a);
     defer pool.deinit();
     const before = pool.snapshotStats();
-    var occupying = try native.acquireFdPermits(before.fd_admission_capacity - before.fd_persistent_reserve);
+    var occupying = try native.acquireFdPermits(before.fd_admission_capacity - before.fd_persistent_reserve - before.fd_mapping_reserve);
     defer occupying.release();
     try std.testing.expectError(error.StorageDescriptorPressure, storage_io.ProcessNativeFdPermit.acquire(io));
     occupying.release();
