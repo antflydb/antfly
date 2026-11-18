@@ -441,6 +441,41 @@ pub const FileReader = struct {
         return self.readFrame(alloc, max_bytes, kind);
     }
 
+    /// Verify an exact-size plaintext frame while retaining only its prefix
+    /// and a caller-selected payload region.
+    pub fn readPlainBlockRegion(self: *FileReader, kind: BlockType, payload_size: usize, prefix: []u8, offset: usize, region: []u8) !void {
+        if (prefix.len > offset or offset > payload_size or region.len > payload_size - offset)
+            return error.InvalidBackupManifest;
+        var env: [6]u8 = undefined;
+        try self.readExact(&env);
+        if (env[0] != @backingInt(kind) or env[1] != 0 or
+            std.mem.readInt(u32, env[2..6], .little) != payload_size)
+            return error.InvalidBackupManifest;
+        if (payload_size > @min(max_block_payload_bytes, self.max_block_bytes)) return error.BackupBlockTooLarge;
+        var crc = Crc32.init();
+        crc.update(&env);
+        try self.readExact(prefix);
+        crc.update(prefix);
+        try self.checksumPlainBytes(&crc, offset - prefix.len);
+        try self.readExact(region);
+        crc.update(region);
+        try self.checksumPlainBytes(&crc, payload_size - offset - region.len);
+        var encoded_crc: [4]u8 = undefined;
+        try self.readExact(&encoded_crc);
+        if (crc.final() != std.mem.readInt(u32, &encoded_crc, .little)) return error.BlockCrcMismatch;
+    }
+
+    fn checksumPlainBytes(self: *FileReader, crc: *Crc32, count: usize) !void {
+        var buffer: [64 * 1024]u8 = undefined;
+        var remaining = count;
+        while (remaining != 0) {
+            const chunk = buffer[0..@min(buffer.len, remaining)];
+            try self.readExact(chunk);
+            crc.update(chunk);
+            remaining -= chunk.len;
+        }
+    }
+
     fn readFrame(self: *FileReader, alloc: Allocator, max_bytes: usize, plain_kind: ?BlockType) !Block {
         const limit = @min(max_bytes, self.max_block_bytes);
         var env: [6]u8 = undefined;
@@ -1708,6 +1743,19 @@ test "bounded block readers reject stored payload before allocation and accept e
     const from_file = try reader.readBlock(a);
     defer a.free(from_file.payload);
     try std.testing.expectEqualStrings("payload", from_file.payload);
+
+    var prefix: [2]u8 = undefined;
+    var region: [2]u8 = undefined;
+    reader = FileReader.init(io, file, data.items.len);
+    try reader.readPlainBlockRegion(.document_batch, 7, &prefix, 3, &region);
+    try std.testing.expectEqualStrings("pa", &prefix);
+    try std.testing.expectEqualStrings("lo", &region);
+    try std.testing.expectEqual(@as(u64, data.items.len), reader.pos);
+    reader = FileReader.init(io, file, data.items.len);
+    try std.testing.expectError(error.InvalidBackupManifest, reader.readPlainBlockRegion(.document_batch, 7, &prefix, 6, &region));
+    try file.writePositionalAll(io, "X", 6 + 2);
+    reader = FileReader.init(io, file, data.items.len);
+    try std.testing.expectError(error.BlockCrcMismatch, reader.readPlainBlockRegion(.document_batch, 7, &prefix, 3, &region));
 
     // The input carries only the envelope. Reject it without trying to
     // allocate or read the claimed native metadata payload.

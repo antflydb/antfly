@@ -39865,7 +39865,7 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
 }
 const restore_job_logical_prefix = "\x00\x00__api_restore_jobs__:";
 const max_restore_job_logical_key_bytes: usize = 128;
-const max_restore_job_value_bytes: usize = 64 * 1024;
+const max_restore_job_value_bytes: usize = 256 * 1024;
 
 fn applySystemCatalogTestCommand(store: *RaftApplyStore, index: u64, command: SystemCatalogCommand) !void {
     const alloc = std.testing.allocator;

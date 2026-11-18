@@ -971,7 +971,9 @@ fn metadataRestoreJobPut(ptr: *anyopaque, key: []const u8, value: []const u8, le
 
 fn metadataRestoreJobCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, leadership_term: u64) ![]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("topology_protocol.zig").restore_job_admission_version);
+    const protocol = @import("topology_protocol.zig");
+    const required_version = if (try restore_jobs.requiresPinnedRestoreWorker(alloc, value)) protocol.pinned_restore_job_version else protocol.restore_job_admission_version;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);
@@ -987,7 +989,9 @@ fn metadataRestoreJobCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []co
 
 fn metadataRestoreJobCreateWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan_json: []const u8, leadership_term: u64) ![]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("topology_protocol.zig").coordinated_lifecycle_version);
+    const protocol = @import("topology_protocol.zig");
+    const required_version = if (try restore_jobs.requiresPinnedRestoreWorker(alloc, value)) protocol.pinned_restore_job_version else protocol.coordinated_lifecycle_version;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);

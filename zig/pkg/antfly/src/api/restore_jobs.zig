@@ -26,7 +26,10 @@ const key_prefix = "\x00\x00__api_restore_jobs__:";
 const restore_job_retention_ms: u64 = 7 * 24 * 60 * 60 * 1000;
 const restore_job_scan_page_size: usize = 512;
 const max_retained_restore_jobs: usize = 10_000;
-const max_restore_job_record_bytes: usize = 64 * 1024;
+const max_restore_job_record_bytes: usize = 256 * 1024;
+const max_legacy_restore_job_record_bytes: usize = 64 * 1024;
+pub const restore_child_digest_bytes: usize = 32;
+const max_encoded_child_pins = std.base64.standard.Encoder.calcSize(4096 * restore_child_digest_bytes);
 const max_retained_restore_job_bytes: usize = 64 * 1024 * 1024;
 const restore_job_prune_interval_ms: u64 = 60 * 1000;
 const restore_job_prune_batch_size: usize = 1024;
@@ -42,6 +45,12 @@ const restore_job_format_version: u32 = 4;
 // Workers that only understand v4 must reject these rows instead of
 // checkpointing a job while dropping its source binding.
 const pinned_restore_job_format_version: u32 = 5;
+
+pub fn requiresPinnedRestoreWorker(alloc: std.mem.Allocator, encoded: []const u8) !bool {
+    const parsed = try std.json.parseFromSlice(struct { format_version: u32 }, alloc, encoded, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    return parsed.value.format_version >= pinned_restore_job_format_version;
+}
 pub const restore_retry_min_ms: u64 = 100;
 pub const restore_retry_max_ms: u64 = 5_000;
 
@@ -146,6 +155,7 @@ pub const ClusterRestoreBinding = struct {
     manifest_sha256: []const u8,
     selected_ordinals: ?[]const u16 = null,
     children_sha256: ?[]const u8 = null,
+    child_pins: ?[]const u8 = null,
 };
 
 pub const StartRequest = struct {
@@ -1179,7 +1189,8 @@ pub const Store = struct {
         // Leave room for bounded progress checkpoints and the compact terminal
         // result. Admission must fail before work starts rather than discover
         // after an irreversible restore that the terminal record cannot fit.
-        if (encoded.len > max_initial_restore_job_bytes) return error.RestoreJobRecordTooLarge;
+        const pin_bytes = if (req.cluster_binding) |binding| if (binding.child_pins) |pins| pins.len else 0 else 0;
+        if (encoded.len > max_initial_restore_job_bytes + pin_bytes) return error.RestoreJobRecordTooLarge;
         try self.jobs.ensureUnusedCapacity(self.alloc, 1);
         try self.pending.ensureUnusedCapacity(self.alloc, 1);
         try self.history.ensureUnusedCapacity(self.alloc, 1);
@@ -1200,8 +1211,10 @@ pub const Store = struct {
                 const committed = (if (req.generation_plan_json orelse req.rewrite_plan_json) |plan|
                     replicated.createWithStaging(alloc, key, encoded, plan, self.replicated_leadership_term)
                 else
-                    replicated.create(alloc, key, encoded, self.replicated_leadership_term)) catch
-                    return .{ .unknown = encoded };
+                    replicated.create(alloc, key, encoded, self.replicated_leadership_term)) catch |err| switch (err) {
+                    error.TableTopologyProtocolUpgradeRequired => return err,
+                    else => return .{ .unknown = encoded },
+                };
                 var state = std.json.parseFromSlice(JobState, alloc, committed, .{ .ignore_unknown_fields = true }) catch {
                     alloc.free(committed);
                     return .{ .unknown = encoded };
@@ -2151,7 +2164,8 @@ pub const Store = struct {
         try validateProgressState(next);
         const encoded = try encode(alloc, next);
         errdefer alloc.free(encoded);
-        if (encoded.len > max_restore_job_record_bytes) return error.RestoreJobRecordTooLarge;
+        const record_limit = if (next.format_version == restore_job_format_version) max_legacy_restore_job_record_bytes else max_restore_job_record_bytes;
+        if (encoded.len > record_limit) return error.RestoreJobRecordTooLarge;
         try self.storeLocked(current.job_id, encoded);
         if (next.phase != .running or next.attempt_id != current.attempt_id)
             _ = self.continuations.remove(current.job_id);
@@ -2540,6 +2554,12 @@ fn validateStartRequest(req: StartRequest) !void {
 fn validClusterRestoreBinding(scope: Scope, source_kind: SourceKind, names: ?[]const []const u8, binding: ?ClusterRestoreBinding) bool {
     const value = binding orelse return true;
     if (!validRestoreDigest(value.manifest_sha256)) return false;
+    if (value.child_pins) |encoded| {
+        if (scope != .cluster or value.children_sha256 != null or encoded.len > max_encoded_child_pins) return false;
+        const bytes = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return false;
+        if (bytes % restore_child_digest_bytes != 0 or bytes / restore_child_digest_bytes > max_cluster_tables_per_job) return false;
+        if (names) |selected| if (bytes / restore_child_digest_bytes != selected.len) return false;
+    }
     if (value.children_sha256) |digest| {
         if (scope != .cluster or !validRestoreDigest(digest)) return false;
     }
@@ -4862,6 +4882,8 @@ test "restore runtime store persists checkpoints and requeues interrupted work" 
     defer alloc.free(recovered);
     var parsed = try std.json.parseFromSlice(JobState, alloc, recovered, .{});
     defer parsed.deinit();
+    try std.testing.expect(try requiresPinnedRestoreWorker(alloc, recovered));
+    try std.testing.expect(!try requiresPinnedRestoreWorker(alloc, "{\"format_version\":4}"));
     try std.testing.expectEqual(pinned_restore_job_format_version, parsed.value.format_version);
     var wrong_version = parsed.value;
     wrong_version.format_version = restore_job_format_version;

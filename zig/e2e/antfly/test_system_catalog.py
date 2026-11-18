@@ -462,6 +462,32 @@ def test_catalog_cluster_backup_retains_scope_and_literal_names(backup_api):
         assert json.loads(command.stdout)["result"]["committed_table_count"] == 3
         for index, path in enumerate(paths):
             assert api.get(path + "/documents/doc") == {"scope": index}
+        request = {
+            "backup_id": "catalog-cluster",
+            "location": other_location,
+            "connection": E2E_BACKUP_CONNECTION,
+            "restore_mode": "skip_if_exists",
+        }
+        headers = {"Idempotency-Key": f"{database}-archive-replay"}
+        accepted = api.s.post(
+            f"{api.url}/restore", json=request, headers=headers, timeout=30
+        )
+        assert accepted.status_code == 202, accepted.text
+        job_id = accepted.json()["job_id"]
+
+        def terminal():
+            job = api.get(f"/restore/jobs/{job_id}")
+            return job if job["phase"] in {"succeeded", "failed", "cancelled"} else None
+
+        completed = wait_until(terminal, timeout_s=60, interval_s=0.1)
+        assert completed["phase"] == "succeeded", json.dumps(completed)
+        (Path(directory) / "other").rename(Path(directory) / "moved")
+        replay = api.s.post(
+            f"{api.url}/restore", json=request, headers=headers, timeout=30
+        )
+        assert replay.status_code == 202, replay.text
+        assert replay.json()["job_id"] == job_id
+        assert replay.json()["phase"] == "succeeded"
     for path in paths:
         api.delete(path)
     api.delete(f"/databases/{database}")

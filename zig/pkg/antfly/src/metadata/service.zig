@@ -13837,6 +13837,13 @@ test "metadata table topology protocol checks the command's required version and
         .metadata_raft_local_node_id = 7,
         .metrics = .{},
     };
+    const pinned_restore_version = metadata_topology_protocol.pinned_restore_job_version;
+    status.table_topology_protocol_version = pinned_restore_version - 1;
+    try std.testing.expect(!tableTopologyProtocolCompatible(status, 42, 7, incarnation, pinned_restore_version));
+    try std.testing.expect(tableTopologyProtocolCompatible(status, 42, 7, incarnation, metadata_topology_protocol.restore_job_admission_version));
+    status.table_topology_protocol_version = pinned_restore_version;
+    try std.testing.expect(tableTopologyProtocolCompatible(status, 42, 7, incarnation, pinned_restore_version));
+    status.table_topology_protocol_version = 0;
     try std.testing.expect(!tableTopologyProtocolCompatible(
         status,
         42,

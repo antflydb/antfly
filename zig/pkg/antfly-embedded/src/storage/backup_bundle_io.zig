@@ -168,16 +168,14 @@ pub fn readNativeObjectAlloc(
     if (trailer.footer_payload_size != expected_footer_size) return error.InvalidBundleFooter;
     var reader = backup_codec.FileReader.init(io, source, source_size - bundle.trailer_size);
     reader.pos = trailer.footer_offset;
-    reader.max_block_bytes = expected_footer_size;
-    const footer_block = try reader.readPlainBlock(alloc, .footer_index, expected_footer_size);
-    defer alloc.free(footer_block.payload);
-    if (footer_block.block_type != .footer_index or footer_block.payload.len != expected_footer_size or reader.hasRemaining() or
-        std.mem.readInt(u32, footer_block.payload[0..index_count_bytes], .little) != manifest.blobs.len)
-        return error.InvalidBundleFooter;
-
     // A full bundle includes every digest-sorted blob in ordinal order.
     const offset_in_footer = index_count_bytes + ordinal * index_entry_bytes;
-    const entry = bundle.decodeFooterIndexEntry(footer_block.payload[offset_in_footer..][0..index_entry_bytes]);
+    var count_bytes: [index_count_bytes]u8 = undefined;
+    var entry_bytes: [index_entry_bytes]u8 = undefined;
+    try reader.readPlainBlockRegion(.footer_index, expected_footer_size, &count_bytes, offset_in_footer, &entry_bytes);
+    if (reader.hasRemaining() or std.mem.readInt(u32, &count_bytes, .little) != manifest.blobs.len)
+        return error.InvalidBundleFooter;
+    const entry = bundle.decodeFooterIndexEntry(&entry_bytes);
     if (!std.mem.eql(u8, &entry.sha256, &digest)) return error.InvalidBundleFooter;
     if (entry.header_offset >= trailer.footer_offset or entry.stored_size_bytes != object.size_bytes)
         return error.InvalidBundleFooter;

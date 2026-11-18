@@ -13398,16 +13398,27 @@ pub const ApiHttpServer = struct {
             artifact_backup_id,
         );
         defer manifest.deinit(alloc);
+        try self.authorizeRestoreDefinitionDestinations(alloc, manifest.table_name, manifest.replication_sources_json, manifest.indexes_json, principal);
+    }
+
+    fn authorizeRestoreDefinitionDestinations(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        replication_sources_json: []const u8,
+        indexes_json: []const u8,
+        principal: []const u8,
+    ) !void {
         const fingerprint = try stored_destination_authorization.destinationConfigFingerprintAlloc(
             alloc,
-            manifest.replication_sources_json,
-            manifest.indexes_json,
+            replication_sources_json,
+            indexes_json,
         );
         defer alloc.free(fingerprint);
         const effective_principal = try restoreDestinationPrincipal(
             alloc,
-            manifest.replication_sources_json,
-            manifest.indexes_json,
+            replication_sources_json,
+            indexes_json,
             if (principal.len > 0) fingerprint else "",
             principal,
         );
@@ -13417,16 +13428,16 @@ pub const ApiHttpServer = struct {
         };
         const sealed_replication_sources = try stored_destination_authorization.sealReplicationSourcesJsonForPrincipalAlloc(
             alloc,
-            manifest.replication_sources_json,
-            manifest.table_name,
+            replication_sources_json,
+            table_name,
             effective_principal,
             authorizer,
         );
         defer alloc.free(sealed_replication_sources);
         const sealed_indexes = try stored_destination_authorization.sealIndexesJsonForPrincipalAlloc(
             alloc,
-            manifest.indexes_json,
-            manifest.table_name,
+            indexes_json,
+            table_name,
             effective_principal,
             authorizer,
         );
@@ -13434,13 +13445,13 @@ pub const ApiHttpServer = struct {
         try stored_destination_authorization.authorizeReplicationSourcesJson(
             alloc,
             sealed_replication_sources,
-            manifest.table_name,
+            table_name,
             authorizer,
         );
         try stored_destination_authorization.authorizeIndexesJson(
             alloc,
             sealed_indexes,
-            manifest.table_name,
+            table_name,
             authorizer,
         );
     }
@@ -13498,6 +13509,7 @@ pub const ApiHttpServer = struct {
         manifest: *const backups_api.ClusterBackupManifest,
         ordinals: ?[]const u16,
         cancellation: api_operation.CancellationToken,
+        destination_principal: ?[]const u8,
     ) !LegacyRestoreChildren {
         const count = if (ordinals) |selected| selected.len else manifest.tables.len;
         const bindings = try self.alloc.alloc(backups_api.TableManifestDigest, count);
@@ -13516,10 +13528,42 @@ pub const ApiHttpServer = struct {
             // Both accepted manifest envelopes declare their artifact SHA-256
             // and size. Preserve this guarantee if adding a legacy decoder.
             if (child.artifact_integrity_mode != .declared) return error.BackupIntegrityMissing;
+            if (destination_principal) |principal| try self.authorizeRestoreDefinitionDestinations(
+                self.alloc,
+                child.table_name,
+                child.replication_sources_json,
+                child.indexes_json,
+                principal,
+            );
             if (!guarded) guarded = try portableForeignKeyRestoreGuarded(self.alloc, &child, self.cfg.allow_unverified_portable_fk_restore_for_tests);
             hash.update(binding);
         }
         return .{ .bindings = bindings, .digest = std.fmt.bytesToHex(hash.finalResult(), .lower), .foreign_keys_guarded = guarded };
+    }
+
+    fn verifyPendingLegacyRestoreChildren(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        location: *backups_api.BackupLocation,
+        manifest: *const backups_api.ClusterBackupManifest,
+        table_names: []const []const u8,
+        ordinals: ?[]const u16,
+        children: []const backups_api.TableManifestDigest,
+        published_table_ranges: []const restore_jobs.TableIndexRange,
+        cancellation: ?RestoreCancellation,
+    ) !void {
+        // Validate all remaining sources before the next publication.
+        // The catalog and restore intent are authoritative after publication.
+        for (children, table_names, 0..) |*expected, name, index| {
+            if (restore_jobs.containsTableIndex(published_table_ranges, @intCast(index))) continue;
+            try self.ensureRestoreActive(cancellation);
+            const entry = &manifest.tables[if (ordinals) |selected| selected[index] else index];
+            var child = try readLegacyRestoreChild(expected, alloc, location, entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id);
+            defer child.deinit(alloc);
+            if (!std.mem.eql(u8, child.table_name, name)) return error.BackupArtifactIntegrityMismatch;
+            if (portableForeignKeyRestoreGuarded(alloc, &child, self.cfg.allow_unverified_portable_fk_restore_for_tests) catch return error.InvalidRequest)
+                return error.PortableForeignKeyRestoreUnavailable;
+        }
     }
 
     fn restoreOwnedTableWithLifecycle(
@@ -13820,6 +13864,13 @@ pub const ApiHttpServer = struct {
             };
         }
         return false;
+    }
+
+    fn authorizePublishedRestoreDestinations(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, principal: []const u8) !void {
+        var snapshot = (try self.source.adminSnapshot()) orelse return error.MetadataCapabilityUnavailable;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        try self.authorizeRestoreDefinitionDestinations(alloc, table.name, table.replication_sources_json, table.indexes_json, principal);
     }
 
     fn validateRestoredManagedEmbeddingCatalog(
@@ -21755,13 +21806,18 @@ pub const ApiHttpServer = struct {
         // archives instead of writing lease sidecars into the source.
         var verification_cache: backups_api.ArtifactVerificationCache = .{};
         defer verification_cache.deinit(op_alloc);
-        var manifest = backups_api.readClusterManifestForRestoreAdmissionWithCache(
-            op_alloc,
-            restore_io,
-            location,
-            req.backup_id,
-            &verification_cache,
-        ) catch |err| {
+        // Pinned legacy attempts already verified repository health at admission.
+        // Reopening the head would check unrelated and already published shards.
+        var manifest = (if (req.admitted_child_pins != null)
+            backups_api.readClusterManifestFromLocation(op_alloc, location, req.backup_id)
+        else
+            backups_api.readClusterManifestForRestoreAdmissionWithCache(
+                op_alloc,
+                restore_io,
+                location,
+                req.backup_id,
+                &verification_cache,
+            )) catch |err| {
             const mapped = mapClusterRestoreRepositoryError(err);
             if (mapped == error.InternalFailure) {
                 std.log.err(
@@ -21827,9 +21883,20 @@ pub const ApiHttpServer = struct {
         };
         if (table_names.len > restore_jobs.max_cluster_tables_per_job) return error.InvalidRequest;
 
-        const legacy_children = if (req.admitted_children_sha256) |expected| blk: {
+        const legacy_children = if (req.admitted_child_pins) |encoded| blk: {
+            if (manifest.cohort_json.len != 0 or encoded.len != std.base64.standard.Encoder.calcSize(table_names.len * @sizeOf(backups_api.TableManifestDigest)))
+                return error.BackupIntegrityFailure;
+            const children = op_alloc.alloc(backups_api.TableManifestDigest, table_names.len) catch return error.InternalFailure;
+            errdefer op_alloc.free(children);
+            std.base64.standard.Decoder.decode(std.mem.sliceAsBytes(children), encoded) catch return error.BackupIntegrityFailure;
+            self.verifyPendingLegacyRestoreChildren(op_alloc, location, &manifest, table_names, req.admitted_table_ordinals, children, published_table_ranges, cancellation) catch |err| return switch (err) {
+                error.PortableForeignKeyRestoreUnavailable, error.InvalidRequest, error.Cancelled, error.NotLeader, error.InternalFailure => |known| known,
+                else => mapClusterRestoreRepositoryError(err),
+            };
+            break :blk children;
+        } else if (req.admitted_children_sha256) |expected| blk: {
             if (manifest.cohort_json.len != 0) return error.BackupIntegrityFailure;
-            const children = self.bindLegacyRestoreChildren(location, &manifest, req.admitted_table_ordinals, repair_cancellation) catch |err| switch (err) {
+            const children = self.bindLegacyRestoreChildren(location, &manifest, req.admitted_table_ordinals, repair_cancellation, null) catch |err| switch (err) {
                 error.Canceled => return error.Cancelled,
                 else => return mapClusterRestoreRepositoryError(err),
             };
@@ -21943,13 +22010,16 @@ pub const ApiHttpServer = struct {
             // because it now exists; wait for the already-published replica
             // restore intent to drain instead.
             if (restore_jobs.containsTableIndex(published_table_ranges, @intCast(i))) {
-                self.authorizeClusterRestoreManifestDestinations(
-                    op_alloc,
-                    location,
-                    table_backup_id,
-                    artifact_backup_id,
-                    destination_authorization_principal,
-                ) catch |err| switch (err) {
+                (if (req.admitted_child_pins != null)
+                    self.authorizePublishedRestoreDestinations(op_alloc, table_name, destination_authorization_principal)
+                else
+                    self.authorizeClusterRestoreManifestDestinations(
+                        op_alloc,
+                        location,
+                        table_backup_id,
+                        artifact_backup_id,
+                        destination_authorization_principal,
+                    )) catch |err| switch (err) {
                     error.RestoreDestinationReauthorizationRequired,
                     error.StoredDestinationAuthorizationRevoked,
                     => return error.RestoreDestinationReauthorizationRequired,
@@ -25433,93 +25503,26 @@ pub const ApiHttpServer = struct {
         return try self.restoreJobResponse(202, encoded);
     }
 
+    fn clusterRestoreAdmissionManifestErrorResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
+        return switch (err) {
+            error.StoredDestinationCredentialUnsupported => contextualJsonErrorResponse(alloc, 422, "durable destinations require Basic or API-key authentication"),
+            error.StoredDestinationAuthorizationRevoked => contextualJsonErrorResponse(alloc, 403, "destination authorization is missing or revoked"),
+            error.RestoreDestinationReauthorizationRequired => contextualJsonErrorResponse(alloc, 409, "restore destination authorization must be refreshed"),
+            error.BackupManifestTooLarge => contextualJsonErrorResponse(alloc, 413, "table backup manifest is too large"),
+            else => contextualJsonErrorResponse(alloc, 400, "invalid table backup manifest or artifacts"),
+        };
+    }
+
     pub fn handlePublicClusterRestore(
         self: *ApiHttpServer,
         body: []const u8,
         idempotency_key: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
-        if (self.hotStandbyMutationPolicy().failover_safe_mutations_only and !self.restoreExecutionPermitted())
-            return try contextualJsonErrorResponse(self.alloc, 503, "hot-standby restore metadata authority is not ready");
         var req = backups_api.parseClusterRestoreRequest(self.alloc, body) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore request");
         defer backups_api.freeClusterRestoreRequest(self.alloc, &req);
         const connection = req.connection orelse return try contextualJsonErrorResponse(self.alloc, 400, "restore requires a named external_io connection");
         const restore_mode = backups_api.validateClusterRestoreMode(req.restore_mode) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore mode");
-        var location = backups_api.openBackupLocationWithOptions(self.alloc, req.location, .{
-            .secret_store = self.cfg.secret_store,
-            .node_config = self.cfg.node_config,
-            .connection = connection,
-            .required_capability = "restore.read",
-            .network_io = self.sharedApiNetworkIo(),
-            .filesystem_io = self.sharedApiFilesystemIo(),
-        }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
-        defer location.deinit(self.alloc);
-
-        var prechecked_digest: ?[64]u8 = null;
-        if (self.hotStandbyMutationPolicy().failover_safe_mutations_only) {
-            const restore_io = self.backupLocationIo(&location) orelse
-                return try contextualJsonErrorResponse(self.alloc, 503, "restore service unavailable");
-            var verification_cache: backups_api.ArtifactVerificationCache = .{};
-            defer verification_cache.deinit(self.alloc);
-            var manifest = backups_api.readClusterManifestForRestoreAdmissionWithCache(self.alloc, restore_io, &location, req.backup_id, &verification_cache) catch
-                return try contextualJsonErrorResponse(self.alloc, 400, "invalid cluster backup manifest");
-            defer manifest.deinit(self.alloc);
-            prechecked_digest = manifest.persisted_sha256.?;
-            if (manifest.cohort_json.len == 0)
-                return try contextualJsonErrorResponse(self.alloc, 422, "hot-standby restore requires a dependency-complete native cluster cohort");
-        }
-
-        if (authenticated_identity) |identity| {
-            const credential_supported = std.mem.startsWith(u8, identity.credential_principal, "basic:") or
-                std.mem.startsWith(u8, identity.credential_principal, "api-key:");
-            if (!credential_supported) {
-                const restore_io = self.backupLocationIo(&location) orelse
-                    return try contextualJsonErrorResponse(self.alloc, 503, "restore service unavailable");
-                var verification_cache: backups_api.ArtifactVerificationCache = .{};
-                defer verification_cache.deinit(self.alloc);
-                var cluster_manifest = backups_api.readClusterManifestForRestoreAdmissionWithCache(
-                    self.alloc,
-                    restore_io,
-                    &location,
-                    req.backup_id,
-                    &verification_cache,
-                ) catch |err| return try contextualJsonErrorResponse(
-                    self.alloc,
-                    if (err == error.BackupManifestTooLarge) 413 else 400,
-                    if (err == error.BackupManifestTooLarge) backups_api.manifest_too_large_message else "invalid cluster backup manifest",
-                );
-                defer cluster_manifest.deinit(self.alloc);
-                const manifest_digest = cluster_manifest.persisted_sha256.?;
-                if (prechecked_digest) |expected| {
-                    if (!std.mem.eql(u8, &expected, &manifest_digest))
-                        return try contextualJsonErrorResponse(self.alloc, 409, "backup manifest changed during admission");
-                }
-                prechecked_digest = manifest_digest;
-                const count = if (req.table_names) |names| names.len else cluster_manifest.tables.len;
-                if (count > restore_jobs.max_cluster_tables_per_job)
-                    return try contextualJsonErrorResponse(self.alloc, 400, "too many tables requested");
-                var selection: backups_api.ClusterTableSelection = .{ .manifest = &cluster_manifest };
-                for (0..count) |index| {
-                    const cluster_table = if (req.table_names) |names|
-                        selection.find(names[index]) orelse return try contextualJsonErrorResponse(self.alloc, 400, "backup does not include a requested table")
-                    else
-                        &cluster_manifest.tables[index];
-                    const artifact_backup_id = cluster_table.artifact_backup_id orelse cluster_table.table_backup_id;
-                    self.authorizeClusterRestoreManifestDestinations(
-                        self.alloc,
-                        &location,
-                        cluster_table.table_backup_id,
-                        artifact_backup_id,
-                        identity.credential_principal,
-                    ) catch |err| switch (err) {
-                        error.StoredDestinationCredentialUnsupported => return try contextualJsonErrorResponse(self.alloc, 422, "durable destinations require Basic or API-key authentication"),
-                        error.StoredDestinationAuthorizationRevoked => return try contextualJsonErrorResponse(self.alloc, 403, "destination authorization is missing or revoked"),
-                        error.RestoreDestinationReauthorizationRequired => return try contextualJsonErrorResponse(self.alloc, 409, "restore destination authorization must be refreshed"),
-                        else => return try contextualJsonErrorResponse(self.alloc, 400, "invalid table backup manifest"),
-                    };
-                }
-            }
-        }
         self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
         const idempotency_namespace = try restoreIdempotencyNamespaceAlloc(
             self.alloc,
@@ -25550,6 +25553,18 @@ pub const ApiHttpServer = struct {
             };
         }
         if (admission == null) {
+            if (self.hotStandbyMutationPolicy().failover_safe_mutations_only and !self.restoreExecutionPermitted())
+                return try contextualJsonErrorResponse(self.alloc, 503, "hot-standby restore metadata authority is not ready");
+            var location = backups_api.openBackupLocationWithOptions(self.alloc, req.location, .{
+                .secret_store = self.cfg.secret_store,
+                .node_config = self.cfg.node_config,
+                .connection = connection,
+                .required_capability = "restore.read",
+                .network_io = self.sharedApiNetworkIo(),
+                .filesystem_io = self.sharedApiFilesystemIo(),
+            }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
+            defer location.deinit(self.alloc);
+
             const restore_io = self.backupLocationIo(&location) orelse
                 return try contextualJsonErrorResponse(self.alloc, 503, "restore service unavailable");
             var verification_cache: backups_api.ArtifactVerificationCache = .{};
@@ -25558,10 +25573,8 @@ pub const ApiHttpServer = struct {
                 return try contextualJsonErrorResponse(self.alloc, if (err == error.BackupManifestTooLarge) 413 else 400, "invalid cluster backup manifest");
             defer manifest.deinit(self.alloc);
             const manifest_digest = manifest.persisted_sha256.?;
-            if (prechecked_digest) |expected| {
-                if (!std.mem.eql(u8, &expected, &manifest_digest))
-                    return try contextualJsonErrorResponse(self.alloc, 409, "backup manifest changed during admission");
-            }
+            if (self.hotStandbyMutationPolicy().failover_safe_mutations_only and manifest.cohort_json.len == 0)
+                return try contextualJsonErrorResponse(self.alloc, 422, "hot-standby restore requires a dependency-complete native cluster cohort");
             const ordinals = if (req.table_names) |names| try self.alloc.alloc(u16, names.len) else null;
             defer if (ordinals) |values| self.alloc.free(values);
             start_request.cluster_binding = .{ .manifest_sha256 = &manifest_digest, .selected_ordinals = ordinals };
@@ -25573,13 +25586,30 @@ pub const ApiHttpServer = struct {
             else
                 null;
             defer if (selected) |names| freeOwnedTableNames(self.alloc, names);
-            var children_digest: [64]u8 = undefined;
+            const destination_principal = if (authenticated_identity) |identity| blk: {
+                const principal = identity.credential_principal;
+                break :blk if (std.mem.startsWith(u8, principal, "basic:") or std.mem.startsWith(u8, principal, "api-key:")) null else principal;
+            } else null;
+            if (manifest.cohort_json.len != 0) {
+                if (destination_principal) |principal| {
+                    const count = if (ordinals) |values| values.len else manifest.tables.len;
+                    for (0..count) |index| {
+                        const table = manifest.tables[if (ordinals) |values| values[index] else index];
+                        self.authorizeClusterRestoreManifestDestinations(self.alloc, &location, table.table_backup_id, table.artifact_backup_id orelse table.table_backup_id, principal) catch |err|
+                            return try clusterRestoreAdmissionManifestErrorResponse(self.alloc, err);
+                    }
+                }
+            }
+            var child_pins: ?[]u8 = null;
+            defer if (child_pins) |pins| self.alloc.free(pins);
             const guarded = if (manifest.cohort_json.len == 0) blk: {
-                const children = self.bindLegacyRestoreChildren(&location, &manifest, ordinals, .none) catch |err|
-                    return try contextualJsonErrorResponse(self.alloc, if (err == error.BackupManifestTooLarge) 413 else 400, "invalid table backup manifest or artifacts");
+                const children = self.bindLegacyRestoreChildren(&location, &manifest, ordinals, .none, destination_principal) catch |err|
+                    return try clusterRestoreAdmissionManifestErrorResponse(self.alloc, err);
                 defer self.alloc.free(children.bindings);
-                children_digest = children.digest;
-                start_request.cluster_binding.?.children_sha256 = &children_digest;
+                const raw_pins = std.mem.sliceAsBytes(children.bindings);
+                const encoded = try self.alloc.alloc(u8, std.base64.standard.Encoder.calcSize(raw_pins.len));
+                child_pins = encoded;
+                start_request.cluster_binding.?.child_pins = std.base64.standard.Encoder.encode(encoded, raw_pins);
                 break :blk children.foreign_keys_guarded;
             } else clusterPortableForeignKeyRestoreGuarded(self.alloc, &location, &manifest, selected, self.cfg.allow_unverified_portable_fk_restore_for_tests) catch
                 return try contextualJsonErrorResponse(self.alloc, 400, "invalid relational backup declarations");
@@ -26062,6 +26092,7 @@ pub const ApiHttpServer = struct {
                 .admitted_manifest_sha256 = if (state.cluster_binding) |binding| binding.manifest_sha256 else null,
                 .admitted_table_ordinals = if (state.cluster_binding) |binding| binding.selected_ordinals else null,
                 .admitted_children_sha256 = if (state.cluster_binding) |binding| binding.children_sha256 else null,
+                .admitted_child_pins = if (state.cluster_binding) |binding| binding.child_pins else null,
                 .restore_mode = state.restore_mode,
             }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
                 if (restoreJobErrorIsRetryable(err)) {
@@ -27121,6 +27152,7 @@ fn restoreJobStartErrorResponse(alloc: std.mem.Allocator, err: anyerror) !contex
         error.IdempotencyConflict => try contextualJsonErrorResponse(alloc, 409, "idempotency key reused for a different restore"),
         error.RestoreStagingPrincipalImmutable => try contextualJsonErrorResponse(alloc, 409, "restore targets are reserved under a different principal; cancel this restore and start a new restore to change its authorization identity"),
         error.AsyncRestoreUnavailable => try contextualJsonErrorResponse(alloc, 503, "asynchronous restore worker unavailable"),
+        error.TableTopologyProtocolUpgradeRequired => try contextualJsonErrorResponse(alloc, 503, "pinned restore jobs require upgraded metadata voters"),
         error.RestoreJobPersistenceUnavailable => try contextualJsonErrorResponse(alloc, 503, "durable restore store unavailable"),
         error.RestoreJobCapacityExceeded => try contextualJsonErrorResponse(alloc, 503, "restore job history is at capacity"),
         error.RestoreJobRecordTooLarge, error.TooManyRestoreTables => try contextualJsonErrorResponse(alloc, 400, "restore request is too large"),
@@ -56006,10 +56038,12 @@ test "legacy cluster restore pins child manifests under an unchanged aggregate" 
     defer alloc.free(root);
     var child = borrowedTestRestoreManifest("docs-backup", "docs");
     try writeTestRestoreManifestAndArtifact(alloc, root, &child);
-    var aggregate = try backups_api.createClusterManifest(alloc, "daily", "file:///archive", &.{.{
-        .name = "docs",
-        .table_backup_id = "docs-backup",
-    }});
+    var pending = borrowedTestRestoreManifest("pending-backup", "pending");
+    try writeTestRestoreManifestAndArtifact(alloc, root, &pending);
+    var aggregate = try backups_api.createClusterManifest(alloc, "daily", "file:///archive", &.{
+        .{ .name = "docs", .table_backup_id = "docs-backup" },
+        .{ .name = "pending", .table_backup_id = "pending-backup" },
+    });
     defer aggregate.deinit(alloc);
     try backups_api.writeClusterManifest(alloc, root, &aggregate);
     var before = try backups_api.readClusterManifest(alloc, root, "daily");
@@ -56022,7 +56056,7 @@ test "legacy cluster restore pins child manifests under an unchanged aggregate" 
     };
     var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = undefined, .vtable = &.{ .status = Fake.status } }, null, null);
     defer server.deinit();
-    const pinned = try server.bindLegacyRestoreChildren(&location, &before, null, .none);
+    const pinned = try server.bindLegacyRestoreChildren(&location, &before, null, .none, null);
     defer alloc.free(pinned.bindings);
 
     child.description = "replacement under the same ID";
@@ -56034,10 +56068,18 @@ test "legacy cluster restore pins child manifests under an unchanged aggregate" 
     var after = try backups_api.readClusterManifest(alloc, root, "daily");
     defer after.deinit(alloc);
     try std.testing.expectEqual(before.persisted_sha256, after.persisted_sha256);
-    const fresh = try server.bindLegacyRestoreChildren(&location, &after, &.{0}, .none);
+    const fresh = try server.bindLegacyRestoreChildren(&location, &after, null, .none, null);
     defer alloc.free(fresh.bindings);
     try std.testing.expect(!std.mem.eql(u8, &pinned.digest, &fresh.digest));
     try std.testing.expectError(error.BackupArtifactIntegrityMismatch, ApiHttpServer.readLegacyRestoreChild(&pinned.bindings[0], alloc, &location, child.backup_id, child.backup_id));
+    const table_names = &.{ "docs", "pending" };
+    try std.testing.expectError(error.BackupArtifactIntegrityMismatch, server.verifyPendingLegacyRestoreChildren(alloc, &location, &after, table_names, null, pinned.bindings, &.{}, null));
+    try std.Io.Dir.cwd().deleteFile(io, path);
+    try server.verifyPendingLegacyRestoreChildren(alloc, &location, &after, table_names, null, pinned.bindings, &.{.{ 0, 0 }}, null);
+    const pending_path = try backups_api.metadataPath(alloc, root, pending.backup_id);
+    defer alloc.free(pending_path);
+    try std.Io.Dir.cwd().deleteFile(io, pending_path);
+    try std.testing.expectError(error.FileNotFound, server.verifyPendingLegacyRestoreChildren(alloc, &location, &after, table_names, null, pinned.bindings, &.{.{ 0, 0 }}, null));
 }
 
 test "owned restore verifies declared artifact identity instead of accepting staged bytes" {
