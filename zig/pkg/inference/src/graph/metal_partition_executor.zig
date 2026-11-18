@@ -22881,30 +22881,11 @@ fn executeSynchronousPhysicalRegions(allocator: std.mem.Allocator, graph: *const
         const backend = frame.pool.backends[installed.backend_index];
         if (backend.ptr != cb.ptr or backend.vtable != cb.vtable) return error.PreparedRegionOwnerChanged;
     }
-    const binding = @import("../execution/region_binding.zig");
-    const kernel = @import("../execution/kernel_route.zig");
     for (nodes) |node| {
         if (!reachable[node] or graph.node(node).op == .parameter) continue;
-        const installed = frame.pool.regionAtEntry(node) orelse continue;
-        if (installed.owner.input_nodes.len > binding.max_inputs) return error.PreparedRegionBindingChanged;
-        var facts: [binding.max_inputs]kernel.Binding = undefined;
-        var inputs: [binding.max_inputs]CT = undefined;
-        const count = installed.owner.input_nodes.len;
-        try frame.pool.regionExecutionFacts(installed.owner, facts[0..count]);
-        for (installed.owner.input_nodes, facts[0..count], inputs[0..count]) |input, fact, *value| {
-            // Immutable facts own their exact retained source CT. Consuming
-            // this capability avoids replacing it with a fresh parameter
-            // wrapper from ordinary materialization. Runtime activation facts
-            // still consume this invocation's actual values table.
-            value.* = if (fact == .tensor) fact.tensor.value else values[input] orelse return error.MissingValue;
-        }
-        for (installed.outputs) |output| if (values[output.slot.node] != null) return error.PreparedRegionOutputMismatch;
-        var produced = try frame.executeRegion(installed, facts[0..count], inputs[0..count]);
-        defer produced.deinit();
-        for (installed.outputs, 0..) |output, index| {
-            values[output.slot.node] = try produced.take(index);
-            devices[output.slot.node] = device_id;
-        }
+        const installed = (try @import("../execution/region_dispatch.zig").execute(frame, cb, node, values)) orelse return error.PreparedRegionBoundaryChanged;
+        if (installed.owner.entry_node != node) continue;
+        for (installed.outputs) |output| devices[output.slot.node] = device_id;
         if (stats) |actual| {
             actual.runtime_region_plan_dispatches += 1;
             actual.runtime_region_plan_active_regions += 1;

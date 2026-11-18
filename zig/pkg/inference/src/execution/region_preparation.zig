@@ -144,6 +144,7 @@ pub fn select(request: Request) !?Selected {
             if (backend.kind() != kind) continue;
             const functions = backend.vtable.kernels orelse continue;
             if (!functions.accepts(backend.vtable) or functions.prepareRegionRoutes == null) continue;
+            if (request.execution_profile == .unknown and !functions.regionRoutesInOrdinaryFrame) continue;
             // This physical plan has no per-slot concrete device identity.
             // Ambiguous same-kind providers remain compatibility execution.
             if (target != null) {

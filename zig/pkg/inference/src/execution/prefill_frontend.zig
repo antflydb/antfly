@@ -25,12 +25,13 @@ const output_names = names: {
 pub const Spec = struct {
     config: Config,
     rows: usize,
+    last_row: bool = false,
 
     pub fn donorLayers(self: *const Spec) usize {
         return self.config.num_hidden_layers - self.config.num_kv_shared_layers;
     }
     pub fn resolve(self: *Spec) capture.Forward {
-        return .{ .context = self, .fingerprint = self.config.fingerprint() ^ 0x70726566696c6c01, .optimization = .authored_schedule, .device_inputs = .assigned, .output_abi = abi, .validate = validate, .run = run };
+        return .{ .context = self, .fingerprint = self.config.fingerprint() ^ 0x70726566696c6c01 ^ @as(u64, @intFromBool(self.last_row)), .optimization = .authored_schedule, .device_inputs = .assigned, .output_abi = abi, .validate = validate, .run = run };
     }
 };
 
@@ -69,7 +70,7 @@ fn run(raw: *anyopaque, cb: *const ops.ComputeBackend, a: std.mem.Allocator, inp
     defer if (ple) |value| cb.free(value);
     const context = gpt.DecodeContext{ .total_sequence_len = spec.rows, .query_sequence_len = spec.rows, .kv_sequence_len = spec.rows, .forward_kv_reuse = scope.context() };
     owns_hidden = false;
-    const final = try gpt.forwardFinalHiddenWithSharedKvOutput(cb, a, spec.config, hidden, .{}, 1, spec.rows, &context, ple, null, null, if (@import("gemma4_native_plan.zig").Geometry.resolve(spec.config) != null) .last else .all);
+    const final = try gpt.forwardFinalHiddenWithSharedKvOutput(cb, a, spec.config, hidden, .{}, 1, spec.rows, &context, ple, null, null, if (spec.last_row) .last else .all);
     outputs[0] = .{ .name = names[0], .value = final.hidden };
     initialized = 1;
     for (0..spec.donorLayers()) |layer| {
@@ -120,6 +121,9 @@ test "functional prefix exports KV and preserves ordinary decoder hidden values"
     defer input.deinit();
     const declared = [_]capture.Input{.{ .tensor = input }};
     var spec = Spec{ .config = config, .rows = 2 };
+    var last = spec;
+    last.last_row = true;
+    try std.testing.expect(spec.resolve().fingerprint != last.resolve().fingerprint);
     const Resolve = struct {
         fn shape(raw: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8) !?@import("ml").graph.Shape {
             const backend: *const ops.ComputeBackend = @ptrCast(@alignCast(raw.?));

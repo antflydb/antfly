@@ -30,13 +30,14 @@ const Direct = struct {
     slot: route.OutputSlot,
     support: Support,
     immutable_resources: bool,
+    runtime_inputs: bool = false,
     workspace: ops.kernel_descriptor.WorkspaceRequirement,
     auxiliaries: ops.kernel_descriptor.AuxiliaryRequirements,
 
     fn matches(raw: *anyopaque, request: route.Validate) bool {
         const self: *Direct = @ptrCast(@alignCast(raw));
         if (!self.support(self.backend.ptr, &self.descriptor) or request.output.epoch != self.slot.epoch or request.output.node != self.slot.node or request.output.allocation != self.slot.allocation or !shapeEqual(request.output.logical, self.descriptor.output_shape) or request.inputs.len != self.descriptor.input_count) return false;
-        for (request.inputs, 0..) |input, index| if (!bindingDense(self.backend, input, self.descriptor.input_shapes[index])) return false;
+        for (request.inputs, 0..) |input, index| if (!(self.runtime_inputs and input == .unknown) and !bindingDense(self.backend, input, self.descriptor.input_shapes[index])) return false;
         // Canonical prepareImmutable callers attest descriptor-only resource
         // recipes. Keep support policy, current slots and every input checked
         // above while reusing the cold workspace and auxiliary requirements.
@@ -130,24 +131,32 @@ fn actualDense(backend: ops.ComputeBackend, known: anytype, expected: ml.graph.S
 }
 
 pub fn prepare(backend: ops.ComputeBackend, request: route.Prepare, support: Support) !?route.Owned {
-    return prepareImpl(backend, request, support, false);
+    return prepareImpl(backend, request, support, false, false);
 }
 
 /// Only canonical backends with descriptor-only resource callbacks call this.
 /// Current support policy and model Tensor operands still require validation.
 /// Runtime input equivalence remains mandatory for either validation scope.
 pub fn prepareImmutable(backend: ops.ComputeBackend, request: route.Prepare, support: Support) !?route.Owned {
-    return prepareImpl(backend, request, support, true);
+    return prepareImpl(backend, request, support, true, false);
 }
 
-fn prepareImpl(backend: ops.ComputeBackend, request: route.Prepare, support: Support, immutable_program: bool) !?route.Owned {
+/// An explicit target family may guarantee an assigned dense output while
+/// validating unavailable predecessor CTs at dispatch. This grants no input
+/// representation or admission proof and always retains invocation validation.
+/// The target must reject malformed current CTs before submitting any work.
+pub fn prepareWithRuntimeInputs(backend: ops.ComputeBackend, request: route.Prepare, support: Support) !?route.Owned {
+    return prepareImpl(backend, request, support, false, true);
+}
+
+fn prepareImpl(backend: ops.ComputeBackend, request: route.Prepare, support: Support, immutable_program: bool, runtime_inputs: bool) !?route.Owned {
     if (request.descriptor.elements() == 0) return null;
     const implementation = request.implementation orelse return null;
     if (implementation.context != backend.ptr or implementation.table != @as(*const anyopaque, @ptrCast(backend.vtable))) return null;
     const canonical = backend.vtable.kernels orelse return null;
     if (!canonical.accepts(backend.vtable)) return null;
     if (!support(backend.ptr, request.descriptor) or request.inputs.len != request.descriptor.input_count) return null;
-    for (request.inputs, 0..) |input, index| if (!bindingDense(backend, input, request.descriptor.input_shapes[index])) return null;
+    for (request.inputs, 0..) |input, index| if (!(runtime_inputs and input == .unknown) and !bindingDense(backend, input, request.descriptor.input_shapes[index])) return null;
     const functions = backend.vtable.kernels orelse return null;
     const workspace = if (functions.assignedKernelWorkspace) |query| try query(backend.ptr, request.descriptor) else ops.kernel_descriptor.WorkspaceRequirement{};
     const auxiliaries = if (functions.assignedKernelAuxiliaries) |query| try query(backend.ptr, request.descriptor) else ops.kernel_descriptor.AuxiliaryRequirements{};
@@ -157,7 +166,7 @@ fn prepareImpl(backend: ops.ComputeBackend, request: route.Prepare, support: Sup
         if (index >= request.inputs_witnessed.len or !request.inputs_witnessed[index] or input == .tensor) stable = false;
     }
     const owner = try request.allocator.create(Direct);
-    owner.* = .{ .allocator = request.allocator, .backend = backend.withoutSynchronousBorrows(), .descriptor = request.descriptor.*, .slot = request.output, .support = support, .immutable_resources = immutable_program, .workspace = workspace, .auxiliaries = auxiliaries };
+    owner.* = .{ .allocator = request.allocator, .backend = backend.withoutSynchronousBorrows(), .descriptor = request.descriptor.*, .slot = request.output, .support = support, .immutable_resources = immutable_program, .runtime_inputs = runtime_inputs, .workspace = workspace, .auxiliaries = auxiliaries };
     return .{ .validation_scope = if (stable) .prepared_program else .invocation, .context = owner, .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .key = @intCast(request.output.node), .requirements = .{ .primary_alignment = request.descriptor.alignment, .primary_bytes = primary_bytes, .profile = @intCast(@backingInt(std.meta.activeTag(request.descriptor.operation))), .workspace = workspace, .auxiliaries = auxiliaries, .capture = if (functions.physicalReplayKernelSupported) |query| (if (query(backend.ptr, request.descriptor)) .supported else .unsupported) else .unsupported }, .vtable = &Direct.vtable };
 }
 

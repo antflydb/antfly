@@ -50,6 +50,12 @@ pub const Output = struct {
 
 pub const Requirements = struct {
     outputs: []const Output,
+    /// Explicit target proof that assigned resources submit without allocation,
+    /// upload, descriptor discovery or request-address capture after warmup.
+    capture: enum { unsupported, supported } = .unsupported,
+    /// False only for an ordinary assigned region that changes no ambient
+    /// provider mode and inherits the frame's exclusion/completion ownership.
+    requires_execution_profile: bool = true,
     payload_claim_required: bool = false,
     /// These phases are disjoint: a planner may share their backing only
     /// after proving the cold phase finishes before numerical dispatch.

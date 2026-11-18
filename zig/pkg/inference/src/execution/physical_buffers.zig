@@ -450,6 +450,11 @@ pub const Pool = struct {
                     node.output_shape.numElements() == null or node.output_shape.numElements() != graph.node(node.inputs[0]).output_shape.numElements()) return;
                 continue;
             }
+            if (self.regionForNode(@intCast(id))) |installed| {
+                if (installed.backend_index != index or installed.owner.requirements.capture != .supported) return;
+                if (installed.owner.entry_node == id) count += 1;
+                continue;
+            }
             const kernel = self.kernels[id] orelse return;
             if (kernel.backend_index != index) return;
             if (self.preparedKernelRoute(@intCast(id))) |owned| {
@@ -470,13 +475,45 @@ pub const Pool = struct {
         }
         for (graph.outputs.items) |id| {
             const source = replayOutputSource(graph, id) orelse return;
-            if (self.kernels[source] != null or graph.node(source).op == .constant) continue;
+            if (self.kernels[source] != null or self.regionForNode(source) != null or graph.node(source).op == .constant) continue;
             var mutable = false;
             for (bindings) |binding| if (binding.node_id == source and (binding.kind == .input or binding.kind == .state_input)) {
                 mutable = true;
                 break;
             };
             if (!mutable) return;
+        }
+        if (self.replay_inputs.len != 0 or self.replay_outputs.len != 0 or self.replay_input_indices.len != 0) {
+            // A private variant may replace primitive dispatches with regions
+            // while retaining the root's exact input banks. Recheck legality
+            // and cost above, then reuse that unchanged binding ABI. Rebuilding
+            // the tables would orphan already-admitted ingress allocations.
+            const root = self.root_pool orelse return error.InvalidReplayTemplate;
+            const inherited = root.replay_config orelse return error.InvalidReplayTemplate;
+            if (inherited.graph != graph or inherited.bindings.ptr != bindings.ptr or inherited.bindings.len != bindings.len or
+                self.replay_inputs.len != binding_count or self.replay_outputs.len != graph.outputs.items.len or self.replay_input_indices.len != graph.nodeCount()) return error.InvalidReplayTemplate;
+            for (self.replay_inputs, 0..) |input, input_index| {
+                if (input.node >= graph.nodeCount() or self.replay_input_indices[input.node] != input_index or
+                    !input.shape.eq(graph.node(input.node).output_shape)) return error.InvalidReplayTemplate;
+                if (input.allocation) |allocation| {
+                    const bank = plan.allocationById(allocation) orelse return error.InvalidReplayTemplate;
+                    if (bank.backend != .cuda) return error.InvalidReplayTemplate;
+                }
+            }
+            for (graph.outputs.items, self.replay_outputs) |id, *output| {
+                if (output.node != id or !output.shape.eq(graph.node(id).output_shape)) return error.InvalidReplayTemplate;
+                const source = replayOutputSource(graph, id).?;
+                output.allocation = if (self.regionForNode(source) != null)
+                    (plan.slotForNode(source) orelse return error.InvalidShape).allocation
+                else if (self.kernels[source]) |kernel|
+                    kernel.output_allocation
+                else
+                    self.replay_inputs[self.replay_input_indices[source]].allocation orelse return error.InvalidShape;
+            }
+            self.replay_kernel_count = count;
+            self.replay_backend = index;
+            self.replay_decision = .warming;
+            return;
         }
         const inputs = try self.allocator.alloc(ReplayInput, binding_count);
         errdefer self.allocator.free(inputs);
@@ -513,7 +550,7 @@ pub const Pool = struct {
         }
         for (graph.outputs.items, outputs) |id, *output| {
             const source = replayOutputSource(graph, id).?;
-            const allocation = if (self.kernels[source]) |kernel| kernel.output_allocation else inputs[input_indices[source]].allocation orelse return error.InvalidShape;
+            const allocation = if (self.regionForNode(source) != null) (plan.slotForNode(source) orelse return error.InvalidShape).allocation else if (self.kernels[source]) |kernel| kernel.output_allocation else inputs[input_indices[source]].allocation orelse return error.InvalidShape;
             output.* = .{ .node = id, .allocation = allocation, .shape = graph.node(id).output_shape };
         }
         self.replay_inputs = inputs;
@@ -1137,7 +1174,6 @@ pub const Pool = struct {
             if (qualified or child.cuda_frame_dispatch or child.device_input_plans.len != 0) {
                 // Root templates are immutable. This private variant owns its
                 // copied plan and publishes fresh templates only on success.
-                if (child.replay_inputs.len != 0 or child.replay_outputs.len != 0 or child.replay_input_indices.len != 0) return error.InvalidReplayTemplate;
                 try child.prepareReplay(config.graph, &child.plan, config.bindings, config.costs);
             }
         };
@@ -1259,7 +1295,13 @@ pub const Pool = struct {
         return self.prepareRegionsWithAuthority(null);
     }
     fn prepareRegionsWithAuthority(self: *Pool, authority: ?@import("backend_operation.zig").Borrowed) !void {
-        if (self.region_execution_profile == .unknown) return;
+        if (self.region_execution_profile == .unknown) {
+            var ordinary = false;
+            for (self.backends) |backend| if (backend.vtable.kernels) |functions| {
+                ordinary = ordinary or (functions.accepts(backend.vtable) and functions.regionRoutesInOrdinaryFrame);
+            };
+            if (!ordinary) return;
+        }
         const region_binding = @import("region_binding.zig");
         const preparation = @import("region_preparation.zig");
         const graph = self.coverage_graph orelse return;
@@ -1282,15 +1324,13 @@ pub const Pool = struct {
             return;
         }
         for (owned.owners) |owner| {
+            if (self.region_execution_profile == .unknown and owner.requirements.requires_execution_profile) return error.RegionExecutionProfileChanged;
             if (owner.input_nodes.len > region_binding.max_inputs or owner.requirements.outputs.len > region_binding.max_outputs) return error.UnsupportedPreparedRegionBoundary;
         }
         var lifetimes = try @import("region_lifetimes.zig").create(self.allocator, graph, reachable, &self.plan, owned.owners);
         defer lifetimes.deinit();
         try @import("region_recolor.zig").applyWithLastUse(&self.plan, lifetimes.first_use, lifetimes.input_last_use);
         try self.rebindRegionKernelSlots();
-        // Per-node owners capture allocation IDs. Rebuild them against the
-        // final coloring; input representations/profile policies remain exact.
-        try selected.refreshWithAuthority(self, authority);
         const installed = try self.allocator.alloc(region_binding.Installed, owned.owners.len);
         errdefer self.allocator.free(installed);
         var initialized: usize = 0;
@@ -1334,16 +1374,27 @@ pub const Pool = struct {
                 const literal = store.node_indices[node];
                 if (literal == ml.graph.null_node or !self.literalEnabled(literal)) return error.PreparedRegionLiteralUnavailable;
             }
+            initialized += 1;
+        }
+        // Borrow the complete region boundary during the cold route refresh.
+        // Its assigned outputs seed exact downstream layout facts; no ordinary
+        // kernel owner is retained for an elided/region-covered operation.
+        self.regions = installed;
+        self.region_by_node = region_by_node;
+        errdefer {
+            self.regions = &.{};
+            self.region_by_node = &.{};
+        }
+        try selected.refreshWithAuthority(self, authority);
+        for (installed) |value| {
+            const owner = value.owner;
             var input_facts: [region_binding.max_inputs]route.Binding = undefined;
             var output_slots: [region_binding.max_outputs]route.OutputSlot = undefined;
             try self.regionFacts(owner, selected.inputs.entries, input_facts[0..owner.input_nodes.len]);
-            for (outputs, output_slots[0..outputs.len]) |output, *slot| slot.* = output.slot;
-            const backend = self.backends[backend_index];
-            try owner.validate(.{ .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .policy_key = try self.currentRegionPolicy(backend_index), .inputs = input_facts[0..owner.input_nodes.len], .outputs = output_slots[0..outputs.len] });
-            initialized += 1;
+            for (value.outputs, output_slots[0..value.outputs.len]) |output, *slot| slot.* = output.slot;
+            const backend = self.backends[value.backend_index];
+            try owner.validate(.{ .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .policy_key = try self.currentRegionPolicy(value.backend_index), .inputs = input_facts[0..owner.input_nodes.len], .outputs = output_slots[0..value.outputs.len] });
         }
-        self.regions = installed;
-        self.region_by_node = region_by_node;
         self.region_owner = owned;
         self.region_runtime_last_use = lifetimes.runtime_last_use;
         lifetimes.runtime_last_use = &.{};
@@ -1553,13 +1604,15 @@ pub const Pool = struct {
     }
 
     fn applyRouteRequirements(self: *Pool) !bool {
-        var capture_supported = self.regions.len == 0;
+        var capture_supported = true;
+        for (self.regions) |installed| capture_supported = capture_supported and installed.owner.requirements.capture == .supported;
         const selected = if (self.selection) |*value| value else return capture_supported;
         // Existing independently qualified compatibility routes retain their
         // original storage. Selected exact routes replace their own scratch,
         // never silently selecting a new profile after admission.
         for (selected.routes, 0..) |maybe, node| {
             const owned = maybe orelse continue;
+            if (self.regionForNode(@intCast(node)) != null) continue;
             const required = owned.requirements;
             const kernel = &self.kernels[node].?;
             const kind = self.backends[kernel.backend_index].kind();
@@ -2616,8 +2669,16 @@ pub const Frame = struct {
         const index = self.pool.replay_backend orelse return false;
         const backend = self.pool.backends[index];
         if (self.pool.coverage_reachable) |reachable| if (reachable.len != self.pool.kernels.len) return error.InvalidReachabilityTable;
+        for (self.pool.regions, self.region_assigned) |installed, resources| {
+            if (installed.owner.requirements.capture != .supported or
+                (installed.owner.vtable.prepare_assigned != null and resources == null)) return false;
+        }
         for (self.pool.kernels, 0..) |maybe, node| if (maybe) |kernel| {
             if (self.pool.coverage_reachable) |reachable| if (!reachable[node]) continue;
+            if (self.pool.regionForNode(@intCast(node))) |installed| {
+                if (installed.owner.requirements.capture != .supported) return false;
+                continue;
+            }
             const allowed = if (self.pool.preparedKernelRoute(@intCast(node))) |owned| owned.requirements.capture == .supported else backend.vtable.kernels.?.physicalReplayKernelSupported.?(backend.ptr, &kernel.descriptor);
             if (!allowed) {
                 self.stats.replay_decision = .unsupported_graph;

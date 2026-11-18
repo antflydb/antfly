@@ -521,6 +521,38 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
                     continue;
                 }
 
+                // The ordinary frame executes a selected numerical region
+                // once at entry; its covered intermediates must never re-enter
+                // the compatibility interpreter or overwrite publications.
+                const installed = if (options.physical_frame) |frame|
+                    try @import("../execution/region_dispatch.zig").execute(frame, cb, node_id, values)
+                else
+                    null;
+                if (installed) |region| {
+                    if (region.owner.entry_node == node_id) {
+                        for (region.outputs) |output| {
+                            value_device[output.slot.node] = dev_id;
+                            try runtime_shape_tracker.record(cb, output.slot.node, values[output.slot.node].?);
+                        }
+                        if (options.execution_control) |control| try control.check();
+                        if (collect_stats) {
+                            exec_stats.runtime_region_plan_dispatches += 1;
+                            exec_stats.runtime_region_plan_active_regions += 1;
+                            exec_stats.runtime_region_plan_covered_nodes += region.owner.covered_nodes.len;
+                            exec_stats.runtime_region_plan_elided_nodes += region.owner.covered_nodes.len - 1;
+                        }
+                        for (region.owner.input_nodes) |input| {
+                            if (last_use[input] != node_id or (rt_map.contains(input) and !donated.contains(input) and !owned_runtime_transfers.contains(input))) continue;
+                            if (values[input]) |value| {
+                                const source = mesh.device(value_device[input]) orelse return error.DeviceNotFound;
+                                source.backend.free(value);
+                                values[input] = null;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 // Skip placeholders.
                 if (graph.node(node_id).op == .fused_from_float32) continue;
 

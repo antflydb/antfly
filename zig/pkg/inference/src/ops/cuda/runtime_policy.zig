@@ -41,6 +41,22 @@ pub const Seq2seq = struct {
     }
 };
 
+/// Static partition of the existing split attention kernels. Both eager and
+/// assigned execution use this geometry; storage ownership stays with callers.
+pub const SplitAttention = struct {
+    chunk_size: usize,
+    chunk_count: usize,
+
+    pub fn select(capacity: usize, configured: usize, warp_f16: bool, windowed: bool) ?SplitAttention {
+        if (capacity == 0 or configured == 0) return null;
+        const minimum: usize = if (warp_f16) (if (windowed) 64 else 128) else configured;
+        const chunk_size = @max(@max(configured, minimum), std.math.divCeil(usize, capacity, 128) catch return null);
+        const chunk_count = std.math.divCeil(usize, capacity, chunk_size) catch return null;
+        if (chunk_count <= 1 or chunk_count > 128) return null;
+        return .{ .chunk_size = chunk_size, .chunk_count = chunk_count };
+    }
+};
+
 pub const Policy = struct {
     seq2seq: Seq2seq = .{},
     temp_cache_mb: ?usize = null,
@@ -150,4 +166,18 @@ test "CUDA dense seq2seq precision is explicit and leaves unrelated runtime poli
     const independent = Seq2seq{ .encoder_attention = .f16, .vendor_attention = false };
     try std.testing.expect(independent.projections == .f32 and independent.enabled());
     try std.testing.expectEqual(@as(usize, 0), defaults.workspace_bytes);
+}
+
+test "split attention partition preserves short context decline and bounded long context scratch" {
+    try std.testing.expect(SplitAttention.select(128, 64, true, false) == null);
+    try std.testing.expect(SplitAttention.select(64, 64, true, true) == null);
+    try std.testing.expect(SplitAttention.select(512, 0, true, true) == null);
+    const local = SplitAttention.select(129, 64, true, true).?;
+    try std.testing.expectEqual(@as(usize, 64), local.chunk_size);
+    try std.testing.expectEqual(@as(usize, 3), local.chunk_count);
+    const global = SplitAttention.select(257, 64, true, false).?;
+    try std.testing.expectEqual(@as(usize, 128), global.chunk_size);
+    try std.testing.expectEqual(@as(usize, 3), global.chunk_count);
+    const long = SplitAttention.select(std.math.maxInt(usize), 32, false, false).?;
+    try std.testing.expectEqual(@as(usize, 128), long.chunk_count);
 }

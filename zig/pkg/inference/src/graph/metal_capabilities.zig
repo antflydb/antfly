@@ -111,6 +111,7 @@ pub fn supportsMetalEagerGraph(op: OpCode) bool {
         .scatter_add,
         .slice,
         .concat_prim,
+        .fused_concat,
         .dot_general,
         .conv_general,
         .fused_sdpa,
@@ -158,6 +159,11 @@ pub fn decideMetalEagerGraph(query: CapabilityQuery) CapabilityDecision {
             return CapabilityDecision.acceptCost(cost);
         },
         .fused_from_float32, .fused_zero_tensor => return CapabilityDecision.acceptCost(cost),
+        .fused_concat => {
+            if (@import("../ops/kernel_descriptor.zig").lower(query.graph, query.node_id) == null) return CapabilityDecision.reject(.unsupported_op);
+            if (!nodeHasMetalResidentInput(query)) return CapabilityDecision.reject(.wrong_storage);
+            return CapabilityDecision.acceptCost(cost);
+        },
         .reshape, .transpose, .broadcast_in_dim, .slice, .concat_prim => {
             if (!nodeHasMetalResidentInput(query) and !packed_quant_metadata_view) return CapabilityDecision.reject(.wrong_storage);
             return CapabilityDecision.acceptCost(cost);

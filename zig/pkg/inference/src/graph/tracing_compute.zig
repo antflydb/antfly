@@ -352,6 +352,7 @@ pub const TracingCompute = struct {
         .cloneTensorShape = &cloneTensorShapeOp,
         .sliceLastDim = &sliceLastDimOp,
         .linearNoBiasPair = &linearNoBiasPairOp,
+        .linearNoBiasQkv = &linearNoBiasQkvOp,
         .mulMatId = &moeLinearNoBiasOp,
         .moeLinearNoBias = &moeLinearNoBiasOp,
         .moeLinearNoBiasPair = &moeLinearNoBiasPairOp,
@@ -1695,6 +1696,17 @@ pub const TracingCompute = struct {
     }
 
     // ── Linear pair / MoE / misc ────────────────────────────────────────
+
+    // Preserve the three original projection identities and their different
+    // output widths. Target region selection may share activation staging;
+    // ordinary interpreters retain independent numerical projection semantics.
+    fn linearNoBiasQkvOp(ctx: *anyopaque, input: CT, q: CT, k: CT, v: CT, rows: usize, in_dim: usize, q_width: usize, kv_width: usize) anyerror!?ops.LinearNoBiasTripleResult {
+        return .{
+            .first = try linearNoBiasOp(ctx, input, q, rows, in_dim, q_width),
+            .second = try linearNoBiasOp(ctx, input, k, rows, in_dim, kv_width),
+            .third = try linearNoBiasOp(ctx, input, v, rows, in_dim, kv_width),
+        };
+    }
 
     fn linearNoBiasPairOp(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!LinearNoBiasPairResult {
         const tc = fromCtx(ctx);

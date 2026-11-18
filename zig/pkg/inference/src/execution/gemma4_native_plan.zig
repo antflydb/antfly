@@ -20,6 +20,7 @@ pub const Plan = struct {
     wide_f32_vendor: bool = true,
     flash_prefill: bool = true,
     capture_prefill: bool = false,
+    trace_prefill: bool = false,
     warp_decode: bool = false,
 
     pub fn resolve(config: Config) ?Plan {
@@ -29,6 +30,7 @@ pub const Plan = struct {
             .wide_f32_vendor = !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_WIDE_F32_VENDOR"),
             .flash_prefill = !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_PAGED_F16_FLASH"),
             .capture_prefill = platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_CAPTURE_PREFILL"),
+            .trace_prefill = platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_TRACE_PREFILL_PROGRAM"),
             .warp_decode = platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_F16_WARP_DECODE", true),
         };
     }

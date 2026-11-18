@@ -783,6 +783,7 @@ pub const Runtime = struct {
         try decode_runtime.appendPrefillChunkWithCleanup(chunk.len, .{ .boundary = self.forward.context.cleanupEpoch(), .operation = self.forward.context.cb.operationToken() });
         var decode_context = decode_runtime.makeDecodeContext(total_chunk_end, chunk.len);
         try self.forward.context.bindDecoderCleanup(&decode_context);
+        if (comptime build_options.enable_cuda) cuda_compute.CudaCompute.tracePrefillProgram(self.forward.context.cb, "chunk", &decode_context, self.forward.context.gpt_config.num_hidden_layers, seq_len);
         // Shared-KV pruning is only valid for these explicit output
         // intents. Checkpoint fitting collects queries from every
         // consumer; hidden-row/MTP consumers also retain the full path.

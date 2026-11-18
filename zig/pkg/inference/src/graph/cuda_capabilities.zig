@@ -49,6 +49,7 @@ pub fn supports(op: ml.graph.OpCode) bool {
         .slice,
         .gather,
         .concat_prim,
+        .fused_concat,
         .fused_layer_norm,
         .fused_rms_norm,
         .fused_softmax,
@@ -90,7 +91,7 @@ fn dense(query: partition.CapabilityQuery, node_id: ml.graph.NodeId) bool {
         // is likewise normalized by transfer; explicit strided inputs retain
         // the stride check below. Walk reshape chains without recursive stack.
         switch (query.graph.node(id).op) {
-            .transpose, .broadcast_in_dim, .slice, .concat_prim => return true,
+            .transpose, .broadcast_in_dim, .slice, .concat_prim, .fused_concat => return true,
             .reshape => {
                 id = query.graph.node(id).inputs[0];
                 continue;
@@ -155,6 +156,14 @@ pub fn decide(query: partition.CapabilityQuery) partition.CapabilityDecision {
         },
         .transpose, .broadcast_in_dim => {
             if (@import("../ops/kernel_descriptor.zig").lower(query.graph, query.node_id) == null) return reject(.unsupported_op);
+        },
+        .fused_concat => |attrs| {
+            if (node.num_inputs != 2) return reject(.unsupported_op);
+            const lhs = query.graph.node(node.inputs[0]).output_shape;
+            const rhs = query.graph.node(node.inputs[1]).output_shape;
+            if (lhs.rank() != 2 or rhs.rank() != 2 or lhs.dims[0] != attrs.total or rhs.dims[0] != attrs.total or
+                lhs.dims[1] != attrs.dim_a or rhs.dims[1] != attrs.dim_b or
+                @import("../ops/kernel_descriptor.zig").lower(query.graph, query.node_id) == null) return reject(.unsupported_op);
         },
         .concat_prim => |attrs| {
             if (node.num_inputs != 2) return reject(.unsupported_op);

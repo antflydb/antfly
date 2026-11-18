@@ -61,6 +61,9 @@ pub const VTable = struct {
     regionPolicyKey: ?*const fn (*anyopaque) anyerror!?u64 = null,
     /// Backend-owned, metadata-only operation proof. Unsupported/foreign or
     /// capture scopes return null; a frontend must never mint ordinary mode.
+    /// Target regions whose assigned resources need no ambient mutable mode.
+    /// They retain the ordinary frame's exclusion and completion protocol.
+    regionRoutesInOrdinaryFrame: bool = false,
     claimRegionExecutionProfile: ?*const fn (*anyopaque, @import("../execution/region_execution_profile.zig").Request) anyerror!?@import("../execution/region_execution_profile.zig").Claim = null,
     prepareRegionRoutes: ?*const fn (*anyopaque, @import("../execution/region_route.zig").Prepare) anyerror!?@import("../execution/region_route.zig").OwnedList = null,
     /// Optional metadata-only registration of retained input storage owners.

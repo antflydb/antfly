@@ -529,7 +529,9 @@ pub const Runtime = struct {
                     const root = self.physical_pool orelse return error.InvalidPreparedKernelRoute;
                     if (routes.pool.root_pool != root) return error.InvalidPreparedKernelRoute;
                     try routes.validateRuntimeInputs(options.runtime_inputs orelse &.{}, self.default_backend);
-                    if (routes.pool.regions.len != 0) {
+                    var requires_profile = false;
+                    for (routes.pool.regions) |installed| requires_profile = requires_profile or installed.owner.requirements.requires_execution_profile;
+                    if (requires_profile) {
                         const profile = options.region_execution_profile orelse return error.RegionExecutionProfileChanged;
                         if (!profile.held or profile.profile != routes.pool.region_execution_profile or profile.phase != .active) return error.RegionExecutionProfileChanged;
                     }

@@ -1390,20 +1390,7 @@ pub fn forwardLastLogitsLastRowTensorFromEmbeddingsWithLayer0Overrides(
     if (output == .last) std.log.info("cuda_multimodal_shared_kv_prefill rows={d} donor_layers={d}", .{
         seq_len, config.num_hidden_layers - config.num_kv_shared_layers,
     });
-    const captured = if (comptime build_options.enable_cuda) captured: {
-        if (output != .last or !layer0DecoderOverridesEmpty(overrides)) break :captured null;
-        try validateDecoderForwardCleanup(cb, overrides.cleanup, decode_context);
-        break :captured @import("../ops/cuda/cuda_compute.zig").CudaCompute.tryCapturedPrefill(cb, allocator, config, hidden_input, ple_vectors, decode_context.?) catch |err| {
-            cb.free(hidden_input);
-            return err;
-        };
-    } else null;
-    const hidden_result = if (captured) |value| blk: {
-        // This public GPT entry consumes its embedding, while the shared
-        // program borrows it just like the prepared decoder entry.
-        cb.free(hidden_input);
-        break :blk HiddenTensorResult{ .hidden = value, .total_rows = 1 };
-    } else try forwardFinalHiddenWithSharedKvOutput(
+    const hidden_result = try forwardFinalHiddenWithSharedKvOutput(
         cb,
         allocator,
         config,
@@ -3139,6 +3126,22 @@ pub fn forwardFinalHiddenWithSharedKvOutput(
     var owns_hidden = true;
     errdefer if (owns_hidden) cb.free(hidden);
     try validatePackedQwenContext(config, batch, query_seq_len, decode_context);
+    // Both full-row consumers (including text/MTP) and last-row media consumers
+    // enter the same functional prefix owner. Its output ABI is specialized;
+    // never prune rows that an ordinary hidden-state consumer may still need.
+    if (comptime build_options.enable_cuda) {
+        if (batch == 1 and output != .kv_only and pre_norm_out == null and trace_sink == null and
+            layer0DecoderOverridesEmpty(overrides))
+        {
+            if (decode_context) |context| {
+                if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.tryCapturedPrefillRows(cb, allocator, config, hidden, ple_vectors, context, output == .last)) |captured| {
+                    cb.free(hidden);
+                    owns_hidden = false;
+                    return .{ .hidden = captured, .total_rows = if (output == .last) 1 else total };
+                }
+            }
+        }
+    }
     const shared_boundary: ?usize = if (output == .all) null else blk: {
         if (batch != 1 or pre_norm_out != null or trace_sink != null) return error.UnsupportedShape;
         break :blk sharedKvPrefillBoundary(config, (decode_context orelse return error.UnsupportedShape).*) orelse return error.UnsupportedShape;
@@ -6819,7 +6822,7 @@ fn decoderBlockImpl(
         // contract as Gemma here, so keep it on the existing BF16/Q4-aware
         // triple route instead of converting the activation three times.
         const use_cuda_qkv = config.family == .gemma or config.family == .qwen3_vl;
-        if (cb.kind() == .cuda and use_cuda_qkv and !shares_kv and !config.layerOmitsVProj(layer) and q_projection_dim == q_dim) {
+        if ((cb.kind() == .cuda or cb.kind() == .graph) and use_cuda_qkv and !shares_kv and !config.layerOmitsVProj(layer) and q_projection_dim == q_dim) {
             const q_name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_proj.weight", .{layer}) catch return error.NameTooLong;
             const q_w = try getModelWeight(cb, config, q_name);
             defer freeTensorWithCleanup(cb, q_w, raw_overrides.cleanup);

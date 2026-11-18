@@ -337,6 +337,52 @@ pub fn pairedProjection(graph: *const ml.graph.Graph, first: ml.graph.NodeId, se
     return head;
 }
 
+/// Original gated pair with an explicit activation contract. Numerical owners
+/// must additionally prove that the three intermediates have no external users.
+pub const GatedProjection = struct { head: ProjectionHead, activation: Unary, output: ml.graph.NodeId };
+
+pub fn gatedPairedProjection(graph: *const ml.graph.Graph, first: ml.graph.NodeId, second: ml.graph.NodeId, output: ml.graph.NodeId) ?GatedProjection {
+    var head = pairedProjection(graph, first, second) orelse return null;
+    if (output >= graph.nodeCount()) return null;
+    const product = graph.node(output);
+    if (product.op != .fused_elem_multiply or product.num_inputs != 2) return null;
+    const activated = if (product.inputs[0] == second) product.inputs[1] else if (product.inputs[1] == second) product.inputs[0] else return null;
+    if (activated >= graph.nodeCount()) return null;
+    const activation = graph.node(activated);
+    if (activation.num_inputs != 1 or activation.inputs[0] != first or !activation.output_shape.eq(product.output_shape) or !activation.output_shape.eq(graph.node(first).output_shape)) return null;
+    const kind: Unary = switch (activation.op) {
+        .fused_gelu => .gelu,
+        .fused_gelu_exact => .gelu_exact,
+        .fused_silu => .silu,
+        .fused_relu => .relu,
+        else => return null,
+    };
+    if (!head.append(activated) or !head.append(output)) return null;
+    return .{ .head = head, .activation = kind, .output = output };
+}
+
+/// Independent projections sharing one activation. Outputs may have different
+/// widths; every source retains its own projection/rounding contract. Callers
+/// prove partition membership and availability, rather than guessing adjacency.
+pub fn independentProjections(graph: *const ml.graph.Graph, outputs: []const ml.graph.NodeId) ?ProjectionHead {
+    if (outputs.len < 2 or outputs.len > 3) return null;
+    var head = ProjectionHead{ .form = .independent, .count = @intCast(outputs.len), .input = ml.graph.null_node, .entry = outputs[0] };
+    for (outputs, 0..) |output, index| {
+        if (output >= graph.nodeCount()) return null;
+        const node = graph.node(output);
+        const descriptor = lower(graph, output) orelse return null;
+        if (descriptor.operation != .linear or descriptor.operation.linear.bias or node.getInputs().len != 2) return null;
+        if (index == 0) head.input = node.inputs[0] else if (node.inputs[0] != head.input) return null;
+        const dims = descriptor.operation.linear;
+        if (!head.source(graph, index, node.inputs[1], output, dims.rows, dims.in_dim, dims.out_dim, true) or !head.append(output)) return null;
+        if (descriptor.output_shape.dtype != .f32 or descriptor.input_shapes[0].dtype != .f32 or descriptor.input_shapes[1].dtype != .f32) return null;
+        if (index != 0 and (dims.rows != head.linears[0].operation.linear.rows or dims.in_dim != head.linears[0].operation.linear.in_dim)) return null;
+        for (head.weights[0..index]) |prior| if (prior == head.weights[index]) return null;
+        for (outputs[0..index]) |prior| if (prior == output) return null;
+    }
+    return head;
+}
+
 /// Complete parameter-fed projection head only. Mixed graphs keep their
 /// original executor and schedule; no reachability/placement is guessed here.
 pub fn projectionHead(graph: *const ml.graph.Graph) ?ProjectionHead {
@@ -353,18 +399,7 @@ pub fn projectionHead(graph: *const ml.graph.Graph) ?ProjectionHead {
             result = head;
         }
     }
-    if (result == null) {
-        var head = ProjectionHead{ .form = .independent, .count = @intCast(outputs.len), .input = ml.graph.null_node, .entry = outputs[0] };
-        for (outputs, 0..) |output, index| {
-            const node = graph.node(output);
-            const descriptor = lower(graph, output) orelse return null;
-            if (descriptor.operation != .linear or descriptor.operation.linear.bias or node.getInputs().len != 2) return null;
-            if (index == 0) head.input = node.inputs[0] else if (node.inputs[0] != head.input) return null;
-            const dims = descriptor.operation.linear;
-            if (!head.source(graph, index, node.inputs[1], output, dims.rows, dims.in_dim, dims.out_dim, true) or !head.append(output)) return null;
-        }
-        result = head;
-    }
+    if (result == null) result = independentProjections(graph, outputs) orelse return null;
     const head = result.?;
     if (graph.node(head.input).op != .parameter) return null;
     for (head.linears[0..head.count], 0..) |linear, index| {
@@ -493,12 +528,22 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
             }
             break :blk .{ .broadcast = layout };
         },
-        .concat_prim => |attrs| blk: {
+        .concat_prim, .fused_concat => blk: {
             if (node.num_inputs != 2) return null;
             const lhs = inputShape(graph, id, 0) orelse return null;
             const rhs = inputShape(graph, id, 1) orelse return null;
+            if (lhs.dtype != shape.dtype or rhs.dtype != shape.dtype) return null;
+            const axis: u32 = switch (node.op) {
+                .concat_prim => |attrs| attrs.axis,
+                .fused_concat => |attrs| legacy: {
+                    if (lhs.rank() != 2 or rhs.rank() != 2 or shape.rank() != 2 or lhs.dims[0] != attrs.total or rhs.dims[0] != attrs.total or
+                        lhs.dims[1] != attrs.dim_a or rhs.dims[1] != attrs.dim_b) return null;
+                    break :legacy 1;
+                },
+                else => unreachable,
+            };
             var expected: [8]i64 = undefined;
-            const geometry = kernel_geometry.ConcatAxis.init(lhs.dims[0..lhs.rank()], rhs.dims[0..rhs.rank()], attrs.axis, &expected) catch return null;
+            const geometry = kernel_geometry.ConcatAxis.init(lhs.dims[0..lhs.rank()], rhs.dims[0..rhs.rank()], axis, &expected) catch return null;
             if (!std.mem.eql(i64, expected[0..lhs.rank()], shape.dims[0..shape.rank()]) or (geometry.count() catch return null) != count) return null;
             break :blk .{ .concat = geometry };
         },
@@ -616,6 +661,12 @@ test "shared layout descriptors lower concrete concat slice and gather without w
     const indices = try builder.parameter("indices", ml.graph.Shape.init(.f32, &.{2}));
     const gathered = try builder.gather(a, indices, ml.graph.Shape.init(.f32, &.{ 2, 3 }));
     try std.testing.expect(lower(&graph, joined).?.operation == .concat);
+    const legacy = try graph.addNode(.{ .op = .{ .fused_concat = .{ .total = 2, .dim_a = 3, .dim_b = 2 } }, .output_shape = ml.graph.Shape.init(.f32, &.{ 2, 5 }), .inputs = .{ a, b, ml.graph.null_node, ml.graph.null_node }, .num_inputs = 2 });
+    try std.testing.expect(std.meta.eql(lower(&graph, joined).?.operation.concat, lower(&graph, legacy).?.operation.concat));
+    try std.testing.expect(@import("../graph/cuda_capabilities.zig").decide(.{ .graph = &graph, .node_id = legacy, .op = graph.node(legacy).op }).can_execute);
+    graph.nodeMut(legacy).op.fused_concat.dim_b = 3;
+    try std.testing.expect(lower(&graph, legacy) == null);
+    try std.testing.expect(!@import("../graph/cuda_capabilities.zig").decide(.{ .graph = &graph, .node_id = legacy, .op = graph.node(legacy).op }).can_execute);
     try std.testing.expect(lower(&graph, sliced).?.operation == .slice);
     try std.testing.expect(lower(&graph, gathered).?.operation == .gather);
     graph.nodeMut(sliced).op.slice.strides[0] = 0;
@@ -784,4 +835,50 @@ test "functional grouped attention descriptor preserves query offsets KV widths 
     malformed = descriptor;
     malformed.operation.dense_attention_rows.num_kv_heads = 3;
     try std.testing.expect(!malformed.operation.dense_attention_rows.valid(&malformed));
+}
+
+test "shared gated projection descriptor distinguishes activation precision and publication geometry" {
+    var graph = ml.graph.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{ 1, 32 });
+    const input = try builder.parameter("x", shape);
+    const gate = try builder.parameter("gate", ml.graph.Shape.init(.f32, &.{ 32, 32 }));
+    const up = try builder.parameter("up", ml.graph.Shape.init(.f32, &.{ 32, 32 }));
+    const pair = try graph.addNode(.{ .op = .{ .fused_linear_no_bias_pair = .{ .rows = 1, .in_dim = 32, .out_dim = 32 } }, .output_shape = shape, .inputs = .{ input, gate, up, ml.graph.null_node }, .num_inputs = 3 });
+    const second = try graph.addNode(.{ .op = .{ .fused_to_float32 = {} }, .output_shape = shape, .inputs = .{ pair, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node }, .num_inputs = 1 });
+    const activated = try builder.silu(pair);
+    const product = try builder.elemMultiply(activated, second);
+    const selected = gatedPairedProjection(&graph, pair, second, product) orelse return error.MissingGatedProjection;
+    try std.testing.expectEqual(Unary.silu, selected.activation);
+    try std.testing.expectEqual(@as(u8, 4), selected.head.covered_count);
+    try std.testing.expectEqual(product, selected.output);
+    graph.nodeMut(activated).op = .{ .fused_gelu_exact = {} };
+    try std.testing.expectEqual(Unary.gelu_exact, gatedPairedProjection(&graph, pair, second, product).?.activation);
+    graph.nodeMut(activated).op = .{ .fused_gelu = {} };
+    try std.testing.expectEqual(Unary.gelu, gatedPairedProjection(&graph, pair, second, product).?.activation);
+    graph.nodeMut(product).output_shape = ml.graph.Shape.init(.f32, &.{ 1, 31 });
+    try std.testing.expect(gatedPairedProjection(&graph, pair, second, product) == null);
+    graph.nodeMut(product).output_shape = shape;
+    graph.nodeMut(product).inputs[1] = pair;
+    try std.testing.expect(gatedPairedProjection(&graph, pair, second, product) == null);
+}
+
+test "shared independent projection descriptor preserves unequal widths and rejects duplicate sources" {
+    const a = std.testing.allocator;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ 3, 32 }));
+    var outputs: [3]ml.graph.NodeId = undefined;
+    for ([_]usize{ 64, 32, 16 }, [_][]const u8{ "first", "second", "third" }, &outputs) |width, name, *output| {
+        const weight = try builder.parameter(name, ml.graph.Shape.init(.f32, &.{ @intCast(width), 32 }));
+        output.* = try graph.addNode(.{ .op = .{ .fused_linear_no_bias = .{ .rows = 3, .in_dim = 32, .out_dim = @intCast(width) } }, .output_shape = ml.graph.Shape.init(.f32, &.{ 3, @intCast(width) }), .inputs = .{ input, weight, ml.graph.null_node, ml.graph.null_node }, .num_inputs = 2 });
+    }
+    const head = independentProjections(&graph, &outputs) orelse return error.MissingIndependentProjection;
+    try std.testing.expectEqual(@as(u8, 3), head.count);
+    for (head.linears, [_]u32{ 64, 32, 16 }) |linear, width| try std.testing.expectEqual(width, linear.operation.linear.out_dim);
+    try std.testing.expect(independentProjections(&graph, &.{ outputs[0], outputs[0] }) == null);
+    graph.nodeMut(outputs[2]).output_shape.dtype = .bf16;
+    try std.testing.expect(independentProjections(&graph, &outputs) == null);
 }

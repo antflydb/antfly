@@ -88,6 +88,11 @@ pub fn refine(pool: anytype) !void {
     }
     for (pool.replay_inputs) |input| if (input.allocation) |id| try original(pool, required, id);
     for (pool.host_input_plans) |input| try mark(required, input.allocation, input.requirements.bytes);
+    for (pool.device_input_plans) |input| {
+        const count = input.shape.numElements() orelse return error.InvalidPhysicalProjectionResource;
+        if (count <= 0) return error.InvalidPhysicalProjectionResource;
+        try mark(required, input.allocation, try std.math.mul(usize, @intCast(count), input.shape.dtype.byteSize()));
+    }
 
     // Do not invalidate alias extents when their provider-specific layout has
     // no exact replacement proof. Its backing remains conservatively original.

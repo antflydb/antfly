@@ -93,6 +93,9 @@ const Entry = struct {
         return self;
     }
     fn release(self: *Entry) void {
+        self.releaseWithCleanup(.{});
+    }
+    fn releaseWithCleanup(self: *Entry, cleanup: @import("cleanup_context.zig").Context) void {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         std.debug.assert(self.creating == 0);
         if (comptime @import("build_options").enable_pjrt) if (self.resident) |resident| resident.partitionExecutor().deinitExecutor();
@@ -102,7 +105,7 @@ const Entry = struct {
             index -= 1;
             const frame = self.frames.items[index];
             std.debug.assert(!frame.busy);
-            if (frame.executable) |*value| value.deinit();
+            if (frame.executable) |*value| value.deinitWithCleanup(cleanup);
             frame.releaseWeights(self.allocator);
             frame.backend.deinit();
             self.allocator.destroy(frame);
@@ -268,6 +271,35 @@ pub const Cache = struct {
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         return self.entries.entries.items.len;
+    }
+
+    /// Retire least-recently-used idle specializations at a safe outer boundary.
+    /// Detach under metadata locks and dispose outside them. An active result,
+    /// frame or constructor is never evicted. The count is not byte/quota credit:
+    /// exported Leases may legitimately keep physical storage alive afterwards.
+    pub fn evictIdle(self: *Cache, maximum: usize, cleanup: @import("cleanup_context.zig").Context) usize {
+        var retired: usize = 0;
+        while (retired < maximum) {
+            platform.sync.lockYielding(&self.mutex);
+            var victim: ?*Entry = null;
+            for (self.entries.entries.items, 0..) |entry, index| {
+                if (entry.references.load(.acquire) != 1) continue;
+                platform.sync.lockYielding(&entry.mutex);
+                var idle = entry.creating == 0;
+                for (entry.frames.items) |frame| idle = idle and !frame.busy;
+                if (idle) {
+                    victim = self.entries.entries.orderedRemove(index);
+                    self.entries.stats.evictions +%= 1;
+                }
+                entry.mutex.unlock();
+                if (victim != null) break;
+            }
+            self.mutex.unlock();
+            const retired_entry = victim orelse break;
+            retired_entry.releaseWithCleanup(cleanup);
+            retired += 1;
+        }
+        return retired;
     }
 
     fn sameProvider(a: Provider, b: Provider) bool {
@@ -463,7 +495,14 @@ pub const Cache = struct {
                 if (frame_executable.runtime.physical_pool) |pool| routes = try pool.prepareRoutes(facts.items);
             }
         };
-        var result = try frame_executable.run(allocator, .{ .runtime_inputs = runtime_inputs.items, .prepared_routes = routes, .execution_control = control, .output_placement = .producer, .strict_integer_constants = true, .activation_readbacks = readbacks });
+        var region_claims: ?@import("region_claims.zig").Set = null;
+        defer if (region_claims) |*claims| claims.releaseUnsubmitted();
+        if (routes) |selected| switch (try selected.pool.claimRegions(allocator, null, frame.weight_bindings.items)) {
+            .no_regions => {},
+            .reprepare => return error.PreparedRegionBindingChanged,
+            .ready => |claims| region_claims = claims,
+        };
+        var result = try frame_executable.run(allocator, .{ .runtime_inputs = runtime_inputs.items, .prepared_routes = routes, .region_claims = if (region_claims) |*claims| claims else null, .execution_control = control, .output_placement = .producer, .strict_integer_constants = true, .activation_readbacks = readbacks });
         errdefer result.deinit(&frame_executable.runtime);
         if (control) |active| try active.check();
         return .{ .entry = entry, .frame = frame, .result = result };
@@ -1190,4 +1229,48 @@ test "scalar affine real PJRT preserves native scaled branch arithmetic" {
     };
     defer client.deinit();
     try TestScalarAffine.qualify(@ptrCast(&client));
+}
+
+test "captured forward cache pressure retires idle programs while current outputs remain pinned" {
+    const a = std.testing.allocator;
+    var source = TestProvider{ .weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } };
+    defer source.weights.deinitOwned();
+    const Stage = struct {
+        fn run(_: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const capture.Input) ![]capture.Output {
+            const input = try inputs[0].value(cb);
+            defer cb.free(input);
+            const result = try cb.primNegate(input);
+            errdefer cb.free(result);
+            const outputs = try allocator.alloc(capture.Output, 1);
+            outputs[0] = .{ .name = "negative", .value = result };
+            return outputs;
+        }
+    };
+    var cache = Cache{};
+    defer cache.deinit(a);
+    var input = try Tensor.initFloat32(a, "x", &.{2}, &.{ 2, -3 });
+    defer input.deinit();
+    const inputs = [_]capture.Input{.{ .tensor = input }};
+    const provider = Provider{ .context = &source, .create = TestProvider.create, .import = TestProvider.import };
+    const forward = capture.Forward{ .context = &source, .fingerprint = 0x7072657373757265, .run = Stage.run, .output_names = &.{"negative"} };
+    var held = try cache.runDevice(a, provider, forward, &inputs, a, null);
+    var held_open = true;
+    defer if (held_open) held.deinit();
+    var other = forward;
+    other.fingerprint = 1;
+    var idle = try cache.runDevice(a, provider, other, &inputs, a, null);
+    idle.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cache.evictIdle(32, .{}));
+    try std.testing.expectEqual(@as(usize, 1), cache.specializationCount());
+    const values = try held.backend(0).toFloat32(held.result.outputs[0], a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ -2, 3 }, values);
+    held.deinit();
+    held_open = false;
+    try std.testing.expectEqual(@as(usize, 1), cache.evictIdle(32, .{}));
+    try std.testing.expectEqual(@as(usize, 0), cache.specializationCount());
+    var rebuilt = try cache.runDevice(a, provider, forward, &inputs, a, null);
+    defer rebuilt.deinit();
+    try std.testing.expectEqual(@as(u64, 3), cache.entries.stats.builds);
+    try std.testing.expectEqual(@as(u64, 2), cache.entries.stats.evictions);
 }

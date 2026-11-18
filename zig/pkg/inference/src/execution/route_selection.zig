@@ -297,6 +297,17 @@ pub const Selection = struct {
             }
         }.less);
         for (order) |node| {
+            // A selected region's assigned publication is the representation
+            // authority for later consumers. Covered intermediates get no
+            // invented plane or independent per-node numerical owner.
+            if (pool.regionForNode(node)) |installed| {
+                for (installed.owner.requirements.outputs) |publication| if (publication.node == node) {
+                    self.planes[node][0] = try densePlane(publication.logical, pool.backends[installed.backend_index], .primary, self.epoch);
+                    self.plane_counts[node] = 1;
+                    self.planes_witnessed[node] = true;
+                };
+                continue;
+            }
             if (try self.selectAlias(pool, node)) continue;
             const kernel = if (pool.kernels[node]) |*value| value else continue;
             const backend = pool.backends[kernel.backend_index];
