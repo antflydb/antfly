@@ -873,12 +873,14 @@ const PathGate = struct {
     /// turn, never nested with another one, so it cannot cycle against
     /// `WriterLane.checkout`'s own sequential (never nested) hold of the
     /// two mutexes.
-    /// Caller holds `self.mutex`, as for `pinLocalWriterLeaseForRead`.
-    fn releasePeerParkedLeases(self: *PathGate, requester: *const Owner) void {
+    /// Takes another owner's idle parked lease on this path. Caller holds
+    /// `self.mutex`, as for `pinLocalWriterLeaseForRead`.
+    fn takePeerParkedLease(self: *PathGate, requester: *const Owner) ?WriterLane.PeerRelease {
         for (self.owners.items) |owner| {
             if (owner == requester or !h.liteOpenModeCanWrite(owner.options.open_mode)) continue;
-            owner.writer_lane.releaseParkedForLocalPeer();
+            if (owner.writer_lane.takeParkedForLocalPeer()) |release| return release;
         }
+        return null;
     }
 
     fn pinLocalWriterLeaseForRead(self: *PathGate) ?*WriterLane {
@@ -1986,32 +1988,41 @@ pub const WriterLane = struct {
         _ = self.maintainParkedLease();
     }
 
-    /// Releases an idle parked lease for another owner on this path. A
-    /// same-process waiter shares this process's pid, so the foreign-waiter
-    /// release in `maintainParkedLease` never sees it.
-    fn releaseParkedForLocalPeer(self: *WriterLane) void {
+    const PeerRelease = struct {
+        lane: *WriterLane,
+        lease: native.PathWriterLock,
+        store: ?*NativeStore,
+    };
+
+    /// Takes this lane's idle parked lease for another owner on this path.
+    /// That owner's waits share this process's pid, so the foreign-waiter
+    /// release never sees them. The lane stays checked out until
+    /// `finishLocalPeerRelease`.
+    fn takeParkedForLocalPeer(self: *WriterLane) ?PeerRelease {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
-        if (self.checked_out or self.reading or self.local_reader_activity.count != 0) {
-            self.mutex.unlock(io);
-            return;
-        }
-        var lease = self.parked orelse {
-            self.mutex.unlock(io);
-            return;
-        };
+        defer self.mutex.unlock(io);
+        if (self.checked_out or self.reading or self.local_reader_activity.count != 0) return null;
+        const lease = self.parked orelse return null;
         self.parked = null;
         self.foreign_release_due = false;
         self.checked_out = true;
         self.holder = std.Thread.getCurrentId();
         const store = self.parked_store;
         self.parked_store = null;
-        self.mutex.unlock(io);
-        if (store) |held_store| {
+        return .{ .lane = self, .lease = lease, .store = store };
+    }
+
+    /// Drains and syncs the store, which can enter maintenance writer
+    /// admission and take the path gate: the caller must not hold it.
+    fn finishLocalPeerRelease(release: *PeerRelease) void {
+        const self = release.lane;
+        if (release.store) |held_store| {
             held_store.ensureDurableForReuse();
             held_store.sync() catch {};
         }
-        lease.close();
+        release.lease.close();
+        const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         self.checked_out = false;
         self.mutex.unlock(io);
@@ -2690,6 +2701,7 @@ pub const Owner = struct {
         self.foreground_runtime_stale = false;
         replacement.lite_refresh_adoption_epoch = replacement.owned_lite_backend.?.native_docstore.?.file.adoptionEpoch();
         replacement.lite_runtime_sequence = replacement.owned_lite_backend.?.native_docstore.?.file.committedSequence();
+        self.installStoreHooks(replacement);
         self.current = replacement;
         for (self.connections.items) |connection| {
             connection.current = replacement;
@@ -4284,6 +4296,16 @@ pub const Owner = struct {
         return self.maintenanceWaitMillis(pending);
     }
 
+    /// The serving store's writer-lane hooks. Set once, before the root is
+    /// published as `current`: the commit leader reads them under the
+    /// store's commit mutex while other connections attach.
+    fn installStoreHooks(self: *Owner, root: *h.Handle) void {
+        const backend = if (root.owned_lite_backend) |*b| b else return;
+        const store = backend.native_docstore orelse return;
+        store.background_write_admission = .{ .ptr = &self.writer_lane, .try_enter = Connection.backgroundWriteRefused, .leave = Connection.backgroundWriteLeave };
+        store.pending_admission_hint = .{ .ptr = &self.writer_lane, .active = Connection.pendingAdmissionActive };
+    }
+
     /// Drives `WriterLane.maintainParkedLease` from `maintenanceLoop`,
     /// converting its nanosecond bound to the milliseconds
     /// `maintenanceLoop`'s own wait is expressed in.
@@ -4761,6 +4783,19 @@ pub const Connection = struct {
         return true;
     }
 
+    /// Releases other owners' idle parked leases on this path before this
+    /// owner takes its own. The release runs with the path gate unlocked;
+    /// see `WriterLane.finishLocalPeerRelease`.
+    fn releasePeerParkedLeases(self: *Connection) void {
+        const io = h.handleLockIo();
+        while (self.gate.takePeerParkedLease(self.owner)) |taken| {
+            var release = taken;
+            self.gate.mutex.unlock(io);
+            WriterLane.finishLocalPeerRelease(&release);
+            self.gate.mutex.lockUncancelable(io);
+        }
+    }
+
     fn acquirePathLeaseAssumeLocked(self: *Connection, skip_lane_wait: bool) !native.PathWriterLock {
         const io = h.handleLockIo();
         const deadline = self.admissionDeadline();
@@ -4768,7 +4803,7 @@ pub const Connection = struct {
         // permits an immediate acquisition when nobody is queued.
         if (h.liteOpenModeCanWrite(self.options.open_mode)) {
             const stats = &self.owner.publication_stats.foreground_lease;
-            self.gate.releasePeerParkedLeases(self.owner);
+            self.releasePeerParkedLeases();
             // lite-writer-authority.md W2: borrow the lane's lease. Skipped
             // only for `checkout`'s own cold path (`acquireForOwnCheckout`),
             // which already holds the lane and keeps the lease itself.
@@ -5026,10 +5061,6 @@ pub const Connection = struct {
 
     fn attach(self: *Connection, root: *h.Handle) void {
         std.debug.assert(!self.attached);
-        if (root.owned_lite_backend) |*backend| if (backend.native_docstore) |store| {
-            store.background_write_admission = .{ .ptr = &self.owner.writer_lane, .try_enter = backgroundWriteRefused, .leave = backgroundWriteLeave };
-            store.pending_admission_hint = .{ .ptr = &self.owner.writer_lane, .active = pendingAdmissionActive };
-        };
         std.debug.assert(root.sql_sessions.count() == 0 and root.sql_cursors.count() == 0);
         root.lite_connection_context = self;
         root.sql_sessions = self.sql_sessions;
@@ -5221,6 +5252,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         if (initial) |root| {
             root.lite_refresh_adoption_epoch = root.owned_lite_backend.?.native_docstore.?.file.adoptionEpoch();
             root.lite_runtime_sequence = root.owned_lite_backend.?.native_docstore.?.file.committedSequence();
+            owner.installStoreHooks(root);
         }
     }
     errdefer if (existing == null) @import("io_lifetime.zig").release();
@@ -8985,6 +9017,101 @@ test "capi path gate lets a peer owner vacuum after another owner's write" {
     const code = api.antfly_lite_vacuum_json(peer, &out);
     if (code != .ok) std.debug.print("peer vacuum: {s}: {s}\n", .{ @tagName(code), std.mem.span(h.capi.lastErrorDetail()) });
     try std.testing.expectEqual(h.capi.ErrorCode.ok, code);
+}
+
+// The commit leader reads the serving store's writer-lane hooks under its
+// commit mutex, so attaching another connection must not rewrite them.
+test "capi path gate installs serving store hooks once per root" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var tmp = try api.TestDirectory.init("serving-store-hooks");
+    defer tmp.cleanup();
+    const io = h.handleLockIo();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/database.aflite", .{tmp.path()});
+    defer std.testing.allocator.free(path);
+
+    const first_handle = try open(path, .{ .profile = .hosted }, true);
+    const first = try api.publishHandle(first_handle);
+    defer api.antfly_db_close(first);
+    const owner = first_handle.lite_connection.?.owner;
+    const store = owner.current.?.owned_lite_backend.?.native_docstore.?;
+    const hint = store.pending_admission_hint orelse return error.TestUnexpectedResult;
+    try std.testing.expect(hint.ptr == @as(*anyopaque, &owner.writer_lane));
+    try std.testing.expect(store.background_write_admission != null);
+
+    const Poison = struct {
+        fn active(_: *anyopaque) bool {
+            return false;
+        }
+    };
+    var poison_target: u8 = 0;
+    store.pending_admission_hint = .{ .ptr = &poison_target, .active = Poison.active };
+    defer store.pending_admission_hint = hint;
+    const second = try api.publishHandle(try open(path, .{ .profile = .hosted }, false));
+    defer api.antfly_db_close(second);
+    const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("doc:seed"), .value = .fromSlice("{\"text\":\"seed\"}"), .is_delete = false }};
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(second, &writes, writes.len, null, 0, 0, 0));
+    try std.testing.expect(store.pending_admission_hint.?.ptr == @as(*anyopaque, &poison_target));
+}
+
+// Releasing a parked lease syncs its store, and a hosted maintenance turn
+// installs writer admission on that store, which takes the path gate. The
+// peer waiting for the release holds that same gate, so the release must
+// not run on the peer's thread under it.
+test "capi path gate peer handoff survives maintenance admission on the parked store" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var tmp = try api.TestDirectory.init("peer-owner-handoff-admission");
+    defer tmp.cleanup();
+    const io = h.handleLockIo();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/database.aflite", .{tmp.path()});
+    defer std.testing.allocator.free(path);
+
+    const first_handle = try open(path, .{ .profile = .hosted, .busy_timeout_ms = 10_000 }, true);
+    const first = try api.publishHandle(first_handle);
+    defer api.antfly_db_close(first);
+    const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("doc:seed"), .value = .fromSlice("{\"text\":\"seed\"}"), .is_delete = false }};
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(first, &writes, writes.len, null, 0, 0, 0));
+
+    const connection = first_handle.lite_connection.?;
+    const lane = &connection.owner.writer_lane;
+    lane.mutex.lockUncancelable(io);
+    const store = lane.parked_store;
+    lane.mutex.unlock(io);
+    const parked_store = store orelse return error.SkipZigTest;
+    const GateAdmission = struct {
+        fn enter(ptr: *anyopaque, _: PublicationScope) anyerror!void {
+            const gate: *PathGate = @ptrCast(@alignCast(ptr));
+            gate.mutex.lockUncancelable(h.handleLockIo());
+        }
+        fn leave(ptr: *anyopaque) void {
+            const gate: *PathGate = @ptrCast(@alignCast(ptr));
+            gate.mutex.unlock(h.handleLockIo());
+        }
+    };
+    parked_store.writer_admission = .{ .ptr = connection.gate, .enter = GateAdmission.enter, .leave = GateAdmission.leave };
+    defer parked_store.writer_admission = null;
+
+    const peer = try api.publishHandle(try open(path, .{ .profile = .hosted, .no_sync = true, .busy_timeout_ms = 10_000 }, false));
+    defer api.antfly_db_close(peer);
+    const Vacuum = struct {
+        id: ?*anyopaque,
+        code: std.atomic.Value(i32) = .init(-1),
+        fn run(self: *@This()) void {
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&out);
+            self.code.store(@backingInt(api.antfly_lite_vacuum_json(self.id, &out)), .release);
+        }
+    };
+    var vacuum: Vacuum = .{ .id = peer };
+    const thread = try std.Thread.spawn(.{}, Vacuum.run, .{&vacuum});
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + 20 * std.time.ns_per_s;
+    while (vacuum.code.load(.acquire) == -1) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) @panic("peer lease handoff deadlocked under the path gate");
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    thread.join();
+    try std.testing.expectEqual(@as(i32, @backingInt(h.capi.ErrorCode.ok)), vacuum.code.load(.acquire));
 }
 
 test "capi native parked writer lease releases itself after the idle window with nobody checking out" {
