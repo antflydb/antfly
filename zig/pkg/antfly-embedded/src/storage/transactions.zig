@@ -376,6 +376,13 @@ pub const DagDomainPrepare = struct {
     attempt: dag.Attempt,
     producer_versions: dag.Digest,
     replacements: []const dag.Contributions.Replacement,
+
+    /// Resolve only against a trusted read of the authority ledger.
+    pub fn requireAccepted(self: DagDomainPrepare, authority_txn: anytype) !dag.Receipt {
+        const candidate = dag.Contributions.candidate(self.producer_versions, self.replacements);
+        if (!std.mem.eql(u8, &candidate, &self.attempt.candidate)) return error.GraphConstraintAttemptConflict;
+        return dag.Storage.requireAccepted(authority_txn, self.domain, self.revision, self.attempt);
+    }
 };
 
 pub const DagPrepare = struct {
@@ -5348,6 +5355,15 @@ test "DAG transaction prepare and resolution share the primary transaction" {
             try std.testing.expectError(error.GraphConstraintAttemptConflict, manager.writeIntents(id, intents, &.{}));
             try manager.resolveIntents(id, .committed, 200);
             try manager.resolveIntents(id, .committed, 200);
+            {
+                var reader = try store.beginReadTxn();
+                defer reader.abort();
+                const receipt = try current.requireAccepted(&reader);
+                try std.testing.expectEqual(@as(u64, 1), receipt.revision);
+                var different = current;
+                different.producer_versions[0] ^= 1;
+                try std.testing.expectError(error.GraphConstraintAttemptConflict, different.requireAccepted(&reader));
+            }
             const value = try getVisibleDoc(&store, alloc, key);
             defer alloc.free(value);
             try std.testing.expectEqualStrings("{}", value);

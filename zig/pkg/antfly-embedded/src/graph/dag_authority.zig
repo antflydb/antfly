@@ -499,6 +499,25 @@ pub const Storage = struct {
         out.* = hash.finalResult();
     }
 
+    /// Check the exact vote against a durable authority snapshot. Owner
+    /// handoff and later accepted revisions leave this decision intact.
+    /// Callers must separately fence the destination index incarnation.
+    pub fn requireAccepted(txn: anytype, id: Digest, base_revision: u64, attempt: Attempt) !Receipt {
+        const receipt = (try readReceipt(txn, id, attempt)) orelse return error.GraphConstraintNotValidated;
+        switch (receipt.outcome) {
+            .semantic_rejection => {
+                if (receipt.revision != base_revision) return error.GraphConstraintRevisionChanged;
+                return error.GraphCycle;
+            },
+            .aborted => return error.GraphConstraintAttemptConflict,
+            .accepted => {
+                const expected = std.math.add(u64, base_revision, 1) catch return error.GraphConstraintRevisionChanged;
+                if (receipt.revision != expected) return error.GraphConstraintRevisionChanged;
+            },
+        }
+        return receipt;
+    }
+
     fn readReceipt(txn: anytype, id: Digest, attempt: Attempt) !?Receipt {
         const key = receiptKey(id, attempt.id);
         const raw = txn.get(&key) catch |err| {
@@ -589,6 +608,7 @@ test "DAG storage terminal receipts fence replay and changed payloads" {
     var witness: Storage.validation.Witness = .{};
     try std.testing.expectError(error.GraphConstraintNotValidated, Storage.accept(alloc, &txn, token, changes, membership));
     try Storage.validate(alloc, &txn, token, changes, membership, &budget, &witness);
+    try std.testing.expectError(error.GraphConstraintNotValidated, Storage.requireAccepted(&txn, state.domain, 0, token.attempt));
     try std.testing.expectError(error.GraphConstraintAttemptConflict, Storage.accept(alloc, &txn, token, changes, &.{}));
     try std.testing.expectError(error.GraphConstraintAttemptConflict, Storage.accept(alloc, &txn, token, &.{}, &.{}));
     try std.testing.expectError(error.GraphConstraintAttemptConflict, Storage.validate(alloc, &txn, token, &.{}, &.{}, &budget, &witness));
@@ -598,6 +618,11 @@ test "DAG storage terminal receipts fence replay and changed payloads" {
     const current = (try recovered.recoveryToken(2)).?;
     const receipt = try Storage.accept(alloc, &txn, current, changes, membership);
     try std.testing.expectEqualDeep(receipt, try Storage.accept(alloc, &txn, current, changes, membership));
+    try std.testing.expectEqualDeep(receipt, try Storage.requireAccepted(&txn, state.domain, 0, token.attempt));
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, Storage.requireAccepted(&txn, state.domain, 1, token.attempt));
+    var another_transaction = token.attempt;
+    another_transaction.transaction[0] ^= 1;
+    try std.testing.expectError(error.GraphConstraintAttemptConflict, Storage.requireAccepted(&txn, state.domain, 0, another_transaction));
     try std.testing.expectEqual(@as(usize, 1), txn.edges);
     try std.testing.expectEqual(@as(u64, 2), txn.owners);
     try std.testing.expectEqualDeep(receipt, (try Storage.begin(&txn, state.domain, 2, 0, testAttempt(1))).terminal);
@@ -1461,6 +1486,8 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
             try std.testing.expectError(error.GraphCycle, Contributions.prepare(alloc, &txn, reverse_token, versions, reverse, &budget, &witness));
             try std.testing.expectError(error.GraphConstraintNotValidated, Contributions.accept(alloc, &txn, reverse_token, versions, reverse));
             _ = try TransactionParticipant.resolve(alloc, &txn, id, epoch, rejected, .semantic_rejection);
+            try std.testing.expectError(error.GraphCycle, Storage.requireAccepted(&txn, id, 2, rejected));
+            try std.testing.expectError(error.GraphConstraintRevisionChanged, Storage.requireAccepted(&txn, id, 1, rejected));
         }
     }
     const existing_id: Digest = @splat(2);
