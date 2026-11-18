@@ -53,7 +53,8 @@ class MatchedDurabilityTests(unittest.TestCase):
                 "sqlite", path, True, None, [{"worker": 0, "successful_calls": 130}]
             )
             self.assertEqual(result["primary_rows_checked"], 128)
-            self.assertTrue(result["latest_and_overwritten_tokens_checked"])
+            self.assertEqual(result["live_tokens_checked"], 128)
+            self.assertEqual(result["overwritten_tokens_checked"], 2)
 
     def test_verifier_rejects_missing_latest_values_even_with_valid_integrity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -63,6 +64,34 @@ class MatchedDurabilityTests(unittest.TestCase):
                 bench.verify(
                     "sqlite", path, False, None, [{"worker": 0, "successful_calls": 1}]
                 )
+
+    def test_verifier_rejects_live_documents_missing_from_search(self):
+        count = 200
+        rows = {
+            bench.key(0, slot): bench.payload(0, bench.slot_sequence(count, slot))
+            for slot in range(128)
+        }
+        latest = f"matchedworker0sequence{count - 1}"
+
+        def only_latest(token):
+            # Every primary row is correct, but search exposes one document.
+            return [bench.key(0, count - 1)] if token == latest else []
+
+        with self.assertRaises(AssertionError):
+            bench.verify_rows({0: count}, True, rows.__getitem__, only_latest)
+
+    def test_verifier_rejects_a_live_token_on_the_wrong_document(self):
+        count = 3
+        rows = {
+            bench.key(0, slot): bench.payload(0, bench.slot_sequence(count, slot))
+            for slot in range(128)
+        }
+
+        def wrong_key(token):
+            return ["worker-0-0"]
+
+        with self.assertRaises(AssertionError):
+            bench.verify_rows({0: count}, True, rows.__getitem__, wrong_key)
 
     def test_compiler_processes_returns_a_list_without_raising(self):
         # This process's own ancestry (pytest/uv/the test runner) must never

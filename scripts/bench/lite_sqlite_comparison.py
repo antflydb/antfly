@@ -25,7 +25,7 @@ on both engines; primary-only cases have no full-text index on either engine.
 from __future__ import annotations
 import argparse, contextlib, hashlib, json, math, multiprocessing as mp, os
 from pathlib import Path
-import platform, queue, sqlite3, subprocess, sys, time, traceback
+import platform, queue, shutil, sqlite3, subprocess, sys, threading, time, traceback
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts/bench"))
@@ -33,6 +33,84 @@ from lite_contention import sdk
 
 TIMEOUT = 5.0
 UPSERT = "INSERT INTO documents(id,payload) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload"
+
+
+# Counts durability syscalls in every image of a worker process, the same way
+# for both engines. Preloaded into each worker process; see `sync_counter`.
+SYNC_COUNTER_SOURCE = r"""
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <unistd.h>
+static _Atomic unsigned long long antfly_bench_syncs;
+unsigned long long antfly_bench_sync_count(void) { return atomic_load(&antfly_bench_syncs); }
+static int is_sync_command(int cmd) {
+#ifdef F_FULLFSYNC
+    if (cmd == F_FULLFSYNC) return 1;
+#endif
+#ifdef F_BARRIERFSYNC
+    if (cmd == F_BARRIERFSYNC) return 1;
+#endif
+    return 0;
+}
+#ifdef __APPLE__
+extern int fdatasync(int);
+static int counted_fsync(int fd) { atomic_fetch_add(&antfly_bench_syncs, 1); return fsync(fd); }
+static int counted_fdatasync(int fd) { atomic_fetch_add(&antfly_bench_syncs, 1); return fdatasync(fd); }
+static int counted_fcntl(int fd, int cmd, ...) {
+    va_list args; va_start(args, cmd); long arg = va_arg(args, long); va_end(args);
+    if (is_sync_command(cmd)) atomic_fetch_add(&antfly_bench_syncs, 1);
+    return fcntl(fd, cmd, arg);
+}
+__attribute__((used, section("__DATA,__interpose"))) static struct { const void *replacement, *original; } interposers[] = {
+    { (const void *)counted_fsync, (const void *)fsync },
+    { (const void *)counted_fdatasync, (const void *)fdatasync },
+    { (const void *)counted_fcntl, (const void *)fcntl },
+};
+#else
+#define _GNU_SOURCE
+#include <dlfcn.h>
+int fsync(int fd) { static int (*real)(int); if (!real) real = dlsym(RTLD_NEXT, "fsync"); atomic_fetch_add(&antfly_bench_syncs, 1); return real(fd); }
+int fdatasync(int fd) { static int (*real)(int); if (!real) real = dlsym(RTLD_NEXT, "fdatasync"); atomic_fetch_add(&antfly_bench_syncs, 1); return real(fd); }
+int fcntl(int fd, int cmd, ...) {
+    static int (*real)(int, int, ...); if (!real) real = dlsym(RTLD_NEXT, "fcntl");
+    va_list args; va_start(args, cmd); long arg = va_arg(args, long); va_end(args);
+    if (is_sync_command(cmd)) atomic_fetch_add(&antfly_bench_syncs, 1);
+    return real(fd, cmd, arg);
+}
+#endif
+"""
+PRELOAD_VARIABLE = "DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"
+
+
+def build_sync_counter(directory):
+    """Compiles the sync-counting shim, or returns None without a C compiler."""
+    compiler = shutil.which("cc")
+    if compiler is None:
+        return None
+    source = directory / "sync_counter.c"
+    output = directory / (
+        "sync_counter.dylib" if sys.platform == "darwin" else "sync_counter.so"
+    )
+    source.write_text(SYNC_COUNTER_SOURCE)
+    command = [compiler, "-shared", "-fPIC", "-O2", "-o", str(output), str(source)]
+    if sys.platform != "darwin":
+        command.append("-ldl")
+    subprocess.run(command, check=True)
+    return output
+
+
+def sync_counter(config):
+    """The preloaded shim's process-wide counter, or None when not loaded."""
+    if not config.get("sync_counter") or config["sync_counter"] not in os.environ.get(
+        PRELOAD_VARIABLE, ""
+    ):
+        return None
+    import ctypes
+
+    function = ctypes.CDLL(config["sync_counter"]).antfly_bench_sync_count
+    function.restype = ctypes.c_ulonglong
+    return function
 
 
 def payload(worker, sequence, text_bytes=1024):
@@ -139,6 +217,7 @@ def worker_main(config, worker, ready, start, begin, stop, results):
         "latencies_ns": [],
         "error": None,
     }
+    syncs = sync_counter(config)
     try:
         if config["engine"] == "sqlite":
             db = sqlite_open(config["path"])
@@ -174,6 +253,8 @@ def worker_main(config, worker, ready, start, begin, stop, results):
         while time.monotonic() < begin.value:
             time.sleep(0.001)
         result["started"] = time.monotonic()
+        if syncs:
+            result["syncs_started"] = syncs()
         deadline = begin.value + config["seconds"]
         sequence = 0
         while not stop.is_set() and time.monotonic() < deadline:
@@ -214,6 +295,8 @@ def worker_main(config, worker, ready, start, begin, stop, results):
             sequence += 1
         result["successful_calls"] = sequence
         result["ended"] = time.monotonic()
+        if syncs:
+            result["syncs_ended"] = syncs()
     except BaseException:
         result["error"] = traceback.format_exc()
         stop.set()
@@ -227,6 +310,34 @@ def worker_main(config, worker, ready, start, begin, stop, results):
                 result["close_error"] = traceback.format_exc()
         result["close_seconds"] = time.monotonic() - closing
         results.put(result)
+
+
+def thread_group_main(config, workers, ready, start, begin, stop, results):
+    """Runs every worker as a thread of one process, each with its own
+    connection, so they share the engine's in-process group commit."""
+    threads = [
+        threading.Thread(
+            target=worker_main,
+            args=(config, worker, ready, start, begin, stop, results),
+        )
+        for worker in workers
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
+def timed_syncs(config, rows):
+    """Durability syscalls issued inside the timed window, or None."""
+    if any("syncs_started" not in row or "syncs_ended" not in row for row in rows):
+        return None
+    if config["worker_model"] == "process":
+        return sum(row["syncs_ended"] - row["syncs_started"] for row in rows)
+    # One process-wide counter: from the first start to the last end.
+    return max(row["syncs_ended"] for row in rows) - min(
+        row["syncs_started"] for row in rows
+    )
 
 
 def verify(engine, path, indexed, library, worker_results):
@@ -255,44 +366,64 @@ def verify(engine, path, indexed, library, worker_results):
                     ).fetchone()[0]
                 )
 
-            def search_count(token):
-                return db.execute(
-                    "SELECT count(*) FROM search WHERE search MATCH ?", (token,)
-                ).fetchone()[0]
+            def search_keys(token):
+                return sorted(
+                    row[0]
+                    for row in db.execute(
+                        "SELECT documents.id FROM search JOIN documents ON documents.rowid=search.rowid WHERE search MATCH ?",
+                        (token,),
+                    )
+                )
 
-            checked = verify_rows(counts, indexed, lookup, search_count)
+            checked = verify_rows(counts, indexed, lookup, search_keys)
             assert db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
     else:
         af = sdk(library)
         with af.open(path, no_sync=False, busy_timeout=TIMEOUT) as db:
-            db.run_until_idle()
-            assert db.check()["valid"]
 
-            def search_count(token):
+            def search_keys(token):
                 result = db.search(
                     {
                         "full_text_search": {"match": {"field": "text", "text": token}},
                         "limit": 16,
                     }
                 )
-                return len(result["responses"][0]["hits"]["hits"])
+                return sorted(
+                    hit["_id"] for hit in result["responses"][0]["hits"]["hits"]
+                )
 
-            checked = verify_rows(counts, indexed, db.lookup, search_count)
+            # full_index acknowledged every write as searchable: check before
+            # any drain, which could repair a missed acknowledgement.
+            checked = verify_rows(counts, indexed, db.lookup, search_keys)
+            db.run_until_idle()
+            assert db.check()["valid"]
     return {
         "every_latest_value_checked": True,
         "primary_rows_checked": checked,
         "expected_rows": expected_rows,
-        "latest_and_overwritten_tokens_checked": indexed,
+        "live_tokens_checked": sum(min(count, 128) for count in counts.values())
+        if indexed
+        else 0,
+        "overwritten_tokens_checked": sum(
+            max(0, min(count, 256) - 128) for count in counts.values()
+        )
+        if indexed
+        else 0,
         "integrity_passed": True,
         "seconds": time.monotonic() - began,
     }
 
 
-def verify_rows(counts, indexed, lookup, search_count):
+def slot_sequence(count, slot):
+    """Latest sequence written to `slot`, or -1 for the bootstrap value."""
+    return count - 1 - ((count - 1 - slot) % 128) if count > slot else -1
+
+
+def verify_rows(counts, indexed, lookup, search_keys):
     checked = 0
     for worker, count in counts.items():
         for slot in range(128):
-            sequence = count - 1 - ((count - 1 - slot) % 128) if count > slot else -1
+            sequence = slot_sequence(count, slot)
             document_key = key(worker, slot)
             assert lookup(document_key) == payload(worker, sequence), (
                 worker,
@@ -300,13 +431,21 @@ def verify_rows(counts, indexed, lookup, search_count):
                 sequence,
             )
             checked += 1
-        if indexed and count:
-            latest = f"matchedworker{worker}sequence{count - 1}"
-            assert search_count(latest) == 1, (latest, "not visible")
-            if count > 128:
-                assert (
-                    search_count(f"matchedworker{worker}sequence{count - 129}") == 0
-                ), "overwritten token remains visible"
+    if not indexed:
+        return checked
+    # Every live document, by its own key, then the generation each slot
+    # overwrote: a lost full-text delete leaves that token visible.
+    for worker, count in counts.items():
+        for slot in range(min(count, 128)):
+            sequence = slot_sequence(count, slot)
+            document_key = key(worker, slot)
+            token = f"matchedworker{worker}sequence{sequence}"
+            found = search_keys(token)
+            assert found == [document_key], (token, document_key, found, "not visible")
+            if sequence >= 128:
+                stale = f"matchedworker{worker}sequence{sequence - 128}"
+                found = search_keys(stale)
+                assert found == [], (stale, found, "overwritten token remains visible")
     return checked
 
 
@@ -371,25 +510,50 @@ def run_case(config):
     ctx = mp.get_context("spawn")
     ready, results = ctx.Queue(), ctx.Queue()
     start, stop, begin = ctx.Event(), ctx.Event(), ctx.Value("d", 0)
-    processes = [
-        ctx.Process(
-            target=worker_main,
-            args=(config, worker, ready, start, begin, stop, results),
-        )
-        for worker in range(config["workers"])
-    ]
+    if config["worker_model"] == "thread":
+        processes = [
+            ctx.Process(
+                target=thread_group_main,
+                args=(
+                    config,
+                    list(range(config["workers"])),
+                    ready,
+                    start,
+                    begin,
+                    stop,
+                    results,
+                ),
+            )
+        ]
+    else:
+        processes = [
+            ctx.Process(
+                target=worker_main,
+                args=(config, worker, ready, start, begin, stop, results),
+            )
+            for worker in range(config["workers"])
+        ]
+    preload = os.environ.get(PRELOAD_VARIABLE)
     rows, samples = [], []
     contamination = []
     try:
-        for process in processes:
-            process.start()
-        for _ in processes:
+        if config.get("sync_counter"):
+            os.environ[PRELOAD_VARIABLE] = config["sync_counter"]
+        try:
+            for process in processes:
+                process.start()
+        finally:
+            if preload is None:
+                os.environ.pop(PRELOAD_VARIABLE, None)
+            else:
+                os.environ[PRELOAD_VARIABLE] = preload
+        for _ in range(config["workers"]):
             assert ready.get(timeout=120)["ready"], "Worker could not open database"
         begin.value = time.monotonic() + 0.1
         start.set()
         deadline = time.monotonic() + config["seconds"] + TIMEOUT + 120
         next_inspection = 0
-        while len(rows) < len(processes):
+        while len(rows) < config["workers"]:
             assert time.monotonic() < deadline, "Worker watchdog"
             try:
                 rows.append(results.get(timeout=0.1))
@@ -433,9 +597,15 @@ def run_case(config):
     )
     latencies = sorted(value for row in rows for value in row.pop("latencies_ns"))
     elapsed = max(row["ended"] for row in rows) - min(row["started"] for row in rows)
+    syncs = timed_syncs(config, rows)
     result = {
         "engine": config["engine"],
         "batch_path": config.get("batch_path"),
+        "worker_model": config["worker_model"],
+        "timed_syncs": syncs,
+        "syncs_per_write": syncs / len(latencies)
+        if syncs is not None and latencies
+        else None,
         "indexed": config["indexed"],
         "workers": config["workers"],
         "seconds_requested": config["seconds"],
@@ -486,6 +656,15 @@ def main():
         "(the length-prefixed binary format); 'both' measures each as a "
         "separate case. No effect on the sqlite engine.",
     )
+    parser.add_argument(
+        "--worker-model",
+        choices=["both", "process", "thread"],
+        default="both",
+        help="'process' runs each worker as its own OS process (cross-process "
+        "lease contention); 'thread' runs every worker as a thread of one "
+        "process, each with its own connection, which shares in-process group "
+        "commit. 'both' measures each as a separate case.",
+    )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--source-commit", default="unspecified")
     args = parser.parse_args()
@@ -496,6 +675,7 @@ def main():
     )
     args.directory.mkdir(parents=True, exist_ok=True)
     assert not args.output.exists()
+    counter = build_sync_counter(args.directory)
     library = Path(args.library).resolve()
     library_sha = hashlib.file_digest(library.open("rb"), "sha256").hexdigest()
     script_sha = hashlib.file_digest(Path(__file__).open("rb"), "sha256").hexdigest()
@@ -536,6 +716,9 @@ def main():
         "payload_bytes_text": 1024,
         "documents_per_transaction": 1,
         "keys_per_worker": 128,
+        "sync_counter": "fsync, fdatasync and F_FULLFSYNC/F_BARRIERFSYNC calls in the worker processes during the timed window"
+        if counter
+        else None,
         "retention": "One fixed path per engine, removed after closed successful verification; receipts only.",
         "cases": [],
         "documentation": [
@@ -573,7 +756,14 @@ def main():
                                 else [args.batch_path]
                             )
                         )
-                        for batch_path in batch_paths:
+                        worker_models = (
+                            ["process", "thread"]
+                            if args.worker_model == "both"
+                            else [args.worker_model]
+                        )
+                        for batch_path, worker_model in (
+                            (b, m) for b in batch_paths for m in worker_models
+                        ):
                             assert (
                                 hashlib.file_digest(
                                     library.open("rb"), "sha256"
@@ -589,6 +779,7 @@ def main():
                             report["current_case"] = {
                                 "engine": engine,
                                 "batch_path": batch_path,
+                                "worker_model": worker_model,
                                 "indexed": indexed,
                                 "workers": workers,
                                 "round": ordinal,
@@ -607,6 +798,8 @@ def main():
                             config = {
                                 "engine": engine,
                                 "batch_path": batch_path,
+                                "worker_model": worker_model,
+                                "sync_counter": str(counter) if counter else None,
                                 "path": args.directory
                                 / (engine + path_tag + "." + suffix),
                                 "indexed": indexed,
