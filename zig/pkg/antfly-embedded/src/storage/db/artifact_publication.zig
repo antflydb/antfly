@@ -1205,15 +1205,7 @@ pub const PreparedEffects = struct {
     /// The writer already owns the publication source and contender guards.
     pub fn stageLocalDag(self: *@This(), alloc: std.mem.Allocator, txn: anytype, command: Command) !void {
         if (command.mode != .publish or command.producer_kind != .graph) return;
-        const raw = txn.get(&localDagBindingKey(command)) catch |err| {
-            if (err == error.NotFound) return;
-            return err;
-        };
-        if (raw.len > local_dag_max_bytes) return error.InvalidDagAuthority;
-        const parsed = std.json.parseFromSlice(LocalDagBinding, alloc, raw, .{ .allocate = .alloc_always }) catch |err| {
-            if (err == error.OutOfMemory) return err;
-            return error.InvalidDagAuthority;
-        };
+        const parsed = (try LocalDagBinding.read(alloc, txn, command)) orelse return;
         defer parsed.deinit();
         const binding = parsed.value;
         try binding.validate();
@@ -1250,6 +1242,53 @@ const local_dag_max_bytes = 64 * 1024;
 pub const LocalDagBinding = struct {
     table_identity: [16]u8,
     edge_types: []const []const u8,
+
+    fn read(alloc: std.mem.Allocator, txn: anytype, command: Command) !?std.json.Parsed(LocalDagBinding) {
+        const raw = txn.get(&localDagBindingKey(command)) catch |err| {
+            if (err == error.NotFound) return null;
+            return err;
+        };
+        if (raw.len > local_dag_max_bytes) return error.InvalidDagAuthority;
+        const parsed = std.json.parseFromSlice(LocalDagBinding, alloc, raw, .{ .allocate = .alloc_always }) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return error.InvalidDagAuthority;
+        };
+        errdefer parsed.deinit();
+        try parsed.value.validate();
+        return parsed;
+    }
+
+    /// Catalog refreshes can reuse a binding for the same incarnation, but
+    /// every declared type must still have an active certified authority.
+    pub fn requireDeclared(alloc: std.mem.Allocator, txn: anytype, command: Command, config_json: []const u8) !void {
+        const syntax = try std.json.parseFromSlice(std.json.Value, alloc, config_json, .{ .parse_numbers = false });
+        defer syntax.deinit();
+        if (syntax.value != .object) return;
+        const edges = syntax.value.object.get("edge_types") orelse return;
+        if (edges != .array) return;
+        var constrained: usize = 0;
+        for (edges.array.items) |edge| {
+            if (edge != .object) continue;
+            const topology = edge.object.get("topology") orelse continue;
+            if (topology == .string and std.mem.eql(u8, topology.string, "dag")) constrained += 1;
+        }
+        if (constrained == 0) return;
+        const parsed = (try read(alloc, txn, command)) orelse return error.GraphConstraintNotReady;
+        defer parsed.deinit();
+        if (constrained != parsed.value.edge_types.len) return error.InvalidDagDomain;
+        var config = try @import("catalog/index_manager.zig").parseGraphActivationConfig(alloc, config_json);
+        defer config.deinit(alloc);
+        const dag = @import("../../graph/dag_authority.zig");
+        for (config.edge_type_configs) |edge| {
+            if (edge.topology != .dag) continue;
+            const found = for (parsed.value.edge_types) |name| {
+                if (std.mem.eql(u8, name, edge.name)) break true;
+            } else false;
+            if (!found) return error.InvalidDagDomain;
+            const id = try dag.domain(parsed.value.table_identity, command.producer_generation, command.producer_name, edge.name);
+            _ = try dag.Storage.requireActive(txn, id);
+        }
+    }
 
     fn validate(self: LocalDagBinding) !void {
         if (self.edge_types.len == 0 or self.edge_types.len > 64) return error.InvalidDagAuthority;

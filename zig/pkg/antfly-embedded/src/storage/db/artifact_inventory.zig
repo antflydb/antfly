@@ -427,33 +427,27 @@ pub fn stageOrdered(alloc: std.mem.Allocator, txn: anytype, command: Command, ap
     const raw = try prepareOrdered(alloc, txn, command, applied_index);
     defer if (raw) |value| alloc.free(value);
     if (raw) |value| {
-        if (command.dag_activations) |activations| try stageDagActivations(alloc, txn, command, activations);
+        if (command.dag_activations) |activations| try checkDagCatalog(alloc, txn, command, activations, true);
         try txn.put(ordered_key, value);
     }
     try @import("artifact_catalog_activation.zig").stage(alloc, txn, command);
 }
 
-fn stageDagActivations(alloc: std.mem.Allocator, txn: anytype, command: Command, activations: []const DagActivation) !void {
+fn checkDagCatalog(alloc: std.mem.Allocator, txn: anytype, command: Command, activations: []const DagActivation, comptime install: bool) !void {
+    if (command.catalogs.indexes.len == 0) {
+        if (activations.len != 0) return error.InvalidArtifactCatalogCommand;
+        return;
+    }
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const publication = @import("artifact_publication.zig");
     const indexes = try @import("catalog/index_manager.zig").deserializeCatalog(arena.allocator(), command.catalogs.indexes);
-    for (activations) |activation| {
+    if (install) for (activations) |activation| {
         const index = for (indexes) |index| {
             if (std.mem.eql(u8, index.name, activation.index_name)) break index;
         } else return error.InvalidArtifactCatalogCommand;
         if (index.kind != .graph) return error.InvalidArtifactCatalogCommand;
-        const producer: publication.Command = .{
-            .producer_kind = .graph,
-            .namespace = command.namespace,
-            .authority_epoch = command.binding.epoch,
-            .catalog_digest = command.binding.digest,
-            .producer_name = index.name,
-            .producer_generation = index.coverage_generation,
-            .sources = &.{},
-            .mutations = &.{},
-            .publication_digest = @splat(0),
-        };
+        const producer = dagProducer(command, index.name, index.coverage_generation);
         publication.LocalDagBinding.stageFromConfig(alloc, txn, producer, activation.table_identity, index.config_json, activation.proofs) catch |err| switch (err) {
             error.InvalidIndexConfig,
             error.InvalidDagDomain,
@@ -467,7 +461,28 @@ fn stageDagActivations(alloc: std.mem.Allocator, txn: anytype, command: Command,
             => return error.InvalidArtifactCatalogCommand,
             else => return err,
         };
+    };
+    for (indexes) |index| {
+        if (index.kind != .graph) continue;
+        publication.LocalDagBinding.requireDeclared(alloc, txn, dagProducer(command, index.name, index.coverage_generation), index.config_json) catch |err| switch (err) {
+            error.GraphConstraintNotReady, error.InvalidDagDomain, error.InvalidIndexConfig => return error.InvalidArtifactCatalogCommand,
+            else => return err,
+        };
     }
+}
+
+fn dagProducer(command: Command, name: []const u8, generation: u64) @import("artifact_publication.zig").Command {
+    return .{
+        .producer_kind = .graph,
+        .namespace = command.namespace,
+        .authority_epoch = command.binding.epoch,
+        .catalog_digest = command.binding.digest,
+        .producer_name = name,
+        .producer_generation = generation,
+        .sources = &.{},
+        .mutations = &.{},
+        .publication_digest = @splat(0),
+    };
 }
 
 pub fn prepareOrdered(alloc: std.mem.Allocator, txn: anytype, command: Command, applied_index: u64) !?[]u8 {
@@ -487,6 +502,7 @@ pub fn prepareOrdered(alloc: std.mem.Allocator, txn: anytype, command: Command, 
         if (!std.meta.eql(command.previous, @as(?Binding, value.value.command.binding)) or applied_index <= value.value.applied_index)
             return error.ArtifactCatalogEpochChanged;
     } else if (command.previous != null) return error.ArtifactCatalogEpochChanged;
+    if (command.dag_activations == null) try checkDagCatalog(alloc, txn, command, &.{}, false);
     return try std.json.Stringify.valueAlloc(alloc, Ordered{ .command = command, .applied_index = applied_index }, .{});
 }
 pub fn status(alloc: std.mem.Allocator, txn: anytype, namespace: [24]u8) !Status {

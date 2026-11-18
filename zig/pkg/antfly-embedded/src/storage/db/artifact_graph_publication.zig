@@ -195,10 +195,18 @@ test "ordered artifact inventory graph publication validates guards generations 
                 .dag_activations = &.{.{ .index_name = "g", .table_identity = @splat(2), .proofs = activations }},
             };
             try @import("../source_authority.zig").bind(&writer, .native, command.namespace);
+            var missing = ordered;
+            missing.dag_activations = null;
+            try std.testing.expectError(error.InvalidArtifactCatalogCommand, inventory.stageOrdered(alloc, &writer, missing, 1));
+            try std.testing.expect((try inventory.load(alloc, &writer)) == null);
+            try std.testing.expectEqual(.validating, (try dag.Storage.load(&writer, request.domain)).phase);
             try inventory.stageOrdered(alloc, &writer, ordered, 1);
             try inventory.stageOrdered(alloc, &writer, ordered, 1);
             ordered.dag_activations = &.{.{ .index_name = "g", .table_identity = @splat(9), .proofs = activations }};
             try std.testing.expectError(error.ArtifactCatalogEpochChanged, inventory.stageOrdered(alloc, &writer, ordered, 1));
+            missing.previous = ordered.binding;
+            missing.binding.epoch += 1;
+            try inventory.stageOrdered(alloc, &writer, missing, 2);
             try binding.stage(alloc, &writer, command);
             try result.stageLocalDag(alloc, &writer, command);
             try writer.put(edge_key, edge);

@@ -2964,6 +2964,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var ordered_artifact_value: ?[]u8 = null;
             defer if (ordered_artifact_value) |value| S.ownerField(self, "alloc").*.free(value);
             if (req.artifact_catalog) |command| {
+                if (command.dag_activations != null) return error.InvalidArtifactCatalogCommand;
                 const entry = opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand;
                 var read = try S.ownerField(self, "core").*.store.beginReadTxn();
                 defer read.abort();
