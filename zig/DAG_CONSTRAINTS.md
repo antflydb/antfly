@@ -62,9 +62,10 @@ its fence only after draining prepared writers, in the same serialized writer
 that excludes new votes. Topology admission and activation fences exclude each
 other, and topology drain includes authority-only prepared participants.
 The private ordered source-fence command commits acquisition, release, scan
-initialization, or a bounded scan page with its apply receipt. It rejects delayed
+initialization, takeover, or a bounded scan page with its apply receipt. It rejects delayed
 acquisitions for released attempts and checks the full fence identity before
-staging scan work. An active source fence allows an ordered catalog change only
+staging scan work. An owner takeover preserves the pinned scan cursor and
+fences subsequent proposals from the old owner. An active source fence allows an ordered catalog change only
 when activation proofs match its pinned snapshot. Raft protocol version 31
 gates these commands, DAG-bearing transaction prepare, and catalog activation
 proofs. The source-fence command currently requires a root without asynchronous

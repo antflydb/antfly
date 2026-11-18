@@ -80,7 +80,10 @@ pub const SourceFenceCommand = struct {
     pub const Scan = struct {
         domain: Digest,
         owner_epoch: u64,
-        /// A null page pins a new scan. A page continues the existing scan.
+        /// A takeover changes the epoch of an existing pinned scan. It cannot
+        /// initialize a scan or change its cursor.
+        previous_owner_epoch: ?u64 = null,
+        /// Without a previous owner or page, pin a new scan.
         page: ?Page = null,
     };
 
@@ -93,6 +96,21 @@ pub const SourceFenceCommand = struct {
         const scan = self.scan orelse return error.InvalidBatchRequest;
         const current = (try SourceFence.read(txn)) orelse return error.GraphConstraintNotReady;
         if (!std.meta.eql(current, self.fence)) return error.GraphConstraintAttemptConflict;
+        if (scan.previous_owner_epoch) |previous| {
+            const state = Storage.load(txn, scan.domain) catch |err| {
+                if (err == error.NotFound) return error.GraphConstraintNotReady;
+                return err;
+            };
+            if (state.owner_epoch != previous and state.owner_epoch != scan.owner_epoch)
+                return error.GraphConstraintOwnerChanged;
+            const snapshot = (try Contributions.activationSnapshot(txn, scan.domain, state.owner_epoch)) orelse
+                return error.GraphConstraintNotReady;
+            if (!std.mem.eql(u8, &snapshot, &self.fence.snapshot))
+                return error.GraphConstraintRevisionChanged;
+            if (state.owner_epoch == previous)
+                try Storage.takeover(txn, scan.domain, previous, scan.owner_epoch);
+            return;
+        }
         if (scan.page) |page| {
             const ScanClock = struct {
                 fn now(_: *anyopaque) u64 {
@@ -135,6 +153,10 @@ pub const SourceFenceCommand = struct {
         if ((command.action == .scan) != (command.scan != null)) return error.InvalidBatchRequest;
         if (command.scan) |scan| {
             if (scan.owner_epoch == 0) return error.InvalidBatchRequest;
+            if (scan.previous_owner_epoch) |previous| {
+                if (previous == 0 or previous >= scan.owner_epoch or scan.page != null)
+                    return error.InvalidBatchRequest;
+            }
             if (scan.page) |page| {
                 if (page.replacements.len == 0) return error.InvalidBatchRequest;
             }
@@ -1711,7 +1733,17 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     try Contributions.seedActivationPage(alloc, &txn, existing_id, 1, versions, null, &initial, &budget, &witness);
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, existing_id, 1));
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.begin(&txn, existing_id, 1, 0, testAttempt(7)));
-    try Storage.takeover(&txn, existing_id, 1, 2);
+    const takeover: SourceFenceCommand = .{
+        .namespace = @splat(0),
+        .action = .scan,
+        .fence = fence,
+        .scan = .{ .domain = existing_id, .owner_epoch = 2, .previous_owner_epoch = 1 },
+    };
+    var stale_cut = takeover;
+    stale_cut.fence.activation = @splat(10);
+    try std.testing.expectError(error.GraphConstraintAttemptConflict, stale_cut.stageScan(alloc, &txn));
+    try takeover.stageScan(alloc, &txn);
+    try takeover.stageScan(alloc, &txn);
     const first_cursor = (try Contributions.activationCursor(alloc, &txn, existing_id, 2, versions)).?;
     defer alloc.free(first_cursor);
     const cycle: []const Contributions.Replacement = &.{

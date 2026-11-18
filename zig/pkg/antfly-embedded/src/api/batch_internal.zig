@@ -104,6 +104,14 @@ test "distributed txn private control wire carries only an isolated DAG source f
     var scan_parsed = try parseInternalBatchRequest(alloc, scan_encoded);
     defer scan_parsed.deinit(alloc);
     try std.testing.expectEqualDeep(scan.dag_source_fence, scan_parsed.req.dag_source_fence);
+    scan.dag_source_fence.?.scan.?.previous_owner_epoch = 6;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, scan));
+    scan.dag_source_fence.?.scan.?.page = null;
+    const takeover_encoded = try encodeBatchRequest(alloc, scan);
+    defer alloc.free(takeover_encoded);
+    var takeover_parsed = try parseInternalBatchRequest(alloc, takeover_encoded);
+    defer takeover_parsed.deinit(alloc);
+    try std.testing.expectEqualDeep(scan.dag_source_fence, takeover_parsed.req.dag_source_fence);
 }
 
 test "internal isolated controls preserve neutral document versions across owner and forwarded codecs" {
