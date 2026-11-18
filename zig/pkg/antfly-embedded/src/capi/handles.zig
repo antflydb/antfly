@@ -51,6 +51,15 @@ pub const Handle = struct {
     /// Active connection context while its private SQL state is attached.
     lite_connection_context: ?*@import("lite_connection.zig").Connection = null,
     lease_snapshot: bool = false,
+    /// The root file's `NativeFile.adoptionEpoch()` when the Lite owner last
+    /// decided this root was current. A later adoption (a writer's begin,
+    /// a lease-time commit) can make the file match a fresh probe while this
+    /// root's in-memory runtime still reflects the older state.
+    lite_refresh_adoption_epoch: u64 = 0,
+    /// The root file's committed sequence its loaded runtime (indexes cache
+    /// their content in memory) is known to reflect. Another process's index
+    /// change past it forces a reopen, even after the file adopted it.
+    lite_runtime_sequence: u64 = 0,
     selected_table_name: ?[]u8 = null,
     selected_table_id: u64 = 0,
     // Table handles borrow a DB and enter their owning database's fence.

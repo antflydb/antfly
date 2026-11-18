@@ -379,9 +379,11 @@ def test_catalog_cluster_backup_retains_scope_and_literal_names(backup_api):
     database = "archive_" + uuid.uuid4().hex[:12]
     api.post(f"/databases/{database}", {})
     literal = "sales/archive.v1"
+    display_collision = f"{database}.public.{literal}"
     paths = [
         "/tables/" + quote(literal, safe=""),
         f"/databases/{database}/namespaces/public/tables/" + quote(literal, safe=""),
+        "/tables/" + quote(display_collision, safe=""),
     ]
     for index, path in enumerate(paths):
         # Snapshot qualification requires primary ownership, including scoped
@@ -398,6 +400,17 @@ def test_catalog_cluster_backup_retains_scope_and_literal_names(backup_api):
             literal,
             f"{database}.public.{literal}",
         }
+        listed = next(
+            item
+            for item in api.list_backups(location=location)["backups"]
+            if item["backup_id"] == "catalog-cluster"
+        )
+        selectors = listed["table_selectors"]
+        assert [item["name"] for item in selectors] == listed["tables"]
+        collisions = [
+            item["selector"] for item in selectors if item["name"] == display_collision
+        ]
+        assert len(set(collisions)) == 2
         # The API assertions below exercise the durable manifest after names
         # have disappeared from the live catalog; they cannot pass through a
         # cache of existing bindings.
@@ -407,8 +420,9 @@ def test_catalog_cluster_backup_retains_scope_and_literal_names(backup_api):
             backup_id="catalog-cluster",
             location=location,
             restore_mode="fail_if_exists",
+            table_names=[literal, *collisions],
         )
-        assert restored["committed_table_count"] == 2
+        assert restored["committed_table_count"] == 3
         for index, path in enumerate(paths):
             assert api.get(path + "/documents/doc") == {"scope": index}
     for path in paths:

@@ -4973,6 +4973,7 @@ const RedoCommitState = struct {
         record.appendSliceAssumeCapacity(self.logical_pending.items);
         record.appendSliceAssumeCapacity(self.pending.items);
         try self.writer.append(commit_sequence, record.items);
+        self.shared.noteApplied(commit_sequence);
     }
 
     /// The exact byte length `appendRecord` would write right now for the
@@ -6811,7 +6812,7 @@ pub const MergedCursor = struct {
             // `disk` candidate below, so a phantom overlay entry never
             // wrongly discards a disk candidate that is, in fact, the
             // correct answer for this view.
-            const entry = try self.tree.file.redoOverlayEntryAt(.documents, self.mark, winner_key);
+            const entry = try self.tree.file.redoOverlayEntryAt(.documents, self.mark, self.tree.checkpoint.redo_folded_through, winner_key);
             if (disk != null and std.mem.eql(u8, disk.?.key, winner_key) and entry != null) {
                 var consumed = disk.?;
                 consumed.deinit(self.tree.file.allocator);
@@ -7848,6 +7849,51 @@ pub const NativeFile = struct {
         self.redo = RedoCommitState{ .writer = redo_log.Writer.init(self.file, io, offset, capacity), .shared = shared, .checkpoint_sequence = checkpoint_sequence, .durable_sequence = durable_sequence };
     }
 
+    /// Replays the log records after `floor` and after the overlay's own
+    /// `appliedThrough` into the shared overlay. Caller holds
+    /// `inode_lock.withRedoOverlayLock` (the overlay's own mutex included)
+    /// and a reader pin over the scan.
+    fn replayIntoSharedOverlay(file: *NativeFile, io: std.Io, overlay: *redo_overlay.SharedRedoOverlay, floor: u64) !redo_log.ReplayOutcome {
+        const Apply = struct {
+            overlay: *redo_overlay.SharedRedoOverlay,
+            io: std.Io,
+            fn onRecord(ctx_ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
+                const ac: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+                if (record.payload.len < CompactCheckpoint.encoded_size + 4) return error.InvalidNativeRedoRecord;
+                const logical_len = std.mem.readInt(u32, record.payload[CompactCheckpoint.encoded_size..][0..4], .little);
+                const logical_start = CompactCheckpoint.encoded_size + 4;
+                if (logical_start + logical_len > record.payload.len) return error.InvalidNativeRedoRecord;
+                try ac.overlay.decodeLogicalMutationsPayload(std.heap.page_allocator, record.payload[logical_start..][0..logical_len], record.commit_sequence);
+                try ac.overlay.decodeRedoGroupPayload(std.heap.page_allocator, record.payload[logical_start + logical_len ..]);
+            }
+        };
+        var apply: Apply = .{ .overlay = overlay, .io = io };
+        const start_after = @max(floor, overlay.appliedThrough());
+        const outcome = try redo_log.replay(file.allocator, file.file, io, file.header.redo_log_offset, file.header.redo_log_capacity, start_after, Apply.onRecord, &apply);
+        if (outcome.valid_count != 0) _ = overlay.replay_epoch.fetchAdd(1, .acq_rel);
+        return outcome;
+    }
+
+    /// See `adoption_epoch`. The shared overlay's own replay epoch counts
+    /// too: another instance's replay changes what this one reads.
+    pub fn adoptionEpoch(self: *const NativeFile) u64 {
+        const shared_epoch = if (self.redo) |redo| redo.shared.replay_epoch.load(.acquire) else 0;
+        return self.adoption_epoch.load(.acquire) +% shared_epoch;
+    }
+
+    /// Re-read the on-disk header and adopt its recovered active checkpoint
+    /// (a concurrent fold published past what this handle opened with).
+    fn adoptOnDiskCheckpoint(self: *NativeFile, io: std.Io) !void {
+        var header_bytes: [header_size]u8 = undefined;
+        try readHeaderExactAt(self.file, io, &header_bytes);
+        var fresh_header = try decodeHeader(&header_bytes);
+        const file_size = (try self.file.stat(io)).size;
+        fresh_header.checkpoints = loadCheckpointSlots(self.file, io, fresh_header.page_size, file_size);
+        const recovered = try recoverActiveCheckpoint(self.file, io, fresh_header, file_size, false);
+        fresh_header.active_checkpoint = recovered.index;
+        try self.adoptIndexPublicationHeader(fresh_header);
+    }
+
     /// Replays the valid log prefix past the on-disk checkpoint's own
     /// `commit_sequence`, and wires up `self.redo` -- including the
     /// per-inode shared overlay (§9.6a) -- so every subsequent read/commit
@@ -7866,25 +7912,8 @@ pub const NativeFile = struct {
     /// genuinely first opener on this inode, under its own lock) runs a
     /// second, full replay that also decodes the logical/page-shaped
     /// content, directly into the (`std.heap.page_allocator`-owned)
-    /// shared overlay -- a second opener never replays that content at
-    /// all, since the first opener's replay already populated the
-    /// structure every later opener on this inode shares.
-    pub fn adoptionEpoch(self: *const NativeFile) u64 {
-        return self.adoption_epoch.load(.acquire);
-    }
-    /// Re-read the on-disk header and adopt its recovered active checkpoint
-    /// (a concurrent fold published past what this handle opened with).
-    fn adoptOnDiskCheckpoint(self: *NativeFile, io: std.Io) !void {
-        var header_bytes: [header_size]u8 = undefined;
-        try readHeaderExactAt(self.file, io, &header_bytes);
-        var fresh_header = try decodeHeader(&header_bytes);
-        const file_size = (try self.file.stat(io)).size;
-        fresh_header.checkpoints = loadCheckpointSlots(self.file, io, fresh_header.page_size, file_size);
-        const recovered = try recoverActiveCheckpoint(self.file, io, fresh_header, file_size, false);
-        fresh_header.active_checkpoint = recovered.index;
-        try self.adoptIndexPublicationHeader(fresh_header);
-    }
-
+    /// shared overlay. A later opener in this process replays only the
+    /// records another process appended since (`replayIntoSharedOverlay`).
     fn recoverRedoLog(self: *NativeFile, allocator: Allocator, io: std.Io, test_hook: if (builtin.is_test) ?*const fn (?*anyopaque) void else void, test_ctx: if (builtin.is_test) ?*anyopaque else void) !void {
         var checkpoint = self.activeCheckpoint();
         // perf/lwa-fold-boundary: the real, durable fold boundary this
@@ -8074,6 +8103,7 @@ pub const NativeFile = struct {
                         if (logical_start + logical_len > record.payload.len) return error.InvalidNativeRedoRecord;
                         try rc.overlay.decodeLogicalMutationsPayload(rc.pop_allocator, record.payload[logical_start..][0..logical_len], record.commit_sequence);
                         try rc.overlay.decodeRedoGroupPayload(rc.pop_allocator, record.payload[logical_start + logical_len ..]);
+                        rc.overlay.noteApplied(record.commit_sequence);
                     }
                 };
                 var rctx: RecordCtx = .{ .overlay = overlay, .pop_allocator = pop_allocator };
@@ -8183,6 +8213,26 @@ pub const NativeFile = struct {
             .durable_sequence = resumed_sequence,
             .checkpoint_sequence = folded_through,
         };
+        // A second opener in this process skips the populate above, but
+        // another process may have appended records since. Its reads must
+        // see what its sequence (from the scan) covers.
+        if (pctx.outcome == null and (outcome.last_sequence orelse 0) > @max(shared.appliedThrough(), folded_through)) {
+            const Catch = struct {
+                file: *NativeFile,
+                io: std.Io,
+                floor: u64,
+                ceiling: ?u64,
+                outcome: redo_log.ReplayOutcome = undefined,
+                fn run(ctx: *@This(), overlay: *redo_overlay.SharedRedoOverlay) anyerror!void {
+                    ctx.outcome = try replayIntoSharedOverlay(ctx.file, ctx.io, overlay, ctx.floor);
+                    if (ctx.outcome.stop_reason == .corrupt_record and (ctx.ceiling == null or ctx.outcome.valid_bytes < ctx.ceiling.?)) return error.NativeRedoLogCorrupt;
+                }
+            };
+            var catch_up: Catch = .{ .file = self, .io = io, .floor = folded_through, .ceiling = durable_ceiling_offset };
+            try inode_lock.withRedoOverlayLock(entry, io, &catch_up, Catch.run);
+            if (catch_up.outcome.valid_count != 0) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
+            shared.noteApplied(catch_up.outcome.last_sequence orelse 0);
+        }
         self.publishRedoLogState();
     }
 
@@ -9076,20 +9126,7 @@ pub const NativeFile = struct {
             redo.checkpoint_sequence = self.header.checkpoints[self.header.active_checkpoint].redo_folded_through;
         }
 
-        if (published.durable_sequence > redo.durable_sequence) {
-            const ApplyCtx = struct {
-                overlay: *redo_overlay.SharedRedoOverlay,
-                fn onRecord(ctx_ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
-                    const ac: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
-                    if (record.payload.len < CompactCheckpoint.encoded_size + 4) return error.InvalidNativeRedoRecord;
-                    const logical_len = std.mem.readInt(u32, record.payload[CompactCheckpoint.encoded_size..][0..4], .little);
-                    const logical_start = CompactCheckpoint.encoded_size + 4;
-                    if (logical_start + logical_len > record.payload.len) return error.InvalidNativeRedoRecord;
-                    try ac.overlay.decodeLogicalMutationsPayload(std.heap.page_allocator, record.payload[logical_start..][0..logical_len], record.commit_sequence);
-                    try ac.overlay.decodeRedoGroupPayload(std.heap.page_allocator, record.payload[logical_start + logical_len ..]);
-                }
-            };
-
+        if (published.durable_sequence > @min(redo.durable_sequence, redo.shared.appliedThrough())) {
             const ReplayCtx = struct {
                 file: *NativeFile,
                 io: std.Io,
@@ -9097,8 +9134,7 @@ pub const NativeFile = struct {
                 durable_ceiling_offset: u64,
                 outcome: redo_log.ReplayOutcome = undefined,
                 fn run(rc: *@This(), overlay: *redo_overlay.SharedRedoOverlay) anyerror!void {
-                    var actx: ApplyCtx = .{ .overlay = overlay };
-                    rc.outcome = try redo_log.replay(rc.file.allocator, rc.file.file, rc.io, rc.file.header.redo_log_offset, rc.file.header.redo_log_capacity, rc.start_after_sequence, ApplyCtx.onRecord, &actx);
+                    rc.outcome = try replayIntoSharedOverlay(rc.file, rc.io, overlay, rc.start_after_sequence);
                     // perf/lwa-xproc-redocorrupt2: `replay` has no upper
                     // bound of its own -- a stop at or past this read's own
                     // `published.durable_offset` ceiling (captured before
@@ -9117,12 +9153,17 @@ pub const NativeFile = struct {
             // instead walks into the sequence a deferred fold consumed
             // without appending a record, which reads as a gap
             // (`NativeRedoLogCorrupt`).
-            var rctx: ReplayCtx = .{ .file = self, .io = io, .start_after_sequence = @max(redo.durable_sequence, redo.checkpoint_sequence), .durable_ceiling_offset = publishedDurableCeiling(region, published) orelse std.math.maxInt(u64) };
+            var rctx: ReplayCtx = .{ .file = self, .io = io, .start_after_sequence = redo.checkpoint_sequence, .durable_ceiling_offset = publishedDurableCeiling(region, published) orelse std.math.maxInt(u64) };
             try inode_lock.withRedoOverlayLock(entry, io, &rctx, ReplayCtx.run);
 
             const outcome = rctx.outcome;
-            if (outcome.valid_count != 0) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
-            redo.durable_sequence = outcome.last_sequence orelse redo.durable_sequence;
+            // Another instance on this inode in the same process records its
+            // commits in the shared overlay directly, so replay finds nothing
+            // for them; they still advance what this instance reads.
+            const seen = @max(outcome.last_sequence orelse 0, @min(published.durable_sequence, redo.shared.appliedThrough()));
+            if (outcome.valid_count != 0 or seen > redo.durable_sequence) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
+            redo.shared.noteApplied(@max(published.durable_sequence, outcome.last_sequence orelse 0));
+            redo.durable_sequence = @max(redo.durable_sequence, seen);
             redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, outcome.valid_bytes, outcome.last_sequence);
         }
 
@@ -14713,8 +14754,10 @@ pub const NativeFile = struct {
         if (self.redo) |*redo| {
             if (try redo.shared.resolveAlloc(self.allocator, self.runtimeIo(), @backingInt(TransactionWrites.Root.documents), key, self.readMark(checkpoint))) |resolved| {
                 defer self.allocator.free(resolved.value);
-                if (resolved.is_delete) return null;
-                return packed_record_flag | resolved.sequence;
+                if (resolved.sequence > checkpoint.redo_folded_through) {
+                    if (resolved.is_delete) return null;
+                    return packed_record_flag | resolved.sequence;
+                }
             }
         }
         return self.lookupDocumentIndexPage(checkpoint, key);
@@ -16430,7 +16473,7 @@ pub const NativeFile = struct {
                     // snapshot `view` captured at this function's entry,
                     // regardless of whatever `self.activeCheckpoint()` does
                     // concurrently while this loop runs unlocked.
-                    const overlay_entry = try self.redoOverlayEntryAt(root_kind, view.mark, key);
+                    const overlay_entry = try self.redoOverlayEntryAt(root_kind, view.mark, view.checkpoint.redo_folded_through, key);
                     defer if (overlay_entry) |entry| self.allocator.free(entry.value);
                     if (overlay_entry) |entry| {
                         if (!entry.is_delete) record = entry;
@@ -18474,7 +18517,7 @@ pub const NativeFile = struct {
     /// `self.allocator.free(entry.value)` once done with it, exactly like
     /// any other `...Alloc` function in this file.
     pub fn redoOverlayEntry(self: *NativeFile, root: TransactionWrites.Root, checkpoint: CheckpointSlot, key: []const u8) !?CatalogEntry {
-        return self.redoOverlayEntryAt(root, self.readMark(checkpoint), key);
+        return self.redoOverlayEntryAt(root, self.readMark(checkpoint), checkpoint.redo_folded_through, key);
     }
 
     /// §9.7c (ReadView): the overlay read mark M corresponding to
@@ -18516,9 +18559,17 @@ pub const NativeFile = struct {
     /// correct `M` for their pinned (C, M) pair; `redoOverlayEntry`
     /// itself is now a thin wrapper computing `M` via `readMark` for
     /// callers that have only a `CheckpointSlot` in hand.
-    pub fn redoOverlayEntryAt(self: *NativeFile, root: TransactionWrites.Root, mark: u64, key: []const u8) !?CatalogEntry {
+    /// `fold_floor` is the read checkpoint's own `redo_folded_through`: its
+    /// tree already holds every version at or below it. A version there can
+    /// be older than that tree's, when another process folded records this
+    /// process's overlay never replayed, so it must not shadow the tree.
+    pub fn redoOverlayEntryAt(self: *NativeFile, root: TransactionWrites.Root, mark: u64, fold_floor: u64, key: []const u8) !?CatalogEntry {
         const redo = self.redo orelse return null;
         const resolved = (try redo.shared.resolveAlloc(self.allocator, self.runtimeIo(), @backingInt(root), key, mark)) orelse return null;
+        if (resolved.sequence <= fold_floor) {
+            self.allocator.free(resolved.value);
+            return null;
+        }
         return .{
             .previous_page = 0,
             .key = key,

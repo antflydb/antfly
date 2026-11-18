@@ -7091,7 +7091,7 @@ components:
           maxLength: 4096
           description: |
             Storage location for the backup. Supports multiple backends:
-            - Scoped filesystem connection: `file:///logical/path`
+            - Scoped filesystem connection: an absolute `file:///path/inside/connection/root`
             - Amazon S3: `s3://bucket-name/path/to/backup`
             - Google Cloud Storage: `gs://bucket-name/path/to/backup`
 
@@ -7177,7 +7177,7 @@ components:
           maxLength: 4096
           description: |
             Storage location for the backup. Supports multiple backends:
-            - Scoped filesystem connection: `file:///logical/path`
+            - Scoped filesystem connection: an absolute `file:///path/inside/connection/root`
             - Amazon S3: `s3://bucket-name/path/to/backup`
             - Google Cloud Storage: `gs://bucket-name/path/to/backup`
 
@@ -7494,6 +7494,19 @@ components:
             type: string
           description: Tables included in the backup
           example: ["users", "products"]
+        table_selectors:
+          type: array
+          description: Exact restore selectors paired with display names, in the same order as tables. Use selector in ClusterRestoreRequest.table_names to disambiguate identical display names.
+          items:
+            type: object
+            required: [name, selector]
+            properties:
+              name:
+                type: string
+                description: Display name of the backed-up table.
+              selector:
+                type: string
+                description: Opaque identifier accepted by restore for this backup.
         location:
           type: string
           description: Storage location of the backup

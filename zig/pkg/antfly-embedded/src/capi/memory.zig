@@ -871,7 +871,7 @@ test "capi local model memory admission pins dense geometry across reopen" {
             const code = api.antfly_db_memory_json(handle, .fromSlice("dimensions"), .fromSlice(request), &output);
             const bytes = if (output.ptr) |ptr| ptr[0..output.len] else "";
             if (code != .ok) {
-                std.debug.print("dimension admission {s}: {s}: {s}\n", .{ @tagName(action), @tagName(code), bytes });
+                std.debug.print("dimension admission {s}: {s}: {s} ({s})\n", .{ @tagName(action), @tagName(code), bytes, std.mem.span(h.capi.lastErrorDetail()) });
                 return error.QualificationOperationFailed;
             }
             return allocator.dupe(u8, bytes);
@@ -887,7 +887,7 @@ test "capi local model memory admission pins dense geometry across reopen" {
         defer api.antfly_db_close(handle);
         // On reopen, replay of the omitted-width request uses the durable receipt.
         _ = try Call.invoke(handle, alloc, .create, request, "create");
-        const inspected = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try Call.invoke(handle, alloc, .inspect, .{}, ""), .{});
+        const inspected = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try Call.invoke(handle, alloc, .inspect, .{ .limit = @as(u16, 64) }, ""), .{});
         const pinned = inspected.object.get("state").?.object.get("config").?.object.get("models").?.object.get("embedder").?.object;
         const actual_dimensions: u32 = @intCast(pinned.get("dimensions").?.integer);
         const actual_revision = pinned.get("revision").?.string;

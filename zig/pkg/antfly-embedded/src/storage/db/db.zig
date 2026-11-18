@@ -23563,14 +23563,29 @@ pub const DB = struct {
         // A table-local historical image cannot certify references owned by
         // other tables at a later cut. Keep the candidate unpublished until a
         // cluster-coordinated restore/activation barrier is available.
+        var detach_backup_fence = false;
         if (purpose == .historical_table) {
             const topology_fence = opened_primary.store.get(alloc, @import("relational_integrity_topology.zig").fence_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
             if (topology_fence) |bytes| {
-                alloc.free(bytes);
-                return error.CoordinatedConstraintRestoreRequired;
+                defer alloc.free(bytes);
+                const fence = try @import("relational_integrity_topology.zig").Fence.decode(bytes);
+                if (fence.role != .backup_snapshot) return error.CoordinatedConstraintRestoreRequired;
+                var read = try opened_primary.store.beginReadTxn();
+                defer read.abort();
+                const namespace = (try doc_identity.loadNamespaceTxn(&read)) orelse return error.IdentityNamespaceMismatch;
+                if (!namespace.eql(fence.namespace)) return error.IdentityNamespaceMismatch;
+                const catalog = read.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                portable_backup.requireUncoordinatedIntegrityState(alloc, &read, catalog) catch |err| switch (err) {
+                    error.CoordinatedConstraintPortableBackupUnsupported => return error.CoordinatedConstraintRestoreRequired,
+                    else => return err,
+                };
+                detach_backup_fence = true;
             }
             const retirement = opened_primary.store.get(alloc, @import("relational_integrity_retirement.zig").key) catch |err| switch (err) {
                 error.NotFound => null,
@@ -23599,6 +23614,11 @@ pub const DB = struct {
                 },
             };
         }
+        // Only this unpublished, proven-uncoordinated candidate may discard
+        // its source backup's writer fence. Other topology roles, retirement,
+        // active/historical constraints and integrity records remain rejected.
+        if (detach_backup_fence)
+            try opened_primary.store.delete(@import("relational_integrity_topology.zig").fence_key);
         if (!streaming_store)
             try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
         // The candidate root owns its identity. Creating it while the staged
@@ -29613,13 +29633,19 @@ pub const DB = struct {
                     const enrichment = self.enrichmentStatsWithSupervisorState(.{ .enabled = true });
                     const has_producers = enrichment.enabled or self.core.hasGeneratedEnrichmentTargets() or self.core.index_manager.enrichments.items.len != 0 or self.hasConfiguredResolvers();
                     if (replication_lsn == null and has_producers) {
-                        const target = self.currentMaintenanceTargetSequence();
+                        // Each producer consumes its own indexed replay lane.
+                        // A later output/derived-only record need not wake that
+                        // producer and cannot be used as its drain frontier.
+                        const source = self.core.replaySource();
+                        const enrichment_target = try source.latestMatchingSequence(self.alloc, enrichment.applied_sequence, .enrichment);
                         if (enrichment.retrying or enrichment.worker_failed or enrichment.stalled or
-                            ((enrichment.enabled or self.core.hasGeneratedEnrichmentTargets() or self.core.index_manager.enrichments.items.len != 0) and enrichment.applied_sequence < @max(target, enrichment.target_sequence))) return error.IntegrityTopologyBusy;
+                            ((enrichment.enabled or self.core.hasGeneratedEnrichmentTargets() or self.core.index_manager.enrichments.items.len != 0) and enrichment.applied_sequence < @max(enrichment_target, enrichment.target_sequence))) return error.IntegrityTopologyBusy;
                         if (self.hasConfiguredResolvers()) {
                             const resolution = self.resolutionStageStats();
                             const promotion = self.promotionStageStats();
-                            if (!resolution.enabled or !promotion.enabled or resolution.blocked or promotion.blocked or resolution.applied_sequence < target or promotion.applied_sequence < target) return error.IntegrityTopologyBusy;
+                            const resolution_target = try source.latestMatchingSequence(self.alloc, resolution.applied_sequence, .resolution);
+                            const promotion_target = try source.latestMatchingSequence(self.alloc, promotion.applied_sequence, .promotion);
+                            if (!resolution.enabled or !promotion.enabled or resolution.blocked or promotion.blocked or resolution.catch_up_required or promotion.catch_up_required or resolution.applied_sequence < @max(resolution_target, resolution.target_sequence) or promotion.applied_sequence < @max(promotion_target, promotion.target_sequence)) return error.IntegrityTopologyBusy;
                         }
                         // An old participant commit could enqueue a new
                         // primary-changing callback after this freeze. Drain
@@ -40931,6 +40957,7 @@ pub const DB = struct {
             .identity_namespace = target_identity,
             .prefer_existing_identity_namespace = true,
             .unpublished_staging = true,
+            .detach_uncoordinated_cohort = true,
         });
         portable_backup.validateCompleteDatabaseImageAlloc(alloc, self.core.store) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -42056,6 +42083,7 @@ pub const DB = struct {
             .import_derived_indexes = true,
             .embedding_source_fields = options.embedding_source_fields,
             .unpublished_staging = true,
+            .detach_uncoordinated_cohort = true,
             .cancellation = options.cancellation,
         });
         portable_backup.validateCompleteDatabaseImageAlloc(alloc, self.core.store) catch |err| switch (err) {
@@ -42089,6 +42117,7 @@ pub const DB = struct {
         if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
         try portable_backup.importPortableFileWithOptions(alloc, self.core.store, io, file, file_size, .{
             .cohort = cohort,
+            .detach_uncoordinated_cohort = cohort == null,
             .cancellation = cancellation,
             .identity_namespace = target_identity,
             .prefer_existing_identity_namespace = true,
@@ -157096,6 +157125,39 @@ test "db pending producer replay never ages missing full text input into complet
     try std.testing.expectEqual(sequence, try db.core.loadAppliedSequence(alloc, "text"));
 }
 
+test "db backup producer freeze uses lane-specific committed replay frontiers" {
+    const a = std.testing.allocator;
+    var producer: PrivacyAbsentFieldProducer = .{};
+    var directory = try TestDirectory.init("backup-producer-frontier");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = producer.interface() } });
+    defer db.close();
+    try addPrivacyAbsentFieldProducer(a, &db, "backup-drain");
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .sync_level = .write });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    const applied = db.enrichment_runtime.?.stats().applied_sequence;
+    const unrelated = db.core.reserveDerivedAppendSequence();
+    try std.testing.expect(unrelated > applied);
+    const record = try @import("derived/change_journal.zig").encodeRecord(a, .{ .sequence = unrelated, .target_hints = &.{.full_text} });
+    defer a.free(record);
+    try db.core.store.appendReplayOpaque(a, unrelated, record);
+    const identity = try db.relationalTopologyIdentity();
+    const fence: @import("relational_integrity_topology_contract.zig").Fence = .{ .transition_id = 1, .attempt = 1, .admission_epoch = identity.next_epoch, .owner_group_id = 2, .peer_group_id = 2, .role = .backup_snapshot, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest };
+    try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
+    try std.testing.expect((try db.relationalTopologyStatus()).fence.?.eql(fence));
+    try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .cancel }, null);
+    const pending = db.core.reserveDerivedAppendSequence();
+    const input = try @import("derived/change_journal.zig").encodeRecord(a, .{ .sequence = pending, .changed_doc_keys = &.{"doc"}, .target_hints = &.{.enrichment} });
+    defer a.free(input);
+    try db.core.store.appendReplayOpaque(a, pending, input);
+    const next_identity = try db.relationalTopologyIdentity();
+    var next = fence;
+    next.transition_id = 2;
+    next.admission_epoch = next_identity.next_epoch;
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.applyRelationalTopologyControl(.{ .fence = next, .action = .begin }, null));
+    try std.testing.expect((try db.relationalTopologyStatus()).fence == null);
+}
+
 test "db dense index inspection does not expose unprotected or missing artifacts" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("dense-index-inspection");
@@ -157105,6 +157167,13 @@ test "db dense index inspection does not expose unprotected or missing artifacts
     try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2}" });
     try std.testing.expect((try db.getDocumentArtifactManifest(a, "missing", "dense")) == null);
     try std.testing.expect((try db.getDocumentArtifactManifest(a, "missing", "absent")) == null);
+    const large_id = try a.alloc(u8, types.dense_index_inspection_limits.identity_bytes + 1);
+    defer a.free(large_id);
+    @memset(large_id, 'x');
+    // Optional dense inspection must not turn an absent privacy artifact into
+    // an inspection-budget failure for a legal large document identifier.
+    try std.testing.expect((try db.getDocumentArtifactManifest(a, large_id, "absent")) == null);
+    try std.testing.expectError(error.ResourceBudgetExceeded, db.getDocumentArtifactManifest(a, large_id, "dense"));
     const asset_key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "dense");
     defer a.free(asset_key);
     try db.core.store.putBatch(&.{.{ .key = asset_key, .value = "{\"manifest_version\":2}" }}, &.{});

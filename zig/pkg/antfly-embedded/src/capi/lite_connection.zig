@@ -873,6 +873,14 @@ const PathGate = struct {
     /// turn, never nested with another one, so it cannot cycle against
     /// `WriterLane.checkout`'s own sequential (never nested) hold of the
     /// two mutexes.
+    /// Caller holds `self.mutex`, as for `pinLocalWriterLeaseForRead`.
+    fn releasePeerParkedLeases(self: *PathGate, requester: *const Owner) void {
+        for (self.owners.items) |owner| {
+            if (owner == requester or !h.liteOpenModeCanWrite(owner.options.open_mode)) continue;
+            owner.writer_lane.releaseParkedForLocalPeer();
+        }
+    }
+
     fn pinLocalWriterLeaseForRead(self: *PathGate) ?*WriterLane {
         for (self.owners.items) |owner| {
             if (!h.liteOpenModeCanWrite(owner.options.open_mode)) continue;
@@ -1978,6 +1986,38 @@ pub const WriterLane = struct {
         _ = self.maintainParkedLease();
     }
 
+    /// Releases an idle parked lease for another owner on this path. A
+    /// same-process waiter shares this process's pid, so the foreign-waiter
+    /// release in `maintainParkedLease` never sees it.
+    fn releaseParkedForLocalPeer(self: *WriterLane) void {
+        const io = h.handleLockIo();
+        self.mutex.lockUncancelable(io);
+        if (self.checked_out or self.reading or self.local_reader_activity.count != 0) {
+            self.mutex.unlock(io);
+            return;
+        }
+        var lease = self.parked orelse {
+            self.mutex.unlock(io);
+            return;
+        };
+        self.parked = null;
+        self.foreign_release_due = false;
+        self.checked_out = true;
+        self.holder = std.Thread.getCurrentId();
+        const store = self.parked_store;
+        self.parked_store = null;
+        self.mutex.unlock(io);
+        if (store) |held_store| {
+            held_store.ensureDurableForReuse();
+            held_store.sync() catch {};
+        }
+        lease.close();
+        self.mutex.lockUncancelable(io);
+        self.checked_out = false;
+        self.mutex.unlock(io);
+        self.signalReleased(io);
+    }
+
     pub fn maintainParkedLease(self: *WriterLane) ?i96 {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
@@ -2454,6 +2494,10 @@ pub const Owner = struct {
             // a sibling connection on their own: every fast path here must
             // also agree on this logical watermark before reusing `current`.
             const sequence_unchanged = probe.committedSequence() == file.committedSequence();
+            // Something other than this refresh adopted newer state into the
+            // root's file, so the comparisons below would see a match the
+            // root's runtime does not have. Only a reopen reconciles it.
+            const adopted_unseen = file.adoptionEpoch() != current.lite_refresh_adoption_epoch;
             // A hosted/non-independent `maintenanceTurn` sets `root` to
             // `self.current` itself and bumps *its own* `maintenance_references`
             // for the turn's duration (see that field's own doc comment). A
@@ -2468,7 +2512,7 @@ pub const Owner = struct {
             // An uncertain publication can fail before writing anything, so an
             // unchanged header does not prove the runtime is reusable: reopen
             // to reconcile from durable state.
-            if (!self.foreground_runtime_stale and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and sequence_unchanged and std.meta.eql(probe.header, file.header)) {
+            if (!self.foreground_runtime_stale and !adopted_unseen and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and sequence_unchanged and std.meta.eql(probe.header, file.header)) {
                 if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
                     try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                 return current;
@@ -2487,7 +2531,7 @@ pub const Owner = struct {
             // the physical one for `sequence_unchanged` to protect.
             const fast2_metadata_unchanged = try file.runtimeMetadataUnchanged(&probe);
             const fast2_index_unchanged = try loadedIndexInputsUnchanged(current, file, &probe);
-            if (!self.foreground_runtime_stale and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and (sequence_unchanged or file.redo == null) and
+            if (!self.foreground_runtime_stale and !adopted_unseen and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and (sequence_unchanged or file.redo == null) and
                 fast2_metadata_unchanged and fast2_index_unchanged)
             {
                 // Lease bookkeeping and unpublished shadow files do not change
@@ -2499,6 +2543,8 @@ pub const Owner = struct {
                     _ = try self.copyIdleSnapshotLedger(file);
                     _ = try file.inheritAllocatorCertificate();
                 }
+                current.lite_refresh_adoption_epoch = file.adoptionEpoch();
+                current.lite_runtime_sequence = @max(current.lite_runtime_sequence, probe.committedSequence());
                 return current;
             }
             if (self.maintenance_snapshot) |snapshot| {
@@ -2642,6 +2688,8 @@ pub const Owner = struct {
         // may still be draining when it is replaced (W5).
         if (self.current) |outgoing| if (outgoing.owned_lite_backend.?.native_docstore) |outgoing_store| outgoing_store.ensureDurableForReuse();
         self.foreground_runtime_stale = false;
+        replacement.lite_refresh_adoption_epoch = replacement.owned_lite_backend.?.native_docstore.?.file.adoptionEpoch();
+        replacement.lite_runtime_sequence = replacement.owned_lite_backend.?.native_docstore.?.file.committedSequence();
         self.current = replacement;
         for (self.connections.items) |connection| {
             connection.current = replacement;
@@ -2733,7 +2781,7 @@ pub const Owner = struct {
         // Another writer's index content (native catalog records under the
         // redo log) is invisible to this root's loaded indexes, which cache
         // it in memory. Reopen rather than keep serving and writing them.
-        if (before.indexCatalogChangedAfter(before.activeCheckpoint().commit_sequence)) return false;
+        if (before.indexCatalogChangedAfter(root.lite_runtime_sequence)) return false;
         if (before.header.indexed_reclamation and after.header.indexed_reclamation) {
             if (std.mem.eql(u8, &before.activeCheckpoint().logical.indexes, &after.activeCheckpoint().logical.indexes)) return true;
             // Prefix comparisons dereference the old root. Its page numbers
@@ -4720,6 +4768,7 @@ pub const Connection = struct {
         // permits an immediate acquisition when nobody is queued.
         if (h.liteOpenModeCanWrite(self.options.open_mode)) {
             const stats = &self.owner.publication_stats.foreground_lease;
+            self.gate.releasePeerParkedLeases(self.owner);
             // lite-writer-authority.md W2: borrow the lane's lease. Skipped
             // only for `checkout`'s own cold path (`acquireForOwnCheckout`),
             // which already holds the lane and keeps the lease itself.
@@ -5169,6 +5218,10 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         // the process signal owner alive until this executor has joined too.
         @import("io_lifetime.zig").acquire();
         owner.* = .{ .path = gate.path, .gate = gate, .options = resolved_options, .current = initial, .owned_ttl_owner_id = ttl_owner_id, .owned_models_dir = models_dir, .path_lock_io = std.Io.Threaded.init(alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) }) };
+        if (initial) |root| {
+            root.lite_refresh_adoption_epoch = root.owned_lite_backend.?.native_docstore.?.file.adoptionEpoch();
+            root.lite_runtime_sequence = root.owned_lite_backend.?.native_docstore.?.file.committedSequence();
+        }
     }
     errdefer if (existing == null) @import("io_lifetime.zig").release();
     errdefer if (existing == null) owner.path_lock_io.deinit();
@@ -8908,6 +8961,32 @@ test "capi native cold lane checkout never waits on its own checkout" {
 // consumer's already-scheduled poll, which may never come at all). This
 // test leaves the maintenance worker running (unlike the cold-checkout
 // test above): it is what has to actually perform the release.
+// A connection with a different durability policy owns a separate runtime
+// and writer lane. Its vacuum must still get the file once another owner's
+// write has parked that owner's lease.
+test "capi path gate lets a peer owner vacuum after another owner's write" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var tmp = try api.TestDirectory.init("peer-owner-vacuum");
+    defer tmp.cleanup();
+    const io = h.handleLockIo();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/database.aflite", .{tmp.path()});
+    defer std.testing.allocator.free(path);
+
+    const first = try api.publishHandle(try open(path, .{ .profile = .hosted }, true));
+    defer api.antfly_db_close(first);
+    const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("doc:seed"), .value = .fromSlice("{\"text\":\"seed\"}"), .is_delete = false }};
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(first, &writes, writes.len, null, 0, 0, 0));
+
+    const peer = try api.publishHandle(try open(path, .{ .profile = .hosted, .no_sync = true }, false));
+    defer api.antfly_db_close(peer);
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&out);
+    const code = api.antfly_lite_vacuum_json(peer, &out);
+    if (code != .ok) std.debug.print("peer vacuum: {s}: {s}\n", .{ @tagName(code), std.mem.span(h.capi.lastErrorDetail()) });
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, code);
+}
+
 test "capi native parked writer lease releases itself after the idle window with nobody checking out" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var tmp = try api.TestDirectory.init("parked-lease-idle-release");

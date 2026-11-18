@@ -51,8 +51,25 @@ pub const Latency = struct {
     }
 };
 
+/// Estimated work, owned by a waiting ticket or an active lease. These are
+/// scheduling hints; they never replace resource admission or the CUDA guard.
+pub const Work = struct {
+    prefill_tokens: usize = 0,
+    decode_tokens: usize = 0,
+
+    fn add(self: Work, other: Work) !Work {
+        return .{ .prefill_tokens = try std.math.add(usize, self.prefill_tokens, other.prefill_tokens), .decode_tokens = try std.math.add(usize, self.decode_tokens, other.decode_tokens) };
+    }
+
+    fn sub(self: Work, other: Work) Work {
+        return .{ .prefill_tokens = self.prefill_tokens - other.prefill_tokens, .decode_tokens = self.decode_tokens - other.decode_tokens };
+    }
+};
+
 pub const Stats = struct {
     active: usize = 0,
+    active_work: Work = .{},
+    queued_work: Work = .{},
     waiting: usize = 0,
     started: u64 = 0,
     rejected: u64 = 0,
@@ -64,6 +81,8 @@ pub const Stats = struct {
 
     pub fn add(self: *Stats, other: Stats) void {
         self.active += other.active;
+        self.active_work = self.active_work.add(other.active_work) catch unreachable;
+        self.queued_work = self.queued_work.add(other.queued_work) catch unreachable;
         self.waiting += other.waiting;
         self.started +|= other.started;
         self.rejected +|= other.rejected;
@@ -94,6 +113,7 @@ pub const Limits = struct {
 pub const Lane = struct {
     const Waiter = struct {
         next: ?*Waiter = null,
+        work: Work = .{},
         ready: std.Io.Event = .unset,
         io: ?std.Io = null,
     };
@@ -107,6 +127,7 @@ pub const Lane = struct {
         lane: *Lane,
         exclusive: bool,
         owner_id: u64,
+        work: Work = .{},
         pub fn release(self: Lease) void {
             self.lane.lock();
             defer self.lane.mutex.unlock();
@@ -116,6 +137,7 @@ pub const Lane = struct {
                 self.lane.exclusive = false;
             }
             self.lane.stats.active -= 1;
+            self.lane.stats.active_work = self.lane.stats.active_work.sub(self.work);
             self.lane.wake();
         }
     };
@@ -136,6 +158,7 @@ pub const Lane = struct {
                 if (previous) |p| p.next = item.next else self.head = item.next;
                 if (self.tail == item) self.tail = previous;
                 self.stats.waiting -= 1;
+                self.stats.queued_work = self.stats.queued_work.sub(item.work);
                 return;
             }
             previous = item;
@@ -144,17 +167,26 @@ pub const Lane = struct {
     }
 
     pub fn acquire(self: *Lane, control: Control, exclusive: bool, limits: Limits) !Lease {
+        return self.acquireWithWork(control, exclusive, limits, .{});
+    }
+
+    pub fn acquireWithWork(self: *Lane, control: Control, exclusive: bool, limits: Limits, work: Work) !Lease {
         std.debug.assert(limits.active == null or limits.active.? > 0);
         std.debug.assert(limits.queued > 0);
         try control.check();
         const started = platform.time.monotonicNs();
-        var waiter = Waiter{ .io = control.io };
+        var waiter = Waiter{ .io = control.io, .work = work };
         self.lock();
         if (self.stats.waiting >= limits.queued) {
             self.stats.rejected +|= 1;
             self.mutex.unlock();
             return error.GenerationQueueFull;
         }
+        const queued_work = self.stats.queued_work.add(work) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.stats.queued_work = queued_work;
         if (self.tail) |tail| tail.next = &waiter else self.head = &waiter;
         self.tail = &waiter;
         self.stats.waiting += 1;
@@ -171,6 +203,11 @@ pub const Lane = struct {
             self.lock();
             const available = !self.exclusive and (limits.active == null or self.stats.active < limits.active.?) and (!exclusive or self.stats.active == 0);
             if (self.head == &waiter and available) {
+                const active_work = self.stats.active_work.add(work) catch |err| {
+                    self.mutex.unlock();
+                    return err;
+                };
+                self.stats.active_work = active_work;
                 self.remove(&waiter);
                 self.stats.active += 1;
                 self.exclusive = exclusive;
@@ -181,7 +218,7 @@ pub const Lane = struct {
                 const owner_id = self.stats.started;
                 self.wake();
                 self.mutex.unlock();
-                return .{ .lane = self, .exclusive = exclusive, .owner_id = owner_id };
+                return .{ .lane = self, .exclusive = exclusive, .owner_id = owner_id, .work = work };
             }
             waiter.ready.reset();
             self.mutex.unlock();
@@ -284,4 +321,44 @@ test "generation admission latency histograms retain cumulative buckets when agg
     try std.testing.expect(std.mem.indexOf(u8, writer.written(), "# TYPE generation_queue_seconds histogram") != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.written(), "generation_queue_seconds_bucket{le=\"+Inf\"} 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.written(), "generation_queue_seconds_count 2") != null);
+}
+
+test "generation admission work belongs to its lease and rolls back overflow" {
+    var lane = Lane{};
+    const limits = Limits{ .active = 2, .queued = 2 };
+    const first = try lane.acquireWithWork(.{}, false, limits, .{ .prefill_tokens = 128, .decode_tokens = 32 });
+    const second = try lane.acquireWithWork(.{}, false, limits, .{ .prefill_tokens = 16, .decode_tokens = 64 });
+    try std.testing.expectEqualDeep(Work{ .prefill_tokens = 144, .decode_tokens = 96 }, lane.snapshot().active_work);
+    try std.testing.expectEqualDeep(Work{}, lane.snapshot().queued_work);
+    first.release();
+    try std.testing.expectEqualDeep(second.work, lane.snapshot().active_work);
+    try std.testing.expectError(error.Overflow, lane.acquireWithWork(.{}, false, limits, .{ .prefill_tokens = std.math.maxInt(usize) }));
+    try std.testing.expectEqual(@as(usize, 0), lane.snapshot().waiting);
+    try std.testing.expectEqualDeep(Work{}, lane.snapshot().queued_work);
+    second.release();
+    try std.testing.expectEqualDeep(Work{}, lane.snapshot().active_work);
+}
+
+test "generation admission work cancellation removes the waiting owner's estimate" {
+    var lane = Lane{};
+    const limits = Limits{ .active = 1, .queued = 2 };
+    const active = try lane.acquireWithWork(.{}, false, limits, .{ .prefill_tokens = 128, .decode_tokens = 16 });
+    defer active.release();
+    const Pending = struct {
+        lane: *Lane,
+        checks: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks == 2) {
+                try std.testing.expectEqualDeep(Work{ .prefill_tokens = 256, .decode_tokens = 32 }, self.lane.snapshot().queued_work);
+                return error.InferenceCancelled;
+            }
+        }
+    };
+    var pending = Pending{ .lane = &lane };
+    try std.testing.expectError(error.InferenceCancelled, lane.acquireWithWork(.{ .ptr = &pending, .check_fn = Pending.check }, false, limits, .{ .prefill_tokens = 256, .decode_tokens = 32 }));
+    try std.testing.expectEqualDeep(Work{}, lane.snapshot().queued_work);
+    try std.testing.expectEqualDeep(active.work, lane.snapshot().active_work);
+    try std.testing.expectEqual(@as(usize, 0), lane.snapshot().waiting);
 }

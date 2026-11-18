@@ -267,6 +267,16 @@ pub const SharedRedoOverlay = struct {
     /// this is how an instance learns another process changed a root's
     /// logical content after its own checkpoint (`replayedSequence`).
     replayed_sequence: [3]std.atomic.Value(u64) = .{ .init(0), .init(0), .init(0) },
+    /// Every log record at or below this sequence is in the overlay (or in
+    /// the tree, below a fold). Own appends advance it under the writer
+    /// lease, and a writer replays other processes' records before its own
+    /// next append (`NativeFile.refreshIfWriterBaseStale`), so no record
+    /// below it is ever missing. An opener replays the log past it.
+    applied_through: std.atomic.Value(u64) = .init(0),
+    /// Bumped whenever a replay adds another process's records. Every
+    /// instance sharing this overlay reads them, so it is part of each
+    /// instance's `NativeFile.adoptionEpoch`.
+    replay_epoch: std.atomic.Value(u64) = .init(0),
     /// The last checkpoint `checkpointRedoLog` durably published: any
     /// version with `sequence <= durable_checkpoint_sequence` is also
     /// already reflected in real, physical pages, so it survives in this
@@ -479,6 +489,14 @@ pub const SharedRedoOverlay = struct {
     /// enum). Takes ownership of `value` (already caller-allocated with
     /// the same allocator this overlay uses throughout); duplicates `key`
     /// only the first time it's seen for this root.
+    pub fn noteApplied(self: *SharedRedoOverlay, sequence: u64) void {
+        _ = self.applied_through.fetchMax(sequence, .acq_rel);
+    }
+
+    pub fn appliedThrough(self: *const SharedRedoOverlay) u64 {
+        return self.applied_through.load(.acquire);
+    }
+
     pub fn replayedSequence(self: *const SharedRedoOverlay, root: u8) u64 {
         return self.replayed_sequence[root].load(.acquire);
     }
@@ -1127,11 +1145,35 @@ pub const SharedRedoOverlay = struct {
             // still the only valid source of a `VersionedOverlayEntry` node:
             // `destroyChain`'s `pool.destroy` elsewhere would otherwise be
             // handed a pointer the pool's own free list does not own.
+            const gop = try self.maps[root].getOrPut(allocator, key);
+            _ = self.replayed_sequence[root].fetchMax(sequence, .acq_rel);
+            // A catch-up replays records this overlay may already hold, or
+            // ones older than this process's own later appends. Keep each
+            // chain newest-first and each sequence once.
+            if (gop.found_existing) {
+                var newer: ?*VersionedOverlayEntry = null;
+                var cursor: ?*VersionedOverlayEntry = gop.value_ptr.*;
+                while (cursor) |version| {
+                    if (version.sequence <= sequence) break;
+                    newer = version;
+                    cursor = version.older;
+                }
+                if (cursor) |version| if (version.sequence == sequence) {
+                    allocator.free(decoded.value);
+                    continue;
+                };
+                if (newer) |above| {
+                    const node = try self.entry_pool.create(allocator);
+                    node.* = decoded;
+                    node.older = cursor;
+                    above.older = node;
+                    self.pending_retirement_versions += 1;
+                    continue;
+                }
+            }
             const node = try self.entry_pool.create(allocator);
             errdefer self.entry_pool.destroy(node);
             node.* = decoded;
-            const gop = try self.maps[root].getOrPut(allocator, key);
-            _ = self.replayed_sequence[root].fetchMax(sequence, .acq_rel);
             if (gop.found_existing) {
                 node.older = gop.value_ptr.*;
                 // Mirror `appendVersion`'s own accounting: chaining onto an
