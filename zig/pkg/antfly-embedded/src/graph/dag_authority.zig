@@ -400,12 +400,24 @@ pub const Storage = struct {
     pub const Begin = union(enum) { reserved: Token, terminal: Receipt };
 
     pub fn begin(txn: anytype, id: Digest, epoch: u64, revision: u64, attempt: Attempt) !Begin {
+        return beginChecked(txn, id, epoch, revision, attempt, false);
+    }
+
+    /// A co-located publisher must never resolve a reservation owned by a
+    /// distributed coordinator, even if it carries the same attempt bytes.
+    pub fn beginUnreserved(txn: anytype, id: Digest, epoch: u64, revision: u64, attempt: Attempt) !Begin {
+        return beginChecked(txn, id, epoch, revision, attempt, true);
+    }
+
+    fn beginChecked(txn: anytype, id: Digest, epoch: u64, revision: u64, attempt: Attempt, require_unreserved: bool) !Begin {
         var state = load(txn, id) catch |err| {
             if (err == error.NotFound) return error.GraphConstraintNotReady;
             return err;
         };
         if (state.owner_epoch != epoch) return error.GraphConstraintOwnerChanged;
         if (try readReceipt(txn, id, attempt)) |receipt| return .{ .terminal = receipt };
+        if (require_unreserved and state.pending != null) return error.GraphConstraintBusy;
+        _ = try Contributions.readActivationCertificate(txn, id);
         const token = try state.begin(epoch, revision, attempt);
         try save(txn, state);
         return .{ .reserved = token };
@@ -561,6 +573,7 @@ test "DAG storage terminal receipts fence replay and changed payloads" {
         state: ?[State.encoded_len]u8 = null,
         receipt: ?[89]u8 = null,
         proof_value: ?Digest = null,
+        certificate: ?[33]u8 = null,
         edges: usize = 0,
         owners: u64 = 0,
 
@@ -588,6 +601,8 @@ test "DAG storage terminal receipts fence replay and changed payloads" {
                 if (self.state) |*raw| return raw;
             } else if (std.mem.startsWith(u8, key, Storage.proof_prefix)) {
                 if (self.proof_value) |*raw| return raw;
+            } else if (std.mem.startsWith(u8, key, Contributions.certificate_prefix)) {
+                if (self.certificate) |*raw| return raw;
             } else if (self.receipt) |*raw| return raw;
             return error.NotFound;
         }
@@ -597,6 +612,8 @@ test "DAG storage terminal receipts fence replay and changed payloads" {
                 self.state = raw[0..State.encoded_len].*;
             } else if (std.mem.startsWith(u8, key, Storage.proof_prefix)) {
                 self.proof_value = raw[0..32].*;
+            } else if (std.mem.startsWith(u8, key, Contributions.certificate_prefix)) {
+                self.certificate = raw[0..33].*;
             } else if (std.mem.startsWith(u8, key, Adjacency.prefix)) {
                 self.edges += 1;
             } else if (std.mem.startsWith(u8, key, Membership.prefix)) {
@@ -612,6 +629,9 @@ test "DAG storage terminal receipts fence replay and changed payloads" {
     try Storage.create(&txn, state.domain, 1);
     try std.testing.expectError(error.GraphConstraintAlreadyExists, Storage.create(&txn, state.domain, 1));
     try Storage.save(&txn, state);
+    try std.testing.expectError(error.GraphConstraintNotReady, Storage.begin(&txn, state.domain, 1, 0, testAttempt(1)));
+    try std.testing.expect((try Storage.load(&txn, state.domain)).pending == null);
+    try Contributions.saveActivationCertificate(&txn, state.domain, null);
     const token = (try Storage.begin(&txn, state.domain, 1, 0, testAttempt(1))).reserved;
     const alloc = std.testing.allocator;
     const changes: []const Storage.validation.Change = &.{.{ .source = "a", .target = "b", .present = true }};

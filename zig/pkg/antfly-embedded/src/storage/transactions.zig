@@ -382,15 +382,7 @@ pub const DagDomainPrepare = struct {
     /// guards and publication effects in the same transaction.
     pub fn stagePublication(self: DagDomainPrepare, alloc: Allocator, writer: anytype, budget: *dag_validation.Budget, witness: *dag_validation.Witness) !dag.Receipt {
         witness.* = .{};
-        const authority = dag.Storage.load(writer, self.domain) catch |err| {
-            if (err == error.NotFound) return error.GraphConstraintNotReady;
-            return err;
-        };
-        if (authority.owner_epoch != self.epoch) return error.GraphConstraintOwnerChanged;
-        // A co-located commit may not resolve previously enlisted distributed
-        // work. Only its transaction coordinator owns that terminal decision.
-        if (authority.pending != null) return error.GraphConstraintBusy;
-        switch (try dag.Storage.begin(writer, self.domain, self.epoch, self.revision, self.attempt)) {
+        switch (try dag.Storage.beginUnreserved(writer, self.domain, self.epoch, self.revision, self.attempt)) {
             .terminal => return self.requireAccepted(writer),
             .reserved => |token| {
                 try dag.Contributions.prepare(alloc, writer, token, self.producer_versions, self.replacements, budget, witness);
