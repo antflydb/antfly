@@ -1259,6 +1259,25 @@ pub const LocalDagBinding = struct {
         }
     }
 
+    /// Publish exactly the constrained types declared for this incarnation.
+    /// The catalog caller pins the configuration and owns transaction rollback.
+    pub fn stageFromConfig(alloc: std.mem.Allocator, txn: anytype, command: Command, table_identity: [16]u8, config_json: []const u8) !void {
+        var config = try @import("catalog/index_manager.zig").parseGraphActivationConfig(alloc, config_json);
+        defer config.deinit(alloc);
+        var edge_types: std.ArrayList([]const u8) = .empty;
+        defer edge_types.deinit(alloc);
+        for (config.edge_type_configs) |edge| {
+            if (edge.topology == .dag) try edge_types.append(alloc, edge.name);
+        }
+        if (edge_types.items.len == 0) return;
+        std.mem.sort([]const u8, edge_types.items, {}, struct {
+            fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.lessThan);
+        try (LocalDagBinding{ .table_identity = table_identity, .edge_types = edge_types.items }).stage(alloc, txn, command);
+    }
+
     pub fn stage(self: LocalDagBinding, alloc: std.mem.Allocator, txn: anytype, command: Command) !void {
         if (command.producer_kind != .graph or command.producer_generation == 0) return error.InvalidDagDomain;
         try self.validate();

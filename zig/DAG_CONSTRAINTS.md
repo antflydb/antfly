@@ -49,7 +49,9 @@ physical transaction. The ordered graph publication writer invokes this path
 after its source and contender guards when a co-located binding exists for the
 producer incarnation. Binding installation and publication both require a
 visible active authority and its activation certificate. The catalog still
-needs to provision those bindings from the declared index configuration.
+needs to invoke binding provisioning under its activation fence. The
+activation-only parser supplies the declared DAG types and rejects ambiguous
+names. Regular index admission and direct graph-index open still reject DAG.
 An existing distributed reservation remains under the original coordinator,
 and the publication coordinator still needs to enlist the authority under the source and contender guards, and document-derived
 and explicit writers still need to supply their final contributions. The authority also stages bounded activation pages into a private

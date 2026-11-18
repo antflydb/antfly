@@ -174,6 +174,9 @@ test "ordered artifact inventory graph publication validates guards generations 
             try dag.Storage.create(&writer, request.domain, 1);
             try std.testing.expectError(error.GraphConstraintNotReady, binding.stage(alloc, &writer, command));
             try dag.Storage.activateNewIncarnation(&writer, request.domain, 1);
+            try publication.LocalDagBinding.stageFromConfig(alloc, &writer, command, @splat(2),
+                \\{"edge_types":[{"name":"unconstrained","topology":"graph"},{"name":"links","topology":"dag"}]}
+            );
             try binding.stage(alloc, &writer, command);
             try result.stageLocalDag(alloc, &writer, command);
             try writer.put(edge_key, edge);

@@ -706,7 +706,7 @@ fn graphMetricFirstComponentAfterPrefixAlloc(alloc: Allocator, key: []const u8, 
 // GraphIndex
 // ============================================================================
 
-pub const TopologyMode = enum { graph, tree };
+pub const TopologyMode = enum { graph, tree, dag };
 
 pub const EdgeTypeConfig = struct {
     name: []const u8,
@@ -6857,6 +6857,9 @@ pub const GraphIndex = struct {
     }
 
     pub fn openWithPrivateStores(alloc: Allocator, outgoing_path: [*:0]const u8, reverse_path: [*:0]const u8, index_name: []const u8, opts: GraphIndexOptions) !GraphIndex {
+        for (opts.edge_type_configs) |edge| {
+            if (edge.topology == .dag) return error.GraphConstraintNotReady;
+        }
         try validateGraphMetricEdgeFilters(opts.edge_type_configs, opts.metric_configs);
 
         var outgoing_store = try openEdgeStore(alloc, outgoing_path, opts);
