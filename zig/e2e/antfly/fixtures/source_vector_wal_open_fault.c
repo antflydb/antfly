@@ -63,21 +63,32 @@ static const struct { const void *replacement, *original; } interposers[] = {
     { (const void *)fault_openat, (const void *)openat },
 };
 #elif defined(__linux__)
-/* Zig's native Linux I/O uses openat on 64-bit libc builds. Resolve the
- * original alongside the call, with no constructor or global hook state. */
-int openat(int dirfd, const char *path, int flags, ...) {
+static int linux_openat(const char *symbol, int dirfd, const char *path, int flags, va_list args) {
     if (fail_wal_open(path, flags)) return -1;
-    int (*original)(int, const char *, int, ...) = dlsym(RTLD_NEXT, "openat");
+    int (*original)(int, const char *, int, ...) = dlsym(RTLD_NEXT, symbol);
     if (original == NULL) {
         errno = ENOSYS;
         return -1;
     }
-    if ((flags & O_CREAT) == 0 && (flags & O_TMPFILE) != O_TMPFILE)
-        return original(dirfd, path, flags);
+    if ((flags & O_CREAT) != 0 || (flags & O_TMPFILE) == O_TMPFILE)
+        return original(dirfd, path, flags, va_arg(args, mode_t));
+    return original(dirfd, path, flags);
+}
+
+int openat(int dirfd, const char *path, int flags, ...) {
     va_list args;
     va_start(args, flags);
-    mode_t mode = va_arg(args, mode_t);
+    int result = linux_openat("openat", dirfd, path, flags, args);
     va_end(args);
-    return original(dirfd, path, flags, mode);
+    return result;
+}
+
+/* Zig selects the large-file symbol on GNU libc, including 64-bit hosts. */
+int openat64(int dirfd, const char *path, int flags, ...) {
+    va_list args;
+    va_start(args, flags);
+    int result = linux_openat("openat64", dirfd, path, flags, args);
+    va_end(args);
+    return result;
 }
 #endif
