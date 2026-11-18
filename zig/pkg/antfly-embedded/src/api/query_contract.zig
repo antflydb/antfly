@@ -1669,6 +1669,13 @@ fn appendAlgebraicVectorWorkerQuery(
             try appendJsonFieldUsize(alloc, out, &first, "k", dense.k);
             try appendJsonFieldName(alloc, out, &first, "vector");
             try appendF32Array(alloc, out, dense.vector);
+            if (dense.model_revision_fence) |fence| {
+                try appendJsonFieldName(alloc, out, &first, "_model_revision");
+                if (fence.expected) |revision|
+                    try appendJsonString(alloc, out, &std.fmt.bytesToHex(revision, .lower))
+                else
+                    try out.appendSlice(alloc, "null");
+            }
         },
         .sparse => |sparse| {
             try appendJsonFieldString(alloc, out, &first, "kind", "sparse");
@@ -1920,8 +1927,10 @@ fn parseAlgebraicVectorWorkerQueryAlloc(
     const k = try parseOptionalU32Json(value.object.get("k"), 10);
     if (std.mem.eql(u8, kind_value.string, "dense")) {
         if (layout != .dense_vector) return error.InvalidQueryRequest;
+        const revision = value.object.get("_model_revision");
         return .{ .dense = .{
             .vector = try parseF32JsonArrayAlloc(alloc, value.object.get("vector") orelse return error.InvalidQueryRequest),
+            .model_revision_fence = if (revision) |raw| .{ .expected = try parseEmbeddingRevisionFence(raw) } else null,
             .k = k,
         } };
     }
@@ -3091,7 +3100,46 @@ pub fn parseQueryRequestWithDeadline(
             owned.req.privacy_policy_version = try parsePrivacyPolicyVersion(value);
         };
     }
+    if (std.mem.indexOf(u8, effective_body, "_embedding_model_revisions") != null) {
+        var raw = try std.json.parseFromSlice(std.json.Value, alloc, effective_body, .{});
+        defer raw.deinit();
+        if (raw.value.object.get("_embedding_model_revisions")) |revisions| {
+            if (revisions != .object or revisions.object.count() == 0) return error.InvalidQueryRequest;
+            var fields = revisions.object.iterator();
+            while (fields.next()) |field| {
+                const revision = try parseEmbeddingRevisionFence(field.value_ptr.*);
+                var matched = false;
+                if (owned.req.index_name) |name| {
+                    if (std.mem.eql(u8, name, field.key_ptr.*)) {
+                        if (owned.req.dense) |*dense| {
+                            dense.model_revision_fence = .{ .expected = revision };
+                            matched = true;
+                        }
+                        if (owned.req.query == .dense_knn) {
+                            owned.req.query.dense_knn.model_revision_fence = .{ .expected = revision };
+                            matched = true;
+                        }
+                    }
+                }
+                for (@constCast(owned.req.dense_queries)) |*dense| {
+                    if (std.mem.eql(u8, dense.index_name, field.key_ptr.*)) {
+                        dense.query.model_revision_fence = .{ .expected = revision };
+                        matched = true;
+                    }
+                }
+                if (!matched) return error.InvalidQueryRequest;
+            }
+        }
+    }
     return owned;
+}
+
+fn parseEmbeddingRevisionFence(value: std.json.Value) !?[32]u8 {
+    if (value == .null) return null;
+    if (value != .string or value.string.len != 64) return error.InvalidQueryRequest;
+    var revision: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&revision, value.string) catch return error.InvalidQueryRequest;
+    return revision;
 }
 
 pub fn parsePrivacyPolicyVersion(value: std.json.Value) ![64]u8 {
@@ -3387,6 +3435,23 @@ fn liveReadEncodingScenario(a: std.mem.Allocator) !void {
 test "api query contract live read encoding owns failures and annotates typed delivery" {
     try liveReadEncodingScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, liveReadEncodingScenario, .{});
+}
+
+test "api query contract preserves pinned dense revisions on the storage owner wire" {
+    const alloc = std.testing.allocator;
+    const pinned: [32]u8 = @splat(0x23);
+    const codec = @import("query_execution_contract.zig");
+    for ([_]?[32]u8{ null, pinned }) |revision| {
+        const wire = try codec.encodeStorageKernelQueryRequest(alloc, .{
+            .index_name = "semantic",
+            .dense = .{ .vector = &.{ 1, 2 }, .k = 2, .model_revision_fence = .{ .expected = revision } },
+        });
+        defer alloc.free(wire);
+        var decoded = try parseQueryRequest(alloc, null, "docs", wire);
+        defer decoded.deinit(alloc);
+        const dense_query = if (decoded.req.dense) |dense| dense else decoded.req.dense_queries[0].query;
+        try std.testing.expectEqual(revision, dense_query.model_revision_fence.?.expected);
+    }
 }
 
 test "api query contract hierarchy worker wire preserves explicit deferred projection" {
@@ -12884,31 +12949,33 @@ fn queryBodyForGeneratedContractAlloc(
     return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
 }
 
+const internal_shard_fields = [_][]const u8{
+    "_projection_source_fields",
+    "_distributed_text_stats",
+    "native_doc_id_constraints",
+    "_filter_query_json",
+    "_exclusion_query_json",
+    "_identity_read_generation",
+    "_native_cut",
+    "_index_alias_fences",
+    "_response_live_read",
+    "_document_authority",
+    "_privacy_policy_version",
+    "_index_name",
+    "_primary_text_index_name",
+    "_embedding_limits",
+    "_embedding_model_revisions",
+    "_hierarchy_parent_admitted",
+    "_defer_hierarchy_child_hydration",
+    "_require_algebraic_filter_resolution",
+    db_mod.doc_filter_wire.field_name,
+    "_filter_doc_ids",
+    "_filter_doc_ids_positive",
+    "_exclude_doc_ids",
+};
+
 fn isInternalShardFieldName(name: []const u8) bool {
-    const internal_fields = [_][]const u8{
-        "_projection_source_fields",
-        "_distributed_text_stats",
-        "native_doc_id_constraints",
-        "_filter_query_json",
-        "_exclusion_query_json",
-        "_identity_read_generation",
-        "_native_cut",
-        "_index_alias_fences",
-        "_response_live_read",
-        "_document_authority",
-        "_privacy_policy_version",
-        "_index_name",
-        "_primary_text_index_name",
-        "_embedding_limits",
-        "_hierarchy_parent_admitted",
-        "_defer_hierarchy_child_hydration",
-        "_require_algebraic_filter_resolution",
-        db_mod.doc_filter_wire.field_name,
-        "_filter_doc_ids",
-        "_filter_doc_ids_positive",
-        "_exclude_doc_ids",
-    };
-    inline for (internal_fields) |field| {
+    inline for (internal_shard_fields) |field| {
         if (std.mem.eql(u8, name, field)) return true;
     }
     return false;
@@ -13267,30 +13334,7 @@ fn validateCanonicalHierarchyExecutionBudget(req: db_mod.types.SearchRequest) !v
 }
 
 fn removeInternalShardFields(object: *std.json.ObjectMap) void {
-    const internal_fields = [_][]const u8{
-        "_projection_source_fields",
-        "_distributed_text_stats",
-        "native_doc_id_constraints",
-        "_filter_query_json",
-        "_exclusion_query_json",
-        "_identity_read_generation",
-        "_native_cut",
-        "_index_alias_fences",
-        "_response_live_read",
-        "_document_authority",
-        "_privacy_policy_version",
-        "_index_name",
-        "_primary_text_index_name",
-        "_embedding_limits",
-        "_hierarchy_parent_admitted",
-        "_defer_hierarchy_child_hydration",
-        "_require_algebraic_filter_resolution",
-        db_mod.doc_filter_wire.field_name,
-        "_filter_doc_ids",
-        "_filter_doc_ids_positive",
-        "_exclude_doc_ids",
-    };
-    inline for (internal_fields) |field| {
+    inline for (internal_shard_fields) |field| {
         _ = object.orderedRemove(field);
     }
 }

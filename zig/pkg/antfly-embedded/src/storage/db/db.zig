@@ -17501,6 +17501,37 @@ pub const DB = struct {
         options: types.ArtifactRepairRunOptions,
         lease_authority: IndexRepairLeaseAuthority,
     ) anyerror!types.ArtifactRepairResult { // explicit: re-enters the artifact repair dispatch
+        if (req.observe_index_repair) {
+            const name = req.index_name orelse return error.InvalidArgument;
+            if (req.force or req.control != null) return error.InvalidArgument;
+            if (try self.indexRepairIdForIndex(alloc, name)) |id| {
+                var entry = self.loadIndexRepairEntryById(alloc, id) catch |err| switch (err) {
+                    error.IndexRepairIntentNotFound => return .{ .observed_only = true, .observation_changed = true },
+                    else => return err,
+                };
+                defer entry.deinit(alloc);
+                const intent = entry.intent;
+                const terminal = intent.phase == .terminal and retryableIndexRepairTerminalPhase(intent.last_error, intent.trigger) == null;
+                const needs_source_dispatch = intent.work_class == .initial_build and
+                    (intent.trigger == .catalog_admission or intent.trigger == .replay_artifact_unavailable) and
+                    initialBuildCanRetireBeforeActivation(intent);
+                if (terminal or !needs_source_dispatch) return .{
+                    .limit = req.limit,
+                    .scanned = 1,
+                    .failed = @intFromBool(terminal),
+                    .unresolved = 1,
+                    .in_progress = @intFromBool(!terminal),
+                    .indexes_degraded_after = 1,
+                    .debt_remaining = true,
+                    .observed_only = true,
+                    .terminal_error = if (terminal) try alloc.dupe(u8, intent.last_error orelse "index_repair_terminal") else null,
+                };
+            } else if (try self.indexGenerationRepairRequired(alloc, name)) {
+                return .{ .observed_only = true, .observation_changed = true };
+            }
+            // Once the generation settles, operator repair can still have
+            // source artifacts to dispatch. Use the ordinary bounded pass.
+        }
         // Operator continuations carry an artifact-ledger cursor. Generation
         // repair has no local cursor and must retain its own request validation.
         var generation_req = req;
@@ -17680,17 +17711,25 @@ pub const DB = struct {
             result.scanned = 1;
             result.indexes_degraded_before = @intFromBool(repair_required);
             result.indexes_degraded_after = 1;
-            if (req.force) {
+            if (req.force or options.defer_durable_index_repair_execution) {
                 var current = try self.loadIndexRepairEntryById(alloc, repair_id);
                 defer current.deinit(alloc);
                 if (current.intent.phase == .terminal) {
-                    try self.updateIndexRepairIntent(alloc, repair_id, .{
-                        .phase = .detected,
-                        .attempt_count = current.intent.attempt_count +| 1,
-                        .failure_streak = 0,
-                        .next_retry_at_ms = 0,
-                        .replace_last_error = true,
-                    });
+                    if (req.force) {
+                        try self.updateIndexRepairIntent(alloc, repair_id, .{
+                            .phase = .detected,
+                            .attempt_count = current.intent.attempt_count +| 1,
+                            .failure_streak = 0,
+                            .next_retry_at_ms = 0,
+                            .replace_last_error = true,
+                        });
+                    } else if (retryableIndexRepairTerminalPhase(current.intent.last_error, current.intent.trigger) == null) {
+                        result.terminal_error = try alloc.dupe(u8, current.intent.last_error orelse "index_repair_terminal");
+                        result.failed = 1;
+                        result.unresolved = 1;
+                        result.debt_remaining = true;
+                        return result;
+                    }
                 }
             }
             if (options.defer_durable_index_repair_execution) {

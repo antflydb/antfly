@@ -892,6 +892,85 @@ pub fn currentArtifactProduced(alloc: std.mem.Allocator, txn: anytype, artifact:
     return error.ArtifactCatalogCorrupt;
 }
 
+const embedding_output_revision_prefix = "\x00\x00__artifact_publication__:embedding_output_revision:v1:";
+fn embeddingOutputRevisionKey(namespace: publication.Namespace, artifact: []const u8) [embedding_output_revision_prefix.len + 24 + 32]u8 {
+    var result: [embedding_output_revision_prefix.len + 24 + 32]u8 = undefined;
+    @memcpy(result[0..embedding_output_revision_prefix.len], embedding_output_revision_prefix);
+    @memcpy(result[embedding_output_revision_prefix.len..][0..24], &namespace);
+    std.crypto.hash.sha2.Sha256.hash(artifact, result[result.len - 32 ..][0..32], .{});
+    return result;
+}
+
+/// Resolve the execution identity of an already accepted output. The ordered
+/// apply checked the causal inputs before writing the artifact reference. Here
+/// the current output position is the fence: replaying its accepted bytes
+/// must not revalidate a source row that may already have advanced.
+pub const EmbeddingOutputRevisions = struct {
+    authority: publication.Authority,
+    last: ?struct { digest: publication.Digest, revision: ?publication.Digest } = null,
+
+    pub fn read(self: *EmbeddingOutputRevisions, txn: anytype, artifact: []const u8) !?publication.Digest {
+        // Ordered acceptance publishes a compact, epoch-independent witness
+        // for immutable output bytes. The exact output position also rejects
+        // a later unpinned write, tombstone, or source-side replacement.
+        const stable_key = embeddingOutputRevisionKey(self.authority.namespace, artifact);
+        const stable = txn.get(&stable_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (stable) |raw| {
+            if (raw.len != 32 + publication.Position.encoded_len) return error.ArtifactCatalogCorrupt;
+            const revision: publication.Digest = raw[0..32].*;
+            const position = publication.Position.decode(raw[32..]) catch return error.ArtifactCatalogCorrupt;
+            if (std.meta.eql(try publication.artifactRevision(txn, self.authority.namespace, artifact), @as(?publication.Position, position)))
+                return revision;
+        }
+        // Existing data written before compact witnesses used epoch-local
+        // proofs. Continue to accept those during their original epoch.
+        const reference = artifactReferenceKey(self.authority, artifact);
+        const raw = txn.get(&reference) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        if (raw.len != 32 + publication.Position.encoded_len) return error.ArtifactCatalogCorrupt;
+        const digest: publication.Digest = raw[0..32].*;
+        const position = publication.Position.decode(raw[32..]) catch return error.ArtifactCatalogCorrupt;
+        if (!std.meta.eql(try publication.artifactRevision(txn, self.authority.namespace, artifact), @as(?publication.Position, position)))
+            return null;
+        if (self.last) |last| {
+            if (std.mem.eql(u8, &last.digest, &digest)) return last.revision;
+        }
+        const proof = txn.get(&key(self.authority.namespace, digest)) catch |err| switch (err) {
+            error.NotFound => return error.ArtifactCatalogCorrupt,
+            else => return err,
+        };
+        if (proof.len < 32 or proof.len > max_encoded_bytes) return error.ArtifactCatalogCorrupt;
+        var checksum: publication.Digest = undefined;
+        const body = proof[0 .. proof.len - checksum.len];
+        std.crypto.hash.sha2.Sha256.hash(body, &checksum, .{});
+        if (!std.mem.eql(u8, &checksum, proof[body.len..])) return error.ArtifactCatalogCorrupt;
+
+        var cursor: ProofCursor = .{ .bytes = body };
+        if (!std.mem.eql(u8, try cursor.take(4), proof_magic)) return error.ArtifactCatalogCorrupt;
+        const version = try cursor.byte();
+        if (version != 3 and version != 4) return error.ArtifactCatalogCorrupt;
+        const kind = try cursor.byte();
+        if (!std.mem.eql(u8, try cursor.take(24), &self.authority.namespace) or
+            try cursor.readU64() != self.authority.epoch or
+            !std.mem.eql(u8, try cursor.take(32), &self.authority.catalog_digest))
+            return error.ArtifactCatalogCorrupt;
+        _ = try cursor.readU64(); // producer generation
+        if (!std.mem.eql(u8, try cursor.take(32), &digest)) return error.ArtifactCatalogCorrupt;
+        _ = try cursor.take(32); // input digest
+        const revision = if (version == 4 and kind == @backingInt(@as(@FieldType(publication.Command, "producer_kind"), .index)))
+            (try cursor.take(32))[0..32].*
+        else
+            null;
+        self.last = .{ .digest = digest, .revision = revision };
+        return revision;
+    }
+};
+
 fn readCurrentArtifactProof(alloc: std.mem.Allocator, txn: anytype, artifact: []const u8, expected_value: ?[]const u8, comptime verify_value: bool) !?Owned {
     const authority = (try publication.authority(txn)) orelse return null;
     const reference = artifactReferenceKey(authority, artifact);
@@ -1367,6 +1446,19 @@ fn stageWithDocumentReferences(txn: anytype, command: publication.Command, encod
         const effect_key = if (adopted) |selected| selected.proof.effects[effect_index].key else command.mutations[effect_index].key;
         const effect_position = if (adopted) |selected| try (selected.positions[effect_index] orelse position).encode() else encoded_position;
         @memcpy(value[32..], &effect_position);
+        if (command.producer_kind == .index) if (command.execution_identity) |revision| {
+            const family = if (adopted) |selected| selected.proof.effects[effect_index].family else command.mutations[effect_index].family;
+            if (family == .base_vector or family == .derived_vector) {
+                const live = if (adopted) |selected| selected.proof.effects[effect_index].value_digest != null else command.mutations[effect_index].value != null;
+                const stable_key = embeddingOutputRevisionKey(command.namespace, effect_key);
+                if (live) {
+                    var witness: [32 + publication.Position.encoded_len]u8 = undefined;
+                    @memcpy(witness[0..32], &revision);
+                    @memcpy(witness[32..], &effect_position);
+                    try txn.put(&stable_key, &witness);
+                } else try txn.delete(&stable_key);
+            }
+        };
         const reference = artifactReferenceKey(authority, effect_key);
         const previous = txn.get(&reference) catch |err| switch (err) {
             error.NotFound => null,
@@ -1889,6 +1981,49 @@ test "ordered artifact inventory compact proof preserves output CAS history" {
     try std.testing.expectEqualDeep(command.execution_identity, revised_decoded.proof.execution_identity);
     try std.testing.expect(!std.mem.eql(u8, &old_input, &revised_decoded.proof.input_digest));
     try revised_decoded.proof.validatePortableShape(alloc);
+    const position: publication.Position = .{ .raft = .{ .term = 2, .index = 10 } };
+    const reference = artifactReferenceKey(.{
+        .namespace = command.namespace,
+        .epoch = command.authority_epoch,
+        .catalog_digest = command.catalog_digest,
+    }, artifact);
+    const position_key = publication.artifactRevisionKey(command.namespace, artifact);
+    const proof_key = key(command.namespace, command.publication_digest);
+    const encoded_position = try position.encode();
+    var encoded_reference: [32 + publication.Position.encoded_len]u8 = undefined;
+    @memcpy(encoded_reference[0..32], &command.publication_digest);
+    @memcpy(encoded_reference[32..], &encoded_position);
+    const EvidenceRead = struct {
+        keys: [4][]const u8,
+        values: [4][]const u8,
+
+        pub fn get(self: @This(), name: []const u8) anyerror![]const u8 {
+            for (self.keys, self.values) |candidate, value| {
+                if (std.mem.eql(u8, candidate, name)) return value;
+            }
+            return error.NotFound;
+        }
+    };
+    var read: EvidenceRead = .{
+        .keys = .{ &reference, &position_key, &proof_key, "" },
+        .values = .{ &encoded_reference, &encoded_position, revised_raw, "" },
+    };
+    var evidence: EmbeddingOutputRevisions = .{
+        .authority = .{ .namespace = command.namespace, .epoch = command.authority_epoch, .catalog_digest = command.catalog_digest },
+    };
+    try std.testing.expectEqualDeep(command.execution_identity, try evidence.read(read, artifact));
+    const stable_key = embeddingOutputRevisionKey(command.namespace, artifact);
+    var stable_value = encoded_reference;
+    @memcpy(stable_value[0..32], &command.execution_identity.?);
+    read.keys[3] = &stable_key;
+    read.values[3] = &stable_value;
+    evidence.authority.epoch += 1;
+    evidence.authority.catalog_digest = @splat(3);
+    try std.testing.expectEqualDeep(command.execution_identity, try evidence.read(read, artifact));
+    const replaced = try (publication.Position{ .raft = .{ .term = 2, .index = 11 } }).encode();
+    read.values[1] = &replaced;
+    try std.testing.expectEqual(@as(?publication.Digest, null), try evidence.read(read, artifact));
+
     const transport = @import("artifact_publication_transport_codec.zig");
     const wire = try transport.encodeAlloc(alloc, command);
     defer alloc.free(wire);

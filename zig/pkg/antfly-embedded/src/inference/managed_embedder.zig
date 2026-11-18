@@ -687,6 +687,7 @@ pub const ManagedEmbeddingEntry = struct {
     document_input_type: []u8 = "",
     query_instruction: []u8 = "",
     model_identity: []u8 = "",
+    required_model_revision: ?[32]u8 = null,
     planned_embedding_lease: ?inference_work.CapabilityLease = null,
     truncate: []u8 = "",
     /// Borrowed from the service ProviderRuntime, or from the owning
@@ -1579,6 +1580,11 @@ pub const ManagedEmbedder = struct {
         return try embedWithEntryForTask(alloc, &request_entry, text, request_entry.dimensions, .retrieval_query);
     }
 
+    pub fn queryModelRevision(self: *const ManagedEmbedder, index_name: []const u8) ?[32]u8 {
+        const entry = self.findQueryEntry(index_name) orelse return null;
+        return entry.required_model_revision;
+    }
+
     pub fn prepareQueryEmbedding(
         self: *const ManagedEmbedder,
         alloc: std.mem.Allocator,
@@ -2361,7 +2367,7 @@ pub const ManagedEmbedder = struct {
                 else => return err,
             };
             if (lease.capabilities != null) {
-                lease.scope_digest = try remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, headers);
+                lease.scope_digest = try remote_capabilities.revisionScopedDigest(alloc, entry.base_url, entry.model, .embed, headers, entry.required_model_revision);
                 return lease;
             }
         }
@@ -3079,6 +3085,10 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
             try resolveAntflyInferenceBaseUrl(alloc, embedder_cfg, options),
     };
     defer alloc.free(endpoint);
+    const model_revision = try @import("../storage/db/types.zig").embeddingProducerModelRevision(embedder_value.object);
+    if (model_revision != null and (provider != .antfly or embedder_cfg.model.len == 0 or std.mem.eql(u8, endpoint, "antfly:embedded") or (cfg.sparse orelse false)))
+        return error.InvalidCreateTableRequest;
+    const revision_hex = if (model_revision) |revision| std.fmt.bytesToHex(revision, .lower) else null;
     if (credential_safety.containsSecretReference(endpoint) or credential_safety.urlContainsCredentials(endpoint))
         return error.InvalidCreateTableRequest;
     const SemanticProducer = struct {
@@ -3097,6 +3107,7 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         document_input_type: ?[]const u8 = null,
         query_instruction: ?[]const u8 = null,
         model_identity: ?[]const u8 = null,
+        model_revision: ?[]const u8 = null,
     };
     return try std.json.Stringify.valueAlloc(alloc, SemanticProducer{
         .provider = @tagName(provider),
@@ -3113,6 +3124,7 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         .document_input_type = if (embedder_cfg.document_input_type.len > 0) embedder_cfg.document_input_type else null,
         .query_instruction = if (embedder_cfg.query_instruction.len > 0) embedder_cfg.query_instruction else null,
         .model_identity = if (embedder_cfg.model_identity.len > 0) embedder_cfg.model_identity else null,
+        .model_revision = if (revision_hex) |*hex| hex else null,
     }, .{ .emit_null_optional_fields = false });
 }
 
@@ -4250,7 +4262,8 @@ fn semanticProducerComparisonConfigJsonAlloc(
             std.mem.eql(u8, field.key_ptr.*, "query_input_type") or
             std.mem.eql(u8, field.key_ptr.*, "document_input_type") or
             std.mem.eql(u8, field.key_ptr.*, "query_instruction") or
-            std.mem.eql(u8, field.key_ptr.*, "model_identity");
+            std.mem.eql(u8, field.key_ptr.*, "model_identity") or
+            std.mem.eql(u8, field.key_ptr.*, "model_revision");
         if (!allowed) return error.InvalidEmbeddingArtifactProducer;
     }
     if (object.get("url") != null or object.get("api_url") != null or object.get("base_url") != null)
@@ -4286,6 +4299,7 @@ fn semanticProducerComparisonConfigJsonAlloc(
         document_input_type: ?[]const u8 = null,
         query_instruction: ?[]const u8 = null,
         model_identity: ?[]const u8 = null,
+        model_revision: ?[]const u8 = null,
     };
     const optionalString = struct {
         fn get(source: std.json.ObjectMap, name: []const u8) !?[]const u8 {
@@ -4317,6 +4331,7 @@ fn semanticProducerComparisonConfigJsonAlloc(
         .document_input_type = try optionalString(object, "document_input_type"),
         .query_instruction = try optionalString(object, "query_instruction"),
         .model_identity = try optionalString(object, "model_identity"),
+        .model_revision = try optionalString(object, "model_revision"),
     }, .{ .emit_null_optional_fields = false });
 }
 
@@ -4349,10 +4364,16 @@ fn buildArtifactManagedEmbeddingEntryFromProducerValue(
         null;
     defer if (semantic_comparison) |*parsed| parsed.deinit();
     const parser_input = if (semantic_comparison) |parsed| parsed.value else producer;
-    const entry = buildManagedEmbeddingEntry(alloc, index_name, artifact_cfg, parser_input, options, dims, null) catch |err| switch (err) {
+    var entry = buildManagedEmbeddingEntry(alloc, index_name, artifact_cfg, parser_input, options, dims, null) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidEmbeddingArtifactProducer,
     };
+    errdefer entry.deinit(alloc);
+    if (semantic_comparison_json != null) {
+        entry.required_model_revision = try @import("../storage/db/types.zig").embeddingProducerModelRevision(producer.object);
+        if (entry.required_model_revision != null and (entry.provider != .antfly or entry.antfly_provider != null or sparse))
+            return error.InvalidEmbeddingArtifactProducer;
+    }
     return .{
         .entry = entry,
         .semantic_identity_only = semantic_comparison_json != null,
@@ -4625,6 +4646,10 @@ fn validateCatalogOwnerSemanticIdentity(
     var embedder_cfg = parseEmbedderConfigFromValue(alloc, embedder_value) catch
         return error.InvalidEmbeddingArtifactProducer;
     defer embedder_cfg.deinit(alloc);
+    const identity_revision = try @import("../storage/db/types.zig").embeddingProducerModelRevision(parsed_identity.value.object);
+    const configured_revision = try @import("../storage/db/types.zig").embeddingProducerModelRevision(embedder_value.object);
+    if (configured_revision != null and !std.meta.eql(identity_revision, configured_revision))
+        return error.InvalidEmbeddingArtifactProducer;
     const provider = parseEmbedderProvider(embedder_cfg) catch
         return error.InvalidEmbeddingArtifactProducer;
     const configured_query_input_type = embedder_cfg.query_input_type;
@@ -5312,6 +5337,7 @@ const CatalogSemanticExecutionBinding = struct {
     region: []u8,
     project_id: []u8,
     embedded: bool,
+    model_revision: ?[32]u8 = null,
 
     pub fn deinit(self: *CatalogSemanticExecutionBinding, alloc: std.mem.Allocator) void {
         alloc.free(self.endpoint);
@@ -5355,7 +5381,10 @@ fn catalogSemanticExecutionBindingAlloc(
     const endpoint = try semanticIdentityStringField(identity.value, "endpoint");
     const region = try semanticIdentityStringField(identity.value, "region");
     const project_id = try semanticIdentityOptionalStringField(identity.value, "project_id");
+    const model_revision = try @import("../storage/db/types.zig").embeddingProducerModelRevision(identity.value.object);
     const embedded = std.mem.eql(u8, endpoint, "antfly:embedded");
+    if (model_revision != null and (embedded or sparse or !std.mem.eql(u8, try semanticIdentityStringField(identity.value, "provider"), "antfly")))
+        return error.InvalidEmbeddingArtifactProducer;
     if (embedded and options.antfly_provider == null)
         return error.InvalidEmbeddingArtifactProducer;
 
@@ -5370,6 +5399,7 @@ fn catalogSemanticExecutionBindingAlloc(
         .region = owned_region,
         .project_id = owned_project_id,
         .embedded = embedded,
+        .model_revision = model_revision,
     };
 }
 
@@ -5438,6 +5468,9 @@ fn buildManagedEmbeddingEntry(
         options.antfly_provider
     else
         null;
+    const required_model_revision = if (semantic_binding) |binding| binding.model_revision else try @import("../storage/db/types.zig").embeddingProducerModelRevision(embedder.object);
+    if (required_model_revision != null and (provider != .antfly or antfly_provider != null or sparse))
+        return error.InvalidEmbeddingArtifactProducer;
     const owned_index_name = try alloc.dupe(u8, index_name);
     errdefer alloc.free(owned_index_name);
     const owned_embedding_name: []u8 = if (cfg.embedding_name) |embedding_name| try alloc.dupe(u8, embedding_name) else @constCast("");
@@ -5552,6 +5585,7 @@ fn buildManagedEmbeddingEntry(
         .provider = provider,
         .model = owned_model,
         .model_identity = model_identity,
+        .required_model_revision = required_model_revision,
         .base_url = base_url,
         .gateway_id = gateway_id,
         .source_table = source_table,
@@ -6542,6 +6576,7 @@ fn discoverRemoteEmbeddingLease(entry: *const ManagedEmbeddingEntry, http: *http
     const cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
     var lease = try cache.getOrDiscoverLeaseWithContext(http, entry.base_url, entry.model, .embed, headers, .{
         .deadline_ns = entry.deadline_ns,
+        .required_model_revision = entry.required_model_revision,
         .retry_not_before_ns = entry.retry_not_before_ns,
         .cancellation = entry.cancellation orelse .none,
         .refresh_in_background = entry.remote_query_workload and entry.shared_http_client == null and
@@ -6563,8 +6598,13 @@ fn acquireRemoteEmbeddingLease(
     headers: []const [2][]const u8,
 ) !remote_capabilities.CapabilityLease {
     if (entry.planned_embedding_lease) |planned| {
+        if (entry.required_model_revision) |revision| {
+            const capabilities = planned.capabilities orelse return error.InferenceCapabilitiesStale;
+            if (!capabilities.model_revision_pinning or !std.meta.eql(capabilities.model_revision, @as(?[32]u8, revision)))
+                return error.InferenceCapabilitiesStale;
+        }
         if (planned.scope_digest) |scope| {
-            const actual = try remote_capabilities.scopeDigest(provider.allocator, entry.base_url, entry.model, .embed, headers);
+            const actual = try remote_capabilities.revisionScopedDigest(provider.allocator, entry.base_url, entry.model, .embed, headers, entry.required_model_revision);
             if (!std.mem.eql(u8, &scope, &actual)) return error.InferenceCapabilitiesStale;
         }
         // Keep the coordinator's route and descriptor through every retry.
@@ -6631,7 +6671,7 @@ fn invalidateRemoteEmbeddingLease(
     lease: remote_capabilities.CapabilityLease,
 ) !void {
     const cache = entry.capabilityCache() orelse return;
-    try cache.invalidateLease(entry.base_url, entry.model, .embed, headers, .{
+    try cache.invalidateRevisionScopedLease(entry.base_url, entry.model, .embed, headers, entry.required_model_revision, .{
         .routing_token = lease.routing_token,
         .descriptor_revision = lease.descriptor_revision,
     });
@@ -7237,7 +7277,7 @@ fn embedPartItemsWithEntry(
     const capability_cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
     const planned_capabilities = planned_lease.capabilities orelse return error.EmbeddingCapabilitiesUnavailable;
     if (planned_lease.scope_digest) |scope| {
-        const current_scope = try remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, capability_headers);
+        const current_scope = try remote_capabilities.revisionScopedDigest(alloc, entry.base_url, entry.model, .embed, capability_headers, entry.required_model_revision);
         if (!std.mem.eql(u8, &scope, &current_scope)) return error.InferenceCapabilitiesStale;
         const lease = planned_lease;
         const live = lease.capabilities orelse return error.InferenceCapabilitiesStale;
@@ -7755,7 +7795,7 @@ fn prepareRemoteQueryEmbedding(alloc: std.mem.Allocator, entry: *const ManagedEm
         failure = err;
         return err;
     };
-    lease.scope_digest = remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, headers) catch |err| {
+    lease.scope_digest = remote_capabilities.revisionScopedDigest(alloc, entry.base_url, entry.model, .embed, headers, entry.required_model_revision) catch |err| {
         failure = err;
         return err;
     };
@@ -13382,4 +13422,30 @@ test "offline lake build configuration validates algorithms metrics and corpus a
 
 test "managed embedder commit requirements sparse discovery carries caller context" {
     try testSparseCacheRevision();
+}
+
+test "managed embedder model revision survives durable producer normalization and runtime translation" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"test-model","url":"http://127.0.0.1:1/ai/v1","model_revision":"1111111111111111111111111111111111111111111111111111111111111111"}}
+    ;
+    var original = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer original.deinit();
+    const normalized = (try normalizeEmbeddingCatalogSemanticProducerJsonWithOptions(alloc, original.value, .{})).?;
+    defer alloc.free(normalized);
+    var admitted = try std.json.parseFromSlice(std.json.Value, alloc, normalized, .{});
+    defer admitted.deinit();
+    const stored_index = try translateEmbeddingsIndexConfigJson(alloc, "semantic", admitted.value);
+    defer alloc.free(stored_index);
+    var translated = try std.json.parseFromSlice(std.json.Value, alloc, stored_index, .{});
+    defer translated.deinit();
+    const proof = admitted.value.object.get("semantic_producer").?.string;
+    try std.testing.expectEqualStrings(proof, translated.value.object.get("semantic_producer").?.string);
+
+    const indexes = try std.fmt.allocPrint(alloc, "{{\"semantic\":{s}}}", .{normalized});
+    defer alloc.free(indexes);
+    var runtime = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes, .{});
+    defer runtime.deinit();
+    try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(0x11))), runtime.queryModelRevision("semantic"));
+    try std.testing.expectEqual(runtime.queryModelRevision("semantic"), runtime.findArtifactEntry("semantic").?.required_model_revision);
 }

@@ -150,6 +150,7 @@ const CapabilityFlight = struct {
 };
 
 pub const WaitContext = struct {
+    required_model_revision: ?[32]u8 = null,
     retry_not_before_ns: ?*u64 = null,
     deadline_ns: ?u64 = null,
     cancellation: CancellationToken = .none,
@@ -264,7 +265,7 @@ pub const Cache = struct {
         var wait_context = supplied_context;
         if (wait_context.deadline_ns == null)
             wait_context.deadline_ns = monotonicNowNs(self.io) +| capability_activation_timeout_ns;
-        const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, operation, headers);
+        const key = try revisionScopedCacheKeyAlloc(self.alloc, inference_url, model, operation, headers, wait_context.required_model_revision);
         defer self.alloc.free(key);
         while (true) {
             if (wait_context.retry_not_before_ns) |hint| hint.* = 0;
@@ -297,7 +298,7 @@ pub const Cache = struct {
                             now_ns >= entry.refresh_not_before_ns and !self.flights.contains(key))
                         {
                             entry.refresh_not_before_ns = now_ns +| capability_refresh_retry_ns;
-                            self.scheduleRefreshLocked(http, inference_url, model, operation, headers) catch {};
+                            self.scheduleRefreshLocked(http, inference_url, model, operation, headers, wait_context.required_model_revision) catch {};
                         }
                         const observed = entry.*;
                         self.mutex.unlock(self.io);
@@ -479,8 +480,7 @@ pub const Cache = struct {
                 {
                     // A failed cold flight has no lease to defer. Remember its
                     // cooldown in the same bounded cache as positive entries.
-                    const cooldown = @max(discovery_retry, now_after_discovery +| capability_refresh_retry_ns);
-                    discovery_retry = cooldown;
+                    discovery_retry = @max(discovery_retry, now_after_discovery +| capability_refresh_retry_ns);
                     self.putEntryLocked(key, .{
                         .value = null,
                         .expires_at_ns = 0,
@@ -538,6 +538,7 @@ pub const Cache = struct {
         model: []const u8,
         operation: work.Operation,
         headers: []const [2][]const u8,
+        required_model_revision: ?[32]u8,
 
         fn run(refresh: Refresh) void {
             var arena = refresh.arena;
@@ -545,6 +546,7 @@ pub const Cache = struct {
             const now = monotonicNowNs(refresh.cache.io);
             _ = refresh.cache.getOrDiscoverLeaseWithContext(refresh.http, refresh.url, refresh.model, refresh.operation, refresh.headers, .{
                 .passive_refresh = true,
+                .required_model_revision = refresh.required_model_revision,
                 .deadline_ns = now +| capability_discovery_timeout_ns,
             }) catch return;
         }
@@ -557,6 +559,7 @@ pub const Cache = struct {
         model: []const u8,
         operation: work.Operation,
         headers: []const [2][]const u8,
+        required_model_revision: ?[32]u8,
     ) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         errdefer arena.deinit();
@@ -575,6 +578,7 @@ pub const Cache = struct {
             .model = owned_model,
             .operation = operation,
             .headers = owned_headers,
+            .required_model_revision = required_model_revision,
         }});
     }
 
@@ -696,7 +700,19 @@ pub const Cache = struct {
         headers: []const [2][]const u8,
         rejected: LeaseIdentity,
     ) !void {
-        const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, operation, headers);
+        return self.invalidateRevisionScopedLease(inference_url, model, operation, headers, null, rejected);
+    }
+
+    pub fn invalidateRevisionScopedLease(
+        self: *Cache,
+        inference_url: []const u8,
+        model: []const u8,
+        operation: work.Operation,
+        headers: []const [2][]const u8,
+        required_model_revision: ?[32]u8,
+        rejected: LeaseIdentity,
+    ) !void {
+        const key = try revisionScopedCacheKeyAlloc(self.alloc, inference_url, model, operation, headers, required_model_revision);
         defer self.alloc.free(key);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -805,11 +821,22 @@ fn waitForFlight(io: std.Io, flight: *CapabilityFlight, context: WaitContext) !v
 }
 
 pub fn scopeDigest(alloc: std.mem.Allocator, url: []const u8, model: []const u8, operation: work.Operation, headers: []const [2][]const u8) ![32]u8 {
-    const key = try capabilityCacheKeyAlloc(alloc, url, model, operation, headers);
+    return revisionScopedDigest(alloc, url, model, operation, headers, null);
+}
+
+pub fn revisionScopedDigest(alloc: std.mem.Allocator, url: []const u8, model: []const u8, operation: work.Operation, headers: []const [2][]const u8, revision: ?[32]u8) ![32]u8 {
+    const key = try revisionScopedCacheKeyAlloc(alloc, url, model, operation, headers, revision);
     defer alloc.free(key);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(key, &digest, .{});
     return digest;
+}
+
+fn revisionScopedCacheKeyAlloc(alloc: std.mem.Allocator, url: []const u8, model: []const u8, operation: work.Operation, headers: []const [2][]const u8, revision: ?[32]u8) ![]u8 {
+    const key = try capabilityCacheKeyAlloc(alloc, url, model, operation, headers);
+    const expected = revision orelse return key;
+    defer alloc.free(key);
+    return std.fmt.allocPrint(alloc, "{s}\x1f{s}", .{ key, &std.fmt.bytesToHex(expected, .lower) });
 }
 
 fn capabilityCacheKeyAlloc(
@@ -1459,7 +1486,10 @@ fn loadMissingModelInstance(
     const deadline = @min(context.deadline_ns orelse now +| capability_activation_timeout_ns, now +| capability_activation_timeout_ns);
     const catalog_url = try modelsUrlAlloc(alloc, inference_url);
     defer alloc.free(catalog_url);
-    const url = try std.fmt.allocPrint(alloc, "{s}/instances?operation={s}", .{ catalog_url, operation.wireName() });
+    const url = if (context.required_model_revision) |revision|
+        try std.fmt.allocPrint(alloc, "{s}/instances?operation={s}&model_revision={s}", .{ catalog_url, operation.wireName(), &std.fmt.bytesToHex(revision, .lower) })
+    else
+        try std.fmt.allocPrint(alloc, "{s}/instances?operation={s}", .{ catalog_url, operation.wireName() });
     defer alloc.free(url);
     const kind: []const u8 = switch (operation.task()) {
         .read => "reader",
@@ -1562,7 +1592,13 @@ fn discoverWithContextOnce(
     ));
     const scoped_url = try scopedModelsUrlAlloc(alloc, inference_url, model, operation);
     defer alloc.free(scoped_url);
-    const url = scoped_url;
+    const required_revision = context.required_model_revision;
+    const revision_url = if (required_revision) |revision|
+        try std.fmt.allocPrint(alloc, "{s}&model_revision={s}", .{ scoped_url, &std.fmt.bytesToHex(revision, .lower) })
+    else
+        null;
+    defer if (revision_url) |value| alloc.free(value);
+    const url = revision_url orelse scoped_url;
     var response = http.get(url, .{
         .follow_redirects = false,
         .headers = headers,
@@ -1579,7 +1615,7 @@ fn discoverWithContextOnce(
     };
     defer response.deinit();
     const activation_advertised = if (response.headers.get(model_activation_header)) |value|
-        std.ascii.eqlIgnoreCase(value, "supported")
+        std.ascii.eqlIgnoreCase(value, if (required_revision == null) "supported" else "revision-wake")
     else
         false;
     // Ordinary catalog discovery remains read-only. Only an execution-owned,
@@ -1587,6 +1623,7 @@ fn discoverWithContextOnce(
     // service explicitly advertises the existing model-instance protocol.
     if (!response.ok()) {
         const failure = discoveryResponseError(response);
+        if (required_revision != null and failure == error.RemoteCapabilityDiscoveryUnsupported) return error.RemoteCapabilityDiscoveryRejected;
         if (failure == error.RemoteCapabilityDiscoveryTransient) recordDiscoveryRetryHint(alloc, io, response, context);
         if (allow_activation and activation_advertised and response.status.code == 503 and
             try loadMissingModelInstance(alloc, io, http, inference_url, model, operation, headers, context))
@@ -1597,6 +1634,11 @@ fn discoverWithContextOnce(
     }
     const body = response.body orelse return error.InvalidInferenceCapabilities;
     const capabilities = try parseModelCapabilities(alloc, body, model, operation.task());
+    if (required_revision) |revision| {
+        const descriptor = capabilities orelse return error.RemoteCapabilitySelectorAbsent;
+        if (!descriptor.model_revision_pinning or !std.meta.eql(descriptor.model_revision, @as(?[32]u8, revision)))
+            return error.RemoteCapabilityDiscoveryRejected;
+    }
     if (capabilities == null) {
         if (response.headers.get(capability_selector_rejected_header)) |value| {
             if (std.ascii.eqlIgnoreCase(value, "true")) return error.RemoteCapabilityDiscoveryRejected;
@@ -2662,4 +2704,77 @@ test "remote Antfly dense output geometry is optional bounded metadata" {
     }) |shape| try std.testing.expectError(error.InvalidInferenceCapabilities, parseModelCapabilities(std.testing.allocator, prefix ++ shape ++ suffix, "model", .embed));
     const legacy = (try parseModelCapabilities(std.testing.allocator, "{\"embedders\":{\"model\":{\"inputs\":[\"text\"]}}}", "model", .embed)).?;
     try std.testing.expect(legacy.dense_output == null);
+}
+
+test "revision-scoped embedding discovery rejects an unpinned or different descriptor" {
+    const alloc = std.testing.allocator;
+    const requested: [32]u8 = @splat(0x11);
+    const sha = "1111111111111111111111111111111111111111111111111111111111111111";
+    const other = "2222222222222222222222222222222222222222222222222222222222222222";
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("model=model&task=embed&operation=embed&model_revision=" ++ sha, req.query);
+        }
+
+        fn serve(server: *httpx.TestServer) std.Io.Cancelable!void {
+            server.handleOne() catch {};
+        }
+    };
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    for ([_]enum { exact, changed, unpinned, missing, busy }{ .exact, .changed, .unpinned, .missing, .busy }) |mode| {
+        const descriptor = switch (mode) {
+            .exact => "{\"embedders\":{\"model\":{\"inputs\":[\"text\"],\"model_revision_pinning\":true,\"model_revision\":\"" ++ sha ++ "\"}}}",
+            .changed => "{\"embedders\":{\"model\":{\"inputs\":[\"text\"],\"model_revision_pinning\":true,\"model_revision\":\"" ++ other ++ "\"}}}",
+            .unpinned => "{\"embedders\":{\"model\":{\"inputs\":[\"text\"],\"model_revision\":\"" ++ sha ++ "\"}}}",
+            .missing, .busy => "{}",
+        };
+        var server = try httpx.TestServer.start(alloc, io, &.{.{
+            .method = .GET,
+            .path = "/ai/v1/models",
+            .max_uses = 1,
+            .assert_request = Check.request,
+            .respond = .{
+                .status = if (mode == .busy) 503 else 200,
+                .body = descriptor,
+                .headers = if (mode == .busy) &.{.{ .name = "Retry-After", .value = "5" }} else &.{},
+            },
+        }});
+        defer server.deinit();
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Check.serve, .{&server});
+        var http = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+        defer http.deinit();
+        var cache = Cache.init(alloc, io);
+        defer cache.deinit();
+        var retry_at: u64 = 0;
+        const context: WaitContext = .{
+            .required_model_revision = requested,
+            .deadline_ns = monotonicNowNs(io) + 2 * std.time.ns_per_s,
+            .retry_not_before_ns = &retry_at,
+        };
+        const result = cache.getOrDiscoverLeaseWithContext(&http, server.baseUrl(), "model", .embed, &.{}, context);
+        switch (mode) {
+            .exact => {
+                try std.testing.expectEqual(requested, (try result).capabilities.?.model_revision.?);
+                const cached = try cache.getOrDiscoverLeaseWithContext(&http, server.baseUrl(), "model", .embed, &.{}, context);
+                try std.testing.expectEqual(requested, cached.capabilities.?.model_revision.?);
+                const pinned = try revisionScopedDigest(alloc, server.baseUrl(), "model", .embed, &.{}, requested);
+                const alias = try scopeDigest(alloc, server.baseUrl(), "model", .embed, &.{});
+                try std.testing.expect(!std.mem.eql(u8, &pinned, &alias));
+            },
+            .changed, .unpinned => try std.testing.expectError(error.RemoteCapabilityDiscoveryRejected, result),
+            .missing => try std.testing.expectError(error.RemoteCapabilitySelectorAbsent, result),
+            .busy => {
+                try std.testing.expectError(error.RemoteCapabilityDiscoveryTransient, result);
+                const first_delay = retry_at;
+                try std.testing.expect(first_delay > monotonicNowNs(io));
+                try std.testing.expectError(error.RemoteCapabilityDiscoveryTransient, cache.getOrDiscoverLeaseWithContext(&http, server.baseUrl(), "model", .embed, &.{}, context));
+                try std.testing.expectEqual(first_delay, retry_at);
+            },
+        }
+        try group.await(io);
+    }
 }

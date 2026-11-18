@@ -105,7 +105,7 @@ pub const Catalogs = struct {
             for (configs) |cfg| {
                 if (try indexes.denseArtifactFlagsRequired(alloc, cfg)) return dense_artifact_flags_protocol;
                 if (try indexes.onlineGeneratedChunkVectorConfig(alloc, cfg, producers)) required = @max(required, 18);
-                if (try indexes.onlineBaseGeneratedVectorConfig(alloc, cfg, producers)) required = @max(required, 17);
+                if (try indexes.denseConfigModelRevision(alloc, cfg) != null or try indexes.onlineBaseGeneratedVectorConfig(alloc, cfg, producers)) required = @max(required, 17);
             }
         }
         if (self.resolvers.len != 0) {

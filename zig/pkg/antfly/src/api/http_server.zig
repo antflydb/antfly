@@ -18098,6 +18098,8 @@ pub const ApiHttpServer = struct {
             else => return error.InternalFailure,
         };
         defer alloc.free(expanded_index_json);
+        const model_pin = table_index_config.hasModelRevisionPin(alloc, expanded_index_json, false) catch return error.InvalidIndexRequest;
+        if (model_pin and (self.cfg.deployment_mode != .distributed or external_table)) return error.InvalidIndexRequest;
         const normalized_index_json = table_index_config.normalizeManagedEmbeddingIndexDimensionForCatalogJsonWithOptions(
             alloc,
             index_name,
@@ -18151,7 +18153,7 @@ pub const ApiHttpServer = struct {
         };
 
         const uses_artifact_sources = indexes_api.indexConfigUsesArtifactSources(alloc, normalized_index_json) catch return error.InvalidIndexRequest;
-        try self.admitArtifactSources(request, uses_artifact_sources);
+        try self.admitArtifactSources(request, uses_artifact_sources or model_pin);
 
         const destination_principal = if (request.destination_authorization_principal.len > 0)
             request.destination_authorization_principal
@@ -23130,6 +23132,15 @@ pub const ApiHttpServer = struct {
         };
         if (request.schema_json) |old| self.alloc.free(old);
         request.schema_json = bound_schema;
+        const model_pin = table_index_config.hasModelRevisionPin(self.alloc, request.indexes_json orelse tables_api.default_indexes_json, true) catch
+            return try contextual_operations.textAlloc(self.alloc, 400, "invalid table index configuration");
+        if (model_pin) {
+            var pinned_schema = schema_mod.parseValidatedTableSchema(self.alloc, bound_schema) catch
+                return try contextual_operations.textAlloc(self.alloc, 400, "invalid table schema");
+            defer pinned_schema.deinit(self.alloc);
+            if (self.cfg.deployment_mode != .distributed or pinned_schema.external_base_source != null)
+                return try contextual_operations.textAlloc(self.alloc, 400, "model revision pinning requires distributed ordered vector publication");
+        }
         const normalized_indexes_json = table_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
             self.alloc,
             request.indexes_json orelse tables_api.default_indexes_json,
@@ -23184,7 +23195,7 @@ pub const ApiHttpServer = struct {
             self.alloc,
             request.indexes_json orelse tables_api.default_indexes_json,
         ) catch return try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration");
-        self.admitArtifactSources(.{}, uses_artifact_sources) catch |err| return switch (err) {
+        self.admitArtifactSources(.{}, uses_artifact_sources or model_pin) catch |err| return switch (err) {
             error.UnsupportedArtifactIndexSources => try contextualUnsupportedArtifactSourcesResponse(self.alloc),
             error.ArtifactIndexSourcesTemporarilyUnavailable => try contextualArtifactSourcesUpgradePendingResponse(self.alloc),
             error.Canceled, error.DeadlineExceeded => return err,

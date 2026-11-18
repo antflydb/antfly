@@ -15190,6 +15190,9 @@ fn searchDenseInternal(
 
     const index_lookup_start = total_start;
     const entry = (try executor.dense_index(executor.ctx, req.index_name)) orelse return error.IndexNotFound;
+    if (dense.model_revision_fence) |fence| {
+        if (!std.meta.eql(entry.model_revision, fence.expected)) return error.IndexGenerationMismatch;
+    }
     profile.index_lookup_ns = platform_time.monotonicNs() - index_lookup_start;
     if (returnModeRequiresUnitGrouping(req.return_mode) and !entry.supports_unit_grouping)
         return error.UnsupportedHierarchyGrouping;

@@ -17567,6 +17567,8 @@ export interface components {
          *     }
          */
         AntflyEmbedderConfig: {
+            /** @description Physical hosted embedding model revision advertised by scoped inference discovery. Supported for managed dense embeddings with distributed ordered vector publication. To change revisions, build a new index and finish backfill before switching the serving alias. */
+            model_revision?: string;
             /** @description Immutable EmbeddingGemma 2 asset and recipe identity returned by /embed. Pin this when indexing; a changed checkpoint, tokenizer, or processor rejects embedding before vector publication. */
             model_identity?: string;
             /**

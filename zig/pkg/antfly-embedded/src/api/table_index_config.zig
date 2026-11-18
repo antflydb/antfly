@@ -224,6 +224,36 @@ pub fn isCatalogMetadataField(kind: db_types.IndexKind, field: []const u8) bool 
     return kind != .algebraic and std.mem.eql(u8, field, "version");
 }
 
+/// Detect revision pinning in a user index, or in its normalized producer.
+pub fn indexHasModelRevisionPin(alloc: std.mem.Allocator, value: std.json.Value) !bool {
+    if (value != .object) return error.InvalidCreateTableRequest;
+    const kind = value.object.get("type") orelse return false;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "embeddings")) return false;
+    if (value.object.get("embedder")) |embedder| {
+        if (embedder == .object and try db_types.embeddingProducerModelRevision(embedder.object) != null)
+            return true;
+    }
+    if (value.object.get("semantic_producer")) |producer| {
+        if (producer != .string) return error.InvalidCreateTableRequest;
+        var identity = try std.json.parseFromSlice(std.json.Value, alloc, producer.string, .{});
+        defer identity.deinit();
+        if (identity.value != .object) return error.InvalidCreateTableRequest;
+        return try db_types.embeddingProducerModelRevision(identity.value.object) != null;
+    }
+    return false;
+}
+
+pub fn hasModelRevisionPin(alloc: std.mem.Allocator, raw: []const u8, catalog: bool) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    if (!catalog) return try indexHasModelRevisionPin(alloc, parsed.value);
+    if (parsed.value != .object) return error.InvalidCreateTableRequest;
+    for (parsed.value.object.values()) |value| {
+        if (value == .object and try indexHasModelRevisionPin(alloc, value)) return true;
+    }
+    return false;
+}
+
 pub fn normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
     alloc: std.mem.Allocator,
     index_name: []const u8,
