@@ -161,13 +161,46 @@ pub const Catalogs = struct {
         self.* = undefined;
     }
 };
+pub const DagActivation = struct {
+    index_name: []const u8,
+    table_identity: [16]u8,
+    proofs: []const @import("artifact_publication.zig").LocalDagBinding.Activation,
+};
+
 pub const Command = struct {
     namespace: [24]u8,
     previous: ?Binding = null,
     binding: Binding,
     catalogs: Catalogs,
+    dag_activations: ?[]const DagActivation = null,
+
+    pub fn nativeJsonSkipField(self: Command, name: []const u8) bool {
+        return std.mem.eql(u8, name, "dag_activations") and self.dag_activations == null;
+    }
+
+    pub fn jsonStringify(self: Command, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (comptime std.meta.fieldNames(Command)) |name| {
+            if (!self.nativeJsonSkipField(name)) {
+                try stream.objectField(name);
+                if (comptime std.mem.eql(u8, name, "dag_activations")) {
+                    try @import("relational_integrity_json.zig").writeCompact(self.dag_activations, stream);
+                } else try stream.write(@field(self, name));
+            }
+        }
+        try stream.endObject();
+    }
 
     pub fn validate(self: Command) !void {
+        if (self.dag_activations) |activations| {
+            if (self.binding.effect_protocol < 16 or activations.len == 0 or activations.len > 64)
+                return error.InvalidArtifactCatalogCommand;
+            for (activations, 0..) |activation, i| {
+                if (activation.index_name.len == 0 or activation.proofs.len == 0 or activation.proofs.len > 64 or
+                    (i != 0 and std.mem.order(u8, activations[i - 1].index_name, activation.index_name) != .lt))
+                    return error.InvalidArtifactCatalogCommand;
+            }
+        }
         const previous_epoch = if (self.previous) |p| p.epoch else 0;
         if (!self.binding.valid() or previous_epoch == std.math.maxInt(u64) or self.binding.epoch != previous_epoch + 1 or
             !std.mem.eql(u8, &self.binding.digest, &self.catalogs.digest()) or
@@ -182,6 +215,23 @@ pub const Command = struct {
     }
 };
 pub const Ordered = struct { command: Command, applied_index: u64 };
+
+fn activationPlansEqual(a: []const DagActivation, b: []const DagActivation) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left.index_name, right.index_name) or
+            !std.mem.eql(u8, &left.table_identity, &right.table_identity) or
+            left.proofs.len != right.proofs.len) return false;
+        for (left.proofs, right.proofs) |x, y| {
+            if (!std.mem.eql(u8, x.edge_type, y.edge_type) or x.owner_epoch != y.owner_epoch or
+                std.meta.activeTag(x.proof) != std.meta.activeTag(y.proof)) return false;
+            if (x.proof == .scanned and (!std.mem.eql(u8, &x.proof.scanned.snapshot, &y.proof.scanned.snapshot) or
+                !std.mem.eql(u8, x.proof.scanned.after, y.proof.scanned.after))) return false;
+        }
+    }
+    return true;
+}
+
 pub const LocalBinding = struct { epoch: u64, digest: [32]u8 };
 pub const Status = struct { ordered: ?Binding, applied_index: u64, local: LocalBinding, ready: bool };
 
@@ -194,6 +244,7 @@ pub fn desiredCommand(alloc: std.mem.Allocator, txn: anytype, namespace: [24]u8,
         defer installed.deinit();
         var command = installed.value.command;
         command.catalogs = catalogs_value;
+        command.dag_activations = null;
         return command;
     }
     return .{ .namespace = namespace, .previous = observed.ordered, .binding = .{
@@ -240,6 +291,8 @@ test "ordered artifact inventory catalog JSON preserves arbitrary binary layout 
 pub fn validateRequest(req: anytype) !void {
     const command = req.artifact_catalog orelse return;
     try command.validate();
+    if (command.dag_activations != null and (req.online_source != null or req.merge_checkpoint != null or req.merge_replication != null))
+        return error.InvalidArtifactCatalogCommand;
     const empty: @TypeOf(req) = .{};
     inline for (@typeInfo(@TypeOf(req)).@"struct".field_names, @typeInfo(@TypeOf(req)).@"struct".field_types) |reflected_name, field_type| {
         if (comptime std.mem.eql(u8, reflected_name, "document_version_scheme")) continue;
@@ -373,8 +426,48 @@ pub fn load(alloc: std.mem.Allocator, txn: anytype) !?std.json.Parsed(Ordered) {
 pub fn stageOrdered(alloc: std.mem.Allocator, txn: anytype, command: Command, applied_index: u64) !void {
     const raw = try prepareOrdered(alloc, txn, command, applied_index);
     defer if (raw) |value| alloc.free(value);
-    if (raw) |value| try txn.put(ordered_key, value);
+    if (raw) |value| {
+        if (command.dag_activations) |activations| try stageDagActivations(alloc, txn, command, activations);
+        try txn.put(ordered_key, value);
+    }
     try @import("artifact_catalog_activation.zig").stage(alloc, txn, command);
+}
+
+fn stageDagActivations(alloc: std.mem.Allocator, txn: anytype, command: Command, activations: []const DagActivation) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const publication = @import("artifact_publication.zig");
+    const indexes = try @import("catalog/index_manager.zig").deserializeCatalog(arena.allocator(), command.catalogs.indexes);
+    for (activations) |activation| {
+        const index = for (indexes) |index| {
+            if (std.mem.eql(u8, index.name, activation.index_name)) break index;
+        } else return error.InvalidArtifactCatalogCommand;
+        if (index.kind != .graph) return error.InvalidArtifactCatalogCommand;
+        const producer: publication.Command = .{
+            .producer_kind = .graph,
+            .namespace = command.namespace,
+            .authority_epoch = command.binding.epoch,
+            .catalog_digest = command.binding.digest,
+            .producer_name = index.name,
+            .producer_generation = index.coverage_generation,
+            .sources = &.{},
+            .mutations = &.{},
+            .publication_digest = @splat(0),
+        };
+        publication.LocalDagBinding.stageFromConfig(alloc, txn, producer, activation.table_identity, index.config_json, activation.proofs) catch |err| switch (err) {
+            error.InvalidIndexConfig,
+            error.InvalidDagDomain,
+            error.InvalidDagMutation,
+            error.GraphConstraintNotReady,
+            error.GraphConstraintOwnerChanged,
+            error.GraphConstraintRevisionChanged,
+            error.GraphConstraintAttemptConflict,
+            error.GraphConstraintCapacity,
+            error.NotFound,
+            => return error.InvalidArtifactCatalogCommand,
+            else => return err,
+        };
+    }
 }
 
 pub fn prepareOrdered(alloc: std.mem.Allocator, txn: anytype, command: Command, applied_index: u64) !?[]u8 {
@@ -384,7 +477,13 @@ pub fn prepareOrdered(alloc: std.mem.Allocator, txn: anytype, command: Command, 
     defer if (old) |value| value.deinit();
     if (old) |value| {
         if (!std.mem.eql(u8, &value.value.command.namespace, &command.namespace)) return error.ArtifactCatalogScopeChanged;
-        if (std.meta.eql(value.value.command.binding, command.binding)) return null;
+        if (std.meta.eql(value.value.command.binding, command.binding)) {
+            if (command.dag_activations) |activations| {
+                const previous = value.value.command.dag_activations orelse return error.ArtifactCatalogEpochChanged;
+                if (!activationPlansEqual(previous, activations)) return error.ArtifactCatalogEpochChanged;
+            }
+            return null;
+        }
         if (!std.meta.eql(command.previous, @as(?Binding, value.value.command.binding)) or applied_index <= value.value.applied_index)
             return error.ArtifactCatalogEpochChanged;
     } else if (command.previous != null) return error.ArtifactCatalogEpochChanged;

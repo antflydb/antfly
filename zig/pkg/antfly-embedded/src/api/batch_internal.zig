@@ -26,6 +26,22 @@ test "ordered artifact inventory private batch roundtrip rejects public and mixe
     var parsed = try parseInternalBatchRequest(alloc, encoded);
     defer parsed.deinit(alloc);
     try std.testing.expectEqualDeep(request.artifact_catalog.?, parsed.req.artifact_catalog.?);
+    var dag_request = request;
+    dag_request.artifact_catalog.?.binding.effect_protocol = 16;
+    dag_request.artifact_catalog.?.dag_activations = &.{.{
+        .index_name = "g",
+        .table_identity = @splat(3),
+        .proofs = &.{.{ .edge_type = "links", .owner_epoch = 1, .proof = .{
+            .scanned = .{ .snapshot = @splat(7), .after = "\xff\x00" },
+        } }},
+    }};
+    const dag_bytes = try encodeBatchRequest(alloc, dag_request);
+    defer alloc.free(dag_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, dag_bytes, "artifact_catalog_dag_v1") != null);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, dag_bytes));
+    var dag_parsed = try parseInternalBatchRequest(alloc, dag_bytes);
+    defer dag_parsed.deinit(alloc);
+    try std.testing.expectEqualDeep(dag_request.artifact_catalog, dag_parsed.req.artifact_catalog);
     var mixed = request;
     mixed.writes = &.{.{ .key = "key", .value = "{}" }};
     try std.testing.expectError(error.InvalidArtifactCatalogCommand, encodeBatchRequest(alloc, mixed));
@@ -942,7 +958,11 @@ fn parseBatchRequestWithOptions(
         if (marker != .object) return error.InvalidBatchRequest;
         const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
         if (kind != .string) return error.InvalidBatchRequest;
-        break :control @as(?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Command), try std.json.parseFromValue(@import("../storage/db/artifact_inventory.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
+        var parsed_catalog = try std.json.parseFromValue(@import("../storage/db/artifact_inventory.zig").Command, alloc, value, .{ .allocate = .alloc_always });
+        errdefer parsed_catalog.deinit();
+        if (std.mem.eql(u8, kind.string, "artifact_catalog_dag_v1") != (parsed_catalog.value.dag_activations != null))
+            return error.InvalidBatchRequest;
+        break :control @as(?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Command), parsed_catalog);
     } else null;
     errdefer if (artifact_catalog) |*control| control.deinit();
     var group_source = if (root.get("_group_source")) |value| control: {
@@ -1405,7 +1425,7 @@ fn parseBatchRequestWithOptions(
             if (restore_staging == null or object.count() != 1) return error.InvalidBatchRequest;
             break :merge null;
         }
-        if (std.mem.eql(u8, kind_value.string, "artifact_catalog_v1")) {
+        if (std.mem.eql(u8, kind_value.string, "artifact_catalog_v1") or std.mem.eql(u8, kind_value.string, "artifact_catalog_dag_v1")) {
             if (artifact_catalog == null or object.count() != 1) return error.InvalidBatchRequest;
             break :merge null;
         }
@@ -2129,7 +2149,11 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         try writer.writeAll(encoded);
     }
     if (req.artifact_catalog) |control| {
-        if (req.online_source == null and req.merge_checkpoint == null) try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"artifact_catalog_v1\"}");
+        if (control.dag_activations != null) {
+            if (req.online_source != null or req.merge_checkpoint != null) return error.InvalidBatchRequest;
+            try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"artifact_catalog_dag_v1\"}");
+        } else if (req.online_source == null and req.merge_checkpoint == null) try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"artifact_catalog_v1\"}");
+
         try writer.writeAll(",\"_artifact_catalog\":");
         const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
         defer alloc.free(encoded);

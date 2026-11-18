@@ -50,8 +50,10 @@ after its source and contender guards when a co-located binding exists for the
 producer incarnation. Binding installation and publication both require a
 visible active authority and its activation certificate. Binding provisioning
 checks that the activation proofs cover exactly the declared DAG types and
-stages every activation certificate with the binding. The catalog still
-needs to invoke provisioning under its source-write fence. Regular index
+stages every activation certificate with the binding. The private ordered
+artifact catalog command can carry these proofs and install them with the
+catalog watermark. The activation coordinator still needs to pin and scan
+the source graph, fence writes, and propose that command. Regular index
 admission and direct graph-index open still reject DAG.
 An existing distributed reservation remains under the original coordinator,
 and the publication coordinator still needs to enlist the authority under the source and contender guards, and document-derived

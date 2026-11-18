@@ -368,7 +368,14 @@ pub const Storage = struct {
     }
 
     fn requireEmptyLedger(txn: anytype, id: Digest) !void {
-        var cursor = try txn.openCursor();
+        const Handle = switch (@typeInfo(@TypeOf(txn))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(txn),
+        };
+        var cursor = if (comptime @hasDecl(Handle, "openPhysicalCursorAdapter"))
+            try txn.openPhysicalCursorAdapter()
+        else
+            try txn.openCursor();
         defer cursor.close();
         const suffix = std.fmt.bytesToHex(id, .lower);
         try requireEmptyPrefix(&cursor, &(Adjacency.prefix.* ++ id));
