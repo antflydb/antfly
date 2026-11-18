@@ -3645,13 +3645,54 @@ test "source vector payloads retain accounting across reopen before collection o
     }
 }
 
+test "source vector payloads retry descriptor pressure before appending" {
+    const alloc = std.testing.allocator;
+    const Fault = struct {
+        fn rejectBeforeAppend(_: *anyopaque, _: []const u8, _: []const u8, _: bool, may_have_appended: *bool) !void {
+            may_have_appended.* = false;
+            return error.ProcessFdQuotaExceeded;
+        }
+    };
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const keys = @import("internal_keys.zig");
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(key);
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 23, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    var reference: [payload.reference_len]u8 = undefined;
+    {
+        var source = try Store.open(alloc, memory.storage(), "/descriptor-retry", false);
+        defer source.deinit();
+        var faulty_vtable = memory.storage().vtable.*;
+        faulty_vtable.append_file_absolute_checked = Fault.rejectBeforeAppend;
+        source.opened.store.storage.vtable = &faulty_vtable;
+        const session = try payload.Session.create(alloc, source.interface());
+        defer session.release();
+        @memcpy(&reference, try session.put(key, artifact));
+        const prior_batch = source.opened.store.last_committed_batch;
+        try std.testing.expectError(error.ProcessFdQuotaExceeded, session.prepareCommit());
+        try std.testing.expect(!source.poisoned);
+        try std.testing.expectEqual(prior_batch, source.opened.store.last_committed_batch);
+        source.opened.store.storage.vtable = memory.storage().vtable;
+        try session.prepareCommit();
+        session.committed = true;
+    }
+    var reopened = try Store.open(alloc, memory.storage(), "/descriptor-retry", false);
+    defer reopened.deinit();
+    const session = try payload.Session.create(alloc, reopened.interface());
+    defer session.release();
+    try std.testing.expectEqualSlices(u8, artifact, try session.get(key, &reference));
+}
+
 test "source vector payloads fence ambiguous durable preparations and recover retries" {
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
     const keys = @import("internal_keys.zig");
     const Fault = struct {
-        fn appendThenFail(ptr: *anyopaque, path: []const u8, bytes: []const u8, sync: bool) !void {
+        fn appendThenFail(ptr: *anyopaque, path: []const u8, bytes: []const u8, sync: bool, may_have_appended: *bool) !void {
+            may_have_appended.* = true;
             const memory: *lsm.MemoryStorage = @ptrCast(@alignCast(ptr));
             try memory.storage().vtable.append_file_absolute.?(ptr, path, bytes, sync);
             return error.InjectedLostAcknowledgement;
@@ -3668,7 +3709,7 @@ test "source vector payloads fence ambiguous durable preparations and recover re
         var source = try Store.open(alloc, memory.storage(), "/ambiguous", false);
         defer source.deinit();
         var faulty_vtable = memory.storage().vtable.*;
-        faulty_vtable.append_file_absolute = Fault.appendThenFail;
+        faulty_vtable.append_file_absolute_checked = Fault.appendThenFail;
         source.opened.store.storage.vtable = &faulty_vtable;
         const session = try payload.Session.create(alloc, source.interface());
         defer session.release();

@@ -16,25 +16,28 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* Keep the descriptor cache anchor in one native object per linked image.
  * The server links several Zig archives that each compile storage_io.zig. */
 __attribute__((visibility("hidden")))
-void *antfly_platform_native_fd_cache(void *(*init)(void)) {
+void *antfly_platform_native_fd_cache(uint64_t expected_layout, void *(*init)(void)) {
     static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
     static _Atomic(void *) cache;
+    static uint64_t layout;
 
     void *result = atomic_load_explicit(&cache, memory_order_acquire);
     if (result != NULL) {
-        return result;
+        return layout == expected_layout ? result : NULL;
     }
 
     pthread_mutex_lock(&mutex);
     result = atomic_load_explicit(&cache, memory_order_relaxed);
     if (result == NULL) {
         result = init();
+        layout = expected_layout;
         atomic_store_explicit(&cache, result, memory_order_release);
     }
     pthread_mutex_unlock(&mutex);
-    return result;
+    return layout == expected_layout ? result : NULL;
 }

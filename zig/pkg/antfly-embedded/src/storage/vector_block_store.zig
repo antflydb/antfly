@@ -741,8 +741,9 @@ pub const Store = struct {
         if (next_bytes > max_wal_bytes) return error.VectorWalTooLarge;
         const path = try self.walPathAlloc(self.wal_generation);
         defer self.alloc.free(path);
-        self.storage.appendFileAbsolute(self.alloc, path, bytes, options.sync) catch |err| {
-            self.poisoned = true;
+        var may_have_appended: bool = undefined;
+        self.storage.appendFileAbsoluteChecked(self.alloc, path, bytes, options.sync, &may_have_appended) catch |err| {
+            self.poisoned = may_have_appended;
             return err;
         };
         self.wal_committed_bytes = next_bytes;

@@ -643,6 +643,9 @@ pub const Storage = struct {
         /// the bytes addressed through this storage implementation.
         supports_host_path_generation_publication: bool = false,
         supports_native_path_locks: bool = false,
+        // False on failure only when the provider proves that no bytes were
+        // appended. Providers without this capability are treated as uncertain.
+        append_file_absolute_checked: ?*const fn (*anyopaque, []const u8, []const u8, bool, *bool) anyerror!void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -760,6 +763,16 @@ pub const Storage = struct {
     }
 
     pub fn appendFileAbsolute(self: Storage, allocator: Allocator, path: []const u8, contents: []const u8, sync: bool) !void {
+        return self.appendFileAbsoluteChecked(allocator, path, contents, sync, null);
+    }
+
+    pub fn appendFileAbsoluteChecked(self: Storage, allocator: Allocator, path: []const u8, contents: []const u8, sync: bool, may_have_appended: ?*bool) !void {
+        if (may_have_appended) |outcome| {
+            outcome.* = true;
+            if (self.vtable.append_file_absolute_checked) |append_checked| {
+                return BoundaryAbi.call("append_file_absolute_checked", self.boundary_dispatch, append_checked, .{ self.ptr, path, contents, sync, outcome });
+            }
+        }
         if (self.vtable.append_file_absolute) |append_file_absolute| {
             return BoundaryAbi.call("append_file_absolute", self.boundary_dispatch, append_file_absolute, .{ self.ptr, path, contents, sync });
         }
@@ -1968,7 +1981,38 @@ else
 
 var process_native_storage_pool_mutex: std.atomic.Mutex = .unlocked;
 var process_native_fd_cache: ?*FdCache = null;
-extern fn antfly_platform_native_fd_cache(init: *const fn () callconv(.c) *anyopaque) *anyopaque;
+extern fn antfly_platform_native_fd_cache(layout: u64, init: *const fn () callconv(.c) *anyopaque) ?*anyopaque;
+
+fn fdCacheLayoutMix(hash: u64, value: u64) u64 {
+    return (hash ^ value) *% 1099511628211;
+}
+
+fn fdCacheTypeLayout(comptime T: type, seed: u64) u64 {
+    var hash = fdCacheLayoutMix(seed, @sizeOf(T));
+    hash = fdCacheLayoutMix(hash, @alignOf(T));
+    if (@typeInfo(T) == .@"struct") {
+        const fields = @typeInfo(T).@"struct";
+        inline for (fields.field_names, fields.field_types, fields.field_attrs) |name, Field, attrs| {
+            if (!attrs.@"comptime") {
+                hash = fdCacheLayoutMix(hash, @offsetOf(T, name));
+                hash = fdCacheTypeLayout(Field, hash);
+            }
+        }
+    }
+    return hash;
+}
+
+fn fdCacheLayout() u64 {
+    @setEvalBranchQuota(20_000);
+    // Bump the seed when changing invariants that affect how independently
+    // linked consumers operate on the shared state without changing offsets.
+    var hash: u64 = 1;
+    for (builtin.zig_version_string) |byte| hash = fdCacheLayoutMix(hash, byte);
+    inline for (.{ FdCache, FdCache.Shard, FdCache.Entry, FdCache.AdmissionWaiter, Allocator.VTable, std.ArrayListUnmanaged(*FdCache.Entry) }) |T| {
+        hash = fdCacheTypeLayout(T, hash);
+    }
+    return hash;
+}
 
 fn initProcessNativeFdCache() callconv(.c) *anyopaque {
     const cache = std.heap.page_allocator.create(FdCache) catch @panic("OOM");
@@ -1980,8 +2024,11 @@ fn processNativeFdCache() *FdCache {
     // Each native archive has its own Zig globals. Resolve the shared cache
     // through the final link so readers and writers can evict one another's
     // idle entries and the metrics observe the same admission domain.
-    if (comptime supports_posix_fd_cache and platform.filesystem.capacity_supported)
-        return @ptrCast(@alignCast(antfly_platform_native_fd_cache(&initProcessNativeFdCache)));
+    if (comptime supports_posix_fd_cache and platform.filesystem.capacity_supported) {
+        const cache = antfly_platform_native_fd_cache(comptime fdCacheLayout(), &initProcessNativeFdCache) orelse
+            @panic("incompatible native descriptor cache layout across linked Antfly archives");
+        return @ptrCast(@alignCast(cache));
+    }
 
     const locked = lockAtomic(&process_native_storage_pool_mutex);
     defer if (locked) process_native_storage_pool_mutex.unlock();
@@ -2192,20 +2239,21 @@ const NativeStorageState = struct {
 /// writer cannot deadlock while retaining its publication input/output lease.
 pub const ProcessNativeFdPermit = struct {
     io: std.Io,
-    active: bool = false,
+    cache: ?*FdCache = null,
 
     pub fn acquire(io: std.Io) !ProcessNativeFdPermit {
         if (comptime supports_posix_fd_cache) {
-            if (!processNativeFdCache().tryReserveDescriptors(io, 1)) return error.StorageDescriptorPressure;
-            return .{ .io = io, .active = true };
+            const cache = processNativeFdCache();
+            if (!cache.tryReserveDescriptors(io, 1)) return error.StorageDescriptorPressure;
+            return .{ .io = io, .cache = cache };
         }
         return .{ .io = io };
     }
 
     pub fn release(self: *ProcessNativeFdPermit) void {
-        if (!self.active) return;
-        self.active = false;
-        if (comptime supports_posix_fd_cache) processNativeFdCache().releaseDescriptors(self.io, 1);
+        const cache = self.cache orelse return;
+        self.cache = null;
+        cache.releaseDescriptors(self.io, 1);
     }
 };
 
@@ -2571,8 +2619,8 @@ const EventedNativeStorage = struct {
         self.state.invalidatePath(path);
         defer self.state.invalidatePath(path);
         switch (self.runtime) {
-            .threaded => |*threaded| try appendFileAbsoluteWithIo(threaded.io(), path, contents, sync),
-            .evented => |*evented| try appendFileAbsoluteWithIo(evented.io(), path, contents, sync),
+            .threaded => |*threaded| try appendFileAbsoluteWithIo(threaded.io(), path, contents, sync, null),
+            .evented => |*evented| try appendFileAbsoluteWithIo(evented.io(), path, contents, sync, null),
         }
     }
 
@@ -2709,6 +2757,7 @@ const ThreadedNativeStorage = struct {
         .read_file_trailer_alloc = readFileTrailerAlloc,
         .write_file_absolute = writeFileAbsolute,
         .append_file_absolute = appendFileAbsolute,
+        .append_file_absolute_checked = appendFileAbsoluteChecked,
         .begin_atomic_write = beginAtomicWrite,
         .begin_cold_sequential_read = beginColdSequentialRead,
         .begin_cold_random_read = beginColdRandomRead,
@@ -2883,12 +2932,21 @@ const ThreadedNativeStorage = struct {
     }
 
     fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
+        return appendFileAbsoluteImpl(ptr, path, contents, sync, null);
+    }
+
+    fn appendFileAbsoluteChecked(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool, may_have_appended: *bool) !void {
+        may_have_appended.* = false;
+        return appendFileAbsoluteImpl(ptr, path, contents, sync, may_have_appended);
+    }
+
+    fn appendFileAbsoluteImpl(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool, may_have_appended: ?*bool) !void {
         const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
         var permit = try state.acquireFdPermits(createPathDescriptorCount(path));
         defer permit.release();
         permit.state.invalidatePath(path);
         defer permit.state.invalidatePath(path);
-        try appendFileAbsoluteWithIo(permit.io, path, contents, sync);
+        try appendFileAbsoluteWithIo(permit.io, path, contents, sync, may_have_appended);
     }
 
     fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
@@ -3037,7 +3095,7 @@ fn listNamesWithIo(allocator: Allocator, io: anytype, path: []const u8, kind: st
     return try names.toOwnedSlice(allocator);
 }
 
-fn appendFileAbsoluteWithIo(io: anytype, path: []const u8, contents: []const u8, sync: bool) !void {
+fn appendFileAbsoluteWithIo(io: anytype, path: []const u8, contents: []const u8, sync: bool, may_have_appended: ?*bool) !void {
     var file = openFilePathForWriteWithIo(io, path, .{ .truncate = false }) catch |err| {
         std.log.err("lsm appendFileAbsolute create failed path={s} bytes={} err={s}", .{ path, contents.len, @errorName(err) });
         return err;
@@ -3052,6 +3110,7 @@ fn appendFileAbsoluteWithIo(io: anytype, path: []const u8, contents: []const u8,
         std.log.err("lsm appendFileAbsolute seek failed path={s} offset={} err={s}", .{ path, size, @errorName(actual) });
         return actual;
     };
+    if (may_have_appended) |outcome| outcome.* = true;
     writer.interface.writeAll(contents) catch |err| {
         const actual = if (err == error.WriteFailed) writer.err orelse err else err;
         std.log.err("lsm appendFileAbsolute write failed path={s} bytes={} err={s}", .{ path, contents.len, @errorName(actual) });
@@ -5376,6 +5435,39 @@ test "transient admission fails fast when only persistent descriptors prevent pr
     persistent_held = false;
     try pool.fd_cache.reserveDescriptors(io, 1);
     defer pool.fd_cache.releaseDescriptors(io, 1);
+}
+
+test "native fd pressure reports an unstarted append and permits retry" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var temp = try TestDirectory.init("storage");
+    defer temp.cleanup();
+    const path = temp.path();
+
+    var pool = NativeStoragePool.initWithCapacityForTest(alloc, 4);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(alloc, .threaded, &pool);
+    defer native.deinit();
+    const storage = native.storage();
+    try storage.appendFileAbsolute(alloc, path, "before", true);
+
+    try pool.fd_cache.reservePersistentDescriptors(std.testing.io, 2);
+    var held = true;
+    defer if (held) pool.fd_cache.releasePersistentDescriptors(std.testing.io, 2);
+    var may_have_appended: bool = undefined;
+    try std.testing.expectError(
+        error.PersistentDescriptorAdmissionExhausted,
+        storage.appendFileAbsoluteChecked(alloc, path, " after", true, &may_have_appended),
+    );
+    try std.testing.expect(!may_have_appended);
+    pool.fd_cache.releasePersistentDescriptors(std.testing.io, 2);
+    held = false;
+
+    try storage.appendFileAbsoluteChecked(alloc, path, " after", true, &may_have_appended);
+    const bytes = try storage.readFileAlloc(alloc, path, 100);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("before after", bytes);
 }
 
 test "persistent path locks honor an explicitly configured pool" {
