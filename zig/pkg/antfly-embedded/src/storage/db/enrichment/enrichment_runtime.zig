@@ -18581,6 +18581,41 @@ const SubmittedOutputs = struct {
     const Entry = struct { output: []u8, resubmits: u8 = 0 };
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.AutoHashMapUnmanaged([32]u8, Entry) = .empty,
+    /// Inputs currently being produced by some attempt.
+    in_flight: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
+
+    const Acquired = union(enum) {
+        /// A recorded output to publish instead of producing.
+        output: []u8,
+        /// Another attempt is producing this input right now.
+        busy,
+        /// This attempt now owns producing the input; `release` it after.
+        claimed,
+        /// Neither recorded nor claimable (memory); produce unclaimed.
+        unclaimed,
+    };
+
+    fn acquire(self: *SubmittedOutputs, alloc: Allocator, key: [32]u8) !Acquired {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.entries.getPtr(key)) |entry| {
+            if (entry.resubmits < max_resubmits) {
+                entry.resubmits += 1;
+                return .{ .output = try alloc.dupe(u8, entry.output) };
+            }
+            alloc.free(entry.output);
+            _ = self.entries.remove(key);
+        }
+        if (self.in_flight.contains(key)) return .busy;
+        self.in_flight.put(alloc, key, {}) catch return .unclaimed;
+        return .claimed;
+    }
+
+    fn release(self: *SubmittedOutputs, key: [32]u8) void {
+        self.lock();
+        defer self.mutex.unlock();
+        _ = self.in_flight.remove(key);
+    }
 
     fn lock(self: *SubmittedOutputs) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -18595,6 +18630,7 @@ const SubmittedOutputs = struct {
     fn deinit(self: *SubmittedOutputs, alloc: Allocator) void {
         self.clear(alloc);
         self.entries.deinit(alloc);
+        self.in_flight.deinit(alloc);
     }
 
     /// A copy of the output submitted for `key` to resubmit, if any.
@@ -18631,17 +18667,19 @@ const SubmittedOutputs = struct {
     }
 };
 
-/// Producer-input identity of an ordered asset item. Null for unordered
-/// (local) items.
+/// Producer-input identity of an asset item, shared by its unordered and
+/// ordered attempts. Null for private artifacts.
 fn submittedOutputKey(item: *AssetProducerBatchItem) !?[32]u8 {
-    // What the provider output depends on: producer, rendered input, output
-    // and the exact source contents (plus any context identity). Catalog
-    // epochs and guard revisions are excluded: they can advance between
-    // attempts without changing the output, and the owner re-validates every
-    // resubmission against the current catalog.
-    const token = if (item.producer_context) |*value| value else return null;
+    // What the provider output depends on: the producer and its exact
+    // rendered input (which already carries any context block). Catalog
+    // epochs, guard revisions and whether ordered authority exists yet are
+    // excluded: they can change between attempts without changing the
+    // output, and an ordered owner re-validates every publication.
+    const privacy = @import("../../../privacy/document.zig");
+    const name = requestArtifactName(item.request);
+    if (privacy.isArtifactName(name) or privacy.consumerPolicyVersion(name) != null) return null;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly-submitted-output-v2\x00");
+    hash.update("antfly-submitted-output-v3\x00");
     var tag: [8]u8 = undefined;
     std.mem.writeInt(u64, &tag, @intFromEnum(item.producer_type), .little);
     hash.update(&tag);
@@ -18650,14 +18688,6 @@ fn submittedOutputKey(item: *AssetProducerBatchItem) !?[32]u8 {
         hash.update(&tag);
         hash.update(part);
     }
-    for (token.sources()) |source| {
-        std.mem.writeInt(u64, &tag, source.document_key.len, .little);
-        hash.update(&tag);
-        hash.update(source.document_key);
-        hash.update(&.{@intFromBool(source.exists)});
-        hash.update(&source.content_digest);
-    }
-    if (token.execution_identity) |identity| hash.update(&identity);
     var key: [32]u8 = undefined;
     hash.final(&key);
     return key;
@@ -18679,28 +18709,50 @@ const AssetBatchOutcome = struct {
     }
 };
 
-/// Move items with a submitted-but-unaccepted output to the front and
-/// resubmit those outputs. Returns how many items were served this way.
+/// Partition items before any provider call. Items with a recorded output
+/// for their exact input publish it; ordered items whose input another
+/// attempt is producing right now wait for it (publication pending). Both
+/// move to the front and are not produced. The rest are claimed, and their
+/// keys appended to `claimed` for the caller to release. Returns how many
+/// items were handled without production.
 fn resubmitPendingAssetOutputs(
     runtime: *EnrichmentRuntime,
     items: []AssetProducerBatchItem,
     window: *GeneratedReplayWindow,
     scope: *FailureScope,
     outcome: *AssetBatchOutcome,
+    claimed: *std.ArrayListUnmanaged([32]u8),
 ) !usize {
     var served: usize = 0;
     for (items, 0..) |*item, index| {
         const key = (try submittedOutputKey(item)) orelse continue;
-        const cached = (try runtime.submitted_outputs.getAlloc(runtime.alloc, key)) orelse retained: {
-            const value = item.retained_output orelse continue;
+        var acquired = try runtime.submitted_outputs.acquire(runtime.alloc, key);
+        if (acquired == .claimed) {
+            claimed.append(runtime.alloc, key) catch |err| {
+                runtime.submitted_outputs.release(key);
+                return err;
+            };
+            if (item.retained_output == null) continue;
+            // An earlier attempt left this exact output in the store.
+            runtime.submitted_outputs.release(key);
+            _ = claimed.pop();
+            acquired = .{ .output = item.retained_output.? };
             item.retained_output = null;
-            break :retained value;
-        };
-        defer runtime.alloc.free(cached);
+        }
+        if (acquired == .unclaimed) continue;
+        if (acquired == .busy and item.producer_context == null) continue;
         std.mem.swap(AssetProducerBatchItem, &items[served], &items[index]);
         const current = &items[served];
         served += 1;
         scope.enterAsset(current);
+        const cached = switch (acquired) {
+            .output => |value| value,
+            else => {
+                outcome.publication_pending = true;
+                continue;
+            },
+        };
+        defer runtime.alloc.free(cached);
         applyAssetProducerBatchOutput(runtime, current, cached, window) catch |err| {
             if (err == error.ArtifactPublicationPending) {
                 outcome.publication_pending = true;
@@ -18739,7 +18791,12 @@ fn flushAssetProducerBatchItems(
     var outcome: AssetBatchOutcome = .{};
     // Items whose output was already submitted for this exact input resubmit
     // it; only the rest reach a provider.
-    const pending_count = try resubmitPendingAssetOutputs(runtime, items, window, scope, &outcome);
+    var claimed: std.ArrayListUnmanaged([32]u8) = .empty;
+    defer {
+        for (claimed.items) |key| runtime.submitted_outputs.release(key);
+        claimed.deinit(runtime.alloc);
+    }
+    const pending_count = try resubmitPendingAssetOutputs(runtime, items, window, scope, &outcome, &claimed);
     if (pending_count == items.len) return outcome.finish();
     const remaining = items[pending_count..];
     scope.enterOwned(assetProducerBatchFailureFingerprint(remaining), .{ .assets = remaining });
@@ -19937,7 +19994,13 @@ fn applyAssetProducerBatchOutput(
     const producer_recipe = local.requestRecipe(item.request);
     const receipt = local.encode(producer_recipe, item.raw_doc, validated);
     try writes.append(runtime.alloc, .{ .key = receipt_key, .value = &receipt });
+    // If this local write is refused (e.g. ordered authority arrived while
+    // the provider ran), the ordered retry publishes these bytes instead of
+    // producing them again.
+    const recorded = try submittedOutputKey(item);
+    if (recorded) |key| try runtime.submitted_outputs.put(runtime.alloc, key, produced);
     try storePutBatchGuarded(runtime, writes.items, &.{}, .{ .doc_key = item.request.doc_key, .digest = sourceRecordDigest(item.raw_doc), .upstream_name = item.request.upstream_artifact_name, .upstream_digest = item.upstream_digest, .producer_name = requestArtifactName(item.request), .producer_recipe = producer_recipe, .dependency = if (item.context_publish) |publish| .{ .artifact = requestArtifactName(item.request), .publish = publish, .new_version = true, .producer_recipe = producer_recipe } else null });
+    if (recorded) |key| runtime.submitted_outputs.remove(runtime.alloc, key);
 
     try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, item.artifact_key);
 
@@ -50891,4 +50954,22 @@ test "submitted ordered outputs are reused a bounded number of times until retir
     try outputs.put(alloc, key, "fresh");
     outputs.remove(alloc, key);
     try std.testing.expect((try outputs.getAlloc(alloc, key)) == null);
+}
+
+test "concurrent attempts at one producer input wait for the claiming attempt's output" {
+    const alloc = std.testing.allocator;
+    var outputs: SubmittedOutputs = .{};
+    defer outputs.deinit(alloc);
+    const key: [32]u8 = @splat(2);
+    try std.testing.expect((try outputs.acquire(alloc, key)) == .claimed);
+    // A second attempt while the first is producing does not produce.
+    try std.testing.expect((try outputs.acquire(alloc, key)) == .busy);
+    try outputs.put(alloc, key, "made once");
+    outputs.release(key);
+    const reused = try outputs.acquire(alloc, key);
+    try std.testing.expectEqualStrings("made once", reused.output);
+    alloc.free(reused.output);
+    outputs.remove(alloc, key);
+    try std.testing.expect((try outputs.acquire(alloc, key)) == .claimed);
+    outputs.release(key);
 }
