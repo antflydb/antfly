@@ -1036,8 +1036,8 @@ pub const TxnManager = struct {
         try self.applyBatchWithParticipant(writes.items, extra_batch.deletes, null, .{
             .previous = if (previous_admission) |old| old.reservation() else 0,
             .next = admission.reservation(),
-        }, null, if (extra_batch.dag_prepare) |payload| .{
-            .prepare = .{ .id = txn_id, .payload = payload },
+        }, null, if (intents.len != 0 or extra_batch.graph_sources.len != 0 or extra_batch.prepared_enrichments_json != null or extra_batch.dag_prepare != null) .{
+            .prepare = .{ .id = txn_id, .payload = extra_batch.dag_prepare },
         } else null);
 
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
@@ -1589,6 +1589,17 @@ pub const TxnManager = struct {
         var read = try self.store.beginRead();
         defer read.abort();
         return readHasPrefix(&read, intents_prefix);
+    }
+
+    /// Check drain and install the source fence in one serialized writer.
+    /// Idle transactions can remain open. A transaction with a durable vote
+    /// must have its coordinator resolve it before activation can proceed.
+    pub fn stageDagSourceFence(txn: anytype, fence: dag.SourceFence) !void {
+        if (try txn.hasPrefix(intents_prefix) or
+            try txn.hasPrefix(intent_locks_prefix) or
+            try txn.hasPrefix(prepared_enrichments_prefix) or
+            try txn.hasPrefix(dag_domains_prefix)) return error.GraphConstraintBusy;
+        try fence.acquire(txn);
     }
 
     /// Returns whether a topology transition would strand transaction state.
@@ -2800,7 +2811,10 @@ pub const TxnManager = struct {
         }
         if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
         if (dag_batch) |op| switch (op) {
-            .prepare => |prepare| try stageDagPrepare(self.alloc, &batch, prepare.id, prepare.payload),
+            .prepare => |prepare| {
+                try dag.SourceFence.requireWritable(&batch);
+                if (prepare.payload) |payload| try stageDagPrepare(self.alloc, &batch, prepare.id, payload);
+            },
             .resolve => |resolve| try stageDagResolution(self.alloc, &batch, resolve.id, resolve.status),
         };
         try batch.commit();
@@ -2836,7 +2850,7 @@ pub fn isDagAuthorityKey(key: []const u8) bool {
 
 const max_dag_domains_per_participant = 64;
 const DagBatch = union(enum) {
-    prepare: struct { id: TxnId, payload: DagPrepare },
+    prepare: struct { id: TxnId, payload: ?DagPrepare },
     resolve: struct { id: TxnId, status: TxnStatus },
 };
 
@@ -5301,6 +5315,48 @@ test "time series source language reserves signed source slots before voting" {
     try std.testing.expectEqual(legacy + 16, try retainedIntentBytesForLanguage(std.testing.allocator, intent, true));
     const deleted: WriteIntent = .{ .key = "row", .value = null };
     try std.testing.expectEqual(try retainedIntentBytes(std.testing.allocator, deleted), try retainedIntentBytesForLanguage(std.testing.allocator, deleted, true));
+}
+
+test "DAG activation fence drains prepared writers and rejects new votes" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-dag-source-fence");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+
+    const first: TxnId = @splat(1);
+    const second: TxnId = @splat(2);
+    const intents: []const WriteIntent = &.{.{ .key = "row", .value = "{}" }};
+    try manager.initTransaction(first, 100);
+    try manager.writeIntents(first, intents, &.{});
+    const fence: dag.SourceFence = .{ .activation = @splat(3), .snapshot = @splat(4) };
+    {
+        var writer = try store.beginWriteTxn();
+        defer writer.abort();
+        try std.testing.expectError(error.GraphConstraintBusy, TxnManager.stageDagSourceFence(&writer, fence));
+        try std.testing.expect((try dag.SourceFence.read(&writer)) == null);
+    }
+    try manager.resolveIntents(first, .committed, 101);
+    try manager.initTransaction(second, 102);
+    {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        try TxnManager.stageDagSourceFence(&writer, fence);
+        try writer.commit();
+    }
+    try std.testing.expectError(error.GraphConstraintBusy, manager.writeIntents(second, intents, &.{}));
+    try std.testing.expect(!(try manager.hasIntents(second)));
+    {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        try fence.release(&writer);
+        try writer.commit();
+    }
+    try manager.writeIntents(second, intents, &.{});
+    try manager.resolveIntents(second, .aborted, 103);
 }
 
 test "DAG co-located publication rolls back authority and output together" {

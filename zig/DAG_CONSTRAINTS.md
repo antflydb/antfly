@@ -57,9 +57,10 @@ only when it covers the declared types and their certified authorities.
 The authority persists the scanner's snapshot before its first page, so a
 new owner can resume even when no page has committed yet. Physical writers
 reject source and artifact changes while a root's activation fence is
-installed. Scan progress and completion require that fence. The activation
-coordinator still needs to acquire all source-root fences, drain prepared
-writers, read the pinned graph, and propose the completion command. Regular index
+installed. Scan progress and completion require that fence. Each root installs
+its fence only after draining prepared writers, in the same serialized writer
+that excludes new votes. The activation coordinator still needs to drive
+that protocol across roots, read the pinned graph, and propose completion. Regular index
 admission and direct graph-index open still reject DAG.
 An existing distributed reservation remains under the original coordinator,
 and the publication coordinator still needs to enlist the authority under the source and contender guards, and document-derived
