@@ -74,6 +74,7 @@ pub const SlotState = struct {
     lifecycle: SlotLifecycle = .streaming,
     reseed_required: bool = false,
     last_error: ?[]const u8 = null,
+    restore_job_format: u32 = 0,
 
     pub fn lagFrom(self: SlotState, primary_lsn: u64) u64 {
         return primary_lsn -| self.applied_lsn;
@@ -161,6 +162,21 @@ pub const SlotStore = struct {
         self.slots.deinit(self.alloc);
         self.wal.close();
         self.* = undefined;
+    }
+
+    /// Capability observations are deliberately process-local. WAL replay,
+    /// slot recreation and reseeding require a fresh standby report.
+    pub fn observeRestoreJobFormat(self: *SlotStore, name: []const u8, format: u32) void {
+        const index = self.findIndex(name) orelse return;
+        self.slots.items[index].state.restore_job_format = format;
+    }
+
+    pub fn supportsRestoreJobFormat(self: *const SlotStore, timeline: u64, format: u32) bool {
+        for (self.slots.items) |slot| {
+            if (slot.state.timeline_id != timeline or slot.state.reseed_required) continue;
+            if (slot.state.lifecycle != .streaming or slot.state.restore_job_format < format) return false;
+        }
+        return true;
     }
 
     pub fn count(self: *const SlotStore) usize {
@@ -251,6 +267,7 @@ pub const SlotStore = struct {
         const current = self.get(name) orelse return error.SlotNotFound;
         var next = current;
         next.reseed_required = true;
+        next.restore_job_format = 0;
         try self.createOrUpdate(next);
     }
 
@@ -721,12 +738,20 @@ test "storage.hot_standby slot store persists slot progress across reopen" {
             .applied_lsn = 3,
             .safe_read_lsn = 3,
         });
+        try std.testing.expect(!store.supportsRestoreJobFormat(1, 5));
+        store.observeRestoreJobFormat("standby-a", 5);
+        try std.testing.expect(store.supportsRestoreJobFormat(1, 5));
+        try std.testing.expect(!store.supportsRestoreJobFormat(1, 6));
+        store.observeRestoreJobFormat("standby-a", 0);
+        try std.testing.expect(!store.supportsRestoreJobFormat(1, 5));
+        store.observeRestoreJobFormat("standby-a", 5);
         try store.updateProgress("standby-a", 8, 7, 6);
     }
 
     {
         var reopened = try SlotStore.open(alloc, path.ptr, .{});
         defer reopened.close();
+        try std.testing.expect(!reopened.supportsRestoreJobFormat(1, 5));
         try std.testing.expectEqual(@as(usize, 1), reopened.count());
         const slot = reopened.get("standby-a") orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(@as(u64, 1), slot.timeline_id);

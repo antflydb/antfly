@@ -33,6 +33,9 @@ pub const retirement_reader_version: u32 = 8;
 pub const max_manifest_bytes: usize = 16 * 1024 * 1024;
 pub const max_objects: usize = 1_000_000;
 pub const max_path_bytes: usize = 4096;
+const blob_header_fixed_bytes: usize = 4 + 4 + 4 + 8 + 8 + 1 + std.crypto.hash.sha2.Sha256.digest_length;
+pub const max_blob_header_bytes: usize = blob_header_fixed_bytes + max_path_bytes + 128;
+pub const blob_chunk_prefix_bytes: usize = 12;
 pub const native_chunk_target_bytes: usize = 4 * 1024 * 1024;
 pub const trailer_magic = [8]u8{ 'A', 'F', 'B', '2', 'I', 'D', 'X', '\n' };
 pub const trailer_size: usize = 32;
@@ -337,7 +340,7 @@ pub const DecodedBlobHeader = struct {
 };
 
 pub fn decodeBlobHeader(alloc: std.mem.Allocator, encoded: []const u8) !DecodedBlobHeader {
-    const fixed_without_strings = 4 + 4 + 4 + 8 + 8 + 1 + std.crypto.hash.sha2.Sha256.digest_length;
+    const fixed_without_strings = blob_header_fixed_bytes;
     if (encoded.len < fixed_without_strings) return error.InvalidNativeFileHeader;
     const path_len = std.mem.readInt(u32, encoded[4..8], .little);
     if (path_len == 0 or path_len > max_path_bytes or encoded.len < 8 + path_len + 4)
@@ -387,7 +390,7 @@ pub fn encodeBlobChunkAlloc(alloc: std.mem.Allocator, chunk: BlobChunk) ![]u8 {
 }
 
 pub fn decodeBlobChunk(encoded: []const u8) !BlobChunk {
-    if (encoded.len <= 12 or encoded.len > 12 + native_chunk_target_bytes)
+    if (encoded.len <= blob_chunk_prefix_bytes or encoded.len > blob_chunk_prefix_bytes + native_chunk_target_bytes)
         return error.InvalidNativeFileChunk;
     return .{
         .ordinal = std.mem.readInt(u32, encoded[0..4], .little),
