@@ -85,6 +85,25 @@ records 60 exact-match HTTP responses and a 2,312,110,080-byte reduction in
 managed CUDA peak allocations. Its latency measurements were contended and
 do not qualify L4 performance; host placement remains opt-in.
 
+## EmbeddingGemma 2 automatic L4 profile
+
+On NVIDIA L4, singleton shared-encoder requests up to 8192 tokens automatically
+use the qualified packed-projection,
+extended-attention, graph-replay and fused-backbone profile. Global packed-GEMM
+attention additionally requires 512–8192 encoder tokens. Other hardware,
+unsupported shapes, unavailable bundled kernels/libraries, and denied scratch
+admission retain existing fallbacks. Projection autotuning and experimental
+audio-tower/batching routes remain off unless explicitly enabled. Vision-tower
+profile flags also remain explicit. Automatic graph replay stays off for short
+tails that would suppress 64-row tiled padding; this avoids a measured image-only
+latency regression. Image/audio requests can use the automatic shared encoder.
+
+Set `ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_AUTOMATIC=0` to restore the prior
+default selection; explicit route settings still apply. Individual promoted
+flags set to `0` disable their automatic route. The automatic recipe has a
+separate CUDA embedding identity, so existing pinned embeddings need a
+compatible recipe or regeneration. See [scope, overrides and validation](scripts/embeddinggemma2/profiling/AUTOMATIC_DEFAULTS.md).
+
 ## EmbeddingGemma 2 CUDA image residency
 
 Pure-image groups and the direct image embedding pipeline retain resized patches,
@@ -241,7 +260,8 @@ also the repeatable retrieval path: timed selection is owned by each model
 session and can otherwise choose numerically different algorithms for models
 with identical shapes.
 
-EmbeddingGemma 2 global text attention uses the resident SM89 BF16 flash
+Outside the automatic/explicit global-GEMM profile, EmbeddingGemma 2 global
+text attention uses the resident SM89 BF16 flash
 kernel for its exact 512-token, four-query-head, one-KV-head, 512-dimension
 geometry. This route is independent of the optional cuDNN
 policy. Other global shapes use the generic attention kernel. Sliding text
