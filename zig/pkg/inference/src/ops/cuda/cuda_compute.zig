@@ -7956,12 +7956,12 @@ pub const CudaCompute = struct {
         if (!self.gemma4_projector_cache_enabled or key.len > 384 or
             self.gemma4_projector_weights.contains(key) or
             self.ctx.prepared_cache_funding != null or self.managed_derived_weight_publication or
-            self.shared_operation_owner != null or self.run_budget != null or
+            self.shared_operation_owner != null or
             self.resident_training_cache or self.execution_scope != null or
             self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
             cudaEffectiveTempSlotPeriod(self) != 0) return;
         const source = tensorFromCt(value);
-        if (!source.owned_by_tensor or !source.owns_buffer or source.buffer.borrowed or
+        if (!source.owned_by_tensor or !source.owns_buffer or !source.owns_shape or source.buffer.borrowed or
             source.resident_parent != null or source.resident_references.load(.acquire) != 1 or
             source.storage_retirement != null or source.physical_lease != null or source.physical_storage_base or
             source.foreign_payload_owner != null or source.foreign_clone_owner != null or source.foreign_header_allocator != null or
@@ -9212,7 +9212,7 @@ pub const CudaCompute = struct {
         if (!plan.capture_prefill or self.owned_by_backend or self.shared_operation_owner != null or self.execution_scope != null or
             self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or dc.attention_mode != .paged_prefill or
             dc.query_sequence_len <= 1 or dc.query_sequence_len != dc.total_sequence_len or dc.kv_sequence_len != dc.total_sequence_len or
-            dc.kv_position_offset != 0 or dc.kv_batch != null or dc.forward_kv_reuse != null or dc.attn_or_mask != null or dc.selection_query_capture != null or
+            dc.kv_position_offset != 0 or dc.kv_batch != null or dc.forward_kv_reuse != null or dc.selection_query_capture != null or
             dc.mrope_positions != null or dc.qwen3vl_visual_mask != null or dc.qwen3vl_deepstack_embeddings != null or
             (config.hasPle() and ple == null)) return null;
         const kv = dc.kv_cache orelse return null;
@@ -9227,7 +9227,7 @@ pub const CudaCompute = struct {
         // share this owner without inventing aliases or copying embeddings.
         // An admitted error propagates; it must not retry an eager KV write.
         const rows = dc.query_sequence_len;
-        var spec = @import("../../execution/prefill_frontend.zig").Spec{ .config = config, .rows = rows, .output = output_contract };
+        var spec = @import("../../execution/prefill_frontend.zig").Spec{ .config = config, .rows = rows, .output = output_contract, .attn_or_mask = dc.attn_or_mask };
         const hidden_shape = [_]i64{ @intCast(rows), config.hidden_size };
         const ple_shape = [_]i64{ @intCast(rows), @intCast(config.num_hidden_layers * config.ple_hidden_size) };
         const Capture = @import("../../execution/capture.zig");
@@ -17476,7 +17476,9 @@ fn allocPinnedTempSlot(
         traceCudaTempAlloc(self, seq, "alloc_slot_busy_fallback", len, .{});
         return null;
     }
-    if (slot.requested_len != 0 and slot.requested_len != len) {
+    if ((slot.requested_len != 0 and slot.requested_len != len) or
+        (slot.buffer.ptr != 0 and slot.buffer.len != len))
+    {
         if (self.temp_slot_config.autoplan_enabled) self.temp_arena_planner.markPinnedValidationFailure();
         traceCudaTempAlloc(self, seq, "alloc_slot_shape_fallback", len, .{});
         return null;
@@ -17526,12 +17528,18 @@ fn resetTempPinnedSlotsForRequestWithCleanup(self: *CudaCompute, current: CacheC
     while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
     defer self.temp_buffer_mutex.unlock();
 
-    try recycleTempPinnedSlotsUnlocked(self);
+    try recycleTempPinnedSlotsUnlocked(self, if (self.temp_slot_config.autoplan_enabled) .idle else .none);
     self.temp_trace_seq = 0;
     self.temp_arena_planner.resetForRequest();
 }
 
-fn recycleTempPinnedSlotsUnlocked(self: *CudaCompute) !void {
+const TempSlotReuse = union(enum) {
+    none,
+    idle,
+    plan: []const usize,
+};
+
+fn recycleTempPinnedSlotsUnlocked(self: *CudaCompute, reuse: TempSlotReuse) !void {
     var reusable_count: usize = 0;
     for (self.temp_pinned_slots.items) |slot| {
         if (slot.in_use) return error.InvalidCudaState;
@@ -17542,7 +17550,26 @@ fn recycleTempPinnedSlotsUnlocked(self: *CudaCompute) !void {
     const max_buffers = cudaTempCacheMaxBuffers(self);
     var cached_bytes: usize = 0;
     for (self.temp_buffers.buffers.items) |cached| cached_bytes +|= cached.len;
-    for (self.temp_pinned_slots.items) |*slot| {
+    // Retain only physical backing, never a request's graph or allocation ABI.
+    // The next request must reprove its trace before these slots can be used.
+    // A separate bounded arena bank avoids overflowing the ordinary 256-entry
+    // cache on every request; original device allocation leases remain live.
+    const retained_budget = if (reuse == .none or max_buffers == 0) 0 else @min(cache_budget, cudaTempArenaAdmissionBudgetBytes(self));
+    var retained_bytes: usize = 0;
+    for (self.temp_pinned_slots.items, 0..) |*slot, index| {
+        const requested_len: ?usize = switch (reuse) {
+            .none => null,
+            .idle => 0,
+            .plan => |lengths| if (index < lengths.len and slot.buffer.len == lengths[index]) lengths[index] else null,
+        };
+        const physical_bytes = @max(slot.buffer.len, slot.buffer.allocation_bytes);
+        if (requested_len != null and slot.buffer.ptr != 0 and
+            !slot.buffer.borrowed and physical_bytes <= retained_budget -| retained_bytes)
+        {
+            retained_bytes += physical_bytes;
+            slot.requested_len = requested_len.?;
+            continue;
+        }
         if (slot.buffer.ptr != 0) {
             var buffer = slot.buffer;
             if (self.temp_buffers.buffers.items.len < max_buffers and
@@ -17590,7 +17617,7 @@ fn installLearnedTempArenaPlan(self: *CudaCompute) !bool {
     while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
     defer self.temp_buffer_mutex.unlock();
 
-    try recycleTempPinnedSlotsUnlocked(self);
+    try recycleTempPinnedSlotsUnlocked(self, .{ .plan = lengths });
     try ensureTempPinnedSlots(self, lengths.len);
     for (lengths, 0..) |len, index| {
         self.temp_pinned_slots.items[index].requested_len = len;
@@ -17602,7 +17629,7 @@ fn discardLearnedTempArenaSlots(self: *CudaCompute) !void {
     invalidateDebugFinalHiddenGraph(self);
     while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
     defer self.temp_buffer_mutex.unlock();
-    try recycleTempPinnedSlotsUnlocked(self);
+    try recycleTempPinnedSlotsUnlocked(self, .none);
 }
 
 fn noteLearnedTempArenaBoundary(self: *CudaCompute) !void {
@@ -19469,6 +19496,10 @@ test "CUDA request reset clears pinned temp slot ABI mappings" {
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
+    self.temp_slot_config = .{};
+    self.run_budget = null;
+    self.capability_profile = null;
+    self.stats = .{};
     self.allocator = std.testing.allocator;
     self.temp_buffer_mutex = .unlocked;
     self.temp_buffers = .empty;
@@ -19501,6 +19532,24 @@ test "CUDA request reset clears pinned temp slot ABI mappings" {
         try std.testing.expectEqual(@as(usize, 0), slot.requested_len);
         try std.testing.expect(!slot.in_use);
     }
+
+    // An automatic plan parks backing without retaining its ordinal ABI.
+    self.temp_slot_config.autoplan_enabled = true;
+    self.temp_pinned_slots.items[0] = .{ .buffer = self.temp_buffers.orderedRemove(0), .requested_len = 64 };
+    self.temp_pinned_slots.items[1] = .{ .buffer = self.temp_buffers.orderedRemove(0), .requested_len = 128 };
+    try resetTempPinnedSlotsForRequest(&self);
+    try std.testing.expectEqual(@as(usize, 0), self.temp_buffers.buffers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), self.temp_pinned_slots.items[0].requested_len);
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x1000), self.temp_pinned_slots.items[0].buffer.ptr);
+    const lengths = [_]usize{ 64, 256 };
+    try recycleTempPinnedSlotsUnlocked(&self, .{ .plan = &lengths });
+    try std.testing.expectEqual(@as(usize, 64), self.temp_pinned_slots.items[0].requested_len);
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), self.temp_pinned_slots.items[1].buffer.ptr);
+    try std.testing.expectEqual(@as(usize, 1), self.temp_buffers.buffers.items.len);
+    // Discarding a plan unpins every backing through ordinary bounded
+    // recycling, including buffers that matched the preceding plan.
+    try recycleTempPinnedSlotsUnlocked(&self, .none);
+    try std.testing.expectEqual(@as(usize, 2), self.temp_buffers.buffers.items.len);
 
     self.temp_pinned_slots.items[0] = .{
         .buffer = .{ .ptr = 0x3000, .len = 256 },
@@ -62014,6 +62063,12 @@ test "Gemma4 CUDA projector cache preserves compact dtype and independent admiss
     var replacement = @import("../../runtime/tier/memory.zig").AdmissionController{};
     var compute = try CudaCompute.init(a);
     defer compute.deinit();
+    // Ordinary request budgeting is not a managed numerical boundary. Keep
+    // the existing independently admitted zero-copy cache available to these
+    // callers; actual managed/funded/scoped execution remains rejected below.
+    var request_budget = run_memory.RunBudget.init(.{ .backend_limit_bytes = 1024 * 1024 });
+    compute.configureRunBudget(&request_budget);
+    defer compute.configureRunBudget(null);
     compute.capability_profile = .gemma4;
     compute.gemma4_projector_cache_enabled = true;
     const cb = compute.computeBackend();
@@ -62025,6 +62080,13 @@ test "Gemma4 CUDA projector cache preserves compact dtype and independent admiss
         const source = tensor_mod.Tensor{ .data = if (dtype == .f32) @constCast(std.mem.sliceAsBytes(&values)) else std.mem.sliceAsBytes(&bits), .dtype = dtype, .shape = &.{4}, .name = "projector-fixture", .allocator = a, .owns_data = false, .owns_shape = false };
         const weight = try compute.uploadProjectorWeight(&source);
         defer cb.free(weight);
+        // A cache cannot extend borrowed shape metadata beyond its caller.
+        // Restore this fixture's real ownership before either exit path.
+        tensorFromCt(weight).owns_shape = false;
+        compute.retainGemma4ProjectorWeight("borrowed-shape", weight);
+        tensorFromCt(weight).owns_shape = true;
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_weight_bytes);
+        try std.testing.expectEqual(@as(usize, 0), compute.gemma4_projector_weight_count);
         // Optional cache metadata failure neither fails the request nor leaks a lease.
         compute.allocator = std.testing.failing_allocator;
         compute.retainGemma4ProjectorWeight("failed-key", weight);
@@ -62539,4 +62601,47 @@ test "CUDA model constant retirement preserves physical dtype byte accounting" {
         try std.testing.expectEqual(@as(usize, 0), compute.embedding_gemma2_constant_count.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), compute.ctx.device_allocations.snapshot().live);
     }
+}
+
+test "Gemma4 CUDA learned scratch backing survives requests without retaining the allocation ABI" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    compute.temp_slot_config = .{ .autoplan_enabled = true, .configured_period = 2 };
+    compute.runtime_policy.temp_cache_mb = 1;
+    compute.runtime_policy.max_temp_buffers = 1;
+    var first = (try allocPinnedTempSlot(&compute, 0, 64)).?;
+    var second = (try allocPinnedTempSlot(&compute, 1, 128)).?;
+    const first_ptr = first.ptr;
+    const second_ptr = second.ptr;
+    try std.testing.expect(releasePinnedTempSlot(&compute, &first));
+    try std.testing.expect(releasePinnedTempSlot(&compute, &second));
+    try compute.ctx.synchronize();
+    const allocations = compute.stats.device_alloc_calls;
+    const frees = compute.stats.device_free_calls;
+    try resetTempPinnedSlotsForRequest(&compute);
+    try std.testing.expectEqual(@as(usize, 0), compute.temp_buffers.buffers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), compute.temp_pinned_slots.items[0].requested_len);
+    const lengths = [_]usize{ 64, 128 };
+    try recycleTempPinnedSlotsUnlocked(&compute, .{ .plan = &lengths });
+    first = (try allocPinnedTempSlot(&compute, 0, 64)).?;
+    second = (try allocPinnedTempSlot(&compute, 1, 128)).?;
+    try std.testing.expectEqual(first_ptr, first.ptr);
+    try std.testing.expectEqual(second_ptr, second.ptr);
+    try std.testing.expectEqual(allocations, compute.stats.device_alloc_calls);
+    try std.testing.expectEqual(frees, compute.stats.device_free_calls);
+    try std.testing.expectError(error.InvalidCudaState, resetTempPinnedSlotsForRequest(&compute));
+    try std.testing.expect(releasePinnedTempSlot(&compute, &first));
+    try std.testing.expect(releasePinnedTempSlot(&compute, &second));
+    try resetTempPinnedSlotsForRequest(&compute);
+    // A new shape cannot borrow an old backing even after the old ABI cleared.
+    try std.testing.expect((try allocPinnedTempSlot(&compute, 0, 256)) == null);
+    try std.testing.expectEqual(first_ptr, compute.temp_pinned_slots.items[0].buffer.ptr);
+    // Disabling retention drops the physical allocations as well as metadata.
+    compute.runtime_policy.temp_cache_mb = 0;
+    try resetTempPinnedSlotsForRequest(&compute);
+    for (compute.temp_pinned_slots.items) |slot| try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), slot.buffer.ptr);
+    try std.testing.expectEqual(@as(usize, 0), compute.temp_buffers.buffers.items.len);
+    try synchronizeAndDrainDeferredDeviceFrees(&compute);
+    try std.testing.expect(compute.stats.device_free_calls >= frees + 2);
 }

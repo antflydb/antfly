@@ -31,12 +31,18 @@ pub const Spec = struct {
     config: Config,
     rows: usize,
     output: HiddenOutput = .{},
+    /// Immutable control metadata, specialized by contents rather than a
+    /// borrowed request address. OR visibility retains the ordinary decoder
+    /// semantics, including bidirectional media spans inside a causal prefix.
+    attn_or_mask: ?[]const u8 = null,
 
     pub fn donorLayers(self: *const Spec) usize {
         return self.config.num_hidden_layers - self.config.num_kv_shared_layers;
     }
     pub fn resolve(self: *Spec) capture.Forward {
-        return .{ .context = self, .fingerprint = self.config.fingerprint() ^ 0x70726566696c6c01 ^ @as(u64, @intFromBool(self.output.last_row)) ^ (@as(u64, @intFromBool(self.output.final_norm)) << 1), .optimization = .authored_schedule, .device_inputs = .assigned, .output_abi = abi, .validate = validate, .run = run };
+        var fingerprint = self.config.fingerprint() ^ 0x70726566696c6c01 ^ @as(u64, @intFromBool(self.output.last_row)) ^ (@as(u64, @intFromBool(self.output.final_norm)) << 1);
+        if (self.attn_or_mask) |mask| fingerprint = std.hash.Wyhash.hash(fingerprint ^ 0x7669736962696c01, mask);
+        return .{ .context = self, .fingerprint = fingerprint, .optimization = .authored_schedule, .device_inputs = .assigned, .output_abi = abi, .validate = validate, .run = run };
     }
 };
 
@@ -49,6 +55,11 @@ fn validate(raw: *anyopaque, inputs: []const capture.Input) !void {
     const spec: *Spec = @ptrCast(@alignCast(raw));
     _ = try abi(raw, inputs);
     if (spec.rows <= 1 or spec.rows > spec.config.max_position_embeddings or inputs.len != (if (spec.config.hasPle()) @as(usize, 2) else 1)) return error.InvalidInputShape;
+    if (spec.attn_or_mask) |mask| {
+        const expected = std.math.mul(usize, spec.rows, spec.rows) catch return error.InvalidAttentionMask;
+        if (mask.len != expected) return error.InvalidAttentionMask;
+        for (mask) |bit| if (bit > 1) return error.InvalidAttentionMask;
+    }
     for (inputs, 0..) |input, index| {
         const shape = try input.shape();
         const width = if (index == 0) spec.config.hidden_size else spec.config.num_hidden_layers * spec.config.ple_hidden_size;
@@ -73,7 +84,7 @@ fn run(raw: *anyopaque, cb: *const ops.ComputeBackend, a: std.mem.Allocator, inp
     errdefer if (owns_hidden) cb.free(hidden);
     const ple = if (inputs.len == 2) try inputs[1].value(cb) else null;
     defer if (ple) |value| cb.free(value);
-    const context = gpt.DecodeContext{ .total_sequence_len = spec.rows, .query_sequence_len = spec.rows, .kv_sequence_len = spec.rows, .forward_kv_reuse = scope.context() };
+    const context = gpt.DecodeContext{ .total_sequence_len = spec.rows, .query_sequence_len = spec.rows, .kv_sequence_len = spec.rows, .forward_kv_reuse = scope.context(), .attn_or_mask = spec.attn_or_mask };
     owns_hidden = false;
     const final = try gpt.forwardFinalHiddenWithSharedKvOutputAndFinalNorm(cb, a, spec.config, hidden, .{}, 1, spec.rows, &context, ple, null, null, if (spec.output.last_row) .last else .all, spec.output.final_norm);
     outputs[0] = .{ .name = names[0], .value = final.hidden };
@@ -219,6 +230,30 @@ test "functional prefix exports KV and preserves ordinary decoder hidden values"
         try std.testing.expectEqual(@as(usize, config.vocab_size), last_logits.len);
         for (full[config.vocab_size..], last_logits) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
     }
+    var masked_spec = spec;
+    masked_spec.attn_or_mask = &.{ 0, 1, 0, 0 };
+    try std.testing.expect(spec.resolve().fingerprint != masked_spec.resolve().fingerprint);
+    var other_mask = masked_spec;
+    other_mask.attn_or_mask = &.{ 0, 0, 0, 0 };
+    try std.testing.expect(other_mask.resolve().fingerprint != masked_spec.resolve().fingerprint);
+    const masked_outputs = try run(&masked_spec, &cb, a, &declared);
+    defer a.free(masked_outputs);
+    defer for (masked_outputs) |output| cb.free(output.value);
+    const masked_input = try cb.fromFloat32Shape(input.asFloat32(), &.{ 2, 4 });
+    var masked_context = context;
+    masked_context.attn_or_mask = masked_spec.attn_or_mask;
+    const masked_reference = try gpt.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(&cb, a, config, masked_input, .{}, 1, 2, &masked_context, null);
+    defer cb.free(masked_reference.hidden);
+    const masked_expected = try cb.toFloat32(masked_reference.hidden, a);
+    defer a.free(masked_expected);
+    const masked_actual = try cb.toFloat32(masked_outputs[0].value, a);
+    defer a.free(masked_actual);
+    for (masked_expected, masked_actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
+    other_mask.attn_or_mask = &.{0};
+    try std.testing.expectError(error.InvalidAttentionMask, validate(&other_mask, &declared));
+    other_mask.attn_or_mask = &.{ 0, 2, 0, 0 };
+    try std.testing.expectError(error.InvalidAttentionMask, validate(&other_mask, &declared));
+
     for (outputs[1..]) |output| {
         const values = try cb.toFloat32(output.value, a);
         defer a.free(values);
