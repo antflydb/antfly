@@ -13129,6 +13129,20 @@ fn deinitBackendClearRunBudget(ctx: *anyopaque) void {
     deinitBackend(ctx);
 }
 
+/// Retained constants preserve their physical dtype through final release.
+/// The same accounting serves ordinary and prepared retirement ownership.
+fn noteModelConstantRetirement(self: *CudaCompute, tensor: *const CudaTensor) void {
+    const bytes = tensor.elem_count * tensor.dtype.byteSize();
+    if (tensor.gemma4_projector_constant) {
+        self.gemma4_projector_weight_bytes -= bytes;
+        self.gemma4_projector_weight_count -= 1;
+    } else {
+        const previous_bytes = self.embedding_gemma2_constant_bytes.fetchSub(bytes, .acq_rel);
+        const previous_count = self.embedding_gemma2_constant_count.fetchSub(1, .acq_rel);
+        std.debug.assert(previous_bytes >= bytes and previous_count != 0);
+    }
+}
+
 fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor, current: @import("../../execution/cleanup_context.zig").Context) void {
     if (cuda_tensor.cache_retirement_slot) |slot| {
         slot.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
@@ -13153,24 +13167,12 @@ fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor, current: 
         if (cuda_tensor.cache_retirement_slot) |slot| {
             slot.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
             _ = cuda_tensor.buffer.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
-            if (cuda_tensor.gemma4_projector_constant) {
-                self.gemma4_projector_weight_bytes -= cuda_tensor.elem_count * cuda_tensor.dtype.byteSize();
-                self.gemma4_projector_weight_count -= 1;
-            } else {
-                _ = self.embedding_gemma2_constant_bytes.fetchSub(cuda_tensor.elem_count * @sizeOf(f32), .acq_rel);
-                _ = self.embedding_gemma2_constant_count.fetchSub(1, .acq_rel);
-            }
+            noteModelConstantRetirement(self, cuda_tensor);
             cuda_tensor.model_constant_quota.finishRetainedAfterSdkDeath(slot, current) catch platform.inference_process_supervisor.restartWorker();
             cuda_tensor.cache_retirement_slot = null;
         } else {
             _ = cuda_tensor.buffer.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
-            if (cuda_tensor.gemma4_projector_constant) {
-                self.gemma4_projector_weight_bytes -= cuda_tensor.elem_count * cuda_tensor.dtype.byteSize();
-                self.gemma4_projector_weight_count -= 1;
-            } else {
-                _ = self.embedding_gemma2_constant_bytes.fetchSub(cuda_tensor.elem_count * @sizeOf(f32), .acq_rel);
-                _ = self.embedding_gemma2_constant_count.fetchSub(1, .acq_rel);
-            }
+            noteModelConstantRetirement(self, cuda_tensor);
             cuda_tensor.model_constant_quota.releaseAfterSdkDeath(current) catch platform.inference_process_supervisor.restartWorker();
         }
     } else if (cuda_tensor.owns_buffer) releaseDeviceBuffer(self, &cuda_tensor.buffer);
@@ -62443,4 +62445,42 @@ test "CUDA encoder automatic policy funds the same physical cache as its resolve
     var explicit = CacheFunding.Builder{ .storage = &explicit_storage };
     try compute.appendEncoderCacheWorkload(config, 1, mask.len, &mask, &explicit);
     try std.testing.expectEqualDeep(automatic.workload().requests, explicit.workload().requests);
+}
+
+test "CUDA model constant retirement preserves physical dtype byte accounting" {
+    const Mock = struct {
+        fn current(_: driver_mod.CUcontext) callconv(.c) c_int {
+            return 0;
+        }
+        fn alloc(pointer: *driver_mod.CUdeviceptr, _: usize) callconv(.c) c_int {
+            pointer.* = 0x8000;
+            return 0;
+        }
+        fn free(_: driver_mod.CUdeviceptr) callconv(.c) c_int {
+            return 0;
+        }
+    };
+    for ([_]tensor_mod.DType{ .f32, .f16, .bf16 }) |dtype| {
+        var compute: CudaCompute = undefined;
+        compute.ctx = .{ .driver = undefined, .ctx = @ptrFromInt(1), .stream = null, .device = 0, .info = .{} };
+        compute.ctx.driver.fns.cuCtxSetCurrent = Mock.current;
+        compute.ctx.driver.fns.cuMemAlloc = Mock.alloc;
+        compute.ctx.driver.fns.cuMemFree = Mock.free;
+        const bytes = 8 * dtype.byteSize();
+        compute.embedding_gemma2_constant_bytes = .init(bytes);
+        compute.embedding_gemma2_constant_count = .init(1);
+        var shape = [_]i64{8};
+        var tensor = CudaTensor{
+            .buffer = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, bytes),
+            .dtype = dtype,
+            .shape = &shape,
+            .elem_count = 8,
+            .model_constant = true,
+            .owns_shape = false,
+        };
+        freeCudaTensorStorage(&compute, &tensor, .{ .outside_execution = true });
+        try std.testing.expectEqual(@as(usize, 0), compute.embedding_gemma2_constant_bytes.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), compute.embedding_gemma2_constant_count.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), compute.ctx.device_allocations.snapshot().live);
+    }
 }
