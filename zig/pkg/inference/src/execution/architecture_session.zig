@@ -4858,6 +4858,12 @@ pub fn cudaStatsDelta(after: CudaRuntimeStats, before: CudaRuntimeStats) CudaRun
             else => {},
         }
     }
+    // Quantized operator counts are nested, but obey the same request
+    // boundary as the top-level counters. Retaining their lifetime totals
+    // falsely attributes warmup and earlier requests to the current request.
+    inline for (@typeInfo(@TypeOf(after.quant_ops)).@"struct".field_names) |name| {
+        @field(delta.quant_ops, name) = @field(after.quant_ops, name) -| @field(before.quant_ops, name);
+    }
     return delta;
 }
 
@@ -21882,4 +21888,15 @@ test "host preparation rejects explicit PJRT when provider support is disabled" 
     const manifest = manifest_mod.ModelManifest{ .allocator = a };
     try std.testing.expectError(error.PjrtNotEnabled, createPjrtSessionFromManifestWithOptions(a, "/never-opened", &manifest, .{ .memory_policy = .cpu }));
     try std.testing.expectError(error.PjrtNotEnabled, createSessionFromManifest(a, "/never-opened", &manifest, .pjrt, .{}, .dynamic, null, null, false));
+}
+
+test "CUDA counter delta excludes earlier quantized operations and saturates resets" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const before: CudaRuntimeStats = .{ .kernel_launches = 30, .quant_ops = .{ .total = 10, .mul_mv = 7, .fallback = 3 } };
+    const after: CudaRuntimeStats = .{ .kernel_launches = 35, .quant_ops = .{ .total = 12, .mul_mv = 9, .fallback = 1 } };
+    const delta = cudaStatsDelta(after, before);
+    try std.testing.expectEqual(@as(usize, 5), delta.kernel_launches);
+    try std.testing.expectEqual(@as(usize, 2), delta.quant_ops.total);
+    try std.testing.expectEqual(@as(usize, 2), delta.quant_ops.mul_mv);
+    try std.testing.expectEqual(@as(usize, 0), delta.quant_ops.fallback);
 }

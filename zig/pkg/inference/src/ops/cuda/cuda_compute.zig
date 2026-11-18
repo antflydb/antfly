@@ -38651,6 +38651,74 @@ fn assignedKernelAuxiliariesOp(ctx: *anyopaque, descriptor: *const ops.kernel_de
 // Q4 gate/activation/up remains the original single fused kernel.
 // The ordinary frame owns scratch/output banks; model roots and vendor plans
 // have independent lifetimes, so replay never depends on mutable cache headers.
+/// Reuses the eager head-local F32 schedule with assigned output authority.
+/// The norm operand remains an invocation input: adjusted model weights need
+/// not be promoted to persistent roots or captured from a request allocation.
+const AssignedHeadNormRope = struct {
+    const region = @import("../../execution/region_route.zig");
+    allocator: std.mem.Allocator,
+    compute: *CudaCompute,
+    program: ops.kernel_descriptor.HeadNormRope,
+    inputs: [2]@import("ml").graph.NodeId,
+    outputs: [1]region.Output,
+    policy_key: u64,
+
+    fn ready(self: *@This()) bool {
+        return !cudaDisableHeadNormRopeFusion() and !cudaDebugDecodeScalarsReady(self.compute) and self.compute.kernels.rms_norm_heads_rope_f32 != null;
+    }
+    fn matches(raw: *anyopaque, request: region.Validate) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.ready() and request.policy_key == self.policy_key and request.inputs.len == 2 and
+            PreparedCudaProjection.dense(self.compute, request.inputs[0], self.program.shape) and
+            PreparedCudaProjection.dense(self.compute, request.inputs[1], self.program.weight_shape);
+    }
+    fn validate(raw: *anyopaque, request: region.Validate) !void {
+        if (!matches(raw, request)) return error.PreparedRegionBindingChanged;
+    }
+    fn dispatch(raw: *anyopaque, request: region.Invocation) !region.Outcome {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try validate(raw, request.validation);
+        if (request.inputs.len != 2 or request.outputs.len != 1) return error.InvalidShape;
+        const input = tensorFromCt(request.inputs[0]);
+        const weight = tensorFromCt(request.inputs[1]);
+        const bytes = self.outputs[0].bytes;
+        try ensureF32(input);
+        try ensureF32(weight);
+        try ensureCount(input, bytes / 4);
+        try ensureCount(weight, self.program.rotary.head_dim);
+        const output = try assignedRegionOutput(self.compute, request, 0, bytes);
+        const g = self.program;
+        const r = g.rotary;
+        var profile = beginPrefillProfile(self.compute, .rope, g.rows);
+        defer if (profile) |*scope| scope.end();
+        try self.compute.kernels.launchRmsNormHeadsRopeF32(&self.compute.ctx, output, input.buffer, weight.buffer, g.rows, g.width, r.head_dim, r.rope_dim, g.eps, r.theta, r.freq_scale, r.position_offset, r.seq_len, r.consecutive_pairs, 1.0);
+        self.compute.stats.head_norm_rope_fused_hits += 1;
+        self.compute.stats.launch_norm += 1;
+        self.compute.stats.launch_norm_head_rope += 1;
+        return .completed;
+    }
+    fn deinit(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.allocator.destroy(self);
+    }
+    const table: region.Owned.VTable = .{ .matches = matches, .validate = validate, .dispatch = dispatch, .deinit = deinit };
+};
+
+fn assignedRegionOutput(compute: *CudaCompute, request: @import("../../execution/region_route.zig").Invocation, index: usize, bytes: usize) !buffer_mod.DeviceBuffer {
+    const output = tensorFromCt(request.outputs[index].tensor);
+    const authority = request.outputs[index].authority orelse return error.InvalidAssignedOutput;
+    const lease = output.physical_lease orelse return error.InvalidAssignedOutput;
+    if (lease.backend.ptr != @as(*anyopaque, @ptrCast(compute)) or !acceptsPhysicalImplementation(lease.backend.vtable) or
+        output.dtype != .f32 or output.quant_type != null or output.elem_count != bytes / 4 or cudaTensorReadOnly(output) or output.buffer.len < bytes or
+        !lease.acceptsWritableRegion(authority.slot.allocation, authority.slot.epoch, bytes, authority.region) or
+        output.buffer.ptr != authority.region.backing.base + authority.region.byte_offset) return error.InvalidAssignedOutput;
+    for (request.inputs) |value| {
+        const source = tensorFromCt(value).buffer;
+        if (kernel_geometry.byteRangesOverlap(output.buffer.ptr, bytes, source.ptr, source.len)) return error.InvalidAssignedAlias;
+    }
+    return .{ .ptr = output.buffer.ptr, .len = bytes };
+}
+
 const AssignedProjectionGroup = struct {
     const region = @import("../../execution/region_route.zig");
     const route = @import("../../execution/kernel_route.zig");
@@ -38715,20 +38783,10 @@ const AssignedProjectionGroup = struct {
         if (!matches(raw, request)) return error.PreparedRegionBindingChanged;
     }
     fn outputBuffer(self: *@This(), request: region.Invocation, index: usize) !buffer_mod.DeviceBuffer {
-        const output = tensorFromCt(request.outputs[index].tensor);
-        const authority = request.outputs[index].authority orelse return error.InvalidAssignedOutput;
-        const lease = output.physical_lease orelse return error.InvalidAssignedOutput;
-        const bytes = self.outputs[index].bytes;
-        if (lease.backend.ptr != @as(*anyopaque, @ptrCast(self.compute)) or !acceptsPhysicalImplementation(lease.backend.vtable) or
-            output.dtype != .f32 or output.elem_count != bytes / 4 or cudaTensorReadOnly(output) or output.buffer.len < bytes or
-            !lease.acceptsWritableRegion(authority.slot.allocation, authority.slot.epoch, bytes, authority.region) or
-            output.buffer.ptr != authority.region.backing.base + authority.region.byte_offset) return error.InvalidAssignedOutput;
-        for (request.inputs) |value| {
-            const source = tensorFromCt(value).buffer;
-            if (kernel_geometry.byteRangesOverlap(output.buffer.ptr, bytes, source.ptr, source.len)) return error.InvalidAssignedAlias;
-        }
-        for (self.weight_buffers[0..self.head.count]) |weight| if (kernel_geometry.byteRangesOverlap(output.buffer.ptr, bytes, weight.ptr, weight.len)) return error.InvalidAssignedAlias;
-        return .{ .ptr = output.buffer.ptr, .len = bytes };
+        const output = try assignedRegionOutput(self.compute, request, index, self.outputs[index].bytes);
+        const bytes = output.len;
+        for (self.weight_buffers[0..self.head.count]) |weight| if (kernel_geometry.byteRangesOverlap(output.ptr, bytes, weight.ptr, weight.len)) return error.InvalidAssignedAlias;
+        return .{ .ptr = output.ptr, .len = bytes };
     }
     fn invocation(self: *@This(), request: region.Invocation, index: usize) !cublaslt_mod.TensorCoreInvocation {
         const input = tensorFromCt(request.inputs[0]);
@@ -38886,6 +38944,26 @@ const AssignedProjectionGroup = struct {
         for (request.partition_nodes) |node| {
             if (!request.reachable[node]) continue;
             const value = request.graph.node(node);
+            if (value.op == .fused_rope) {
+                const program = ops.kernel_descriptor.headNormRope(request.graph, node) orelse continue;
+                const entry = program.covered[0];
+                var eligible = markers[program.input].position < markers[entry].position and markers[program.weight].position < markers[entry].position;
+                for (program.covered, 0..) |covered, index| {
+                    eligible = eligible and markers[covered].member;
+                    if (index < 3) eligible = eligible and markers[covered].users == 1 and markers[covered].last_user == program.covered[index + 1];
+                }
+                if (!eligible or !PreparedCudaProjection.dense(self, request.node_facts[program.input], program.shape) or
+                    !PreparedCudaProjection.dense(self, request.node_facts[program.weight], program.weight_shape)) continue;
+                const owner = try request.allocator.create(AssignedHeadNormRope);
+                owner.* = .{ .allocator = request.allocator, .compute = self, .program = program, .inputs = .{ program.input, program.weight }, .outputs = .{.{ .node = node, .logical = program.shape, .bytes = try checkedMul(@intCast(program.shape.numElements().?), 4) }}, .policy_key = request.policy_key };
+                if (!owner.ready()) {
+                    request.allocator.destroy(owner);
+                    continue;
+                }
+                errdefer owner.allocator.destroy(owner);
+                try result.append(request.allocator, .{ .context = owner, .implementation = request.implementation, .key = entry, .policy_key = request.policy_key, .covered_nodes = &owner.program.covered, .input_nodes = &owner.inputs, .entry_node = entry, .requirements = .{ .outputs = &owner.outputs, .capture = .supported, .requires_execution_profile = false, .uncovered = .{} }, .vtable = &AssignedHeadNormRope.table });
+                continue;
+            }
             var head = if (value.op == .fused_linear_no_bias_pair and !markers[node].ambiguous)
                 ops.kernel_descriptor.pairedProjection(request.graph, node, markers[node].node orelse continue) orelse continue
             else if (value.op == .fused_linear_no_bias and value.num_inputs == 2) independent: {
@@ -60430,4 +60508,100 @@ test "CUDA replay retains exact GELU fallback before fused gate source access" {
     request.activation = .gelu_exact;
     try std.testing.expect((try runGatedFfnResidualOp(&compute, &request)) == null);
     try std.testing.expectEqual(@as(u64, 1), compute.stats.decoder_runtime_gated_ffn_misses);
+}
+
+test "CUDA replay retains head normalization rotary schedule with current input and norm weights" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const compute = try a.create(CudaCompute);
+    defer a.destroy(compute);
+    compute.* = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    compute.gemma4_native_plan = .{ .projection = .packed_q4, .geometry = .{ .donor_layers = 24 } };
+    const cb = compute.computeBackend();
+    const Capture = @import("../../execution/capture.zig");
+    const Stage = struct {
+        fn run(_: *anyopaque, backend: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const Capture.Input) ![]Capture.Output {
+            const weight = try inputs[1].value(backend);
+            defer backend.free(weight);
+            var value = try inputs[0].value(backend);
+            errdefer backend.free(value);
+            for (0..32) |_| {
+                const next = if (acceptsPhysicalImplementation(backend.vtable))
+                    (try backend.rmsNormHeadsRope(value, weight, 6, 64, 32, 16, 0.00001, 10000, 0.5, 7, 3, false, 1)) orelse return error.UnsupportedPrimitiveOp
+                else traced: {
+                    const flat = (try backend.reshape2d(value, 12, 32)).?;
+                    defer backend.free(flat);
+                    const norm = try backend.rmsNorm(flat, weight, 32, 0.00001);
+                    defer backend.free(norm);
+                    const restored = (try backend.reshape2d(norm, 6, 64)).?;
+                    defer backend.free(restored);
+                    break :traced try backend.rope(restored, 3, 32, 16, 10000, 0.5, 7, false);
+                };
+                backend.free(value);
+                value = next;
+            }
+            const outputs = try allocator.alloc(Capture.Output, 1);
+            outputs[0] = .{ .name = "output", .value = value };
+            return outputs;
+        }
+    };
+    var cache = @import("../../execution/captured_forward.zig").Cache{};
+    defer cache.deinit(a);
+    const shape = [_]i64{ 6, 64 };
+    const weight_shape = [_]i64{32};
+    var captures: u64 = 0;
+    var replays: u64 = 0;
+    for (0..4) |iteration| {
+        try cb.beginRequest();
+        var values: [384]f32 = undefined;
+        var weights: [32]f32 = undefined;
+        for (&values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i + iteration * 17)) * 0.13);
+        for (&weights, 0..) |*v, i| v.* = 0.75 + @as(f32, @floatFromInt(i + iteration)) / 128;
+        const input = try cb.fromFloat32Shape(&values, &.{ 6, 64 });
+        defer cb.free(input);
+        const weight = try cb.fromFloat32Shape(&weights, &.{32});
+        defer cb.free(weight);
+        const inputs = [_]Capture.Input{
+            .{ .tensor = .{ .name = "x", .data = &.{}, .dtype = .f32, .shape = &shape, .allocator = a, .owns_data = false, .owns_shape = false }, .resident = .{ .backend = &cb, .value = input } },
+            .{ .tensor = .{ .name = "w", .data = &.{}, .dtype = .f32, .shape = &weight_shape, .allocator = a, .owns_data = false, .owns_shape = false }, .resident = .{ .backend = &cb, .value = weight } },
+        };
+        var held = try cache.runDevice(a, .{ .context = compute, .create = CudaCompute.createPrefillFrame, .import = CudaCompute.importPrefillControl }, .{ .context = compute, .fingerprint = 0x686561646e6f726d, .optimization = .authored_schedule, .device_inputs = .assigned, .output_names = &.{"output"}, .run = Stage.run }, &inputs, a, .{ .native_call_policy = .in_process, .io = std.testing.io });
+        defer held.deinit();
+        captures += held.result.stats.physical_graph_captures;
+        replays += held.result.stats.physical_graph_replays;
+        const pool = held.frame.executable.?.runtime.physical_pool.?;
+        var selected = false;
+        if (pool.variant_cache) |variants| for (variants.entries.items) |variant| {
+            if (variant.pool.regions.len != 32) continue;
+            var complete = true;
+            for (variant.pool.regions) |installed| complete = complete and installed.owner.vtable == &AssignedHeadNormRope.table;
+            selected = selected or complete;
+        };
+        try std.testing.expect(selected);
+        const actual = try held.backend(0).toFloat32(held.result.outputs[0], a);
+        defer a.free(actual);
+        const frozen = try Stage.run(compute, &cb, a, &inputs);
+        defer a.free(frozen);
+        defer cb.free(frozen[0].value);
+        const original = try cb.toFloat32(frozen[0].value, a);
+        defer a.free(original);
+        try std.testing.expectEqualSlices(f32, original, actual);
+        // Independent F64 normalization/partial half-split rotation, including
+        // repeated sequences, nonunit weights, and untouched rotary tail.
+        var reference = values;
+        for (0..32) |_| for (0..12) |chunk| {
+            var sum: f64 = 0;
+            for (reference[chunk * 32 ..][0..32]) |v| sum += @as(f64, v) * v;
+            var norm: [32]f64 = undefined;
+            for (&norm, 0..) |*v, i| v.* = reference[chunk * 32 + i] / @sqrt(sum / 32 + 0.00001) * weights[i];
+            for (0..32) |i| {
+                const angle = @as(f64, @floatFromInt(7 + (chunk / 2) % 3)) * 0.5 / std.math.pow(f64, 10000, @as(f64, @floatFromInt(i % 16)) / 8);
+                reference[chunk * 32 + i] = @floatCast(if (i < 8) norm[i] * @cos(angle) - norm[i + 16] * @sin(angle) else if (i >= 16 and i < 24) norm[i] * @cos(angle) + norm[i - 16] * @sin(angle) else norm[i]);
+            }
+        };
+        for (reference, actual) |expected, got| try std.testing.expectApproxEqAbs(expected, got, 0.0001);
+    }
+    if (captures == 0 or replays == 0) std.debug.print("head norm region captures={d} replays={d}\n", .{ captures, replays });
+    try std.testing.expect(captures > 0 and replays > 0);
 }

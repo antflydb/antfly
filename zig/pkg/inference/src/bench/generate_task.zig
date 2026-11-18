@@ -87,9 +87,15 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
     var cold: [2]u64 = @splat(0);
     const requests = try std.math.mul(usize, try std.math.add(usize, options.warmup, options.iterations), if (comparison) @as(usize, 2) else 1);
     const cuda_before = factory.getCudaRuntimeStats(model.session);
+    var cuda_before_measured: @TypeOf(cuda_before) = null;
     for (0..requests) |i| {
         const mode: usize = if (comparison and (i % 4 == 1 or i % 4 == 2)) 1 else 0;
         if (comparison) pipeline.pjrt_decoder_cache = mode == 1;
+        // Native requests have one contiguous measured cohort. Snapshot after
+        // warmup, outside request timing: cold weight conversion and program
+        // construction must not be attributed to steady-state GPU work.
+        // The interleaved comparison is PJRT-only and has no CUDA counters.
+        if (!comparison and i == options.warmup) cuda_before_measured = factory.getCudaRuntimeStats(model.session);
         const start = inference.platform.time.awakeNs(init.io);
         // This benchmark reuses one backend, whereas serving acquires it for
         // each request. Reset captured temporaries before media/prompt tensors
@@ -153,6 +159,8 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .samples_ns = samples,
         .stage_samples_ms = stage_samples,
         .cuda_request_counters = cuda_counts,
+        .cuda_measured_counters = if (cuda_before_measured != null and cuda_after != null) factory.cudaStatsDelta(cuda_after.?, cuda_before_measured.?) else null,
+        .cuda_profile_intervals = "nested; category durations are not additive",
         .cached_stage_samples_ms = if (comparison) cached_stage_samples else null,
         .warmup = options.warmup,
         .text = held.text,

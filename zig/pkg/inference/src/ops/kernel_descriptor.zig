@@ -361,6 +361,52 @@ pub fn gatedPairedProjection(graph: *const ml.graph.Graph, first: ml.graph.NodeI
     return .{ .head = head, .activation = kind, .output = output };
 }
 
+/// Head-local F32 normalization followed by rotary position encoding. This
+/// describes the original reshape/RMS/reshape/RoPE chain; consumers must prove
+/// its intermediate values are private before choosing a fused schedule.
+pub const HeadNormRope = struct {
+    input: ml.graph.NodeId,
+    weight: ml.graph.NodeId,
+    covered: [4]ml.graph.NodeId,
+    shape: ml.graph.Shape,
+    weight_shape: ml.graph.Shape,
+    rows: usize,
+    width: usize,
+    eps: f32,
+    rotary: Rope,
+};
+
+pub fn headNormRope(graph: *const ml.graph.Graph, output: ml.graph.NodeId) ?HeadNormRope {
+    if (output >= graph.nodeCount()) return null;
+    const rope = graph.node(output);
+    if (rope.op != .fused_rope or rope.num_inputs != 1) return null;
+    const restored_id = rope.inputs[0];
+    const restored = graph.node(restored_id);
+    if (restored.op != .reshape or restored.num_inputs != 1 or !restored.output_shape.eq(rope.output_shape)) return null;
+    const norm_id = restored.inputs[0];
+    const norm = graph.node(norm_id);
+    if (norm.op != .fused_rms_norm or norm.num_inputs != 2) return null;
+    const flat_id = norm.inputs[0];
+    const flat = graph.node(flat_id);
+    if (flat.op != .reshape or flat.num_inputs != 1 or !flat.output_shape.eq(norm.output_shape)) return null;
+    const input = graph.node(flat.inputs[0]);
+    const shape = rope.output_shape;
+    const weight_shape = graph.node(norm.inputs[1]).output_shape;
+    if (shape.dtype != .f32 or shape.rank() != 2 or !input.output_shape.eq(shape) or
+        flat.output_shape.dtype != .f32 or flat.output_shape.rank() != 2 or
+        weight_shape.dtype != .f32 or weight_shape.rank() != 1 or
+        shape.dim(0) <= 0 or shape.dim(1) <= 0) return null;
+    const descriptor = lower(graph, output) orelse return null;
+    const rotary = descriptor.operation.rope;
+    const width: usize = @intCast(shape.dim(1));
+    const rows: usize = @intCast(shape.dim(0));
+    const dim = rotary.head_dim;
+    if (width % dim != 0 or rows % rotary.seq_len != 0 or rotary.chunks_per_token != width / dim or
+        norm.op.fused_rms_norm.dim != dim or weight_shape.dim(0) != dim or
+        flat.output_shape.dim(1) != dim or flat.output_shape.numElements() != shape.numElements()) return null;
+    return .{ .input = flat.inputs[0], .weight = norm.inputs[1], .covered = .{ flat_id, norm_id, restored_id, output }, .shape = shape, .weight_shape = weight_shape, .rows = rows, .width = width, .eps = norm.op.fused_rms_norm.eps, .rotary = rotary };
+}
+
 /// Independent projections sharing one activation. Outputs may have different
 /// widths; every source retains its own projection/rounding contract. Callers
 /// prove partition membership and availability, rather than guessing adjacency.
@@ -881,4 +927,28 @@ test "shared independent projection descriptor preserves unequal widths and reje
     try std.testing.expect(independentProjections(&graph, &.{ outputs[0], outputs[0] }) == null);
     graph.nodeMut(outputs[2]).output_shape.dtype = .bf16;
     try std.testing.expect(independentProjections(&graph, &outputs) == null);
+}
+
+test "shared head normalization rotary descriptor preserves head geometry and precision" {
+    var graph = ml.graph.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{ 6, 64 });
+    const input = try b.parameter("x", shape);
+    const weight = try b.parameter("w", ml.graph.Shape.init(.f32, &.{32}));
+    const flat = try b.reshape(input, ml.graph.Shape.init(.f32, &.{ 12, 32 }));
+    const norm = try b.rmsNorm(flat, weight, 32, 0.00001);
+    const restored = try b.reshape(norm, shape);
+    const output = try graph.addNode(.{ .op = .{ .fused_rope = .{ .seq_len = 3, .head_dim = 32, .rope_dim = 16, .theta = 10000, .freq_scale = 0.5, .position_offset = 7 } }, .output_shape = shape, .inputs = .{ restored, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node }, .num_inputs = 1 });
+    const selected = headNormRope(&graph, output) orelse return error.MissingHeadNormRope;
+    try std.testing.expectEqualSlices(ml.graph.NodeId, &.{ flat, norm, restored, output }, &selected.covered);
+    for ([_]usize{ 7, 7, 8, 8, 9, 9, 7, 7, 8, 8, 9, 9 }, 0..) |expected, chunk| try std.testing.expectEqual(expected, selected.rotary.positionAt(chunk));
+    graph.nodeMut(norm).op.fused_rms_norm.dim = 64;
+    try std.testing.expect(headNormRope(&graph, output) == null);
+    graph.nodeMut(norm).op.fused_rms_norm.dim = 32;
+    graph.nodeMut(weight).output_shape.dtype = .bf16;
+    try std.testing.expect(headNormRope(&graph, output) == null);
+    graph.nodeMut(weight).output_shape.dtype = .f32;
+    graph.nodeMut(restored).output_shape = ml.graph.Shape.init(.f32, &.{ 3, 128 });
+    try std.testing.expect(headNormRope(&graph, output) == null);
 }

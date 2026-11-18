@@ -444,15 +444,18 @@ pub const Pool = struct {
                 }
                 continue;
             }
+            // A frozen region owns every covered view, including views whose
+            // standalone allocation was deliberately removed by recoloring.
+            // Check region ownership before requiring individual reshape slots.
+            if (self.regionForNode(@intCast(id))) |installed| {
+                if (installed.backend_index != index or installed.owner.requirements.capture != .supported) return;
+                if (installed.owner.entry_node == id) count += 1;
+                continue;
+            }
             if (node.op == .reshape and self.backends[index].vtable.kernels.?.physicalReplayReshapeViews) {
                 const slot = plan.slotForNode(@intCast(id)) orelse return;
                 if (slot.backend != .cuda or node.num_inputs != 1 or node.output_shape.dtype != .f32 or
                     node.output_shape.numElements() == null or node.output_shape.numElements() != graph.node(node.inputs[0]).output_shape.numElements()) return;
-                continue;
-            }
-            if (self.regionForNode(@intCast(id))) |installed| {
-                if (installed.backend_index != index or installed.owner.requirements.capture != .supported) return;
-                if (installed.owner.entry_node == id) count += 1;
                 continue;
             }
             const kernel = self.kernels[id] orelse return;
