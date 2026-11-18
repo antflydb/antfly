@@ -2023,7 +2023,7 @@ const RaftTableApplyStateMachine = struct {
                 if (@import("builtin").is_test) self.test_faults.document_apply_successes += 1;
                 return;
             };
-            try owner_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
+            try owner_source.applyPreparedReplicatedBatchClassified(
                 self.alloc,
                 group_id,
                 table_name,
@@ -2031,6 +2031,11 @@ const RaftTableApplyStateMachine = struct {
                 req,
                 entry.term,
                 entry.index,
+                struct {
+                    fn isTerminal(err: anyerror, batch: antfly.db.types.BatchRequest) bool {
+                        return ExpectedApplyFailure.forRequest(err, batch) != null;
+                    }
+                }.isTerminal,
             );
             // The descriptor-pinned owner call intentionally bypasses the
             // ProvisionedTableWriteSource mutation vtable. Publish the
