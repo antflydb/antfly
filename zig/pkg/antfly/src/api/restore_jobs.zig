@@ -160,6 +160,7 @@ pub const ClusterRestoreBinding = struct {
     child_pins: ?[]const u8 = null,
     recovery_manifests_json: ?[]const u8 = null,
     manifest_json: ?[]const u8 = null,
+    publication_nonce: ?[]const u8 = null,
 };
 
 pub const StartRequest = struct {
@@ -1062,6 +1063,15 @@ pub const Store = struct {
             try (self.io orelse return error.AsyncRestoreUnavailable).randomSecure(&nonce);
             const hex = std.fmt.bytesToHex(nonce, .lower);
             req.idempotency_key = try std.fmt.bufPrint(&generated_key_buf, "auto:{s}", .{hex});
+        }
+        var publication_nonce: [32]u8 = undefined;
+        if (req.cluster_binding) |*binding| {
+            if (binding.publication_nonce == null) {
+                var entropy: [16]u8 = undefined;
+                try (self.io orelse return error.AsyncRestoreUnavailable).randomSecure(&entropy);
+                publication_nonce = std.fmt.bytesToHex(entropy, .lower);
+                binding.publication_nonce = &publication_nonce;
+            }
         }
         try validateStartRequest(req);
         _ = self.io orelse return error.AsyncRestoreUnavailable;
@@ -2687,6 +2697,11 @@ fn validateStartRequest(req: StartRequest) !void {
 fn validClusterRestoreBinding(scope: Scope, source_kind: SourceKind, names: ?[]const []const u8, binding: ?ClusterRestoreBinding) bool {
     const value = binding orelse return true;
     if (!validRestoreDigest(value.manifest_sha256)) return false;
+    if (value.publication_nonce) |nonce| {
+        if (nonce.len != 32) return false;
+        for (nonce) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+
     if (value.child_pins) |encoded| {
         if (scope != .cluster or value.children_sha256 != null or encoded.len > max_encoded_child_pins) return false;
         const bytes = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return false;

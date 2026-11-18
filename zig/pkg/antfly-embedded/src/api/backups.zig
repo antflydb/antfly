@@ -3785,13 +3785,16 @@ const publication_identity_prefix = "antfly-restore-job/v1/";
 
 /// Bind a physical publication receipt to one durable admission incarnation.
 /// The archive URI remains independent and is still used for source access.
-pub fn restorePublicationIdentityAlloc(alloc: std.mem.Allocator, job_id: u64, created_at_ms: u64, location: []const u8) ![]u8 {
-    if (job_id == 0 or std.mem.startsWith(u8, location, publication_identity_prefix)) return error.InvalidBackupRequest;
+pub fn restorePublicationIdentityAlloc(alloc: std.mem.Allocator, job_id: u64, admission_nonce: []const u8, location: []const u8) ![]u8 {
+    if (job_id == 0 or admission_nonce.len != 32 or std.mem.startsWith(u8, location, publication_identity_prefix)) return error.InvalidBackupRequest;
+    for (admission_nonce) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return error.InvalidBackupRequest;
+    }
     const canonical = try canonicalRestoreSourceIdentityAlloc(alloc, location);
     defer alloc.free(canonical);
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(canonical, &hash, .{});
-    return std.fmt.allocPrint(alloc, "{s}{x:0>16}/{x:0>16}/{s}", .{ publication_identity_prefix, job_id, created_at_ms, std.fmt.bytesToHex(hash, .lower) });
+    return std.fmt.allocPrint(alloc, "{s}{x:0>16}/{s}/{s}", .{ publication_identity_prefix, job_id, admission_nonce, std.fmt.bytesToHex(hash, .lower) });
 }
 
 pub fn canonicalRestoreSourceIdentityAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -3804,9 +3807,9 @@ pub fn canonicalRestoreSourceIdentityAlloc(alloc: std.mem.Allocator, raw: []cons
 
     if (std.mem.startsWith(u8, raw, publication_identity_prefix)) {
         const suffix = raw[publication_identity_prefix.len..];
-        if (suffix.len != 98 or suffix[16] != '/' or suffix[33] != '/') return error.InvalidBackupRequest;
+        if (suffix.len != 114 or suffix[16] != '/' or suffix[49] != '/') return error.InvalidBackupRequest;
         for (suffix, 0..) |byte, index| {
-            if (index == 16 or index == 33) continue;
+            if (index == 16 or index == 49) continue;
             if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return error.InvalidBackupRequest;
         }
         const job = std.fmt.parseInt(u64, suffix[0..16], 16) catch return error.InvalidBackupRequest;

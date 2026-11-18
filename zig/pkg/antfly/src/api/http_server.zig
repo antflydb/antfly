@@ -21819,8 +21819,9 @@ pub const ApiHttpServer = struct {
             const state = std.json.parseFromSlice(restore_jobs.JobState, self.alloc, current, .{}) catch return error.InternalFailure;
             defer state.deinit();
             if (state.value.format_version >= restore_jobs.pinned_restore_job_format_version and
-                state.value.cluster_binding != null and state.value.cluster_binding.?.recovery_manifests_json != null)
-                publication_identity = backups_api.restorePublicationIdentityAlloc(op_alloc, state.value.job_id, state.value.created_at_ms, req.location) catch return error.InvalidRequest;
+                state.value.cluster_binding != null and state.value.cluster_binding.?.recovery_manifests_json != null and
+                state.value.cluster_binding.?.publication_nonce != null)
+                publication_identity = backups_api.restorePublicationIdentityAlloc(op_alloc, state.value.job_id, state.value.cluster_binding.?.publication_nonce.?, req.location) catch return error.InvalidRequest;
             if (state.value.staging_attempt_id != 0) {
                 const id = @import("../metadata/restore_staging.zig").idForAttempt(restore.job_id, state.value.staging_attempt_id) catch return error.InternalFailure;
                 var staged_control = StagedRestoreControl{ .server = self, .restore = restore };
@@ -22052,7 +22053,14 @@ pub const ApiHttpServer = struct {
                     }
                     var source_manifest = backups_api.parseTableBackupManifestWithArtifactBackupId(op_alloc, recovery.value[index], entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id) catch return error.BackupIntegrityFailure;
                     defer source_manifest.deinit(op_alloc);
-                    if (self.reconcileLocalRestorePublication(destination, publication_identity orelse req.location, entry.artifact_backup_id orelse entry.table_backup_id, &source_manifest, repair_cancellation) catch |err| return metadataAccessFailure(err)) {
+                    if (self.reconcileLocalRestorePublication(destination, publication_identity orelse req.location, entry.artifact_backup_id orelse entry.table_backup_id, &source_manifest, repair_cancellation) catch |err| {
+                        if (metadata_authority.isRetryableError(err)) return error.NotLeader;
+                        if (err == error.Canceled or err == error.Cancelled) return error.Cancelled;
+                        if (err == error.InvalidRestoreState or backups_api.isArtifactIntegrityError(err)) return error.BackupIntegrityFailure;
+                        if (restore_staging_diagnostic_gate.admit(platform_time.monotonicNs()))
+                            std.log.warn("restore publication recovery waiting class={s}", .{@errorName(err)});
+                        return error.RestoreStagingWait;
+                    }) {
                         self.authorizePublishedRestoreDestinations(op_alloc, destination, destination_authorization_principal) catch |err| return switch (err) {
                             error.StoredDestinationAuthorizationRevoked, error.RestoreDestinationReauthorizationRequired => error.RestoreDestinationReauthorizationRequired,
                             error.TableNotFound => error.InvalidRequest,
@@ -26103,14 +26111,15 @@ pub const ApiHttpServer = struct {
             return;
         }
         if (state.scope == .cluster) if (state.cluster_binding) |binding| {
-            if (binding.recovery_manifests_json != null and binding.manifest_json != null and
+            if (binding.publication_nonce != null and binding.recovery_manifests_json != null and binding.manifest_json != null and
                 (state.active_table_index != null or
                     (if (state.durability_pending_table_ranges) |ranges| ranges.len != 0 else false) or
                     (if (state.published_table_ranges) |ranges| ranges.len != 0 else false)))
             {
                 // Publication receipts and the live catalog can finish a
                 // retry before resolving source credentials or opening a root.
-                var unused_location: backups_api.BackupLocation = .{ .file = "." };
+                var unused_root = [_]u8{'.'};
+                var unused_location: backups_api.BackupLocation = .{ .file = &unused_root };
                 const recovered: ?[]u8 = self.executeStoredClusterRestore(state, &unused_location, true) catch |err| switch (err) {
                     error.RestoreValidationPending => null,
                     else => {
@@ -55495,7 +55504,7 @@ test "api http server cluster overwrite restores from read-only repository witho
     defer running_state.deinit();
     const active = try server.restore_job_store.recordTableStarted(alloc, recovery_state.value.job_id, running_state.value.attempt_id, 0);
     defer alloc.free(active);
-    const expected_publication = try backups_api.restorePublicationIdentityAlloc(alloc, recovery_state.value.job_id, recovery_state.value.created_at_ms, location_uri);
+    const expected_publication = try backups_api.restorePublicationIdentityAlloc(alloc, recovery_state.value.job_id, recovery_state.value.cluster_binding.?.publication_nonce.?, location_uri);
     defer alloc.free(expected_publication);
     // A receipt from an older restore of the same archive cannot satisfy
     // this newly admitted overwrite.
