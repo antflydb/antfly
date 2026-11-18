@@ -1,0 +1,199 @@
+{
+  "date": "2026-11-16",
+  "gpu": "NVIDIA L4, 580.159.03, 23034 MiB",
+  "recipe": "automatic-l4-b1-encoder8192-tiled-tails-v2",
+  "checkpoint_sha256": "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79",
+  "binary_sha256": "c4fd57b3ed2f7a20d6aa8d337318ee14f8b7ab8d3c4d7d22378f2427ddde1cb1",
+  "scope": "local encoded file read, decode, preprocessing, tokenization, media tower, shared encoder, pooling and synchronized vector readback; excludes process/model startup and request cleanup",
+  "rounds": 3,
+  "warmups": 3,
+  "iterations_per_round": 8,
+  "latency_aggregation": "median of all 24 samples per workload/arm",
+  "reference": "explicit five-flag profile; automatic short-tail padding and legacy vision tower are intentional differences",
+  "minimum_cosine": 0.9999,
+  "maximum_absolute_error": 0.003,
+  "maximum_latency_ratio_to_legacy": 1.05,
+  "passed": true,
+  "vectors_validated": 720,
+  "automatic_vectors_compared": 240,
+  "cases": [
+    {
+      "name": "text_128",
+      "tokens": 128,
+      "ms": {
+        "legacy": 7.22217,
+        "automatic": 5.281370000000001,
+        "explicit": 5.285368
+      },
+      "legacy_speedup": 1.3674804075457692,
+      "automatic_explicit_min_cosine": 1.0000000000000002,
+      "automatic_explicit_max_abs": 0.0,
+      "automatic_explicit_bitwise_equal": true,
+      "passed": true,
+      "parity_passed": true,
+      "latency_passed": true
+    },
+    {
+      "name": "text_512",
+      "tokens": 512,
+      "ms": {
+        "legacy": 16.0912465,
+        "automatic": 13.8585965,
+        "explicit": 13.8640615
+      },
+      "legacy_speedup": 1.1611021722149137,
+      "automatic_explicit_min_cosine": 1.0,
+      "automatic_explicit_max_abs": 0.0,
+      "automatic_explicit_bitwise_equal": true,
+      "passed": true,
+      "parity_passed": true,
+      "latency_passed": true
+    },
+    {
+      "name": "text_2048",
+      "tokens": 2048,
+      "ms": {
+        "legacy": 225.07919199999998,
+        "automatic": 60.719736,
+        "explicit": 60.5260155
+      },
+      "legacy_speedup": 3.7068539296679415,
+      "automatic_explicit_min_cosine": 1.0,
+      "automatic_explicit_max_abs": 0.0,
+      "automatic_explicit_bitwise_equal": true,
+      "passed": true,
+      "parity_passed": true,
+      "latency_passed": true
+    },
+    {
+      "name": "text_8192",
+      "tokens": 8192,
+      "ms": {
+        "legacy": 2899.4501609999998,
+        "automatic": 301.50082,
+        "explicit": 300.9517985
+      },
+      "legacy_speedup": 9.616723964465503,
+      "automatic_explicit_min_cosine": 1.0,
+      "automatic_explicit_max_abs": 0.0,
+      "automatic_explicit_bitwise_equal": true,
+      "passed": true,
+      "parity_passed": true,
+      "latency_passed": true
+    },
+    {
+      "name": "image_png",
+      "tokens": 264,
+      "ms": {
+        "legacy": 98.279691,
+        "automatic": 95.129973,
+        "explicit": 110.97682449999999
+      },
+      "legacy_speedup": 1.0331096278141485,
+      "automatic_explicit_min_cosine": 0.9999963979671189,
+      "automatic_explicit_max_abs": 0.00032296404242515564,
+      "automatic_explicit_bitwise_equal": false,
+      "passed": true,
+      "parity_passed": true,
+      "latency_passed": true
+    },
+    {
+      "name": "image_jpeg",
+      "tokens": 270,
+      "ms": {
+        "legacy": 125.89576600000001,
+        "automatic": 121.7454545,
+        "explicit": 140.48597999999998
+      },
+      "legacy_speedup": 1.0340900735641019,
+      "automatic_explicit_min_cosine": 0.9999926396089526,
+      "automatic_explicit_max_abs": 0.0005912706255912781,
+      "automatic_explicit_bitwise_equal": false,
+      "passed": true,
+      "parity_passed": true,
+      "latency_passed": true
+    },
+    {
+      "name": "text_image",
+      "tokens": 1157,
+      "ms": {
+        "legacy": 210.808405,
+        "automatic": 146.563419,
+        "explicit": 148.108678
+      },
+      "legacy_speedup": 1.4383425716890514,
+      "automatic_explicit_min_cosine": 1.0,
+      "automatic_explicit_max_abs": 0.0,
+      "automatic_explicit_bitwise_equal": true,
+      "passed": true,
+      "parity_passed": true,
+      "latency_passed": true
+    },
+    {
+      "name": "audio_1s",
+      "tokens": 29,
+      "ms": {
+        "legacy": 10.0994755,
+        "automatic": 9.446427,
+        "explicit": 9.3062965
+      },
+      "legacy_speedup": 1.0691317997799592,
+      "automatic_explicit_min_cosine": 0.9999999999999998,
+      "automatic_explicit_max_abs": 0.0,
+      "automatic_explicit_bitwise_equal": true,
+      "passed": true,
+      "parity_passed": true,
+      "latency_passed": true
+    },
+    {
+      "name": "audio_12s",
+      "tokens": 304,
+      "ms": {
+        "legacy": 25.272441,
+        "automatic": 22.212658,
+        "explicit": 22.1729405
+      },
+      "legacy_speedup": 1.1377495210163502,
+      "automatic_explicit_min_cosine": 1.0000000000000002,
+      "automatic_explicit_max_abs": 0.0,
+      "automatic_explicit_bitwise_equal": true,
+      "passed": true,
+      "parity_passed": true,
+      "latency_passed": true
+    },
+    {
+      "name": "audio_30s",
+      "tokens": 754,
+      "ms": {
+        "legacy": 80.3882935,
+        "automatic": 51.936879999999995,
+        "explicit": 52.680774
+      },
+      "legacy_speedup": 1.547807521360544,
+      "automatic_explicit_min_cosine": 1.0,
+      "automatic_explicit_max_abs": 0.0,
+      "automatic_explicit_bitwise_equal": true,
+      "passed": true,
+      "parity_passed": true,
+      "latency_passed": true
+    }
+  ],
+  "evidence": "evidence/automatic-promotion/final-run/",
+  "median_campaign_peaks": {
+    "legacy": {
+      "gpu_gib": 2.884765625,
+      "pss_gib": 1.5885791778564453,
+      "footprint_gib": 4.071101188659668
+    },
+    "automatic": {
+      "gpu_gib": 3.353515625,
+      "pss_gib": 1.6717605590820312,
+      "footprint_gib": 4.555665969848633
+    },
+    "explicit": {
+      "gpu_gib": 3.740234375,
+      "pss_gib": 1.680734634399414,
+      "footprint_gib": 4.940024375915527
+    }
+  }
+}
