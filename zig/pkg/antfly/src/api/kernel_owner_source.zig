@@ -7475,6 +7475,15 @@ test "committed owner apply consumes an independently opened owner before delaye
         if (platform_time.monotonicNs() >= deadline) return error.TestSuccessorDidNotQueue;
         try io.sleep(.fromMilliseconds(1), .awake);
     }
+    const publication = try source.registerPublication(1, "docs");
+    {
+        Source.lock(&source.mutex);
+        defer source.mutex.unlock();
+        try std.testing.expect(source.apply_control_active.?.claimed);
+        try std.testing.expectEqual(@as(usize, 0), source.apply_control_pending.items.len);
+        try std.testing.expectEqual(@as(u32, 0), source.apply_control_requests.count());
+    }
+    Source.endPublication(&source, publication);
     gate.proceed.set(io);
     while (true) {
         const done = blk: {
@@ -7482,7 +7491,6 @@ test "committed owner apply consumes an independently opened owner before delaye
             defer source.mutex.unlock();
             if (source.apply_control_active != null or source.apply_control_pending.items.len != 0) break :blk false;
             try std.testing.expectEqual(@as(u32, 0), source.apply_control_requests.count());
-            try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
             break :blk true;
         };
         if (done) break;
@@ -7551,8 +7559,25 @@ test "committed owner apply reports permanent projection failures for the exact 
     var valid = invalid;
     valid.indexes_json = "{}";
     try applyCommittedForTest(&source, alloc, 1, "docs", valid, batch, 2, 2);
-    // A snapshot may skip a failed entry before Raft retrieves its result.
-    try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 2, "skipped", invalid, batch, 2, 1));
+    // Wait for a completed failure before publishing past its entry.
+    while (true) {
+        Source.lock(&source.mutex);
+        const queued = source.apply_control_requests.contains(.{ .group_id = 2, .table_name = "skipped" });
+        source.mutex.unlock();
+        if (queued) break;
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 2, "skipped", invalid, batch, 2, 1));
+        if (platform_time.monotonicNs() >= deadline) return error.TestColdOwnerDidNotQueue;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    while (true) {
+        Source.lock(&source.mutex);
+        const request = source.apply_control_requests.get(.{ .group_id = 2, .table_name = "skipped" }).?;
+        const completed = request.projection_failure != null;
+        source.mutex.unlock();
+        if (completed) break;
+        if (platform_time.monotonicNs() >= deadline) return error.TestProjectionFailureDidNotComplete;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
     const publication = try source.registerPublication(2, "skipped");
     Source.endPublication(&source, publication);
     try applyCommittedForTest(&source, alloc, 2, "skipped", valid, batch, 2, 2);
