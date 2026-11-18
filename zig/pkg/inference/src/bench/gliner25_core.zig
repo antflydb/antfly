@@ -8,7 +8,7 @@ const deberta = inference.architectures.deberta;
 const decision = inference.architectures.gliner_decision_head;
 const A = std.heap.c_allocator;
 const Input = struct { name: []const u8, shape: []const i64, data: []const i64 };
-const Case = struct { id: []const u8, text: []const u8, schema_json: ?[]const u8 = null, texts: ?[]const []const u8 = null, bf16_flags: ?u32 = null, encoder_layers: ?usize = null, encoder_core: bool = false, pad_sequence: bool = false, inputs: []const Input, kind: enum { classification, entities } = .classification };
+const Case = struct { id: []const u8, text: []const u8, schema_json: ?[]const u8 = null, texts: ?[]const []const u8 = null, inputs: []const Input, kind: enum { classification, entities } = .classification };
 const Manifest = struct { cases: []const Case, architecture: enum { span, boundary } };
 const processor = inference.pipelines.gliner_boundary_processor;
 const schema_mod = inference.pipelines.extraction_schema;
@@ -114,17 +114,6 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     for (parsed.value.cases) |case| {
-        if (case.bf16_flags) |flags| {
-            if (precision != .bf16_full) return error.DiagnosticFlagsRequireFullBf16;
-            const backend = try factory.getComputeBackend(session, A);
-            const cuda: *inference.native_compute.cuda.CudaCompute = @ptrCast(@alignCast(backend.ptr));
-            if (flags != cuda.gliner_bf16_full.flags) {
-                try cuda.ctx.synchronize();
-                cuda.gliner_relative_cache.deinit(A, &cuda.ctx);
-                cuda.gliner_relative_generation +%= 1;
-                cuda.gliner_bf16_full.flags = flags;
-            }
-        }
         if (case.inputs.len != (if (case.kind == .entities) @as(usize, 6) else 4)) return error.InvalidInputs;
         for (case.inputs) |input| if (input.shape.len != 2) return error.InvalidShape;
         const batch = std.math.cast(usize, case.inputs[0].shape[0]) orelse return error.InvalidShape;
@@ -138,7 +127,7 @@ pub fn main(init: std.process.Init) !void {
         defer if (compiled) |*value| value.deinit();
         var prepared: ?processor.PreparedBatch = null;
         defer if (prepared) |*value| value.deinit();
-        if (boundary_config != null and case.encoder_layers == null and !case.encoder_core) {
+        if (boundary_config != null) {
             if (batch > 8) return error.UnsupportedBoundaryBatch;
             compiled = try schema_mod.compile(A, case.schema_json orelse (if (case.kind == .entities) entity_schema else classification_schema), .{});
             const items = try A.alloc(processor.Item, batch);
@@ -147,21 +136,6 @@ pub fn main(init: std.process.Init) !void {
             for (items, 0..) |*item, i| item.* = .{ .text = if (case.texts) |texts| texts[i] else case.text, .schema = &compiled.? };
             prepared = try processor.prepare(A, tok.?, items, .{ .max_batch_items = 8, .max_text_words = 512, .max_sequence_tokens = 512, .max_queries = 64 });
             const value = &prepared.?;
-            if (case.pad_sequence and value.sequence_length < seq) {
-                const old_seq = value.sequence_length;
-                const batch_allocator = value.arena.allocator();
-                const ids = try batch_allocator.alloc(i64, batch * seq);
-                const mask = try batch_allocator.alloc(i64, batch * seq);
-                @memset(ids, 0);
-                @memset(mask, 0);
-                for (0..batch) |row| {
-                    @memcpy(ids[row * seq ..][0..old_seq], value.input_ids[row * old_seq ..][0..old_seq]);
-                    @memcpy(mask[row * seq ..][0..old_seq], value.attention_mask[row * old_seq ..][0..old_seq]);
-                }
-                value.input_ids = ids;
-                value.attention_mask = mask;
-                value.sequence_length = seq;
-            }
             if (value.sequence_length != seq or !std.mem.eql(i64, value.input_ids, case.inputs[0].data) or !std.mem.eql(i64, value.attention_mask, case.inputs[1].data)) return error.PreparedTokenMismatch;
             if (case.kind == .entities) {
                 if (!std.mem.eql(i64, value.text_word_indices, case.inputs[2].data) or !std.mem.eql(i64, value.query_marker_indices, case.inputs[4].data)) return error.PreparedRouteMismatch;
@@ -176,20 +150,7 @@ pub fn main(init: std.process.Init) !void {
             var cb = try factory.getComputeBackend(session, A);
             const started = now();
             var ended: ?u64 = null;
-            if (case.encoder_layers) |layers| {
-                if (layers > cfg.num_hidden_layers) return error.InvalidEncoderLayers;
-                const hidden = try deberta.forwardUntilLayerCt(&cb, A, cfg, case.inputs[0].data, case.inputs[1].data, batch, seq, layers);
-                defer cb.free(hidden);
-                const full = try cb.toFloat32(hidden, A);
-                defer A.free(full);
-                values = try A.alloc(f32, batch * labels * cfg.hidden_size);
-                for (case.inputs[2].data, 0..) |position, i| {
-                    if (position < 0 or position >= seq) return error.InvalidMarkerPosition;
-                    const offset = (i / labels * seq + @as(usize, @intCast(position))) * cfg.hidden_size;
-                    @memcpy(values[i * cfg.hidden_size ..][0..cfg.hidden_size], full[offset..][0..cfg.hidden_size]);
-                }
-                forward_count += 1;
-            } else if (!case.encoder_core and boundary_config != null) {
+            if (boundary_config != null) {
                 const config = boundary_config.?;
                 const result = try boundaryForward(&cb, config, &prepared.?, case.kind == .entities, (precision == .bf16 or precision == .bf16_full));
                 forward_count += 1;
@@ -211,7 +172,7 @@ pub fn main(init: std.process.Init) !void {
                     @memcpy(values[offset * labels ..][0 .. rows * labels], output);
                 }
             }
-            if (case.encoder_layers == null and case.kind == .classification) for (values, case.inputs[3].data) |*v, valid| {
+            if (case.kind == .classification) for (values, case.inputs[3].data) |*v, valid| {
                 if (!std.math.isFinite(v.*)) return error.NonFiniteOutput;
                 if (valid == 0) v.* = -1e4;
             };

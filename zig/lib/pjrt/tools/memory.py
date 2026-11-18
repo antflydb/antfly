@@ -15,9 +15,7 @@
 
 """Process-tree PSS plus per-process NVML sampling for isolated Linux runs."""
 
-import json
-import threading
-import time
+import json, threading, time
 from pathlib import Path
 
 
@@ -97,7 +95,7 @@ class MemorySampler:
                         )
                         + "\n"
                     )
-                except Exception as error:  # noqa: BLE001 - invalidate every sampler failure
+                except Exception as error:
                     self.errors.append(repr(error))
                 self.stop_event.wait(0.2)
 
