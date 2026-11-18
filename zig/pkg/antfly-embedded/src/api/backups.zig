@@ -3781,6 +3781,19 @@ pub const max_restore_source_identity_bytes: usize = 4096;
 /// generation. Canonicalization makes equivalent accepted spellings (such as
 /// gcs:// and gs://, redundant file path components, or trailing object-store
 /// separators) share one idempotency key.
+const publication_identity_prefix = "antfly-restore-job/v1/";
+
+/// Bind a physical publication receipt to one durable admission incarnation.
+/// The archive URI remains independent and is still used for source access.
+pub fn restorePublicationIdentityAlloc(alloc: std.mem.Allocator, job_id: u64, created_at_ms: u64, location: []const u8) ![]u8 {
+    if (job_id == 0 or std.mem.startsWith(u8, location, publication_identity_prefix)) return error.InvalidBackupRequest;
+    const canonical = try canonicalRestoreSourceIdentityAlloc(alloc, location);
+    defer alloc.free(canonical);
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(canonical, &hash, .{});
+    return std.fmt.allocPrint(alloc, "{s}{x:0>16}/{x:0>16}/{s}", .{ publication_identity_prefix, job_id, created_at_ms, std.fmt.bytesToHex(hash, .lower) });
+}
+
 pub fn canonicalRestoreSourceIdentityAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
     if (raw.len == 0 or raw.len > max_restore_source_identity_bytes)
         return error.InvalidBackupRequest;
@@ -3788,6 +3801,18 @@ pub fn canonicalRestoreSourceIdentityAlloc(alloc: std.mem.Allocator, raw: []cons
         if (byte < 0x20 or byte == 0x7f) return error.InvalidBackupRequest;
     }
     if (std.mem.indexOfAny(u8, raw, "?#") != null) return error.InvalidBackupRequest;
+
+    if (std.mem.startsWith(u8, raw, publication_identity_prefix)) {
+        const suffix = raw[publication_identity_prefix.len..];
+        if (suffix.len != 98 or suffix[16] != '/' or suffix[33] != '/') return error.InvalidBackupRequest;
+        for (suffix, 0..) |byte, index| {
+            if (index == 16 or index == 33) continue;
+            if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return error.InvalidBackupRequest;
+        }
+        const job = std.fmt.parseInt(u64, suffix[0..16], 16) catch return error.InvalidBackupRequest;
+        if (job == 0) return error.InvalidBackupRequest;
+        return alloc.dupe(u8, raw);
+    }
 
     const normalized = normalizeRemoteLocationAlloc(alloc, raw) catch |err| switch (err) {
         error.OutOfMemory => return err,

@@ -444,6 +444,8 @@ pub const canonicalRestoreSourceIdentityAlloc = @import("antfly_local_sources").
 
 const canonicalObjectStoreLocationAlloc = @import("antfly_local_sources").api_local_backups.canonicalObjectStoreLocationAlloc;
 
+pub const restorePublicationIdentityAlloc = @import("antfly_local_sources").api_local_backups.restorePublicationIdentityAlloc;
+
 pub const validateCanonicalRestoreSourceIdentity = @import("antfly_local_sources").api_local_backups.validateCanonicalRestoreSourceIdentity;
 
 pub const RestorePublicationHook = backup_contract.RestorePublicationHook;
@@ -12592,6 +12594,20 @@ test "restore source identities are bounded and canonical" {
     );
     defer alloc.free(canonical_file);
     try std.testing.expectEqualStrings("file:///tmp/backups", canonical_file);
+
+    const first_job = try restorePublicationIdentityAlloc(alloc, 42, 100, canonical_file);
+    defer alloc.free(first_job);
+    try validateCanonicalRestoreSourceIdentity(alloc, first_job);
+    const same_job = try restorePublicationIdentityAlloc(alloc, 42, 100, "file:///tmp/antfly/../backups");
+    defer alloc.free(same_job);
+    try std.testing.expectEqualStrings(first_job, same_job);
+    const next_job = try restorePublicationIdentityAlloc(alloc, 43, 100, canonical_file);
+    defer alloc.free(next_job);
+    try std.testing.expect(!std.mem.eql(u8, first_job, next_job));
+    const reused_id = try restorePublicationIdentityAlloc(alloc, 42, 101, canonical_file);
+    defer alloc.free(reused_id);
+    try std.testing.expect(!std.mem.eql(u8, first_job, reused_id));
+    try std.testing.expectError(error.InvalidBackupRequest, restorePublicationIdentityAlloc(alloc, 42, 100, first_job));
 
     const canonical_gcs = try canonicalRestoreSourceIdentityAlloc(
         alloc,

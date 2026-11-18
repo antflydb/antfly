@@ -21811,11 +21811,16 @@ pub const ApiHttpServer = struct {
         if (restore_connection.len == 0 or restore_connection.len > 256) return error.InvalidRequest;
         const restore_io = self.backupLocationIo(location) orelse return error.InternalFailure;
 
+        var publication_identity: ?[]u8 = null;
+        defer if (publication_identity) |identity| op_alloc.free(identity);
         if (cancellation) |restore| {
             const current = (self.restore_job_store.load(self.alloc, restore.job_id) catch return error.InternalFailure) orelse return error.NotLeader;
             defer self.alloc.free(current);
             const state = std.json.parseFromSlice(restore_jobs.JobState, self.alloc, current, .{}) catch return error.InternalFailure;
             defer state.deinit();
+            if (state.value.format_version >= restore_jobs.pinned_restore_job_format_version and
+                state.value.cluster_binding != null and state.value.cluster_binding.?.recovery_manifests_json != null)
+                publication_identity = backups_api.restorePublicationIdentityAlloc(op_alloc, state.value.job_id, state.value.created_at_ms, req.location) catch return error.InvalidRequest;
             if (state.value.staging_attempt_id != 0) {
                 const id = @import("../metadata/restore_staging.zig").idForAttempt(restore.job_id, state.value.staging_attempt_id) catch return error.InternalFailure;
                 var staged_control = StagedRestoreControl{ .server = self, .restore = restore };
@@ -22047,7 +22052,7 @@ pub const ApiHttpServer = struct {
                     }
                     var source_manifest = backups_api.parseTableBackupManifestWithArtifactBackupId(op_alloc, recovery.value[index], entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id) catch return error.BackupIntegrityFailure;
                     defer source_manifest.deinit(op_alloc);
-                    if (self.reconcileLocalRestorePublication(destination, req.location, entry.artifact_backup_id orelse entry.table_backup_id, &source_manifest, repair_cancellation) catch |err| return metadataAccessFailure(err)) {
+                    if (self.reconcileLocalRestorePublication(destination, publication_identity orelse req.location, entry.artifact_backup_id orelse entry.table_backup_id, &source_manifest, repair_cancellation) catch |err| return metadataAccessFailure(err)) {
                         self.authorizePublishedRestoreDestinations(op_alloc, destination, destination_authorization_principal) catch |err| return switch (err) {
                             error.StoredDestinationAuthorizationRevoked, error.RestoreDestinationReauthorizationRequired => error.RestoreDestinationReauthorizationRequired,
                             error.TableNotFound => error.InvalidRequest,
@@ -22389,7 +22394,7 @@ pub const ApiHttpServer = struct {
             const outcome = self.restoreOwnedTableWithRetryAndLifecycle(
                 table_name,
                 location,
-                req.location,
+                publication_identity orelse req.location,
                 table_backup_id,
                 artifact_backup_id,
                 cluster_table.catalog_target != null,
@@ -26100,8 +26105,8 @@ pub const ApiHttpServer = struct {
         if (state.scope == .cluster) if (state.cluster_binding) |binding| {
             if (binding.recovery_manifests_json != null and binding.manifest_json != null and
                 (state.active_table_index != null or
-                    (state.durability_pending_table_ranges orelse &.{}).len != 0 or
-                    (state.published_table_ranges orelse &.{}).len != 0))
+                    (if (state.durability_pending_table_ranges) |ranges| ranges.len != 0 else false) or
+                    (if (state.published_table_ranges) |ranges| ranges.len != 0 else false)))
             {
                 // Publication receipts and the live catalog can finish a
                 // retry before resolving source credentials or opening a root.
@@ -55213,6 +55218,7 @@ test "api http server cluster overwrite restores from read-only repository witho
     const State = struct {
         present: bool = true,
         restored: bool = false,
+        published_source_identity: ?[]u8 = null,
         definition_replaced: bool = false,
         metadata_drop_called: bool = false,
         local_drop_called: bool = false,
@@ -55386,7 +55392,7 @@ test "api http server cluster overwrite restores from read-only repository witho
             self.state.restore_lifecycle_finished = true;
         }
 
-        pub fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, plan: backups_api.TableRestorePlan) !?void {
+        pub fn restoreTable(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, plan: backups_api.TableRestorePlan) !?void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings(self.state.expected_backup_id, plan.manifest.backup_id);
@@ -55394,6 +55400,8 @@ test "api http server cluster overwrite restores from read-only repository witho
             if (plan.reconcile_only) {
                 try std.testing.expect(self.state.restored);
                 try std.testing.expect(!plan.replace_existing);
+                if (!std.mem.eql(u8, self.state.published_source_identity orelse return error.RestoreIdentityMismatch, plan.source_location))
+                    return error.RestoreIdentityMismatch;
                 return {};
             }
             try std.testing.expect(plan.replace_existing);
@@ -55402,10 +55410,13 @@ test "api http server cluster overwrite restores from read-only repository witho
             try (plan.publication_hook orelse return error.TestUnexpectedResult).publish();
             try std.testing.expect(self.state.definition_replaced);
             self.state.restored = true;
+            if (self.state.published_source_identity) |identity| inner_alloc.free(identity);
+            self.state.published_source_identity = try inner_alloc.dupe(u8, plan.source_location);
         }
     };
 
     var state = State{ .expected_backup_id = table_backup_id, .indexes_json = alias_indexes };
+    defer if (state.published_source_identity) |identity| alloc.free(identity);
     var source = FakeSource{ .state = &state };
     var read_source = FakeReads{ .state = &state };
     var write_source = FakeWrites{ .state = &state };
@@ -55484,6 +55495,13 @@ test "api http server cluster overwrite restores from read-only repository witho
     defer running_state.deinit();
     const active = try server.restore_job_store.recordTableStarted(alloc, recovery_state.value.job_id, running_state.value.attempt_id, 0);
     defer alloc.free(active);
+    const expected_publication = try backups_api.restorePublicationIdentityAlloc(alloc, recovery_state.value.job_id, recovery_state.value.created_at_ms, location_uri);
+    defer alloc.free(expected_publication);
+    // A receipt from an older restore of the same archive cannot satisfy
+    // this newly admitted overwrite.
+    try std.testing.expect(!try server.reconcileLocalRestorePublication("docs", expected_publication, table_backup_id, &table_manifest, .none));
+    if (state.published_source_identity) |identity| alloc.free(identity);
+    state.published_source_identity = try alloc.dupe(u8, expected_publication);
     try backup_dir.setPermissions(std.testing.io, backup_dir_permissions);
     try std.Io.Dir.cwd().deleteTree(std.testing.io, backup_root_abs);
     var removed_location: backups_api.BackupLocation = .{ .file = backup_root_abs };
