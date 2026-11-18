@@ -65,6 +65,8 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .pjrt_decoder_cache = options.pjrt.decoder_cache,
     };
     defer pipeline.deinit();
+    const text_bytes = if (options.generate_text_file) |path| try std.Io.Dir.cwd().readFileAlloc(init.io, path, a, .limited(16 * 1024 * 1024)) else null;
+    defer if (text_bytes) |bytes| a.free(bytes);
     const image_bytes = if (options.generate_image) |path| try std.Io.Dir.cwd().readFileAlloc(init.io, path, a, .limited(64 * 1024 * 1024)) else null;
     defer if (image_bytes) |bytes| a.free(bytes);
     const audio_bytes = if (options.generate_audio) |path| try std.Io.Dir.cwd().readFileAlloc(init.io, path, a, .limited(64 * 1024 * 1024)) else null;
@@ -73,7 +75,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
     defer if (video_bytes) |bytes| a.free(bytes);
     const image_inputs = [_][]const u8{image_bytes orelse &.{}};
     const audio_inputs = [_][]const u8{audio_bytes orelse &.{}};
-    const messages = [_]generation.Message{.{ .role = "user", .content = options.generate_text.?, .image_bytes = if (image_bytes != null) &image_inputs else null, .audio_bytes = if (audio_bytes != null) &audio_inputs else null, .video_bytes = video_bytes }};
+    const messages = [_]generation.Message{.{ .role = "user", .content = text_bytes orelse options.generate_text.?, .image_bytes = if (image_bytes != null) &image_inputs else null, .audio_bytes = if (audio_bytes != null) &audio_inputs else null, .video_bytes = video_bytes }};
     const samples = try a.alloc(u64, options.iterations);
     defer a.free(samples);
     const stage_samples = try a.alloc(?generation.GenerationTimingMs, options.iterations);
@@ -171,6 +173,8 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .kv_cached = !is_pjrt or pipeline.pjrt_decoder_cache_used,
         .native_kv_dtype = pipeline.kv_dtype,
         .model_load_in_timing = false,
+        .model_context_tokens = config.max_position_embeddings,
+        .max_output_tokens = options.generate_tokens,
         .measurement_control = if (options.generate_control_stdin) "stdin_after_warmup" else "uncontrolled",
         .model_chat_template = model.chat_tmpl != null,
         .runtime_capabilities = if (cache.compiled_model_runtime) |*runtime| runtime.capabilities() else null,
