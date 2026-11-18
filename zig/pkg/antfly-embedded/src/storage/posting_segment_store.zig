@@ -1600,16 +1600,17 @@ test "storage.posting WAL retries a pre-write descriptor error and fences an amb
     try store.appendBatch(1, batch, 11);
     try std.testing.expectEqual(@as(u64, 2), try store.nextBatchId());
 
-    const next = &.{BatchRecord{ .kind = .base, .posting_id = 7, .source_sequence = 12, .payload = "update" }};
+    const next = &.{BatchRecord{ .kind = .base, .posting_id = 7, .source_sequence = 12, .payload = "second update" }};
     fault_vtable.append_file_absolute_checked = Fault.appendThenFail;
     try std.testing.expectError(error.InputOutput, store.appendBatch(2, next, 12));
     try std.testing.expectError(error.PostingStoreRequiresReopen, store.appendBatch(2, next, 12));
 
     var reopened = try Store.open(alloc, memory.storage(), "/posting-retry");
     defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 2), reopened.last_committed_batch);
     var replay = try reopened.recoverWal();
     defer replay.deinit();
-    try std.testing.expectEqualStrings("update", replay.replay.latest(7, .base).?.payload);
+    try std.testing.expectEqualStrings("second update", replay.replay.latest(7, .base).?.payload);
 }
 
 test "storage.posting segment store poisons ambiguous CURRENT publication" {
