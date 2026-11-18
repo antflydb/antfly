@@ -579,12 +579,10 @@ pub const Store = struct {
         const wal_path = try self.walPathAlloc(self.wal_generation);
         defer self.alloc.free(wal_path);
         const encoded_at = if (trace) @import("antfly_platform").time.monotonicNs() else 0;
-        self.storage.appendFileAbsolute(self.alloc, wal_path, writer.bytes(), options.sync) catch |err| {
-            // The storage error may be ambiguous (for example fsync failed
-            // after the append reached the page cache). Refuse retries on this
-            // handle; reopen reparses the durable prefix without risking a
-            // duplicate committed batch.
-            self.poisoned = true;
+        var may_have_appended: bool = undefined;
+        self.storage.appendFileAbsoluteChecked(self.alloc, wal_path, writer.bytes(), options.sync, &may_have_appended) catch |err| {
+            // An uncertain append must be reconciled against the durable WAL.
+            self.poisoned = may_have_appended;
             return err;
         };
         self.wal_committed_bytes = next_committed_bytes;
@@ -1560,6 +1558,58 @@ test "storage.posting segment store publishes checkpoint and committed WAL gener
     var replay = try store.recoverWal();
     defer replay.deinit();
     try std.testing.expectEqualStrings("quant-v2", replay.replay.latest(7, .quantized_checkpoint).?.payload);
+}
+
+test "storage.posting WAL retries a pre-write descriptor error and fences an ambiguous append" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const Fault = struct {
+        fn reject(_: *anyopaque, _: []const u8, _: []const u8, _: bool, may_have_appended: *bool) !void {
+            may_have_appended.* = false;
+            return error.ProcessFdQuotaExceeded;
+        }
+
+        fn appendThenFail(ptr: *anyopaque, path: []const u8, bytes: []const u8, sync: bool, may_have_appended: *bool) !void {
+            may_have_appended.* = true;
+            const memory_storage: *lsm_backend.MemoryStorage = @ptrCast(@alignCast(ptr));
+            try memory_storage.storage().vtable.append_file_absolute.?(ptr, path, bytes, sync);
+            return error.InputOutput;
+        }
+    };
+
+    var store = try Store.open(alloc, memory.storage(), "/posting-retry");
+    defer store.deinit();
+    var writer = posting_segment.Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBaseAt(7, 10, "base");
+    const segment = try writer.build();
+    defer alloc.free(segment);
+    try store.publishCheckpoint(1, 10, segment);
+
+    var fault_vtable = memory.storage().vtable.*;
+    store.storage.vtable = &fault_vtable;
+    const batch = &.{BatchRecord{ .kind = .base, .posting_id = 7, .source_sequence = 11, .payload = "update" }};
+    fault_vtable.append_file_absolute_checked = Fault.reject;
+    try std.testing.expectError(error.ProcessFdQuotaExceeded, store.appendBatch(1, batch, 11));
+    try std.testing.expect(!store.poisoned);
+    try std.testing.expectEqual(@as(u64, 0), store.wal_committed_bytes);
+    try std.testing.expectEqual(@as(u64, 1), try store.nextBatchId());
+
+    fault_vtable.append_file_absolute_checked = null;
+    try store.appendBatch(1, batch, 11);
+    try std.testing.expectEqual(@as(u64, 2), try store.nextBatchId());
+
+    const next = &.{BatchRecord{ .kind = .base, .posting_id = 7, .source_sequence = 12, .payload = "update" }};
+    fault_vtable.append_file_absolute_checked = Fault.appendThenFail;
+    try std.testing.expectError(error.InputOutput, store.appendBatch(2, next, 12));
+    try std.testing.expectError(error.PostingStoreRequiresReopen, store.appendBatch(2, next, 12));
+
+    var reopened = try Store.open(alloc, memory.storage(), "/posting-retry");
+    defer reopened.deinit();
+    var replay = try reopened.recoverWal();
+    defer replay.deinit();
+    try std.testing.expectEqualStrings("update", replay.replay.latest(7, .base).?.payload);
 }
 
 test "storage.posting segment store poisons ambiguous CURRENT publication" {

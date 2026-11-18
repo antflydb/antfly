@@ -10288,6 +10288,7 @@ pub const HBCIndex = struct {
         records: []const posting_segment_store_mod.BatchRecord,
         covered_source_sequence: u64,
         options: ExperimentalPostingWalAppendOptions,
+        retain_writer_on_failure: ?*bool,
     ) !void {
         if (self.experimental_posting_write_store == null) {
             self.experimental_posting_write_store = try self.openExperimentalPostingStore();
@@ -10304,6 +10305,7 @@ pub const HBCIndex = struct {
             // same batch again. Promote the retained checkpoint builder and
             // let derived replay retry after its short publication handoff.
             if (first_err == error.PostingWalTooLarge) {
+                if (retain_writer_on_failure) |retain| retain.* = true;
                 // A compatibility sidecar is invalidated by the enclosing
                 // capture failure and falls back to its complete LSM. Starting
                 // a builder there would make invalidation join and discard it
@@ -10324,6 +10326,10 @@ pub const HBCIndex = struct {
                     };
                 }
                 if (wal_authoritative) _ = self.forceExperimentalPostingCheckpointBuild(false);
+                return first_err;
+            }
+            if (!self.experimental_posting_write_store.?.poisoned) {
+                if (retain_writer_on_failure) |retain| retain.* = true;
                 return first_err;
             }
             self.closeExperimentalPostingWalWriter();
@@ -10348,7 +10354,11 @@ pub const HBCIndex = struct {
                 covered_source_sequence,
                 .{ .sync = options.sync },
             ) catch |retry_err| {
-                self.closeExperimentalPostingWalWriter();
+                if (recovered.poisoned) {
+                    self.closeExperimentalPostingWalWriter();
+                } else if (retain_writer_on_failure) |retain| {
+                    retain.* = true;
+                }
                 return retry_err;
             };
         };
@@ -10431,7 +10441,7 @@ pub const HBCIndex = struct {
                 .source_sequence = applied_sequence,
                 .payload = &.{},
             }};
-            try self.appendExperimentalPostingBatchDurably(batch_id, &coverage, applied_sequence, options);
+            try self.appendExperimentalPostingBatchDurably(batch_id, &coverage, applied_sequence, options, null);
             try self.publishExperimentalPostingGenerationAfterDurableCommit(&.{}, applied_sequence);
         }
 
@@ -10779,13 +10789,11 @@ pub const HBCIndex = struct {
         // and serve the complete LSM state. WAL-authoritative mode has no such
         // fallback: retain and restore the last committed generation so replay
         // can retry without ever exposing a partial mutation.
-        // A capacity rejection is known to precede append I/O. Keep the valid
-        // writer in that one case: closing it would make every retry reread a
-        // potentially hundreds-of-MiB WAL while its checkpoint is staging.
-        // All ambiguous append/publication failures still reopen and recover.
-        var append_capacity_rejected = false;
+        // An unstarted append leaves the writer and its committed WAL valid.
+        // Keep that handle so replay can retry without reparsing the WAL.
+        var retain_writer_on_failure = false;
         errdefer if (self.experimental_posting_wal_authoritative.load(.acquire))
-            self.preserveExperimentalPostingWalAfterCaptureFailure(!append_capacity_rejected)
+            self.preserveExperimentalPostingWalAfterCaptureFailure(!retain_writer_on_failure)
         else
             self.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
                 std.log.warn("dense posting sidecar capture invalidation failed err={s}", .{@errorName(invalidate_err)});
@@ -10895,15 +10903,13 @@ pub const HBCIndex = struct {
         }
         self.observeApplyWorkspaceBytes();
         if (trace_capture) patch_finished = nowNs();
-        self.appendExperimentalPostingBatchDurably(
+        try self.appendExperimentalPostingBatchDurably(
             batch_id,
             commit_workspace.records.items,
             covered_source_sequence,
             options,
-        ) catch |err| {
-            append_capacity_rejected = err == error.PostingWalTooLarge;
-            return err;
-        };
+            &retain_writer_on_failure,
+        );
         if (trace_capture) wal_finished = nowNs();
 
         // Patch construction and rollback no longer need their old-generation
@@ -26767,6 +26773,7 @@ test "background posting checkpoint preserves concurrent same-sequence WAL tail"
             &coverage,
             4,
             .{},
+            null,
         );
         posting_store = &idx.experimental_posting_write_store.?;
         try std.testing.expect(posting_store.wal_committed_bytes > source_wal_bytes);
@@ -26957,6 +26964,59 @@ test "max-chain full checkpoint starts below the hard WAL budget" {
     try std.testing.expect(managedPostingFullCheckpointWalBytes < managedPostingCheckpointHardWalBytes);
 }
 
+test "posting WAL pre-write descriptor pressure retains the HBC writer" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 2,
+        .search_width = 8,
+        .use_quantization = true,
+        .storage_backend = .lsm,
+    });
+    defer idx.close();
+    try idx.insertWithMetadata(1, &.{ 1.0, 0.0 }, "doc:1");
+    try idx.finalizeExperimentalPostingGenerationAtAppliedSequence(1, .{ .flatten = false });
+    if (idx.experimental_posting_write_store == null) {
+        idx.experimental_posting_write_store = try idx.openExperimentalPostingStore();
+    }
+
+    const Fault = struct {
+        fn reject(_: *anyopaque, _: []const u8, _: []const u8, _: bool, may_have_appended: *bool) !void {
+            may_have_appended.* = false;
+            return error.ProcessFdQuotaExceeded;
+        }
+    };
+    const store = &idx.experimental_posting_write_store.?;
+    const original_vtable = store.storage.vtable;
+    var fault_vtable = original_vtable.*;
+    fault_vtable.append_file_absolute_checked = Fault.reject;
+    store.storage.vtable = &fault_vtable;
+    const batch_id = try store.nextBatchId();
+    const records = &.{posting_segment_store_mod.BatchRecord{
+        .kind = .coverage,
+        .posting_id = 0,
+        .source_sequence = 2,
+        .payload = &.{},
+    }};
+    var retain_writer = false;
+    const result = idx.appendExperimentalPostingBatchDurably(batch_id, records, 2, .{}, &retain_writer);
+    if (idx.experimental_posting_write_store) |*retained| {
+        try std.testing.expectEqual(&fault_vtable, retained.storage.vtable);
+        retained.storage.vtable = original_vtable;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.ProcessFdQuotaExceeded, result);
+    try std.testing.expect(retain_writer);
+    try idx.appendExperimentalPostingBatchDurably(batch_id, records, 2, .{}, null);
+    try std.testing.expectEqual(@as(u64, 2), idx.experimental_posting_write_store.?.covered_source_sequence);
+}
+
 test "posting WAL capacity rejection starts mandatory checkpoint recovery" {
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
@@ -27000,6 +27060,7 @@ test "posting WAL capacity rejection starts mandatory checkpoint recovery" {
             &coverage,
             1,
             .{},
+            null,
         ),
     );
     const build = idx.experimental_posting_checkpoint_build orelse

@@ -1994,6 +1994,8 @@ fn fdCacheTypeLayout(comptime T: type, seed: u64) u64 {
         const fields = @typeInfo(T).@"struct";
         inline for (fields.field_names, fields.field_types, fields.field_attrs) |name, Field, attrs| {
             if (!attrs.@"comptime") {
+                hash = fdCacheLayoutMix(hash, name.len);
+                for (name) |byte| hash = fdCacheLayoutMix(hash, byte);
                 hash = fdCacheLayoutMix(hash, @offsetOf(T, name));
                 hash = fdCacheTypeLayout(Field, hash);
             }
@@ -5435,6 +5437,18 @@ test "transient admission fails fast when only persistent descriptors prevent pr
     persistent_held = false;
     try pool.fd_cache.reserveDescriptors(io, 1);
     defer pool.fd_cache.releaseDescriptors(io, 1);
+}
+
+test "native fd cache rejects mismatched layouts" {
+    if (comptime !supports_posix_fd_cache or !platform.filesystem.capacity_supported) return error.SkipZigTest;
+    const A = extern struct { admitted: usize, persistent: usize };
+    const B = extern struct { persistent: usize, admitted: usize };
+    try std.testing.expect(comptime fdCacheTypeLayout(A, 1) != fdCacheTypeLayout(B, 1));
+
+    const cache = processNativeFdCache();
+    const incompatible = antfly_platform_native_fd_cache(comptime fdCacheLayout() ^ 1, &initProcessNativeFdCache);
+    try std.testing.expect(incompatible == null);
+    try std.testing.expectEqual(cache, processNativeFdCache());
 }
 
 test "native fd pressure reports an unstarted append and permits retry" {

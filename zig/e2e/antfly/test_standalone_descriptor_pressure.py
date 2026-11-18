@@ -17,8 +17,12 @@
 
 import os
 import random
+import shlex
+import shutil
+import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -41,18 +45,25 @@ from conftest import (
 )
 
 
-@pytest.mark.e2e_resource("antfly_process")
-@pytest.mark.skipif(
-    sys.platform not in ("darwin", "linux"), reason="requires FD sampling"
-)
-def test_full_index_ingest_and_reopen_with_minimum_file_limit(tmp_path):
+@pytest.fixture
+def descriptor_test_binary():
     binary = Path(
         resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     )
     if not binary.is_file():
         pytest.skip(f"Antfly binary not found: {binary}")
+    return binary
+
+
+@pytest.mark.e2e_resource("antfly_process")
+@pytest.mark.skipif(
+    sys.platform not in ("darwin", "linux"), reason="requires FD sampling"
+)
+def test_full_index_ingest_and_reopen_with_minimum_file_limit(
+    tmp_path, descriptor_test_binary
+):
     wrapper = tmp_path / "antfly-with-file-limit"
-    write_server_wrapper(wrapper, binary, 256)
+    write_server_wrapper(wrapper, descriptor_test_binary, 256)
     measurements = ProcessMeasurements()
     server = None
     query_done = threading.Event()
@@ -167,3 +178,93 @@ def test_full_index_ingest_and_reopen_with_minimum_file_limit(tmp_path):
                 server.stop(test_failed=failed)
         finally:
             measurements.close()
+
+
+@pytest.mark.e2e_resource("antfly_process")
+@pytest.mark.skipif(
+    sys.platform != "darwin", reason="requires Darwin dylib interposition"
+)
+def test_retry_after_source_vector_wal_open_exhaustion(
+    tmp_path, descriptor_test_binary
+):
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("A C compiler is required for the WAL-open fault fixture")
+    fixture = Path(__file__).parent / "fixtures" / "source_vector_wal_open_fault.c"
+    library = tmp_path / "wal-open-fault.dylib"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-dynamiclib",
+            str(fixture),
+            "-o",
+            str(library),
+        ],
+        check=True,
+    )
+    arm = tmp_path / "fail-next-wal-open"
+    # Set the dyld variable immediately before exec, after the shell used by
+    # the limit wrapper. Only this test's server inherits the interposer.
+    runtime = tmp_path / "fault-runtime"
+    standalone_arg = (
+        "shift\n" if descriptor_test_binary.name == "antfly-standalone" else ""
+    )
+    runtime.write_text(
+        "#!/bin/sh\n"
+        f"{standalone_arg}"
+        f"export DYLD_INSERT_LIBRARIES={shlex.quote(str(library))}\n"
+        f"export ANTFLY_TEST_WAL_OPEN_FAULT={shlex.quote(str(arm))}\n"
+        f'exec {shlex.quote(str(descriptor_test_binary))} "$@"\n'
+    )
+    runtime.chmod(0o700)
+    wrapper = tmp_path / "antfly-with-wal-open-fault"
+    write_server_wrapper(wrapper, runtime, 256)
+    server = StandaloneAntflyServer(
+        str(wrapper), "127.0.0.1", find_free_port(), api_root=ANTFLY_PUBLIC_API_ROOT
+    )
+    failed = True
+    vector = [1.0, 0.5, 0.25]
+    batch_path = "/tables/documents/batch"
+    payload = {
+        "inserts": {
+            "d000000000": {"text": "descriptor retry", "_embeddings": {"vec": vector}}
+        },
+        "sync_level": "full_index",
+    }
+    try:
+        url = server.api_url
+        with requests.Session() as session:
+            call(session, url, "POST", "/tables/documents", {"num_shards": 1})
+            call(
+                session,
+                url,
+                "POST",
+                "/tables/documents/indexes/vec",
+                {"type": "embeddings", "dimension": len(vector), "external": True},
+            )
+            arm.touch()
+            first = session.post(url + batch_path, json=payload, timeout=30)
+            assert not arm.exists(), (
+                "source-vector WAL open did not reach the fault fixture"
+            )
+            assert first.status_code == 503, first.text
+            assert first.json()["error"] == "storage_descriptor_pressure"
+            assert first.headers["Retry-After"] == "1"
+            time.sleep(int(first.headers["Retry-After"]))
+            retry = session.post(url + batch_path, json=payload, timeout=30)
+            assert retry.status_code == 201, retry.text
+            assert retry.json()["status"] == "committed"
+
+        server.pause(crash=True)
+        server.resume()
+        with requests.Session() as session:
+            doc = call(session, url, "GET", "/tables/documents/documents/d000000000")
+            assert doc["text"] == "descriptor retry"
+            query(session, url, vector)
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
