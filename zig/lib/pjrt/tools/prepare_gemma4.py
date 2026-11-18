@@ -1,167 +1,112 @@
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Export official Gemma E4B text/media + cached decode to native-PJRT artifacts."""
+"""Export cached Gemma 4 BF16 HLO with dynamic parameter, token and cache inputs."""
 
-import argparse
-import hashlib
-import importlib.metadata
-import json
-import math
-import os
+import argparse, json, os
 from pathlib import Path
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_ENABLE_X64", "1")
-import jax
-import numpy as np
-import torch
-import torchax
-from gemma4_graph import (
-    load_multimodal_meta,
-    make_multimodal_step,
-    media_metadata,
-    state_shapes,
+import torch, numpy as np, jax, torchax
+from transformers import Gemma4TextConfig
+from transformers.models.gemma4.modeling_gemma4 import Gemma4TextRotaryEmbedding
+from transformers.modeling_gguf_pytorch_utils import (
+    get_gguf_hf_weights_map,
+    TensorProcessor,
 )
-from gemma4_inputs import prepare, processor
-from gemma4_weights import parameter_specs
+from gemma4_graph import configure_model, make_step, patch_casts
 
-
-def digest(path):
-    h = hashlib.sha256()
-    with Path(path).open("rb") as f:
-        for part in iter(lambda: f.read(1 << 24), b""):
-            h.update(part)
-    return h.hexdigest()
-
-
-def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    for name in ("config", "processor", "suite", "gguf", "mmproj", "out"):
-        p.add_argument("--" + name, type=Path, required=True)
-    p.add_argument("--only", action="append", default=[])
-    a = p.parse_args()
-    a.out.mkdir(parents=True, exist_ok=False)
-    config = json.loads(a.config.read_text())
-    m = load_multimodal_meta(config)
-    specs = parameter_specs(m, a.gguf, a.mmproj)
-    shapes = {
-        s["name"]: jax.ShapeDtypeStruct(
-            s["shape"], jax.numpy.bfloat16 if s["dtype"] == "bfloat16" else np.float32
-        )
-        for s in specs
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--config", type=Path, required=True)
+parser.add_argument("--cases", type=Path, required=True)
+parser.add_argument("--out", type=Path, required=True)
+args = parser.parse_args()
+out = args.out
+out.mkdir(parents=True, exist_ok=False)
+cfg = Gemma4TextConfig(**json.loads(args.config.read_text())["text_config"])
+patch_casts()
+m = configure_model(cfg)
+m.model.rotary_emb = Gemma4TextRotaryEmbedding(cfg, device="cpu")
+for mod in m.modules():
+    if hasattr(mod, "scalar_embed_scale"):
+        mod.embed_scale = torch.tensor(mod.scalar_embed_scale, dtype=torch.float32)
+params = {**dict(m.named_parameters()), **dict(m.named_buffers())}
+mapping = get_gguf_hf_weights_map(m, TensorProcessor())
+reverse = {v: k for k, v in mapping.items()}
+expected = set(m.state_dict())
+specs = []
+shapes = {}
+for name, t in sorted(params.items()):
+    spec = {
+        "name": name,
+        "shape": list(t.shape),
+        "dtype": "bfloat16" if name in expected else "float32",
     }
-    suite = json.loads(a.suite.read_text())
-    proc = processor(a.processor)
-    manifest = {
-        "version": 2,
-        "family": "gemma4",
-        "precision": "bf16",
-        "parameters": specs,
-        "cases": [],
-        "context_limit": suite["context_tokens"],
-        "scope": "CPU official processor and native Zig/PJRT generation; weights from identical QAT GGUF files; BF16 dense weights and KV; excludes HTTP and cold load/compile",
-        "parameter_bytes": sum(
-            math.prod(s["shape"]) * (2 if s["dtype"] == "bfloat16" else 4)
-            for s in specs
-        ),
-        "preparation": {
-            "versions": {
-                name: importlib.metadata.version(name)
-                for name in (
-                    "torch",
-                    "transformers",
-                    "torchax",
-                    "jax",
-                    "jaxlib",
-                    "numpy",
-                    "gguf",
-                    "av",
-                )
-            },
-            "config_sha256": digest(a.config),
-            "gguf_sha256": digest(a.gguf),
-            "mmproj_sha256": digest(a.mmproj),
-            "source_sha256": {
-                f.name: digest(f) for f in Path(__file__).parent.glob("gemma4_*.py")
-            },
-            "representation": "GGUF audio scales are already softplus; audio norm names inverted; vision patch convolution reordered to NHWC; QAT clipping retained",
-        },
-    }
-    for case in suite["cases"]:
-        if a.only and case["id"] not in a.only:
-            continue
-        values, metadata = prepare(proc, case, a.suite.parent)
-        meta = media_metadata(m, values)
-        if len(values["input_ids"][0]) != case["expected_prompt_tokens"]:
-            raise ValueError(("prepared tokens changed", case["id"]))
-        capacity = ((len(values["input_ids"][0]) + case["max_tokens"] + 15) // 16) * 16
-        if capacity > suite["context_tokens"]:
-            raise ValueError("Context exceeded")
-        states = state_shapes(m.config.text_config, capacity)
-        state = tuple(
-            jax.ShapeDtypeStruct(shape, jax.numpy.bfloat16) for shape in states
-        )
-        inputs = tuple(
-            jax.ShapeDtypeStruct(
-                values[k].shape,
-                np.int64 if values[k].dtype == torch.int64 else np.float32,
-            )
-            for k in meta["keys"]
-        )
-        entry = {
-            **case,
-            "inputs": [
-                {
-                    "name": key,
-                    "shape": list(values[key].shape),
-                    "dtype": "int64" if values[key].dtype == torch.int64 else "float32",
-                }
-                for key in meta["keys"]
-            ],
-            "state_shapes": states,
-            "cache_capacity": capacity,
-            "processor_metadata": metadata,
-        }
-        for phase in ("prefill", "decode", "logits"):
-            fn = make_multimodal_step(
-                m,
-                capacity,
-                meta=meta,
-                prefill=phase != "decode",
-                logits=phase == "logits",
-            )
-            lowered = jax.jit(torchax.interop.jax_view(fn), keep_unused=True).lower(
-                shapes,
-                state,
-                inputs
-                if phase != "decode"
-                else (jax.ShapeDtypeStruct((1, 1), np.int64),),
-                jax.ShapeDtypeStruct((), np.int64),
-            )
-            hlo = lowered.compiler_ir(dialect="hlo")
-            name = f"{case['id']}-{phase}.hlo"
-            (a.out / name).write_bytes(hlo.as_serialized_hlo_module_proto())
-            entry[phase] = name
-            print(
-                "exported",
-                name,
-                "parameters",
-                len(hlo.program_shape().parameter_shapes()),
-                flush=True,
-            )
-        manifest["cases"].append(entry)
-        (a.out / "model.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    if not manifest["cases"]:
-        raise ValueError("No selected cases")
-    print(
-        "complete",
-        len(manifest["cases"]),
-        "cases",
-        manifest["parameter_bytes"],
-        "resident parameter bytes",
-        flush=True,
+    if name in expected:
+        source = reverse[name]
+        if source.endswith(".layer_output_scale"):
+            source += ".weight"
+        spec["source"] = source
+    else:
+        assert not t.is_meta, (name, "meta")
+        spec["data"] = t.reshape(-1).tolist()
+    specs.append(spec)
+    shapes[name] = jax.ShapeDtypeStruct(
+        t.shape, jax.numpy.bfloat16 if name in expected else np.float32
     )
+manifest = {
+    "version": 1,
+    "family": "gemma4",
+    "parameters": specs,
+    "cases": [],
+    "repeats": 4,
+    "warmups": 1,
+}
+cases = json.loads(args.cases.read_text())
+for c in cases:
+    p = {"ids": c["prompt_ids"]}
+    cap = ((len(p["ids"]) + c["max_tokens"] + 15) // 16) * 16
+    state_shapes = []
+    for i in range(cfg.num_hidden_layers - cfg.num_kv_shared_layers):
+        dim = cfg.per_layer_config[i].head_dim
+        state_shapes.extend([[1, cfg.num_key_value_heads, cap, dim]] * 2)
+    state = tuple(jax.ShapeDtypeStruct(s, jax.numpy.bfloat16) for s in state_shapes)
+    raw = make_step(m, cap)
 
+    def generate(params, state, ids, pos):
+        logits, state, pos = raw(params, state, ids, pos)
+        return logits.argmax(-1).unsqueeze(1), state, pos
 
-if __name__ == "__main__":
-    main()
+    fn = jax.jit(torchax.interop.jax_view(generate), keep_unused=True)
+    paths = []
+    for phase, length in [("prefill", len(p["ids"])), ("decode", 1)]:
+        lowered = fn.lower(
+            shapes,
+            state,
+            jax.ShapeDtypeStruct((1, length), np.int64),
+            jax.ShapeDtypeStruct((), np.int64),
+        )
+        hlo = lowered.compiler_ir(dialect="hlo")
+        filename = f"{c['id']}-{phase}.hlo"
+        (out / filename).write_bytes(hlo.as_serialized_hlo_module_proto())
+        paths.append(filename)
+        print(
+            "exported",
+            filename,
+            "parameters",
+            len(hlo.program_shape().parameter_shapes()),
+            flush=True,
+        )
+    oracle = c.get("oracle_tokens", [])
+    manifest["cases"].append(
+        {
+            "id": c["id"],
+            "prompt_ids": p["ids"],
+            "max_tokens": c["max_tokens"],
+            "prefill": paths[0],
+            "decode": paths[1],
+            "state_shapes": state_shapes,
+            "oracle_tokens": oracle,
+        }
+    )
+(out / "model.json").write_text(json.dumps(manifest, indent=2))

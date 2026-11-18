@@ -1443,7 +1443,7 @@ const Builder = struct {
                     try self.graph_parameter_slots.append(self.alloc, index - 1);
                 };
                 if (reference.search) |search| {
-                    if (!self.backend.supports_search_relations) return error.UnsupportedSqlExecution;
+                    if (!self.backend.supports_search_relations) return error.SqlSearchUnavailable;
                     if (reference.mutation_target) return error.UnsupportedSqlShape;
                     const extra = [_]catalog.Column{
                         .{ .name = "score", .path = "score", .type = .number },

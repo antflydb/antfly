@@ -62,3 +62,58 @@ A broad default-suite attempt was not completed after its mock CUDA allocation r
 The native PLE normalization regression passes against the literal scaled-projection formula. A separate L4 fused-kernel check on checkpoint Q6_K rows passes six zero/nonzero-epsilon cases with maximum absolute error below 1.8e-6. Live Metal validation was not run on this Linux host.
 
 Reproduction and artifact preparation: [GEMMA4.md](GEMMA4.md).
+
+## PR scope and remaining qualification
+
+The production change on this branch is the PLE projection-normalization epsilon
+correction across direct, fused, graph and prepared decoder paths. The CUDA
+performance optimizations measured above were already present on the base
+commit. This campaign establishes a comparison with this PJRT artifact runner;
+it does not isolate a branch-versus-main performance improvement.
+
+The earlier [L4 HTTP qualification against llama.cpp](../../../pkg/inference/scripts/gemma4/qualification/e4b-qat-l4-http-20261115.md)
+is already on main. It reports 1.004–1.037× end-to-end speedups on five workloads,
+with an explicit L4 profile, while TTFT and VRAM remain worse. Its measurement
+boundary, inputs and native binary differ from this direct PJRT campaign.
+It predates the PLE correction and does not cover the 12/30-second audio or video
+cases here. These separate results cannot establish a current three-engine win
+across all modalities.
+
+The merge review reproduced the numerical failures from the retained vectors:
+native passes 5/8 logit gates and PJRT 6/8, with 8/8 first-token argmax matches
+for each. The comparator now saves these failures and exits nonzero. Missing
+engine/round/vector coverage also fails; invalid memory samples cannot silently
+produce a successful benchmark. The text-only exporter and runner from main are
+preserved alongside the separate multimodal exporter and runner.
+
+This is suitable for review as a correctness fix and experimental benchmark
+harness. Full performance qualification remains open: resolve the frozen logit
+gate failures, run task-quality/whole-generation checks, and collect a matched
+post-correction comparison with llama.cpp before claiming broad superiority.
+The historical result JSON and its source/binary hashes are unchanged.
+The original campaign did not retain the native tuning environment. New
+campaigns record inference overrides and the legacy Gemma backbone controls;
+the old measurements cannot independently establish that every override was
+unset.
+
+## Merge review checks, 2026-11-18
+
+- All three PJRT runners build; the library reports 38 passing checks, including
+  two plugin-dependent checks that return early without an installed CPU plugin.
+- CUDA inference and Gemma worker type checks pass all 19 build steps. The
+  focused native CPU PLE regression passes with zero skips. Six fresh L4 fused
+  PLE kernel cases match the literal FP64 reference within 1.8e-6 absolute error.
+- All 23 Python tests pass, including retained text-runner compatibility,
+  sliding-cache wraparound, failed-gate exit status and missing-result rejection.
+  Ruff checks all 12 changed Python files; Zig formatting and whitespace pass.
+- The rebuilt PJRT worker deserializes the retained, identity-checked CUDA
+  executables and reproduces all eight complete PJRT token sequences. Its new
+  first-step logits retain the same six passing frozen gates and two failures.
+
+The [compact merge review record](gemma4-l4-merge-review.json) retains current
+source, worker, executable and CUDA artifact hashes, numerical checks and attempt
+history. Fresh compilation completed two text cases before switching to retained
+executable compatibility checks. An initial compatibility startup stopped during
+its largest parameter upload without a worker diagnostic; the retry succeeded
+after host compilation freed memory. These are functional checks, with no new
+performance measurements or cross-engine whole-generation parity claim.

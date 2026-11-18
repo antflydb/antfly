@@ -127,5 +127,6 @@ zig-pkg/
 # Local LangChain integration validation state
 /.state/
 
-# Local model qualification outputs and traces.
+# Local native GPU benchmark artifacts and measurements.
 /evidence/
+/.cache/

@@ -247,6 +247,10 @@ def main():
     a = p.parse_args()
     if not 1 <= a.rounds <= 10 or not 1 <= a.iterations <= 100:
         p.error("Invalid campaign bounds")
+    if a.validate and a.iterations != 1:
+        p.error(
+            "Validation requires --iterations 1 to retain every measured logit vector"
+        )
     a.out.mkdir(parents=True, exist_ok=False)
     manifest = json.loads(a.manifest.read_text())
     suite = json.loads(a.suite.read_text())
@@ -305,6 +309,22 @@ def main():
         "fixture_scope": suite["fixture_scope"],
         "video_prompt_convention": "single video marker followed by one space, matching native ChatTemplate",
         "compiler_environment": compiler_environment(),
+        "runtime_environment": {
+            key: value
+            for key, value in sorted(os.environ.items())
+            if key.startswith("ANTFLY_INFERENCE_")
+            or key
+            in (
+                "CUDA_VISIBLE_DEVICES",
+                "NVIDIA_TF32_OVERRIDE",
+                "TERMITE_DISABLE_PLE",
+                "TERMITE_DISABLE_SHARED_KV",
+                "TERMITE_DISABLE_SLIDING_ATTENTION",
+                "TERMITE_DENSE_DECODE_EVAL_STRIDE",
+                "TERMITE_GEMMA4_DISABLE_LAYER_OUTPUT_SCALE",
+                "TERMITE_GEMMA4_DISABLE_RMSNORM_ADD_FUSION",
+            )
+        },
     }
     (a.out / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
     proc = processor(processor_dir)
@@ -378,6 +398,9 @@ def main():
                 finally:
                     session.close()
             results[arm].extend(rows)
+            memory = json.loads((out / f"{arm}.memory.json").read_text())
+            if not memory["valid"]:
+                raise RuntimeError("Invalid memory sampling; inspect " + str(out))
             print(
                 round_index,
                 arm,

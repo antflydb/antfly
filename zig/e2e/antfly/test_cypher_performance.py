@@ -34,6 +34,7 @@ from conftest import (
     StandaloneAntflyServer,
     find_free_port,
 )
+from helpers import run_readonly_psql_with_retry
 
 
 def _psql_binary():
@@ -1367,18 +1368,18 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
                 "parameters": [[0, 1, 2] * 100],
             },
         )["rows"] == [["k000999", "1"]]
-        pg_groups = subprocess.run(
+        pg_groups = run_readonly_psql_with_retry(
             [
                 _psql_binary(),
                 f"host=127.0.0.1 port={server.pgwire_port} user=admin dbname=default sslmode=disable",
                 "-X",
                 "-At",
                 "-v",
+                "VERBOSITY=verbose",
+                "-v",
                 "ON_ERROR_STOP=1",
             ],
             input=";".join(ordered_queries) + ";",
-            capture_output=True,
-            text=True,
             timeout=45,
             env={**os.environ, "PGPASSWORD": AUTH_BOOTSTRAP_PASSWORD},
         )

@@ -16,6 +16,7 @@ the complete fixed output-token budget, synchronizing generated token readback.
 From the worktree root, using the repository's pinned Zig:
 
 ```sh
+export ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/global"
 zig build --build-file zig/pkg/inference/build.zig bench-gemma4-core-build \
   -Doptimize=ReleaseFast -Dcuda=true -Dcuda-artifacts=sm89 \
   --cache-dir .zig-cache/native --prefix zig-out -j1
@@ -39,13 +40,13 @@ of text cases carrying `text`, `id`, `max_tokens`, and prepared `prompt_ids`.
 Synthetic media qualify geometry and implementation, not task quality.
 
 ```sh
-JAX_PLATFORMS=cpu python zig/lib/pjrt/tools/prepare_gemma4.py \
+JAX_PLATFORMS=cpu python zig/lib/pjrt/tools/prepare_gemma4_multimodal.py \
   --config "$CONFIG" --processor "$PROCESSOR" --suite "$SUITE" \
   --gguf "$GGUF" --mmproj "$MMPROJ" --out evidence/gemma4-artifacts
 ```
 
 The retained three text prompts and expected prepared token IDs are in
-`gemma4_text_cases.json`. To generate and prepare the eight-case fixture suite
+`gemma4_cases.json`. To generate and prepare the eight-case fixture suite
 before export (set `PROCESSOR` to the sidecar directory):
 
 ```sh
@@ -54,7 +55,7 @@ import json, os
 from pathlib import Path
 from gemma4_inputs import make_fixtures, prepare, processor
 out = Path("evidence/gemma4-fixtures")
-texts = json.loads(Path("zig/lib/pjrt/tools/gemma4_text_cases.json").read_text())
+texts = json.loads(Path("zig/lib/pjrt/tools/gemma4_cases.json").read_text())
 suite = make_fixtures(out, texts)
 proc = processor(Path(os.environ["PROCESSOR"]))
 expected = {case["id"]: case["prompt_ids"] for case in texts}
@@ -125,8 +126,12 @@ python -m unittest discover -s zig/lib/pjrt/tools -p 'test_gemma4*.py'
 
 The comparator reports cosine, relative L2, maximum absolute error, exact argmax,
 and its FP32-reference gap. Its declared logit gate is cosine >= 0.9999 and
-relative L2 <= 0.02. Argmax agreement is separate; first-step checks do not prove
-whole-generation parity. Preserve failures rather than widening the gate.
+relative L2 <= 0.02. Argmax agreement is reported separately; qualification
+requires both gates. The comparator saves all diagnostics and exits nonzero on
+either failure. It rejects missing rounds, arms or vectors. Validation requires
+`--iterations 1` so the native worker retains every measured vector. First-step
+checks do not prove whole-generation parity. Preserve failures rather than
+widening the gate. Invalid memory sampling also fails the benchmark campaign.
 Large artifacts, media, vectors, HLO, executable caches and full logs belong under
 ignored `evidence/`; keep only compact results/provenance in the branch.
 
@@ -141,6 +146,18 @@ The regression checks actual PLE outputs against the literal scaled-projection
 formula at zero and nonzero epsilon, including low-variance projection rows.
 CUDA qualification is measured here; live Metal validation is not available on
 this Linux host.
+
+Build and run the focused native CPU regression with a compile-time filter:
+
+```sh
+zig build --build-file zig/pkg/inference/build.zig test-bin \
+  -Dtest-filter="Gemma4 PLE context normalization" -Doptimize=ReleaseFast \
+  --cache-dir .zig-cache/native --prefix zig-out -j1
+zig-out/bin/antfly-inference-tests --test-filter "Gemma4 PLE context normalization"
+```
+
+Passing only the filter after `--` selects runtime execution and still compiles
+the complete test binary.
 
 The manifest records export-time source hashes; campaign provenance separately
 records the timed preparer and workers. Token IDs are variable program inputs.

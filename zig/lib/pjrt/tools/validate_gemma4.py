@@ -35,14 +35,31 @@ def compare(actual, reference):
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--campaign", type=Path, required=True)
-    parser.add_argument("--cpu", type=Path, action="append", required=True)
-    parser.add_argument("--out", type=Path, required=True)
-    args = parser.parse_args()
+def validate_campaign(campaign, cpu):
+    provenance = json.loads((campaign / "provenance.json").read_text())
+    if not provenance.get("validation_only") or provenance["iterations"] != 1:
+        raise ValueError(
+            "Expected a validation campaign with one measured call per case"
+        )
+    summary = json.loads((campaign / "summary.json").read_text())["results"]
+    expected = {row["id"] for row in summary}
+    arms = {arm for row in summary for arm in row["ms"]}
+    if (
+        not expected
+        or len(expected) != len(summary)
+        or not arms
+        or not arms <= {"native", "pjrt"}
+        or any(set(row["ms"]) != arms for row in summary)
+        or not 1 <= provenance["rounds"] <= 10
+    ):
+        raise ValueError("Invalid campaign coverage")
+    directories = {
+        f"r{index}-{arm}" for index in range(provenance["rounds"]) for arm in arms
+    }
+    if {path.name for path in campaign.glob("r*-*") if path.is_dir()} != directories:
+        raise ValueError("Incomplete validation rounds/arms")
     references = {}
-    for directory in args.cpu:
+    for directory in cpu:
         for path in directory.glob("*.f32"):
             if path.stem in references:
                 raise ValueError("Duplicate CPU case: " + path.stem)
@@ -50,21 +67,18 @@ def main():
     if not references:
         raise ValueError("No CPU references")
     rows = []
-    expected = {
-        row["id"]
-        for row in json.loads((args.campaign / "summary.json").read_text())["results"]
-    }
-    for directory in sorted(args.campaign.glob("r*-*")):
-        covered = set()
-        for path in sorted(directory.glob("*.f32")):
-            case_id = (
-                path.stem.rsplit("-", 1)[0]
-                if directory.name.endswith("-pjrt")
-                else path.stem
-            )
+    for name in sorted(directories):
+        directory = campaign / name
+        files = {
+            case_id + ("-1" if name.endswith("-pjrt") else "") + ".f32": case_id
+            for case_id in expected
+        }
+        if {path.name for path in directory.glob("*.f32")} != set(files):
+            raise ValueError("Incomplete logit coverage: " + name)
+        for filename, case_id in sorted(files.items()):
+            path = directory / filename
             if case_id not in references:
                 raise ValueError("Missing CPU reference: " + case_id)
-            covered.add(case_id)
             rows.append(
                 {
                     "case": case_id,
@@ -73,23 +87,29 @@ def main():
                     **compare(np.fromfile(path, dtype="<f4"), references[case_id]),
                 }
             )
-        if covered != expected:
-            raise ValueError("Incomplete logit coverage: " + directory.name)
-    if not rows:
-        raise ValueError("No measured logits")
-    args.out.write_text(
-        json.dumps(
-            {
-                "scope": "first-step logits only; full generation parity is separate",
-                "rows": rows,
-            },
-            indent=2,
-        )
-        + "\n"
-    )
-    for row in rows:
+    logits_pass = all(row["logit_tolerance_pass"] for row in rows)
+    argmax_pass = all(row["argmax_matches"] for row in rows)
+    return {
+        "scope": "first-step logits only; full generation parity is separate",
+        "logit_tolerance_pass": logits_pass,
+        "argmax_all_match": argmax_pass,
+        "passed": logits_pass and argmax_pass,
+        "rows": rows,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--campaign", type=Path, required=True)
+    parser.add_argument("--cpu", type=Path, action="append", required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    args = parser.parse_args()
+    report = validate_campaign(args.campaign, args.cpu)
+    args.out.write_text(json.dumps(report, indent=2) + "\n")
+    for row in report["rows"]:
         print(row)
+    return 0 if report["passed"] else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

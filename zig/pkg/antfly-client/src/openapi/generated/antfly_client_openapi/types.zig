@@ -2888,6 +2888,8 @@ pub const BackupInfo = struct {
     timestamp: []const u8,
     /// Tables included in the backup
     tables: []const []const u8,
+    /// Exact restore selectors paired with display names, in the same order as tables. Use selector in ClusterRestoreRequest.table_names to disambiguate identical display names.
+    table_selectors: ?[]const std.json.Value = null,
     /// Storage location of the backup
     location: []const u8,
     /// Antfly version that created the backup
@@ -2900,6 +2902,7 @@ pub const BackupInfo = struct {
         .{ "backup_id", "backup_id", false },
         .{ "timestamp", "timestamp", false },
         .{ "tables", "tables", false },
+        .{ "table_selectors", "table_selectors", true },
         .{ "location", "location", false },
         .{ "antfly_version", "antfly_version", true },
         .{ "format", "format", true },
@@ -2921,6 +2924,10 @@ pub const BackupInfo = struct {
         try jw.write(self.timestamp);
         try jw.objectField("tables");
         try jw.write(self.tables);
+        if (self.table_selectors) |value| {
+            try jw.objectField("table_selectors");
+            try jw.write(value);
+        }
         try jw.objectField("location");
         try jw.write(self.location);
         if (self.antfly_version) |value| {
@@ -3082,7 +3089,7 @@ pub const BackupOutcomeAmbiguousConflict = struct {
 pub const BackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
+    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: an absolute `file:///path/inside/connection/root` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
     location: []const u8,
     /// ID of a configured `external_io` connection. Required for every network API backup and restore. Object locations enforce bucket and prefix scopes; filesystem URI paths resolve beneath the connection root.
     connection: []const u8,
@@ -6039,7 +6046,7 @@ pub const CloudflareSTTConfig = struct {
 pub const ClusterBackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
+    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: an absolute `file:///path/inside/connection/root` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
     location: []const u8,
     /// Required configured `external_io` connection with the `backup.write` capability.
     connection: []const u8,
@@ -61739,8 +61746,6 @@ pub const UpdatePasswordRequest = struct {
 
 pub const User = struct {
     username: []const u8,
-    /// Base64 encoded password hash. Exposing this is a security risk.
-    password_hash: []const u8,
     /// Server-side auth metadata available to stored row-filter policies through $auth metadata paths.
     metadata: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
 
@@ -61748,8 +61753,6 @@ pub const User = struct {
         try jw.beginObject();
         try jw.objectField("username");
         try jw.write(self.username);
-        try jw.objectField("password_hash");
-        try jw.write(self.password_hash);
         switch (self.metadata) {
             .absent => {},
             .null_value => {

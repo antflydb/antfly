@@ -415,23 +415,38 @@ func QueryKnowledge(ctx context.Context, p KnowledgeQueryClient, b Binding, requ
 
 		return sha256.Sum256(encoded), err
 	}
-	before, err := observe()
-	if err != nil {
-		return nil, err
-	}
-	raw, err := p.Query(context.WithValue(ctx, responseLimitKey{}, management.MaxResponseBytes), b.Table, query)
-	if err != nil {
-		return nil, err
-	}
-	if len(raw) > management.MaxResponseBytes {
-		return nil, fmt.Errorf("knowledge response exceeds budget")
-	}
-	after, err := observe()
-	if err != nil {
-		return nil, err
-	}
-	if before != after || time.Now().Unix() >= *b.ValidUntil {
-		return nil, fmt.Errorf("knowledge generation or access changed during query")
+	var raw []byte
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		before, err := observe()
+		if err != nil {
+			return nil, err
+		}
+		raw, err = p.Query(context.WithValue(ctx, responseLimitKey{}, management.MaxResponseBytes), b.Table, query)
+		if err != nil {
+			return nil, err
+		}
+		if len(raw) > management.MaxResponseBytes {
+			return nil, fmt.Errorf("knowledge response exceeds budget")
+		}
+		after, err := observe()
+		if err != nil {
+			return nil, err
+		}
+		if time.Now().Unix() >= *b.ValidUntil {
+			return nil, fmt.Errorf("knowledge generation or access changed during query")
+		}
+		if before == after {
+			break
+		}
+		// Discard the read from a moving generation and recapture once. The
+		// shared context still bounds all work, and every attempt revalidates
+		// the declaration and access before returning any graph result.
+		if attempt != 0 {
+			return nil, fmt.Errorf("knowledge generation or access changed during query")
+		}
 	}
 	consistency, err := SearchConsistency(raw)
 	if err != nil {

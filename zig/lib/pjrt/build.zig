@@ -48,6 +48,24 @@ pub fn build(b: *std.Build) void {
     pjrt_mod.addImport("protobuf", protobuf_mod);
     pjrt_mod.addImport("xla_proto", xla_proto_mod);
 
+    const runner = b.addExecutable(.{ .name = "antfly-pjrt-cuda-model", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/model_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "protobuf", .module = protobuf_mod }, .{ .name = "xla_proto", .module = xla_proto_mod } },
+    }) });
+    runner.root_module.link_libc = true;
+    b.step("model-runner", "Build the native CUDA HLO model artifact runner").dependOn(&b.addInstallArtifact(runner, .{}).step);
+
+    const media_runner = b.addExecutable(.{ .name = "antfly-pjrt-cuda-media", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/media_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "protobuf", .module = protobuf_mod }, .{ .name = "xla_proto", .module = xla_proto_mod } },
+    }) });
+    media_runner.root_module.link_libc = true;
+    b.step("media-runner", "Build interactive native full-media CUDA HLO runner").dependOn(&b.addInstallArtifact(media_runner, .{}).step);
+
     const gemma = b.addExecutable(.{ .name = "antfly-pjrt-gemma4", .root_module = b.createModule(.{
         .root_source_file = b.path("src/gemma4_runner.zig"),
         .target = target,

@@ -18114,9 +18114,10 @@ pub const RaftApplyStore = struct {
     fn privacyIndexes(txn: *docstore.DocStore.Txn, group: u64, table: u64) ![]const u8 {
         var buffer: [160]u8 = undefined;
         const raw = txn.get(try tableKeyForGroup(&buffer, group, table)) catch |err| if (err == error.NotFound) return "" else return err;
-        const record = try borrowTableProjection(raw, .query);
-        // Borrow the pinned transaction bytes: GC must not duplicate the table
-        // schema and catalog for every checkpoint examined.
+        // Serving projections omit operational scan/census cursors. GC must
+        // examine the complete durable catalog or it could reclaim live blobs.
+        // Borrow it directly: neither schema nor catalog needs a copy.
+        const record = try borrowTableProjection(raw, .admission);
         return record.query_definition.?.indexes_json;
     }
     fn privacyReferenced(txn: *docstore.DocStore.Txn, group: u64, table: u64, ref: privacy_keys.Ref) !bool {
@@ -45112,6 +45113,11 @@ test "privacy key attachment and incremental reclamation are atomic and survive 
     }
     try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &initial_hash, .value = ready } });
     try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = table, .replacement = attached } });
+    // The serving projection intentionally omits this live operational token.
+    // Reclamation still has to find it in the complete durable definition.
+    const encoded_attached = try encodeTableRecord(a, attached);
+    const serving = try borrowTableProjection(encoded_attached, .query);
+    try std.testing.expect(std.mem.indexOf(u8, serving.query_definition.?.indexes_json, &ref.token()) == null);
     const attached_header = (try store.getJobState(a, group, manifest)).?;
     var parsed_header = try std.json.parseFromSlice(keys.Header, a, attached_header, .{});
     defer parsed_header.deinit();
@@ -45161,18 +45167,19 @@ test "privacy checkpoint ownership borrows large table records without allocator
     const schema = try a.alloc(u8, 8 * 1024 * 1024);
     defer a.free(schema);
     @memset(schema, ' ');
-    const record = try encodeTableRecord(a, .{ .table_id = 7, .name = "privacy", .schema_json = schema, .indexes_json = "{\"_privacy\":{}}" });
+    const indexes_json = "{\"_privacy\":{\"generation\":1,\"scans\":[{\"from_key\":\"pk1:held\"}]}}";
+    const record = try encodeTableRecord(a, .{ .table_id = 7, .name = "privacy", .schema_json = schema, .indexes_json = indexes_json });
     defer a.free(record);
     // A complete GC page can examine the same large record without creating
     // any schema/catalog copies. The projection retains the pinned row.
     for (0..32) |_| {
-        const view = try borrowTableProjection(record, .query);
+        const view = try borrowTableProjection(record, .admission);
         const indexes = view.query_definition.?.indexes_json;
-        try std.testing.expectEqualStrings("{\"_privacy\":{}}", indexes);
+        try std.testing.expectEqualStrings(indexes_json, indexes);
         try std.testing.expect(@intFromPtr(indexes.ptr) >= @intFromPtr(record.ptr));
         try std.testing.expect(@intFromPtr(indexes.ptr) + indexes.len <= @intFromPtr(record.ptr) + record.len);
     }
-    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, borrowTableProjection(record[0 .. record.len - 1], .query));
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, borrowTableProjection(record[0 .. record.len - 1], .admission));
 }
 
 test "privacy retained capacity denies staging atomically and releases only on final erase" {

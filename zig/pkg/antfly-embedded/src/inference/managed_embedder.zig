@@ -3245,6 +3245,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
             defer out.deinit(alloc);
             try out.appendSlice(alloc, "{\"field\":");
             try appendJsonString(alloc, &out, source_field);
+            try out.appendSlice(alloc, ",\"external\":true");
             try appendCoveragePolicyIfPresent(alloc, &out, cfg.coverage_policy);
             try appendExecutionObjectIfPresent(alloc, &out, root);
             try out.append(alloc, '}');
@@ -9645,7 +9646,7 @@ test "managed embedder translates external sparse embeddings config" {
     const config_json = try translateEmbeddingsIndexConfigJson(std.testing.allocator, "semantic_idx", parsed.value);
     defer std.testing.allocator.free(config_json);
 
-    try std.testing.expectEqualStrings("{\"field\":\"embedding\"}", config_json);
+    try std.testing.expectEqualStrings("{\"field\":\"embedding\",\"external\":true}", config_json);
 }
 
 test "managed embedder translates chunker config into db generator config" {
