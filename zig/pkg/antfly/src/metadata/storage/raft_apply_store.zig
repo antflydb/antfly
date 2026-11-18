@@ -9335,8 +9335,20 @@ test "metadata raft apply store replicates restore job records with immutable in
     defer store.deinit();
     const group = group_ids.main_metadata_group_id;
     const logical = restore_job_logical_prefix ++ "000000000000002a";
-    const initial = "{\"format_version\":6,\"job_id\":42,\"phase\":\"queued\",\"cluster_binding\":{\"child_pins\":\"immutable-source-witness\"}}";
-    try store.applyStandaloneCommand(group, .{ .create_restore_job = .{ .key = logical, .value = initial } });
+    const padding = try alloc.alloc(u8, 4 * 1024 * 1024);
+    defer alloc.free(padding);
+    @memset(padding, 'a');
+    const initial = try std.json.Stringify.valueAlloc(alloc, .{
+        .format_version = restore_inputs.version,
+        .job_id = 42,
+        .phase = "queued",
+        .cluster_binding = .{ .child_pins = "immutable-source-witness", .manifest_json = padding },
+    }, .{});
+    defer alloc.free(initial);
+    const proposal = try restore_inputs.packAdmission(alloc, initial);
+    defer alloc.free(proposal);
+    try std.testing.expect(proposal.len < topology_protocol.max_transition_command_bytes);
+    try store.applyStandaloneCommand(group, .{ .create_restore_job = .{ .key = logical, .value = proposal } });
     const raw = (try store.getRestoreJobRecord(alloc, group, logical)).?;
     defer alloc.free(raw);
     try std.testing.expect(std.mem.indexOf(u8, raw, "immutable-source-witness") == null);
@@ -9359,6 +9371,7 @@ test "metadata raft apply store replicates restore job records with immutable in
     defer alloc.free(input_key);
     const saved_inputs = try store.store.get(alloc, input_key);
     defer alloc.free(saved_inputs);
+    try std.testing.expect(saved_inputs.len > padding.len);
     const newer = (try store.getRestoreJobRecord(alloc, group, logical)).?;
     defer alloc.free(newer);
     const hash = restore_inputs.digest(newer);

@@ -845,6 +845,7 @@ pub const Store = struct {
         var expired_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer expired_keys.deinit(self.alloc);
         for (rows) |row| {
+            if (try self.captureInputRowLocked(row.key, row.value)) continue;
             if (try replicatedRowExpired(self.alloc, row.value)) {
                 try expired_keys.append(self.alloc, row.key);
                 continue;
@@ -2820,6 +2821,52 @@ fn rangesContainRange(ranges: []const TableIndexRange, candidate: TableIndexRang
 
 pub fn stagingNeedsResolution(state: JobState) bool {
     return state.staging_attempt_id != 0 and state.staging_resolution == .active;
+}
+
+test "restore admission recovers generated identity and immutable inputs from a compact late commit" {
+    const alloc = std.testing.allocator;
+    var persistence = TestReplicatedPersistence.init(alloc);
+    defer persistence.deinit();
+    var store = Store.initWithIo(alloc, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+    const started = try store.start(alloc, .{
+        .scope = .cluster,
+        .backup_id = "daily",
+        .location = "s3://archive/daily",
+        .connection = "archive",
+        .idempotency_namespace = "immutable-recovery",
+        .cluster_binding = .{ .manifest_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" },
+    });
+    defer alloc.free(started);
+    var parsed = try std.json.parseFromSlice(JobState, alloc, started, .{});
+    defer parsed.deinit();
+    const id = parsed.value.job_id;
+    const key = try jobKey(alloc, id);
+    defer alloc.free(key);
+    const input_key = try std.fmt.allocPrint(alloc, "{s}{s}", .{ key, immutable_inputs.suffix });
+    const parts = try immutable_inputs.split(alloc, started);
+    defer parts.deinit(alloc);
+    const old = persistence.rows.getPtr(key).?;
+    alloc.free(old.*);
+    old.* = try alloc.dupe(u8, parts.record);
+    try persistence.rows.put(alloc, input_key, try alloc.dupe(u8, parts.inputs.?));
+    store.clearInMemoryLocked();
+    const recovered = (try store.load(alloc, id)).?;
+    defer alloc.free(recovered);
+    var full = try std.json.parseFromSlice(JobState, alloc, recovered, .{});
+    defer full.deinit();
+    try std.testing.expectEqualStrings(parsed.value.cluster_binding.?.manifest_sha256, full.value.cluster_binding.?.manifest_sha256);
+    const running = (try store.begin(alloc, id)).?;
+    defer alloc.free(running);
+    try std.testing.expect(std.mem.indexOf(u8, running, "cluster_binding_sha256") != null);
+    try store.prepareReplicatedLeadership(alloc, 2);
+    const reloaded = (try store.loadCached(alloc, id)).?;
+    defer alloc.free(reloaded);
+    var reloaded_state = try std.json.parseFromSlice(JobState, alloc, reloaded, .{});
+    defer reloaded_state.deinit();
+    try std.testing.expectEqual(Phase.queued, reloaded_state.value.phase);
+    try std.testing.expectEqualStrings(parsed.value.cluster_binding.?.manifest_sha256, reloaded_state.value.cluster_binding.?.manifest_sha256);
 }
 
 test "restore staging incarnation survives retries and cancellation waits for owner cleanup" {

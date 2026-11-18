@@ -41,7 +41,7 @@ pub fn packAdmission(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
     defer parts.deinit(alloc);
     const inputs = parts.inputs orelse return alloc.dupe(u8, encoded);
     if (inputs.len < 64 * 1024) return alloc.dupe(u8, encoded);
-    var compressed: std.Io.Writer.Allocating = .init(alloc);
+    var compressed = try std.Io.Writer.Allocating.initCapacity(alloc, 4096);
     defer compressed.deinit();
     const history = try alloc.alloc(u8, std.compress.flate.max_window_len);
     defer alloc.free(history);

@@ -22066,10 +22066,17 @@ pub const ApiHttpServer = struct {
                     } else if (published) return error.InvalidRequest;
                 }
             }
-            self.verifyPendingLegacyRestoreChildren(op_alloc, location, &manifest, table_names, req.admitted_table_ordinals, legacy_children.?, published_table_ranges, &reconciled, cancellation) catch |err| return switch (err) {
-                error.PortableForeignKeyRestoreUnavailable, error.InvalidRequest, error.Cancelled, error.NotLeader, error.InternalFailure => |known| known,
-                else => mapClusterRestoreRepositoryError(err),
-            };
+            if (req.defer_source_checks) {
+                for (0..table_names.len) |index| {
+                    if (!reconciled.isSet(index) and !restore_jobs.containsTableIndex(published_table_ranges, @intCast(index)))
+                        return error.RestoreValidationPending;
+                }
+            } else {
+                self.verifyPendingLegacyRestoreChildren(op_alloc, location, &manifest, table_names, req.admitted_table_ordinals, legacy_children.?, published_table_ranges, &reconciled, cancellation) catch |err| return switch (err) {
+                    error.PortableForeignKeyRestoreUnavailable, error.InvalidRequest, error.Cancelled, error.NotLeader, error.InternalFailure => |known| known,
+                    else => mapClusterRestoreRepositoryError(err),
+                };
+            }
         }
 
         if (std.mem.eql(u8, restore_mode, "fail_if_exists")) {
@@ -26004,6 +26011,38 @@ pub const ApiHttpServer = struct {
         self.restore_schedule_mutex.unlock();
     }
 
+    fn executeStoredClusterRestore(self: *ApiHttpServer, state: restore_jobs.JobState, location: *backups_api.BackupLocation, defer_source_checks: bool) cluster_api_http.ClusterApi.ExecuteRestoreError![]u8 {
+        return executePublicClusterRestoreWithCancellation(self, self.alloc, .{
+            .backup_id = state.backup_id,
+            .location = state.location,
+            .connection = state.connection,
+            .table_names = state.table_names,
+            .admitted_manifest_sha256 = if (state.cluster_binding) |binding| binding.manifest_sha256 else null,
+            .admitted_table_ordinals = if (state.cluster_binding) |binding| binding.selected_ordinals else null,
+            .admitted_children_sha256 = if (state.cluster_binding) |binding| binding.children_sha256 else null,
+            .admitted_child_pins = if (state.cluster_binding) |binding| binding.child_pins else null,
+            .admitted_recovery_manifests_json = if (state.cluster_binding) |binding| binding.recovery_manifests_json else null,
+            .admitted_manifest_json = if (state.cluster_binding) |binding| binding.manifest_json else null,
+            .defer_source_checks = defer_source_checks,
+            .restore_mode = state.restore_mode,
+        }, location, state.restore_mode, state.destination_authorization_principal, .{
+            .job_id = state.job_id,
+            .attempt_id = state.attempt_id,
+        }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}, state.completed_table_ranges orelse &.{});
+    }
+
+    fn handleRestoreExecutionFailure(self: *ApiHttpServer, state: restore_jobs.JobState, err: anyerror) !void {
+        if (restoreJobErrorIsRetryable(err)) {
+            const retried = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(err), restoreRetryDelayNs(err, state.job_id, state.attempt_id));
+            self.alloc.free(retried);
+            self.wakeRequeuedRestoreJobs();
+            return;
+        }
+        if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
+        const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
+        self.alloc.free(failed);
+    }
+
     fn runRestoreJob(
         self: *ApiHttpServer,
         job_id: u64,
@@ -26058,6 +26097,29 @@ pub const ApiHttpServer = struct {
             try self.finishRestoreJobResult(state, result, true);
             return;
         }
+        if (state.scope == .cluster) if (state.cluster_binding) |binding| {
+            if (binding.recovery_manifests_json != null and binding.manifest_json != null and
+                (state.active_table_index != null or
+                    (state.durability_pending_table_ranges orelse &.{}).len != 0 or
+                    (state.published_table_ranges orelse &.{}).len != 0))
+            {
+                // Publication receipts and the live catalog can finish a
+                // retry before resolving source credentials or opening a root.
+                var unused_location: backups_api.BackupLocation = .{ .file = "." };
+                const recovered: ?[]u8 = self.executeStoredClusterRestore(state, &unused_location, true) catch |err| switch (err) {
+                    error.RestoreValidationPending => null,
+                    else => {
+                        try self.handleRestoreExecutionFailure(state, err);
+                        return;
+                    },
+                };
+                if (recovered) |result| {
+                    defer self.alloc.free(result);
+                    try self.finishRestoreJobResult(state, result, false);
+                    return;
+                }
+            }
+        };
         var repair_cancellation = RestoreRepairCancellation{
             .server = self,
             .restore = .{ .job_id = state.job_id, .attempt_id = state.attempt_id },
@@ -26211,36 +26273,8 @@ pub const ApiHttpServer = struct {
                 if (!self.restoreExecutionPermitted()) return error.RestoreJobFenced;
                 break :blk try backups_api.encodeRestoreTriggered(self.alloc);
             },
-            .cluster => executePublicClusterRestoreWithCancellation(self, self.alloc, .{
-                .backup_id = state.backup_id,
-                .location = state.location,
-                .connection = state.connection,
-                .table_names = state.table_names,
-                .admitted_manifest_sha256 = if (state.cluster_binding) |binding| binding.manifest_sha256 else null,
-                .admitted_table_ordinals = if (state.cluster_binding) |binding| binding.selected_ordinals else null,
-                .admitted_children_sha256 = if (state.cluster_binding) |binding| binding.children_sha256 else null,
-                .admitted_child_pins = if (state.cluster_binding) |binding| binding.child_pins else null,
-                .admitted_recovery_manifests_json = if (state.cluster_binding) |binding| binding.recovery_manifests_json else null,
-                .admitted_manifest_json = if (state.cluster_binding) |binding| binding.manifest_json else null,
-                .restore_mode = state.restore_mode,
-            }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}, state.completed_table_ranges orelse &.{}) catch |err| {
-                if (restoreJobErrorIsRetryable(err)) {
-                    const retry_delay_ns = restoreRetryDelayNs(err, state.job_id, state.attempt_id);
-                    const retried = try self.restore_job_store.retryRunning(
-                        self.alloc,
-                        state,
-                        @errorName(err),
-                        retry_delay_ns,
-                    );
-                    self.alloc.free(retried);
-                    self.wakeRequeuedRestoreJobs();
-                    return;
-                }
-                if (restoreJobErrorIsFenced(err)) {
-                    return error.RestoreJobFenced;
-                }
-                const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
-                self.alloc.free(failed);
+            .cluster => self.executeStoredClusterRestore(state, &location, false) catch |err| {
+                try self.handleRestoreExecutionFailure(state, err);
                 return;
             },
         };
@@ -55470,6 +55504,20 @@ test "api http server cluster overwrite restores from read-only repository witho
     defer summary.deinit(alloc);
     try std.testing.expect(summary.succeeded);
     try std.testing.expect(!state.restore_lifecycle_active);
+    const requeued = try server.restore_job_store.retryRunning(alloc, running_state.value, "interrupted-after-publication", 0);
+    defer alloc.free(requeued);
+    // Source authorization can also disappear after all physical work has
+    // committed. A completed retry no longer resolves that connection.
+    server.cfg.node_config = null;
+    var attempt_id: u64 = 0;
+    var established = false;
+    try server.runRestoreJob(recovery_state.value.job_id, &attempt_id, &established);
+    try std.testing.expect(established);
+    const finished = (try server.restore_job_store.loadCached(alloc, recovery_state.value.job_id)).?;
+    defer alloc.free(finished);
+    var final_state = try std.json.parseFromSlice(restore_jobs.JobState, alloc, finished, .{});
+    defer final_state.deinit();
+    try std.testing.expectEqual(restore_jobs.Phase.succeeded, final_state.value.phase);
 }
 
 test "api http server cluster restore rejects missing extension package digest" {

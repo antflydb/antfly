@@ -65,6 +65,7 @@ pub const ClusterRestoreRequest = struct {
     admitted_child_pins: ?[]const u8 = null,
     admitted_recovery_manifests_json: ?[]const u8 = null,
     admitted_manifest_json: ?[]const u8 = null,
+    defer_source_checks: bool = false,
 };
 
 pub const format_version = @import("antfly_local_sources").api_local_backups.format_version;
