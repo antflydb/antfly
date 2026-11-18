@@ -1419,6 +1419,22 @@ pub const ProvisionedKernelOwnerSource = struct {
         publication.* = .{ .group_id = group_id, .table_name = try self.alloc.dupe(u8, table_name) };
         errdefer self.alloc.free(publication.table_name);
         try self.publications.append(self.alloc, publication);
+        // Publication supersedes queued descriptors. Active work keeps its
+        // allocation until the worker observes the cancellation under this lock.
+        const key: ApplyOpenKey = .{ .group_id = group_id, .table_name = table_name };
+        if (self.apply_control_requests.get(key)) |request| {
+            _ = self.apply_control_requests.remove(key);
+            request.claimed = true;
+            if (self.apply_control_active != request) {
+                for (self.apply_control_pending.items, 0..) |pending, index| {
+                    if (pending == request) {
+                        _ = self.apply_control_pending.orderedRemove(index);
+                        break;
+                    }
+                }
+                request.deinit(self.alloc);
+            }
+        }
         // Close admission before observing users or dropping the registry lock.
         // The gate outlives the last Entry, including an initially cold group.
         for (self.entries.items) |entry| {
@@ -4237,6 +4253,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         pending.prepare_graph_indexes = needs_index_catalog;
         var pending_owned = true;
         defer if (pending_owned) pending.deinit(self.alloc);
+        // Refresh outside the registry lock; the owner pin covers a cache
+        // replacement between this lookup and the admission recheck.
+        if (physical == null)
+            physical = self.physical_catalogs.lookup(group_id, raw_descriptor.indexes_json) catch null;
         if (!self.mutex.tryLock()) return error.RaftApplyWriterUnavailable;
         defer self.mutex.unlock();
         if (!self.canAcquireApplyLocked(group_id, table_name)) return error.RaftApplyWriterUnavailable;
@@ -4245,10 +4265,6 @@ pub const ProvisionedKernelOwnerSource = struct {
             claimed_open = failed;
             return failed.projection_failure.?;
         }
-        // The control executor may have admitted the raw cut while we
-        // prepared the queue item. Recheck without building a projection.
-        if (physical == null)
-            physical = self.physical_catalogs.lookup(group_id, raw_descriptor.indexes_json) catch null;
         if (self.tryAcquireWarmApplyLocked(group_id, table_name, raw_descriptor, if (physical) |cut| cut.bytes else null, needs_index_catalog)) |lease| {
             claimed_open = self.claimApplyOpenLocked(lease.entry, request);
             return lease;
@@ -7535,6 +7551,11 @@ test "committed owner apply reports permanent projection failures for the exact 
     var valid = invalid;
     valid.indexes_json = "{}";
     try applyCommittedForTest(&source, alloc, 1, "docs", valid, batch, 2, 2);
+    // A snapshot may skip a failed entry before Raft retrieves its result.
+    try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 2, "skipped", invalid, batch, 2, 1));
+    const publication = try source.registerPublication(2, "skipped");
+    Source.endPublication(&source, publication);
+    try applyCommittedForTest(&source, alloc, 2, "skipped", valid, batch, 2, 2);
 }
 
 test "owner shutdown joins recovery close while raft progress remains available" {
