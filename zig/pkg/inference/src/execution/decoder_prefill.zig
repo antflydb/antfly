@@ -1316,7 +1316,10 @@ pub const Forward = struct {
         capture_last_hidden: bool,
     ) !?Output {
         const capture_requested = if (comptime build_options.enable_cuda) cuda_compute.CudaCompute.capturedPrefillRequested(self.forward.context.cb) else false;
-        if (!decoder_routes.cudaPreparedPrefillGreedyEnabled(capture_requested)) return null;
+        // This tail is qualified with the owned native prefix program. The
+        // legacy eager prepared decoder is not reset-stable for this route;
+        // decline before embedding/PLE/KV work even when its flag is forced.
+        if (!capture_requested or !decoder_routes.cudaCapturedPrefillGreedyEnabled()) return null;
         if (self.forward.context.cb.kind() != .cuda) return null;
         if (decode_context.attention_mode != .paged_prefill or decode_context.query_sequence_len != input_ids.len) return null;
 
@@ -1328,7 +1331,7 @@ pub const Forward = struct {
             input_ids,
             seq_len,
             decode_context,
-            false,
+            .{ .execution = .captured_native },
         )) orelse return null;
         var owns_hidden = true;
         errdefer if (owns_hidden) self.forward.context.cb.free(tail.final_hidden);
@@ -1422,7 +1425,7 @@ pub const Forward = struct {
             input_ids,
             seq_len,
             decode_context,
-            true,
+            .{ .prefer_greedy_token = true },
         )) orelse return null;
         defer self.forward.context.cb.free(tail.final_hidden);
 

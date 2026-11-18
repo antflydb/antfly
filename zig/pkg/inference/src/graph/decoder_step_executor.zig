@@ -441,7 +441,7 @@ pub const Executor = struct {
                     attempt.work.token_ids,
                     attempt.work.seq_len,
                     attempt.decode_context,
-                    false,
+                    .{},
                 )) orelse return false;
                 pipeline.context.cb.free(tail.final_hidden);
                 return true;

@@ -6300,7 +6300,7 @@ pub const CudaCompute = struct {
     // Lazily-built concatenated [2*ffn, hidden] BF16 gate|up mirrors for the
     // fused gate/up prefill GEMM, keyed by the gate weight's mirror pointer.
     // Owned here; freed in deinit.
-    bf16_pair_mirror_cache: std.AutoHashMapUnmanaged(usize, buffer_mod.DeviceBuffer) = .{},
+    bf16_pair_mirror_cache: std.AutoHashMapUnmanaged(Bf16PairMirrorKey, buffer_mod.DeviceBuffer) = .{},
     capture_gates: CudaCaptureGateConfig = .{},
     temp_slot_config: CudaTempSlotConfig = .{},
     runtime_jit_shape_gating: bool = false,
@@ -15980,9 +15980,12 @@ fn tryCublasLtBf16LinearPair(
     return true;
 }
 
-// Lazily build and cache the concatenated [2*ffn, in_dim] BF16 weight (gate
-// rows then up rows) from the two per-weight mirrors, keyed by the gate
-// mirror's device pointer. One device-to-device copy per half, once per layer.
+/// Immutable resident mirrors can share a gate across different pairs. Both
+/// sources and their interpretation identify the derived concatenated matrix.
+const Bf16PairMirrorKey = struct { gate: u64, up: u64, rows: usize, columns: usize };
+
+// Lazily cache the concatenated BF16 matrix. Source mirrors remain resident
+// for the compute owner's lifetime; the cached matrix retires with that owner.
 fn ensureBf16PairMirror(
     self: *CudaCompute,
     gate_mirror: buffer_mod.DeviceBuffer,
@@ -15990,11 +15993,11 @@ fn ensureBf16PairMirror(
     ffn: usize,
     in_dim: usize,
 ) !?buffer_mod.DeviceBuffer {
-    const key: usize = @intCast(gate_mirror.ptr);
-    if (self.bf16_pair_mirror_cache.get(key)) |buf| return buf;
     const half_elems = try checkedMul(ffn, in_dim);
     const half_bytes = try checkedMul(half_elems, @sizeOf(u16));
-    if (gate_mirror.len < half_bytes or up_mirror.len < half_bytes) return null;
+    if (half_bytes == 0 or gate_mirror.ptr == 0 or up_mirror.ptr == 0 or gate_mirror.len < half_bytes or up_mirror.len < half_bytes) return null;
+    const key = Bf16PairMirrorKey{ .gate = gate_mirror.ptr, .up = up_mirror.ptr, .rows = ffn, .columns = in_dim };
+    if (self.bf16_pair_mirror_cache.get(key)) |buf| return buf;
     var combined = try allocDeviceBuffer(self, try checkedMul(half_bytes, 2));
     // Both device copies are asynchronous. A later failure must retire the
     // destination through the stream-ordered temporary-buffer path.
@@ -23792,19 +23795,45 @@ fn launchQ4KTcHmmaNoBias(
     return true;
 }
 
-fn q4_0CublasPrefillEligible(
-    self: *const CudaCompute,
-    weight: *const CudaTensor,
-    rows: usize,
-    in_dim: usize,
-    out_dim: usize,
-) bool {
-    const elements = std.math.mul(usize, in_dim, out_dim) catch return false;
-    return self.tuned_route_gates.q4_0_cublas_prefill and rows >= 128 and
-        !self.kernels.attention_match_repeat and isKnownQuant(weight, .Q4_0) and
-        self.cublaslt != null and self.kernels.dequant_q4_0_bf16 != null and
-        !self.ctx.debug_graph_capture_active and !self.debug_cuda_graph_capture_active and
-        elements <= 128 * 1024 * 1024 / @sizeOf(u16);
+/// Original Q4 -> BF16 vendor boundary, independent of a tensor-core packed
+/// payload. Assigned programs supply their declared expansion bank; eager
+/// callers additionally require an allocation-safe execution phase.
+fn q4VendorPrefillBytes(self: *const CudaCompute, weight: *const CudaTensor, rows: usize, in_dim: usize, out_dim: usize) ?usize {
+    if (!self.tuned_route_gates.q4_0_cublas_prefill or rows < 128 or self.cooperative_decode_rows != 0 or
+        self.kernels.attention_match_repeat or !isKnownQuant(weight, .Q4_0) or in_dim == 0 or in_dim % 32 != 0 or out_dim == 0 or
+        self.cublaslt == null or !cudaCublasLtEnabled() or self.ctx.info.compute_major < 8 or self.kernels.dequant_q4_0_bf16 == null) return null;
+    const elements = std.math.mul(usize, in_dim, out_dim) catch return null;
+    if (weight.elem_count != elements or elements > 128 * 1024 * 1024 / 2 or weight.buffer.len < (elements / 32) * 18) return null;
+    return elements * 2;
+}
+
+fn q4_0CublasPrefillEligible(self: *const CudaCompute, weight: *const CudaTensor, rows: usize, in_dim: usize, out_dim: usize) bool {
+    return !self.ctx.debug_graph_capture_active and !self.debug_cuda_graph_capture_active and q4VendorPrefillBytes(self, weight, rows, in_dim, out_dim) != null;
+}
+
+fn tryQ4VendorPrefill(self: *CudaCompute, dst: buffer_mod.DeviceBuffer, input: *const CudaTensor, weight: *const CudaTensor, rows: usize, in_dim: usize, out_dim: usize) !bool {
+    if (!q4_0CublasPrefillEligible(self, weight, rows, in_dim, out_dim)) return false;
+    const bytes = q4VendorPrefillBytes(self, weight, rows, in_dim, out_dim).?;
+    var dense = try allocDeviceBuffer(self, bytes);
+    defer releaseDeviceBuffer(self, &dense);
+    try self.kernels.launchDequantQ4_0Bf16(&self.ctx, dense, weight.buffer, weight.elem_count / 32);
+    if (!try tryCublasLtBf16Linear(self, dst, input, dense, rows, in_dim, out_dim)) return false;
+    self.dispatch_stats.note(self.allocator, .linear_no_bias, .q4_0, .dense_lt, .none, .none, rows, in_dim, out_dim, bytes);
+    return true;
+}
+
+fn tryQ4VendorPair(self: *CudaCompute, first: buffer_mod.DeviceBuffer, second: buffer_mod.DeviceBuffer, input: *const CudaTensor, a: *const CudaTensor, b: *const CudaTensor, rows: usize, in_dim: usize, out_dim: usize) !bool {
+    if (!q4_0CublasPrefillEligible(self, a, rows, in_dim, out_dim) or !q4_0CublasPrefillEligible(self, b, rows, in_dim, out_dim)) return false;
+    const half_bytes = boundedQ4PairHalfBytes(in_dim, out_dim, a.elem_count, b.elem_count) orelse return false;
+    var dense = try allocDeviceBuffer(self, half_bytes * 2);
+    defer releaseDeviceBuffer(self, &dense);
+    const lo = buffer_mod.DeviceBuffer{ .ptr = dense.ptr, .len = half_bytes };
+    const hi = buffer_mod.DeviceBuffer{ .ptr = dense.ptr + half_bytes, .len = half_bytes };
+    try self.kernels.launchDequantQ4_0Bf16(&self.ctx, lo, a.buffer, a.elem_count / 32);
+    try self.kernels.launchDequantQ4_0Bf16(&self.ctx, hi, b.buffer, b.elem_count / 32);
+    // The shared owner prepares BOTH original vendor submissions before either
+    // writes an output and converts the activation once for the pair.
+    return try tryCublasLtBf16LinearPair(self, first, second, input, lo, hi, rows, in_dim, out_dim);
 }
 
 // W4A16 Q4_0 tensor-core prefill route. Returns true if it consumed the launch
@@ -23822,19 +23851,6 @@ fn launchQ4_0TcHmmaNoBias(
     out_dim: usize,
 ) !bool {
     if (variant != .tc_hmma) return false;
-    if (q4_0CublasPrefillEligible(self, weight, rows, in_dim, out_dim)) {
-        const weight_bytes = try checkedMul(try checkedMul(in_dim, out_dim), @sizeOf(u16));
-        // Bound additional residency, including unusually large output heads.
-        // Allocation stays in the ordinary budgeted temporary pool; a caller
-        // cannot use this route to bypass the owner's GPU memory admission.
-        var dense = try allocDeviceBuffer(self, weight_bytes);
-        defer releaseDeviceBuffer(self, &dense);
-        try self.kernels.launchDequantQ4_0Bf16(&self.ctx, dense, weight.buffer, weight.elem_count / 32);
-        if (try tryCublasLtBf16Linear(self, dst, input, dense, rows, in_dim, out_dim)) {
-            self.dispatch_stats.note(self.allocator, .linear_no_bias, .q4_0, .dense_lt, .none, .none, rows, in_dim, out_dim, weight_bytes);
-            return true;
-        }
-    }
     const packed_buffer = tcQuantBuffer(weight, .q4_0_hmma) orelse return false;
     // Prefer the BF16-fragment kernel: bf16 has f32's exponent range, so it
     // stays accurate on Gemma's large activations where the f16 tc kernel loses
@@ -24815,7 +24831,9 @@ fn linearNoBiasInto(self: *CudaCompute, device: buffer_mod.DeviceBuffer, input_t
     var prefill_profile_scope = beginPrefillProfile(self, prefillProfileCategoryForLinearNoBias(weight_tensor, rows, in_dim, out_dim), rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
     const bf16_mirror = weightBf16MirrorForRows(self, weight_tensor, rows);
-    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill and self.cooperative_decode_rows == 0, rows, bf16_mirror != null) and
+    if (bf16_mirror == null and try tryQ4VendorPrefill(self, device, input_tensor, weight_tensor, rows, in_dim, out_dim)) {
+        // Bounded vendor expansion needs no persistent TC repack.
+    } else if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill and self.cooperative_decode_rows == 0, rows, bf16_mirror != null) and
         try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device, input_tensor, weight_tensor, rows, in_dim, out_dim))
     {
         // W4A16 tensor-core prefill route (default on SM89). It DEFERS to the
@@ -26321,6 +26339,12 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
     const k_mirror = weightBf16MirrorForRows(self, k_weight_tensor, rows);
     const v_mirror = weightBf16MirrorForRows(self, v_weight_tensor, rows);
     const use_hybrid_bf16 = q_mirror != null and k_mirror != null and v_mirror != null;
+    // A bounded vendor projection needs no packed TC payload. The ordinary
+    // triple adapter retains its existing single-projection fallback; owned
+    // graph regions additionally share the conversion and declared bank.
+    if (!use_hybrid_bf16 and q4VendorPrefillBytes(self, q_weight_tensor, rows, in_dim, q_out_dim) != null and
+        q4VendorPrefillBytes(self, k_weight_tensor, rows, in_dim, kv_out_dim) != null and
+        q4VendorPrefillBytes(self, v_weight_tensor, rows, in_dim, kv_out_dim) != null) return null;
     // W4A16 QKV: when the tensor-core packs are present AND no BF16 mirror is
     // attached, defer to the individual linearNoBias path (which routes Q4_0
     // prefill through tc_hmma). When a mirror IS present, keep the fused
@@ -26897,7 +26921,9 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
     var prefill_profile_scope = beginPrefillProfile(self, if (use_bf16) .bf16_pair else if (use_q4_0) .q4_pair else null, rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
 
-    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill and self.cooperative_decode_rows == 0, rows, use_hybrid_bf16) and
+    if (!use_hybrid_bf16 and try tryQ4VendorPair(self, device_a, device_b, input_tensor, weight_a_tensor, weight_b_tensor, rows, in_dim, out_dim)) {
+        // Preserve the original paired vendor schedule and aggregate bound.
+    } else if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill and self.cooperative_decode_rows == 0, rows, use_hybrid_bf16) and
         tcQuantBuffer(weight_a_tensor, .q4_0_hmma) != null and
         tcQuantBuffer(weight_b_tensor, .q4_0_hmma) != null and
         try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device_a, input_tensor, weight_a_tensor, rows, in_dim, out_dim) and
@@ -38737,6 +38763,9 @@ const AssignedProjectionGroup = struct {
     activation_bytes: usize,
     vendor_offset: usize,
     vendor_bytes: usize,
+    workspace_bytes: usize,
+    dequant_bytes: [3]usize = @splat(0),
+    dequant_offsets: [3]usize = @splat(0),
 
     fn policy(ctx: *anyopaque) !?u64 {
         const self: *CudaCompute = @ptrCast(@alignCast(ctx));
@@ -38745,7 +38774,7 @@ const AssignedProjectionGroup = struct {
         if (self.gemma4_native_plan == null or self.resident_training_cache or self.lazy_host_store != null or
             self.lighton_bf16_decode_outputs or self.lighton_bf16_projection_outputs or
             self.cublaslt_bf16_tuning_profile != .off or !cudaCublasLtEnabled() or self.cublaslt == null or self.ctx.info.compute_major < 8) return null;
-        const fields = [2]u64{ self.runtime_policy.workspace_bytes, q8Policy(self, 2048) };
+        const fields = [3]u64{ self.runtime_policy.workspace_bytes, q8Policy(self, 2048), @intFromBool(self.tuned_route_gates.q4_0_cublas_prefill) };
         const key = std.hash.Wyhash.hash(1166, std.mem.asBytes(&fields));
         return if (key == 0) 1 else key;
     }
@@ -38772,9 +38801,13 @@ const AssignedProjectionGroup = struct {
         if ((policy(self.compute) catch return false) != self.policy_key or request.inputs.len != self.head.count + 1 or
             !PreparedCudaProjection.dense(self.compute, request.inputs[0], self.head.linears[0].input_shapes[0])) return false;
         if (self.activation != null and q8Policy(self.compute, self.head.linears[0].operation.linear.in_dim) != self.q8_policy) return false;
-        for (request.inputs[1..], self.weight_buffers[0..self.head.count]) |fact, original| {
+        for (request.inputs[1..], self.weight_buffers[0..self.head.count], 0..) |fact, original, index| {
             const value = PreparedCudaProjection.tensorFact(self.compute, fact) orelse return false;
-            const current = (if (self.activation == null) weightBuffer(self.compute, @ptrCast(@constCast(value)), self.head.linears[0].operation.linear.rows) else rawWeight(self.compute, @ptrCast(@constCast(value)), self.head.linears[0].operation.linear.rows)) orelse return false;
+            const current = if (self.dequant_bytes[index] != 0) expanded: {
+                const g = self.head.linears[index].operation.linear;
+                if (weightBf16MirrorForRows(self.compute, value, g.rows) != null or q4VendorPrefillBytes(self.compute, value, g.rows, g.in_dim, g.out_dim) != self.dequant_bytes[index]) return false;
+                break :expanded value.buffer;
+            } else (if (self.activation == null) weightBuffer(self.compute, @ptrCast(@constCast(value)), self.head.linears[0].operation.linear.rows) else rawWeight(self.compute, @ptrCast(@constCast(value)), self.head.linears[0].operation.linear.rows)) orelse return false;
             if (current.ptr != original.ptr or current.len != original.len) return false;
         }
         return true;
@@ -38796,23 +38829,23 @@ const AssignedProjectionGroup = struct {
         const workspace = tensorFromCt(request.workspace orelse return error.MissingAssignedWorkspace);
         if (workspace.physical_lease == null or workspace.physical_lease.?.backend.ptr != @as(*anyopaque, @ptrCast(self.compute)) or
             !acceptsPhysicalImplementation(workspace.physical_lease.?.backend.vtable) or cudaTensorReadOnly(workspace) or workspace.buffer.ptr % 256 != 0 or
-            workspace.buffer.len < self.vendor_offset + self.vendor_bytes) return error.MissingAssignedWorkspace;
+            workspace.buffer.len < self.workspace_bytes) return error.MissingAssignedWorkspace;
         const bank = workspace.buffer;
         const activation = if (input.bf16_mirror.ptr != 0 and input.bf16_mirror.len >= self.activation_bytes)
             buffer_mod.DeviceBuffer{ .ptr = input.bf16_mirror.ptr, .len = self.activation_bytes }
         else
             buffer_mod.DeviceBuffer{ .ptr = bank.ptr, .len = self.activation_bytes };
         if (kernel_geometry.byteRangesOverlap(output.ptr, bytes, activation.ptr, activation.len) or
-            (activation.ptr != bank.ptr and kernel_geometry.byteRangesOverlap(bank.ptr, self.vendor_offset + self.vendor_bytes, activation.ptr, activation.len))) return error.InvalidAssignedAlias;
+            (activation.ptr != bank.ptr and kernel_geometry.byteRangesOverlap(bank.ptr, self.workspace_bytes, activation.ptr, activation.len))) return error.InvalidAssignedAlias;
         for (request.inputs) |value| {
             const source = tensorFromCt(value).buffer;
-            if (kernel_geometry.byteRangesOverlap(bank.ptr, self.vendor_offset + self.vendor_bytes, source.ptr, source.len) or
+            if (kernel_geometry.byteRangesOverlap(bank.ptr, self.workspace_bytes, source.ptr, source.len) or
                 kernel_geometry.byteRangesOverlap(output.ptr, bytes, source.ptr, source.len)) return error.InvalidAssignedAlias;
         }
-        if (kernel_geometry.byteRangesOverlap(bank.ptr, self.vendor_offset + self.vendor_bytes, output.ptr, bytes)) return error.InvalidAssignedAlias;
-        for (self.weight_buffers[0..self.head.count]) |weight| if (kernel_geometry.byteRangesOverlap(bank.ptr, self.vendor_offset + self.vendor_bytes, weight.ptr, weight.len) or
+        if (kernel_geometry.byteRangesOverlap(bank.ptr, self.workspace_bytes, output.ptr, bytes)) return error.InvalidAssignedAlias;
+        for (self.weight_buffers[0..self.head.count]) |weight| if (kernel_geometry.byteRangesOverlap(bank.ptr, self.workspace_bytes, weight.ptr, weight.len) or
             kernel_geometry.byteRangesOverlap(output.ptr, bytes, weight.ptr, weight.len)) return error.InvalidAssignedAlias;
-        return .{ .dst = .{ .ptr = output.ptr, .len = bytes }, .input = activation, .weight = self.weight_buffers[index], .workspace = if (self.vendor_bytes == 0) .{} else .{ .ptr = bank.ptr + self.vendor_offset, .len = self.vendor_bytes } };
+        return .{ .dst = .{ .ptr = output.ptr, .len = bytes }, .input = activation, .weight = if (self.dequant_bytes[index] == 0) self.weight_buffers[index] else .{ .ptr = bank.ptr + self.dequant_offsets[index], .len = self.dequant_bytes[index] }, .workspace = if (self.vendor_bytes == 0) .{} else .{ .ptr = bank.ptr + self.vendor_offset, .len = self.vendor_bytes } };
     }
     const Resources = struct {
         owner: *AssignedProjectionGroup,
@@ -38892,6 +38925,12 @@ const AssignedProjectionGroup = struct {
         const input = tensorFromCt(request.inputs[0]);
         const g = self.head.linears[0].operation.linear;
         errdefer self.compute.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+        // The original dequantizer writes invocation-owned scratch. No dense
+        // weight is cached or attributed to an immutable packed source root.
+        for (self.dequant_bytes[0..self.head.count], 0..) |bytes, index| if (bytes != 0) {
+            const invocation_weight = (try self.invocation(request, index)).weight;
+            try self.compute.kernels.launchDequantQ4_0Bf16(&self.compute.ctx, invocation_weight, self.weight_buffers[index], bytes / 2 / 32);
+        };
         try convertBf16ActivationForCublasLt(self.compute, input, .{ .buffer = first.input, .cast = first.input.ptr != input.bf16_mirror.ptr, .count = self.activation_bytes / 2 }, g.rows);
         for (resources.plans[0..self.head.count], 0..) |*plan, index| _ = try plan.submit(&self.compute.ctx, try self.invocation(request, index));
         self.compute.stats.bf16_cublaslt_linear_calls += self.head.count;
@@ -38954,8 +38993,9 @@ const AssignedProjectionGroup = struct {
                 }
                 if (!eligible or !PreparedCudaProjection.dense(self, request.node_facts[program.input], program.shape) or
                     !PreparedCudaProjection.dense(self, request.node_facts[program.weight], program.weight_shape)) continue;
+                const output_bytes = try checkedMul(@intCast(program.shape.numElements().?), 4);
                 const owner = try request.allocator.create(AssignedHeadNormRope);
-                owner.* = .{ .allocator = request.allocator, .compute = self, .program = program, .inputs = .{ program.input, program.weight }, .outputs = .{.{ .node = node, .logical = program.shape, .bytes = try checkedMul(@intCast(program.shape.numElements().?), 4) }}, .policy_key = request.policy_key };
+                owner.* = .{ .allocator = request.allocator, .compute = self, .program = program, .inputs = .{ program.input, program.weight }, .outputs = .{.{ .node = node, .logical = program.shape, .bytes = output_bytes }}, .policy_key = request.policy_key };
                 if (!owner.ready()) {
                     request.allocator.destroy(owner);
                     continue;
@@ -38995,6 +39035,24 @@ const AssignedProjectionGroup = struct {
                     continue;
                 };
             }
+            var dequant_bytes: [3]usize = @splat(0);
+            if (!eligible) vendor: {
+                var total: usize = 0;
+                for (head.weights[0..head.count], 0..) |weight, index| {
+                    const tensor = PreparedCudaProjection.tensorFact(self, request.node_facts[weight]) orelse break :vendor;
+                    if (!PreparedCudaProjection.pinnedWeight(tensor) or weightBf16MirrorForRows(self, tensor, g.rows) != null) break :vendor;
+                    const geometry = head.linears[index].operation.linear;
+                    const bytes = q4VendorPrefillBytes(self, tensor, geometry.rows, geometry.in_dim, geometry.out_dim) orelse break :vendor;
+                    total = try std.math.add(usize, total, bytes);
+                    // The whole group shares the eager pair's 128 MiB bound.
+                    if (total > 128 * 1024 * 1024) break :vendor;
+                    sources[index] = @ptrCast(@constCast(tensor));
+                    buffers[index] = tensor.buffer;
+                    dequant_bytes[index] = bytes;
+                }
+                eligible = true;
+            }
+            if (!eligible) dequant_bytes = @splat(0);
             var activation: ?ops.DecoderRuntimeActivationKind = null;
             var gated_output: ?@import("ml").graph.NodeId = null;
             if (!eligible) {
@@ -39050,7 +39108,15 @@ const AssignedProjectionGroup = struct {
             }
             const activation_bytes = try checkedMul(try checkedMul(g.rows, g.in_dim), 2);
             const offset = try std.math.add(usize, activation_bytes, 255) & ~@as(usize, 255);
-            owner.* = .{ .allocator = request.allocator, .compute = self, .head = head, .inputs = undefined, .outputs = undefined, .weights = sources, .weight_buffers = buffers, .activation_bytes = activation_bytes, .vendor_offset = offset, .vendor_bytes = if (activation == null) self.runtime_policy.workspace_bytes else 0, .activation = activation, .q8_bytes = q8_bytes, .q8_policy = q8_policy, .policy_key = request.policy_key, .output_count = if (activation == null) head.count else 1 };
+            const vendor_bytes = if (activation == null) self.runtime_policy.workspace_bytes else 0;
+            var workspace_bytes = if (activation == null) try std.math.add(usize, offset, vendor_bytes) else q8_bytes;
+            var dequant_offsets: [3]usize = @splat(0);
+            for (dequant_bytes[0..head.count], 0..) |bytes, index| if (bytes != 0) {
+                workspace_bytes = try std.math.add(usize, workspace_bytes, 255) & ~@as(usize, 255);
+                dequant_offsets[index] = workspace_bytes;
+                workspace_bytes = try std.math.add(usize, workspace_bytes, bytes);
+            };
+            owner.* = .{ .allocator = request.allocator, .compute = self, .head = head, .inputs = undefined, .outputs = undefined, .weights = sources, .weight_buffers = buffers, .activation_bytes = activation_bytes, .vendor_offset = offset, .vendor_bytes = vendor_bytes, .workspace_bytes = workspace_bytes, .dequant_bytes = dequant_bytes, .dequant_offsets = dequant_offsets, .activation = activation, .q8_bytes = q8_bytes, .q8_policy = q8_policy, .policy_key = request.policy_key, .output_count = if (activation == null) head.count else 1 };
             owner.inputs[0] = head.input;
             for (0..head.count) |index| {
                 owner.inputs[index + 1] = head.weights[index];
@@ -39058,7 +39124,7 @@ const AssignedProjectionGroup = struct {
                 owner.outputs[index] = .{ .node = head.outputs[index], .logical = projection.output_shape, .bytes = try checkedMul(try checkedMul(projection.operation.linear.rows, projection.operation.linear.out_dim), 4) };
             }
             if (gated_output) |node_output| owner.outputs[0].node = node_output;
-            try result.append(request.allocator, .{ .context = owner, .implementation = request.implementation, .key = head.entry, .policy_key = request.policy_key, .covered_nodes = owner.head.covered[0..owner.head.covered_count], .input_nodes = owner.inputs[0 .. head.count + 1], .entry_node = head.entry, .requirements = .{ .outputs = owner.outputs[0..owner.output_count], .dispatch_workspace = .{ .byte_size = if (activation == null) try std.math.add(usize, offset, owner.vendor_bytes) else q8_bytes, .alignment = 256 }, .capture = .supported, .requires_execution_profile = false, .uncovered = .{} }, .vtable = if (activation == null) &table else &q4_table });
+            try result.append(request.allocator, .{ .context = owner, .implementation = request.implementation, .key = head.entry, .policy_key = request.policy_key, .covered_nodes = owner.head.covered[0..owner.head.covered_count], .input_nodes = owner.inputs[0 .. head.count + 1], .entry_node = head.entry, .requirements = .{ .outputs = owner.outputs[0..owner.output_count], .dispatch_workspace = .{ .byte_size = workspace_bytes, .alignment = 256 }, .capture = .supported, .requires_execution_profile = false, .uncovered = .{} }, .vtable = if (activation == null) &table else &q4_table });
         }
         if (result.items.len == 0) return null;
         return .{ .allocator = request.allocator, .items = try result.toOwnedSlice(request.allocator) };
@@ -45565,14 +45631,13 @@ const PreparedCudaProjection = struct {
             var selected: Packed = undefined;
             switch (format) {
                 .Q4_0 => {
+                    if (q4VendorPrefillBytes(self, weight, g.rows, g.width, g.columns)) |expansion_bytes| {
+                        p.family = .vendor_bf16;
+                        p.dequant_weight_bytes = expansion_bytes;
+                        p.dequant_function = self.kernels.dequant_q4_0_bf16;
+                        return p;
+                    }
                     if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, g.rows, false)) {
-                        if (self.tuned_route_gates.q4_0_cublas_prefill and g.rows >= 128 and !self.kernels.attention_match_repeat and self.cublaslt != null and self.kernels.dequant_q4_0_bf16 != null and weight.elem_count <= 128 * 1024 * 1024 / 2) {
-                            if (!cudaCublasLtEnabled() or self.ctx.info.compute_major < 8) return null;
-                            p.family = .vendor_bf16;
-                            p.dequant_weight_bytes = try checkedMul(try checkedMul(g.width, g.columns), 2);
-                            p.dequant_function = self.kernels.dequant_q4_0_bf16;
-                            return p;
-                        }
                         if (tcQuantBuffer(weight, .q4_0_hmma)) |quantized| {
                             if (self.kernels.linear_q4_0_f32_tc_hmma_bf16) |function| {
                                 selected = .{ .kind = .q4_0_hmma_bf16, .function = function, .append_bias = g.bias };
@@ -60288,7 +60353,7 @@ test "CUDA borrowed quantized metadata preserves logical shape without physical 
     try std.testing.expectEqual(@as(usize, 1), check.planes);
 }
 
-fn qualifyCapturedProjectionPair(comptime gated: bool, comptime q8: bool, comptime independent: bool) !void {
+fn qualifyCapturedProjectionPair(comptime gated: bool, comptime q8: bool, comptime independent: bool, comptime vendor: bool) !void {
     if (comptime !cuda_enabled) return error.SkipZigTest;
     const a = std.testing.allocator;
     const compute = try a.create(CudaCompute);
@@ -60296,11 +60361,13 @@ fn qualifyCapturedProjectionPair(comptime gated: bool, comptime q8: bool, compti
     compute.* = try CudaCompute.testing.init(a);
     defer compute.deinit();
     compute.gemma4_native_plan = .{ .projection = .packed_q4, .geometry = .{ .donor_layers = 24 } };
+    compute.tuned_route_gates.q4_0_cublas_prefill = vendor;
+    compute.tuned_route_gates.q4_0_tc_hmma_prefill = false;
     compute.bf16_mirror_row_selector = .{ .diagnostic_min_rows = 1 };
     compute.tuned_route_gates.pair_activation_q8_1_dp4a = q8;
     compute.tuned_route_gates.pair_q8_1_dp4a = q8;
     const cb = compute.computeBackend();
-    const rows = if (gated) 1 else 3;
+    const rows = if (vendor) 128 else if (gated) 1 else 3;
     const width = 32;
     for ([_][]const u8{ "gate.weight", "up.weight", "value.weight" }, 0..) |key, source_index| {
         const columns: usize = if (independent and source_index != 0) width / 2 else width;
@@ -60313,11 +60380,11 @@ fn qualifyCapturedProjectionPair(comptime gated: bool, comptime q8: bool, compti
         var primary = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, encoded.len);
         errdefer primary.free(&compute.ctx);
         try primary.copyFromHost(&compute.ctx, encoded);
-        var mirror = if (!gated) try buffer_mod.DeviceBuffer.alloc(&compute.ctx, weights.len * 2) else buffer_mod.DeviceBuffer{};
-        errdefer if (!gated) mirror.free(&compute.ctx);
+        var mirror = if (!gated and !vendor) try buffer_mod.DeviceBuffer.alloc(&compute.ctx, weights.len * 2) else buffer_mod.DeviceBuffer{};
+        errdefer if (!gated and !vendor) mirror.free(&compute.ctx);
         const source = try cb.fromFloat32Shape(weights, &.{ @intCast(columns), width });
         defer cb.free(source);
-        if (!gated) try compute.kernels.launchF32ToBf16(&compute.ctx, mirror, tensorFromCt(source).buffer, weights.len);
+        if (!gated and !vendor) try compute.kernels.launchF32ToBf16(&compute.ctx, mirror, tensorFromCt(source).buffer, weights.len);
         const shape = try a.dupe(i64, &.{ @intCast(columns), width });
         errdefer a.free(shape);
         const name = try a.dupe(u8, key);
@@ -60393,13 +60460,19 @@ fn qualifyCapturedProjectionPair(comptime gated: bool, comptime q8: bool, compti
         defer held.deinit();
         captures += held.result.stats.physical_graph_captures;
         replays += held.result.stats.physical_graph_replays;
-        if (independent) {
+        if (independent or vendor) {
             const pool = held.frame.executable.?.runtime.physical_pool.?;
             var selected_groups = false;
             if (pool.variant_cache) |variants| for (variants.entries.items) |variant| {
                 if (variant.pool.regions.len != 8) continue;
                 var complete = true;
-                for (variant.pool.regions) |installed| complete = complete and installed.owner.requirements.outputs.len == 3;
+                for (variant.pool.regions) |installed| {
+                    complete = complete and installed.owner.requirements.outputs.len == (if (independent) @as(usize, 3) else 2);
+                    if (vendor) {
+                        const program: *const AssignedProjectionGroup = @ptrCast(@alignCast(installed.owner.context));
+                        complete = complete and program.dequant_bytes[0] != 0 and program.dequant_bytes[1] != 0 and (!independent or program.dequant_bytes[2] != 0);
+                    }
+                }
                 selected_groups = selected_groups or complete;
             };
             try std.testing.expect(selected_groups);
@@ -60453,7 +60526,22 @@ fn qualifyCapturedProjectionPair(comptime gated: bool, comptime q8: bool, compti
             var reference = values;
             for (0..8) |_| for (&reference) |*value| {
                 const rounded = @as(f32, @bitCast(@as(u32, f32ToBf16BitsRoundNearestEven(value.*)) << 16));
-                value.* = (rounded + rounded + rounded) * 0.5;
+                const projected = if (vendor) rounded * (7.0 / 8.0) else rounded;
+                value.* = (projected + projected + projected) * 0.5;
+            };
+            try std.testing.expectEqualSlices(f32, &reference, actual);
+        } else if (vendor) {
+            const frozen_inputs = [_]@import("../../execution/capture.zig").Input{.{ .tensor = .{ .name = "x", .data = &.{}, .dtype = .f32, .shape = &shape, .allocator = a, .owns_data = false, .owns_shape = false }, .resident = .{ .backend = &cb, .value = input } }};
+            const frozen = try Stage.run(compute, &cb, a, &frozen_inputs);
+            defer a.free(frozen);
+            defer cb.free(frozen[0].value);
+            const original = try cb.toFloat32(frozen[0].value, a);
+            defer a.free(original);
+            try std.testing.expectEqualSlices(f32, original, actual);
+            var reference = values;
+            for (0..8) |_| for (&reference) |*value| {
+                const rounded = @as(f32, @bitCast(@as(u32, f32ToBf16BitsRoundNearestEven(value.*)) << 16));
+                value.* = rounded * (7.0 / 8.0);
             };
             try std.testing.expectEqualSlices(f32, &reference, actual);
         } else try std.testing.expectEqualSlices(f32, &values, actual);
@@ -60462,19 +60550,27 @@ fn qualifyCapturedProjectionPair(comptime gated: bool, comptime q8: bool, compti
 }
 
 test "CUDA replay retains original paired BF16 schedule across current inputs and cache eviction" {
-    try qualifyCapturedProjectionPair(false, false, false);
+    try qualifyCapturedProjectionPair(false, false, false, false);
 }
 
 test "CUDA replay retains fused gated Q4 schedule against frozen and independent references" {
-    try qualifyCapturedProjectionPair(true, false, false);
+    try qualifyCapturedProjectionPair(true, false, false, false);
 }
 
 test "CUDA replay retains default Q4 Q8_1 gated schedule against frozen and independent references" {
-    try qualifyCapturedProjectionPair(true, true, false);
+    try qualifyCapturedProjectionPair(true, true, false, false);
 }
 
 test "CUDA replay retains independent BF16 projection groups against frozen schedules" {
-    try qualifyCapturedProjectionPair(false, false, true);
+    try qualifyCapturedProjectionPair(false, false, true, false);
+}
+
+test "CUDA replay retains bounded paired Q4 vendor expansion without tensor core repacking" {
+    try qualifyCapturedProjectionPair(false, false, false, true);
+}
+
+test "CUDA replay retains bounded QKV vendor expansion with unequal widths and no tensor core repack" {
+    try qualifyCapturedProjectionPair(false, false, true, true);
 }
 
 test "CUDA replay retains dense pointwise output facts without fabricating unknown input ownership" {
@@ -60604,4 +60700,28 @@ test "CUDA replay retains head normalization rotary schedule with current input 
     }
     if (captures == 0 or replays == 0) std.debug.print("head norm region captures={d} replays={d}\n", .{ captures, replays });
     try std.testing.expect(captures > 0 and replays > 0);
+}
+
+test "CUDA borrowed quantized metadata pair mirrors distinguish the second source and geometry" {
+    var compute: CudaCompute = undefined;
+    compute.bf16_pair_mirror_cache = .empty;
+    defer compute.bf16_pair_mirror_cache.deinit(std.testing.allocator);
+    const key = Bf16PairMirrorKey{ .gate = 4096, .up = 8192, .rows = 32, .columns = 64 };
+    try compute.bf16_pair_mirror_cache.put(std.testing.allocator, key, .{ .ptr = 16384, .len = 8192 });
+    try std.testing.expect(compute.bf16_pair_mirror_cache.get(.{ .gate = 4096, .up = 12288, .rows = 32, .columns = 64 }) == null);
+    try std.testing.expect(compute.bf16_pair_mirror_cache.get(.{ .gate = 4096, .up = 8192, .rows = 64, .columns = 32 }) == null);
+    // Even a matching cached identity cannot waive current extent validation.
+    try std.testing.expect((try ensureBf16PairMirror(&compute, .{ .ptr = 4096, .len = 4096 }, .{ .ptr = 8192, .len = 4 }, 32, 64)) == null);
+    try std.testing.expectEqual(@as(u64, 16384), (try ensureBf16PairMirror(&compute, .{ .ptr = 4096, .len = 4096 }, .{ .ptr = 8192, .len = 4096 }, 32, 64)).?.ptr);
+}
+
+test "CUDA borrowed quantized metadata native prefill requirement declines before model or SDK work" {
+    var compute: CudaCompute = undefined;
+    compute.gemma4_native_plan = null;
+    const cb = ops.ComputeBackend{ .ptr = &compute, .vtable = &vtable };
+    const config = gpt_model.Config{ .family = .llama, .hidden_size = 4, .num_attention_heads = 1, .num_key_value_heads = 1, .attention_head_dim = 4, .num_hidden_layers = 1, .intermediate_size = 8, .vocab_size = 8, .max_position_embeddings = 16, .norm_type = .rms_norm, .activation = .silu, .position_encoding = .rope };
+    const dc = gpt_arch.DecodeContext{ .attention_mode = .paged_prefill, .total_sequence_len = 2, .query_sequence_len = 2, .kv_sequence_len = 2 };
+    // All model maps and SDK fields are intentionally uninitialized. A
+    // captured-program miss cannot silently enter the eager prepared decoder.
+    try std.testing.expect((try @import("../../backends/decoder_gated_runtime.zig").forwardPrefillLastPreparedTail(&cb, std.testing.allocator, config, 1, &.{ 1, 2 }, 2, &dc, .{ .execution = .captured_native })) == null);
 }

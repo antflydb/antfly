@@ -2170,7 +2170,7 @@ pub fn forwardPrefillLastPreparedTailFamily(
             input_ids,
             seq_len,
             @ptrCast(@alignCast(decode_context)),
-            prefer_greedy_token,
+            .{ .prefer_greedy_token = prefer_greedy_token },
         )) |tail| .{
             .final_hidden = tail.final_hidden,
             .final_norm_slot = tail.final_norm_slot,

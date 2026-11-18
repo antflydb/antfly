@@ -282,8 +282,8 @@ pub fn positionedPrefillHostScratchCapacity(items: usize, seq: usize, vocab: usi
     return std.math.add(usize, arrays, 32 * 1024) catch error.ResourceLimitExceeded;
 }
 
-pub fn cudaPreparedPrefillGreedyEnabled(default_enabled: bool) bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREFILL_PREPARED_TAIL_GREEDY", default_enabled);
+pub fn cudaCapturedPrefillGreedyEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREFILL_PREPARED_TAIL_GREEDY", true);
 }
 
 pub fn metalPreparedPrefillHiddenCaptureEnabled() bool {

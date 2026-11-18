@@ -6531,6 +6531,12 @@ pub const PrefillPreparedTail = struct {
     greedy_token_id: ?i64 = null,
 };
 
+pub const PrefillTailOptions = struct {
+    prefer_greedy_token: bool = false,
+    /// A native-program miss must decline before any decoder/KV execution.
+    execution: enum { compatible, captured_native } = .compatible,
+};
+
 pub fn forwardPrefillLastPreparedTail(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
@@ -6539,11 +6545,16 @@ pub fn forwardPrefillLastPreparedTail(
     input_ids: []const i64,
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
-    prefer_greedy_token: bool,
+    options: PrefillTailOptions,
 ) !?PrefillPreparedTail {
     if (!supportsConfig(gpt_config)) return null;
     if (input_ids.len == 0 or decode_context.query_sequence_len != input_ids.len) return null;
     if (decode_context.attention_mode != .paged_prefill) return null;
+    if (options.execution == .captured_native) {
+        if (comptime !build_options.enable_cuda) return null;
+        if (configured_layer_count != gpt_config.num_hidden_layers or seq_len != decode_context.query_sequence_len or gatedFamilyCompareRequested()) return null;
+        if (!@import("../ops/cuda/cuda_compute.zig").CudaCompute.capturedPrefillRequested(cb)) return null;
+    }
     timing_stats.prefill_calls += 1;
     timing_stats.prefill_query_tokens += input_ids.len;
 
@@ -6611,7 +6622,11 @@ pub fn forwardPrefillLastPreparedTail(
     }
 
     started_at = monotonicNowNs();
-    const direct_hidden_result = try forwardFinalHiddenTensorDirect(
+    const direct_hidden_result: ?DirectHiddenResult = if (options.execution == .captured_native) native: {
+        if (comptime !build_options.enable_cuda) break :native null;
+        const captured = (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.tryCapturedPrefillBeforeFinalNorm(cb, allocator, gpt_config, hidden, ple_vectors, decode_context)) orelse break :native null;
+        break :native .{ .hidden = captured, .total_rows = 1 };
+    } else try forwardFinalHiddenTensorDirect(
         cb,
         allocator,
         gpt_config,
@@ -6721,7 +6736,7 @@ pub fn forwardPrefillLastPreparedTail(
         timing_stats.prefill_frame_finish_nanos += frame_finish_finished_at - frame_finish_started_at;
     }
     var greedy_token_id: ?i64 = null;
-    if (prefer_greedy_token) {
+    if (options.prefer_greedy_token) {
         if (try cb.decoderRuntimeApplyRmsNormLinearArgmax(&.{
             .input = last_hidden,
             .norm_slot = finalNormSlot(configured_layer_count),
@@ -7081,7 +7096,7 @@ pub fn forwardPrefillLastLogits(
         input_ids,
         seq_len,
         decode_context,
-        false,
+        .{},
     )) orelse return null;
     defer cb.free(tail.final_hidden);
 
