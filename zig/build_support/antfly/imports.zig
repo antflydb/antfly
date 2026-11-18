@@ -525,11 +525,16 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_inference_runtime_paths", self.inference_runtime_paths);
         mod.addImport("antfly_inference_query_embedding_cache", self.inference_query_embedding_cache);
         if (link_libc and !self.platform_link_libc) {
-            platform_build.addNativeFilesystemSources(
+            platform_build.addFilesystemCapacitySource(
                 mod,
                 self.filesystem_capacity_source_file,
                 self.platform_target,
             );
+            // The platform module already provides the anchor on Linux even
+            // when it was configured without libc.
+            if (self.platform_target.result.os.tag != .linux) {
+                platform_build.addNativeFdCacheSource(mod, self.filesystem_capacity_source_file, self.platform_target);
+            }
         }
         mod.link_libc = link_libc;
     }

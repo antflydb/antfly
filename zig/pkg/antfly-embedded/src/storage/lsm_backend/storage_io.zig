@@ -1922,11 +1922,12 @@ else
                 }
                 self.unlinkEntryLocked(shard, entry);
                 std.debug.assert(entry.ref_count == 0);
-                _ = self.cache_entry_count.fetchSub(1, .monotonic);
-                _ = self.admitted_descriptors.fetchSub(1, .monotonic);
-                _ = self.admission_epoch.fetchAdd(1, .release);
+                // The OS descriptor remains charged until close completes.
                 entry.deinit(self.allocator);
                 self.allocator.destroy(entry);
+                _ = self.cache_entry_count.fetchSub(1, .monotonic);
+                _ = self.admitted_descriptors.fetchSub(1, .release);
+                _ = self.admission_epoch.fetchAdd(1, .release);
                 return;
             }
             unreachable;
@@ -1981,7 +1982,16 @@ else
 
 var process_native_storage_pool_mutex: std.atomic.Mutex = .unlocked;
 var process_native_fd_cache: ?*FdCache = null;
-extern fn antfly_platform_native_fd_cache(layout: u64, init: *const fn () callconv(.c) *anyopaque) ?*anyopaque;
+const shared_fd_cache_supported = supports_posix_fd_cache and
+    (builtin.os.tag == .linux or platform.filesystem.capacity_supported);
+const NativeFdCacheRecord = extern struct { layout: u64, cache: *anyopaque };
+const NativeFdCacheCandidate = struct { record: NativeFdCacheRecord, cache: FdCache };
+
+extern fn antfly_platform_native_fd_cache_v2(
+    layout: u64,
+    init: *const fn (u64) callconv(.c) *NativeFdCacheRecord,
+    discard: *const fn (*NativeFdCacheRecord) callconv(.c) void,
+) ?*anyopaque;
 
 fn fdCacheLayoutMix(hash: u64, value: u64) u64 {
     return (hash ^ value) *% 1099511628211;
@@ -2016,18 +2026,25 @@ fn fdCacheLayout() u64 {
     return hash;
 }
 
-fn initProcessNativeFdCache() callconv(.c) *anyopaque {
-    const cache = std.heap.page_allocator.create(FdCache) catch @panic("OOM");
-    cache.* = FdCache.init(std.heap.page_allocator, configuredNativeFdAdmissionCapacity());
-    return cache;
+fn initProcessNativeFdCache(layout: u64) callconv(.c) *NativeFdCacheRecord {
+    const candidate = std.heap.page_allocator.create(NativeFdCacheCandidate) catch @panic("OOM");
+    candidate.record = .{ .layout = layout, .cache = &candidate.cache };
+    candidate.cache = FdCache.init(std.heap.page_allocator, configuredNativeFdAdmissionCapacity());
+    return &candidate.record;
+}
+
+fn discardProcessNativeFdCache(record: *NativeFdCacheRecord) callconv(.c) void {
+    const candidate: *NativeFdCacheCandidate = @alignCast(@fieldParentPtr("record", record));
+    candidate.cache.deinit();
+    std.heap.page_allocator.destroy(candidate);
 }
 
 fn processNativeFdCache() *FdCache {
     // Each native archive has its own Zig globals. Resolve the shared cache
     // through the final link so readers and writers can evict one another's
     // idle entries and the metrics observe the same admission domain.
-    if (comptime supports_posix_fd_cache and platform.filesystem.capacity_supported) {
-        const cache = antfly_platform_native_fd_cache(comptime fdCacheLayout(), &initProcessNativeFdCache) orelse
+    if (comptime shared_fd_cache_supported) {
+        const cache = antfly_platform_native_fd_cache_v2(comptime fdCacheLayout(), &initProcessNativeFdCache, &discardProcessNativeFdCache) orelse
             @panic("incompatible native descriptor cache layout across linked Antfly archives");
         return @ptrCast(@alignCast(cache));
     }
@@ -2039,7 +2056,7 @@ fn processNativeFdCache() *FdCache {
     // The process admission domain intentionally lives for the process
     // lifetime. This prevents one BackendRuntime from invalidating permits or
     // cached descriptors still owned by another runtime during shutdown.
-    const cache: *FdCache = @ptrCast(@alignCast(initProcessNativeFdCache()));
+    const cache: *FdCache = @ptrCast(@alignCast(initProcessNativeFdCache(0).cache));
     process_native_fd_cache = cache;
     return cache;
 }
@@ -5440,13 +5457,13 @@ test "transient admission fails fast when only persistent descriptors prevent pr
 }
 
 test "native fd cache rejects mismatched layouts" {
-    if (comptime !supports_posix_fd_cache or !platform.filesystem.capacity_supported) return error.SkipZigTest;
+    if (comptime !shared_fd_cache_supported) return error.SkipZigTest;
     const A = extern struct { admitted: usize, persistent: usize };
     const B = extern struct { persistent: usize, admitted: usize };
     try std.testing.expect(comptime fdCacheTypeLayout(A, 1) != fdCacheTypeLayout(B, 1));
 
     const cache = processNativeFdCache();
-    const incompatible = antfly_platform_native_fd_cache(comptime fdCacheLayout() ^ 1, &initProcessNativeFdCache);
+    const incompatible = antfly_platform_native_fd_cache_v2(comptime fdCacheLayout() ^ 1, &initProcessNativeFdCache, &discardProcessNativeFdCache);
     try std.testing.expect(incompatible == null);
     try std.testing.expectEqual(cache, processNativeFdCache());
 }

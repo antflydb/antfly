@@ -182,7 +182,7 @@ def test_full_index_ingest_and_reopen_with_minimum_file_limit(
 
 @pytest.mark.e2e_resource("antfly_process")
 @pytest.mark.skipif(
-    sys.platform != "darwin", reason="requires Darwin dylib interposition"
+    sys.platform not in ("darwin", "linux"), reason="requires native open interposition"
 )
 def test_retry_after_source_vector_wal_open_exhaustion(
     tmp_path, descriptor_test_binary
@@ -191,7 +191,20 @@ def test_retry_after_source_vector_wal_open_exhaustion(
     if cc is None:
         pytest.skip("A C compiler is required for the WAL-open fault fixture")
     fixture = Path(__file__).parent / "fixtures" / "source_vector_wal_open_fault.c"
-    library = tmp_path / "wal-open-fault.dylib"
+    if sys.platform == "linux":
+        readelf = shutil.which("readelf")
+        if readelf is None:
+            pytest.skip("readelf is required to check Linux preload support")
+        program_headers = subprocess.run(
+            [readelf, "-l", str(descriptor_test_binary)],
+            capture_output=True,
+            check=True,
+        ).stdout
+        if b"ld-linux" not in program_headers:
+            pytest.skip("The Linux fault fixture requires a glibc-linked binary")
+    darwin = sys.platform == "darwin"
+    library = tmp_path / ("wal-open-fault.dylib" if darwin else "wal-open-fault.so")
+    loader_env = "DYLD_INSERT_LIBRARIES" if darwin else "LD_PRELOAD"
     subprocess.run(
         [
             cc,
@@ -199,15 +212,16 @@ def test_retry_after_source_vector_wal_open_exhaustion(
             "-Wall",
             "-Wextra",
             "-Werror",
-            "-dynamiclib",
+            *(["-dynamiclib"] if darwin else ["-shared", "-fPIC"]),
             str(fixture),
             "-o",
             str(library),
+            *([] if darwin else ["-ldl"]),
         ],
         check=True,
     )
     arm = tmp_path / "fail-next-wal-open"
-    # Set the dyld variable immediately before exec, after the shell used by
+    # Set the loader variable immediately before exec, after the shell used by
     # the limit wrapper. Only this test's server inherits the interposer.
     runtime = tmp_path / "fault-runtime"
     standalone_arg = (
@@ -216,7 +230,7 @@ def test_retry_after_source_vector_wal_open_exhaustion(
     runtime.write_text(
         "#!/bin/sh\n"
         f"{standalone_arg}"
-        f"export DYLD_INSERT_LIBRARIES={shlex.quote(str(library))}\n"
+        f"export {loader_env}={shlex.quote(str(library))}\n"
         f"export ANTFLY_TEST_WAL_OPEN_FAULT={shlex.quote(str(arm))}\n"
         f'exec {shlex.quote(str(descriptor_test_binary))} "$@"\n'
     )

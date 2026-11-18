@@ -13,6 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#if defined(__linux__)
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -32,6 +36,7 @@ static int fail_wal_open(const char *path, int flags) {
     return 1;
 }
 
+#if defined(__APPLE__)
 static int fault_open(const char *path, int flags, ...) {
     if (fail_wal_open(path, flags)) return -1;
     if (!(flags & O_CREAT)) return open(path, flags);
@@ -57,3 +62,22 @@ static const struct { const void *replacement, *original; } interposers[] = {
     { (const void *)fault_open, (const void *)open },
     { (const void *)fault_openat, (const void *)openat },
 };
+#elif defined(__linux__)
+/* Zig's native Linux I/O uses openat on 64-bit libc builds. Resolve the
+ * original alongside the call, with no constructor or global hook state. */
+int openat(int dirfd, const char *path, int flags, ...) {
+    if (fail_wal_open(path, flags)) return -1;
+    int (*original)(int, const char *, int, ...) = dlsym(RTLD_NEXT, "openat");
+    if (original == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    if ((flags & O_CREAT) == 0 && (flags & O_TMPFILE) != O_TMPFILE)
+        return original(dirfd, path, flags);
+    va_list args;
+    va_start(args, flags);
+    mode_t mode = va_arg(args, mode_t);
+    va_end(args);
+    return original(dirfd, path, flags, mode);
+}
+#endif

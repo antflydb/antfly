@@ -3861,14 +3861,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lsm_backend_test_step = b.step("lsm-backend-test", "Run LSM backend unit tests only");
     lsm_backend_test_step.dependOn(&run_lsm_backend_tests.step);
 
-    if (antfly_imports.platform_link_libc and (target.result.os.tag == .linux or target.result.os.tag == .macos)) {
+    if (target.result.os.tag == .linux or (antfly_imports.platform_link_libc and target.result.os.tag == .macos)) {
         var modules: [2]*std.Build.Module = undefined;
         for (&modules) |*module| {
             module.* = b.createModule(.{
                 .root_source_file = b.path("pkg/antfly-embedded/src/storage_fd_cache_link_test.zig"),
                 .target = target,
                 .optimize = optimize,
-                .link_libc = true,
+                .link_libc = antfly_imports.platform_link_libc,
             });
             module.*.addImport("antfly_platform", platform_mod);
             module.*.addImport("antfly_hash", hash_mod);

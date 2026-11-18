@@ -13,31 +13,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
-/* Keep the descriptor cache anchor in one native object per linked image.
- * The server links several Zig archives that each compile storage_io.zig. */
+struct native_fd_cache {
+    uint64_t layout;
+    void *cache;
+};
+
+/* Publish the cache and its layout together. The cache is initialized only on
+ * the cold path. A concurrent initializer may lose the CAS and discard its
+ * unshared candidate, so the anchor needs neither libc nor a startup lock. */
 __attribute__((visibility("hidden")))
-void *antfly_platform_native_fd_cache(uint64_t expected_layout, void *(*init)(void)) {
-    static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-    static _Atomic(void *) cache;
-    static uint64_t layout;
-
-    void *result = atomic_load_explicit(&cache, memory_order_acquire);
-    if (result != NULL) {
-        return layout == expected_layout ? result : NULL;
+void *antfly_platform_native_fd_cache_v2(
+    uint64_t layout,
+    struct native_fd_cache *(*init)(uint64_t),
+    void (*discard)(struct native_fd_cache *)
+) {
+    static _Atomic(struct native_fd_cache *) published;
+    struct native_fd_cache *current = atomic_load_explicit(&published, memory_order_acquire);
+    if (current == NULL) {
+        struct native_fd_cache *candidate = init(layout);
+        if (atomic_compare_exchange_strong_explicit(
+                &published, &current, candidate, memory_order_acq_rel, memory_order_acquire)) {
+            current = candidate;
+        } else {
+            discard(candidate);
+        }
     }
-
-    pthread_mutex_lock(&mutex);
-    result = atomic_load_explicit(&cache, memory_order_relaxed);
-    if (result == NULL) {
-        result = init();
-        layout = expected_layout;
-        atomic_store_explicit(&cache, result, memory_order_release);
-    }
-    pthread_mutex_unlock(&mutex);
-    return layout == expected_layout ? result : NULL;
+    return current->layout == layout ? current->cache : NULL;
 }
