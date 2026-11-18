@@ -42,7 +42,7 @@ fn createOptions(options: ModuleOptions) std.Build.Module.CreateOptions {
     };
 }
 
-pub fn addFilesystemCapacitySource(
+pub fn addNativeFilesystemSources(
     module: *std.Build.Module,
     source_file: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
@@ -50,6 +50,10 @@ pub fn addFilesystemCapacitySource(
     if (!filesystemCapacitySupported(target)) return;
     module.addCSourceFile(.{
         .file = source_file,
+        .flags = &.{"-std=c11"},
+    });
+    module.addCSourceFile(.{
+        .file = source_file.dirname().path(module.owner, "native_fd_cache.c"),
         .flags = &.{"-std=c11"},
     });
 }
@@ -63,7 +67,7 @@ fn filesystemCapacitySupported(target: std.Build.ResolvedTarget) bool {
 
 fn configureModule(module: *std.Build.Module, options: ModuleOptions) *std.Build.Module {
     if (options.link_libc) {
-        addFilesystemCapacitySource(module, options.filesystem_capacity_source_file, options.target);
+        addNativeFilesystemSources(module, options.filesystem_capacity_source_file, options.target);
     }
     return module;
 }

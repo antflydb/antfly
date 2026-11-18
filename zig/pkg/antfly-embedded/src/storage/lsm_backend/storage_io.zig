@@ -36,9 +36,7 @@ const supports_posix_fd_cache = supports_native_storage and
 // with workload and recovery tests. Native positional reads also use the fd
 // cache directly, so switching std.Io alone would not convert every read path.
 const supports_evented_runtime = false;
-// Standalone NativeStorage values used by focused tools/tests have no
-// BackendRuntime handle, so keep their local cache conservative. Production
-// runtimes inject handles to the single RLIMIT-derived process pool.
+// When the platform cannot report RLIMIT_NOFILE, use a conservative budget.
 const fallback_cached_native_fds: usize = 64;
 const unlimited_fd_admission_capacity: usize = 1024;
 const fd_cache_shard_count: usize = if (builtin.os.tag == .freestanding) 1 else 16;
@@ -1313,6 +1311,9 @@ const FdCache = if (!supports_posix_fd_cache)
         pub fn invalidateTree(_: *FdCache, _: u64, _: []const u8) void {}
         pub fn invalidateRename(_: *FdCache, _: u64, _: []const u8, _: []const u8) void {}
         pub fn invalidateNamespace(_: *FdCache, _: u64) void {}
+        fn nextNamespace(_: *FdCache) u64 {
+            return 0;
+        }
         pub fn reserveDescriptors(_: *FdCache, _: std.Io, _: usize) !void {}
         pub fn tryReserveDescriptors(_: *FdCache, _: std.Io, _: usize) bool {
             return false;
@@ -1382,6 +1383,7 @@ else
         admission_changed: std.Io.Condition = .init,
         admission_head: ?*AdmissionWaiter = null,
         admission_tail: ?*AdmissionWaiter = null,
+        next_namespace: CounterU64 = .init(1),
         access_clock: CounterU64 = .init(0),
         evict_cursor: std.atomic.Value(usize) = .init(0),
         evict_mutex: std.atomic.Mutex = .unlocked,
@@ -1955,6 +1957,10 @@ else
             self.linkEntryLocked(shard, entry);
         }
 
+        fn nextNamespace(self: *FdCache) u64 {
+            return self.next_namespace.fetchAdd(1, .monotonic);
+        }
+
         fn nextAccessLocked(self: *FdCache) u64 {
             return self.access_clock.fetchAdd(1, .monotonic) + 1;
         }
@@ -1962,9 +1968,21 @@ else
 
 var process_native_storage_pool_mutex: std.atomic.Mutex = .unlocked;
 var process_native_fd_cache: ?*FdCache = null;
-var native_storage_cache_namespace: @import("antfly_platform").atomic.Value(u64) = .init(1);
+extern fn antfly_platform_native_fd_cache(init: *const fn () callconv(.c) *anyopaque) *anyopaque;
+
+fn initProcessNativeFdCache() callconv(.c) *anyopaque {
+    const cache = std.heap.page_allocator.create(FdCache) catch @panic("OOM");
+    cache.* = FdCache.init(std.heap.page_allocator, configuredNativeFdAdmissionCapacity());
+    return cache;
+}
 
 fn processNativeFdCache() *FdCache {
+    // Each native archive has its own Zig globals. Resolve the shared cache
+    // through the final link so readers and writers can evict one another's
+    // idle entries and the metrics observe the same admission domain.
+    if (comptime supports_posix_fd_cache and platform.filesystem.capacity_supported)
+        return @ptrCast(@alignCast(antfly_platform_native_fd_cache(&initProcessNativeFdCache)));
+
     const locked = lockAtomic(&process_native_storage_pool_mutex);
     defer if (locked) process_native_storage_pool_mutex.unlock();
     if (process_native_fd_cache) |cache| return cache;
@@ -1972,8 +1990,7 @@ fn processNativeFdCache() *FdCache {
     // The process admission domain intentionally lives for the process
     // lifetime. This prevents one BackendRuntime from invalidating permits or
     // cached descriptors still owned by another runtime during shutdown.
-    const cache = std.heap.page_allocator.create(FdCache) catch @panic("OOM");
-    cache.* = FdCache.init(std.heap.page_allocator, configuredNativeFdAdmissionCapacity());
+    const cache: *FdCache = @ptrCast(@alignCast(initProcessNativeFdCache()));
     process_native_fd_cache = cache;
     return cache;
 }
@@ -2060,7 +2077,7 @@ const NativeStorageState = struct {
         // handles must join the same process admission domain; isolated caches
         // are available only through an explicit test pool.
         state.fd_cache = if (pool) |shared| shared.fd_cache else processNativeFdCache();
-        state.cache_namespace = native_storage_cache_namespace.fetchAdd(1, .monotonic);
+        state.cache_namespace = state.fd_cache.nextNamespace();
         return state;
     }
 

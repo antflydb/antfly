@@ -525,7 +525,7 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_inference_runtime_paths", self.inference_runtime_paths);
         mod.addImport("antfly_inference_query_embedding_cache", self.inference_query_embedding_cache);
         if (link_libc and !self.platform_link_libc) {
-            platform_build.addFilesystemCapacitySource(
+            platform_build.addNativeFilesystemSources(
                 mod,
                 self.filesystem_capacity_source_file,
                 self.platform_target,
