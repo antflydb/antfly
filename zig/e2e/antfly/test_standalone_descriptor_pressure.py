@@ -111,11 +111,13 @@ def test_full_index_ingest_and_reopen_with_minimum_file_limit(tmp_path):
                             if line.startswith("antfly_storage_native_fd_")
                         )
                     }
-                    admitted = metrics["antfly_storage_native_fd_admitted"]
-                    assert metrics["antfly_storage_native_fd_admission_capacity"] == 128
-                    # Idle process overhead fits in the remaining quarter of the
-                    # limit. A second storage cache would consume that headroom.
-                    assert open_fds <= admitted + 64, (batch, open_fds, metrics)
+                    capacity = metrics["antfly_storage_native_fd_admission_capacity"]
+                    assert capacity == 128
+                    assert 0 < metrics["antfly_storage_native_fd_admitted"] <= capacity
+                    # The health listener serves cached metrics. Bound the
+                    # live process sample against capacity and leave 64 slots
+                    # for listeners and other non-storage activity.
+                    assert open_fds <= capacity + 64, (batch, open_fds, metrics)
 
         server.pause(crash=True)
         server.resume()
