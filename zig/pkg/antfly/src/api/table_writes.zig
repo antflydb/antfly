@@ -61255,7 +61255,7 @@ fn implementationTests() type {
                 defer dispatched.deinit(alloc);
                 try std.testing.expectEqualSlices(u64, &.{7001}, dispatched.pending_index_groups.?);
 
-                const repair_state = @import("antfly_source_root").antfly_sources.storage_db_derived_index_repair_state;
+                const repair_state = @import("antfly_source_root").antfly_sources.physical_db.test_support.index_repair_state;
                 const repair_cache = try hostedManagedDbCacheForRoot(replica_root_dir);
                 {
                     var writer = try source.getOrOpenCachedDbMode(repair_cache, path, 7001, "docs", .default);
