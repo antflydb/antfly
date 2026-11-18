@@ -293,7 +293,7 @@ test "source owner lookup and descriptor admission preserve one cancellable cata
             var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "unused", .{ .ptr = &fixture, .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&catalog_io), .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .table_routing_snapshot = Fixture.capture, .linearizable_table_routing_snapshot = Fixture.confirm, .free_routing_snapshot = Fixture.freeRouting } }, read_gate.alreadyReadSafeBarrier());
             const opts: db_types.LookupOptions = .{ .execution_deadline_ns = fixture.request_now + std.time.ns_per_s, .execution_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&request_io), .cancellation = .fromAtomic(&fixture.canceled) };
             const expected: anyerror = switch (mode) {
-                .confirm => error.DescriptorProbeComplete,
+                .confirm => error.StorageReadTemporarilyUnavailable,
                 .cancel => error.Canceled,
                 .expire => error.CatalogRoutingSnapshotTimeout,
             };
@@ -303,7 +303,7 @@ test "source owner lookup and descriptor admission preserve one cancellable cata
                 try std.testing.expectError(expected, source.acquireWithControls(7, "rows", .from(opts)));
             }
             try std.testing.expectEqual(@as(usize, 1), fixture.captures);
-            try std.testing.expectEqual(@as(usize, if (mode == .confirm) 1 else 0), fixture.confirmations);
+            try std.testing.expectEqual(@as(usize, 0), fixture.confirmations);
         }
     }
 }
@@ -315,6 +315,10 @@ test "source owner fenced descriptor disappearance is availability not absence" 
             groups[0] = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } };
             return .{ .found = .{ .metadata_group_id = 1, .metadata_incarnation = null, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .groups = groups } };
         }
+        fn point(_: *anyopaque, _: []const u8, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return .{ .metadata_group_id = 1, .catalog_revision = 1, .tables = &.{}, .ranges = &.{} };
+        }
+        fn freePoint(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
         fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
             return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &.{}, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
         }
@@ -328,6 +332,11 @@ test "source owner fenced descriptor disappearance is availability not absence" 
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, ProvisionedKernelOwnerSource.lookupGroupLocalRouted(&source, std.testing.allocator, fence, 7, "rows", "a", .{}, .read_index));
     // An unfenced physical lookup still identifies a genuinely missing table.
     try std.testing.expectError(error.TableNotFound, ProvisionedKernelOwnerSource.lookupGroupLocal(&source, std.testing.allocator, 7, "rows", "a", .{}, .read_index));
+    var point_vtable = source.catalog.vtable.*;
+    point_vtable.table_routing_snapshot = Fixture.point;
+    point_vtable.free_routing_snapshot = Fixture.freePoint;
+    source.catalog.vtable = &point_vtable;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, ProvisionedKernelOwnerSource.queryGroupLocalRouted(&source, std.testing.allocator, fence, 7, "rows", .{}, .stale));
 }
 
 test "SQL relation lifetime draining admits only exact retained external host control" {
@@ -3681,13 +3690,25 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         budget: table_catalog.RoutingBudget,
     ) !LoadedDescriptor {
-        var projection = (try table_catalog.tableGroupDescriptorProjectionControlled(
-            alloc,
-            self.catalog,
-            table_name,
-            group_id,
-            budget,
-        )) orelse return error.TableNotFound;
+        return self.loadDescriptorForAdmission(alloc, group_id, table_name, budget, false);
+    }
+
+    fn loadDescriptorForAdmission(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        budget: table_catalog.RoutingBudget,
+        applied_only: bool,
+    ) !LoadedDescriptor {
+        var projection = (if (applied_only)
+            try table_catalog.appliedTableGroupDescriptor(alloc, self.catalog, table_name, group_id, budget)
+        else
+            try table_catalog.tableGroupDescriptorProjectionControlled(alloc, self.catalog, table_name, group_id, budget)) orelse {
+            // An applied point cut cannot certify absence. Return to the
+            // routing caller so it can retry outside structural admission.
+            return if (applied_only) error.StorageReadTemporarilyUnavailable else error.TableNotFound;
+        };
         errdefer projection.deinit(alloc);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         return .{
@@ -3821,38 +3842,50 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !Lease {
         var controls = input;
         try controls.check();
-        var descriptor = try self.loadDescriptorWithBudget(self.alloc, group_id, table_name, controls.catalogBudget(self.catalog));
-        defer descriptor.deinit(self.alloc);
-        try controls.check();
-        var view = descriptor.view();
-        if (view.sql_persistence) |native| {
-            // Public/raw callers cannot borrow a native owner merely by
-            // knowing its physical name, even on a stale-read path. Receiver
-            // code creates this process-local authority only after route,
-            // current Boot and signed connection admission have succeeded.
-            const admitted = controls.native_route orelse return self.nativeOwnerFailure(.route_absent, group_id, view.identity.table_id, 0, null);
-            if (admitted.route.execution != .native_local or !native.eql(admitted.route.execution.native_local)) return self.nativeOwnerFailure(.route_descriptor, group_id, view.identity.table_id, 0, null);
-            if (controls.native_decision_owner) |owner| try self.validateNativeDecisionHost(admitted, owner) else try self.validateNativeRoute(admitted);
-            if (!controls.native_boot_observed) {
-                controls.native_initialized = try self.currentNativeInitialized(admitted, controls.native_decision_owner != null);
-                controls.native_boot_observed = true;
+        const budget = controls.catalogBudget(self.catalog);
+        const has_point_projection = self.catalog.vtable.table_routing_snapshot != null;
+        if (!has_point_projection and self.catalog.vtable.linearizable_table_routing_snapshot != null)
+            return error.CatalogRoutingUnavailable;
+        var refreshed = false;
+        while (true) {
+            controls = input;
+            var descriptor = try self.loadDescriptorForAdmission(self.alloc, group_id, table_name, budget, has_point_projection);
+            defer descriptor.deinit(self.alloc);
+            try controls.check();
+            var view = descriptor.view();
+            if (view.sql_persistence) |native| {
+                // Public/raw callers cannot borrow a native owner merely by
+                // knowing its physical name, even on a stale-read path. Receiver
+                // code creates this process-local authority only after route,
+                // current Boot and signed connection admission have succeeded.
+                const admitted = controls.native_route orelse return self.nativeOwnerFailure(.route_absent, group_id, view.identity.table_id, 0, null);
+                if (admitted.route.execution != .native_local or !native.eql(admitted.route.execution.native_local)) return self.nativeOwnerFailure(.route_descriptor, group_id, view.identity.table_id, 0, null);
+                if (controls.native_decision_owner) |owner| try self.validateNativeDecisionHost(admitted, owner) else try self.validateNativeRoute(admitted);
+                if (!controls.native_boot_observed) {
+                    controls.native_initialized = try self.currentNativeInitialized(admitted, controls.native_decision_owner != null);
+                    controls.native_boot_observed = true;
+                }
             }
-        }
 
-        if (controls.native_decision_owner != null) {
-            if (try self.acquireRetainedNativeDecisionDebt(group_id, table_name, view)) |retained| return retained;
-        }
+            if (controls.native_decision_owner != null) {
+                if (try self.acquireRetainedNativeDecisionDebt(group_id, table_name, view)) |retained| return retained;
+            }
 
-        if (controls.durable_catalog) {
-            // Routing still supplies namespace, restore admission and local
-            // generation. Persisted schema/index/runtime settings own the cut;
-            // never reconcile a prospective metadata schema while observing it.
-            view.schema_json = "";
-            view.indexes_json = "";
-            view.table_storage = null;
-            view.initial_range = null;
+            if (controls.durable_catalog) {
+                // Routing still supplies namespace, restore admission and local
+                // generation. Persisted schema/index/runtime settings own the cut;
+                // never reconcile a prospective metadata schema while observing it.
+                view.schema_json = "";
+                view.indexes_json = "";
+                view.table_storage = null;
+                view.initial_range = null;
+            }
+            return self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, view, false, .resident, descriptor.readControls(controls)) catch |err| {
+                if (err != error.StorageKernelOwnerStaleDescriptor or refreshed or !has_point_projection) return err;
+                refreshed = true;
+                continue;
+            };
         }
-        return self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, view, false, .resident, descriptor.readControls(controls));
     }
 
     /// Private metadata-job controls carry their own independently validated
@@ -7321,6 +7354,16 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self.acquireApplyOnlyWithCatalog(group_id, table_name, descriptor, false);
     }
 
+    fn acquireOwnerCatalog(self: *ProvisionedKernelOwnerSource, group_id: u64, descriptor: descriptor_contract.Descriptor) !@import("owner_catalog_projection.zig").Cache.Lease {
+        // A hidden restore owner is bound to the exact immutable bootstrap,
+        // including its complete index catalog. Projecting out operational
+        // fields changes that authority and fails bootstrap validation. Normal
+        // public owners still reuse physical cuts across progress-only changes.
+        if (descriptor.restore_bootstrap_json.len != 0)
+            return .{ .bytes = descriptor.indexes_json };
+        return self.physical_catalogs.acquire(self.alloc, group_id, descriptor.indexes_json);
+    }
+
     fn acquireApplyOnlyWithCatalog(
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
@@ -7331,7 +7374,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         // Native-local owners are never data-Raft participants, including
         // warm owners that happen to share this registry.
         if (raw_descriptor.sql_persistence != null) return error.SqlRelationOwnerChanged;
-        var physical = self.physical_catalogs.acquire(self.alloc, group_id, raw_descriptor.indexes_json) catch |err|
+        var physical = self.acquireOwnerCatalog(group_id, raw_descriptor) catch |err|
             return if (err == error.OutOfMemory or err == error.CatalogProjectionBusy) error.RaftApplyWriterUnavailable else err;
         defer physical.deinit();
         var descriptor = raw_descriptor;
@@ -7425,7 +7468,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (controls.native_published_restore) |published| {
             if (published.admission == null or controls.native_initialized == null or !controls.native_boot_observed) return error.InvalidSqlRelationPersistence;
         }
-        var physical = self.physical_catalogs.acquire(self.alloc, group_id, raw_descriptor.indexes_json) catch |err|
+        var physical = self.acquireOwnerCatalog(group_id, raw_descriptor) catch |err|
             return if (err == error.CatalogProjectionBusy) error.StorageKernelOwnerTransitionRequired else err;
         defer physical.deinit();
         var descriptor = raw_descriptor;
@@ -12351,6 +12394,7 @@ test "owner descriptor alias swaps retain a warm leased physical owner across ca
     const Source = ProvisionedKernelOwnerSource;
     var source = Source.init(a, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
     defer source.entries.deinit(a);
+    defer source.physical_catalogs.deinit(a);
     defer source.catalog_observations.deinit(a);
     var entry: Source.Entry = .{
         .group_id = 1,
@@ -12387,6 +12431,79 @@ test "owner descriptor alias swaps retain a warm leased physical owner across ca
     defer apply.deinit();
     try std.testing.expect(apply.entry == &entry);
     try std.testing.expectEqual(@as(u64, 0), source.owner_cache_misses.load(.monotonic));
+}
+
+test "owner descriptor admission refreshes stale point captures once before execution" {
+    const Source = ProvisionedKernelOwnerSource;
+    const Fixture = struct {
+        captures: usize = 0,
+        confirmations: usize = 0,
+        keep_stale: bool = false,
+        missing: bool = false,
+        cancel: bool = false,
+        canceled: std.atomic.Value(bool) = .init(false),
+        const old_tables = [_]@import("../metadata/table_manager.zig").TableRecord{.{ .table_id = 1, .name = "docs", .schema_json = "{}", .indexes_json = "{\"old\":{}}" }};
+        const new_tables = [_]@import("../metadata/table_manager.zig").TableRecord{.{ .table_id = 1, .name = "docs", .schema_json = "{}", .indexes_json = "{\"new\":{}}" }};
+        const ranges = [_]@import("../metadata/table_manager.zig").RangeRecord{.{ .table_id = 1, .group_id = 2, .range_id = 3, .doc_identity_shard_id = 2, .start_key = "" }};
+        fn snapshot(revision: u64, fresh: bool) metadata_api.CatalogRoutingSnapshot {
+            return .{ .metadata_group_id = 11, .catalog_revision = revision, .tables = @constCast(if (fresh) &new_tables else &old_tables), .ranges = @constCast(&ranges) };
+        }
+        fn capture(ptr: *anyopaque, _: []const u8, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.captures += 1;
+            if (self.captures == 1) return snapshot(41, false);
+            if (self.cancel) self.canceled.store(true, .release);
+            var result = snapshot(if (self.keep_stale) 41 else 42, !self.keep_stale);
+            if (self.missing) result.ranges = &.{};
+            return result;
+        }
+        fn confirm(ptr: *anyopaque, _: []const u8, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.confirmations += 1;
+            return error.UnexpectedReadIndexUnderAdmission;
+        }
+        fn freeRouting(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+        fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    for (0..4) |mode| {
+        var fixture: Fixture = .{ .keep_stale = mode == 1, .cancel = mode == 2, .missing = mode == 3 };
+        var source = Source.init(std.testing.allocator, "/unused", .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .table_routing_snapshot = Fixture.capture, .linearizable_table_routing_snapshot = Fixture.confirm, .free_routing_snapshot = Fixture.freeRouting } }, read_gate.alreadyReadSafeBarrier());
+        defer source.entries.deinit(std.testing.allocator);
+        defer source.physical_catalogs.deinit(std.testing.allocator);
+        defer source.catalog_observations.deinit(std.testing.allocator);
+        var entry: Source.Entry = .{
+            .group_id = 2,
+            .table_name = @constCast("docs"),
+            .generation = table_reads.backend_current_root_generation,
+            .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+            .schema_json = @constCast("{}"),
+            .indexes_json = @constCast("{\"new\":{}}"),
+            .restore_bootstrap_json = @constCast(""),
+            .initial_child_bootstrap_json = @constCast(""),
+            .owner = undefined,
+            .table_storage = Fixture.new_tables[0].storage,
+            .initial_range = .{ .start = "", .end = "" },
+            .active_users = 1,
+            .resident = true,
+        };
+        try source.entries.append(std.testing.allocator, &entry);
+        try source.catalog_observations.put(std.testing.allocator, 2, .{ .metadata_group_id = 11, .revision = 42 });
+        const controls: Source.ReadControls = .{ .cancellation = .fromAtomic(&fixture.canceled) };
+        if (mode == 0) {
+            var lease = try source.acquireWithControls(2, "docs", controls);
+            defer lease.deinit();
+            try std.testing.expect(lease.entry == &entry);
+        } else {
+            try std.testing.expectError(if (mode == 1) error.StorageKernelOwnerStaleDescriptor else if (mode == 2) error.Canceled else error.StorageReadTemporarilyUnavailable, source.acquireWithControls(2, "docs", controls));
+        }
+        try std.testing.expectEqual(@as(usize, 2), fixture.captures);
+        try std.testing.expectEqual(@as(usize, 0), fixture.confirmations);
+        try std.testing.expect(!entry.retired);
+        try std.testing.expectEqual(@as(u64, 0), source.owner_cache_misses.load(.monotonic));
+    }
 }
 
 test "owner descriptor catalog watermark fences index-only regressions across owner close" {
@@ -14844,6 +14961,28 @@ test "source owner privacy progress keeps writer and apply leases warm" {
 
 // A warm cut must remain usable even when no new allocation can succeed.
 // Retained leases also outlive eviction and a failed replacement build.
+test "source owner restore bootstrap retains its exact catalog authority" {
+    const a = std.testing.allocator;
+    var source = ProvisionedKernelOwnerSource.init(a, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.physical_catalogs.deinit(a);
+    const raw = "{\"_privacy\":{\"generation\":1,\"coverage\":{},\"scans\":[]}}";
+    var descriptor: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = 0,
+        .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 2 },
+        .indexes_json = raw,
+        .restore_bootstrap_json = "immutable restore authority",
+    };
+    var hidden = try source.acquireOwnerCatalog(2, descriptor);
+    defer hidden.deinit();
+    try std.testing.expectEqualStrings(raw, hidden.bytes);
+    try std.testing.expect(hidden.entry == null);
+    descriptor.restore_bootstrap_json = "";
+    var public = try source.acquireOwnerCatalog(2, descriptor);
+    defer public.deinit();
+    try std.testing.expect(!std.mem.eql(u8, raw, public.bytes));
+    try std.testing.expectEqual(@as(usize, 0), source.physical_catalogs.entries.count());
+}
+
 test "source owner privacy projection caches exact cuts without warm allocations" {
     const Cache = @import("owner_catalog_projection.zig").Cache;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});

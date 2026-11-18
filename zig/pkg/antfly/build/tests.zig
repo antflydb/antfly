@@ -1225,7 +1225,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     restore_source_imports.configure(b, restore_owner_test_mod, true, true);
     const restore_owner_tests = b.addTest(.{
         .root_module = restore_owner_test_mod,
-        .filters = &.{ "restore owner SQL population", "restore owner verified decoder", "restore owner independent repository snapshot", "restore decoder", "relational integrity portable decoder resumes bounded row pages across LSM reopen", "mapped restore admission" },
+        .filters = &.{ "restore owner SQL population", "restore owner verified decoder", "restore owner independent repository snapshot", "restore decoder", "relational integrity portable decoder resumes bounded row pages across LSM reopen", "relational integrity topology durable backup seal survives restart and later writes", "relational integrity historical restore stays fenced while coherent HA seed preserves namespace", "relational integrity accepted generation survives restart and bounded two-phase GC", "mapped restore admission" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-restore-owner-test", "Run authenticated source cache and replicated owner control integration").dependOn(&addFilteredTestRunArtifact(b, restore_owner_tests).step);
@@ -1556,6 +1556,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "portable backup native resolver authority",
             "portable backup refuses retained retirement and topology authority without a catalog",
             "portable accepted-generation proof requires a sealed v3 reader and canonical unique scope",
+            "portable standalone import detaches informational cohort without granting authority",
+            "public catalog translation preserves runtime config and incarnation",
+            "native backup receipt envelope",
             "portable accepted-generation proof page reads only canonical sealed decoder metadata",
             "portable restore validates historical rows with their public schema epoch",
             "portable archive accepts long history with a bounded decoded working set",
@@ -2766,6 +2769,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "backup cohort admission waits for producer drain",
+        "backup preparation preserves interruption errors",
+        "external lake read refresh hints coalesce",
         "admission routing",
         "native memory",
         "SQL command producer native",
@@ -4318,6 +4324,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "table provisioner restores local shard data from metadata restore intent",
         "table provisioner restore rejects mismatched doc identity namespace",
         "table provisioner replaces embedding index when metadata incarnation changes",
+        "table provisioner preserves vector incarnations across JSON formatting",
         "table provisioner can admit resolver backfill without draining corpus work",
         "runtime schema progress requires every hosted range",
         "table provisioner accepts target schema index when retained read index has inflated doc count",

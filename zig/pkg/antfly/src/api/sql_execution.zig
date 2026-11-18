@@ -313,7 +313,7 @@ fn rejectTransactionalDdl(statement: ast.Statement) !void {
     if (statement == .catalog_ddl and statement.catalog_ddl.concurrently) return error.SqlConcurrentDdlInTransaction;
     // Catalog and publication operations have their own durable commit
     // boundary; a surrounding SQL ROLLBACK cannot undo them.
-    if (@import("antfly_local_sources").sql_ddl_runtime.accepts(statement)) return error.UnsupportedSqlExecution;
+    if (@import("antfly_local_sources").sql_ddl_runtime.accepts(statement)) return error.SqlDdlInTransaction;
 }
 
 const ReceiptWaitBudget = @import("antfly_local_sources").sql_read_requirements.WaitBudget;
@@ -4460,7 +4460,7 @@ test "SQL transaction rejects policy definition and publication DDL before dispa
     }) |sql| {
         var compiled = try @import("antfly_local_sources").sql_compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
-        try std.testing.expectError(error.UnsupportedSqlExecution, rejectTransactionalDdl(compiled.statement));
+        try std.testing.expectError(error.SqlDdlInTransaction, rejectTransactionalDdl(compiled.statement));
     }
 }
 

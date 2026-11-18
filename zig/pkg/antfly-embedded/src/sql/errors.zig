@@ -322,6 +322,8 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlInvalidRecursion => .{ .code = "42P19", .message = "A recursive reference cannot occur inside a data-modifying WITH statement.", .retryable = false },
         error.SqlCteReturningRequired => .{ .code = "0A000", .message = "A referenced data-modifying WITH query requires RETURNING.", .retryable = false },
         error.SqlDuplicateCte => .{ .code = "42712", .message = "A WITH query name was specified more than once.", .retryable = false },
+        error.SqlDdlInTransaction => .{ .code = "25001", .message = "DDL cannot run inside a transaction block.", .hint = "Commit or roll back the transaction, then submit DDL separately.", .retryable = false },
+        error.SqlSearchUnavailable => .{ .code = "0A000", .message = "antfly_search is not supported by this SQL endpoint.", .hint = "Use the table query REST API for search or an embedded Lite SQL connection.", .retryable = false },
         error.UnsupportedSqlExecution, error.UnsupportedSqlShape => .{ .code = "0A000", .message = "This SQL statement or expression is not supported.", .hint = "Use a supported relational SELECT, INSERT, UPDATE, or DELETE statement." },
         error.UnsupportedNativeIndexOwner => .{ .code = "0A000", .message = "This table's owners cannot execute atomic index publication.", .hint = "Use owners with the required index publication capabilities; no index build was admitted.", .retryable = false },
         error.SqlSchemaRewriteRequiresMetadataOwner => .{ .code = "0A000", .message = "This schema rewrite requires the metadata-owned SQL endpoint.", .hint = "Submit the DDL to the metadata API; no rewrite job was admitted on this data node.", .retryable = false },

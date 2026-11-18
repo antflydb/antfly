@@ -148,7 +148,7 @@ pub const VTable = struct {
     writePrepareOwnerSchemaBeforeIndexLoad: *const fn (alloc: std.mem.Allocator, schema_json: []const u8) Outcome(?@import("db/mod.zig").SchemaBeforeIndexLoad),
     writeConfigureStorageKernelOwnerDb: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig, inference: @import("write.zig").InferenceDefaults, installed: ?*@import("write.zig").OwnerManagedConfig) Outcome(void),
     writeConfigureStorageKernelOwnerDbAtOpen: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig, inference: @import("write.zig").InferenceDefaults, installed: ?*@import("write.zig").OwnerManagedConfig, historical_ordered_apply: u8) Outcome(bool),
-    writeOpenStorageKernelRestoreDb: *const fn (alloc: std.mem.Allocator, path: []const u8, indexes_json: []const u8, lsm_root_generation: u64, backend_runtime: *@import("db/mod.zig").background_runtime.BackendRuntime, identity_namespace: ?@import("db/doc_identity.zig").Namespace, prepared_restore: *const @import("backup_restore.zig").PreparedRestore) Outcome(@import("db/mod.zig").DB),
+    writeOpenStorageKernelRestoreDb: *const fn (alloc: std.mem.Allocator, path: []const u8, schema_json: []const u8, indexes_json: []const u8, lsm_root_generation: u64, backend_runtime: *@import("db/mod.zig").background_runtime.BackendRuntime, identity_namespace: ?@import("db/doc_identity.zig").Namespace, prepared_restore: *const @import("backup_restore.zig").PreparedRestore) Outcome(@import("db/mod.zig").DB),
     writeRepairStorageKernelRestoreDb: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, group_id: u64, schema_json: []const u8, indexes_json: []const u8, cancellation: @import("db/mod.zig").types.CancellationToken) Outcome(void),
     writeReconcileStorageKernelOwnerDb: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, target_index_name: ?[]const u8, advance_index_repair: bool, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, inference: @import("write.zig").InferenceDefaults, installed: ?*@import("write.zig").OwnerManagedConfig) Outcome(@import("../api/write_contract.zig").StorageKernelReconcileResult),
     writeRepairStorageKernelOwnerDb: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, target_index_name: ?[]const u8, advance_index_repair: bool, options: @import("db/mod.zig").types.ArtifactRepairRunOptions) Outcome(@import("../api/write_contract.zig").StorageKernelReconcileResult),
@@ -575,8 +575,9 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 }
 // Main privacy callbacks/options plus native policy, layout and retained-status
 // contracts require the combined Engine62 profile.
+pub const descriptor_version: u32 = 63;
 pub const Descriptor = extern struct {
-    version: u32 = 63,
+    version: u32 = descriptor_version,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -774,7 +775,7 @@ pub fn validateExternalRetentionContract(version: u32, contract: native.TypeCont
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
     // Check the fixed prefix before reading any later versioned field.
-    if (descriptor.version != 63) return error.UnsupportedVersion;
+    if (descriptor.version != descriptor_version) return error.UnsupportedVersion;
     try validateCheckedNativeAtomicContract(descriptor.version, descriptor.checked_native_atomic_layout);
     try validateLookupOptionsContract(descriptor.version, descriptor.lookup_options_layout);
     try validateRowPolicyInstalledContract(descriptor.version, descriptor.row_policy_installed_layout);

@@ -329,6 +329,8 @@ pub const AntflyRootImports = struct {
     // keep owner-specific dependencies in their constructors below.
     fn configureDatabase(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
         self.configureBase(mod, link_libc);
+        // Document extraction carries cancellation through this shared contract.
+        mod.addImport("antfly_inference_execution_context", self.inference_execution_context);
         self.addImport(mod, "chunking_api_openapi");
         inline for (.{
             "bloom",            "chunking",           "common_openapi",    "credentials",

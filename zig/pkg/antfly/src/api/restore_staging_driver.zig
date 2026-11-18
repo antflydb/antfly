@@ -218,10 +218,14 @@ pub fn buildPlan(arena: std.mem.Allocator, id: staging.Id, cohort_digest: stagin
             }
             break :blk proofs;
         } else &.{};
+        const prepared_indexes = try @import("antfly_local_sources").privacy_catalog.prepareRestore(arena, manifest.indexes_json);
+        // The durable plan ID is stable across retries and unique to this
+        // restore, including when it replaces the same table twice.
+        const restored_indexes = try @import("antfly_local_sources").api_index_metadata.aliases.renewRestoreEpoch(arena, prepared_indexes, &std.fmt.bytesToHex(id, .lower));
         var target: staging.Target = .{
             .source_table_id = source.source_table_id,
             .source_table_name = if (admissions.len != 0) manifest.table_name else "",
-            .table = .{ .table_id = table_id, .name = source.destination_name orelse manifest.table_name, .description = manifest.description, .schema_json = manifest.schema_json, .read_schema_json = manifest.read_schema_json, .indexes_json = try @import("antfly_local_sources").privacy_catalog.prepareRestore(arena, manifest.indexes_json), .sql_native_indexes_json = manifest.sql_native_indexes_json, .replication_sources_json = if (manifest.replication_sources_json.len == 0) "[]" else manifest.replication_sources_json, .placement_role = if (existing) |table| table.placement_role else "data", .desired_replica_count = if (existing) |table| table.desired_replica_count else 3, .min_ranges = @intCast(ranges.len) },
+            .table = .{ .table_id = table_id, .name = source.destination_name orelse manifest.table_name, .description = manifest.description, .schema_json = manifest.schema_json, .read_schema_json = manifest.read_schema_json, .indexes_json = restored_indexes, .sql_native_indexes_json = manifest.sql_native_indexes_json, .replication_sources_json = if (manifest.replication_sources_json.len == 0) "[]" else manifest.replication_sources_json, .placement_role = if (existing) |table| table.placement_role else "data", .desired_replica_count = if (existing) |table| table.desired_replica_count else 3, .min_ranges = @intCast(ranges.len) },
             .ranges = ranges,
             .source_artifacts = artifacts,
             .source_generation_admissions = admissions,

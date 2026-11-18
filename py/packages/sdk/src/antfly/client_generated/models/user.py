@@ -20,13 +20,11 @@ class User:
     """
     Attributes:
         username (str):  Example: johndoe.
-        password_hash (str): Base64 encoded password hash. Exposing this is a security risk. Example: JGFyZ29uMm....
         metadata (None | Unset | UserMetadataType0): Server-side auth metadata available to stored row-filter policies
             through $auth metadata paths. Example: {'tenant_id': 'acme', 'department': 'eng'}.
     """
 
     username: str
-    password_hash: str
     metadata: None | Unset | UserMetadataType0 = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -34,8 +32,6 @@ class User:
         from ..models.user_metadata_type_0 import UserMetadataType0
 
         username = self.username
-
-        password_hash = self.password_hash
 
         metadata: dict[str, Any] | None | Unset
         if isinstance(self.metadata, Unset):
@@ -50,7 +46,6 @@ class User:
         field_dict.update(
             {
                 "username": username,
-                "password_hash": password_hash,
             }
         )
         if metadata is not UNSET:
@@ -64,8 +59,6 @@ class User:
 
         d = dict(src_dict)
         username = d.pop("username")
-
-        password_hash = d.pop("password_hash")
 
         def _parse_metadata(data: object) -> None | Unset | UserMetadataType0:
             if data is None:
@@ -86,7 +79,6 @@ class User:
 
         user = cls(
             username=username,
-            password_hash=password_hash,
             metadata=metadata,
         )
 

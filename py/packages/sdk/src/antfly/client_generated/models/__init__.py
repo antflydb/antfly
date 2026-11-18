@@ -74,6 +74,7 @@ from .backup_already_exists_conflict import BackupAlreadyExistsConflict
 from .backup_already_exists_conflict_code import BackupAlreadyExistsConflictCode
 from .backup_info import BackupInfo
 from .backup_info_format import BackupInfoFormat
+from .backup_info_table_selectors_item import BackupInfoTableSelectorsItem
 from .backup_list_response import BackupListResponse
 from .backup_namespace_table_response_201 import BackupNamespaceTableResponse201
 from .backup_outcome_ambiguous_conflict import BackupOutcomeAmbiguousConflict
@@ -2821,6 +2822,7 @@ __all__ = (
     "BackupAlreadyExistsConflictCode",
     "BackupInfo",
     "BackupInfoFormat",
+    "BackupInfoTableSelectorsItem",
     "BackupListResponse",
     "BackupNamespaceTableResponse201",
     "BackupOutcomeAmbiguousConflict",

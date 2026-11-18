@@ -360,5 +360,5 @@ fn parsePermissionType(raw: []const u8) antfly_client.types.PermissionType {
 fn parseFile(comptime T: type, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Parsed(T) {
     const data = try cli.readFileAlloc(io, allocator, path, 16 * 1024 * 1024);
     defer allocator.free(data);
-    return std.json.parseFromSlice(T, allocator, data, .{ .ignore_unknown_fields = false });
+    return std.json.parseFromSlice(T, allocator, data, .{ .ignore_unknown_fields = false, .allocate = .alloc_always });
 }

@@ -4397,7 +4397,19 @@ pub fn storageOwnerOpen(
         const bootstrap = restore_bootstrap.?.value;
         bootstrap.validate() catch |err| return storageOwnerStatusFromError(err);
         const namespace = identity_namespace orelse return .invalid_argument;
-        if (!namespace.eql(bootstrap.scope.target_namespace) or !std.mem.eql(u8, bootstrap.table_name, table_name) or !std.mem.eql(u8, bootstrap.schema_json, request.schema_json.slice()) or !std.mem.eql(u8, bootstrap.indexes_json, request.indexes_json.slice())) return storageOwnerStatusFromError(error.RestoreStagingScopeChanged);
+        if (!namespace.eql(bootstrap.scope.target_namespace) or !std.mem.eql(u8, bootstrap.table_name, table_name) or !std.mem.eql(u8, bootstrap.schema_json, request.schema_json.slice()))
+            return storageOwnerStatusFromError(error.RestoreStagingScopeChanged);
+        if (!std.mem.eql(u8, bootstrap.indexes_json, request.indexes_json.slice())) {
+            // The immutable bootstrap binds the full metadata definition.
+            // A storage owner receives its cached physical projection, which
+            // excludes aliases, receipts and other metadata-only controls.
+            const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+            const physical = (aliases.physicalProjectionIfNeeded(alloc, bootstrap.indexes_json) catch |err| return storageOwnerStatusFromError(err)) orelse
+                return storageOwnerStatusFromError(error.RestoreStagingScopeChanged);
+            defer alloc.free(physical);
+            if (!std.mem.eql(u8, physical, request.indexes_json.slice()))
+                return storageOwnerStatusFromError(error.RestoreStagingScopeChanged);
+        }
     }
     var initial_child_bootstrap: ?std.json.Parsed(antfly.capi_dependencies.storage_db_relational_initial_child_publication.Bootstrap) = null;
     defer if (initial_child_bootstrap) |*parsed| parsed.deinit();
@@ -6989,6 +7001,7 @@ pub fn prepareStorageRestore(
     var db = try local_write.openStorageKernelRestoreDb(
         alloc,
         staged.path(),
+        scope.manifest.value.schema_json,
         scope.manifest.value.indexes_json,
         request.lsm_root_generation,
         backend_runtime.ptr(),
@@ -7018,6 +7031,7 @@ pub fn prepareStorageRestore(
         var verify_db = try local_write.openStorageKernelRestoreDb(
             alloc,
             staged.path(),
+            scope.manifest.value.schema_json,
             scope.manifest.value.indexes_json,
             request.lsm_root_generation,
             backend_runtime.ptr(),
