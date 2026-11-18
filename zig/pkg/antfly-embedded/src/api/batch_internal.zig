@@ -92,7 +92,20 @@ test "distributed txn private control wire carries only an isolated DAG source f
     var mixed = request;
     mixed.writes = &.{.{ .key = "row", .value = "{}" }};
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, mixed));
+    var scan = request;
+    scan.dag_source_fence.?.action = .scan;
+    scan.dag_source_fence.?.scan = .{ .domain = @splat(4), .owner_epoch = 7, .page = .{
+        .after = "\x00\xff",
+        .replacements = &.{.{ .owner = @splat(5), .source = "\xfe", .targets = &.{"\xfd"} }},
+    } };
+    const scan_encoded = try encodeBatchRequest(alloc, scan);
+    defer alloc.free(scan_encoded);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, scan_encoded));
+    var scan_parsed = try parseInternalBatchRequest(alloc, scan_encoded);
+    defer scan_parsed.deinit(alloc);
+    try std.testing.expectEqualDeep(scan.dag_source_fence, scan_parsed.req.dag_source_fence);
 }
+
 test "internal isolated controls preserve neutral document versions across owner and forwarded codecs" {
     const a = std.testing.allocator;
     const inventory = @import("../storage/db/artifact_inventory.zig");
@@ -561,6 +574,7 @@ pub const OwnedBatchRequest = struct {
     // Only signed requests allocate this compact proof/database backing.
     row_policy_admission_bytes: ?[]u8 = null,
     restore_staging: ?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control) = null,
+    dag_source_fence: ?std.json.Parsed(@import("../graph/dag_authority.zig").SourceFenceCommand) = null,
     online_source: ?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command) = null,
     group_source: ?std.json.Parsed(@import("../storage/db/group_source_contract.zig").Command) = null,
     resolver_review: ?std.json.Parsed(@import("../storage/db/resolver_review.zig").Command) = null,
@@ -601,6 +615,7 @@ pub const OwnedBatchRequest = struct {
         if (self.row_policy_install_bundle) |bundle| alloc.free(bundle);
         if (self.row_policy_admission_bytes) |bytes| alloc.free(bytes);
         if (self.restore_staging) |*control| control.deinit();
+        if (self.dag_source_fence) |*control| control.deinit();
         if (self.online_source) |*control| control.deinit();
         if (self.group_source) |*control| control.deinit();
         if (self.resolver_review) |*control| control.deinit();
@@ -970,16 +985,15 @@ fn parseBatchRequestWithOptions(
         break :control @as(?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command), try std.json.parseFromValue(@import("../storage/db/online_source_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (online_source) |*control| control.deinit();
-    const dag_source_fence = if (root.get("_dag_source_fence")) |value| control: {
+    var dag_source_fence = if (root.get("_dag_source_fence")) |value| control: {
         if (!allow_internal) return error.InvalidBatchRequest;
         const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
         if (marker != .object) return error.InvalidBatchRequest;
         const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
         if (kind != .string or !std.mem.eql(u8, kind.string, "dag_source_fence_v1")) return error.InvalidBatchRequest;
-        const parsed_fence = try std.json.parseFromValue(@import("../graph/dag_authority.zig").SourceFenceCommand, alloc, value, .{});
-        defer parsed_fence.deinit();
-        break :control parsed_fence.value;
+        break :control @as(?std.json.Parsed(@import("../graph/dag_authority.zig").SourceFenceCommand), try std.json.parseFromValue(@import("../graph/dag_authority.zig").SourceFenceCommand, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
+    errdefer if (dag_source_fence) |*control| control.deinit();
     var artifact_catalog = if (root.get("_artifact_catalog")) |value| control: {
         if (!allow_internal) return error.InvalidBatchRequest;
         const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
@@ -1764,6 +1778,7 @@ fn parseBatchRequestWithOptions(
         .row_policy_install_bundle = row_policy_install_bundle,
         .row_policy_admission_bytes = admission_bytes,
         .restore_staging = restore_staging,
+        .dag_source_fence = dag_source_fence,
         .online_source = online_source,
         .group_source = group_source,
         .resolver_review = resolver_review,
@@ -1805,7 +1820,7 @@ fn parseBatchRequestWithOptions(
             .online_source = if (online_source) |control| control.value else null,
             .group_source = if (group_source) |control| control.value else null,
             .resolver_review = if (resolver_review) |control| control.value else null,
-            .dag_source_fence = dag_source_fence,
+            .dag_source_fence = if (dag_source_fence) |control| control.value else null,
             .artifact_catalog = if (artifact_catalog) |control| control.value else null,
             .artifact_publication = if (artifact_publication) |control| control.value else null,
             .artifact_publication_transport = if (artifact_publication_transport) |control| control.value else null,

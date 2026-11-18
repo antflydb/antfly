@@ -61,12 +61,15 @@ installed. Scan progress and completion require that fence. Each root installs
 its fence only after draining prepared writers, in the same serialized writer
 that excludes new votes. Topology admission and activation fences exclude each
 other, and topology drain includes authority-only prepared participants.
-The private ordered source-fence command commits acquisition or release with
-the apply receipt and rejects a delayed acquisition for an already released
-attempt. The command currently requires a root without asynchronous standby
-mirroring. The activation coordinator still needs to drive
-that protocol across roots, read the pinned graph, and propose completion. Regular index
-admission and direct graph-index open still reject DAG.
+The private ordered source-fence command commits acquisition, release, scan
+initialization, or a bounded scan page with its apply receipt. It rejects delayed
+acquisitions for released attempts and checks the full fence identity before
+staging scan work. Raft protocol version 31 gates these commands, DAG-bearing
+transaction prepare, and catalog activation proofs. The command currently
+requires a root without asynchronous standby mirroring. The activation
+coordinator still needs to execute the protocol across roots, enumerate the
+pinned graph, and certify end of input. Regular index admission and direct
+graph-index open still reject DAG.
 An existing distributed reservation remains under the original coordinator,
 and the publication coordinator still needs to enlist the authority under the source and contender guards, and document-derived
 and explicit writers still need to supply their final contributions. The authority also stages bounded activation pages into a private

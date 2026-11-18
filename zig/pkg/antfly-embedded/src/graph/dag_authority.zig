@@ -73,8 +73,43 @@ pub const SourceFence = struct {
 
 pub const SourceFenceCommand = struct {
     namespace: [24]u8,
-    action: enum { acquire, release },
+    action: enum { acquire, release, scan },
     fence: SourceFence,
+    scan: ?Scan = null,
+
+    pub const Scan = struct {
+        domain: Digest,
+        owner_epoch: u64,
+        /// A null page pins a new scan. A page continues the existing scan.
+        page: ?Page = null,
+    };
+
+    pub const Page = struct {
+        after: ?[]const u8 = null,
+        replacements: []const Contributions.Replacement,
+    };
+
+    pub fn stageScan(self: SourceFenceCommand, alloc: std.mem.Allocator, txn: anytype) !void {
+        const scan = self.scan orelse return error.InvalidBatchRequest;
+        const current = (try SourceFence.read(txn)) orelse return error.GraphConstraintNotReady;
+        if (!std.meta.eql(current, self.fence)) return error.GraphConstraintAttemptConflict;
+        if (scan.page) |page| {
+            const ScanClock = struct {
+                fn now(_: *anyopaque) u64 {
+                    // Raft apply must produce the same result on every replica.
+                    return 0;
+                }
+            };
+            var budget: @import("dag_validation.zig").Budget = .{ .clock = .{ .context = txn, .now = ScanClock.now } };
+            var witness: @import("dag_validation.zig").Witness = .{};
+            try Contributions.seedActivationPage(alloc, txn, scan.domain, scan.owner_epoch, self.fence.snapshot, page.after, page.replacements, &budget, &witness);
+            return;
+        }
+        Storage.create(txn, scan.domain, scan.owner_epoch) catch |err| {
+            if (err != error.GraphConstraintAlreadyExists) return err;
+        };
+        try Contributions.beginActivation(txn, scan.domain, scan.owner_epoch, self.fence.snapshot);
+    }
 
     const completed_prefix = "\x00\x00__metadata__:dag-source-fence-completed:";
 
@@ -96,7 +131,14 @@ pub const SourceFenceCommand = struct {
     }
 
     pub fn validateRequest(req: anytype) !void {
-        if (req.dag_source_fence == null) return;
+        const command = req.dag_source_fence orelse return;
+        if ((command.action == .scan) != (command.scan != null)) return error.InvalidBatchRequest;
+        if (command.scan) |scan| {
+            if (scan.owner_epoch == 0) return error.InvalidBatchRequest;
+            if (scan.page) |page| {
+                if (page.replacements.len == 0) return error.InvalidBatchRequest;
+            }
+        }
         const empty: @TypeOf(req) = .{};
         inline for (comptime std.meta.fieldNames(@TypeOf(req))) |name| {
             if (comptime !std.mem.eql(u8, name, "dag_source_fence") and
@@ -1033,7 +1075,10 @@ pub const Contributions = struct {
     }
 
     fn activationState(txn: anytype, id: Digest, epoch: u64) !State {
-        const state = try Storage.load(txn, id);
+        const state = Storage.load(txn, id) catch |err| {
+            if (err == error.NotFound) return error.GraphConstraintNotReady;
+            return err;
+        };
         if (state.owner_epoch != epoch) return error.GraphConstraintOwnerChanged;
         if (state.phase != .validating or state.revision != 0) return error.GraphConstraintNotReady;
         return state;

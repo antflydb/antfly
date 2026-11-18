@@ -1448,6 +1448,11 @@ const RaftTableApplyStateMachine = struct {
                 error.GraphConstraintAttemptConflict => return .GraphConstraintAttemptConflict,
                 error.GraphConstraintRevisionChanged => return .GraphConstraintRevisionChanged,
                 error.GraphConstraintNotReady => return .GraphConstraintNotReady,
+                error.IntegrityTopologyBusy => return .GraphConstraintBusy,
+                error.GraphConstraintOwnerChanged => return .GraphConstraintOwnerChanged,
+                error.GraphConstraintCapacity => return .GraphConstraintCapacity,
+                error.GraphCycle => return .GraphCycle,
+                error.InvalidDagMutation => return .invalid_batch_request,
                 else => {},
             };
             if (err == error.GraphConstraintBusy) {

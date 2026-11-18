@@ -28823,6 +28823,7 @@ pub const DB = struct {
                 try transactions_mod.TxnManager.stageDagSourceFence(&txn, command.fence);
             },
             .release => try command.stageRelease(&txn),
+            .scan => try command.stageScan(self.alloc, &txn),
         }
         for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
         for (opts.extra_store_deletes) |key| try txn.delete(key);
@@ -156011,11 +156012,34 @@ test "db ordered DAG source fence persists with the apply receipt" {
         defer read.abort();
         try std.testing.expectEqualDeep(fence, (try dag.SourceFence.read(&read)).?);
     }
-    request.dag_source_fence.?.action = .release;
+    const domain: dag.Digest = @splat(5);
+    request.dag_source_fence.?.action = .scan;
+    request.dag_source_fence.?.scan = .{ .domain = domain, .owner_epoch = 1 };
     try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 2 }, true);
+    const owner: dag.Digest = @splat(6);
+    request.dag_source_fence.?.scan.?.page = .{ .replacements = &.{.{ .owner = owner, .source = "a", .targets = &.{"b"} }} };
+    try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 3 }, true);
+    try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 3 }, true);
+    const cursor = owner ++ "a".*;
+    request.dag_source_fence.?.scan.?.page = .{
+        .after = &cursor,
+        .replacements = &.{.{ .owner = owner, .source = "b", .targets = &.{"a"} }},
+    };
+    try std.testing.expectError(error.GraphCycle, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 4 }, true));
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualDeep(fence.snapshot, (try dag.Contributions.activationSnapshot(&read, domain, 1)).?);
+        const saved = (try dag.Contributions.activationCursor(a, &read, domain, 1, fence.snapshot)).?;
+        defer a.free(saved);
+        try std.testing.expectEqualSlices(u8, &cursor, saved);
+    }
+    request.dag_source_fence.?.scan = null;
+    request.dag_source_fence.?.action = .release;
+    try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 5 }, true);
     request.dag_source_fence.?.action = .acquire;
-    try std.testing.expectError(error.GraphConstraintAttemptConflict, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 3 }, true));
-    try std.testing.expectEqualDeep(@as(OrderedApplyReceipt, .{ .term = 1, .index = 2 }), (try db.orderedApplyReceipt()).?);
+    try std.testing.expectError(error.GraphConstraintAttemptConflict, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 6 }, true));
+    try std.testing.expectEqualDeep(@as(OrderedApplyReceipt, .{ .term = 1, .index = 5 }), (try db.orderedApplyReceipt()).?);
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     try std.testing.expect((try dag.SourceFence.read(&read)) == null);
