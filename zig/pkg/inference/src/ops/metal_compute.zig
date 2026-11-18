@@ -18180,7 +18180,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return try self.ctFromOwnedMetalTensor(output);
     }
 
-    fn scaledDotProductAttentionGemma4VisionOp(
+    fn scaledDotProductAttentionUnmaskedF32Op(
         ctx: *anyopaque,
         q_ct: CT,
         k_ct: CT,
@@ -40517,7 +40517,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.maskedMeanRows = maskedMeanRowsOp;
         vt.maskedMeanNormalizedRows = maskedMeanNormalizedRowsOp;
         vt.regions.vision.unmaskedTensorCore = scaledDotProductAttentionQwen3VlVisionOp;
-        vt.regions.vision.unmaskedWarpReduced = scaledDotProductAttentionGemma4VisionOp;
+        vt.regions.vision.unmaskedF32 = scaledDotProductAttentionUnmaskedF32Op;
         vt.regions.vision.unmaskedRetrieval = scaledDotProductAttentionEmbeddingGemma2VisionOp;
         vt.scaledDotProductAttentionFull = scaledDotProductAttentionFullOp;
         vt.maskedBceWithLogitsLoss = maskedBceWithLogitsLossOp;

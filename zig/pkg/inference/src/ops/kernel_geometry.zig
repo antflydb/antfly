@@ -1210,3 +1210,38 @@ test "source GEMM rows preserve actual physical extent without fabricating paddi
     try std.testing.expectError(error.InvalidShape, SourceGemmRows.resolve(2340, 2339));
     try std.testing.expectError(error.InvalidShape, SourceGemmRows.resolve(1, 0));
 }
+
+/// Bounded row-major score bank for unmasked BSHD attention. A tail tile packs
+/// only its live rows per head, so ordinary row softmax needs no padded mask.
+pub const UnmaskedAttentionTile = struct {
+    tile_rows: usize,
+    score_elements: usize,
+    score_bytes: usize,
+    hidden: usize,
+    elements: usize,
+
+    pub fn init(batch: usize, sequence: usize, heads: usize, dim: usize, preferred_rows: usize, score_limit: usize) !UnmaskedAttentionTile {
+        if (batch == 0 or sequence == 0 or heads == 0 or dim == 0 or preferred_rows == 0) return error.InvalidShape;
+        const hidden = try std.math.mul(usize, heads, dim);
+        const elements = try std.math.mul(usize, try std.math.mul(usize, batch, sequence), hidden);
+        const score_row = try std.math.mul(usize, try std.math.mul(usize, heads, sequence), @sizeOf(f32));
+        const available = @min(sequence, @min(preferred_rows, score_limit / score_row));
+        if (available == 0) return error.InsufficientWorkspace;
+        const tile = std.math.floorPowerOfTwo(usize, available);
+        const score_bytes = try std.math.mul(usize, score_row, tile);
+        return .{ .tile_rows = tile, .score_elements = score_bytes / 4, .score_bytes = score_bytes, .hidden = hidden, .elements = elements };
+    }
+};
+
+test "unmasked attention tiles bound score storage and preserve tail geometry" {
+    const plan = try UnmaskedAttentionTile.init(2, 513, 12, 64, 128, 64 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 128), plan.tile_rows);
+    try std.testing.expectEqual(@as(usize, 2 * 513 * 768), plan.elements);
+    try std.testing.expectEqual(@as(usize, 12 * 128 * 513 * 4), plan.score_bytes);
+    const bounded = try UnmaskedAttentionTile.init(1, 8192, 32, 128, 128, 64 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 64), bounded.tile_rows);
+    try std.testing.expect(bounded.score_bytes <= 64 * 1024 * 1024);
+    try std.testing.expectError(error.InsufficientWorkspace, UnmaskedAttentionTile.init(1, 513, 12, 64, 128, 1));
+    try std.testing.expectError(error.InvalidShape, UnmaskedAttentionTile.init(0, 513, 12, 64, 128, 1));
+    try std.testing.expectError(error.Overflow, UnmaskedAttentionTile.init(2, std.math.maxInt(usize), 12, 64, 128, 64 * 1024 * 1024));
+}

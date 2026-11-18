@@ -1403,6 +1403,7 @@ pub const RuntimeStats = struct {
     launch_qwen3vl_mrope: usize = 0,
     launch_qwen3vl_vision_rope: usize = 0,
     launch_attention: usize = 0,
+    f32_tiled_attention_calls: usize = 0,
     launch_qwen3vl_vision_attention: usize = 0,
     launch_attention_gqa_decode: usize = 0,
     launch_attention_gqa_decode_generated: usize = 0,
@@ -8459,7 +8460,7 @@ pub const CudaCompute = struct {
         // Actual source vision warms immutable full/tail vendor plans before
         // capture. Reuse the existing bounded library-owned cache; no numerical
         // lane, plan discovery, or metadata allocation occurs during replay.
-        if (profile == .embedding_gemma2) if (cublaslt) |*blas| {
+        if (profile == .embedding_gemma2 or cudaF32TiledAttentionEnabled()) if (cublaslt) |*blas| {
             blas.attention_plan_cache_enabled = true;
         };
         const lighton_device = @import("lighton_device_policy.zig").Device{ .major = ctx.info.compute_major, .minor = ctx.info.compute_minor, .driver_version = ctx.info.driver_version };
@@ -30096,7 +30097,7 @@ fn sdpaQwen3VlVision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize
     if (self.capability_profile == .transformer_seq2seq) {
         if (self.runtime_policy.seq2seq.encoder_attention == .f16)
             return denseSeq2seqF16Attention(self, q_ct, k_ct, v_ct, batch, seq_len, num_heads, head_dim);
-        return sdpaGemma4Vision(ctx, q_ct, k_ct, v_ct, batch, seq_len, num_heads, head_dim);
+        return sdpaUnmaskedF32(ctx, q_ct, k_ct, v_ct, batch, seq_len, num_heads, head_dim);
     }
     self.stats.launch_qwen3vl_vision_attention += 1;
     if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_QWEN3VL_VISION_ATTENTION_TC_BF16", true)) {
@@ -30154,8 +30155,65 @@ fn sdpaQwen3VlVision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize
     return createTensor(self, device, shape, count);
 }
 
-fn sdpaGemma4Vision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+fn cudaF32TiledAttentionEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_F32_TILED_ATTENTION", false);
+}
+
+/// Full-precision unmasked attention over strided BSHD views. Reuse the shared
+/// vendor GEMM and in-place row-softmax families; no Q/K/V or probability cast.
+/// This eager owner declares capture unsupported before acquiring resources.
+fn tryUnmaskedTiledF32Attention(self: *CudaCompute, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize, sequence: usize, heads: usize, dim: usize) !?CT {
+    if (self.cublaslt == null or !cudaCublasLtEnabled() or self.ctx.info.compute_major < 8 or
+        self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or self.kernels.primitive_softmax_f32 == null or
+        batch == 0 or batch > 16 or sequence == 0 or sequence > 8192 or heads == 0 or heads > 64 or (dim != 64 and dim != 128)) return null;
+    const plan = kernel_geometry.UnmaskedAttentionTile.init(batch, sequence, heads, dim, 128, 64 * 1024 * 1024) catch return null;
+    if (sequence >= 512 and plan.tile_rows < 32) return null;
+    const q = tensorFromCt(q_ct);
+    const k = tensorFromCt(k_ct);
+    const v = tensorFromCt(v_ct);
+    for ([_]*const CudaTensor{ q, k, v }) |input| {
+        try ensureF32(input);
+        try ensureCount(input, plan.elements);
+        if (input.buffer.ptr == 0 or input.buffer.len < try checkedMul(plan.elements, 4)) return error.InvalidShape;
+    }
+    var scores = try allocDeviceBuffer(self, plan.score_bytes);
+    defer releaseDeviceBuffer(self, &scores);
+    var output = try OwnedF32Output.alloc(self, q.shape, plan.elements);
+    defer output.deinit();
+    const workspace = cublasLtWorkspace(self);
+    const blas = &self.cublaslt.?;
+    // Any SDK failure after commitment propagates; the nullable refusal above
+    // never permits replaying this partially submitted phase through fallback.
+    errdefer self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+    var profile = beginPrefillProfile(self, .attention, sequence);
+    defer if (profile) |*scope| scope.end();
+    for (0..batch) |item| {
+        const base = try checkedMul(try checkedMul(item, sequence), plan.hidden * 4);
+        const key = buffer_mod.DeviceBuffer{ .ptr = k.buffer.ptr + base, .len = k.buffer.len - base };
+        const value = buffer_mod.DeviceBuffer{ .ptr = v.buffer.ptr + base, .len = v.buffer.len - base };
+        var first: usize = 0;
+        while (first < sequence) : (first += plan.tile_rows) {
+            const rows = @min(plan.tile_rows, sequence - first);
+            const offset = base + first * plan.hidden * 4;
+            const query = buffer_mod.DeviceBuffer{ .ptr = q.buffer.ptr + offset, .len = q.buffer.len - offset };
+            const dst = buffer_mod.DeviceBuffer{ .ptr = output.buffer.ptr + offset, .len = output.buffer.len - offset };
+            const score_stride = rows * sequence;
+            // Pack the actual tail, rather than leaving per-head padded rows.
+            try blas.matmulAttentionStridedTyped(&self.ctx, scores, query, key, workspace, rows, sequence, dim, plan.hidden, plan.hidden, sequence, heads, dim, dim, score_stride, false, true, true, 1.0 / @sqrt(@as(f32, @floatFromInt(dim))), .f32);
+            try self.kernels.launchPrimitiveSoftmaxF32(&self.ctx, scores, scores, heads * score_stride, sequence, false);
+            try blas.matmulAttentionStridedTyped(&self.ctx, dst, scores, value, workspace, rows, dim, sequence, sequence, plan.hidden, plan.hidden, heads, score_stride, dim, dim, false, false, true, 1.0, .f32);
+            self.stats.launch_attention += 3;
+        }
+    }
+    self.stats.f32_tiled_attention_calls += 1;
+    return output.intoTensor();
+}
+
+fn sdpaUnmaskedF32(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (cudaF32TiledAttentionEnabled() and seq_len >= 512) {
+        if (try tryUnmaskedTiledF32Attention(self, q_ct, k_ct, v_ct, batch, seq_len, num_heads, head_dim)) |result| return result;
+    }
     // Reuse the full-precision encoder kernel's warp-reduced scores. The
     // generic >512-patch path recomputes every QK dot for each output channel.
     if (batch == 0 or num_heads == 0 or seq_len == 0 or seq_len > 8192 or
@@ -30173,6 +30231,8 @@ fn sdpaGemma4Vision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize,
     try ensureCount(v, count);
     var output = try OwnedF32Output.alloc(self, q.shape, count);
     defer output.deinit();
+    var profile = beginPrefillProfile(self, .attention, seq_len);
+    defer if (profile) |*scope| scope.end();
     try self.kernels.launchGlinerEncoderAttentionF32(&self.ctx, output.buffer, q.buffer, k.buffer, v.buffer, .{}, batch, seq_len, num_heads, head_dim, seq_len);
     self.stats.launch_attention += 1;
     return output.intoTensor();
@@ -35929,7 +35989,7 @@ const vtable: ops.ComputeBackend.VTable = .{
         },
         .vision = .{
             .unmaskedTensorCore = &sdpaQwen3VlVision,
-            .unmaskedWarpReduced = &sdpaGemma4Vision,
+            .unmaskedF32 = &sdpaUnmaskedF32,
             .tryUnmaskedRetrieval = &sdpaEmbeddingGemma2Vision,
             .encoderTower = &runEmbeddingGemma2VisionTowerOp,
             .sourceGeometry = &sourceVisionGeometryOp,
@@ -60724,4 +60784,70 @@ test "CUDA borrowed quantized metadata native prefill requirement declines befor
     // All model maps and SDK fields are intentionally uninitialized. A
     // captured-program miss cannot silently enter the eager prepared decoder.
     try std.testing.expect((try @import("../../backends/decoder_gated_runtime.zig").forwardPrefillLastPreparedTail(&cb, std.testing.allocator, config, 1, &.{ 1, 2 }, 2, &dc, .{ .execution = .captured_native })) == null);
+}
+
+test "CUDA tiled F32 unmasked attention preserves frozen and F64 outputs with live tails and batches" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    if (compute.cublaslt == null) return error.SkipZigTest;
+    compute.cublaslt.?.attention_plan_cache_enabled = true;
+    const cb = compute.computeBackend();
+    const Case = struct { batch: usize, sequence: usize, heads: usize, dim: usize };
+    for ([_]Case{ .{ .batch = 2, .sequence = 129, .heads = 2, .dim = 64 }, .{ .batch = 1, .sequence = 513, .heads = 3, .dim = 128 } }) |c| {
+        const hidden = c.heads * c.dim;
+        const count = c.batch * c.sequence * hidden;
+        const q_data = try a.alloc(f32, count);
+        defer a.free(q_data);
+        const k_data = try a.alloc(f32, count);
+        defer a.free(k_data);
+        const v_data = try a.alloc(f32, count);
+        defer a.free(v_data);
+        for (0..2) |iteration| {
+            for (q_data, k_data, v_data, 0..) |*q, *k, *v, i| {
+                q.* = @sin(@as(f32, @floatFromInt(i + iteration * 7)) * 0.113) * 0.75;
+                k.* = @cos(@as(f32, @floatFromInt(i * 3 + iteration * 11)) * 0.071) * 0.5;
+                v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i + iteration * 13) % 127)) - 63)) / 64;
+            }
+            const shape = [_]i32{ @intCast(c.batch * c.sequence), @intCast(hidden) };
+            const q = try cb.fromFloat32Shape(q_data, &shape);
+            defer cb.free(q);
+            const k = try cb.fromFloat32Shape(k_data, &shape);
+            defer cb.free(k);
+            const v = try cb.fromFloat32Shape(v_data, &shape);
+            defer cb.free(v);
+            const before_hits = compute.cublaslt.?.attention_plan_cache_hits;
+            const result = (try tryUnmaskedTiledF32Attention(&compute, q, k, v, c.batch, c.sequence, c.heads, c.dim)) orelse return error.MissingF32Attention;
+            defer cb.free(result);
+            const actual = try cb.toFloat32(result, a);
+            defer a.free(actual);
+            if (iteration != 0) try std.testing.expect(compute.cublaslt.?.attention_plan_cache_hits > before_hits);
+            const frozen = try cb.fromFloat32Shape(v_data, &shape);
+            defer cb.free(frozen);
+            try compute.kernels.launchGlinerEncoderAttentionF32(&compute.ctx, tensorFromCt(frozen).buffer, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, .{}, c.batch, c.sequence, c.heads, c.dim, c.sequence);
+            const original = try cb.toFloat32(frozen, a);
+            defer a.free(original);
+            for (original, actual) |expected, got| try std.testing.expectApproxEqAbs(expected, got, 0.00002);
+            const scores = try a.alloc(f64, c.sequence);
+            defer a.free(scores);
+            for (0..c.batch) |item| for (0..c.heads) |head| for ([_]usize{ 0, c.sequence / 2, c.sequence - 1 }) |row| {
+                var maximum: f64 = -std.math.inf(f64);
+                for (scores, 0..) |*score, key| {
+                    score.* = 0;
+                    for (0..c.dim) |column| score.* += @as(f64, q_data[(item * c.sequence + row) * hidden + head * c.dim + column]) * @as(f64, k_data[(item * c.sequence + key) * hidden + head * c.dim + column]);
+                    score.* /= @sqrt(@as(f64, @floatFromInt(c.dim)));
+                    maximum = @max(maximum, score.*);
+                }
+                var denominator: f64 = 0;
+                for (scores) |score| denominator += @exp(score - maximum);
+                for (0..c.dim) |column| {
+                    var expected: f64 = 0;
+                    for (scores, 0..) |score, key| expected += @exp(score - maximum) / denominator * @as(f64, v_data[(item * c.sequence + key) * hidden + head * c.dim + column]);
+                    try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), actual[(item * c.sequence + row) * hidden + head * c.dim + column], 0.00002);
+                }
+            };
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), compute.stats.f32_tiled_attention_calls);
 }

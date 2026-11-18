@@ -2703,7 +2703,7 @@ pub const ComputeBackend = struct {
         /// unbiased semantics as scaledDotProductAttention with an empty mask,
         /// but lets a backend select a model-scoped kernel without changing
         /// unrelated vision encoders that happen to share a tensor shape.
-        unmaskedWarpReduced: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
+        unmaskedF32: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
         unmaskedRetrieval: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
         unmaskedTensorCore: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
         tryUnmaskedRetrieval: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!?CT = null,
@@ -5306,8 +5306,8 @@ pub const ComputeBackend = struct {
 
     /// Unmasked, token-major Gemma4 vision attention. Providers without the
     /// qualified model-specific kernel retain portable unmasked attention.
-    pub fn scaledDotProductAttentionGemma4Vision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
-        if (self.vtable.regions.vision.unmaskedWarpReduced) |f| {
+    pub fn scaledDotProductAttentionUnmaskedF32(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
+        if (self.vtable.regions.vision.unmaskedF32) |f| {
             return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
         }
         return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);

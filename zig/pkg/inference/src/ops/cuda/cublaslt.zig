@@ -240,12 +240,13 @@ const AttentionPlanKey = struct {
     workspace: usize,
     transpose_a: bool,
     transpose_b: bool,
-    input_f16: bool,
+    input_type: c_int,
     output_f32: bool,
     alignments: [3]u32,
 };
-fn attentionPlanKey(dst: buffer_mod.DeviceBuffer, a: buffer_mod.DeviceBuffer, b: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, n: usize, k: usize, lda: usize, ldb: usize, ldd: usize, batches: usize, stride_a: usize, stride_b: usize, stride_d: usize, transpose_a: bool, transpose_b: bool, input_f16: bool, output_f32: bool) AttentionPlanKey {
-    return .{ .rows = rows, .n = n, .k = k, .lda = lda, .ldb = ldb, .ldd = ldd, .batches = batches, .stride_a = stride_a, .stride_b = stride_b, .stride_d = stride_d, .workspace = workspace.len, .transpose_a = transpose_a, .transpose_b = transpose_b, .input_f16 = input_f16, .output_f32 = output_f32, .alignments = .{ stridedPointerAlignment(a.ptr, stride_a, 2, batches), stridedPointerAlignment(b.ptr, stride_b, 2, batches), stridedPointerAlignment(dst.ptr, stride_d, if (output_f32) 4 else 2, batches) } };
+fn attentionPlanKey(dst: buffer_mod.DeviceBuffer, a: buffer_mod.DeviceBuffer, b: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, n: usize, k: usize, lda: usize, ldb: usize, ldd: usize, batches: usize, stride_a: usize, stride_b: usize, stride_d: usize, transpose_a: bool, transpose_b: bool, input_type: c_int, output_f32: bool) AttentionPlanKey {
+    const input_bytes: usize = if (input_type == CUDA_R_32F) 4 else 2;
+    return .{ .rows = rows, .n = n, .k = k, .lda = lda, .ldb = ldb, .ldd = ldd, .batches = batches, .stride_a = stride_a, .stride_b = stride_b, .stride_d = stride_d, .workspace = workspace.len, .transpose_a = transpose_a, .transpose_b = transpose_b, .input_type = input_type, .output_f32 = output_f32, .alignments = .{ stridedPointerAlignment(a.ptr, stride_a, input_bytes, batches), stridedPointerAlignment(b.ptr, stride_b, input_bytes, batches), stridedPointerAlignment(dst.ptr, stride_d, if (output_f32) 4 else input_bytes, batches) } };
 }
 
 const AttentionPlan = struct {
@@ -1690,7 +1691,7 @@ pub const CublasLt = struct {
     ) Error!bool {
         try self.validateContextIdentity(ctx);
         if (!self.attention_plan_cache_enabled or self.allocator == null) return false;
-        const key = attentionPlanKey(dst, a, b, workspace, rows, n, k, lda, ldb, ldd, batches, stride_a, stride_b, stride_d, transpose_a, transpose_b, false, output_f32);
+        const key = attentionPlanKey(dst, a, b, workspace, rows, n, k, lda, ldb, ldd, batches, stride_a, stride_b, stride_d, transpose_a, transpose_b, CUDA_R_16BF, output_f32);
         spinLock(&self.attention_plans_mutex);
         defer self.attention_plans_mutex.unlock();
         return self.attention_plans.contains(key);
@@ -1744,6 +1745,34 @@ pub const CublasLt = struct {
         alpha_value: f32,
         input_f16: bool,
     ) Error!void {
+        return self.matmulAttentionStridedTyped(ctx, dst, a, b, workspace, rows, n, k, lda, ldb, ldd, batch_count_usize, stride_a_usize, stride_b_usize, stride_d_usize, transpose_a, transpose_b, output_f32, alpha_value, if (input_f16) .f16 else .bf16);
+    }
+
+    /// Shared strided attention GEMM with explicit operand precision. F32
+    /// retains CUBLAS_COMPUTE_32F; it never opts into FAST_TF32 or BF16 inputs.
+    pub fn matmulAttentionStridedTyped(
+        self: *CublasLt,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        a: buffer_mod.DeviceBuffer,
+        b: buffer_mod.DeviceBuffer,
+        workspace: buffer_mod.DeviceBuffer,
+        rows: usize,
+        n: usize,
+        k: usize,
+        lda: usize,
+        ldb: usize,
+        ldd: usize,
+        batch_count_usize: usize,
+        stride_a_usize: usize,
+        stride_b_usize: usize,
+        stride_d_usize: usize,
+        transpose_a: bool,
+        transpose_b: bool,
+        output_f32: bool,
+        alpha_value: f32,
+        precision: DensePrecision,
+    ) Error!void {
         try self.validateContext(ctx);
         if (rows == 0 or n == 0 or k == 0 or batch_count_usize == 0 or batch_count_usize > std.math.maxInt(i32))
             return error.CublasLtUnsupported;
@@ -1759,9 +1788,10 @@ pub const CublasLt = struct {
         const stride_a: i64 = std.math.cast(i64, stride_a_usize) orelse return error.CublasLtUnsupported;
         const stride_b: i64 = std.math.cast(i64, stride_b_usize) orelse return error.CublasLtUnsupported;
         const stride_d: i64 = std.math.cast(i64, stride_d_usize) orelse return error.CublasLtUnsupported;
-        const input_type = if (input_f16) CUDA_R_16F else CUDA_R_16BF;
+        const input_type = precision.native();
+        const input_bytes_per_element: usize = if (precision == .f32) 4 else 2;
         const output_type = if (output_f32) CUDA_R_32F else input_type;
-        const output_bytes_per_element: usize = if (output_f32) 4 else 2;
+        const output_bytes_per_element: usize = if (output_f32) 4 else input_bytes_per_element;
         const a_last_batch = std.math.mul(usize, batch_count_usize - 1, stride_a_usize) catch return error.CublasLtUnsupported;
         const a_last_row = std.math.mul(usize, a_rows - 1, lda) catch return error.CublasLtUnsupported;
         const a_elements = std.math.add(usize, std.math.add(usize, a_last_batch, a_last_row) catch return error.CublasLtUnsupported, a_cols) catch return error.CublasLtUnsupported;
@@ -1771,8 +1801,8 @@ pub const CublasLt = struct {
         const d_last_batch = std.math.mul(usize, batch_count_usize - 1, stride_d_usize) catch return error.CublasLtUnsupported;
         const d_last_row = std.math.mul(usize, rows - 1, ldd) catch return error.CublasLtUnsupported;
         const d_elements = std.math.add(usize, std.math.add(usize, d_last_batch, d_last_row) catch return error.CublasLtUnsupported, n) catch return error.CublasLtUnsupported;
-        const a_bytes = std.math.mul(usize, a_elements, 2) catch return error.CublasLtUnsupported;
-        const b_bytes = std.math.mul(usize, b_elements, 2) catch return error.CublasLtUnsupported;
+        const a_bytes = std.math.mul(usize, a_elements, input_bytes_per_element) catch return error.CublasLtUnsupported;
+        const b_bytes = std.math.mul(usize, b_elements, input_bytes_per_element) catch return error.CublasLtUnsupported;
         const d_bytes = std.math.mul(usize, d_elements, output_bytes_per_element) catch return error.CublasLtUnsupported;
         try checkRawBytes(a, a_bytes);
         try checkRawBytes(b, b_bytes);
@@ -1785,7 +1815,7 @@ pub const CublasLt = struct {
         try requireDisjoint(workspace, workspace.len, dst, d_bytes);
         if (!std.math.isFinite(alpha_value)) return error.CublasLtUnsupported;
         const use_cache = self.attention_plan_cache_enabled and self.allocator != null;
-        const key = attentionPlanKey(dst, a, b, workspace, rows, n, k, lda, ldb, ldd, batch_count_usize, stride_a_usize, stride_b_usize, stride_d_usize, transpose_a, transpose_b, input_f16, output_f32);
+        const key = attentionPlanKey(dst, a, b, workspace, rows, n, k, lda, ldb, ldd, batch_count_usize, stride_a_usize, stride_b_usize, stride_d_usize, transpose_a, transpose_b, input_type, output_f32);
         // Descriptors are immutable and never evicted. Bound host metadata and
         // serialize first-use discovery so concurrent calls cannot leak plans.
         if (use_cache) spinLock(&self.attention_plans_mutex);
@@ -2924,15 +2954,17 @@ test "attention warm plan key retains physical strides publication and alignment
     const b: buffer_mod.DeviceBuffer = .{ .ptr = 0x200000, .len = 10000000 };
     const out: buffer_mod.DeviceBuffer = .{ .ptr = 0x300000, .len = 10000000 };
     const workspace: buffer_mod.DeviceBuffer = .{ .ptr = 0x400000, .len = 33554432 };
-    const key = attentionPlanKey(out, a, b, workspace, 472, 64, 2520, 2520, 768, 768, 12, 1024 * 2520, 64, 64, false, false, false, false);
-    const original = AttentionPlanKey{ .rows = 472, .n = 64, .k = 2520, .lda = 2520, .ldb = 768, .ldd = 768, .batches = 12, .stride_a = 1024 * 2520, .stride_b = 64, .stride_d = 64, .workspace = workspace.len, .transpose_a = false, .transpose_b = false, .input_f16 = false, .output_f32 = false, .alignments = .{ stridedPointerAlignment(a.ptr, 1024 * 2520, 2, 12), stridedPointerAlignment(b.ptr, 64, 2, 12), stridedPointerAlignment(out.ptr, 64, 2, 12) } };
+    const key = attentionPlanKey(out, a, b, workspace, 472, 64, 2520, 2520, 768, 768, 12, 1024 * 2520, 64, 64, false, false, CUDA_R_16BF, false);
+    const original = AttentionPlanKey{ .rows = 472, .n = 64, .k = 2520, .lda = 2520, .ldb = 768, .ldd = 768, .batches = 12, .stride_a = 1024 * 2520, .stride_b = 64, .stride_d = 64, .workspace = workspace.len, .transpose_a = false, .transpose_b = false, .input_type = CUDA_R_16BF, .output_f32 = false, .alignments = .{ stridedPointerAlignment(a.ptr, 1024 * 2520, 2, 12), stridedPointerAlignment(b.ptr, 64, 2, 12), stridedPointerAlignment(out.ptr, 64, 2, 12) } };
     try std.testing.expectEqualDeep(original, key);
-    const f32_output = attentionPlanKey(out, a, b, workspace, 472, 64, 2520, 2520, 768, 768, 12, 1024 * 2520, 64, 64, false, false, false, true);
+    const f32_output = attentionPlanKey(out, a, b, workspace, 472, 64, 2520, 2520, 768, 768, 12, 1024 * 2520, 64, 64, false, false, CUDA_R_16BF, true);
     try std.testing.expect(!std.meta.eql(key, f32_output));
-    const other_physical = attentionPlanKey(out, a, b, workspace, 472, 64, 2340, 2340, 768, 768, 12, 1024 * 2340, 64, 64, false, false, false, false);
+    const f32_input = attentionPlanKey(out, a, b, workspace, 472, 64, 2520, 2520, 768, 768, 12, 1024 * 2520, 64, 64, false, false, CUDA_R_32F, true);
+    try std.testing.expect(!std.meta.eql(f32_output, f32_input));
+    const other_physical = attentionPlanKey(out, a, b, workspace, 472, 64, 2340, 2340, 768, 768, 12, 1024 * 2340, 64, 64, false, false, CUDA_R_16BF, false);
     try std.testing.expect(!std.meta.eql(key, other_physical));
     const shifted: buffer_mod.DeviceBuffer = .{ .ptr = out.ptr + 2, .len = out.len - 2 };
-    const other_alignment = attentionPlanKey(shifted, a, b, workspace, 472, 64, 2520, 2520, 768, 768, 12, 1024 * 2520, 64, 64, false, false, false, false);
+    const other_alignment = attentionPlanKey(shifted, a, b, workspace, 472, 64, 2520, 2520, 768, 768, 12, 1024 * 2520, 64, 64, false, false, CUDA_R_16BF, false);
     try std.testing.expect(!std.meta.eql(key, other_alignment));
 }
 

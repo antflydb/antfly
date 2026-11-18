@@ -1038,7 +1038,7 @@ test "video CUDA vision attention matches CPU softmax across frames and long seq
         const vt = try cb.fromFloat32Shape(v, &shape);
         defer cb.free(vt);
         const before = cb.trainingRuntimeStats();
-        const result = try cb.scaledDotProductAttentionGemma4Vision(qt, kt, vt, batch, seq, heads, dim);
+        const result = try cb.scaledDotProductAttentionUnmaskedF32(qt, kt, vt, batch, seq, heads, dim);
         defer cb.free(result);
         try std.testing.expectEqual(before.d2h_bytes, cb.trainingRuntimeStats().d2h_bytes);
         try std.testing.expectEqual(before.h2d_bytes, cb.trainingRuntimeStats().h2d_bytes);

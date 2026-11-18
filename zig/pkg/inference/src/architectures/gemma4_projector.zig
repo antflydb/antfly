@@ -6598,7 +6598,7 @@ fn selfAttentionBatch(
     else if (cfg.embedding_gemma2_f32_attention)
         try cb.scaledDotProductAttentionEmbeddingGemma2Vision(q, k, v, batch, sequence, cfg.head_count, head_dim)
     else
-        try cb.scaledDotProductAttentionGemma4Vision(q, k, v, batch, sequence, cfg.head_count, head_dim);
+        try cb.scaledDotProductAttentionUnmaskedF32(q, k, v, batch, sequence, cfg.head_count, head_dim);
     defer cb.free(attn);
     try profile.phase(cb, "attention");
 
