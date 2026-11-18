@@ -113,6 +113,24 @@ pub const TableIndexCatalog = struct {
 };
 
 pub const RangeRecord = struct {
+    /// The empty witness is the historical representation. Canonical staged
+    /// plans must keep their original digest across reader upgrades.
+    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "restore_admission_fingerprint") and
+            std.mem.allEqual(u8, &self.restore_admission_fingerprint, 0);
+    }
+
+    pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (!self.nativeJsonSkipField(name)) {
+                try stream.objectField(name);
+                try stream.write(@field(self, name));
+            }
+        }
+        try stream.endObject();
+    }
+
     group_id: u64,
     range_id: u64 = 0,
     table_id: u64,
@@ -143,6 +161,8 @@ pub const RangeRecord = struct {
     /// Durable, bounded idempotency provenance for the most recently
     /// completed restore. Active replica progress can be garbage-collected
     /// without making an exact job retry ambiguous.
+    /// Admission ownership retained through publication, cleanup and splits.
+    restore_admission_fingerprint: RestoreCompletionFingerprint = empty_restore_completion_fingerprint,
     completed_restore_fingerprint: RestoreCompletionFingerprint =
         empty_restore_completion_fingerprint,
 };

@@ -3230,7 +3230,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
 /// Publish the restored physical incarnation and its logical binding together.
 /// Job retries are accepted only when both projections match exactly.
 pub fn restore(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, target: domain.Target, table: table_manager.TableRecord, source_ranges: []const table_manager.RangeRecord) !void {
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.system_catalog_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.restoreAdmissionDecoderVersion(source_ranges, protocol.system_catalog_version));
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);

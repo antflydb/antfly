@@ -2027,33 +2027,36 @@ pub fn readManifestFromLocationWithArtifactBackupId(
     backup_id: []const u8,
     artifact_backup_id: []const u8,
 ) !TableBackupManifest {
+    return readManifestFromLocationWithDigest(alloc, location, backup_id, artifact_backup_id, null);
+}
+
+pub const TableManifestDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+
+pub fn readManifestFromLocationWithDigest(
+    alloc: std.mem.Allocator,
+    location: *BackupLocation,
+    backup_id: []const u8,
+    artifact_backup_id: []const u8,
+    digest: ?*TableManifestDigest,
+) !TableBackupManifest {
     try validateBackupId(artifact_backup_id);
-    switch (location.*) {
-        .file => |backup_root| {
+    const body = switch (location.*) {
+        .file => |backup_root| blk: {
             const path = try metadataPath(alloc, backup_root, backup_id);
             defer alloc.free(path);
-            const body = try readFileAbsoluteAlloc(alloc, path, max_backup_manifest_bytes);
-            defer alloc.free(body);
-            return try parseTableBackupManifestWithArtifactBackupId(
-                alloc,
-                body,
-                backup_id,
-                artifact_backup_id,
-            );
+            break :blk try readFileAbsoluteAlloc(alloc, path, max_backup_manifest_bytes);
         },
-        .remote => |*store| {
+        .remote => |*store| blk: {
             const suffix = try metadataPath(alloc, "", backup_id);
             defer alloc.free(suffix);
-            const body = try store.readBytesAllocLimited(alloc, trimLeftSlash(suffix), max_backup_manifest_bytes);
-            defer alloc.free(body);
-            return parseTableBackupManifestWithArtifactBackupId(
-                alloc,
-                body,
-                backup_id,
-                artifact_backup_id,
-            );
+            break :blk try store.readBytesAllocLimited(alloc, trimLeftSlash(suffix), max_backup_manifest_bytes);
         },
-    }
+    };
+    defer alloc.free(body);
+    var manifest = try parseTableBackupManifestWithArtifactBackupId(alloc, body, backup_id, artifact_backup_id);
+    manifest.restore_admission_fingerprint = null;
+    if (digest) |out| std.crypto.hash.sha2.Sha256.hash(body, out, .{});
+    return manifest;
 }
 
 pub fn parseTableBackupManifest(
@@ -2085,7 +2088,9 @@ pub fn parseTableBackupManifestWithArtifactBackupId(
         var parsed = try std.json.parseFromSlice(TableBackupManifest, alloc, body, .{ .allocate = .alloc_always });
         defer parsed.deinit();
         try validatePublishedTableManifest(alloc, &parsed.value, backup_id);
-        return try cloneTableBackupManifest(alloc, parsed.value);
+        var source_manifest = try cloneTableBackupManifest(alloc, parsed.value);
+        source_manifest.restore_admission_fingerprint = null;
+        return source_manifest;
     }
     return try parseGoPortableTableManifest(alloc, root, backup_id, artifact_backup_id);
 }
@@ -3315,6 +3320,7 @@ pub fn cloneTableBackupManifest(alloc: std.mem.Allocator, manifest: TableBackupM
         .backup_id = try alloc.dupe(u8, manifest.backup_id),
         .table_name = try alloc.dupe(u8, manifest.table_name),
         .table_id = manifest.table_id,
+        .restore_admission_fingerprint = manifest.restore_admission_fingerprint,
         .description = try alloc.dupe(u8, manifest.description),
         .schema_json = try alloc.dupe(u8, manifest.schema_json),
         .read_schema_json = try alloc.dupe(u8, manifest.read_schema_json),
@@ -3822,6 +3828,22 @@ pub const max_restore_source_identity_bytes: usize = 4096;
 /// generation. Canonicalization makes equivalent accepted spellings (such as
 /// gcs:// and gs://, redundant file path components, or trailing object-store
 /// separators) share one idempotency key.
+const publication_identity_prefix = "antfly-restore-job/v1/";
+
+/// Bind a physical publication receipt to one durable admission incarnation.
+/// The archive URI remains independent and is still used for source access.
+pub fn restorePublicationIdentityAlloc(alloc: std.mem.Allocator, job_id: u64, admission_nonce: []const u8, location: []const u8) ![]u8 {
+    if (job_id == 0 or admission_nonce.len != 32 or std.mem.startsWith(u8, location, publication_identity_prefix)) return error.InvalidBackupRequest;
+    for (admission_nonce) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return error.InvalidBackupRequest;
+    }
+    const canonical = try canonicalRestoreSourceIdentityAlloc(alloc, location);
+    defer alloc.free(canonical);
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(canonical, &hash, .{});
+    return std.fmt.allocPrint(alloc, "{s}{x:0>16}/{s}/{s}", .{ publication_identity_prefix, job_id, admission_nonce, std.fmt.bytesToHex(hash, .lower) });
+}
+
 pub fn canonicalRestoreSourceIdentityAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
     if (raw.len == 0 or raw.len > max_restore_source_identity_bytes)
         return error.InvalidBackupRequest;
@@ -3829,6 +3851,18 @@ pub fn canonicalRestoreSourceIdentityAlloc(alloc: std.mem.Allocator, raw: []cons
         if (byte < 0x20 or byte == 0x7f) return error.InvalidBackupRequest;
     }
     if (std.mem.indexOfAny(u8, raw, "?#") != null) return error.InvalidBackupRequest;
+
+    if (std.mem.startsWith(u8, raw, publication_identity_prefix)) {
+        const suffix = raw[publication_identity_prefix.len..];
+        if (suffix.len != 114 or suffix[16] != '/' or suffix[49] != '/') return error.InvalidBackupRequest;
+        for (suffix, 0..) |byte, index| {
+            if (index == 16 or index == 49) continue;
+            if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return error.InvalidBackupRequest;
+        }
+        const job = std.fmt.parseInt(u64, suffix[0..16], 16) catch return error.InvalidBackupRequest;
+        if (job == 0) return error.InvalidBackupRequest;
+        return alloc.dupe(u8, raw);
+    }
 
     const normalized = normalizeRemoteLocationAlloc(alloc, raw) catch |err| switch (err) {
         error.OutOfMemory => return err,

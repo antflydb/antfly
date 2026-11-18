@@ -209,6 +209,7 @@ pub const Server = struct {
             .received_lsn = received_lsn,
             .applied_lsn = applied_lsn,
             .safe_read_lsn = safe_read_lsn,
+            .restore_job_format = parsed.value.restore_job_format orelse 0,
         }) catch |err| return try commandErrorResponse(response_alloc, err);
         return try jsonResponse(response_alloc, response);
     }
@@ -622,6 +623,16 @@ test "storage.hot_standby internal http adapter serves replication pull and stat
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+
+    try std.testing.expect(!primary.slots.supportsRestoreJobFormat(1, 5));
+    var upgraded = try server.handle(.{
+        .method = .POST,
+        .uri = internal_api.routes.standby_replication_status,
+        .body = "{\"slot_name\":\"standby-a\",\"timeline_id\":1,\"received_lsn\":1,\"applied_lsn\":1,\"restore_job_format\":5}",
+    });
+    defer upgraded.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), upgraded.status);
+    try std.testing.expect(primary.slots.supportsRestoreJobFormat(1, 5));
 }
 
 test "storage.hot_standby internal http adapter reports seeding slot as a lifecycle conflict" {

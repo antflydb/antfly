@@ -1600,7 +1600,7 @@ const LocalStandaloneMetadata = struct {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        return (self.lifecycle_store orelse return error.UnsupportedOperation).getRestoreJobValue(alloc, group_ids.main_metadata_group_id, key);
+        return (self.lifecycle_store orelse return error.UnsupportedOperation).getRestoreJobRecord(alloc, group_ids.main_metadata_group_id, key);
     }
     fn applyJobCommandLocked(self: *LocalStandaloneMetadata, command: @import("../metadata/storage/raft_apply_store.zig").TransitionCommand) !void {
         const store = self.lifecycle_store orelse return error.UnsupportedOperation;
@@ -1638,17 +1638,28 @@ const LocalStandaloneMetadata = struct {
         defer locked.deinit();
         try self.requireRestoreJobTermLocked(term);
         try self.applyJobCommandLocked(.{ .upsert_restore_job = .{ .key = key, .value = value } });
-        const actual = (try self.lifecycle_store.?.getRestoreJobValue(self.alloc, group_ids.main_metadata_group_id, key)) orelse return error.RestoreJobCommitNotApplied;
+        const actual = (try self.lifecycle_store.?.getRestoreJobRecord(self.alloc, group_ids.main_metadata_group_id, key)) orelse return error.RestoreJobCommitNotApplied;
         defer self.alloc.free(actual);
         if (!std.mem.eql(u8, actual, value)) return error.RestoreJobCommitNotApplied;
+    }
+    fn requireStandbyRestoreJobFormatLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, value: []const u8) !void {
+        const server = self.hot_standby_catalog_server orelse return;
+        const jobs = antfly.public_api.restore_jobs;
+        if (!try jobs.requiresPinnedRestoreWorker(alloc, value)) return;
+        lockAtomic(&server.hot_standby_state_mutex);
+        defer server.hot_standby_state_mutex.unlock();
+        const primary = server.hot_standby_cfg.internal_primary orelse return error.NotLeader;
+        if (!primary.slots.supportsRestoreJobFormat(primary.identity.timeline_id, jobs.pinned_restore_job_format_version))
+            return error.TableTopologyProtocolUpgradeRequired;
     }
     fn restoreJobsCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, term: u64) ![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         var locked = try self.lockMutation();
         defer locked.deinit();
         try self.requireRestoreJobTermLocked(term);
+        try self.requireStandbyRestoreJobFormatLocked(alloc, value);
         try self.applyJobCommandLocked(.{ .create_restore_job = .{ .key = key, .value = value } });
-        return (try self.lifecycle_store.?.getRestoreJobValue(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
+        return (try self.lifecycle_store.?.getRestoreJobRecord(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
     }
     fn restoreJobsCreateWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan_json: []const u8, term: u64) ![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
@@ -1656,8 +1667,9 @@ const LocalStandaloneMetadata = struct {
         defer locked.deinit();
         if (!self.coordinated_lifecycle_allowed) return error.CoordinatedStandaloneHAMetadataRequired;
         try self.requireRestoreJobTermLocked(term);
+        try self.requireStandbyRestoreJobFormatLocked(alloc, value);
         try self.applyJobCommandLocked(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan_json } });
-        return (try self.lifecycle_store.?.getRestoreJobValue(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
+        return (try self.lifecycle_store.?.getRestoreJobRecord(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
     }
     fn restoreJobsDelete(ptr: *anyopaque, key: []const u8, term: u64) !void {
         return restoreJobsDeleteMany(ptr, &.{key}, term);

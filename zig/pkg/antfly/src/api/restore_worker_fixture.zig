@@ -82,6 +82,7 @@ const Fixture = struct {
     target_paths: [3][]const u8 = undefined,
     target_open: [3]bool = @splat(false),
     restart_after_commit: bool = false,
+    publication_reply_gap: bool = false,
     validation_route_gaps: usize = 0,
     faults_seen: [3]u8 = @splat(0),
     remote_calls: usize = 0,
@@ -332,6 +333,10 @@ const Fixture = struct {
         // Only publication and validation assert the metadata phase. A
         // linearizable progress read on every begin/import page adds a
         // fixture-only metadata round trip absent from the production owner.
+        if (request.action == .publish and self.publication_reply_gap) {
+            self.publication_reply_gap = false;
+            return error.Timeout;
+        }
         if (request.action == .publish or request.action == .validate) {
             const progress = (try self.source.getRestoreStagingProgress(alloc, request.scope.plan_id, context)).?;
             try std.testing.expectEqual(if (request.action == .publish) stages.State.published else stages.State.validating, progress.state);
@@ -805,7 +810,7 @@ pub fn runWithPersistence(comptime Driver: type, invalid_child: bool, override: 
     return runWithPolicy(Driver, invalid_child, override, persistence, .{});
 }
 
-pub const Policy = struct { failover_safe: bool = false, guard: ?http.RestoreExecutionGuard = null, gate: ?db.ReplicationWriteGate = null, mirror: ?db.ReplicationAsyncEffectMirror = null, term: u64 = 1, portable: bool = false, restart_after_commit: bool = false, table_restore: bool = false, migration: bool = false, generated: bool = false, remote_owner: bool = false, benchmark_rows: usize = 1, benchmark_deadline_ms: u32 = 30_000, validation_route_gaps: usize = 0 };
+pub const Policy = struct { failover_safe: bool = false, guard: ?http.RestoreExecutionGuard = null, gate: ?db.ReplicationWriteGate = null, mirror: ?db.ReplicationAsyncEffectMirror = null, term: u64 = 1, portable: bool = false, restart_after_commit: bool = false, table_restore: bool = false, migration: bool = false, generated: bool = false, remote_owner: bool = false, benchmark_rows: usize = 1, benchmark_deadline_ms: u32 = 30_000, validation_route_gaps: usize = 0, remove_connection_after_publication: bool = false };
 
 fn generatedSchema(alloc: std.mem.Allocator, input: []const u8, default_base: []const u8) ![]const u8 {
     var schema = try std.json.parseFromSlice(std.json.Value, alloc, input, .{});
@@ -937,7 +942,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     var raft = raft_engine.core.MemoryStorage.init(alloc);
     defer raft.deinit();
     var svc: metadata_service.MetadataService = undefined;
-    var fixture: Fixture = .{ .alloc = alloc, .raft = &raft, .runtime = &runtime, .non_raft = override != null, .restart_after_commit = policy.restart_after_commit, .owner_count = if (policy.table_restore) 1 else 3, .validation_route_gaps = policy.validation_route_gaps };
+    var fixture: Fixture = .{ .alloc = alloc, .raft = &raft, .runtime = &runtime, .non_raft = override != null, .restart_after_commit = policy.restart_after_commit, .owner_count = if (policy.table_restore) 1 else 3, .validation_route_gaps = policy.validation_route_gaps, .publication_reply_gap = policy.remove_connection_after_publication };
     var opened: usize = 0;
     defer for (fixture.dbs[0..opened], 0..) |target, i| {
         if (fixture.target_open[i]) target.close();
@@ -1124,7 +1129,19 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     // owner imports hundreds of rows within the same CPU quantum.
     const corpus_slice_budget = 120 + 8 * policy.benchmark_rows * fixture.owner_count;
     const slice_budget = @max(corpus_slice_budget, if (policy.restart_after_commit) @as(usize, 6000) else 120);
+    var connection_removed = false;
     for (0..slice_budget) |_| {
+        if (policy.remove_connection_after_publication and !connection_removed) {
+            const staged = (try source.getRestoreStaging(a, plan_id, .{})) orelse return error.RestoreStagingScopeChanged;
+            const live = try std.json.parseFromSlice(stages.Job, a, staged, .{});
+            if (live.value.state == .published) {
+                const current = (try server.restore_job_store.loadRecord(a, worker.value.job_id)).?;
+                const saved = try std.json.parseFromSlice(restore_jobs.JobState, a, current, .{});
+                try std.testing.expectEqual(restore_jobs.StagingResolution.active, saved.value.staging_resolution);
+                server.cfg.node_config = null;
+                connection_removed = true;
+            }
+        }
         try Driver.work(&server, worker.value.job_id);
         // A routing/authentication setup error is not a simulated owner retry.
         // Fail promptly with the first bounded HTTP diagnostic above instead
@@ -1141,6 +1158,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         }
         if (state.value.phase == .succeeded) {
             try std.testing.expect(!invalid_child);
+            if (policy.remove_connection_after_publication) try std.testing.expect(connection_removed);
             if (policy.portable and !policy.table_restore) {
                 var parent_progress = (try fixture.dbs[0].restoreStagingStatus(a)) orelse return error.RestoreSourceProofMissing;
                 defer parent_progress.deinit();
@@ -1260,7 +1278,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     }
     try std.testing.expectEqual(fixture.owner_count, published.tables.len);
     try std.testing.expect(fixture.imports >= fixture.owner_count and fixture.validations >= fixture.owner_count and fixture.sequence > 0);
-    if (policy.restart_after_commit) try std.testing.expect(fixture.publications >= fixture.owner_count) else try std.testing.expectEqual(fixture.owner_count, fixture.publications);
+    if (policy.restart_after_commit or policy.remove_connection_after_publication) try std.testing.expect(fixture.publications >= fixture.owner_count) else try std.testing.expectEqual(fixture.owner_count, fixture.publications);
     for (fixture.dbs[0..fixture.owner_count]) |target| {
         var row = (try target.lookup(alloc, "row", .{})).?;
         defer row.deinit(alloc);

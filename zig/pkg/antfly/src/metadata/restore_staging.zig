@@ -74,6 +74,30 @@ test "graph retirement digest matches production index config extraction for exp
     }
 }
 pub const ProvisioningProjection = @import("restore_provisioning_contract.zig").ProvisioningProjection;
+
+/// Only plans carrying the new range witness need the v2 data reader. Empty
+/// witnesses preserve both the historical plan digest and v1 placement.
+pub fn admissionReaderGroups(alloc: std.mem.Allocator, projection: ProvisioningProjection) ![]u64 {
+    var groups: std.ArrayList(u64) = .empty;
+    errdefer groups.deinit(alloc);
+    for (projection.jobs_json) |bytes| {
+        const job = try std.json.parseFromSlice(Job, alloc, bytes, .{});
+        defer job.deinit();
+        var required = false;
+        for (job.value.plan.targets) |target| {
+            for (target.ranges) |range| required = required or !std.mem.allEqual(u8, &range.restore_admission_fingerprint, 0);
+            if (target.replace) |old| for (old.ranges) |range| {
+                required = required or !std.mem.allEqual(u8, &range.restore_admission_fingerprint, 0);
+            };
+        }
+        for (job.value.plan.external_fk_parents) |parent| for (parent.ranges) |range| {
+            required = required or !std.mem.allEqual(u8, &range.restore_admission_fingerprint, 0);
+        };
+        if (required) for (job.value.plan.targets) |target| for (target.ranges) |range| try groups.append(alloc, range.group_id);
+    }
+    return groups.toOwnedSlice(alloc);
+}
+
 pub const ProvisioningRequest = struct { node_id: u64 };
 
 pub fn scopeProvisioningForNode(alloc: std.mem.Allocator, projection: ProvisioningProjection, node_id: u64, placements: []const @import("../raft/reconciler.zig").PlacementIntent) !ProvisioningProjection {

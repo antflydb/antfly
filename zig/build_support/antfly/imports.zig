@@ -428,6 +428,7 @@ pub const AntflyRootImports = struct {
         @import("../embedded/source_owner.zig").registerStorageIndependent(mod);
         mod.addImport("antfly_platform", self.platform);
         mod.addImport("antfly_cancellation", self.cancellation);
+        mod.addImport("antfly_inference_execution_context", self.inference_execution_context);
         mod.addImport("antfly_template_content", implementation.template_content);
         mod.addImport("antfly_runtime_fs", self.runtime_fs);
         mod.link_libc = link_libc;

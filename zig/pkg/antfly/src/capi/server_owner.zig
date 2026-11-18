@@ -3238,7 +3238,10 @@ pub fn metadataApplyStoreProjection(
             break :blk .ok;
         },
         .restore_job_value => blk: {
-            const value = handle.store.getRestoreJobValue(alloc, request.group_id, request.key.slice()) catch |err|
+            const value = (if (request.arg0 == 1)
+                handle.store.getRestoreJobRecord(alloc, request.group_id, request.key.slice())
+            else
+                handle.store.getRestoreJobValue(alloc, request.group_id, request.key.slice())) catch |err|
                 break :blk storageOwnerStatusFromError(err);
             defer if (value) |bytes| alloc.free(bytes);
             break :blk metadataProjectionJson(alloc, out_json, value);

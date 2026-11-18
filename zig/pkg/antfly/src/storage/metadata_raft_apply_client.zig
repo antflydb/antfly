@@ -1727,6 +1727,12 @@ pub const RaftApplyStore = struct {
         return try alloc.dupe(u8, response.slice());
     }
 
+    pub fn getRestoreJobRecord(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
+        // arg0 selects the compact row for checkpoint acknowledgement without
+        // transporting or hashing the immutable inputs again.
+        return try self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .restore_job_value, .group_id = group_id, .key = .fromSlice(logical_key), .arg0 = 1 });
+    }
+
     pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {
         return try self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .restore_job_value, .group_id = group_id, .key = .fromSlice(key) });
     }

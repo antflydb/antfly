@@ -50,17 +50,23 @@ test "native restore publication waits for every target store capability" {
         .{ .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 12 }, .store_id = 102 },
     };
     var stores = [_]table_manager.StoreRecord{
-        .{ .store_id = 101, .node_id = 11, .native_generation_restore_version = table_manager.native_generation_restore_base_protocol_version },
-        .{ .store_id = 102, .node_id = 12 },
+        .{ .store_id = 101, .node_id = 11, .native_generation_restore_version = table_manager.native_generation_restore_protocol_version },
+        .{ .store_id = 102, .node_id = 12, .native_generation_restore_version = 1 },
     };
 
-    var capabilities = try NativeRestoreCapabilityIndex.init(std.testing.allocator, &stores, &.{range}, &placements);
+    // Historical plans continue to work with v1 readers during rolling upgrades.
+    var legacy = try NativeRestoreCapabilityIndex.init(std.testing.allocator, &stores, &.{range}, &placements, &.{});
+    defer legacy.deinit();
+    try std.testing.expect(legacy.rangeTargetsCapable(range));
+    try std.testing.expect(legacy.placementTargetCapable(placements[1]));
+
+    var capabilities = try NativeRestoreCapabilityIndex.init(std.testing.allocator, &stores, &.{range}, &placements, &.{77});
     defer capabilities.deinit();
     try std.testing.expect(!capabilities.rangeTargetsCapable(range));
     try std.testing.expect(!capabilities.placementTargetCapable(placements[1]));
     capabilities.deinit();
-    stores[1].native_generation_restore_version = table_manager.native_generation_restore_base_protocol_version;
-    capabilities = try NativeRestoreCapabilityIndex.init(std.testing.allocator, &stores, &.{range}, &placements);
+    stores[1].native_generation_restore_version = table_manager.native_generation_restore_protocol_version;
+    capabilities = try NativeRestoreCapabilityIndex.init(std.testing.allocator, &stores, &.{range}, &placements, &.{77});
     try std.testing.expect(capabilities.rangeTargetsCapable(range));
     try std.testing.expect(capabilities.placementTargetCapable(placements[1]));
 }
@@ -89,6 +95,7 @@ pub const CurrentMetadataState = struct {
     /// Plan-bound hidden initial child groups from the private provisioning
     /// projection. Never upsert these tables/ranges into the public catalog.
     initial_fk_owner_group_ids: []const u64 = &.{},
+    admission_reader_group_ids: []const u64 = &.{},
     stores: []const table_manager.StoreRecord = &.{},
     merged_group_statuses: []const MergedGroupStatus = &.{},
     restore_progresses: []const table_manager.RestoreProgressRecord = &.{},
@@ -475,6 +482,7 @@ pub const Reconciler = struct {
             current.stores,
             desired_ranges,
             desired_placements,
+            current.admission_reader_group_ids,
         );
         defer native_restore_capabilities.deinit();
         var membership_index = try MembershipTransitionIndex.init(self.alloc, current, desired_placements, &evidence);
@@ -1448,11 +1456,12 @@ fn rangeCarriesNativeRestoreIdentity(range: table_manager.RangeRecord) bool {
 
 const NativeRestoreCapabilityIndex = struct {
     alloc: std.mem.Allocator,
-    capable_store_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
-    capable_node_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    capable_store_ids: std.AutoHashMapUnmanaged(u64, u16) = .empty,
+    capable_node_ids: std.AutoHashMapUnmanaged(u64, u16) = .empty,
     groups: std.AutoHashMapUnmanaged(u64, GroupTargets) = .empty,
 
     const GroupTargets = struct {
+        required_version: u16 = 1,
         count: usize = 0,
         all_capable: bool = true,
     };
@@ -1462,18 +1471,23 @@ const NativeRestoreCapabilityIndex = struct {
         stores: []const table_manager.StoreRecord,
         ranges: []const table_manager.RangeRecord,
         placements: []const raft_reconciler.PlacementIntent,
+        admission_groups: []const u64,
     ) !NativeRestoreCapabilityIndex {
         var index = NativeRestoreCapabilityIndex{ .alloc = alloc };
         errdefer index.deinit();
         for (stores) |store| {
-            if (store.native_generation_restore_version <
-                table_manager.native_generation_restore_base_protocol_version) continue;
-            try index.capable_store_ids.put(alloc, store.store_id, {});
-            try index.capable_node_ids.put(alloc, store.node_id, {});
+            try index.capable_store_ids.put(alloc, store.store_id, store.native_generation_restore_version);
+            const previous = index.capable_node_ids.get(store.node_id) orelse 0;
+            try index.capable_node_ids.put(alloc, store.node_id, @max(previous, store.native_generation_restore_version));
         }
         for (ranges) |range| {
             if (rangeCarriesNativeRestoreIdentity(range))
                 try index.groups.put(alloc, range.group_id, .{});
+        }
+        for (admission_groups) |group_id| {
+            const group = try index.groups.getOrPut(alloc, group_id);
+            if (!group.found_existing) group.value_ptr.* = .{};
+            group.value_ptr.required_version = table_manager.native_generation_restore_protocol_version;
         }
         for (placements) |intent| {
             const targets = index.groups.getPtr(intent.record.group_id) orelse continue;
@@ -1491,8 +1505,9 @@ const NativeRestoreCapabilityIndex = struct {
     }
 
     fn targetCapable(self: *const NativeRestoreCapabilityIndex, intent: raft_reconciler.PlacementIntent) bool {
-        if (intent.store_id != 0) return self.capable_store_ids.contains(intent.store_id);
-        return self.capable_node_ids.contains(intent.record.local_node_id);
+        const required = (self.groups.get(intent.record.group_id) orelse return true).required_version;
+        if (intent.store_id != 0) return (self.capable_store_ids.get(intent.store_id) orelse 0) >= required;
+        return (self.capable_node_ids.get(intent.record.local_node_id) orelse 0) >= required;
     }
 
     fn placementTargetCapable(self: *const NativeRestoreCapabilityIndex, intent: raft_reconciler.PlacementIntent) bool {
@@ -1501,8 +1516,7 @@ const NativeRestoreCapabilityIndex = struct {
     }
 
     fn rangeTargetsCapable(self: *const NativeRestoreCapabilityIndex, range: table_manager.RangeRecord) bool {
-        if (!rangeCarriesNativeRestoreIdentity(range)) return true;
-        const targets = self.groups.get(range.group_id) orelse return false;
+        const targets = self.groups.get(range.group_id) orelse return !rangeCarriesNativeRestoreIdentity(range);
         // Never publish a native identity before an explicit owner generation
         // exists and every owner can consume it.
         return targets.count != 0 and targets.all_capable;
@@ -3996,6 +4010,7 @@ fn rangeRecordsEqual(a: table_manager.RangeRecord, b: table_manager.RangeRecord)
         std.mem.eql(u8, a.restore_artifact_sha256, b.restore_artifact_sha256) and
         a.restore_native_manifest_size_bytes == b.restore_native_manifest_size_bytes and
         std.mem.eql(u8, a.restore_native_manifest_sha256, b.restore_native_manifest_sha256) and
+        std.mem.eql(u8, &a.restore_admission_fingerprint, &b.restore_admission_fingerprint) and
         std.mem.eql(
             u8,
             &a.completed_restore_fingerprint,
