@@ -330,6 +330,18 @@ pub const Storage = struct {
         return state;
     }
 
+    /// Catalog publication may reference only an activated incarnation whose
+    /// activation certificate is visible in the same storage snapshot.
+    pub fn requireActive(txn: anytype, id: Digest) !State {
+        const state = load(txn, id) catch |err| {
+            if (err == error.NotFound) return error.GraphConstraintNotReady;
+            return err;
+        };
+        if (state.phase != .active) return error.GraphConstraintNotReady;
+        _ = try Contributions.readActivationCertificate(txn, id);
+        return state;
+    }
+
     pub fn create(txn: anytype, id: Digest, epoch: u64) !void {
         const key = stateKey(id);
         if (txn.get(&key)) |_| {
@@ -1011,13 +1023,18 @@ pub const Contributions = struct {
         try txn.put(&activationCertificateKey(id), &activationCertificate(id, proof));
     }
 
-    fn requireActivationCertificate(txn: anytype, id: Digest, proof: ?ActivationProof) !void {
+    fn readActivationCertificate(txn: anytype, id: Digest) ![33]u8 {
         const raw = txn.get(&activationCertificateKey(id)) catch |err| {
             if (err == error.NotFound) return error.GraphConstraintNotReady;
             return err;
         };
         if (raw.len != 33 or raw[0] > 1) return error.InvalidDagAuthority;
-        if (!std.mem.eql(u8, raw, &activationCertificate(id, proof))) return error.GraphConstraintRevisionChanged;
+        return raw[0..33].*;
+    }
+
+    fn requireActivationCertificate(txn: anytype, id: Digest, proof: ?ActivationProof) !void {
+        const raw = try readActivationCertificate(txn, id);
+        if (!std.mem.eql(u8, &raw, &activationCertificate(id, proof))) return error.GraphConstraintRevisionChanged;
     }
 
     /// Call only after the fenced snapshot reader has certified end of input
@@ -1450,7 +1467,9 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     try txn.put(edge, "");
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, id, 1));
     try txn.delete(edge);
+    try std.testing.expectError(error.GraphConstraintNotReady, Storage.requireActive(&txn, id));
     try Storage.activateNewIncarnation(&txn, id, 1);
+    _ = try Storage.requireActive(&txn, id);
     var epoch: u64 = 1;
     for ([_][]const Contributions.Replacement{ &initial, &transfer, &remove }, 0..) |replacements, revision| {
         var attempt = testAttempt(@intCast(revision + 1));

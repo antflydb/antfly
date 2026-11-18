@@ -47,7 +47,9 @@ constrained domain and transaction identity. A co-located writer can stage
 validation, the terminal authority receipt, and publication effects in one
 physical transaction. The ordered graph publication writer invokes this path
 after its source and contender guards when a co-located binding exists for the
-producer incarnation. The catalog still needs to provision those bindings.
+producer incarnation. Binding installation and publication both require a
+visible active authority and its activation certificate. The catalog still
+needs to provision those bindings from the declared index configuration.
 An existing distributed reservation remains under the original coordinator,
 and the publication coordinator still needs to enlist the authority under the source and contender guards, and document-derived
 and explicit writers still need to supply their final contributions. The authority also stages bounded activation pages into a private

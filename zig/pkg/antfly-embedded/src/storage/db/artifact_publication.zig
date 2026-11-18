@@ -1230,10 +1230,7 @@ pub const PreparedEffects = struct {
         var witness: validation.Witness = .{};
         for (binding.edge_types) |edge_type| {
             const id = try dag.domain(binding.table_identity, command.producer_generation, command.producer_name, edge_type);
-            const state = dag.Storage.load(txn, id) catch |err| {
-                if (err == error.NotFound) return error.GraphConstraintNotReady;
-                return err;
-            };
+            const state = try dag.Storage.requireActive(txn, id);
             const vote = (try self.dagPrepare(command, binding.table_identity, edge_type, state.owner_epoch, state.revision, transaction)) orelse continue;
             _ = try vote.stagePublication(alloc, txn, &budget, &witness);
         }
@@ -1265,6 +1262,11 @@ pub const LocalDagBinding = struct {
     pub fn stage(self: LocalDagBinding, alloc: std.mem.Allocator, txn: anytype, command: Command) !void {
         if (command.producer_kind != .graph or command.producer_generation == 0) return error.InvalidDagDomain;
         try self.validate();
+        const dag = @import("../../graph/dag_authority.zig");
+        for (self.edge_types) |edge_type| {
+            const domain = try dag.domain(self.table_identity, command.producer_generation, command.producer_name, edge_type);
+            _ = try dag.Storage.requireActive(txn, domain);
+        }
         const raw = try std.json.Stringify.valueAlloc(alloc, self, .{ .emit_strings_as_arrays = true });
         defer alloc.free(raw);
         if (raw.len > local_dag_max_bytes) return error.GraphConstraintCapacity;

@@ -169,9 +169,12 @@ test "ordered artifact inventory graph publication validates guards generations 
         {
             var writer = try store.beginWriteTxn();
             errdefer writer.abort();
+            const binding: publication.LocalDagBinding = .{ .table_identity = @splat(2), .edge_types = &.{"links"} };
+            try std.testing.expectError(error.GraphConstraintNotReady, binding.stage(alloc, &writer, command));
             try dag.Storage.create(&writer, request.domain, 1);
+            try std.testing.expectError(error.GraphConstraintNotReady, binding.stage(alloc, &writer, command));
             try dag.Storage.activateNewIncarnation(&writer, request.domain, 1);
-            try (publication.LocalDagBinding{ .table_identity = @splat(2), .edge_types = &.{"links"} }).stage(alloc, &writer, command);
+            try binding.stage(alloc, &writer, command);
             try result.stageLocalDag(alloc, &writer, command);
             try writer.put(edge_key, edge);
             try writer.commit();
