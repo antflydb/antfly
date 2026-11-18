@@ -573,6 +573,13 @@ pub const Backend = struct {
         // never calls `setDurable(false)` keeps committing durably, exactly
         // as before this field existed.
         durable: bool = true,
+        // `get` hands out bytes owned by the current tree. A later `put` or
+        // `delete` in this transaction replaces that tree, and releasing it
+        // would free a node this transaction wrote earlier and then read
+        // back. Trees replaced after such a read stay alive here until the
+        // transaction ends, which is as long as a `get` result may be used.
+        read_since_write: bool = false,
+        borrowed_trees: std.ArrayListUnmanaged(ordered.Tree) = .empty,
 
         fn open(backend: *Backend, read_only: bool) !NamespaceTxn {
             lockBackend(backend);
@@ -607,7 +614,26 @@ pub const Backend = struct {
                 self.backend.mutex.unlock();
                 self.rc = null;
             }
+            self.releaseBorrowedTrees();
             self.pending_arena.deinit();
+        }
+
+        fn releaseBorrowedTrees(self: *NamespaceTxn) void {
+            for (self.borrowed_trees.items) |*tree| tree.release(self.allocator);
+            self.borrowed_trees.deinit(self.allocator);
+            self.borrowed_trees = .empty;
+        }
+
+        /// Installs `next` as this transaction's tree, keeping the replaced
+        /// tree alive when a `get` may still be borrowing from it. Capacity
+        /// for that is reserved by the caller before `next` is built.
+        fn replaceTree(self: *NamespaceTxn, next: ordered.Tree) void {
+            const state = &self.rc.?.state;
+            if (self.read_since_write) {
+                self.borrowed_trees.appendAssumeCapacity(state.tree);
+                self.read_since_write = false;
+            } else state.tree.release(self.allocator);
+            state.tree = next;
         }
 
         pub fn abort(self: *NamespaceTxn) void {
@@ -720,16 +746,20 @@ pub const Backend = struct {
             self.backend.mutex.unlock();
             self.rc = null;
             self.closed = true;
+            self.releaseBorrowedTrees();
             self.pending_arena.deinit();
         }
 
         pub fn get(self: *NamespaceTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
-            return try self.rc.?.state.get(namespace, key);
+            const value = try self.rc.?.state.get(namespace, key);
+            self.read_since_write = true;
+            return value;
         }
 
         pub fn put(self: *NamespaceTxn, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
             if (self.read_only) return error.ReadOnly;
-            try self.rc.?.state.put(self.allocator, namespace, key, value);
+            if (self.read_since_write) try self.borrowed_trees.ensureUnusedCapacity(self.allocator, 1);
+            self.replaceTree(try self.rc.?.state.tree.put(self.allocator, namespace.name, key, value));
             try self.pending.append(self.pending_arena.allocator(), .{
                 .namespace = try dupeOpt(self.pending_arena.allocator(), namespace.name),
                 .key = try self.pending_arena.allocator().dupe(u8, key),
@@ -739,7 +769,8 @@ pub const Backend = struct {
 
         pub fn delete(self: *NamespaceTxn, namespace: backend_types.Namespace, key: []const u8) !void {
             if (self.read_only) return error.ReadOnly;
-            try self.rc.?.state.delete(self.allocator, namespace, key);
+            if (self.read_since_write) try self.borrowed_trees.ensureUnusedCapacity(self.allocator, 1);
+            self.replaceTree(try self.rc.?.state.tree.remove(self.allocator, namespace.name, key));
             try self.pending.append(self.pending_arena.allocator(), .{
                 .namespace = try dupeOpt(self.pending_arena.allocator(), namespace.name),
                 .key = try self.pending_arena.allocator().dupe(u8, key),
@@ -1007,6 +1038,35 @@ test "native catalog backend supports prefix cursors over a namespace" {
         found = try cursor.next();
     }
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "native catalog backend keeps a value read back in a write transaction alive across later writes" {
+    // Regression: a write transaction that put a key, read it back, and put
+    // it again freed the first value's tree node, so the borrowed read (a
+    // graph metric page's worker id) pointed at freed memory and a later
+    // encode copied it onto itself (`@memcpy arguments alias`).
+    const a = std.testing.allocator;
+    var test_sink = TestSink{ .allocator = a };
+    defer test_sink.deinit();
+
+    var backend = try Backend.init(a, .{ .sink = test_sink.sink(), .scope = "idx1" });
+    defer backend.close();
+    var runtime = try backend.runtimeNamespaceStore(a);
+    defer runtime.deinit();
+
+    var txn = try runtime.beginWrite();
+    errdefer txn.abort();
+    try txn.put(.{ .name = "meta" }, "page", "worker-a");
+    const first = try txn.get(.{ .name = "meta" }, "page");
+    try txn.put(.{ .name = "meta" }, "page", "worker-b");
+    try txn.delete(.{ .name = "meta" }, "page");
+    try std.testing.expectEqualStrings("worker-a", first);
+    try txn.put(.{ .name = "meta" }, "page", "worker-c");
+    const second = try txn.get(.{ .name = "meta" }, "page");
+    try txn.put(.{ .name = "meta" }, "page", "worker-d");
+    try std.testing.expectEqualStrings("worker-c", second);
+    try std.testing.expectEqualStrings("worker-a", first);
+    try txn.commit();
 }
 
 test "native catalog backend reads and writes through the sink, one submit per commit" {
