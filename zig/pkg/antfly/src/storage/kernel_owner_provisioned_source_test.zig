@@ -380,10 +380,13 @@ test "hidden constrained lookup recovers cold compiled owner from exact plan aut
     const encoded_schema = try @import("antfly_local_sources").storage_schema.serializeSchema(alloc, schema);
     defer alloc.free(encoded_schema);
     const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 70, .shard_id = 7001, .range_id = 7001 }, .target_namespace = .{ .table_id = 71, .shard_id = 7196, .range_id = 7196 }, .target_schema_digest = staging.digest(encoded_schema) };
-    const bootstrap: staging.OwnerBootstrap = .{ .scope = scope, .table_name = "hidden", .schema_json = schema_json, .indexes_json = "{}", .byte_range = .{ .start = "a", .end = "m" } };
+    // The bootstrap retains the metadata epoch while the owner receives the
+    // canonical physical catalog with that control removed.
+    const indexes_json = "{\"_index_alias_epoch\":7}";
+    const bootstrap: staging.OwnerBootstrap = .{ .scope = scope, .table_name = "hidden", .schema_json = schema_json, .indexes_json = indexes_json, .byte_range = .{ .start = "a", .end = "m" } };
     const bootstrap_json = try std.json.Stringify.valueAlloc(alloc, bootstrap, .{});
     defer alloc.free(bootstrap_json);
-    const descriptor: @import("kernel_owner_descriptor.zig").Descriptor = .{ .lsm_root_generation = table_reads.backend_current_root_generation, .identity = .{ .table_id = 71, .shard_id = 7196, .range_id = 7196 }, .schema_json = schema_json, .indexes_json = "{}", .restore_bootstrap_json = bootstrap_json };
+    const descriptor: @import("kernel_owner_descriptor.zig").Descriptor = .{ .lsm_root_generation = table_reads.backend_current_root_generation, .identity = .{ .table_id = 71, .shard_id = 7196, .range_id = 7196 }, .schema_json = schema_json, .indexes_json = indexes_json, .restore_bootstrap_json = bootstrap_json };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
