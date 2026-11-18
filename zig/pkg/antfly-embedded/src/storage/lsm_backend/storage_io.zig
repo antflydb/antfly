@@ -1569,6 +1569,23 @@ else
             };
         }
 
+        fn retainCached(self: *FdCache, shard: *Shard, namespace: u64, path_hash: u64, path: []const u8, epoch: ?*u64) ?*Entry {
+            const locked = lockAtomic(&shard.mutex);
+            defer if (locked) shard.mutex.unlock();
+            if (epoch) |out| out.* = shard.invalidation_epoch;
+            const entry = self.findEntryLocked(shard, namespace, path_hash, path) orelse return null;
+            entry.ref_count += 1;
+            entry.last_access = self.nextAccessLocked();
+            self.touchEntryLocked(shard, entry);
+            return entry;
+        }
+
+        fn mappingEpochMatches(shard: *Shard, epoch: u64) bool {
+            const locked = lockAtomic(&shard.mutex);
+            defer if (locked) shard.mutex.unlock();
+            return shard.invalidation_epoch == epoch;
+        }
+
         fn retainWithAdmission(self: *FdCache, namespace: u64, io: std.Io, path: []const u8, wait: bool) !*Entry {
             const path_hash = namespacedPathHash(namespace, path);
             const shard = self.shardForHash(path_hash);
@@ -1576,16 +1593,7 @@ else
             // allocating a transient pathname (mmap/munmap in the process-wide
             // page-allocated pool) on every point read. Misses still allocate
             // outside the mutex and recheck both the entry and mutation epoch.
-            {
-                const locked = lockAtomic(&shard.mutex);
-                defer if (locked) shard.mutex.unlock();
-                if (self.findEntryLocked(shard, namespace, path_hash, path)) |existing| {
-                    existing.ref_count += 1;
-                    existing.last_access = self.nextAccessLocked();
-                    self.touchEntryLocked(shard, existing);
-                    return existing;
-                }
-            }
+            if (self.retainCached(shard, namespace, path_hash, path, null)) |entry| return entry;
             const owned_path = try self.allocator.dupeSentinel(u8, path, 0);
             var owned_path_active = true;
             errdefer if (owned_path_active) self.allocator.free(owned_path);
@@ -3494,20 +3502,45 @@ const NativeMappedArtifact = struct {
         const retained = try state.acquireLease();
         errdefer retained.release();
         const io = state.threaded.io();
-        const entry = try state.fdCache().retain(state.cache_namespace, io, path);
-        defer state.fdCache().release(io, entry);
-        const size = std.math.cast(usize, try fileSizeFromFd(entry.fd)) orelse return error.FileTooBig;
+        const cache = state.fdCache();
+        const namespace = state.cache_namespace;
+        const path_hash = namespacedPathHash(namespace, path);
+        const shard = cache.shardForHash(path_hash);
+        while (true) {
+            var epoch: u64 = undefined;
+            if (cache.retainCached(shard, namespace, path_hash, path, &epoch)) |entry| {
+                defer cache.release(io, entry);
+                return mapFd(retained, allocator, path, entry.fd, entry.identity);
+            }
+
+            // The mapping owns the inode after mmap. A cold mapping does
+            // not populate the positional descriptor cache.
+            try cache.reserveDescriptors(io, 1);
+            defer cache.releaseDescriptors(io, 1);
+            const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
+                .ACCMODE = .RDONLY,
+                .CLOEXEC = true,
+            }, 0);
+            defer closeFd(fd);
+            const identity = try nativeFileIdentity(fd);
+            if (!FdCache.mappingEpochMatches(shard, epoch)) continue;
+            return mapFd(retained, allocator, path, fd, identity);
+        }
+    }
+
+    fn mapFd(state: *NativeStorageState, allocator: Allocator, path: []const u8, fd: std.posix.fd_t, identity: NativeFileIdentity) !@import("../../segment_source.zig").MappedArtifact {
+        const size = std.math.cast(usize, try fileSizeFromFd(fd)) orelse return error.FileTooBig;
         if (size == 0) return error.EmptySegment;
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
         const self = try allocator.create(NativeMappedArtifact);
         errdefer allocator.destroy(self);
-        const bytes = std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, entry.fd, 0) catch |err| switch (err) {
+        const bytes = std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0) catch |err| switch (err) {
             error.MemoryMappingNotSupported => return error.MappedArtifactUnavailable,
             else => return err,
         };
         std.posix.madvise(bytes.ptr, bytes.len, std.posix.MADV.RANDOM) catch {};
-        self.* = .{ .allocator = allocator, .state = retained, .path = owned_path, .identity = entry.identity };
+        self.* = .{ .allocator = allocator, .state = state, .path = owned_path, .identity = identity };
         return .{ .bytes = bytes, .context = self, .release = release, .try_read_into = tryReadInto };
     }
 
@@ -5454,6 +5487,44 @@ test "transient admission fails fast when only persistent descriptors prevent pr
     persistent_held = false;
     try pool.fd_cache.reserveDescriptors(io, 1);
     defer pool.fd_cache.releaseDescriptors(io, 1);
+}
+
+test "native fd cache keeps cold mappings out of the read working set" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var temp = try TestDirectory.init("mapping");
+    defer temp.cleanup();
+
+    var pool = NativeStoragePool.initWithCapacityForTest(alloc, 2);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(alloc, .threaded, &pool);
+    defer native.deinit();
+    const storage = native.storage();
+    const hot = try std.fmt.allocPrint(alloc, "{s}-hot", .{temp.path()});
+    defer alloc.free(hot);
+    const cold = try std.fmt.allocPrint(alloc, "{s}-cold", .{temp.path()});
+    defer alloc.free(cold);
+    try storage.writeFileAbsolute(hot, "hot");
+    try storage.writeFileAbsolute(cold, "cold");
+
+    var bytes: [3]u8 = undefined;
+    try storage.readFileRangeInto(alloc, hot, 0, &bytes);
+    try std.testing.expectEqualStrings("hot", &bytes);
+    try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_cache_entries);
+
+    var cold_map = try storage.mapImmutableArtifact(alloc, cold);
+    defer cold_map.deinit();
+    try std.testing.expectEqualStrings("cold", cold_map.bytes);
+    try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_admitted_descriptors);
+    var hot_map = try storage.mapImmutableArtifact(alloc, hot);
+    defer hot_map.deinit();
+    try std.testing.expectEqualStrings("hot", hot_map.bytes);
+    try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_cache_entries);
+
+    var positional: [4]u8 = undefined;
+    try std.testing.expect(try cold_map.try_read_into.?(cold_map.context.?, 0, &positional));
+    try std.testing.expectEqualStrings("cold", &positional);
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_cache_entries);
 }
 
 test "native fd cache rejects mismatched layouts" {

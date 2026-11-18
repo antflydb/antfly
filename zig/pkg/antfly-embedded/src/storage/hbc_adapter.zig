@@ -10341,6 +10341,8 @@ pub const HBCIndex = struct {
                 return reopen_err;
             };
             const recovered = &self.experimental_posting_write_store.?;
+            // Opening the writer establishes the durability of its recovered
+            // active WAL, including a complete frame from a failed fsync.
             if (recovered.last_committed_batch == batch_id) {
                 if (recovered.covered_source_sequence != covered_source_sequence) {
                     return error.PostingWalAmbiguousCommitMismatch;

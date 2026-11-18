@@ -336,10 +336,10 @@ pub const Store = struct {
     poisoned: bool,
 
     pub fn open(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !Store {
-        return try openInternal(alloc, storage, root_dir, null, false);
+        return try openInternal(alloc, storage, root_dir, null, .writer);
     }
     pub fn openReadOnly(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !Store {
-        return try openInternal(alloc, storage, root_dir, null, true);
+        return try openInternal(alloc, storage, root_dir, null, .read_only);
     }
 
     /// Opens and validates the store while retaining the already-read segment
@@ -348,7 +348,7 @@ pub const Store = struct {
     /// process startup.
     pub fn openWithSegmentAlloc(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !OpenedWithSegment {
         var retained_segments: ?[]RetainedSegment = null;
-        var store = try openInternal(alloc, storage, root_dir, &retained_segments, false);
+        var store = try openInternal(alloc, storage, root_dir, &retained_segments, .read_serving);
         errdefer store.deinit();
         return .{
             .store = store,
@@ -357,18 +357,21 @@ pub const Store = struct {
     }
     pub fn openReadOnlyWithSegmentAlloc(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !OpenedWithSegment {
         var retained_segments: ?[]RetainedSegment = null;
-        var store = try openInternal(alloc, storage, root_dir, &retained_segments, true);
+        var store = try openInternal(alloc, storage, root_dir, &retained_segments, .read_only);
         errdefer store.deinit();
         return .{ .store = store, .segments = retained_segments orelse return error.MissingPostingCheckpoint };
     }
+
+    const OpenMode = enum { writer, read_serving, read_only };
 
     fn openInternal(
         alloc: Allocator,
         storage: lsm_backend.Storage,
         root_dir: []const u8,
         retained_segments: ?*?[]RetainedSegment,
-        read_only: bool,
+        mode: OpenMode,
     ) !Store {
+        const read_only = mode == .read_only;
         const owned_root = try alloc.dupe(u8, root_dir);
         if (!read_only) storage.createDirPath(owned_root) catch |err| {
             alloc.free(owned_root);
@@ -438,6 +441,13 @@ pub const Store = struct {
         if (recovered.bytes.len != recovered.replay.committed_bytes) {
             if (read_only) return error.PostingWalUncommittedTail;
             try store.replaceWal(recovered.bytes[0..recovered.replay.committed_bytes]);
+        } else if (mode == .writer and recovered.replay.committed_bytes > checkpoint.sealedWalBytes()) {
+            // A complete commit frame may still be in the page cache after
+            // an append's failed fsync. Establish durability before making
+            // a recovered writer available to acknowledge or advance it.
+            const wal_path = try store.walPathAlloc(store.wal_generation);
+            defer alloc.free(wal_path);
+            try storage.syncFileContentsAbsolute(wal_path);
         }
         store.wal_committed_bytes = recovered.replay.committed_bytes;
         store.wal_has_state_records = replayHasStateRecords(&recovered.replay);
@@ -1605,8 +1615,27 @@ test "storage.posting WAL retries a pre-write descriptor error and fences an amb
     try std.testing.expectError(error.InputOutput, store.appendBatch(2, next, 12));
     try std.testing.expectError(error.PostingStoreRequiresReopen, store.appendBatch(2, next, 12));
 
+    // Parsing a complete frame after failed sync is not a durability proof.
+    // Repeated writer opens must keep failing until the barrier succeeds.
+    const Sync = struct {
+        fn fail(_: *anyopaque, _: []const u8) !void {
+            return error.InputOutput;
+        }
+    };
+    fault_vtable.sync_contents_absolute = Sync.fail;
+    {
+        var reader = try Store.openWithSegmentAlloc(alloc, store.storage, "/posting-retry");
+        defer reader.deinit();
+        try std.testing.expectEqual(@as(?u64, 2), reader.store.last_committed_batch);
+    }
+    for (0..2) |_| {
+        try std.testing.expectError(error.InputOutput, Store.open(alloc, store.storage, "/posting-retry"));
+    }
+
+    const syncs_before = memory.sync_contents_calls;
     var reopened = try Store.open(alloc, memory.storage(), "/posting-retry");
     defer reopened.deinit();
+    try std.testing.expectEqual(syncs_before + 1, memory.sync_contents_calls);
     try std.testing.expectEqual(@as(u64, 2), reopened.last_committed_batch);
     var replay = try reopened.recoverWal();
     defer replay.deinit();
