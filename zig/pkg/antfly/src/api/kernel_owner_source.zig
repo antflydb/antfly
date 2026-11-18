@@ -466,6 +466,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         indexes_json: []u8,
         // A prepared apply must remain resumable after cache replacement.
         apply_projection: ?@import("owner_catalog_projection.zig").Cache.Lease = null,
+        apply_handoff_until_ns: u64 = 0,
         restore_bootstrap_json: []u8,
         initial_child_bootstrap_json: []u8,
         initial_range: ?db_types.ByteRange = null,
@@ -659,7 +660,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 if (hooks.before_open) |before_open| before_open(hooks.ptr);
             };
             const opened = blk: {
-                var lease = self.acquireDescriptorOnce(request.group_id, request.table_name, request.path, request.descriptor, .shared, .resident, .{ .historical_raft_apply = true, .prepare_graph_indexes = request.prepare_graph_indexes }) catch |err| {
+                var lease = self.acquireDescriptorOnce(request.group_id, request.table_name, request.path, request.descriptor, .shared, .resident, .{ .historical_raft_apply = true, .prepare_apply_handoff = true, .prepare_graph_indexes = request.prepare_graph_indexes }) catch |err| {
                     switch (err) {
                         error.StorageKernelOwnerTransitionRequired,
                         error.StorageReadTemporarilyUnavailable,
@@ -3129,6 +3130,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         execution_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
         cancellation: ?db_types.CancellationToken = null,
         historical_raft_apply: bool = false,
+        prepare_apply_handoff: bool = false,
         prepare_graph_indexes: bool = false,
         allow_deferred_catalog: bool = false,
 
@@ -4158,6 +4160,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         return error.RaftApplyWriterUnavailable;
     }
 
+    const apply_handoff_timeout_ns = 5 * std.time.ns_per_s;
+
     fn tryAcquireWarmApplyLocked(
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
@@ -4181,6 +4185,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (exactApplyDescriptor(entry, descriptor) and
                 tryReserveEntryLeaseLocked(entry, .shared))
             {
+                entry.apply_handoff_until_ns = 0;
                 entry.resident = true;
                 entry.transient_retirement_pending = false;
                 _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
@@ -4276,6 +4281,14 @@ pub const ProvisionedKernelOwnerSource = struct {
                 }
                 return error.StorageKernelOwnerTransitionRequired;
             }
+            // A control open reserves the owner for the ordered entry until
+            // apply claims it. A new root or explicit retirement can still
+            // supersede it. Bound abandoned handoffs, including leadership
+            // changes that leave the committed descriptor unused here.
+            if (!controls.historical_raft_apply and !self.apply_control_stopping and
+                entry.apply_handoff_until_ns != 0 and
+                platform_time.monotonicNs() < entry.apply_handoff_until_ns)
+                return error.StorageReadTemporarilyUnavailable;
             if (entry.catalog_deferred and !controls.allow_deferred_catalog and !controls.historical_raft_apply)
                 return error.StorageReadTemporarilyUnavailable;
             if ((controls.prepare_graph_indexes and !entry.graph_replay_indexes_prepared) or
@@ -4315,6 +4328,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 entry.resident = true;
                 entry.transient_retirement_pending = false;
             }
+            if (controls.prepare_apply_handoff)
+                entry.apply_handoff_until_ns = platform_time.monotonicNs() +| apply_handoff_timeout_ns;
             if (controls.historical_raft_apply) {
                 const pin = physical.pin();
                 if (entry.apply_projection) |*previous| previous.deinit();
@@ -4417,6 +4432,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .identity = descriptor.identity,
             .schema_json = owned_schema_json,
             .indexes_json = owned_indexes_json,
+            .apply_handoff_until_ns = if (controls.prepare_apply_handoff) platform_time.monotonicNs() +| apply_handoff_timeout_ns else 0,
             .apply_projection = if (controls.historical_raft_apply) physical.pin() else null,
             .restore_bootstrap_json = owned_restore_bootstrap_json,
             .initial_child_bootstrap_json = owned_initial_child_bootstrap_json,
@@ -7098,18 +7114,37 @@ test "committed owner apply never opens or closes storage under the raft apply l
     }
     try std.testing.expect((try source.physical_catalogs.lookup(1, first.indexes_json)) == null);
     gate.cold_release.set(io);
-    try gate.applyCommitted(&source, first, first_batch, 1);
-    var admitted = (try source.physical_catalogs.lookup(1, first.indexes_json)) orelse return error.TestWarmOwnerDidNotAdmit;
-    defer admitted.deinit();
-    try std.testing.expectEqualStrings("{}", admitted.bytes);
+    const handoff_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        const prepared = blk: {
+            Source.lock(&source.mutex);
+            defer source.mutex.unlock();
+            if (source.apply_control_active != null or source.entries.items.len != 1) break :blk false;
+            const entry = source.entries.items[0];
+            const pinned = entry.apply_projection orelse return error.TestWarmOwnerDidNotAdmit;
+            try std.testing.expect(pinned.matchesRaw(first.indexes_json));
+            try std.testing.expectEqualStrings("{}", pinned.bytes);
+            try std.testing.expect(entry.apply_handoff_until_ns != 0);
+            break :blk true;
+        };
+        if (prepared) break;
+        if (platform_time.monotonicNs() >= handoff_deadline) return error.TestWarmOwnerDidNotAdmit;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.acquireDescriptorOnce(1, "docs", path, first, .shared, .resident, .{}));
     source.physical_catalogs.forget(1);
     try std.testing.expect((try source.physical_catalogs.lookup(1, first.indexes_json)) == null);
-    // Holding the shared cache lock also forces the owner-pinned path.
+    // With the shared cache locked, the committed entry can only use its pin.
     {
         try std.testing.expect(source.physical_catalogs.mutex.tryLock());
         defer source.physical_catalogs.mutex.unlock();
-        var pinned = try source.acquireApplyOnly(1, "docs", first);
-        pinned.deinit();
+        try gate.applyCommitted(&source, first, first_batch, 1);
+    }
+    {
+        Source.lock(&source.mutex);
+        defer source.mutex.unlock();
+        try std.testing.expectEqual(@as(u64, 0), source.entries.items[0].apply_handoff_until_ns);
+        try std.testing.expect(!source.entries.items[0].retired);
     }
 
     // A different group's cold open can hold the owner registry while a
