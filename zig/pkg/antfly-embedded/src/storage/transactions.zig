@@ -1595,6 +1595,7 @@ pub const TxnManager = struct {
     /// Idle transactions can remain open. A transaction with a durable vote
     /// must have its coordinator resolve it before activation can proceed.
     pub fn stageDagSourceFence(txn: anytype, fence: dag.SourceFence) !void {
+        try @import("db/relational_integrity_topology.zig").requireUnfenced(txn);
         if (try txn.hasPrefix(intents_prefix) or
             try txn.hasPrefix(intent_locks_prefix) or
             try txn.hasPrefix(prepared_enrichments_prefix) or
@@ -1609,12 +1610,14 @@ pub const TxnManager = struct {
     pub fn hasTopologySensitiveTransactions(self: *TxnManager) !bool {
         var read = try self.store.beginRead();
         defer read.abort();
+        if (try dag.SourceFence.read(&read) != null) return true;
 
         // Resolution normally removes intents and HA outboxes atomically before
         // a transaction becomes quiescent. Check the global prefixes once rather
         // than opening an intent cursor for every retained terminal record.
         if (try readHasPrefix(&read, intents_prefix) or
             try readHasPrefix(&read, intent_locks_prefix) or
+            try readHasPrefix(&read, dag_domains_prefix) or
             try readHasPrefix(&read, read_guards_prefix) or
             try readHasPrefix(&read, read_members_prefix) or
             try readHasPrefix(&read, hot_standby_batch_outbox_prefix) or
@@ -5340,13 +5343,33 @@ test "DAG activation fence drains prepared writers and rejects new votes" {
         try std.testing.expect((try dag.SourceFence.read(&writer)) == null);
     }
     try manager.resolveIntents(first, .committed, 101);
-    try manager.initTransaction(second, 102);
+    try std.testing.expect(!try manager.hasTopologySensitiveTransactions());
+    const topology = @import("db/relational_integrity_topology.zig");
+    var topology_fence: topology.Fence = .{
+        .transition_id = 1,
+        .attempt = 1,
+        .peer_group_id = 2,
+        .owner_group_id = 1,
+        .role = .backup_snapshot,
+        .namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .catalog_digest = undefined,
+    };
+    std.crypto.hash.Blake3.hash("", &topology_fence.catalog_digest, .{});
+    {
+        var writer = try store.beginWriteTxn();
+        defer writer.abort();
+        try topology.stageBegin(&writer, topology_fence);
+        try std.testing.expectError(error.IntegrityTopologyBusy, TxnManager.stageDagSourceFence(&writer, fence));
+    }
     {
         var writer = try store.beginWriteTxn();
         errdefer writer.abort();
         try TxnManager.stageDagSourceFence(&writer, fence);
+        try std.testing.expectError(error.IntegrityTopologyBusy, topology.stageBegin(&writer, topology_fence));
         try writer.commit();
     }
+    try std.testing.expect(try manager.hasTopologySensitiveTransactions());
+    try manager.initTransaction(second, 102);
     try std.testing.expectError(error.GraphConstraintBusy, manager.writeIntents(second, intents, &.{}));
     try std.testing.expect(!(try manager.hasIntents(second)));
     {
@@ -5357,6 +5380,7 @@ test "DAG activation fence drains prepared writers and rejects new votes" {
     }
     try manager.writeIntents(second, intents, &.{});
     try manager.resolveIntents(second, .aborted, 103);
+    try std.testing.expect(!try manager.hasTopologySensitiveTransactions());
 }
 
 test "DAG co-located publication rolls back authority and output together" {

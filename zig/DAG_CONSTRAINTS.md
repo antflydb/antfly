@@ -59,7 +59,9 @@ new owner can resume even when no page has committed yet. Physical writers
 reject source and artifact changes while a root's activation fence is
 installed. Scan progress and completion require that fence. Each root installs
 its fence only after draining prepared writers, in the same serialized writer
-that excludes new votes. The activation coordinator still needs to drive
+that excludes new votes. Topology admission and activation fences exclude each
+other, and topology drain includes authority-only prepared participants.
+The activation coordinator still needs to drive
 that protocol across roots, read the pinned graph, and propose completion. Regular index
 admission and direct graph-index open still reject DAG.
 An existing distributed reservation remains under the original coordinator,

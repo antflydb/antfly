@@ -89,6 +89,7 @@ pub fn stageBegin(txn: anytype, fence: Fence) !void {
 }
 
 pub fn stageBeginWithHandoff(txn: anytype, fence: Fence, handoff: ?@import("relational_integrity_topology_contract.zig").GenerationHandoffIntent) !void {
+    if (try @import("../../graph/dag_authority.zig").SourceFence.read(txn) != null) return error.IntegrityTopologyBusy;
     try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
     if (handoff != null and fence.role != .rewrite_source) return error.InvalidGenerationHandoff;
     _ = try fence.encode();
