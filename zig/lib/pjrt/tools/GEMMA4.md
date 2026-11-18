@@ -205,8 +205,11 @@ not a separately built main binary. Every declared fixture is hash-checked befor
 execution. The recorded arm environment identifies the resize override.
 
 `--control image-resize` compares the CUDA GGUF image path's bilinear and
-upstream bicubic preprocessing. `ANTFLY_INFERENCE_CUDA_GEMMA4_IMAGE_BICUBIC=0`
-restores the old image resize. This correction applies to standard 16-pixel
+upstream bicubic preprocessing. `ANTFLY_INFERENCE_CUDA_GEMMA4_IMAGE_BICUBIC=1`
+opts into bicubic; bilinear remains the default because the paired candidate
+failed its non-increasing first-step-error criterion. The new image continuation
+matches all 64 oracle decisions, so this remains available as an accuracy
+experiment. This correction applies to standard 16-pixel
 patches; other backends and geometries retain their existing behavior. The
 `branch` control above covers PLE and video only, with the same image policy
 in both arms. Use an image-only suite and corresponding first-step reference
@@ -223,8 +226,12 @@ preprocessing for paired checks. Other normalization/patch geometries retain
 their existing route. The focused GPU regression checks normalization and patch
 layout across 12 matrix/range/size combinations without a pixel readback.
 
-The following common profile passes all eight retained **first-step** numerical
-and argmax gates against unmodified Transformers 5.23.0. It retains Q4 text
+The original four precision overrides pass all eight retained **first-step**
+numerical and argmax gates against unmodified Transformers 5.23.0. The image
+experiment adds a fifth override and fixes the intermediate image disagreement
+in the seven-case comparison. The RGB policy adds a sixth override and closes
+the video disagreement: together they match all 585 checked decisions through
+EOS or budget on the eight retained fixtures. This profile retains Q4 text
 weights and F16 KV; it is not an all-F32 decoder:
 
 ```sh
@@ -232,6 +239,8 @@ export ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_COMPACT=0
 export ANTFLY_INFERENCE_CUDA_GEMMA4_VISION_F16=0
 export ANTFLY_INFERENCE_CUDA_Q4_0_PLE_GATE_FUSION=0
 export ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1=0
+export ANTFLY_INFERENCE_CUDA_GEMMA4_IMAGE_BICUBIC=1
+export ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_SWSCALE_RGB=1
 ```
 
 This uses F32 media weights/vision attention, the ordinary PLE gate path and
@@ -240,6 +249,22 @@ campaign provenance records every override. These are explicit qualification
 settings, not new serving defaults. Eight passing first-step gates do not
 establish whole-generation or task-quality parity. The default fast profile
 still has numerical failures on this corpus.
+
+`ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_SWSCALE_RGB=1` separately opts into the
+upstream RGB8 integer-rounding boundary for eight-bit, limited-range BT.601
+video (matrix 2/5/6), without tone mapping. BT.709, full-range, high-depth and HDR
+retain the existing conversion. This is a Gemma4-only experiment; the ordinary
+resident RGB converter and its existing PTX bodies are unchanged. It remains
+off by default. `--control video-rgb` isolates this policy in the same binary.
+
+The GPU pixel test uses a small independent PyAV-generated fixture, checks
+matrix aliases and all rotations, and checks unsupported-format fallbacks.
+For PTX regeneration, build `zig/pkg/inference/tools/nvrtc_ptx_compile.c` against `libdl`, then use
+`input.cu output.ptx compute_75 --precise` with NVRTC 11.8. Precise mode disables
+FMA contraction and fast math; the tool's existing default is unchanged. Prefix
+the output with `// source-sha256: <SHA256 of input.cu>` and retain a single final
+newline. The source-integrity test requires PTX 7.8 and CUDA 11.8; do not replace
+it with PTX from a newer toolkit unsupported by the deployment driver.
 
 Build and run the focused native CPU regression with a compile-time filter:
 
@@ -315,7 +340,7 @@ reference directories and a fresh `--out`. For binaries requiring a newer libc,
 both `--llama-loader` and `--llama-runtime` select an existing compatible runtime.
 Prepare PJRT executables with the exact worker before running it.
 
-This comparison uses the four native accuracy overrides above, checks independent
+This comparison uses the six native accuracy overrides above, checks independent
 first-step logits before timing and reports competitor failures. It verifies
 prepared llama.cpp prompt IDs, complete output budgets and stable greedy tokens
 within/across rounds. It records the llama.cpp timing boundary difference rather

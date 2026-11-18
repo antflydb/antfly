@@ -286,7 +286,7 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
                 platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC", true))
             bicubic: {
                 const raster = frame.rasterSize();
-                const rgb = try self.preprocess.rgb8(gpu_compute, frame);
+                const rgb = try self.preprocess.rgb8Gemma4(gpu_compute, frame);
                 defer self.cb.free(rgb);
                 break :bicubic try gpu_compute.preprocessGemma4ResidentRgb(rgb, raster[0], raster[1], @intCast(g.width), @intCast(g.height));
             } else try self.preprocess.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
@@ -2735,7 +2735,7 @@ fn prepareImageViewAtGeometry(allocator: std.mem.Allocator, store: *ProjectorWei
         // bicubic interpolation, just like its video processor. Retain the old
         // GGUF route for other backends/geometries and explicit rollback.
         if (store.gguf == null or (store.cb.kind() == .cuda and cfg.patch_size == 16 and !cfg.direct_unified and
-            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_IMAGE_BICUBIC", true)))
+            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_IMAGE_BICUBIC", false)))
             .torchvision_bicubic
         else
             .bilinear,

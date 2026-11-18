@@ -1,12 +1,45 @@
 # Gemma 4 E4B QAT: L4 qualification and performance
 
+## Opt-in eight-case correctness follow-up
+
+The six-override accuracy profile in [GEMMA4.md](GEMMA4.md) passes all 8/8
+independent Transformers first-step numerical/argmax gates and all 585 native
+decisions through the first EOS or fixed budget. The video continuation matches
+64/64 decisions after aligning its RGB8 conversion. The seven common
+text/image/audio continuations exactly match the previously checked sequences;
+video is regenerated with the unmodified CPU forward. These checks cover the
+retained fixtures, not broad task-quality evaluation.
+
+The opt-in video converter matches all six PyAV RGB frames byte for byte.
+Its same-binary paired study passes accuracy and latency guardrails: first-step
+relative L2 falls from 0.01367 to 0.01006; median latency changes from 1590.82
+to 1590.30 ms, with median/p95 ratios 0.99967/1.00115. This is an accuracy
+improvement with effectively unchanged latency. It covers eight-bit limited-range
+BT.601; other color policies retain their existing paths.
+
+Production defaults still pass 5/8 numerical gates. Fast precision with only
+the RGB experiment passes 6/8; neither is the qualified accuracy profile.
+The image experiment remains opt-in because its paired first-step-error metric
+regresses despite passing the absolute and every-decision gates. The RGB
+experiment also stays opt-in. The [RGB qualification record](gemma4-l4-rgb-qualification.json)
+retains the exact worker, source snapshot, independent pixels, paired samples,
+all decision checks and default-policy results.
+
+A broad video run has 214 passes, 42 skips and one failure. The failure also
+reproduces with RGB disabled and unchanged legacy PTX: bilinear upscaling
+extrapolates at negative half-pixel coordinates. The saved scalar reproduction
+matches the failing values exactly. That separate edge-clamp correction is
+qualified in the subsequent check, rather than folded into the RGB study.
+
 ## Current seven-case comparison
 
 Three alternating fresh-process rounds, one warmup and two measured calls per
 case give six samples per engine/case. All 126 measured calls complete their
 fixed budgets with stable complete sequences; llama.cpp's backend-greedy tokens
-also equal its independent full-logit oracle sequence. Native uses the four
-accuracy overrides in [GEMMA4.md](GEMMA4.md), including the image resize correction.
+also equal its independent full-logit oracle sequence. Native uses four precision
+overrides and bicubic image resizing. The timed candidate enabled image bicubic
+by default; the final source keeps it opt-in, with the equivalent fifth override
+in [GEMMA4.md](GEMMA4.md).
 PJRT executables were freshly compiled with the current reviewed worker.
 llama.cpp uses official CUDA release b12521 with its asset digest verified.
 

@@ -29,7 +29,7 @@ def main():
     p.add_argument("--cpu", type=Path, action="append", required=True)
     p.add_argument(
         "--control",
-        choices=("ple", "video-resize", "image-resize", "branch"),
+        choices=("ple", "video-resize", "video-rgb", "image-resize", "branch"),
         default="ple",
     )
     p.add_argument("--measure", action="store_true")
@@ -38,6 +38,7 @@ def main():
     a = p.parse_args()
     resize_env = {
         "video-resize": "ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC",
+        "video-rgb": "ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_SWSCALE_RGB",
         "image-resize": "ANTFLY_INFERENCE_CUDA_GEMMA4_IMAGE_BICUBIC",
         "branch": "ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC",
     }.get(a.control)
@@ -65,7 +66,7 @@ def main():
             or digest(path) != identity["sha256"]
         ):
             raise ValueError("Fixture identity differs: " + name)
-    if a.control in ("video-resize", "branch") and not any(
+    if a.control in ("video-resize", "video-rgb", "branch") and not any(
         case.get("kind") == "video" for case in suite["cases"]
     ):
         raise ValueError("Video resize control needs a video case")
@@ -231,6 +232,7 @@ def main():
             + {
                 "ple": "legacy versus corrected PLE epsilon",
                 "video-resize": "bilinear versus bicubic video resize",
+                "video-rgb": "portable float versus upstream integer BT601 RGB8 conversion",
                 "image-resize": "bilinear versus bicubic image resize",
                 "branch": "legacy PLE epsilon and bilinear video versus corrected PLE epsilon and bicubic video",
             }[a.control]
