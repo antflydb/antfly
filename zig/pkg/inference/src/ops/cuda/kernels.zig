@@ -49,6 +49,21 @@ fn bundledQ4_0TcHmmaBf16Supported(compute_major: i32, compute_minor: i32) bool {
     return cuda_artifact.hasBf16WmmaCodeFor(compute_major, compute_minor);
 }
 
+// The portable compute_75 PTX exports this symbol with an empty SM80-only
+// body. A non-null symbol is insufficient: require a matching SASS image.
+fn gemma4VisionRegisterArtifactEligible(has_mma_body: bool, compute_major: i32, compute_minor: i32) bool {
+    return has_mma_body and compute_major == 8 and compute_minor == 9;
+}
+
+test "Gemma4 CUDA vision register attention declines portable PTX stubs and other devices" {
+    try std.testing.expect(gemma4VisionRegisterArtifactEligible(true, 8, 9));
+    try std.testing.expect(!gemma4VisionRegisterArtifactEligible(false, 8, 9));
+    for ([_][2]i32{ .{ 7, 5 }, .{ 8, 0 }, .{ 9, 0 }, .{ 12, 1 }, .{ 13, 0 } }) |cc| {
+        try std.testing.expect(!gemma4VisionRegisterArtifactEligible(true, cc[0], cc[1]));
+        try std.testing.expect(!gemma4VisionRegisterArtifactEligible(false, cc[0], cc[1]));
+    }
+}
+
 pub const Q8ActivationEncoding = enum {
     /// Historical Antfly layout: half d, zero half, 32 signed values.
     q8_zp_legacy,
@@ -2680,6 +2695,9 @@ pub const KernelModule = struct {
     linear_q4_0_f32_tc_hmma: driver_mod.CUfunction = null,
     linear_q4_0_f32_tc_hmma_bf16: driver_mod.CUfunction = null,
     linear_q4_0_bf16_staged: driver_mod.CUfunction = null,
+    gemma4_vision_norm_rope_f32: driver_mod.CUfunction = null,
+    gemma4_vision_attention_registers: driver_mod.CUfunction = null,
+    linear_gemma4_q4_0_bf16_raw: driver_mod.CUfunction = null,
     activation_multiply_fused_gate_up_f32: driver_mod.CUfunction = null,
     linear_q8_0_f32_tile4: driver_mod.CUfunction = null,
     linear_q8_0_gated_down_f32_tile4: driver_mod.CUfunction = null,
@@ -2826,6 +2844,9 @@ pub const KernelModule = struct {
     rms_channel_source_finish_bf16_values_f32: driver_mod.CUfunction = null,
 
     fn bundledSymbol(comptime field: []const u8) ?[:0]const u8 {
+        if (std.mem.eql(u8, field, "gemma4_vision_norm_rope_f32")) return "antfly_gemma4_vision_norm_rope_f32";
+        if (std.mem.eql(u8, field, "gemma4_vision_attention_registers")) return "antfly_gemma4_vision_attention_registers";
+        if (std.mem.eql(u8, field, "linear_gemma4_q4_0_bf16_raw")) return "antfly_linear_gemma4_q4_0_bf16_raw";
         // Reuse the existing unmasked F32 row program's historical device ABI.
         if (std.mem.eql(u8, field, "row_softmax_f32_warp32")) return "termite_embedding_gemma2_training_softmax_f32";
         if (std.mem.eql(u8, field, "e4b_head_prefetch_l2")) return "antfly_gemma4_e4b_head_prefetch_l2";
@@ -2979,6 +3000,8 @@ pub const KernelModule = struct {
     }
 
     fn bundledFunctionEnabled(comptime field: []const u8, major: i32, minor: i32) bool {
+        if (comptime std.mem.eql(u8, field, "gemma4_vision_attention_registers")) return gemma4VisionRegisterArtifactEligible(cuda_artifact.hasBf16WmmaCodeFor(major, minor), major, minor);
+        if (comptime std.mem.eql(u8, field, "linear_gemma4_q4_0_bf16_raw")) return bundledQ4_0TcHmmaBf16Supported(major, minor);
         if (comptime std.mem.eql(u8, field, "e4b_down_prefetch_l2")) return major == 12 and minor == 1;
         if (comptime std.mem.eql(u8, field, "linear_q4_0_f32_tc_hmma_bf16")) return bundledQ4_0TcHmmaBf16Supported(major, minor);
         if (comptime std.mem.eql(u8, field, "linear_q4_0_bf16_staged")) return major == 8 and minor == 9 and bundledQ4_0TcHmmaBf16Supported(major, minor);
@@ -7719,6 +7742,48 @@ pub const KernelModule = struct {
         const window = @min(seq, radius *| 2 +| 1);
         try launchBlocksShared(self.gliner_encoder_attention_f32 orelse return error.CudaKernelUnavailable, ctx, try checkedTensorElements(try checkedTensorElements(batch, seq), heads), 128, window * @sizeOf(f32), &params);
     }
+    pub fn launchGemma4VisionNormRope(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, rows: usize, grid_x: usize, grid_y: usize, eps: f32, theta: f32, scale: f32) driver_mod.Error!void {
+        if (rows == 0 or grid_x == 0 or grid_y == 0) return error.InvalidCudaState;
+        const count = try checkedTensorElements(rows, 768);
+        try checkBytes(dst, count);
+        try checkBytes(input, count);
+        try checkBytes(weight, 64);
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight.ptr;
+        var rows_u32 = try toU32(rows);
+        var x = try toU32(grid_x);
+        var y = try toU32(grid_y);
+        var epsilon = eps;
+        var base = theta;
+        var multiplier = scale;
+        var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&input_ptr), @ptrCast(&weight_ptr), @ptrCast(&rows_u32), @ptrCast(&x), @ptrCast(&y), @ptrCast(&epsilon), @ptrCast(&base), @ptrCast(&multiplier) };
+        try launchBlocks(self.gemma4_vision_norm_rope_f32 orelse return error.CudaKernelUnavailable, ctx, try checkedTensorElements(rows, 12), 64, &params);
+    }
+
+    pub fn launchGemma4VisionRegisterAttention(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, q: buffer_mod.DeviceBuffer, k: buffer_mod.DeviceBuffer, v: buffer_mod.DeviceBuffer, mask: buffer_mod.DeviceBuffer, batch: usize, seq: usize) driver_mod.Error!void {
+        if (!gemma4VisionRegisterArtifactEligible(cuda_artifact.hasBf16WmmaCodeFor(ctx.info.compute_major, ctx.info.compute_minor), ctx.info.compute_major, ctx.info.compute_minor)) return error.CudaKernelUnavailable;
+        if (ctx.info.compute_major != 8 or ctx.info.compute_minor != 9 or batch == 0 or batch > 4 or seq < 2048 or seq > 3136) return error.InvalidCudaState;
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq), 768);
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        try checkRawBytes(mask, try checkedTensorElements(try checkedTensorElements(batch, seq), @sizeOf(i64)));
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_u32 = try toU32(seq);
+        var heads_u32: u32 = 12;
+        var dim_u32: u32 = 64;
+        var radius_u32 = seq_u32;
+        var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&q_ptr), @ptrCast(&k_ptr), @ptrCast(&v_ptr), @ptrCast(&mask_ptr), @ptrCast(&batch_u32), @ptrCast(&seq_u32), @ptrCast(&heads_u32), @ptrCast(&dim_u32), @ptrCast(&radius_u32) };
+        try launchBlocks(self.gemma4_vision_attention_registers orelse return error.CudaKernelUnavailable, ctx, try checkedTensorElements(batch * 12, (seq + 63) / 64), 256, &params);
+    }
+
     pub fn launchGlinerEncoderAttentionTcF16(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, q: buffer_mod.DeviceBuffer, k: buffer_mod.DeviceBuffer, v: buffer_mod.DeviceBuffer, mask: buffer_mod.DeviceBuffer, batch: usize, seq: usize, heads: usize, dim: usize, radius: usize) driver_mod.Error!void {
         if (ctx.info.compute_major < 7 or batch == 0 or seq == 0 or seq > 8192 or dim != 64 or heads == 0) return error.InvalidCudaState;
         const count = try checkedTensorElements(try checkedTensorElements(batch, seq), try checkedTensorElements(heads, dim));
@@ -11933,6 +11998,43 @@ pub const KernelModule = struct {
 
         var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_packed.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
         var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
+        try launch2d(function, ctx, (out_dim + q_tc_hmma_cols - 1) / q_tc_hmma_cols, (rows + q_tc_hmma_rows - 1) / q_tc_hmma_rows, q_tc_hmma_threads, &params);
+    }
+
+    // Same BF16 rounding and accumulation, directly from GGUF blocks.
+    pub fn launchLinearGemma4Q4RawBf16F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_gemma4_q4_0_bf16_raw orelse return error.CudaSymbolMissing;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
         try launch2d(function, ctx, (out_dim + q_tc_hmma_cols - 1) / q_tc_hmma_cols, (rows + q_tc_hmma_rows - 1) / q_tc_hmma_rows, q_tc_hmma_threads, &params);
     }
 

@@ -267,6 +267,10 @@ pub fn transitionMutatesRelationSource(command: anytype) bool {
 }
 
 const store_report_update = @import("../store_report_update.zig");
+/// Expected alias-validation rejections retain their identity across the
+/// independently compiled owner boundary without transporting Zig errors.
+pub const TableIndexMutationValidation = @import("index_mutation_validation.zig").Result;
+
 pub const CatalogProjectionRequest = union(enum) {
     job_state_get: []const u8,
     job_state_scan: ?[]const u8,
@@ -306,6 +310,8 @@ pub const CatalogProjectionRequest = union(enum) {
     sql_policy_publication_status: u64,
     sql_policy_publication_work: u64,
     sql_policy_begin_command: @import("antfly_local_sources").system_catalog_policies.BeginRequest,
+    has_index_aliases: void,
+    validate_table_index_mutation: struct { before: metadata.TableRecord, after: metadata.TableRecord },
     require_policy_index_mutation_allowed: u64,
     require_policy_topology_mutation_allowed: u64,
     sql_completion_reference: [16]u8,
@@ -323,4 +329,5 @@ pub const CatalogProjectionRequest = union(enum) {
     fk_initial_retirement_page: @import("../fk_initial_retirement_wire.zig").PageRequest,
     store_root_control: @import("../fk_initial_retirement_wire.zig").Control,
     fk_initial_parent_decision: @import("../fk_generation_publication.zig").DecisionRequest,
+    has_index_alias_lifecycle_state: void,
 };

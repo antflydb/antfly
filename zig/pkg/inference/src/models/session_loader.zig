@@ -34,6 +34,7 @@ fn manifestHasNativeAssets(man: manifest_mod.ModelManifest) bool {
 }
 
 pub const Reservation = struct {
+    host_lease: ?runtime.tier.memory.AdmissionLease = null,
     lease: runtime.tier.memory.AdmissionLease,
     resident: runtime.tier.memory.AdmissionAmounts,
     serving_floor: ?runtime.tier.memory.Limits,
@@ -323,6 +324,10 @@ fn loadPreferredWithArtifactsImpl(
         // This attempt owns admission until the successful result explicitly
         // takes it. Includes cancellation, guard-arm failure, and fallback.
         defer if (resource_lease) |*lease| lease.release();
+        var host_weight_lease: ?runtime.tier.memory.AdmissionLease = null;
+        defer if (host_weight_lease) |*lease| lease.release();
+        backend_session_manager.cuda_host_weight_lease = &host_weight_lease;
+        var mapped_host_bytes: usize = 0;
         var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
         var admission_limits = runtime.tier.memory.Limits{};
         var serving_floor: ?runtime.tier.memory.Limits = null;
@@ -365,6 +370,8 @@ fn loadPreferredWithArtifactsImpl(
                 continue;
             };
             resource_lease = reservation.lease;
+            host_weight_lease = reservation.host_lease;
+            mapped_host_bytes = if (host_weight_lease) |held| held.amounts.host_weight_bytes else 0;
         }
         var hard_cancellation = enterSessionConstruction(control, backend_runtime) catch |err| {
             if (err == error.ProcessIsolationRequired) {
@@ -413,7 +420,11 @@ fn loadPreferredWithArtifactsImpl(
             // keeping the construction peak leased until preparation drains.
             try loaded.session.prepareResident(control);
             try bound.finish(&proof);
-            if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
+            if (loaded.resource_lease) |*lease| {
+                var model_resident = resident_amounts;
+                model_resident.host_weight_bytes = try std.math.sub(usize, model_resident.host_weight_bytes, mapped_host_bytes);
+                try lease.retain(model_resident);
+            }
             return loaded.take();
         } else |err| {
             std.log.warn("loadModel({s}) backend {s} failed: {s}", .{ model_dir, @tagName(backend), @errorName(err) });
@@ -515,6 +526,10 @@ fn loadComponentImpl(
 
         var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
         defer if (resource_lease) |*lease| lease.release();
+        var host_weight_lease: ?runtime.tier.memory.AdmissionLease = null;
+        defer if (host_weight_lease) |*lease| lease.release();
+        session_manager.cuda_host_weight_lease = &host_weight_lease;
+        var mapped_host_bytes: usize = 0;
         var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
         var admission_limits = runtime.tier.memory.Limits{};
         if (host.admission_enabled) {
@@ -537,7 +552,7 @@ fn loadComponentImpl(
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
-            const admission_plan = (if (source.kind == .onnx) base_plan else load_plan.withJinaAdapterAdmission(source.manifest.?.*, backend, base_plan)) catch |err| {
+            const admission_plan = (if (source.kind == .onnx) base_plan else load_plan.withNativeAuxiliaryAdmission(source.manifest.?.*, backend, base_plan)) catch |err| {
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
@@ -556,6 +571,8 @@ fn loadComponentImpl(
                 continue;
             };
             resource_lease = reservation.lease;
+            host_weight_lease = reservation.host_lease;
+            mapped_host_bytes = if (host_weight_lease) |held| held.amounts.host_weight_bytes else 0;
         }
 
         var construction = enterSessionConstruction(control, backend_runtime) catch |err| {
@@ -588,7 +605,11 @@ fn loadComponentImpl(
             resource_lease = null;
             defer loaded.deinit();
             if (control) |active| try active.check();
-            if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
+            if (loaded.resource_lease) |*lease| {
+                var model_resident = resident_amounts;
+                model_resident.host_weight_bytes = try std.math.sub(usize, model_resident.host_weight_bytes, mapped_host_bytes);
+                try lease.retain(model_resident);
+            }
             if (host.admission_enabled) {
                 try loaded.session.installOwnedExecutionGate(allocator);
                 try host.attach_admission_fn(host.context, &loaded.session, backend_runtime, resident_amounts, source.manifest);

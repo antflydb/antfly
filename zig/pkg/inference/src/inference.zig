@@ -67,6 +67,14 @@ test "dense projection cache metadata declarations compile" {
     _ = @import("backends/dense_projection_pack.zig");
 }
 
+test "Gemma4 CUDA host PLE declarations compile" {
+    _ = @import("backends/admitted_allocator.zig");
+    _ = @import("ops/cuda/host_retirement.zig");
+    _ = @import("ops/cuda/buffer.zig");
+    _ = @import("ops/cuda/ple_host.zig");
+    if (build_options.enable_cuda) _ = @import("ops/cuda/ple_host_test.zig");
+}
+
 test "generation deadline declarations compile" {
     _ = @import("pipelines/generation.zig");
     _ = server;

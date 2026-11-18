@@ -18,6 +18,21 @@ const Allocator = std.mem.Allocator;
 
 pub const BatchResult = struct { start_lsn: u64, end_lsn: u64 };
 
+/// Catalog transitions and direct source admission share the WAL HEAD CAS.
+pub const CatalogFence = struct { latest_lsn: u64 = 0, epoch: u64 = 0, pending_lsn: ?u64 = null };
+/// Source reads are fenced independently of unrelated namespace appends.
+/// `after_lsn` is captured before those reads; delete/recreate ABA is a change.
+pub const PreparedReadSet = struct { after_lsn: u64, documents: []const []const u8 };
+
+pub const CatalogTransition = struct {
+    fence: CatalogFence,
+    payload: ?[]u8 = null,
+    pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        if (self.payload) |bytes| a.free(bytes);
+        self.* = undefined;
+    }
+};
+
 pub const Record = struct {
     lsn: u64,
     timestamp_ns: u64,

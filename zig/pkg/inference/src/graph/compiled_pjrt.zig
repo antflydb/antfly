@@ -1471,38 +1471,39 @@ test "PJRT whole-model availability accepts single PJRT-owned plans without arti
     try std.testing.expect(hasCompilablePartition(&graph, &dpp, context, .single_device));
 }
 
-test "PJRT partition eligibility rejects unsupported typed constants" {
+test "PJRT partition eligibility accepts I64 constants and rejects unsupported F64 constants" {
     const allocator = std.testing.allocator;
-    var graph = @import("ml").graph.Graph.init(allocator);
-    defer graph.deinit();
-    var builder = @import("ml").graph.Builder.init(&graph);
     const ml_graph = @import("ml").graph;
+    for ([_]ml_graph.DType{ .i64, .f64 }) |dtype| {
+        var graph = ml_graph.Graph.init(allocator);
+        defer graph.deinit();
+        var builder = ml_graph.Builder.init(&graph);
+        const values = [_]i64{ 1, 2 };
+        const c = try builder.tensorConstBytes(std.mem.sliceAsBytes(&values), ml_graph.Shape.init(dtype, &.{2}));
+        const cast = try graph.addNode(.{
+            .op = .{ .convert_dtype = .{ .target = .f32 } },
+            .output_shape = ml_graph.Shape.init(.f32, &.{2}),
+            .inputs = .{ c, ml_graph.null_node, ml_graph.null_node, ml_graph.null_node },
+            .num_inputs = 1,
+        });
 
-    const values = [_]i64{ 1, 2 };
-    const c = try builder.tensorConstBytes(std.mem.sliceAsBytes(&values), ml_graph.Shape.init(.i64, &.{2}));
-    const cast = try graph.addNode(.{
-        .op = .{ .convert_dtype = .{ .target = .f32 } },
-        .output_shape = ml_graph.Shape.init(.f32, &.{2}),
-        .inputs = .{ c, ml_graph.null_node, ml_graph.null_node, ml_graph.null_node },
-        .num_inputs = 1,
-    });
+        var internal_nodes = [_]NodeId{ c, cast };
+        const internal_part = partition_mod.Partition{
+            .backend = .pjrt,
+            .node_ids = internal_nodes[0..],
+            .external_inputs = &.{},
+        };
+        try std.testing.expectEqual(dtype == .i64, isPartitionPjrtEligible(&graph, internal_part));
 
-    var internal_nodes = [_]NodeId{ c, cast };
-    const internal_part = partition_mod.Partition{
-        .backend = .pjrt,
-        .node_ids = internal_nodes[0..],
-        .external_inputs = &.{},
-    };
-    try std.testing.expect(!isPartitionPjrtEligible(&graph, internal_part));
-
-    var external_nodes = [_]NodeId{cast};
-    const external_inputs = [_]partition_mod.ExternalInput{
-        .{ .node_id = c, .source_partition = 0 },
-    };
-    const external_part = partition_mod.Partition{
-        .backend = .pjrt,
-        .node_ids = external_nodes[0..],
-        .external_inputs = &external_inputs,
-    };
-    try std.testing.expect(!isPartitionPjrtEligible(&graph, external_part));
+        var external_nodes = [_]NodeId{cast};
+        const external_inputs = [_]partition_mod.ExternalInput{
+            .{ .node_id = c, .source_partition = 0 },
+        };
+        const external_part = partition_mod.Partition{
+            .backend = .pjrt,
+            .node_ids = external_nodes[0..],
+            .external_inputs = &external_inputs,
+        };
+        try std.testing.expectEqual(dtype == .i64, isPartitionPjrtEligible(&graph, external_part));
+    }
 }

@@ -1916,6 +1916,10 @@ pub const AuthenticatedRequest = struct {
 };
 
 pub const SemanticStatusResolver = struct {
+    server: ?*ApiHttpServer = null,
+    catalog_resolver: ?*ApiHttpServer.CatalogQueryResolver = null,
+    pinned_indexes_json: ?[]const u8 = null,
+    statement_indexes_json: ?[]const u8 = null,
     source: StatusSource,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     io: ?std.Io = null,
@@ -1935,9 +1939,47 @@ pub const SemanticStatusResolver = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .bind_index_aliases = bindIndexAliases,
                 .resolve_dense_query = resolveDenseQuery,
             },
         };
+    }
+
+    fn bindIndexAliases(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, body: []const u8) !?query_contract.BoundIndexAliases {
+        const self: *SemanticStatusResolver = @ptrCast(@alignCast(ptr));
+        self.pinned_indexes_json = null;
+        const server = self.server orelse return null;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const owner = if (self.catalog_resolver) |resolver| resolver.arena else alloc;
+        const indexes_json = self.statement_indexes_json orelse table_indexes: {
+            const table = (try server.queryTableDefinition(if (self.catalog_resolver) |resolver| resolver.arena else a, self.catalog_resolver, table_name, .{
+                .deadline_ns = self.query_embedding_deadline_ns,
+                .cancellation = self.query_cancellation orelse .none,
+            })) orelse return null;
+            break :table_indexes table.indexes_json;
+        };
+        const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+        if (std.mem.indexOf(u8, indexes_json, "_index_aliases") == null and std.mem.indexOfScalar(u8, indexes_json, '\\') == null) return null;
+        const compact = try server.index_alias_cache.project(server.alloc, owner, indexes_json);
+        const owned_compact = self.catalog_resolver == null;
+        errdefer if (owned_compact) alloc.free(compact);
+        const catalog = try std.json.parseFromSliceLeaky(std.json.Value, a, compact, .{});
+        if (!catalog.object.contains(aliases.key)) {
+            if (owned_compact) alloc.free(compact);
+            return null;
+        }
+        self.pinned_indexes_json = compact;
+        var query = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{ .allocate = .alloc_always });
+        try aliases.bindQuery(a, catalog, &query);
+        if (query.object.getPtr("_index_alias_fences")) |fences| for (fences.array.items) |*fence| {
+            if (fence.object.get("incarnation").?.integer != 0) continue;
+            const name = fence.object.get("name").?.string;
+            const identity = (try indexes_api.indexRuntimeIdentity(a, name, catalog.object.get(name) orelse return error.InvalidTableIndexMetadata)) orelse return error.InvalidTableIndexMetadata;
+            try fence.object.put(a, "incarnation", .{ .integer = @intCast(identity.incarnation) });
+        };
+        return .{ .body = try std.json.Stringify.valueAlloc(alloc, query, .{}), .indexes_json = if (owned_compact) compact else null };
     }
 
     fn resolveDenseQuery(
@@ -1952,6 +1994,7 @@ pub const SemanticStatusResolver = struct {
         const self: *SemanticStatusResolver = @ptrCast(@alignCast(ptr));
         try ensureRequestActive(self.query_cancellation);
         const planned = try internal_query_operations.planSemanticQuery(.{
+            .indexes_json = self.pinned_indexes_json,
             .ptr = self.source.ptr,
             .admin_snapshot = self.source.vtable.admin_snapshot orelse return error.UnsupportedQueryRequest,
             .free_admin_snapshot = self.source.vtable.free_admin_snapshot orelse return error.UnsupportedQueryRequest,
@@ -2057,6 +2100,7 @@ pub const StatusSource = struct {
         privacy_authority_term: ?*const fn (*anyopaque) anyerror!?u64 = null,
         privacy_work: ?*const fn (*anyopaque, std.mem.Allocator, i64) anyerror!?metadata_table_manager.PrivacyWork = null,
         table_record: ?*const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?metadata_table_manager.TableRecord = null,
+        acknowledge_catalog_replay: ?*const fn (*anyopaque, api_operation.RequestContext) anyerror!void = null,
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         /// Complete catalog and store capabilities without detailed inventories.
@@ -2145,6 +2189,12 @@ pub const StatusSource = struct {
         const call = self.vtable.privacy_work orelse return null;
         return BoundaryAbi.call("privacy_work", self.boundary_dispatch, call, .{ self.ptr, a, now });
     }
+    pub fn acknowledgeCatalogReplay(self: StatusSource, context: api_operation.RequestContext) !void {
+        try context.ensureActive();
+        if (self.vtable.acknowledge_catalog_replay) |call|
+            try BoundaryAbi.call("acknowledge_catalog_replay", self.boundary_dispatch, call, .{ self.ptr, context });
+    }
+
     pub fn tableRecord(self: StatusSource, a: std.mem.Allocator, name: []const u8) !?metadata_table_manager.TableRecord {
         if (self.vtable.table_record) |call| return BoundaryAbi.call("table_record", self.boundary_dispatch, call, .{ self.ptr, a, name });
         var snapshot = (try self.adminSnapshot()) orelse return null;
@@ -2811,6 +2861,9 @@ pub const StatusSource = struct {
             fn nextPrivacyWork(ptr: *anyopaque, a: std.mem.Allocator, now: i64) anyerror!?metadata_table_manager.PrivacyWork {
                 return cast(ptr).nextPrivacyWork(a, now);
             }
+            fn acknowledgeCatalogReplay(ptr: *anyopaque, context: api_operation.RequestContext) anyerror!void {
+                return cast(ptr).acknowledgeCatalogReplay(context);
+            }
             fn tableRecord(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) anyerror!?metadata_table_manager.TableRecord {
                 return cast(ptr).tableRecord(a, name);
             }
@@ -2920,6 +2973,7 @@ pub const StatusSource = struct {
             .privacy_authority_term = if (@hasDecl(T, "privacyAuthorityTerm")) Gen.privacyAuthorityTerm else null,
             .privacy_work = if (@hasDecl(T, "nextPrivacyWork")) Gen.nextPrivacyWork else null,
             .table_record = if (@hasDecl(T, "tableRecord")) Gen.tableRecord else null,
+            .acknowledge_catalog_replay = if (@hasDecl(T, "acknowledgeCatalogReplay")) Gen.acknowledgeCatalogReplay else null,
             .wait_table_projection = Gen.waitTableProjection,
             .run_round = Gen.runRound,
             .get_join_shuffle_lease = Gen.getJoinShuffleLease,
@@ -4056,6 +4110,7 @@ pub const ApiHttpServer = struct {
     }
 
     object_tables: @import("object_table_runtime.zig").Manager = .{},
+    index_alias_cache: @import("index_alias_cache.zig").Cache = .{},
     retained_read_runtime: ?*@import("retained_read_owner.zig").Runtime = null,
     retained_read_runtime_mutex: std.Io.Mutex = .init,
     table_definition_cache: tables_api.DefinitionCache = .{},
@@ -4165,6 +4220,8 @@ pub const ApiHttpServer = struct {
     index_installation_worker_in_flight: std.atomic.Value(bool) = .init(false),
     index_installation_mutex: std.atomic.Mutex = .unlocked,
     index_installation_apply_mutex: std.atomic.Mutex = .unlocked,
+    // Borrowed keys are owned by the corresponding queued publication.
+    pending_lake_publications: std.StringHashMapUnmanaged(void) = .empty,
     index_installation_queue: std.ArrayListUnmanaged(PendingIndexInstallation) = .empty,
     index_installation_reserved_slots: usize = 0,
     index_installation_next_generation: u64 = 1,
@@ -4704,6 +4761,18 @@ pub const ApiHttpServer = struct {
             return error.ArtifactIndexSourcesTemporarilyUnavailable;
     }
 
+    pub fn ensureIndexAliasAdmission(self: *ApiHttpServer, request: api_operation.RequestContext) !void {
+        if (self.cfg.deployment_mode != .distributed) return;
+        var snapshot = (try self.source.linearizableSnapshot(request)) orelse return error.IndexAliasProtocolUpgradeRequired;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        for (snapshot.stores) |store| {
+            if (!store.live or !metadata_table_manager.storeServesTableData(store.role)) continue;
+            if (!metadata_table_manager.indexAliasLifecycleProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version)) return error.IndexAliasProtocolUpgradeRequired;
+        }
+        // Empty data fleets are valid for object tables. The durable alias
+        // admission and subsequent store admission enforce the protocol floor.
+    }
+
     pub fn ensurePrivacyAdmission(self: *ApiHttpServer, request: api_operation.RequestContext) !void {
         const reads = self.table_reads orelse return error.PrivacyProtectiveInstallationRequired;
         if (reads.vtable.privacy_policy_version == null or self.cfg.deployment_mode == .serverless) return error.PrivacyProtectiveInstallationRequired;
@@ -5025,6 +5094,7 @@ pub const ApiHttpServer = struct {
             if (self.index_installation_owner_id != 0) runtime.durable_jobs.closeOwner(self.index_installation_owner_id);
         }
         platform_sync.lockYielding(&self.index_installation_mutex);
+        self.pending_lake_publications.deinit(std.heap.page_allocator);
         for (self.index_installation_queue.items) |*entry| entry.deinit();
         self.index_installation_queue.deinit(std.heap.page_allocator);
         self.index_installation_mutex.unlock();
@@ -5061,6 +5131,7 @@ pub const ApiHttpServer = struct {
         self.query_embedding_cache.deinit(self.inferenceCacheBudget());
         self.sql_plan_cache.deinit(queryEmbeddingCacheIo(self.cfg));
         self.sql_schema_cache.deinit();
+        self.index_alias_cache.deinit(self.alloc);
         self.lake_recent_vector_jobs.deinit();
         self.lake_retained_payloads.deinit();
         self.lake_recent_text.deinit();
@@ -5214,6 +5285,7 @@ pub const ApiHttpServer = struct {
         security_scope: []const u8,
     ) SemanticStatusResolver {
         return .{
+            .server = self,
             .source = self.source,
             .antfly_provider = self.antfly_provider,
             .io = self.inferenceIo(),
@@ -8659,10 +8731,10 @@ pub const ApiHttpServer = struct {
 
         if (std.mem.startsWith(u8, value, "Basic ")) {
             const encoded = value["Basic ".len..];
-            const raw_size = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
+            const raw_size = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.Unauthorized;
             const raw = try self.alloc.alloc(u8, raw_size);
             defer self.alloc.free(raw);
-            try std.base64.standard.Decoder.decode(raw, encoded);
+            std.base64.standard.Decoder.decode(raw, encoded) catch return error.Unauthorized;
             const colon_pos = std.mem.indexOfScalar(u8, raw, ':') orelse return error.Unauthorized;
             var user = try manager.authenticateUser(raw[0..colon_pos], raw[colon_pos + 1 ..]);
             defer user.deinit(manager.alloc);
@@ -8682,10 +8754,10 @@ pub const ApiHttpServer = struct {
 
         if (std.mem.startsWith(u8, value, "ApiKey ") or std.mem.startsWith(u8, value, "Bearer ")) {
             const encoded = if (std.mem.startsWith(u8, value, "ApiKey ")) value["ApiKey ".len..] else value["Bearer ".len..];
-            const raw_size = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
+            const raw_size = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.Unauthorized;
             const raw = try self.alloc.alloc(u8, raw_size);
             defer self.alloc.free(raw);
-            try std.base64.standard.Decoder.decode(raw, encoded);
+            std.base64.standard.Decoder.decode(raw, encoded) catch return error.Unauthorized;
             const colon_pos = std.mem.indexOfScalar(u8, raw, ':') orelse return error.Unauthorized;
             var validated = try manager.validateApiKey(raw[0..colon_pos], raw[colon_pos + 1 ..]);
             defer validated.deinit(manager.alloc);
@@ -10709,6 +10781,10 @@ pub const ApiHttpServer = struct {
         return group_ids;
     }
 
+    pub fn acknowledgeIndexAliasReplay(self: *ApiHttpServer, context: api_operation.RequestContext) !void {
+        try self.source.acknowledgeCatalogReplay(context);
+    }
+
     pub fn loadOwnedTableRecord(
         self: *ApiHttpServer,
         alloc: std.mem.Allocator,
@@ -10930,6 +11006,20 @@ pub const ApiHttpServer = struct {
         index_name: []const u8,
         keys: []const []const u8,
     ) ![]bool {
+        var alias_arena = std.heap.ArenaAllocator.init(alloc);
+        defer alias_arena.deinit();
+        const scratch = alias_arena.allocator();
+        var concrete_index = index_name;
+        var selected_identity: ?distributed_graph.GraphIndexIdentity = null;
+        if (try self.queryTableDefinition(scratch, null, table_name, .{})) |table| {
+            const compact = try self.index_alias_cache.project(self.alloc, scratch, table.indexes_json);
+            const alias_catalog = try std.json.parseFromSliceLeaky(std.json.Value, scratch, compact, .{});
+            concrete_index = try @import("antfly_local_sources").api_index_metadata.aliases.resolve(alias_catalog, index_name);
+            if (!std.mem.eql(u8, concrete_index, index_name)) {
+                const identity = (try indexes_api.indexRuntimeIdentity(scratch, concrete_index, alias_catalog.object.get(concrete_index).?)) orelse return error.IndexNotFound;
+                selected_identity = .{ .incarnation = identity.incarnation, .config_hash = identity.config_hash };
+            }
+        }
         const SourceWorker = struct {
             server: *ApiHttpServer,
             source: table_reads.TableReadSource,
@@ -11014,16 +11104,17 @@ pub const ApiHttpServer = struct {
             .server = self,
             .source = source,
         };
-        return try distributed_graph.probeIncomingEdgesForKeys(
+        return try distributed_graph.probeIncomingEdgesForKeysWithOptions(
             alloc,
             catalog,
             worker.iface(),
             table_name,
             topology_epoch,
             null,
-            index_name,
+            concrete_index,
             keys,
             .read_index,
+            .{ .index_identity = selected_identity },
         );
     }
 
@@ -11179,6 +11270,25 @@ pub const ApiHttpServer = struct {
                 .graph => {
                     try self.appendQueryBuilderGraphIndexMetadata(&graph_metadata, entry.key_ptr.*, entry.value_ptr.*);
                 },
+            }
+        }
+
+        if (object.get(@import("antfly_local_sources").api_index_metadata.aliases.key)) |aliases| {
+            if (aliases != .object) return error.InvalidTableIndexMetadata;
+            var names = aliases.object.iterator();
+            while (names.next()) |entry| {
+                const target = try @import("antfly_local_sources").api_index_metadata.aliases.resolve(parsed.value, entry.key_ptr.*);
+                const config = object.get(target) orelse return error.InvalidTableIndexMetadata;
+                const kind = queryBuilderIndexContextType(target, config) orelse continue;
+                switch (kind) {
+                    .full_text => try self.appendQueryBuilderFullTextIndexMetadata(&full_text_metadata, entry.key_ptr.*, config),
+                    .embeddings => {
+                        const metadata = try self.queryBuilderEmbeddingIndexMetadata(entry.key_ptr.*, config);
+                        errdefer freeQueryBuilderEmbeddingIndexMetadataItem(self.alloc, metadata);
+                        try embedding_metadata.append(self.alloc, metadata);
+                    },
+                    .graph => try self.appendQueryBuilderGraphIndexMetadata(&graph_metadata, entry.key_ptr.*, config),
+                }
             }
         }
 
@@ -12896,6 +13006,14 @@ pub const ApiHttpServer = struct {
             return error.InternalFailure;
         }
 
+        fn preparationError(self: *@This(), cause: anyerror) cluster_api_http.ClusterApi.ExecuteBackupError![]u8 {
+            return switch (cause) {
+                error.Canceled, error.Cancelled => error.Canceled,
+                error.Timeout, error.DeadlineExceeded => error.DeadlineExceeded,
+                else => self.internal(cause),
+            };
+        }
+
         fn logFailure(self: *const @This(), public_err: anyerror) void {
             if (public_err != error.InternalFailure) return;
             std.log.err("cluster backup failed phase={s} class={s}", .{
@@ -13495,11 +13613,20 @@ pub const ApiHttpServer = struct {
 
         var created_metadata = false;
         var storage_committed = false;
+        errdefer if (created_metadata and !storage_committed) self.source.dropTable(self.alloc, table_name) catch {};
         if (!target_exists) {
             var create_req = backups_api.createTableRequestFromManifest(self.alloc, &manifest) catch {
                 return error.UnsupportedBackupFormat;
             };
             defer create_req.deinit(self.alloc);
+            // Creation reserves a fresh catalog identity at generation zero.
+            // Publish the authenticated source generation with storage through
+            // the same definition hook used for replacement restores below.
+            if (create_req.schema_json) |schema| {
+                const initial_schema = try tables_api.normalizeSchemaVersion(self.alloc, schema, 0);
+                self.alloc.free(schema);
+                create_req.schema_json = initial_schema;
+            }
             const logical_target = try system_catalog.restoreTarget(self.alloc, table_name);
             defer if (logical_target) |target| target.deinit(self.alloc);
             const logical_name = if (logical_target) |target| try target.value.resourceNameAlloc(self.alloc) else try self.alloc.dupe(u8, table_name);
@@ -13508,13 +13635,10 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedOperation => {},
                 else => return err,
             };
-            self.waitForMetadataProjection(table_name, manifest.schema_json, manifest.indexes_json) catch |err| switch (err) {
-                error.TableVisibilityTimeout => return error.TableVisibilityTimeout,
-                else => return err,
-            };
             if (try self.tableExists(table_name)) created_metadata = true;
+            try self.waitForMetadataProjection(table_name, tables_api.effectiveSchemaJson(create_req.schema_json), create_req.indexes_json orelse tables_api.default_indexes_json);
+            created_metadata = true;
         }
-        errdefer if (created_metadata and !storage_committed) self.source.dropTable(self.alloc, table_name) catch {};
 
         var previous_definition: ?metadata_table_manager.TableRecord = null;
         defer if (previous_definition) |definition| metadata_table_manager.freeTable(self.alloc, definition);
@@ -13522,19 +13646,26 @@ pub const ApiHttpServer = struct {
         var publication_hook: ?backups_api.RestorePublicationHook = null;
         var replacement_indexes: ?[]u8 = null;
         defer if (replacement_indexes) |value| self.alloc.free(value);
-        if (replace_existing) {
+        if (replace_existing or created_metadata) {
             previous_definition = (try self.loadOwnedTableRecord(self.alloc, table_name)) orelse return error.TableNotFound;
             // Keep authenticated source bytes for storage validation. Only the
             // destination definition loses source-owned operational checkpoints.
-            replacement_indexes = try @import("antfly_local_sources").privacy_catalog.prepareRestore(self.alloc, manifest.indexes_json);
+            if (!created_metadata) {
+                const prepared = try @import("antfly_local_sources").privacy_catalog.prepareRestore(self.alloc, manifest.indexes_json);
+                defer self.alloc.free(prepared);
+                var nonce: [32]u8 = undefined;
+                try staging_io.randomSecure(&nonce);
+                replacement_indexes = try @import("antfly_local_sources").api_index_metadata.aliases.renewRestoreEpoch(self.alloc, prepared, &std.fmt.bytesToHex(nonce, .lower));
+            }
+            const destination_indexes = replacement_indexes orelse previous_definition.?.indexes_json;
             var destination_manifest = manifest;
-            destination_manifest.indexes_json = replacement_indexes.?;
+            destination_manifest.indexes_json = destination_indexes;
             if (!try tableDefinitionMatchesManifest(self.alloc, previous_definition.?, &destination_manifest)) {
                 var replacement = previous_definition.?;
                 replacement.description = manifest.description;
                 replacement.schema_json = manifest.schema_json;
                 replacement.read_schema_json = "";
-                replacement.indexes_json = replacement_indexes.?;
+                replacement.indexes_json = destination_indexes;
                 replacement.replication_sources_json = manifest.replication_sources_json;
                 replacement.restore_backup_id = "";
                 replacement.restore_location = "";
@@ -14797,6 +14928,7 @@ pub const ApiHttpServer = struct {
         const txn_writes: []const db_mod.types.TransactionWrite = @ptrCast(req.writes);
         const tables = [_]distributed_txn.TableCommitRequest{.{
             .table_name = table_name,
+            .commit_requires = req.commit_requires,
             .writes = txn_writes,
             .deletes = req.deletes,
             .transforms = req.transforms,
@@ -14815,6 +14947,9 @@ pub const ApiHttpServer = struct {
         var retained_preparation: ?@import("antfly_local_sources").api_relational_integrity_commit.Prepared = null;
         defer if (retained_preparation) |*prepared| prepared.deinit();
         const outcome = (self.commitPublicTableBatchWithIntegrity(alloc, source, &tables, req.sync_level, request, &retained_preparation) catch |err| switch (err) {
+            error.UnsupportedCommitRequirement => return error.UnsupportedCommitRequirement,
+            error.CommitRequirementUnavailable => return error.Unavailable,
+            error.CommitRequirementTooLarge, error.CommitRequirementFailed => return error.InvalidBatchRequest,
             error.RelationalIndexKeyTooLarge => return error.RelationalIndexKeyTooLarge,
             error.UniqueConstraintViolation => return error.UniqueConstraintViolation,
             error.RelationalCheckViolation => return error.RelationalCheckViolation,
@@ -15069,6 +15204,11 @@ pub const ApiHttpServer = struct {
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
             error.ReembedSetupRetry => return error.ReembedSetupRetry,
+            error.ForeignConnectionFailed => return error.ForeignConnectionFailed,
+            error.ForeignQueryFailed => return error.ForeignQueryFailed,
+            error.ForeignAuthFailed => return error.ForeignAuthFailed,
+            error.ForeignTableNotFound => return error.ForeignTableNotFound,
+            error.LibpqUnavailable => return error.LibpqUnavailable,
             error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation => return error.GraphMinWeightDomainViolation,
             error.GraphMaxWeightDomainViolation => return error.GraphMaxWeightDomainViolation,
@@ -15427,6 +15567,11 @@ pub const ApiHttpServer = struct {
                 error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
                 error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
                 error.ReembedSetupRetry => return error.ReembedSetupRetry,
+                error.ForeignConnectionFailed => return error.ForeignConnectionFailed,
+                error.ForeignQueryFailed => return error.ForeignQueryFailed,
+                error.ForeignAuthFailed => return error.ForeignAuthFailed,
+                error.ForeignTableNotFound => return error.ForeignTableNotFound,
+                error.LibpqUnavailable => return error.LibpqUnavailable,
                 error.GraphWorkBudgetExceeded,
                 error.GraphMinWeightDomainViolation,
                 error.GraphMaxWeightDomainViolation,
@@ -15505,6 +15650,11 @@ pub const ApiHttpServer = struct {
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
             error.ReembedSetupRetry => return error.ReembedSetupRetry,
+            error.ForeignConnectionFailed => return error.ForeignConnectionFailed,
+            error.ForeignQueryFailed => return error.ForeignQueryFailed,
+            error.ForeignAuthFailed => return error.ForeignAuthFailed,
+            error.ForeignTableNotFound => return error.ForeignTableNotFound,
+            error.LibpqUnavailable => return error.LibpqUnavailable,
             error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation,
             error.GraphMaxWeightDomainViolation,
@@ -15630,6 +15780,11 @@ pub const ApiHttpServer = struct {
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
             error.ReembedSetupRetry => return error.ReembedSetupRetry,
+            error.ForeignConnectionFailed => return error.ForeignConnectionFailed,
+            error.ForeignQueryFailed => return error.ForeignQueryFailed,
+            error.ForeignAuthFailed => return error.ForeignAuthFailed,
+            error.ForeignTableNotFound => return error.ForeignTableNotFound,
+            error.LibpqUnavailable => return error.LibpqUnavailable,
             error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation,
             error.GraphMaxWeightDomainViolation,
@@ -16125,6 +16280,7 @@ pub const ApiHttpServer = struct {
         defer resolver.native_capture_token = null;
         try ensureRequestActive(cancellation);
         var semantic_resolver = self.semanticStatusResolver(query_embedding_security_scope.domain, query_embedding_security_scope.value);
+        semantic_resolver.catalog_resolver = resolver;
         semantic_resolver.query_embedding_deadline_ns = request_deadline_ns;
         semantic_resolver.query_cancellation = cancellation;
         var query_req = query_api.parsePublicQueryRequestWithDeadline(
@@ -16610,6 +16766,7 @@ pub const ApiHttpServer = struct {
         const query_body = try stringifyJsonValueAlloc(alloc, query_value);
         defer alloc.free(query_body);
         var semantic_resolver = self.semanticStatusResolver(.internal, "");
+        semantic_resolver.catalog_resolver = resolver;
         semantic_resolver.query_embedding_deadline_ns = execution_deadline_ns;
         semantic_resolver.query_cancellation = cancellation;
         var owned = try query_api.parsePublicQueryRequestWithDeadline(
@@ -16947,6 +17104,7 @@ pub const ApiHttpServer = struct {
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
+        if (try self.nativeObjectIndexResource(alloc, table.*, .list, request)) |resource| return resource;
         if (table.schema_json.len > 0) {
             var schema = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return error.InternalFailure;
             defer schema.deinit(alloc);
@@ -17016,6 +17174,35 @@ pub const ApiHttpServer = struct {
         return result;
     }
 
+    // Native object indexes are owned by the incarnation-fenced object runtime,
+    // rather than resident Raft shards. Share its observation across list, GET
+    // and alias admission so these contracts cannot disagree about readiness.
+    fn nativeObjectIndexResource(self: *ApiHttpServer, alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, resource: @import("object_table_runtime.zig").IndexResource, request: api_operation.RequestContext) public_table_http.TableApi.ExecuteGetIndexError!?[]u8 {
+        if (table.storage.engine != .object) return null;
+        var schema = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return error.InternalFailure;
+        defer schema.deinit(alloc);
+        if (schema.external_base_source != null) return null;
+        var response = (self.tryObjectTableRequestWithOptions(table.name, .get, "indexes", "", null, request, .{ .index_resource = resource, .incarnation = .{ .table_id = table.table_id, .generation = table.object_storage_generation } }) catch {
+            try ensureTableOperationActive(request);
+            return error.Unavailable;
+        }) orelse return error.Unavailable;
+        defer response.deinit(self.alloc);
+        try ensureTableOperationActive(request);
+        if (response.status == 404) return error.NotFound;
+        if (response.status != 200) return error.Unavailable;
+        return alloc.dupe(u8, response.body) catch return error.InternalFailure;
+    }
+
+    pub fn indexAliasTargetResource(self: *ApiHttpServer, alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, index: []const u8, request: api_operation.RequestContext) ![]u8 {
+        if (table.storage.engine == .object) {
+            if (self.nativeObjectIndexResource(alloc, table, .{ .get = index }, request) catch |err| switch (err) {
+                error.NotFound, error.Unavailable => return error.IndexAliasTargetNotReady,
+                else => return err,
+            }) |resource| return resource;
+        }
+        return getIndexResourceWithExpected(self, alloc, table.name, index, request, table);
+    }
+
     fn executePublicTableGetIndex(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -17023,11 +17210,26 @@ pub const ApiHttpServer = struct {
         index_name: []const u8,
         request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
+        return getIndexResourceWithExpected(ptr, alloc, table_name, index_name, request, null);
+    }
+
+    fn getIndexResourceWithExpected(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        request: api_operation.RequestContext,
+        expected: ?metadata_table_manager.TableRecord,
+    ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
+        if (expected) |record| if (!metadata_table_manager.tableDefinitionsEqual(record, table.*)) return error.Conflict;
+        if (table.storage.engine == .object) {
+            if (try self.nativeObjectIndexResource(alloc, table.*, .{ .get = index_name }, request)) |resource| return resource;
+        }
         if (table.schema_json.len != 0) {
             var parsed = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return error.InternalFailure;
             defer parsed.deinit(alloc);
@@ -17235,6 +17437,8 @@ pub const ApiHttpServer = struct {
             alloc,
             self.index_installation_reserved_slots + 1,
         );
+        if (std.mem.eql(u8, index_name, "__lake_publication"))
+            try self.pending_lake_publications.ensureUnusedCapacity(alloc, @intCast(self.index_installation_reserved_slots + 1));
         self.index_installation_reserved_slots += 1;
         payload_transferred = true;
         return .{
@@ -17284,6 +17488,12 @@ pub const ApiHttpServer = struct {
         if (self.index_installation_next_generation == 0) self.index_installation_next_generation = 1;
         std.debug.assert(self.index_installation_reserved_slots > 0);
         self.index_installation_reserved_slots -= 1;
+        const lake_publication = maintenance_table_id == null and std.mem.eql(u8, prepared.index_name, "__lake_publication");
+        if (lake_publication) {
+            // A replacement transfers ownership of the key along with the job.
+            _ = self.pending_lake_publications.remove(prepared.table_name);
+            self.pending_lake_publications.putAssumeCapacity(prepared.table_name, {});
+        }
         if (existing) |pending| {
             pending.deinit();
             pending.* = .{
@@ -17412,6 +17622,11 @@ pub const ApiHttpServer = struct {
     /// periodic inventory sweep. Coalesce that hint without resetting an active
     /// build's generation, failure count, or retry deadline on every poll.
     pub fn requestLakePublication(self: *ApiHttpServer, table_name: []const u8) !void {
+        platform_sync.lockYielding(&self.index_installation_mutex);
+        const queued = self.pending_lake_publications.contains(table_name);
+        self.index_installation_mutex.unlock();
+        if (queued) return;
+
         var prepared = (try self.prepareLakeCommit(table_name)) orelse return;
         defer prepared.deinit(self);
         _ = self.activatePreparedIndexInstallationWithReplacement(&prepared, true, false, 0, null);
@@ -17810,6 +18025,8 @@ pub const ApiHttpServer = struct {
         for (self.index_installation_queue.items, 0..) |*pending, index| {
             if (pending.generation != generation) continue;
             var removed = self.index_installation_queue.orderedRemove(index);
+            if (removed.maintenance_table_id == null and std.mem.eql(u8, removed.index_name, "__lake_publication"))
+                _ = self.pending_lake_publications.remove(removed.table_name);
             removed.deinit();
             if (self.index_installation_queue.items.len == 0) {
                 self.index_installation_cursor = 0;
@@ -17949,6 +18166,13 @@ pub const ApiHttpServer = struct {
         // through consensus and used as the projection expectation, making the
         // operation idempotent across retries and leadership changes.
         const assembled_indexes_json = indexes_api.addIndexToTableIndexesJsonWithIo(alloc, self.inferenceIo(), table_before.indexes_json, index_name, authorized_index_json) catch |err| switch (err) {
+            error.IndexAliasNameConflict, error.IndexReferencedByAlias => return error.Conflict,
+            error.PrivacyManagedGraph => return error.Conflict,
+            error.PrivacyUnsupportedIndexType,
+            error.PrivacyExternalEmbeddingsUnsupported,
+            error.PrivacyEmbeddingProducerRequired,
+            error.PrivacyUnknownArtifactSource,
+            => return error.InvalidIndexRequest,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
@@ -18038,7 +18262,7 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
@@ -18426,7 +18650,7 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject, error.UnsupportedOperation => return error.MethodNotAllowed,
             else => return if (metadata_authority.isRetryableError(err)) error.NotLeader else error.InternalFailure,
         };
@@ -18461,7 +18685,7 @@ pub const ApiHttpServer = struct {
                 external_table = schema.external_base_source != null;
             }
             if (@import("relational_index_mutation.zig").drop(alloc, before, index_name) catch |err| switch (err) {
-                error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+                error.PrivacyManagedGraph, error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
                 else => return error.InternalFailure,
             }) |replacement| {
                 defer metadata_table_manager.freeTable(alloc, replacement);
@@ -18483,9 +18707,10 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.PrivacyManagedGraph, error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
+            error.PrivacyUnknownArtifactSource,
             error.InvalidEnrichmentConfig,
             error.ConflictingEnrichmentConfig,
             error.MissingEmbeddingArtifactEnrichment,
@@ -18676,7 +18901,7 @@ pub const ApiHttpServer = struct {
         self.source.replaceTableDefinition(table_before, replacement) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
@@ -18738,7 +18963,7 @@ pub const ApiHttpServer = struct {
         self.source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.EnrichmentNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidEnrichmentConfig,
@@ -18792,6 +19017,7 @@ pub const ApiHttpServer = struct {
             error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
             error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor => return error.StorageReadTemporarilyUnavailable,
+            error.ResourceBudgetExceeded => return error.ResourceBudgetExceeded,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest lookup failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
@@ -19470,16 +19696,32 @@ pub const ApiHttpServer = struct {
                 },
             };
             trace.enter(.cohort_preparation);
+            var freeze_retry_ms: u32 = 25;
             while (true) {
-                switch (cohort_session.?.prepareSlice() catch |err| return trace.internal(err) catch |zig017_err| {
-                    zig017_return_error = zig017_err;
-                    return zig017_err;
-                }) {
-                    .ready => break,
-                    .advanced => {},
-                    .waiting => backup_io.sleep(.fromMilliseconds(10), .awake) catch |err| return trace.internal(err) catch |zig017_err| {
+                if (lease_heartbeat.lost.load(.acquire))
+                    return trace.internal(error.BackupAttemptLeaseLost) catch |zig017_err| {
                         zig017_return_error = zig017_err;
                         return zig017_err;
+                    };
+                const preparation = cohort_session.?.prepareSlice() catch |err| return trace.preparationError(err) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                };
+                switch (preparation) {
+                    .ready => break,
+                    .advanced => freeze_retry_ms = 25,
+                    .waiting, .waiting_for_producers => {
+                        const delay_ms: u32 = if (preparation == .waiting_for_producers) freeze_retry_ms else 10;
+                        const remaining_ms = operation_request.remainingTimeoutMs() catch |err| return trace.preparationError(err) catch |zig017_err| {
+                            zig017_return_error = zig017_err;
+                            return zig017_err;
+                        };
+                        const sleep_ns = @as(u64, @min(delay_ms, remaining_ms orelse delay_ms)) * std.time.ns_per_ms;
+                        sleepNsCancellable(backup_io, sleep_ns, operation_request.cancellation) catch |err| return trace.preparationError(err) catch |zig017_err| {
+                            zig017_return_error = zig017_err;
+                            return zig017_err;
+                        };
+                        if (preparation == .waiting_for_producers) freeze_retry_ms = @min(250, freeze_retry_ms * 2);
                     },
                 }
             }
@@ -19955,7 +20197,7 @@ pub const ApiHttpServer = struct {
     /// One scheduling slice of the EXISTING restore job. Native row pages,
     /// global constraint activation, publication, and cancellation all retain
     /// the same durable staging incarnation across execution retries.
-    fn driveStagedRestore(self: *ApiHttpServer, restore: RestoreCancellation, staging_attempt: u64, initial: []const u8, table_names: []const []const u8) anyerror![]u8 {
+    fn driveStagedRestore(self: *ApiHttpServer, restore: RestoreCancellation, staging_attempt: u64, initial: []const u8) anyerror![]u8 {
         var zig017_return_error: ?anyerror = null;
         if (self.cfg.deployment_mode == .standalone) _ = (self.source.runRound() catch |zig017_err| {
             zig017_return_error = zig017_err;
@@ -20804,16 +21046,20 @@ pub const ApiHttpServer = struct {
                             return zig017_err;
                         });
                         self.alloc.free(resolved);
-                        const statuses = (self.alloc.alloc(backups_api.ClusterTableRestoreStatus, table_names.len) catch |zig017_err| {
+                        // Use the durable plan after both initial execution and
+                        // resume. The request may name a public catalog alias.
+                        const targets = job.value.plan.targets;
+                        const skipped = job.value.plan.skipped_tables;
+                        const statuses = (self.alloc.alloc(backups_api.ClusterTableRestoreStatus, targets.len + skipped.len) catch |zig017_err| {
                             zig017_return_error = zig017_err;
                             return zig017_err;
                         });
                         defer self.alloc.free(statuses);
-                        for (table_names, statuses) |name, *status| {
-                            const present = for (job.value.plan.targets) |target| {
-                                if (std.mem.eql(u8, target.table.name, name)) break true;
-                            } else false;
-                            status.* = .{ .name = name, .status = if (present) "committed" else "skipped", .@"error" = null };
+                        for (targets, statuses[0..targets.len]) |target, *status| {
+                            status.* = .{ .name = target.table.name, .status = "committed", .@"error" = null };
+                        }
+                        for (skipped, statuses[targets.len..]) |name, *status| {
+                            status.* = .{ .name = name, .status = "skipped", .@"error" = null };
                         }
                         return backups_api.encodeClusterRestoreResponse(self.alloc, statuses) catch |zig017_err| {
                             zig017_return_error = zig017_err;
@@ -21187,7 +21433,7 @@ pub const ApiHttpServer = struct {
         const context = control.context();
         if (try self.source.getRestoreStaging(self.alloc, id, context)) |existing| {
             defer self.alloc.free(existing);
-            return self.driveStagedRestore(restore, staging_attempt, existing, if (req.single_table_destination) |destination| &.{destination} else names);
+            return self.driveStagedRestore(restore, staging_attempt, existing);
         }
         const sources = try a.alloc(driver.SourceTable, names.len);
         const logical_state = if (self.source.vtable.system_catalog != null)
@@ -21277,7 +21523,7 @@ pub const ApiHttpServer = struct {
         const encoded = try std.json.Stringify.valueAlloc(a, stages.Command{ .id = id, .action = .reserve, .plan = plan }, .{});
         const reserved = try self.source.applyRestoreStaging(self.alloc, encoded, context);
         defer self.alloc.free(reserved);
-        return self.driveStagedRestore(restore, staging_attempt, reserved, if (req.single_table_destination) |destination| &.{destination} else names);
+        return self.driveStagedRestore(restore, staging_attempt, reserved);
     }
 
     fn stagedRestoreError(err: anyerror) cluster_api_http.ClusterApi.ExecuteRestoreError {
@@ -21337,16 +21583,7 @@ pub const ApiHttpServer = struct {
         const id = try stages.idForAttempt(state.job_id, state.staging_attempt_id);
         if (try self.source.getRestoreStaging(self.alloc, id, context)) |existing| {
             defer self.alloc.free(existing);
-            var arena = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena.deinit();
-            const parsed = try std.json.parseFromSlice(stages.Job, arena.allocator(), existing, .{});
-            const names = state.table_names orelse names: {
-                const values = try arena.allocator().alloc([]const u8, parsed.value.plan.targets.len + parsed.value.plan.skipped_tables.len);
-                for (parsed.value.plan.targets, values[0..parsed.value.plan.targets.len]) |target, *name| name.* = target.table.name;
-                @memcpy(values[parsed.value.plan.targets.len..], parsed.value.plan.skipped_tables);
-                break :names values;
-            };
-            return self.driveStagedRestore(restore, state.staging_attempt_id, existing, names);
+            return self.driveStagedRestore(restore, state.staging_attempt_id, existing);
         }
         if (!state.cancel_requested and state.staging_failure.len == 0) return error.RestoreValidationPending;
         const command = try std.json.Stringify.valueAlloc(self.alloc, stages.Command{ .id = id, .action = .cancel_reservation }, .{});
@@ -21437,16 +21674,7 @@ pub const ApiHttpServer = struct {
                 var staged_control = StagedRestoreControl{ .server = self, .restore = restore };
                 if (self.source.getRestoreStaging(self.alloc, id, staged_control.context()) catch |err| return stagedRestoreError(err)) |existing| {
                     defer self.alloc.free(existing);
-                    var arena = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena.deinit();
-                    const parsed = std.json.parseFromSlice(@import("../metadata/restore_staging.zig").Job, arena.allocator(), existing, .{}) catch return error.InternalFailure;
-                    const names = req.table_names orelse names: {
-                        const values = arena.allocator().alloc([]const u8, parsed.value.plan.targets.len + parsed.value.plan.skipped_tables.len) catch return error.InternalFailure;
-                        for (parsed.value.plan.targets, values[0..parsed.value.plan.targets.len]) |target, *name| name.* = target.table.name;
-                        @memcpy(values[parsed.value.plan.targets.len..], parsed.value.plan.skipped_tables);
-                        break :names values;
-                    };
-                    return self.driveStagedRestore(restore, state.value.staging_attempt_id, existing, names) catch |err| return stagedRestoreError(err);
+                    return self.driveStagedRestore(restore, state.value.staging_attempt_id, existing) catch |err| return stagedRestoreError(err);
                 }
                 // Fence absent reservations durably. A delayed reserve must
                 // not recreate targets after cancellation has terminalized.
@@ -21517,9 +21745,14 @@ pub const ApiHttpServer = struct {
             const owned = cloneTableNamesAlloc(op_alloc, &.{name}) catch return error.InternalFailure;
             owned_table_names = owned;
             break :single owned;
-        } else if (req.table_names) |values|
-            values
-        else blk: {
+        } else if (req.table_names) |values| blk: {
+            const names = resolveClusterRestoreSelectionAlloc(op_alloc, &manifest, values) catch |err| return switch (err) {
+                error.InvalidRequest => error.InvalidRequest,
+                else => error.InternalFailure,
+            };
+            owned_table_names = names;
+            break :blk names;
+        } else blk: {
             const names = tableNamesFromClusterManifestAlloc(op_alloc, &manifest) catch return error.InternalFailure;
             owned_table_names = names;
             break :blk names;
@@ -23310,6 +23543,7 @@ pub const ApiHttpServer = struct {
     /// adapter exposes only data operations; object catalogs cannot create or
     /// drop native tables or alter their definitions.
     const ObjectTableRequestOptions = struct {
+        index_resource: ?@import("object_table_runtime.zig").IndexResource = null,
         lookup_consistency: raft_mod.ReadConsistency = .read_index,
         has_join: bool = false,
         resolver: ?*CatalogQueryResolver = null,
@@ -23336,6 +23570,10 @@ pub const ApiHttpServer = struct {
             if (hint.storage.engine != .object or hint.table_id != expected.table_id or hint.object_storage_generation != expected.generation) return error.TableGenerationChanged;
         }
         if (hint.storage.engine != .object) return null;
+        // Public controls must be rejected before a trusted alias envelope is
+        // produced or an object runtime can consume it. Native requests retain
+        // their normal parser admission and never bind during this engine probe.
+        if (std.mem.eql(u8, suffix, "query")) try @import("public_graph_query.zig").rejectInternalDocIdentityFields(self.alloc, body);
         var snapshot = (try self.source.linearizableSnapshot(context)) orelse return error.ReadUnavailable;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableGenerationChanged;
@@ -23378,14 +23616,25 @@ pub const ApiHttpServer = struct {
             const current = tables_api.findTableByName(&admitted, table_name) orelse return error.TableNotFound;
             if (!metadata_table_manager.tableDefinitionsEqual(current.*, bound)) return error.TableGenerationChanged;
         }
-        var response = self.object_tables.handle(self.owner_alloc, self.embedding_provider_runtime.io, bound, .{
+        var alias_resolver = self.semanticStatusResolver(.internal, "");
+        alias_resolver.catalog_resolver = options.resolver;
+        alias_resolver.statement_indexes_json = hint.indexes_json;
+        alias_resolver.query_embedding_deadline_ns = context.deadline_ns;
+        alias_resolver.query_cancellation = context.cancellation;
+        const alias_body = if (std.mem.eql(u8, suffix, "query")) try SemanticStatusResolver.bindIndexAliases(&alias_resolver, self.alloc, table_name, body) else null;
+        defer if (alias_body) |value| value.deinit(self.alloc);
+        const runtime_options: @import("object_table_runtime.zig").Options = .{
             .config = self.cfg.node_config,
             .secrets = self.cfg.secret_store,
             .deployment = self.cfg.deployment_mode,
             .local_base_dir = self.cfg.native_lake_artifact_base_dir,
             .graph_execution_limits = self.cfg.graph_execution_limits,
             .remote_content = self.cfg.remote_content,
-        }, method, suffix, body, context) catch |err| switch (err) {
+        };
+        var response = (if (options.index_resource) |resource|
+            self.object_tables.handleIndexResource(self.owner_alloc, self.embedding_provider_runtime.io, bound, runtime_options, resource, context)
+        else
+            self.object_tables.handle(self.owner_alloc, self.embedding_provider_runtime.io, bound, runtime_options, method, suffix, if (alias_body) |value| value.body else body, context)) catch |err| switch (err) {
             error.ObjectTableStorageBindingChanged => return try contextual_operations.textAlloc(self.alloc, 409, "object table storage binding differs from its durable catalog binding"),
             error.ObjectTableDefinitionConflict => return try contextual_operations.textAlloc(self.alloc, 409, "object table definition is immutable; use a new table and explicit migration"),
             error.ObjectTableRuntimeCapacityExceeded => return try contextual_operations.textAlloc(self.alloc, 503, "object table runtime capacity exhausted"),
@@ -23729,9 +23978,14 @@ pub const ApiHttpServer = struct {
         err: anyerror,
     ) !contextual_operations.OwnedResponse {
         return switch (err) {
+            error.ForeignConnectionFailed => try contextualForeignSourceFailureResponse(self.alloc, table_name, .connection),
+            error.ForeignQueryFailed => try contextualForeignSourceFailureResponse(self.alloc, table_name, .execution),
+            error.ForeignAuthFailed => try contextualForeignSourceFailureResponse(self.alloc, table_name, .authentication),
+            error.ForeignTableNotFound => try contextualForeignSourceFailureResponse(self.alloc, table_name, .missing_relation),
+            error.LibpqUnavailable => try contextualForeignSourceFailureResponse(self.alloc, table_name, .driver),
             error.ObjectTableJoinUnsupported => try contextual_operations.textAlloc(self.alloc, 400, "object table joins are not supported"),
             error.Forbidden => try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden"),
-            error.CatalogGenerationChanged, error.TableGenerationChanged, error.LakeSourceOwnerRequired => try contextual_operations.jsonErrorAlloc(self.alloc, 409, "catalog changed during query binding"),
+            error.PreparedGenerationChanged, error.CatalogGenerationChanged, error.TableGenerationChanged, error.LakeSourceOwnerRequired => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
             error.InvalidCatalogName => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid table target"),
             error.InvalidComposedGraphIdentity, error.InvalidQueryRequest => if (db_mod.peekLastSortRejectionDiagnostic() != null)
                 try contextualUnsupportedExactSortResponse(self.alloc)
@@ -26538,11 +26792,11 @@ test "staged restore published metadata wins cancellation only after every owner
     const encoded = try std.json.Stringify.valueAlloc(alloc, job, .{});
     defer alloc.free(encoded);
     const restore: ApiHttpServer.RestoreCancellation = .{ .job_id = worker.value.job_id, .attempt_id = worker.value.attempt_id };
-    try std.testing.expectError(error.RestoreStagingYield, server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{"docs"}));
+    try std.testing.expectError(error.RestoreStagingYield, server.driveStagedRestore(restore, worker.value.attempt_id, encoded));
     try std.testing.expectEqual(@as(usize, 1), fixture.calls[0]);
     for (fixture.calls[1..]) |count| try std.testing.expectEqual(@as(usize, 0), count);
     for (0..130) |_| {
-        const unexpected = server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{"docs"}) catch |err| {
+        const unexpected = server.driveStagedRestore(restore, worker.value.attempt_id, encoded) catch |err| {
             if (err == error.RestoreStagingYield) continue;
             try std.testing.expectEqual(error.Timeout, err);
             break;
@@ -26556,7 +26810,7 @@ test "staged restore published metadata wins cancellation only after every owner
     defer progress.deinit();
     try std.testing.expectEqual(.active, progress.value.staging_resolution);
     const result = for (0..3) |_| {
-        break server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{"docs"}) catch |err| {
+        break server.driveStagedRestore(restore, worker.value.attempt_id, encoded) catch |err| {
             if (err == error.RestoreStagingYield) continue;
             return err;
         };
@@ -26718,7 +26972,7 @@ fn clusterPortableForeignKeyRestoreGuarded(
             const entry = backups_api.findClusterTable(manifest, name) orelse return error.InvalidBackupRequest;
             var table = try backups_api.readManifestFromLocationWithArtifactBackupId(alloc, location, entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id);
             defer table.deinit(alloc);
-            if (!std.mem.eql(u8, table.table_name, name)) return error.BackupIntegrityFailure;
+            if (!std.mem.eql(u8, table.table_name, entry.name)) return error.BackupIntegrityFailure;
             if (try portableForeignKeyRestoreGuarded(alloc, &table, false)) return true;
         }
     } else {
@@ -26882,6 +27136,7 @@ test "authoritative catalog mutation boundaries reject orphaned semantic produce
     const orphan_enrichment =
         "{\"name\":\"orphan_dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":3,\"producer_json\":\"{\\\"version\\\":2,\\\"provider\\\":\\\"antfly\\\",\\\"model\\\":\\\"model-a\\\",\\\"endpoint\\\":\\\"antfly:embedded\\\",\\\"region\\\":\\\"\\\",\\\"request_format\\\":\\\"\\\",\\\"sparse\\\":false,\\\"multimodal\\\":false,\\\"input_type\\\":\\\"\\\",\\\"truncate\\\":\\\"\\\"}\"}";
     const FakeService = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
         table: metadata_table_manager.TableRecord = .{
             .table_id = 7,
             .name = "docs",
@@ -26978,6 +27233,7 @@ test "stamped catalog mutations retain their commit stamp when the post-commit r
         .index = 19,
     };
     const FakeService = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
         table: metadata_table_manager.TableRecord = .{
             .table_id = 42,
             .name = "docs",
@@ -28152,6 +28408,26 @@ fn tableNamesFromAdminSnapshotAlloc(
     return names;
 }
 
+/// Requests use public names, while cohort proofs and artifact manifests bind
+/// storage names. Resolve once before handing the selection to the executor.
+fn resolveClusterRestoreSelectionAlloc(alloc: std.mem.Allocator, manifest: *const backups_api.ClusterBackupManifest, selected: []const []const u8) ![][]u8 {
+    if (selected.len > restore_jobs.max_cluster_tables_per_job) return error.InvalidRequest;
+    var names: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer {
+        for (names.items) |name| alloc.free(name);
+        names.deinit(alloc);
+    }
+    try names.ensureTotalCapacity(alloc, selected.len);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(alloc);
+    for (selected) |name| {
+        const entry = backups_api.findClusterTable(manifest, name) orelse return error.InvalidRequest;
+        if ((try seen.getOrPut(alloc, entry.name)).found_existing) return error.InvalidRequest;
+        names.appendAssumeCapacity(try alloc.dupe(u8, entry.name));
+    }
+    return try names.toOwnedSlice(alloc);
+}
+
 fn tableNamesFromClusterManifestAlloc(
     alloc: std.mem.Allocator,
     manifest: *const backups_api.ClusterBackupManifest,
@@ -28371,6 +28647,12 @@ fn contextualQueryTemporarilyUnavailableResponse(
     reason: public_table_http.QueryTemporarilyUnavailableReason,
 ) !contextual_operations.OwnedResponse {
     var response = try public_table_http.queryTemporarilyUnavailableOwnedResponse(alloc, reason);
+    defer response.deinit(alloc);
+    return try contextualResponseFromPublicTable(alloc, response);
+}
+
+fn contextualForeignSourceFailureResponse(alloc: std.mem.Allocator, source: []const u8, failure: public_table_http.ForeignSourceFailure) !contextual_operations.OwnedResponse {
+    var response = try public_table_http.foreignSourceFailureOwnedResponse(alloc, source, failure);
     defer response.deinit(alloc);
     return try contextualResponseFromPublicTable(alloc, response);
 }
@@ -29728,6 +30010,13 @@ test "httpx inference gateway authorization tells disabled public inference apar
         defer server.deinit();
         try std.testing.expectEqual(case.expected, try server.authorizeInferenceRequest(.{ .trusted_principal = token }, .write));
     }
+}
+
+test "api http commit requirements require a coordinator source" {
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    try std.testing.expectError(error.NotFound, ApiHttpServer.executePublicTableBatch(&server, std.testing.allocator, "docs", .{ .commit_requires = .direct_enrichments }, .{}));
+    try std.testing.expectError(error.NotFound, ApiHttpServer.executePublicTableBatch(&server, std.testing.allocator, "docs", .{ .commit_requires = .none }, .{}));
 }
 
 test "api http server validates dedicated internal service runtime credentials" {
@@ -32901,7 +33190,6 @@ pub fn makeListedUsers(alloc: std.mem.Allocator, users: []const []const u8) ![]L
 pub fn userToOpenApi(alloc: std.mem.Allocator, user: usermgr.User) !usermgr_openapi.User {
     return .{
         .username = user.username,
-        .password_hash = user.password_hash,
         .metadata = if (user.metadata_json.len > 0)
             .{ .value = try parseOwnedJsonObjectMapAlloc(alloc, user.metadata_json) }
         else
@@ -54543,13 +54831,24 @@ test "api http server cluster overwrite restores from read-only repository witho
     };
     defer freeBackupShards(alloc, shards);
 
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    var alias_arena = std.heap.ArenaAllocator.init(alloc);
+    defer alias_arena.deinit();
+    const alias_alloc = alias_arena.allocator();
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, alias_alloc, "{\"queryable\":true}", .{});
+    const alias_indexes = try aliases.put(alias_alloc, tables_api.default_indexes_json, "live", .{
+        .index = "full_text_index_v0",
+        .idempotency_key = "before-overwrite",
+        .require = .queryable,
+    }, ready, 1);
+
     var table_manifest = try backups_api.createManifest(alloc, table_backup_id, .native, &.{
         .table_id = 1,
         .name = "docs",
         .description = "restored docs table",
         .schema_json = "",
         .read_schema_json = "",
-        .indexes_json = tables_api.default_indexes_json,
+        .indexes_json = alias_indexes,
         .replication_sources_json = "[]",
     }, shards);
     defer table_manifest.deinit(alloc);
@@ -54595,6 +54894,7 @@ test "api http server cluster overwrite restores from read-only repository witho
         restore_lifecycle_active: bool = false,
         restore_lifecycle_finished: bool = false,
         expected_backup_id: []const u8,
+        indexes_json: []const u8,
     };
 
     const FakeSource = struct {
@@ -54609,6 +54909,7 @@ test "api http server cluster overwrite restores from read-only repository witho
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_table = createTable,
                     .replace_table_definition = replaceTableDefinition,
+                    .wait_table_projection = waitTableProjection,
                     .drop_table = dropTable,
                 },
             };
@@ -54643,6 +54944,13 @@ test "api http server cluster overwrite restores from read-only repository witho
             };
         }
 
+        fn waitTableProjection(ptr: *anyopaque, table_name: []const u8, _: ?[]const u8, indexes_json: ?[]const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.state.definition_replaced);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(std.mem.indexOf(u8, indexes_json.?, "_index_alias_epoch") != null);
+        }
+
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
         pub fn createTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, _: tables_api.CreateTableRequest) !void {
@@ -54659,6 +54967,15 @@ test "api http server cluster overwrite restores from read-only repository witho
             try std.testing.expectEqual(@as(u64, 1), replacement.table_id);
             try std.testing.expectEqualStrings("docs", replacement.name);
             try std.testing.expectEqualStrings("restored docs table", replacement.description);
+            var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const original = try std.json.parseFromSliceLeaky(std.json.Value, a, self.state.indexes_json, .{});
+            const resource = original.object.get(aliases.key).?.object.get("live").?;
+            const tag = try aliases.catalogResourceEtag(a, original, resource);
+            try std.testing.expectError(error.IndexAliasPreconditionFailed, aliases.remove(a, replacement.indexes_json, "live", tag));
+            const current = try std.json.parseFromSliceLeaky(std.json.Value, a, replacement.indexes_json, .{});
+            try std.testing.expectEqualStrings("full_text_index_v0", current.object.get(aliases.key).?.object.get("live").?.object.get("index").?.string);
             self.state.definition_replaced = true;
         }
 
@@ -54758,7 +55075,7 @@ test "api http server cluster overwrite restores from read-only repository witho
         }
     };
 
-    var state = State{ .expected_backup_id = table_backup_id };
+    var state = State{ .expected_backup_id = table_backup_id, .indexes_json = alias_indexes };
     var source = FakeSource{ .state = &state };
     var read_source = FakeReads{ .state = &state };
     var write_source = FakeWrites{ .state = &state };
@@ -61278,6 +61595,26 @@ test "external lake scheduled maintenance runs outside publication and coalesces
     for (server.lake_scheduled_maintenance_tables) |table| try std.testing.expect(table == null);
 }
 
+test "backup preparation preserves interruption errors" {
+    var trace: ApiHttpServer.ClusterBackupExecutionTrace = .{ .phase = .cohort_preparation };
+    const expired: api_operation.RequestContext = .{ .deadline_ns = 0 };
+    if (expired.remainingTimeoutMs()) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectError(error.DeadlineExceeded, trace.preparationError(err));
+    }
+    var canceled: std.atomic.Value(bool) = .init(true);
+    if (sleepNsCancellable(std.testing.io, std.time.ns_per_ms, CancellationToken.fromAtomic(&canceled))) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectError(error.Canceled, trace.preparationError(err));
+    }
+    try std.testing.expectError(error.Canceled, trace.preparationError(error.Canceled));
+    try std.testing.expect(trace.cause == null);
+    try std.testing.expectError(error.InternalFailure, trace.preparationError(error.CommitDecisionUnknown));
+    try std.testing.expectEqual(error.CommitDecisionUnknown, trace.cause.?);
+}
+
 test "external lake read refresh hints coalesce without superseding active publication work" {
     const a = std.testing.allocator;
     var runtime = try db_mod.background_runtime.BackendRuntime.init(a, .{ .backend = .io_threaded });
@@ -61313,6 +61650,11 @@ test "external lake read refresh hints coalesce without superseding active publi
     try std.testing.expectEqual(@as(u8, 0), server.index_installation_queue.items[0].failures);
     try std.testing.expectEqual(@as(u64, 0), server.index_installation_queue.items[0].retry_after_ns);
     server.completeIndexInstallation(generation);
+    try std.testing.expectEqual(@as(usize, 1), server.index_installation_queue.items.len);
+    try std.testing.expect(server.pending_lake_publications.contains("docs"));
+    server.completeIndexInstallation(server.index_installation_queue.items[0].generation);
+    try std.testing.expect(!server.pending_lake_publications.contains("docs"));
+    try server.requestLakePublication("docs");
     try std.testing.expectEqual(@as(usize, 1), server.index_installation_queue.items.len);
 }
 
@@ -63450,6 +63792,42 @@ test "system catalog graph physical endpoints recheck logical grants and binding
     try std.testing.expectError(error.CatalogGenerationChanged, ApiHttpServer.CatalogGraphReadContext.authorize(&context, a, "table:another"));
 }
 
+test "index alias production resolver owns its producer cut without a catalog resolver" {
+    const alias_catalog = @import("antfly_local_sources").api_index_metadata.aliases;
+    const Fake = struct {
+        table: metadata_table_manager.TableRecord,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 0 };
+        }
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = @as(*[1]metadata_table_manager.TableRecord, @ptrCast(&self.table)), .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"complete\":true}", .{});
+    const base = "{\"a\":{\"type\":\"embeddings\",\"_index_incarnation\":41},\"b\":{\"type\":\"embeddings\",\"_index_incarnation\":42}}";
+    const first = try alias_catalog.put(scratch, base, "live", .{ .index = "a", .idempotency_key = "1" }, ready, 1);
+    const second = try alias_catalog.put(scratch, first, "live", .{ .index = "b", .expected_index = "a", .idempotency_key = "2" }, ready, 2);
+    var fake: Fake = .{ .table = .{ .table_id = 1, .name = "docs", .indexes_json = first } };
+    var server = ApiHttpServer.init(a, .{ .deployment_mode = .standalone }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.free } }, null, null);
+    defer server.deinit();
+    var resolver = server.semanticStatusResolver(.internal, "");
+    const iface = resolver.iface();
+    const bound = (try iface.vtable.bind_index_aliases.?(iface.ptr, a, "docs", "{\"indexes\":[\"live\"],\"semantic_search\":\"hello\"}")).?;
+    defer bound.deinit(a);
+    fake.table.indexes_json = second;
+    var document = try std.json.parseFromSlice(std.json.Value, a, bound.body, .{});
+    defer document.deinit();
+    try std.testing.expectEqualStrings("a", document.value.object.get("indexes").?.array.items[0].string);
+    try std.testing.expectEqual(@as(i64, 41), document.value.object.get("_index_alias_fences").?.array.items[0].object.get("incarnation").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, resolver.pinned_indexes_json.?, "\"index\":\"a\"") != null);
+}
+
 test "system catalog row filter scopes preserve tenant restriction and resolve auth references" {
     const alloc = std.testing.allocator;
     var filters = [_]usermgr.RowFilterEntry{
@@ -63730,6 +64108,40 @@ test "system catalog row filter composition releases partial allocations" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
 }
 
+test "index alias object engine admission rejects private controls before storage and skips native binding" {
+    const Fake = struct {
+        engine: @import("antfly_local_sources").common_table_storage.Engine = .local,
+        reads: usize = 0,
+        aliases: bool = true,
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (call != .query_definition) return error.UnexpectedCatalogRead;
+            self.reads += 1;
+            return std.json.Stringify.valueAlloc(a, system_catalog.QueryDefinition{ .storage_engine = self.engine, .table_id = 7, .schema_json = "{}", .read_schema_json = "", .indexes_json = if (self.aliases) "{\"text\":{\"type\":\"full_text\",\"_index_incarnation\":41},\"_index_aliases\":{\"live\":{\"index\":\"text\"}}}" else "{\"text\":{\"type\":\"full_text\",\"_index_incarnation\":41}}" }, .{});
+        }
+    };
+    const a = std.testing.allocator;
+    var fake: Fake = .{};
+    var server = ApiHttpServer.init(a, .{}, .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.catalog, .supports_query_definitions = true, .supports_object_tables = true } }, null, null);
+    defer server.deinit();
+    try std.testing.expect((try server.tryObjectTableQuery("docs", "{\"indexes\":[\"live\"]}", null, null, null, null, null, .{ .primary_foreign = false, .context = .{} })) == null);
+    try std.testing.expectEqual(@as(usize, 1), fake.reads);
+    try std.testing.expectEqual(@as(usize, 0), server.index_alias_cache.retained_bytes);
+    fake.engine = .object;
+    for ([_]bool{ false, true }) |has_aliases| {
+        fake.aliases = has_aliases;
+        for ([_][]const u8{
+            "{\"_index_alias_fences\":1}",
+            "{\"_index_alias_fences\":[{}]}",
+            "{\"_index_alias_fences\":[{\"name\":\"text\",\"incarnation\":41}]}",
+            "{\"\\u005findex_alias_fences\":[]}",
+        }) |body| {
+            try std.testing.expectError(error.InvalidQueryRequest, server.tryObjectTableQuery("docs", body, null, null, null, null, null, .{ .primary_foreign = false, .context = .{} }));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), server.index_alias_cache.retained_bytes);
+}
+
 test "system catalog row filter composition rejects oversized tails with bounded allocation" {
     const a = std.testing.allocator;
     var policy = std.ArrayListUnmanaged(u8).empty;
@@ -63755,5 +64167,74 @@ test "system catalog row filter composition rejects oversized tails with bounded
             // The unvisited tail must not affect composition allocations.
             try std.testing.expectEqual(expected, measured.allocated_bytes);
         } else prefix_allocation = measured.allocated_bytes;
+    }
+}
+
+test "index alias admission accepts empty object fleets and fences incompatible live data stores" {
+    const Fake = struct {
+        stores: []metadata_table_manager.StoreRecord = &.{},
+        frees: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 0 };
+        }
+        fn snapshot(ptr: *anyopaque, _: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = &.{}, .ranges = &.{}, .stores = self.stores, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(ptr: *anyopaque, _: *metadata_api.AdminSnapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.frees += 1;
+        }
+    };
+    var fake: Fake = .{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .deployment_mode = .distributed }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .linearizable_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.free } }, null, null);
+    defer server.deinit();
+    try server.ensureIndexAliasAdmission(.{});
+    var stores = [_]metadata_table_manager.StoreRecord{.{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .artifact_sources_protocol_version = 2 }};
+    fake.stores = &stores;
+    try std.testing.expectError(error.IndexAliasProtocolUpgradeRequired, server.ensureIndexAliasAdmission(.{}));
+    stores[0].role = "metadata";
+    try server.ensureIndexAliasAdmission(.{});
+    stores[0].role = "data";
+    stores[0].artifact_sources_protocol_version = 4;
+    try server.ensureIndexAliasAdmission(.{});
+    try std.testing.expectEqual(@as(usize, 4), fake.frees);
+}
+
+test "api http query binding generation races return retryable unavailable" {
+    const a = std.testing.allocator;
+    var server: ApiHttpServer = undefined;
+    server.alloc = a;
+    for ([_]struct { err: anyerror, code: []const u8 }{
+        .{ .err = error.ForeignQueryFailed, .code = "foreign_source_query_failed" },
+        .{ .err = error.ForeignAuthFailed, .code = "foreign_source_auth_failed" },
+        .{ .err = error.ForeignTableNotFound, .code = "foreign_source_relation_not_found" },
+    }) |case| {
+        var response = try server.publicQueryOperationErrorResponse("remote_docs", "{}", case.err);
+        defer response.deinit(a);
+        try std.testing.expectEqual(@as(u16, 502), response.status);
+        try std.testing.expectEqual(@as(usize, 0), response.headers.len);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.code, parsed.value.object.get("code").?.string);
+        try std.testing.expectEqualStrings("remote_docs", parsed.value.object.get("source").?.string);
+        try std.testing.expect(!parsed.value.object.get("retryable").?.bool);
+    }
+    for ([_]anyerror{ error.PreparedGenerationChanged, error.CatalogGenerationChanged, error.TableGenerationChanged, error.LakeSourceOwnerRequired }) |err| {
+        var response = try server.publicQueryOperationErrorResponse("docs", "{}", err);
+        defer response.deinit(a);
+        try std.testing.expectEqual(@as(u16, 503), response.status);
+        var retry_after = false;
+        for (response.headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "Retry-After")) {
+                try std.testing.expectEqualStrings("1", header.value);
+                retry_after = true;
+            }
+        }
+        try std.testing.expect(retry_after);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("retryable").?.bool);
+        try std.testing.expectEqualStrings("storage_read_temporarily_unavailable", parsed.value.object.get("code").?.string);
     }
 }

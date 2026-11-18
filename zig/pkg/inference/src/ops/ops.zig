@@ -2330,6 +2330,14 @@ pub const ComputeBackend = struct {
         return op(self.ptr, tensor, target);
     }
 
+    /// Request-local replay intent. Other backend implementations and
+    /// interleaved execution owners keep the ordinary eager dispatch order.
+    pub fn debugCudaGraphReplayRequested(self: *const ComputeBackend) bool {
+        if (self.kind() != .cuda or self.execution_owner != 0) return false;
+        const op = self.vtable.regions.replay.requested orelse return false;
+        return op(self.ptr);
+    }
+
     pub fn debugCudaGraphCaptureBegin(self: *const ComputeBackend, label: []const u8) !bool {
         const op = self.vtable.regions.replay.captureBegin orelse return false;
         return op(self.ptr, label);
@@ -2623,6 +2631,7 @@ pub const ComputeBackend = struct {
     };
 
     pub const ReplayRegion = struct {
+        requested: ?*const fn (ctx: *anyopaque) bool = null,
         captureBegin: ?*const fn (ctx: *anyopaque, label: []const u8) anyerror!bool = null,
         prepareDecodeScalars: ?*const fn (ctx: *anyopaque, position_offset: usize, query_position_offset: usize, kv_seq_len: usize, total_sequence_len: usize, kv_position_offset: usize) anyerror!bool = null,
         traceTensor: ?*const fn (ctx: *anyopaque, label: []const u8, tensor: CT) anyerror!void = null,

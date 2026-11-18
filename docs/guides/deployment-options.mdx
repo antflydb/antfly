@@ -1,0 +1,144 @@
+---
+title: "Choose Lite, Server, or Cloud"
+description: "How Antfly Lite, Antfly Server, and Antfly Cloud differ, what stays identical across them, and how a database moves from one to another"
+sidebar: concepts
+order: 6
+---
+
+<Questions>
+- Should I use Antfly Lite or run an Antfly server?
+- What is the difference between Antfly Lite, Server, and Cloud?
+- Does Antfly support high availability or replicas?
+- How do I move my local Antfly database to a server?
+- Can I start with Lite and switch later?
+</Questions>
+
+Antfly is one engine that runs three ways: in your process from a single file (Lite), as a server you operate (Server), or hosted for you (Cloud). The decision that matters is who needs to reach the data. If only your application does, start with Lite. If other processes, users, or agents need it over the network, run Server or use Cloud. The index model, query JSON, and enrichments are the same in all three, so the choice is reversible.
+
+Both start from the same binary. Lite is a file you create and open:
+
+```bash
+antfly lite init app.aflite
+antfly lite status app.aflite
+```
+
+Server is a process you start and call over HTTP:
+
+```bash
+antfly standalone
+curl http://127.0.0.1:8080/db/v1/status
+```
+
+## The Three Options
+
+| | Antfly Lite | Antfly Server | Antfly Cloud |
+|---|---|---|---|
+| Runs as | A library in your process (`libantfly`, with Go, Python, Rust, TypeScript, and Zig bindings) and the `antfly lite` CLI | `antfly standalone`, one process | Hosted instances |
+| Data lives in | One `.aflite` file | A data directory, or an `.aflite` file | Managed for you |
+| Who reaches it | Your application | Anything on the network: HTTP (`/db/v1`), Postgres wire protocol, MCP, A2A | The same APIs, at a hosted endpoint |
+| Writers | One writer handle at a time; concurrent reads | Many concurrent clients | Many concurrent clients |
+| Access control | The application owns the file | Users, API keys, row filters, trusted gateways | Instance API keys |
+| High availability | None; durability is the `fsync` policy | Optional hot standby | Operated for you |
+| Who operates it | You, as part of your app | You | Antfly |
+
+All first-party Antfly code, Lite and Server included, is Apache-2.0. Cloud is the commercial hosted service; see [pricing](/pricing) and the [Cloud docs](/docs/cloud).
+
+## What Stays the Same
+
+Lite is not a reduced engine. Documents, schemas, full-text, vector, sparse, and graph indexes, enrichments, and the query planner are the same code in all three. A table defined in Lite has the same index definitions on Server, and an enrichment that embeds or extracts on write behaves the same way.
+
+Inference follows the deployment. Server runs Antfly Inference alongside the database in the same process. Lite builds embed the local runtime too, and a Lite database can also run with no inference at all, storing caller-supplied embeddings or deferring model work until a runtime is available.
+
+Two surface differences are worth knowing before you move code. The `antfly lite` CLI's query JSON writes a full-text match as `match: {field, text}`, while the `/db/v1` API takes `match` as a string beside `field`. And network surfaces (HTTP, pgwire, MCP, A2A, the retrieval agents) exist only when a server is running.
+
+## When Lite Fits
+
+Pick Lite for development, tests, desktop and edge apps, single-user tools, and any program that wants a database without a service to operate. There is nothing to install beyond the library, and the database is a file you can copy, check, and back up.
+
+Its limits come from being one file with one owner. Only one writer handle can have the file open at a time, across processes, and the file needs a filesystem with lock support. It has no replication. When a second service or a team needs the same data, that is the signal to serve it from Server.
+
+## When Server Fits
+
+Pick Server when the data is shared: an application tier with several instances, analysts over pgwire, agents over MCP, or anything that needs authentication and per-user row filters. `antfly standalone` runs metadata, data, the APIs, and inference in one process, binds to `127.0.0.1` by default, and serves either a data directory or an `.aflite` file.
+
+Server is also where you operate availability yourself. [Secure a self-hosted Antfly](/docs/guides/access-control) covers what to do before exposing it beyond loopback.
+
+### Hot Standby
+
+For availability, run a hot standby: a primary streams its write-ahead log to one or more read-only standbys, which can serve reads and take over as primary. `antfly standby` manages it.
+
+The primary's `hot_standby.sync.mode` sets what a write waits for before it is acknowledged:
+
+| Mode | Write is acknowledged after | Cost |
+|---|---|---|
+| `async` | Local durability on the primary | Lowest latency; writes not yet streamed are lost if the primary fails |
+| `remote-write` (default) | A standby durably receives the record | A standby may need replay time before serving the latest reads |
+| `remote-apply` | A standby applies the record | Highest write latency; sensitive to standby apply stalls |
+
+`hot_standby.sync.failure` decides what happens when no synchronous standby is available: `block` (the default) waits, `fail-closed` rejects writes, and `degrade-to-async` keeps accepting writes with a weaker guarantee. Promotion is explicit and fenced, so a former primary cannot keep accepting writes after a standby takes over. `antfly standby switchover --to <standby-admin-url>` performs a planned handover, which is also the online upgrade path for a standalone deployment, and `antfly standby follow` repoints standbys at a new primary without a restart.
+
+There is no point-in-time recovery or WAL archive. Backups restore one selected backup, so keep taking them alongside a standby. The operator-level design is in [HOT_STANDBY.md](https://github.com/antflydb/antfly/blob/main/zig/HOT_STANDBY.md).
+
+## When Cloud Fits
+
+Pick Cloud when you want Server's network APIs without running the process, the standby, or the upgrades yourself. Cloud hosts Server instances and Lite instances. You authenticate with instance API keys, and agents connect through [hosted MCP](/docs/cloud/mcp). Start from the [Cloud docs](/docs/cloud).
+
+## Moving Between Them
+
+Every move is a logical backup and restore. Documents, keys, schemas, index and enrichment definitions, and already-computed vectors and artifacts travel; storage-engine files such as text indexes and vector segments are rebuilt on the target.
+
+The server reads and writes backups through a named connection, so its config needs one before either direction works. `--connection archive-writer` below refers to an entry like this in the server's config file (`antfly standalone --config antfly.json`), which grants both backup and restore:
+
+```json
+{
+  "connections": {
+    "archive-writer": {
+      "kind": "external_io",
+      "capabilities": ["backup.write", "restore.read"],
+      "external_io": {"protocol": "filesystem", "root": "/"}
+    }
+  }
+}
+```
+
+The server resolves a `file://` location under the connection's `root`, and the CLI stages files at the literal path. A `root` of `/` lets both use the same absolute path when they share a host.
+
+**Lite to a running server.** `promote` opens the file read-only, stages a portable backup at a location the server can reach, restores it into a table, and leaves the `.aflite` in place:
+
+```bash
+antfly lite promote app.aflite \
+  --target http://127.0.0.1:8080 \
+  --table docs \
+  --connection archive-writer \
+  --location file:///tmp/antfly_backups
+```
+
+**A server table to Lite.** Back it up with `--format portable` (Lite cannot read a native bundle), then restore it into a new file:
+
+```bash
+antfly backup --table docs --backup-id docs-export --connection archive-writer \
+  --format portable --out docs.afb --location file:///tmp/antfly_backups \
+  --url http://127.0.0.1:8080
+antfly lite restore docs.afb --out docs.aflite
+```
+
+**Handing a file to a server.** A standalone server can also adopt an `.aflite` directly: stop the writer, copy the file, and start `antfly standalone --storage-engine lite --storage-path` on it with a fresh data directory. Adoption currently takes the file's `default` table with its schema, full-text indexes, and supported enrichments; dense, sparse, graph, and algebraic indexes are rejected before adoption, so use `promote` for those. After adoption, schema and index changes go through the server's API.
+
+The full procedures, including `.afb` bundles, `antfly backup inspect`, and verification after a move, are in [Antfly Lite](/docs/guides/lite#moving-between-lite-and-a-normal-instance).
+
+## Use Agent Skills
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "Promote my app.aflite into a docs table on my local Antfly server and verify the document count matches", and use this page to judge the result.
+
+## Next Steps
+
+- [Antfly Lite](/docs/guides/lite): the single-file engine, its bindings, and backup formats in depth
+- [Secure a self-hosted Antfly](/docs/guides/access-control): authentication and TLS before a server leaves loopback
+- [Architecture](/docs/architecture): storage engines, replication, and backups as the engine implements them

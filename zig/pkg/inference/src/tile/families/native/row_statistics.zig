@@ -133,6 +133,13 @@ pub const metal_indexed_maximum = struct {
 
 pub const bf16_narrow_exports = struct {
     pub const source_0 =
+        \\extern "C" __global__ void termite_embedding_gemma2_attention_normalized_softmax_bf16(
+        \\    __nv_bfloat16* probs, const float* scores, const long long* mask,
+        \\    unsigned int sequence, unsigned int query_base, unsigned int rows,
+        \\    unsigned int batch_index, unsigned int tile_capacity) {
+        \\    antfly_score_softmax_bf16<AntflyScoreMask::rows_and_keys, AntflyProbabilityPublication::normalized_bf16>(
+        \\        probs, scores, mask, sequence, query_base, rows, batch_index, tile_capacity, sequence);
+        \\}
         \\extern "C" __global__ void antfly_score_softmax_rows_keys_legacy_bf16_warp256(
         \\    __nv_bfloat16* probs, const float* scores, const long long* mask,
         \\    unsigned sequence, unsigned query_base, unsigned rows,

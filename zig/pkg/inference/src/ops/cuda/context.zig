@@ -145,6 +145,7 @@ pub const CudaContext = struct {
     }
 
     pub fn initDefault() driver_mod.Error!CudaContext {
+        @import("host_retirement.zig").process.retry();
         var driver = try CudaDriver.open();
         errdefer driver.deinit();
 

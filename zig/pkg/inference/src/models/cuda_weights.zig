@@ -526,6 +526,21 @@ pub fn prepare(
     gliner_precision: GlinerCudaPrecision,
     selected_manifest: ?*const manifest_mod.ModelManifest,
 ) !PreparedCudaWeights {
+    return prepareWithHostLease(allocator, requested_model_path, override, config, load_context, a4b_request, required_profile_override, gliner_precision, selected_manifest, null);
+}
+
+pub fn prepareWithHostLease(
+    allocator: std.mem.Allocator,
+    requested_model_path: []const u8,
+    override: ?TaskOverride,
+    config: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
+    required_profile_override: ?CudaCapabilityProfile,
+    gliner_precision: GlinerCudaPrecision,
+    selected_manifest: ?*const manifest_mod.ModelManifest,
+    host_lease: ?*?@import("../runtime/tier/memory.zig").AdmissionLease,
+) !PreparedCudaWeights {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
     const load_started_ns = platform.time.monotonicNs();
     defer std.log.info("inference_model_load backend=cuda phase=total elapsed_ms={d}", .{(platform.time.monotonicNs() -| load_started_ns) / std.time.ns_per_ms});
@@ -655,11 +670,22 @@ pub fn prepare(
         load_context,
     );
     errdefer backend_factory.closeCuda(allocator, cuda_compute);
+    if (host_lease) |slot| {
+        cuda_compute.gemma4_ple_host_lease = slot.*;
+        slot.* = null;
+    }
     std.log.info("inference_model_load backend=cuda phase=device_init elapsed_ms={d}", .{(platform.time.monotonicNs() -| device_init_started_ns) / std.time.ns_per_ms});
     if (debug_cuda_session) std.log.info("cuda-session: init cuda compute done path={s}", .{model_path});
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
+    const dense_gemma4 = cuda_profile == .gemma4 and host_weights_owner.architecture == .gpt and
+        host_weights_owner.architecture.gpt.usesGemma4Channels() and
+        !host_weights_owner.architecture.gpt.usesMoe() and !host_weights_owner.architecture.gpt.gemma4_mtp_assistant;
+    try cuda_compute.configureGemma4Dense(dense_gemma4, dense_gemma4 and
+        @import("../ops/cuda/ple_host.zig").eligibleConfig(host_weights_owner.architecture.gpt));
+    if (cuda_compute.gemma4_ple_host_lease != null and !cuda_compute.gemma4_ple_host_enabled)
+        return error.InvalidCudaState;
     if (cuda_profile == .gemma4 and host_weights_owner.architecture == .gpt) {
         cuda_compute.gemma4_native_plan = @import("../execution/gemma4_native_plan.zig").Plan.resolve(host_weights_owner.architecture.gpt);
         if (cuda_compute.gemma4_native_plan) |*plan| {
@@ -754,7 +780,14 @@ pub fn prepare(
             try uploadSeq2seqCudaWeight(cuda_compute, upload.key, upload.loaded, cuda_compute.runtime_policy.seq2seq.projections)
         else
             try uploadGlinerCudaWeight(cuda_compute, upload.key, upload.loaded, gliner_precision);
+        // Upload completion fences all host readers; expert caches retain their own policy.
+        if (cuda_compute.gemma4_e4b_sm89_qualified and a4b_inference == null) {
+            if (upload.mmap_bytes) |bytes| c_file.MmapRegion.adviseBytesDontNeed(bytes);
+        }
     }
+    if (cuda_compute.gemma4_ple_host_lease != null) return error.InvalidCudaState;
+    if (cuda_compute.stats.gemma4_mapped_upload_chunks != 0)
+        std.log.info("inference_model_load backend=cuda phase=mapped_weight_upload chunks={d}", .{cuda_compute.stats.gemma4_mapped_upload_chunks});
     std.log.info("inference_model_load backend=cuda phase=weight_upload weights={d} elapsed_ms={d}", .{ resident_uploads.items.len, (platform.time.monotonicNs() -| dense_upload_start_ns) / std.time.ns_per_ms });
     if (a4b_inference != null) {
         cuda_compute.noteA4bDenseUpload(

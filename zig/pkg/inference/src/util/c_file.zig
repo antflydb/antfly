@@ -230,6 +230,16 @@ pub const MmapRegion = struct {
         advise(@constCast(bytes.ptr), bytes.len, .random);
     }
 
+    /// Release this process's clean file-backed pages after a completed copy.
+    /// The caller must prove the slice belongs to an mmap and wait for every
+    /// asynchronous reader. The mapping and shared file cache remain valid;
+    /// subsequent readers simply fault the original bytes back in.
+    pub fn adviseBytesDontNeed(bytes: []const u8) void {
+        if (comptime !supports_posix_file_advice) return;
+        if (bytes.len == 0) return;
+        advise(@constCast(bytes.ptr), bytes.len, .dont_need);
+    }
+
     /// Release clean pages for a consumed file-backed range. The mapping stays
     /// valid: a later access faults the bytes back from the file. This is an
     /// advisory Linux optimization and deliberately cannot fail allocation or
@@ -990,4 +1000,18 @@ test "consumer sequential advice is confined to the selected mapping span" {
     try std.testing.expectEqual(@as(usize, 0), MmapRegion.SequentialRead.begin(region.data, "heap allocation").bytes.len);
     try std.testing.expectEqual(@as(usize, 0), MmapRegion.SequentialRead.begin(region.data[11..26], region.data[11..27]).bytes.len);
     try std.testing.expectEqualSlices(u8, "checkpoint selected tensor trailing tensor", region.data);
+}
+
+test "Gemma4 CUDA uploaded mapping advice preserves unaligned bytes and neighboring tensors" {
+    const a = std.testing.allocator;
+    const bytes = try a.alloc(u8, 16384);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i * 37);
+    var region = try mmapTempCopy(a, "uploaded-mapping", bytes);
+    defer region.deinit();
+    MmapRegion.adviseBytesDontNeed(region.data[13..8197]);
+    MmapRegion.adviseBytesDontNeed(&.{});
+    try std.testing.expectEqualSlices(u8, bytes, region.data);
+    MmapRegion.adviseBytesDontNeed(region.data);
+    try std.testing.expectEqualSlices(u8, bytes, region.data);
 }

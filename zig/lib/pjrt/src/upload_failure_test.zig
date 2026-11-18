@@ -45,7 +45,7 @@ const Fake = struct {
         arguments_valid = args.struct_size == @sizeOf(@TypeOf(args.*)) and
             args.buffer_type == expected_kind and args.device == expected_device and
             args.data != null and args.num_dims == 1 and args.dims != null and args.dims.?[0] == 1 and
-            args.host_buffer_semantics == .immutable_only_during_call and args.memory == null and args.device_layout == null;
+            args.host_buffer_semantics == (if (expected_kind == .bfloat16) c.HostBufferSemantics.immutable_until_transfer_completes else c.HostBufferSemantics.immutable_only_during_call) and args.memory == null and args.device_layout == null;
         // An API error does not transfer any output ownership to the caller.
         if (mode == .call_failure) return @ptrFromInt(3);
         if (mode != .missing_buffer) {
@@ -91,7 +91,7 @@ pub fn main() !void {
     api._fns[c.Api.FN_ERROR_DESTROY] = @ptrCast(&Fake.destroyError);
     const client = pjrt.Client{ .lib = undefined, .api = &api, .handle = @ptrFromInt(1), .device = @ptrFromInt(1) };
     inline for (std.meta.tags(Mode)) |mode| {
-        for (0..3) |variant| {
+        for (0..4) |variant| {
             Fake.mode = mode;
             Fake.buffers_created = 0;
             Fake.buffers_destroyed = 0;
@@ -100,11 +100,12 @@ pub fn main() !void {
             Fake.events_awaited = 0;
             Fake.errors_destroyed = 0;
             logged_errors = 0;
-            Fake.expected_kind = if (variant == 1) .int64 else .float32;
+            Fake.expected_kind = if (variant == 1) .int64 else if (variant == 3) .bfloat16 else .float32;
             Fake.expected_device = @ptrFromInt(if (variant == 2) @as(usize, 2) else 1);
             const result = switch (variant) {
                 0 => client.bufferFromHostFloat32(&.{7}, &.{1}),
                 1 => client.bufferFromHostInt64(&.{7}, &.{1}),
+                3 => client.bufferFromHostBFloat16(&.{0x3f80}, &.{1}),
                 else => client.bufferFromHostFloat32ForDevice(&.{7}, &.{1}, Fake.expected_device),
             };
             if (mode == .success or mode == .no_event) {

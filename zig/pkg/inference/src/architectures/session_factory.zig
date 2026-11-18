@@ -173,3 +173,7 @@ pub const glideDecoderResidentLoadAmounts = implementation.glideDecoderResidentL
 pub const getGlideHead = implementation.getGlideHead;
 pub const getGlinerDecideMetalExecutionPolicy = implementation.getGlinerDecideMetalExecutionPolicy;
 pub const getGlinerMetalRuntimeStats = implementation.getGlinerMetalRuntimeStats;
+pub const cudaPleHostBytes = implementation.cudaPleHostBytes;
+pub const cudaPleHostBytesForPolicy = implementation.cudaPleHostBytesForPolicy;
+pub const createSessionFromManifestWithHostLease = implementation.createSessionFromManifestWithHostLease;
+pub const getGlinerDecideExecutionBatchPolicy = implementation.getGlinerDecideExecutionBatchPolicy;

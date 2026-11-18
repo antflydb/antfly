@@ -369,7 +369,7 @@ pub const Overlay = struct {
         break :projected value;
     };
     pub fn backend(self: *Overlay) b.Backend {
-        return .{ .ptr = self, .vtable = if (self.base.vtable.project_postimage != null or self.base.vtable.project_node != null) &projecting_vtable else &plain_vtable };
+        return .{ .index_attribution = self.base.index_attribution, .ptr = self, .vtable = if (self.base.vtable.project_postimage != null or self.base.vtable.project_node != null) &projecting_vtable else &plain_vtable };
     }
     fn cast(ptr: *anyopaque) *Overlay {
         return @ptrCast(@alignCast(ptr));

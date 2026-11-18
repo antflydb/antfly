@@ -1916,164 +1916,35 @@ class RuntimeCacheTest(unittest.TestCase):
                 self.assertRegex(output, r"run exe jit-source-identity .* success")
                 # Check the preserved bundle domain, count, length, and order
                 # independently of the Zig hashing implementation.
-                qualifier = [
-                    "src/backends/metal_runtime.zig",
-                    "src/graph/quant_kernel_metal_renderer.zig",
-                    "src/graph/quant_kernel_metal_attention_phases.zig",
-                    "src/graph/quant_kernel_metal_param_abi.zig",
-                    "src/graph/templates/metal_paged_prefill_compat.metal",
-                    "src/graph/templates/metal_projection_native.metal",
-                    "src/graph/templates/metal_paged_decode_native.metal",
-                    "src/backends/metal_compile_options.h",
-                    "src/backends/metal_pipeline_catalog.h",
-                    "src/graph/kernel_jit.zig",
-                    "src/graph/quant_kernel_compiler.zig",
-                    "src/graph/quant_matmul.zig",
-                    "src/gguf/quant_codec.zig",
-                    "src/gguf/tensor_types.zig",
-                    "src/ops/ops.zig",
-                    "src/ops/kernel_backend.zig",
-                    "src/ops/physical_storage.zig",
-                    "src/execution/runtime_telemetry.zig",
-                    "src/ops/kernel_descriptor.zig",
-                    "src/graph/kernel_source_owner.zig",
-                    "src/ops/kernel_geometry.zig",
-                    "src/ops/kernel_reduction.zig",
-                    "src/ops/gpu/depthwise_program.h",
-                    "src/ops/gpu/masked_pool_program.h",
-                    "src/graph/cuda_kernel_fold.zig",
-                    "src/tile/source_inputs.zig",
-                    "src/backends/metal_param_abi.h",
-                    "src/backends/metal_gdn_source.h",
-                    "src/backends/metal_buffer_observation.h",
-                    "src/backends/metal_mtp_head.h",
-                    "src/backends/metal_mtp_head_impl.h",
-                    "src/ops/metal/generated/tile_whisper_logits_partials.msl.h",
-                ] if backend == "metal" else [
-                    "src/ops/cuda/kernels.zig",
-                    "src/ops/cuda/kernels/rms_q8_1_register_rows.cuh",
-                    "src/ops/cuda/kernels/quant_rows_prefetch_l2.cuh",
-                    "src/graph/kernel_jit.zig",
-                    "src/graph/quant_kernel_compiler.zig",
-                    "src/graph/quant_kernel_cuda_renderer.zig",
-                    "src/graph/quant_matmul.zig",
-                    "src/gguf/quant_codec.zig",
-                    "src/gguf/tensor_types.zig",
-                    "src/ops/ops.zig",
-                    "src/ops/kernel_backend.zig",
-                    "src/ops/physical_storage.zig",
-                    "src/execution/runtime_telemetry.zig",
-                    "src/ops/kernel_descriptor.zig",
-                    "src/graph/kernel_source_owner.zig",
-                    "src/ops/kernel_geometry.zig",
-                    "src/ops/kernel_reduction.zig",
-                    "src/ops/gpu/depthwise_program.h",
-                    "src/ops/gpu/masked_pool_program.h",
-                    "src/graph/cuda_kernel_fold.zig",
-                    "src/tile/source_inputs.zig",
-                    "src/graph/cuda_execution_contract.zig",
-                    "src/ops/cuda/lighton_device_policy.zig",
-                    "src/ops/cuda/driver_contract.zig", "src/ops/cuda/artifact.zig", "src/ops/cuda/context.zig", "src/ops/cuda/embedded_module.zig",
-                    "src/ops/cuda/gated_delta.zig",
-                    "src/ops/cuda/paged_attention_bf16.zig",
-                    "src/ops/cuda/bf16_fusions.zig",
-                    "src/ops/cuda/vision_fusions.zig",
-                    "src/ops/cuda/buffer.zig", "src/ops/cuda/allocation_budget.zig",
-                    "src/ops/cuda/buffer_cache.zig",
-                    "src/ops/cuda/cublaslt.zig",
-                    "src/ops/cuda/cudnn_sdpa.zig",
-                    "src/ops/cuda/attention_inputs_f32.zig",
-                    "src/ops/cuda/attention_inputs_partial_mrope_f32.ptx",
-                    "src/ops/cuda/projection_top1_bf16.zig",
-                    "src/ops/cuda/projection_top1_bf16_k1024_n248320_partial.ptx",
-                    "src/ops/cuda/projection_top1_bf16_k1024_n248320_finish.ptx",
-                    "src/ops/cuda/projection_epilogues_bf16.zig",
-                    "src/ops/cuda/encoder_block_bf16.zig",
-                    "src/ops/cuda/encoder_block_phases_bf16.ptx",
-                    "src/ops/cuda/prototypes/attention_inputs_partial_mrope_f32.cu",
-                    "src/ops/cuda/prototypes/encoder_block_phases_bf16.cu",
-                    "src/ops/cuda/prototypes/projection_top1_bf16.py",
-                    "src/ops/cuda/prototypes/projection_gelu_bf16.py",
-                    "src/ops/cuda/prototypes/projection_dot_bias_bf16.py",
-        "src/ops/cuda/prototypes/producer_support.py",
-        "src/ops/cuda/generated/standalone_programs.json",
-        "src/ops/cuda/generated/standalone_images.zig",
-                    "src/ops/cuda/prototypes/projection_residual_bf16.py",
-                    "src/ops/cuda/projection_gelu_sm121_k768_n3072_bias_f32.ptx",
-                    "src/ops/cuda/projection_residual_sm121_k3072_n768_io_f32.ptx",
-                    "src/ops/cuda/projection_gelu_sm121_k768_n3072_bias_bf16.ptx",
-                    "src/ops/cuda/projection_residual_sm121_k3072_n768_io_bf16.ptx",
-                    "src/ops/cuda/projection_gelu_sm121_k1024_n4096_bias_f32.ptx",
-                    "src/ops/cuda/projection_residual_sm121_k4096_n1024_io_f32.ptx",
-                    "src/ops/cuda/projection_gelu_sm121_k1024_n4096_bias_bf16.ptx",
-                    "src/ops/cuda/projection_residual_sm121_k4096_n1024_io_bf16.ptx",
-                    "src/ops/cuda/row_selection_stats.zig",
-                    "src/ops/row_selection_stats.zig",
-                    "src/ops/cuda/row_selection_stats_f32.ptx",
-                    "src/ops/cuda/generated/tile_whisper_logits.cu",
-                    "src/ops/cuda/encoder_decoder_fusions.zig",
-                    "src/ops/cuda/embedding_gemma2.zig",
-                    "src/ops/cuda/lighton_recurrent.ptx",
-                    "src/ops/cuda/lighton_attention.ptx",
-                    "src/ops/cuda/lighton_activation.ptx",
-                    "src/ops/cuda/lighton_vision.ptx",
-                    "src/ops/cuda/florence_fused.ptx",
-                    "src/ops/cuda/prototypes/gated_delta_recurrent.cu",
-                    "src/ops/cuda/prototypes/paged_attention_bf16_programs.cu",
-                    "src/ops/cuda/prototypes/bf16_activation_programs.cu",
-                    "src/ops/cuda/prototypes/vision_projection_programs.cu",
-                    "src/ops/cuda/prototypes/vision_f16_programs.cu",
-                    "src/graph/templates/cuda_attention_scalar_phases.cuh",
-                    "src/graph/templates/cuda_gqa_flash_prefill_f16_sm89.cuh",
-                    "src/graph/templates/cuda_gqa_decode_splitk_online_sm89.cuh",
-                    "src/graph/templates/cuda_gqa_split_decode_f32.cuh",
-                    "src/ops/cuda/launch_abi.zig",
-                    "src/ops/cuda/driver.zig",
-                    "src/graph/templates/cuda_q4_0_bf16_staged.cuh",
-                    "src/graph/templates/cuda_q4_q8_projection.cuh",
-                    "src/graph/templates/cuda_gqa_repeat_prefill_f16.cuh",
-                    "src/graph/templates/cuda_gqa_repeat_split_f16.cuh",
-                    "src/ops/cuda/kernels/kernel_abi.cuh",
-                    "src/ops/cuda/kernels/row_program.cuh",
-                    "src/ops/cuda/kernels/prefix_normalization_program.cuh",
-                    "src/ops/cuda/kernels/wmma_tile_program.cuh",
-                    "src/ops/cuda/kernels/rotary_program.cuh",
-                    "src/ops/cuda/kernels/encoder_multimodal_programs.cuh",
-                    "src/ops/cuda/kernels/local_relative_attention_program.cuh",
-                    "src/ops/cuda/kernels/source_scalar_programs.cuh",
-                    "src/ops/cuda/kernels/score_softmax_bf16_program.cuh",
-                    "src/ops/cuda/kernels/rotary_frequency_training.cuh",
-                    "src/ops/cuda/kernels/encoder_fused_programs.cuh",
-                    "src/ops/cuda/kernels/ragged_boundary_programs.cuh",
-                    "src/ops/cuda/kernels/relative_attention_tensor_rows64.cuh",
-                    "src/ops/cuda/kernels/relative_attention_tensor_tiles.cuh",
-                    "src/ops/cuda/kernels/q8_projection_tile4.cuh",
-                    "src/ops/cuda/kernels/projection_rows_cols_init.cuh",
-                    "src/ops/cuda/kernels/projection_rows_cols_tree.cuh",
-                    "src/ops/cuda/kernels/quant_projection_epilogue.cuh",
-                    "src/ops/cuda/kernels/q4_k_tiled_dot.cuh",
-                    "src/ops/cuda/kernels/dense_qkv_tiled.cuh",
-                    "src/ops/cuda/kernels/quant_tile4_publish.cuh",
-                    "src/ops/cuda/kernels/quant_k_tile4_partials.cuh",
-                    "src/ops/cuda/kernels/scalar_argmax_fold.cuh",
-                    "src/ops/cuda/kernels/q8_1_zero_sum_store.cuh",
-                    "src/ops/cuda/kernels/q4_q8_half_block_load.cuh",
-                    "src/ops/cuda/kernels/tq_mma_visible_range.cuh",
-                    "src/ops/cuda/kernels/tq_mma_stage_kv.cuh",
-                    "src/ops/cuda/kernels/tq_mma_prefill.cuh",
-                    "src/ops/cuda/kernels/tq_scalar_online.cuh",
-                    "src/ops/cuda/kernels/vision_bf16_attention_m32n16.cuh",
-                    "src/ops/cuda/kernels/q6_q8_tile8_partials.cuh",
-                    "src/ops/cuda/kernels/quant_argmax_publish.cuh",
-                    "src/ops/cuda/kernels/block_local_attention.cuh",
-                    "src/ops/cuda/kernels/primitive_gather.cuh",
-                    "src/ops/cuda/kernels/primitive_scatter.cuh",
-                    "src/ops/cuda/kernels/dense_fast_attention_online.cuh",
-                    "src/ops/cuda/kernels/training_validation.cuh",
-                    "src/ops/cuda/kernels/training_welford_layer_norm.cuh",
-                    "src/ops/cuda/kernels/training_row_softmax.cuh",
-                    "src/ops/cuda/kernels/relative_attention_training.cuh",
-                ]
+                # Read the declarative input domains, then hash them in Python.
+                # This independently checks the Zig tool's count/order/length
+                # framing without maintaining a second native-source registry.
+                identity_source = (
+                    self.root / "zig/pkg/inference/build/jit_identity.zig"
+                ).read_text()
+
+                def domain_paths(name):
+                    match = re.search(
+                        rf"const {name} = \[[_]\]\[\]const u8\{{(.*?)\n    \}};",
+                        identity_source,
+                        re.DOTALL,
+                    )
+                    self.assertIsNotNone(match, f"missing identity domain: {name}")
+                    paths = re.findall(r'"([^"\n]+)"', match.group(1))
+                    self.assertTrue(paths, f"empty identity domain: {name}")
+                    return paths
+
+                qualification = re.search(
+                    rf"\.{backend} => &\.\{{(.*?)\n        \}},",
+                    identity_source,
+                    re.DOTALL,
+                )
+                self.assertIsNotNone(qualification)
+                qualifier = (
+                    re.findall(r'"([^"\n]+)"', qualification.group(1))
+                    + domain_paths("contracts")
+                    + domain_paths(f"{backend}_dependencies")
+                )
                 qualifier += sorted(
                     os.path.relpath(Path(directory) / name, self.root / "zig/pkg/inference")
                     for source_root in (self.root / "zig/lib/tile/src", self.root / "zig/pkg/inference/src/tile")
@@ -2094,6 +1965,9 @@ class RuntimeCacheTest(unittest.TestCase):
                                 "src/ops/kernel_geometry.zig",
                                 "src/ops/cuda/kernels/rms_q8_1_register_rows.cuh",
                                 "src/ops/cuda/kernels/quant_rows_prefetch_l2.cuh",
+                                "src/ops/cuda/kernels/gemma4_q4_prefill.cuh",
+                                "src/ops/cuda/kernels/gemma4_vision_norm_rope.cuh",
+                                "src/ops/cuda/kernels/gemma4_vision_attention.cuh",
                                 "src/graph/quant_kernel_compiler.zig",
                                 "src/graph/quant_matmul.zig",
                                 "src/gguf/tensor_types.zig",
@@ -2112,6 +1986,28 @@ class RuntimeCacheTest(unittest.TestCase):
                 )
                 self.assertNotEqual(self.probe(output, label).split()[1], after[1])
                 self.assert_compile(output, "cli", "cached")
+                if backend == "cuda":
+                    for header in (
+                        "gemma4_q4_prefill.cuh",
+                        "gemma4_vision_norm_rope.cuh",
+                        "gemma4_vision_attention.cuh",
+                    ):
+                        before_header = self.probe(output, label).split()
+                        header_source = self.own(
+                            "zig/pkg/inference/src/ops/cuda/kernels/" + header
+                        )
+                        header_source.write_bytes(
+                            header_source.read_bytes() + b"\n// kernel policy edit\n"
+                        )
+                        output = self.build(
+                            "cache-identity", "runtime-unit-cli", backend=backend
+                        )
+                        after_header = self.probe(output, label).split()
+                        self.assertEqual(after_header[0], before_header[0])
+                        self.assertNotEqual(after_header[1], before_header[1])
+                        self.assertNotEqual(after_header[2], before_header[2])
+                        self.assertEqual(after_header[1], self.bundle_digest(qualifier))
+                        self.assert_compile(output, "cli", "cached")
                 if metal_options is not None:
                     before_options = self.probe(output, label).split()
                     metal_options.write_bytes(

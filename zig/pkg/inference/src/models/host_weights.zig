@@ -2239,3 +2239,23 @@ pub fn destroyGlideHead(allocator: std.mem.Allocator, head: *glide_mod.Head) voi
     head.deinit();
     allocator.destroy(head);
 }
+
+/// Admission and upload resolve identical architecture geometry before any
+/// device-weight discount. An unrelated table name is never enough to offload.
+pub fn cudaPleHostBytes(allocator: std.mem.Allocator, model_path: []const u8, manifest: manifest_mod.ModelManifest) !usize {
+    return cudaPleHostBytesForPolicy(allocator, model_path, manifest, @import("../ops/cuda/ple_host.zig").requested());
+}
+
+pub fn cudaPleHostBytesForPolicy(allocator: std.mem.Allocator, model_path: []const u8, manifest: manifest_mod.ModelManifest, enabled: bool) !usize {
+    const ple = @import("../ops/cuda/ple_host.zig");
+    if (!enabled or !manifest.usesGgufWeights()) return 0;
+    var mapped = try c_file.MmapRegion.init(allocator, manifest.gguf_path.?);
+    mapped.preserveFileCacheOnDeinit();
+    defer mapped.deinit();
+    var file = try gguf_mod.format.parseStructure(allocator, mapped.data);
+    defer file.deinit(allocator);
+    try gguf_mod.format.validateTensorDataRanges(&file, mapped.data.len);
+    const arch = try model_definition.detectArchitectureWithGgufFile(allocator, model_path, manifest, &file);
+    if (arch != .gpt or !ple.eligibleConfig(arch.gpt)) return 0;
+    return ple.estimateParsedBytes(&file);
+}

@@ -91,6 +91,7 @@ pub const NativeDecodeState = struct {
     sequence_id: ?runtime.kv.manager.SequenceId = null,
     pool_id: ?runtime.kv.block.KvPoolId = null,
     total_tokens: usize = 0,
+    cuda_request_replay_capacity: ?usize = null,
     kv_view: ?KvView = null,
     kv_compacted: bool = false,
     kv_block_ids: view_metadata.Table = .empty,
@@ -173,6 +174,7 @@ pub const NativeDecodeState = struct {
 
     pub fn configureForGptConfig(self: *NativeDecodeState, config: gpt_mod.Config) void {
         self.force_full_recompute = false;
+        self.cuda_request_replay_capacity = null;
         if (self.total_tokens == 0) self.kv_max_inflight_tokens = 0;
         self.allow_swa_ring = config.supportsSplitSwaGlobalKvRing();
         if (config.family != .gemma) self.gemma4_layer_spec_cache.reset();
@@ -517,8 +519,9 @@ pub const NativeDecodeState = struct {
             .f16, .polar4, .turbo3 => {},
             else => return null,
         }
-        const forced = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") orelse return null;
-        return if (forced == 0) null else forced;
+        if (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY")) |forced|
+            return if (forced == 0) null else forced;
+        return self.cuda_request_replay_capacity;
     }
 
     fn reservePagedKvReplayCapacity(self: *NativeDecodeState) !void {

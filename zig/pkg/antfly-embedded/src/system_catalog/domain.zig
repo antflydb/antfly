@@ -51,7 +51,11 @@ pub const QueryDefinition = struct {
     }
 
     pub fn fromTable(table: anytype) @This() {
-        return .{ .storage_engine = table.storage.engine, .table_id = table.table_id, .object_storage_generation = table.object_storage_generation, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json, .lake_index_catalog_json = table.lake_index_catalog_json };
+        const T = switch (@typeInfo(@TypeOf(table))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(table),
+        };
+        return .{ .storage_engine = table.storage.engine, .table_id = table.table_id, .object_storage_generation = table.object_storage_generation, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = if (@hasField(T, "query_indexes_json")) (if (table.query_indexes_json.len != 0) table.query_indexes_json else table.indexes_json) else table.indexes_json, .lake_index_catalog_json = table.lake_index_catalog_json };
     }
     pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
         const schema = try alloc.dupe(u8, self.schema_json);
@@ -399,6 +403,7 @@ pub const StateIndex = struct {
     storage_names: std.StringHashMapUnmanaged(Resource) = .empty,
     tablespace_users: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     child_positions: std.AutoHashMapUnmanaged(Id, usize) = .empty,
+    graph_users: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(Resource)) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, state: State) !StateIndex {
         var self: StateIndex = .{};
@@ -413,6 +418,8 @@ pub const StateIndex = struct {
             if (id.found_existing) return error.InvalidCatalogRecord;
             id.value_ptr.* = r;
             try self.appendChild(alloc, r);
+            try self.reserveGraphUsers(alloc, &.{r});
+            self.insertGraphUser(r);
             if (r.kind == .table) {
                 const storage = try self.storage_names.getOrPut(alloc, r.storage_name);
                 if (storage.found_existing) return error.InvalidCatalogRecord;
@@ -427,6 +434,27 @@ pub const StateIndex = struct {
         if (!self.ids.contains(.{ .kind = .namespace, .id = default_namespace_id })) try self.appendChild(alloc, default_namespace);
         return self;
     }
+    fn firstGraphTable(r: Resource, ordinal: usize) bool {
+        if (r.kind != .graph) return false;
+        for (r.graph_tables[0..ordinal]) |prior| if (prior.table_id == r.graph_tables[ordinal].table_id) return false;
+        return true;
+    }
+    fn reserveGraphUsers(self: *StateIndex, alloc: std.mem.Allocator, resources: []const Resource) !void {
+        for (resources) |r| for (r.graph_tables, 0..) |table, i| {
+            if (!firstGraphTable(r, i)) continue;
+            const entry = try self.graph_users.getOrPut(alloc, table.table_id);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.ensureUnusedCapacity(alloc, resources.len);
+        };
+    }
+    fn insertGraphUser(self: *StateIndex, r: Resource) void {
+        for (r.graph_tables, 0..) |table, i| {
+            if (firstGraphTable(r, i)) self.graph_users.getPtr(table.table_id).?.appendAssumeCapacity(r);
+        }
+    }
+    pub fn graphsForTable(self: *const StateIndex, table_id: u64) []const Resource {
+        return if (self.graph_users.get(table_id)) |users| users.items else &.{};
+    }
     fn appendChild(self: *StateIndex, alloc: std.mem.Allocator, resource: Resource) !void {
         const entry = try self.children.getOrPut(alloc, .{ .kind = resource.kind, .parent = resource.parent_id });
         if (!entry.found_existing) entry.value_ptr.* = .empty;
@@ -437,6 +465,7 @@ pub const StateIndex = struct {
     /// prepared delta subsequently allocates nothing.
     fn reserve(self: *StateIndex, alloc: std.mem.Allocator, resources: []const Resource) !void {
         errdefer self.pruneEmptyParents(alloc, resources);
+        try self.reserveGraphUsers(alloc, resources);
         const n: u32 = @intCast(resources.len);
         try self.names.ensureUnusedCapacity(alloc, n);
         try self.ids.ensureUnusedCapacity(alloc, n);
@@ -454,6 +483,14 @@ pub const StateIndex = struct {
     // Called only after commit/undo, never while rollback may need capacity.
     fn pruneEmptyParents(self: *StateIndex, alloc: std.mem.Allocator, resources: []const Resource) void {
         for (resources) |r| {
+            for (r.graph_tables, 0..) |table, i| {
+                if (!firstGraphTable(r, i)) continue;
+                const users = self.graph_users.getPtr(table.table_id) orelse continue;
+                if (users.items.len == 0) {
+                    users.deinit(alloc);
+                    _ = self.graph_users.remove(table.table_id);
+                }
+            }
             const key: Parent = .{ .kind = r.kind, .parent = r.parent_id };
             const children = self.children.getPtr(key) orelse continue;
             if (children.items.len != 0) continue;
@@ -462,6 +499,14 @@ pub const StateIndex = struct {
         }
     }
     fn remove(self: *StateIndex, r: Resource) void {
+        for (r.graph_tables, 0..) |table, i| {
+            if (!firstGraphTable(r, i)) continue;
+            const users = self.graph_users.getPtr(table.table_id).?;
+            for (users.items, 0..) |user, position| if (user.id == r.id) {
+                _ = users.swapRemove(position);
+                break;
+            };
+        }
         _ = self.names.remove(.{ .kind = r.kind, .parent = r.parent_id, .name = r.name });
         _ = self.ids.remove(.{ .kind = r.kind, .id = r.id });
         if (r.kind == .table) _ = self.storage_names.remove(r.storage_name);
@@ -479,6 +524,7 @@ pub const StateIndex = struct {
         }
     }
     fn insert(self: *StateIndex, r: Resource) void {
+        self.insertGraphUser(r);
         self.names.putAssumeCapacity(.{ .kind = r.kind, .parent = r.parent_id, .name = r.name }, r);
         self.ids.putAssumeCapacity(.{ .kind = r.kind, .id = r.id }, r);
         if (r.kind == .table) self.storage_names.putAssumeCapacity(r.storage_name, r);
@@ -498,6 +544,9 @@ pub const StateIndex = struct {
         var children = self.children.valueIterator();
         while (children.next()) |value| value.deinit(alloc);
         self.children.deinit(alloc);
+        var graph_users = self.graph_users.valueIterator();
+        while (graph_users.next()) |users| users.deinit(alloc);
+        self.graph_users.deinit(alloc);
         self.storage_names.deinit(alloc);
         self.tablespace_users.deinit(alloc);
         self.child_positions.deinit(alloc);
@@ -666,14 +715,17 @@ pub const MutableState = struct {
         next_id: u64,
         pub fn finish(self: *Change, state: *MutableState, committed: bool) void {
             if (!committed) {
-                for (self.inserted.items) |r| if (state.take(r.kind, r.id)) |removed| freeResource(state.alloc, removed);
+                for (self.inserted.items) |r| _ = state.take(r.kind, r.id);
                 for (self.previous.items) |r| state.put(r);
                 state.value.revision = self.revision;
                 state.value.next_id = self.next_id;
             }
             state.index.pruneEmptyParents(state.alloc, self.previous.items);
             state.index.pruneEmptyParents(state.alloc, self.inserted.items);
-            if (committed) for (self.previous.items) |r| freeResource(state.alloc, r);
+            // Reverse-index cleanup borrows binding arrays from both sides.
+            // Release the discarded side only after every prune has completed.
+            const discarded = if (committed) self.previous.items else self.inserted.items;
+            for (discarded) |r| freeResource(state.alloc, r);
             self.previous.deinit(state.alloc);
             self.inserted.deinit(state.alloc);
             self.* = undefined;
@@ -772,7 +824,7 @@ pub const PhysicalTable = struct {
     name: []const u8,
     /// Test/algorithm reader inventory. Production resolves these lazily from
     /// the same committed transaction through graphIndexIdentity.
-    graph_indexes: []const struct { name: []const u8, identity: @import("cypher").catalog.IndexIdentity } = &.{},
+    graph_indexes: []const struct { name: []const u8, concrete_name: ?[]const u8 = null, identity: @import("cypher").catalog.IndexIdentity } = &.{},
 };
 
 /// Planning uses a transaction-pinned reader. Point mutations touch only their
@@ -883,6 +935,17 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                     out.* = .{ .mapping_index = @intCast(i), .identity = identity };
                 }
                 resource.graph_indexes = graph_indexes;
+                var validation_arena = std.heap.ArenaAllocator.init(alloc);
+                defer validation_arena.deinit();
+                const validation_alloc = validation_arena.allocator();
+                var executable = try graphForExecution(validation_alloc, resource);
+                const mappings = try validation_alloc.dupe(@TypeOf(executable.relationships[0]), executable.relationships);
+                executable.relationships = mappings;
+                for (mappings) |*mapping| {
+                    const label = executable.label(mapping.source_label) orelse return error.InvalidCatalogRecord;
+                    mapping.index = try reader.graphIndexName(label.table_id, mapping.index);
+                }
+                executable.validate() catch return error.InvalidCatalogMutation;
             }
             if (request.kind == .table) {
                 if (request.table_id == 0 or request.storage_name.len == 0) return error.InvalidCatalogMutation;
@@ -992,6 +1055,11 @@ pub const MemoryReader = struct {
     pub fn physicalById(self: @This(), id: u64) !?PhysicalTable {
         for (self.tables) |table| if (id == table.id) return table;
         return null;
+    }
+    pub fn graphIndexName(self: @This(), table_id: u64, index_name: []const u8) ![]const u8 {
+        const table = (try self.physicalById(table_id)) orelse return error.TableNotFound;
+        for (table.graph_indexes) |index| if (std.mem.eql(u8, index.name, index_name)) return index.concrete_name orelse index.name;
+        return error.IndexNotFound;
     }
     pub fn graphIndexIdentity(self: @This(), table_id: u64, index_name: []const u8) !?@import("cypher").catalog.IndexIdentity {
         const table = (try self.physicalById(table_id)) orelse return null;

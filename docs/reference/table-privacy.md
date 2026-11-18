@@ -322,3 +322,111 @@ Generated Go, Python, and Rust clients expose the corresponding
 `getNamespaceTablePrivacyScan`, `listNamespaceTablePrivacyFindings`, and
 `queryNamespaceTablePrivacyFindings` operations (using each language's naming
 convention).
+
+
+### Index migration while protection is active
+
+With `redact_for_search_and_ai`, create a new physical embedding or full-text
+index through the normal create-index API. Antfly attaches it to the current
+protected artifact graph in the same catalog commit. Existing index generations
+and privacy inspection receipts remain usable. Wait for the new index to become
+complete, then move the serving index alias with `expected_index` set to the old
+physical index. After cutover, delete the unreferenced old physical index through
+the normal delete-index API. Its private chunk/embedding producers retire in the
+same catalog mutation, so later writes no longer invoke its model. Shared
+producers and the protected serving guard remain owned by their surviving
+consumers. Raw external vectors and unsupported graph consumers are rejected.
+Repeating an identical creation request preserves the physical generation.
+
+Semantic policy changes (including producer revision or replacement style)
+replace dependent consumer generations and backfill them under the new policy.
+Identical policy PUTs and execution-only tuning preserve existing generations.
+An alias that still references a changed consumer blocks the policy replacement
+with HTTP 409 `IndexReferencedByAlias`. Remove every alias referencing a changed consumer before changing the policy;
+rebind only after the protected index is complete. To remove an alias, GET
+`/tables/{tableName}/index-aliases/{aliasName}` and DELETE the same path with
+`If-Match` set to that response's exact `ETag`. Missing validators return 428,
+stale validators return 412, and a repeated deletion returns 404. This CAS also
+protects against deleting a concurrently recreated alias or one restored from a backup. Physical indexes and
+retained PUT idempotency receipts remain intact. Protection remains
+active throughout the transition. Alias mutations require metadata protocol 91
+and store artifact-source protocol 4 so older owners cannot misread the new
+validator state. Legacy alias catalogs continue to admit protocol-3 stores
+during rolling upgrades until lifecycle validator state is committed.
+
+Missing producer input does not become a successful replay merely because a retry
+limit elapsed. Its journal window remains pending until input arrives, a durable
+source deletion or generation proves it retired, or explicit repair resolves the
+missing state. Workers park instead of polling the same failed window; source or
+producer commits and explicit repair notifications wake them, including repairs
+at the same replay sequence. Ordinary query visibility waits do not wake an
+unchanged missing-input window. Continuing writes also respect a bounded retry
+backoff; they cannot cause a blocked window to replay at the write rate. A retry
+requires both a notification and an elapsed deadline, so idle workers do not
+poll. Reopening retries retained debt. This applies to
+full-text consumers as well as vector consumers.
+
+### Inspect stored vectors as an administrator
+
+For a dense index protected by `redact_for_search_and_ai` and backed by text
+chunk embedding producers, an explicit
+artifact inspection can use the index name:
+
+```http
+GET /db/v1/tables/docs/documents/doc-id/artifacts/semantic-index?detail=raw
+```
+
+This uses the existing table administrator permission for raw artifact
+inspection. Tenant search and document projections retain their artifact
+restrictions. Existing asset names take precedence over an index with the
+same name. Index inspections are explicit lookups and are not added to asset
+manifest enumeration. Unprotected indexes and document-level, sparse, media,
+or elided-vector recipes are outside this inspection format.
+
+The response has `route_type: "dense_index_inspection"`, `manifest_version: 1`,
+and an empty top-level `artifact_id` because an index can consume many physical
+artifacts. Its raw `manifest_json` is a JSON string with format
+`antfly.dense-index-inspection.v1`. It contains the index name, physical
+coverage generation and recipe fingerprint; the active privacy policy version;
+the currently sanitized `document_json` and its SHA-256 fingerprint; and a
+`current` publication flag. Each vector carries its real artifact ID, producer
+name, provider/model identity, producer fingerprint, exact source text and
+SHA-256 fingerprint, the persisted artifact fingerprint and opaque provider cache identity, and
+persisted float values. Fingerprints are lowercase
+SHA-256 hex over the exact represented bytes.
+
+Source, selected chunk heads, recipe, publication guards, and stored vectors
+are captured while apply is held shared, with the source and vectors read from
+one storage snapshot. Standalone inspection uses the same source-guarded coverage generations and
+clean projection checkpoints as protected serving; ordered owners additionally
+verify per-output causal provenance. The payload identifies this authority and
+reports the index/checkpoint config hashes, checkpoint status, applied sequence
+and replay target sequence. It does not substitute asset privacy witnesses for
+vector authority. `current: false` and an `incomplete_reason` do not certify vector
+equivalence. Pending root publication never yields certified vectors.
+The operation never calls an embedding provider to reconstruct missing values.
+It seeks only the selected producers for this document and bounds inspection
+to 16 producers, 128 vectors, 65,536 float values and 1 MiB of source payloads.
+Identities are limited to 4 KiB and each producer configuration to 1 MiB.
+Publication preflight and traversal share a 512-visit, 2 MiB budget, including
+policy/configuration bytes, readiness nodes, index checks and empty unit heads.
+The five-second deadline starts at capture entry and is checked throughout.
+Ordered global readiness verifies one durable catalog authority and each
+producer counter once, without rebuilding per-producer dependency closures.
+Standalone vector readiness reads its index-generation coverage once and does
+not compute source scopes. Full-text scope traversal is linear in the dependency
+graph and charges the same budget during edge discovery, traversal and hashing;
+its existing v2 receipt identity is preserved. Fixed payload or traversal limits
+return HTTP 413 with code `inspection_limit_exceeded`, `retryable: false`, and
+the configured limits; deadline or publication contention remains retryable.
+No response is truncated. Capture excludes primary and replay publication using
+the existing snapshot admission gates, then releases those gates before JSON
+encoding. `checkpoint_generation` and `checkpoint_config_hash` can be checked
+against the independent live index status fields
+`projection_checkpoint_generation` and `projection_checkpoint_config_fingerprint`
+(the latter is hexadecimal).
+
+An independent oracle should compare these values against a separate invocation
+of the intended model on independently retrieved sanitized text. Check source
+revision, policy and index identity as well as the numeric values, and retain
+tenant permission checks separately.

@@ -1747,6 +1747,8 @@ pub const validateArtifactRelativePath = @import("backup_contract.zig").validate
 
 pub fn resolveFilesystemLocationAlloc(alloc: std.mem.Allocator, configured_root: []const u8, location: []const u8, shared_io: ?std.Io) ![]u8 {
     const uri_path = try parseFileLocation(location);
+    // file:// always names an absolute filesystem path, including for a
+    // connection. The root constrains authority; it is not a URI prefix.
     const relative = std.mem.trimStart(u8, uri_path, "/");
     if (relative.len > 0) try validateArtifactRelativePath(relative);
 
@@ -1758,10 +1760,7 @@ pub fn resolveFilesystemLocationAlloc(alloc: std.mem.Allocator, configured_root:
     const io = shared_io orelse io_impl.?.io();
     const canonical_root = try std.Io.Dir.realPathFileAbsoluteAlloc(io, configured_root, alloc);
     defer alloc.free(canonical_root);
-    const candidate = if (relative.len == 0)
-        try alloc.dupe(u8, canonical_root)
-    else
-        try std.fs.path.join(alloc, &.{ canonical_root, relative });
+    const candidate = try alloc.dupe(u8, uri_path);
     errdefer alloc.free(candidate);
 
     // Resolve the nearest existing ancestor. This rejects pre-existing symlinks
@@ -2615,7 +2614,13 @@ pub fn localArtifactStatsEqual(
 
 pub fn createTableRequestFromManifest(alloc: std.mem.Allocator, manifest: *const TableBackupManifest) !tables_api.CreateTableRequest {
     if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
-    const indexes = try @import("../privacy/catalog.zig").prepareRestore(alloc, manifest.indexes_json);
+    const privacy_indexes = try @import("../privacy/catalog.zig").prepareRestore(alloc, manifest.indexes_json);
+    defer alloc.free(privacy_indexes);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var nonce: [32]u8 = undefined;
+    try @import("antfly_platform").entropy.fill(io_impl.io(), &nonce);
+    const indexes = try @import("index_aliases.zig").renewRestoreEpoch(alloc, privacy_indexes, &std.fmt.bytesToHex(nonce, .lower));
     errdefer alloc.free(indexes);
     try tables_api.validateStoredIndexesJson(alloc, indexes);
     return .{

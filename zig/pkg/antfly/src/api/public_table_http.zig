@@ -110,6 +110,7 @@ pub const TableApi = struct {
         InvalidBatchRequest,
         Forbidden,
         UnsupportedSyncLevel,
+        UnsupportedCommitRequirement,
         GraphMetricFeatureNotEnabled,
         GraphMetricMaterializationRejected,
         NotFound,
@@ -214,6 +215,11 @@ pub const TableApi = struct {
         IncompletePublishedSnapshot,
         ReembedBudgetExceeded,
         ReembedSetupRetry,
+        ForeignConnectionFailed,
+        ForeignQueryFailed,
+        ForeignAuthFailed,
+        ForeignTableNotFound,
+        LibpqUnavailable,
         InternalFailure,
     };
 
@@ -416,6 +422,7 @@ pub const TableApi = struct {
         ReadUnavailable,
         StorageReadTemporarilyUnavailable,
         InternalFailure,
+        ResourceBudgetExceeded,
     };
 
     pub const ExecuteDocumentArtifactManifestsError = error{
@@ -917,6 +924,35 @@ test "highlight query cancellation classification preserves deadline identity be
     try std.testing.expectEqual(error.Canceled, queryCancellationError(error.Cancelled).?);
     try std.testing.expect(queryCancellationError(error.ConnectionResetByPeer) == null);
     try std.testing.expect(queryCancellationError(error.OutOfMemory) == null);
+}
+
+/// Do not expose libpq's raw diagnostic: it can contain a credential-bearing DSN.
+pub const ForeignSourceFailure = enum { connection, driver, execution, authentication, missing_relation };
+
+pub fn foreignSourceFailureOwnedResponse(alloc: std.mem.Allocator, source: []const u8, failure: ForeignSourceFailure) !OwnedResponse {
+    const code, const message = switch (failure) {
+        .driver => .{ "foreign_source_driver_unavailable", "PostgreSQL foreign source driver is unavailable on this server" },
+        .connection => .{ "foreign_source_unavailable", "foreign source could not connect; check the source connection and availability" },
+        .execution => .{ "foreign_source_query_failed", "foreign source could not execute the query; check the remote relation and permissions" },
+        .authentication => .{ "foreign_source_auth_failed", "foreign source rejected authentication; check the configured credentials" },
+        .missing_relation => .{ "foreign_source_relation_not_found", "foreign source relation was not found; check the configured remote schema and table" },
+    };
+    // libpq does not expose a reliable SQLSTATE for startup failures.
+    // A failed connection can therefore be a permanent credential rejection.
+    return .{
+        .status = switch (failure) {
+            .connection, .driver => 503,
+            else => 502,
+        },
+        .body = try std.json.Stringify.valueAlloc(alloc, .{
+            .code = code,
+            .@"error" = code,
+            .source = source,
+            .message = message,
+            .retryable = false,
+        }, .{}),
+        .json = true,
+    };
 }
 
 pub fn queryDependencyErrorOwnedResponse(
@@ -1779,6 +1815,7 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         error.RelationalIndexKeyTooLarge => return .{ .status = 413, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"RelationalIndexKeyTooLarge\",\"message\":\"encoded relational index keys, including the document ID, must not exceed 1048576 bytes\"}") },
         error.Forbidden => return .{ .status = 403, .body = try alloc.dupe(u8, "write permission required for every table affected by this mutation") },
         error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
+        error.UnsupportedCommitRequirement => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported commit_requires on this mutation surface") },
         error.UnsupportedSyncLevel => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported sync_level") },
         error.GraphMetricFeatureNotEnabled => return .{
             .status = 422,
@@ -2175,6 +2212,11 @@ pub fn handleTableQueryRequest(
             },
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.ForeignConnectionFailed => return try foreignSourceFailureOwnedResponse(alloc, table_name, .connection),
+            error.ForeignQueryFailed => return try foreignSourceFailureOwnedResponse(alloc, table_name, .execution),
+            error.ForeignAuthFailed => return try foreignSourceFailureOwnedResponse(alloc, table_name, .authentication),
+            error.ForeignTableNotFound => return try foreignSourceFailureOwnedResponse(alloc, table_name, .missing_relation),
+            error.LibpqUnavailable => return try foreignSourceFailureOwnedResponse(alloc, table_name, .driver),
             error.InternalFailure => {
                 std.log.err("public table query failed table={s} err={}", .{ table_name, err });
                 return .{ .status = 500, .body = try alloc.dupe(u8, "query failed") };
@@ -2714,6 +2756,16 @@ pub fn handleDocumentArtifactManifest(
         error.ReadRequiresPrimary => return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") },
         error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
         error.StorageReadTemporarilyUnavailable => return try storageReadTemporarilyUnavailableOwnedResponse(alloc),
+        error.ResourceBudgetExceeded => return .{
+            .status = 413,
+            .json = true,
+            .body = try std.json.Stringify.valueAlloc(alloc, .{
+                .code = "inspection_limit_exceeded",
+                .retryable = false,
+                .message = "Dense index inspection exceeds supported limits; use a smaller source or recipe.",
+                .limits = db_mod.types.dense_index_inspection_limits,
+            }, .{}),
+        },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact manifest lookup failed") },
     };
     defer manifest.deinit(alloc);
@@ -6548,6 +6600,7 @@ test "public document artifact manifest handler returns summary and raw state" {
         ) TableApi.ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
             if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
             if (!std.mem.eql(u8, doc_key, "doc:a")) return error.InternalFailure;
+            if (std.mem.eql(u8, artifact_name, "oversized")) return error.ResourceBudgetExceeded;
             if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return error.InternalFailure;
             return makeManifest(alloc, doc_key, artifact_name);
         }
@@ -6572,6 +6625,15 @@ test "public document artifact manifest handler returns summary and raw state" {
             };
         }
     };
+
+    var limited = try handleDocumentArtifactManifest(std.testing.allocator, "docs", "doc:a", "oversized", .{ .detail = .raw }, Backend.iface());
+    defer limited.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 413), limited.status);
+    const limit_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, limited.body, .{});
+    defer limit_json.deinit();
+    try std.testing.expectEqualStrings("inspection_limit_exceeded", limit_json.value.object.get("code").?.string);
+    try std.testing.expect(!limit_json.value.object.get("retryable").?.bool);
+    try std.testing.expectEqual(@as(i64, 512), limit_json.value.object.get("limits").?.object.get("scan_visits").?.integer);
 
     var resp = try handleDocumentArtifactManifest(
         std.testing.allocator,

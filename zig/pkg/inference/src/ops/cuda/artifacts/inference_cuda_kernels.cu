@@ -3839,9 +3839,6 @@ extern "C" __global__ void termite_gqa_attention_decode_scalars_f32(
 // SPDX-License-Identifier: Apache-2.0
 
 // Runtime source supplies these phases before embedding the template.
-#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
-#include "cuda_attention_scalar_phases.cuh"
-#endif
 
 // Native split-K GQA schedules: geometry fixes registers and shared extents.
 // Scalar replay, reduction trees, masks and accumulation order stay explicit.
@@ -4155,9 +4152,6 @@ __device__ __forceinline__ void antfly_gqa_serial(ANTFLY_GQA_SERIAL_PARAMS) {
 // SPDX-License-Identifier: Apache-2.0
 
 // Runtime source supplies these phases before embedding the template.
-#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
-#include "cuda_attention_scalar_phases.cuh"
-#endif
 // Exact score prework and chronological online-softmax consumers. Geometry
 // specializes statically; serial and tiled schedules retain their own lane
 // ownership, scratch capacity, launch admission, and floating-point recurrence.
@@ -4790,9 +4784,6 @@ __device__ __forceinline__ void splitk_online_body(
 
 
 // Runtime source supplies these phases before embedding the template.
-#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
-#include "cuda_attention_scalar_phases.cuh"
-#endif
 // Typed, default-off SM89 q=1 paged-GQA split-K online-softmax template.
 //
 // One CTA owns one (query head, chronological KV split). It publishes a stable
@@ -4908,9 +4899,6 @@ extern "C" __global__ void ANTFLY_SPLITK_ONLINE_KERNEL(
 
 
 // Runtime source supplies these phases before embedding the template.
-#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
-#include "cuda_attention_scalar_phases.cuh"
-#endif
 // Typed, default-off SM89 q=1 paged-GQA split-K online-softmax template.
 //
 // One CTA owns one (query head, chronological KV split). It publishes a stable
@@ -5890,9 +5878,6 @@ static __device__ void reference_prefill_body(
 
 
 // Runtime source supplies these phases before embedding the template.
-#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
-#include "cuda_attention_scalar_phases.cuh"
-#endif
 // Typed SM89 paged-GQA Flash prefill: qualified E2B and opt-in E4B.
 //
 // The typed CUDA renderer supplies a unique namespace, one production entry
@@ -6056,9 +6041,6 @@ ANTFLY_FLASH_REFERENCE_KERNEL(
 
 
 // Runtime source supplies these phases before embedding the template.
-#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
-#include "cuda_attention_scalar_phases.cuh"
-#endif
 // Typed SM89 paged-GQA Flash prefill: qualified E2B and opt-in E4B.
 //
 // The typed CUDA renderer supplies a unique namespace, one production entry
@@ -6222,9 +6204,6 @@ ANTFLY_FLASH_REFERENCE_KERNEL(
 
 
 // Runtime source supplies these phases before embedding the template.
-#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
-#include "cuda_attention_scalar_phases.cuh"
-#endif
 // Typed SM89 paged-GQA Flash prefill: qualified E2B and opt-in E4B.
 //
 // The typed CUDA renderer supplies a unique namespace, one production entry
@@ -6388,9 +6367,6 @@ ANTFLY_FLASH_REFERENCE_KERNEL(
 
 
 // Runtime source supplies these phases before embedding the template.
-#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
-#include "cuda_attention_scalar_phases.cuh"
-#endif
 // Typed SM89 paged-GQA Flash prefill: qualified E2B and opt-in E4B.
 //
 // The typed CUDA renderer supplies a unique namespace, one production entry
@@ -16116,3 +16092,7 @@ extern "C" __global__ void antfly_spatial_pool_gemm_f32_bf16_phases(
     }
 }
 // tile-codegen:end pool.spatial.gemm.f32_bf16 family
+
+#include "../kernels/gemma4_q4_prefill.cuh"
+#include "../kernels/gemma4_vision_norm_rope.cuh"
+#include "../kernels/gemma4_vision_attention.cuh"

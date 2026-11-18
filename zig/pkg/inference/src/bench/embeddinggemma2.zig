@@ -188,9 +188,12 @@ pub fn main(init: std.process.Init) !void {
             .gpu_memory = try a.alloc(Memory, warmups + n),
             .input_tokens = case.token_ids.len,
         };
+        var profile: ?std.DynLib = null;
+        defer stopProfile(&profile);
         // Both sessions finish compilation/warmup before measurements. Reverse
         // each pair to produce AB/BA controls inside the same process/window.
         for (0..warmups + n) |iteration| for (0..count) |slot| {
+            if (backend == .cuda and iteration == warmups and slot == 0) profile = try startProfile();
             const index = if (iteration % 2 == 0) slot else count - 1 - slot;
             const state = &states[index];
             var bounded = Bounded{ .backing = pipeline.workspaceBackingAllocator(state.session.backend()), .limit = 512 * 1024 * 1024 };
@@ -211,6 +214,7 @@ pub fn main(init: std.process.Init) !void {
             if (bounded.live != 0) return error.WorkspaceLeak;
             state.peak = @max(state.peak, bounded.peak);
         };
+        stopProfile(&profile);
         for (states[0..count]) |state| {
             try measurements.append(a, .{ .backend = @tagName(state.backend), .name = case.name, .tokens = state.input_tokens, .timing_scope = if (parts.len == 0) "prepared text IDs through synchronized vector readback" else "encoded media bytes and text through decode, preprocessing, towers, composition, encoder and synchronized vector readback; fixture I/O excluded", .samples_seconds = state.samples, .vector = state.vector, .host_peak_bytes = state.peak, .host_live_after_release = 0, .gpu_memory = state.gpu_memory, .vm_measured_before = state.vm_before, .vm_measured_after = state.vm_after });
             std.debug.print("encoder {s}/{s}: {d} samples, host peak {d}\n", .{ @tagName(state.backend), case.name, n, state.peak });
@@ -258,4 +262,24 @@ fn sessionVector(session: Session, allocator: std.mem.Allocator, case: Case, mas
     const vector = outputs[0].asFloat32Mut();
     outputs[0].owns_data = false;
     return vector;
+}
+
+// Benchmark-only capture: loading, autotuning and warmups stay outside traces.
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+fn startProfile() !?std.DynLib {
+    const enabled = getenv("ANTFLY_CUDA_PROFILE") orelse return null;
+    if (!std.mem.eql(u8, std.mem.span(enabled), "1")) return null;
+    var lib = try std.DynLib.open("libcuda.so.1");
+    errdefer lib.close();
+    const start = lib.lookup(*const fn () callconv(.c) c_int, "cuProfilerStart") orelse return error.ProfilerUnavailable;
+    if (start() != 0) return error.ProfilerStartFailed;
+    return lib;
+}
+fn stopProfile(profile: *?std.DynLib) void {
+    if (profile.*) |*lib| {
+        const stop = lib.lookup(*const fn () callconv(.c) c_int, "cuProfilerStop") orelse unreachable;
+        _ = stop();
+        lib.close();
+        profile.* = null;
+    }
 }

@@ -352,6 +352,8 @@ pub fn inspectGgufModel(allocator: std.mem.Allocator, model_path: []const u8) !?
 /// Cold-listing inspection reads only GGUF metadata and tensor headers. In
 /// particular, tokenizer vocabulary arrays are skipped rather than allocated.
 pub const inspectGgufModelForListing = host_weights.inspectGgufModelForListing;
+pub const cudaPleHostBytes = host_weights.cudaPleHostBytes;
+pub const cudaPleHostBytesForPolicy = host_weights.cudaPleHostBytesForPolicy;
 
 /// Whether a Laya checkpoint serves its linear weights as Q8_0 (LAYA.md 1d).
 const layaQuantizesWeights = host_weights.layaQuantizesWeights;
@@ -868,8 +870,23 @@ fn createCudaSessionWithRequiredProfile(
     gliner_precision: GlinerCudaPrecision,
     selected_manifest: ?*const manifest_mod.ModelManifest,
 ) !Session {
+    return createCudaSessionWithRequiredProfileAndHostLease(allocator, model_path, override, config, load_context, a4b_request, required_profile_override, gliner_precision, selected_manifest, null);
+}
+
+fn createCudaSessionWithRequiredProfileAndHostLease(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    override: ?TaskOverride,
+    config: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
+    required_profile_override: ?CudaCapabilityProfile,
+    gliner_precision: GlinerCudaPrecision,
+    selected_manifest: ?*const manifest_mod.ModelManifest,
+    host_lease: ?*?@import("../runtime/tier/memory.zig").AdmissionLease,
+) !Session {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
-    var prepared = try cuda_weights.prepare(allocator, model_path, override, config, load_context, a4b_request, required_profile_override, gliner_precision, selected_manifest);
+    var prepared = try cuda_weights.prepareWithHostLease(allocator, model_path, override, config, load_context, a4b_request, required_profile_override, gliner_precision, selected_manifest, host_lease);
     defer prepared.deinit();
     const impl = try allocator.create(ArchSession);
     impl.* = .{
@@ -4756,6 +4773,7 @@ fn archExecutionCapabilities(raw: *anyopaque) @import("../backends/session.zig")
         cfg.effectiveKVHeads() == 2 and cfg.headDim() == 256 and cfg.global_head_dim == 512;
     return .{
         .cooperative_steps = cooperative,
+        .cooperative_prompt_cache = cooperative,
         .max_active_requests = if (cooperative) 2 else 1,
         .max_batch_rows = if (cooperative) compute.cooperativeDecodeBatchRows(cfg.weight_tying) else 1,
         .decode_only_batching = true,
@@ -21420,6 +21438,21 @@ pub fn createSessionFromManifest(
     precision: ?GlinerCudaPrecision,
     allow_unqualified_precision: bool,
 ) !Session {
+    return createSessionFromManifestWithHostLease(allocator, model_path, manifest, backend, jit, load_context, a4b, precision, allow_unqualified_precision, null);
+}
+
+pub fn createSessionFromManifestWithHostLease(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    manifest: *const manifest_mod.ModelManifest,
+    backend: BackendType,
+    jit: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+    a4b: ?backend_contracts.A4bInferenceRequest,
+    precision: ?GlinerCudaPrecision,
+    allow_unqualified_precision: bool,
+    host_lease: ?*?@import("../runtime/tier/memory.zig").AdmissionLease,
+) !Session {
     return switch (backend) {
         .native => openHostSessionFromManifest(allocator, model_path, manifest, null, .{}),
         .pjrt => createPjrtSessionFromManifestWithOptions(allocator, model_path, manifest, .{}),
@@ -21429,7 +21462,7 @@ pub fn createSessionFromManifest(
                 try requireQualifiedGlinerCudaPrecision(value, allow_unqualified_precision);
                 try requireGlinerCudaPrecisionManifest(manifest);
             }
-            break :blk createCudaSessionWithRequiredProfile(allocator, model_path, null, jit, load_context, a4b, null, precision orelse .fp32, manifest);
+            break :blk createCudaSessionWithRequiredProfileAndHostLease(allocator, model_path, null, jit, load_context, a4b, null, precision orelse .fp32, manifest, host_lease);
         },
         else => error.UnsupportedBackend,
     };
@@ -21899,4 +21932,36 @@ test "CUDA counter delta excludes earlier quantized operations and saturates res
     try std.testing.expectEqual(@as(usize, 2), delta.quant_ops.total);
     try std.testing.expectEqual(@as(usize, 2), delta.quant_ops.mul_mv);
     try std.testing.expectEqual(@as(usize, 0), delta.quant_ops.fallback);
+}
+
+pub fn getGlinerDecideExecutionBatchPolicy(session: Session) ?gliner_decide_qualification.ExecutionBatchPolicy {
+    const backend: gliner_decide_qualification.Backend = switch (session.backend()) {
+        .cuda => .cuda,
+        .metal => .metal,
+        else => return null,
+    };
+    const identity = getGlinerDecisionIdentity(session) catch return null;
+    return gliner_decide_qualification.executionBatchPolicy(identity, backend);
+}
+
+test "Decide CUDA execution batches require a sealed session identity" {
+    for ([_]gliner_decide_qualification.Identity{ gliner_decide_qualification.pinned_legacy_fp32_identity, gliner_decide_qualification.pinned_legacy_q8_identity }) |identity| {
+        var arch = ArchSession{
+            .allocator = std.testing.allocator,
+            .arch_config = .{ .deberta = .{} },
+            .task = .extractor,
+            .gliner_decision_identity = identity,
+            .backend_type = .cuda,
+            .backend_data = .{ .native = .{ .allocator = std.testing.allocator, .resident_weights = .empty, .lazy_weights = .empty } },
+        };
+        const session = Session{ .ptr = &arch, .vtable = &arch_vtable };
+        try std.testing.expect(getGlinerDecideExecutionBatchPolicy(session) == null);
+        try sealGlinerDecisionTokenizerDigest(session, identity.sidecars.tokenizer);
+        try std.testing.expectEqual(@as(usize, 8), getGlinerDecideExecutionBatchPolicy(session).?.batch_items);
+        arch.backend_type = .native;
+        try std.testing.expect(getGlinerDecideExecutionBatchPolicy(session) == null);
+        arch.backend_type = .cuda;
+        arch.gliner_decision_identity.?.weight.sha256[0] ^= 1;
+        try std.testing.expect(getGlinerDecideExecutionBatchPolicy(session) == null);
+    }
 }

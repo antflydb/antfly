@@ -2944,6 +2944,10 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (err == error.IndexReferencedByAlias or err == error.IndexAliasGraphConflict or err == error.PrivacyManagedGraph or err == error.PrivacyUnknownArtifactSource) {
+            try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
+            return ctx.status(409).text(@errorName(err));
+        }
         if (err == error.ResolverCurationConflict) {
             try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
             return ctx.status(system_catalog.httpStatus(err)).text(@errorName(err));
@@ -6273,10 +6277,11 @@ test "metadata http server preserves extension-owned table drop conflicts" {
     );
 }
 
-test "metadata http server replaces a table definition through compare-and-swap" {
+test "index alias metadata http server replaces a table definition through compare-and-swap" {
     const FakeSource = struct {
         replaced: bool = false,
         reject_not_leader: bool = false,
+        rejection: ?anyerror = null,
 
         fn iface(self: *@This()) AdminSource {
             return .{
@@ -6312,6 +6317,7 @@ test "metadata http server replaces a table definition through compare-and-swap"
         fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.reject_not_leader) return error.NotLeader;
+            if (self.rejection) |err| return err;
             if (expected.table_id != 42 or !std.mem.eql(u8, expected.description, "original")) return error.TableGenerationChanged;
             try std.testing.expectEqual(@as(u64, 42), replacement.table_id);
             try std.testing.expectEqualStrings("docs", replacement.name);
@@ -6386,6 +6392,19 @@ test "metadata http server replaces a table definition through compare-and-swap"
         http_common.metadata_mutation_not_admitted_value,
         rejected_response.headers.get(http_common.metadata_mutation_not_admitted_header).?,
     );
+    source.reject_not_leader = false;
+    for ([_]anyerror{ error.IndexReferencedByAlias, error.IndexAliasGraphConflict }) |err| {
+        source.rejection = err;
+        inline for (.{ MetadataHttpServer.metadataReplaceTableDefinition, MetadataHttpServer.metadataReplaceTableDefinitionStamped }) |handler| {
+            var conflict = try server.executeTypedHandlerWithBodyForTest(.PUT, "/internal/v1/tables/docs/definition", &table_params,
+                \\{"expected":{"table_id":42,"name":"docs","description":"original"},"definition":{"table_id":42,"name":"docs","description":"restored"}}
+            , handler);
+            defer conflict.deinit();
+            try std.testing.expectEqual(@as(u16, 409), conflict.status.code);
+            try std.testing.expectEqualStrings(@errorName(err), conflict.body.?);
+            try std.testing.expectEqualStrings(routes.Routes.raft_mutation_outcome_not_proposed, conflict.headers.get(routes.Routes.raft_mutation_outcome_header).?);
+        }
+    }
 }
 
 test "metadata http server registers nodes and marks node stores draining for shutdown" {

@@ -240,7 +240,7 @@ pub const AdmittedAllocator = struct {
         var reservation = source.reservations;
         while (reservation) |node| : (reservation = node.next) {
             const lease = node.lease orelse return error.InvalidAdmissionLeaseReduction;
-            if (lease.controller != source_domain or lease.external_lease != null or lease.live_reserved_bytes != 0 or lease.live_settled_bytes != 0 or lease.retain_backend_class != .cpu or lease.amounts.host_scratch_bytes != node.bytes or lease.amounts.hostTotalBytes() != node.bytes or lease.amounts.backendTotalBytes() != 0)
+            if (lease.controller != source_domain or lease.hasExternalReceipt() or lease.live_reserved_bytes != 0 or lease.live_settled_bytes != 0 or lease.retain_backend_class != .cpu or lease.amounts.host_scratch_bytes != node.bytes or lease.amounts.hostTotalBytes() != node.bytes or lease.amounts.backendTotalBytes() != 0)
                 return error.InvalidAdmissionLeaseReduction;
         }
         if (source.reservations) |first| {
@@ -1430,4 +1430,45 @@ test "reader admitted owner rejects malformed callback credit before backing all
     try std.testing.expectError(error.OutOfMemory, owner.allocator().alloc(u8, 1));
     try std.testing.expectEqual(error.InvalidAdmissionLeaseReduction, owner.admission_error.?);
     try std.testing.expectEqual(@as(usize, 0), provider.controller.snapshot().hostTotalBytes());
+}
+
+test "Gemma4 CUDA host PLE shared receipts cannot be rehomed as local allocator credit" {
+    const Mock = struct {
+        fn reserve(_: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            return 17;
+        }
+        fn retain(_: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {}
+        fn release(_: *anyopaque, _: usize) void {}
+    };
+    var marker: u8 = 0;
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    try controller.configureResourceBudget(.{ .context = &marker, .try_reserve = Mock.reserve, .retain = Mock.retain, .release = Mock.release });
+    var foreign = memory.AdmissionController{};
+    defer foreign.deinit();
+    const session = sessions.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 1, .check_live_memory = false } };
+    var source = AdmittedAllocator{ .backing = std.testing.allocator, .session = session };
+    defer source.deinit();
+    const bytes = try source.allocator().alloc(u8, 16);
+    defer source.allocator().free(bytes);
+    const node = source.reservations.?;
+    try std.testing.expect(node.next == null);
+    var empty_parent = node.lease.?;
+    node.lease = try empty_parent.split(empty_parent.amounts);
+    defer empty_parent.release();
+    const shared = node.lease.?;
+    // Every ordinary local-transfer precondition still holds. Only the shared
+    // external receipt must prevent rehoming these real allocated bytes.
+    try std.testing.expect(shared.external_lease == null and shared.hasExternalReceipt());
+    try std.testing.expect(shared.live_reserved_bytes == 0 and shared.live_settled_bytes == 0 and shared.retain_backend_class == .cpu);
+    try std.testing.expectEqual(node.bytes, shared.amounts.host_scratch_bytes);
+    try std.testing.expectEqual(node.bytes, shared.amounts.hostTotalBytes());
+    try std.testing.expectEqual(@as(usize, 0), shared.amounts.backendTotalBytes());
+    var target = AdmittedAllocator{ .backing = std.testing.allocator };
+    defer target.deinit();
+    const before = controller.snapshot();
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, target.absorbLocal(&source, &foreign, &controller));
+    try std.testing.expectEqual(before, controller.snapshot());
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, foreign.snapshot());
+    try std.testing.expectEqual(@as(usize, 0), target.live_bytes);
 }

@@ -2071,7 +2071,20 @@ pub fn renderAttentionKernel(allocator: std.mem.Allocator, plan: AttentionRender
     return out.toOwnedSlice(allocator);
 }
 
-const flash_prefill_f16_sm89_template = @embedFile("templates/cuda_gqa_flash_prefill_f16_sm89.cuh");
+/// Runtime/JIT payloads already publish both shared scalar phase guards.
+/// The canonical header keeps its fallback include for standalone compilation;
+/// embedding it must not introduce a relative include into the assembled unit.
+fn assembledAttentionTemplate(comptime source: []const u8) []const u8 {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        const fallback = "#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)\n#include \"cuda_attention_scalar_phases.cuh\"\n#endif\n";
+        const begin = std.mem.indexOf(u8, source, fallback) orelse @compileError("missing canonical scalar helper fallback");
+        if (std.mem.count(u8, source, fallback) != 1) @compileError("repeated scalar helper fallback");
+        return source[0..begin] ++ source[begin + fallback.len ..];
+    }
+}
+
+const flash_prefill_f16_sm89_template = assembledAttentionTemplate(@embedFile("templates/cuda_gqa_flash_prefill_f16_sm89.cuh"));
 
 pub fn flashPrefillPlanId(plan: FlashPrefillRenderPlan, allocator: std.mem.Allocator) ![]u8 {
     try plan.validate();
@@ -2199,7 +2212,7 @@ pub fn renderFlashPrefillKernel(
     return out.toOwnedSlice(allocator);
 }
 
-const splitk_online_decode_sm89_template = @embedFile("templates/cuda_gqa_decode_splitk_online_sm89.cuh");
+const splitk_online_decode_sm89_template = assembledAttentionTemplate(@embedFile("templates/cuda_gqa_decode_splitk_online_sm89.cuh"));
 
 /// Store standalone AOT instantiations as includes of the same native owner
 /// embedded by the JIT. Do not serialize a complete template per geometry.
@@ -2806,8 +2819,8 @@ fn renderAttentionBody(
     , .{ plan.kernel_id, plan.lowering.head_dim, plan.launch.threads_per_block, plan.lowering.query_heads_per_kv_head, plan.lowering.kv_splits, generated_attention_workspace_max_query_heads, plan.reduction_kernel_id, plan.lowering.head_dim, plan.reduction_launch.threads_per_block, plan.lowering.kv_splits, generated_attention_workspace_max_query_heads });
 }
 
-const attention_split_source = @embedFile("templates/cuda_gqa_split_decode_f32.cuh");
-const attention_score_prework_source = @embedFile("templates/cuda_gqa_score_prework_f32.cuh");
+const attention_split_source = assembledAttentionTemplate(@embedFile("templates/cuda_gqa_split_decode_f32.cuh"));
+const attention_score_prework_source = assembledAttentionTemplate(@embedFile("templates/cuda_gqa_score_prework_f32.cuh"));
 pub fn attentionSplitCommonSource() []const u8 {
     return attention_split_source;
 }

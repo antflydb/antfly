@@ -74,6 +74,7 @@ from .backup_already_exists_conflict import BackupAlreadyExistsConflict
 from .backup_already_exists_conflict_code import BackupAlreadyExistsConflictCode
 from .backup_info import BackupInfo
 from .backup_info_format import BackupInfoFormat
+from .backup_info_table_selectors_item import BackupInfoTableSelectorsItem
 from .backup_list_response import BackupListResponse
 from .backup_namespace_table_response_201 import BackupNamespaceTableResponse201
 from .backup_outcome_ambiguous_conflict import BackupOutcomeAmbiguousConflict
@@ -201,6 +202,7 @@ from .cohere_embedder_config_provider import CohereEmbedderConfigProvider
 from .cohere_embedder_config_truncate import CohereEmbedderConfigTruncate
 from .cohere_reranker_config import CohereRerankerConfig
 from .cohere_reranker_config_provider import CohereRerankerConfigProvider
+from .commit_requires import CommitRequires
 from .committed_mutation_outcome import CommittedMutationOutcome
 from .committed_mutation_outcome_status import CommittedMutationOutcomeStatus
 from .composed_query_source import ComposedQuerySource
@@ -721,6 +723,9 @@ from .geo_shape_query import GeoShapeQuery
 from .get_current_user_response_200 import GetCurrentUserResponse200
 from .get_current_user_response_200_metadata_type_0 import GetCurrentUserResponse200MetadataType0
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
+from .get_document_artifact_manifest_response_413 import GetDocumentArtifactManifestResponse413
+from .get_document_artifact_manifest_response_413_code import GetDocumentArtifactManifestResponse413Code
+from .get_document_artifact_manifest_response_413_limits import GetDocumentArtifactManifestResponse413Limits
 from .get_namespace_table_privacy_response_403 import GetNamespaceTablePrivacyResponse403
 from .get_namespace_table_privacy_response_412 import GetNamespaceTablePrivacyResponse412
 from .get_namespace_table_privacy_response_422 import GetNamespaceTablePrivacyResponse422
@@ -987,6 +992,10 @@ from .image_url_content_part import ImageURLContentPart
 from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
+from .index_alias import IndexAlias
+from .index_alias_request import IndexAliasRequest
+from .index_alias_request_require import IndexAliasRequestRequire
+from .index_alias_require import IndexAliasRequire
 from .index_execution_config import IndexExecutionConfig
 from .index_maintenance_owner_proof import IndexMaintenanceOwnerProof
 from .index_maintenance_request import IndexMaintenanceRequest
@@ -2771,6 +2780,7 @@ __all__ = (
     "BackupAlreadyExistsConflictCode",
     "BackupInfo",
     "BackupInfoFormat",
+    "BackupInfoTableSelectorsItem",
     "BackupListResponse",
     "BackupNamespaceTableResponse201",
     "BackupOutcomeAmbiguousConflict",
@@ -2898,6 +2908,7 @@ __all__ = (
     "CohereEmbedderConfigTruncate",
     "CohereRerankerConfig",
     "CohereRerankerConfigProvider",
+    "CommitRequires",
     "CommittedMutationOutcome",
     "CommittedMutationOutcomeStatus",
     "ComposedQuerySource",
@@ -3410,6 +3421,9 @@ __all__ = (
     "GetCurrentUserResponse200",
     "GetCurrentUserResponse200MetadataType0",
     "GetDocumentArtifactManifestDetail",
+    "GetDocumentArtifactManifestResponse413",
+    "GetDocumentArtifactManifestResponse413Code",
+    "GetDocumentArtifactManifestResponse413Limits",
     "GetNamespaceTablePrivacyResponse403",
     "GetNamespaceTablePrivacyResponse412",
     "GetNamespaceTablePrivacyResponse422",
@@ -3676,6 +3690,10 @@ __all__ = (
     "ImageURLContentPartType",
     "IncompleteDetails",
     "IncompleteDetailsReason",
+    "IndexAlias",
+    "IndexAliasRequest",
+    "IndexAliasRequestRequire",
+    "IndexAliasRequire",
     "IndexExecutionConfig",
     "IndexMaintenanceOwnerProof",
     "IndexMaintenanceRequest",

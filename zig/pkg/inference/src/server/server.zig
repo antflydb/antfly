@@ -1433,7 +1433,7 @@ pub const CooperativeExecutionConfig = struct {
 
     pub fn enabledForRequest(self: @This(), capabilities: @import("../backends/session.zig").ExecutionCapabilities, graph: bool, draft: bool, cache: bool, media: bool) bool {
         return self.mode == .on and capabilities.cooperative_steps and capabilities.max_active_requests >= self.max_active_requests and
-            !graph and !draft and !cache and !media and
+            !graph and !draft and (!cache or capabilities.cooperative_prompt_cache) and !media and
             !platform.env.getenvBool("ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING") and
             !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET") and
             !cudaDecodeGraphReplayRequested(platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"));
@@ -3273,6 +3273,15 @@ fn rejectDisallowedModel(
     ctx: *httpx.Context,
     model_path: []const u8,
 ) !?httpx.Response {
+    return rejectDisallowedModelWithAssessment(self, ctx, model_path, null);
+}
+
+fn rejectDisallowedModelWithAssessment(
+    self: *Node,
+    ctx: *httpx.Context,
+    model_path: []const u8,
+    completed_assessment: ?*bool,
+) !?httpx.Response {
     const summary = self.compatibilitySummaryForDir(ctx.allocator, model_path) catch {
         if (self.config.allow_unknown_models) return null;
         return try ctx.status(400).json(.{
@@ -3280,6 +3289,7 @@ fn rejectDisallowedModel(
             .message = "model compatibility could not be determined; restart with --allow-unknown-models to opt in",
         });
     };
+    if (completed_assessment) |complete| complete.* = true;
     switch (summary.level) {
         .compatible => return null,
         .unknown => {
@@ -3344,6 +3354,12 @@ fn modelArtifactsChangingResponse(ctx: *httpx.Context) !httpx.Response {
 }
 
 fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (@import("../registry/pull_diagnostics.zig").glinerSpanConfigMessage(err)) |message| return ctx.status(400).json(.{
+        .@"error" = "INVALID_MODEL",
+        .reason = @errorName(err),
+        .message = message,
+        .retryable = false,
+    });
     if (err == error.ResourceLimitExceeded) return modelResourceLimitResponse(ctx);
     if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
     if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
@@ -4023,6 +4039,26 @@ fn classifyExtractionResolutionFailure(err: anyerror) ExtractionResolutionFailur
         error.OutOfMemory => .resource_exhausted,
         else => .internal,
     };
+}
+
+// Compatibility summaries are specific to the candidate backend set, as well
+// as the inspected artifact generation. A policy change cannot reuse an
+// assessment that succeeded only on a different backend.
+fn compatibilitySignatureForBackends(artifact: CompatibilitySignature, candidates: []const backends_mod.BackendType) CompatibilitySignature {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-compatibility-backends-v1");
+    hash.update(&artifact);
+    for (candidates) |backend| {
+        const tag: u32 = @backingInt(backend);
+        var encoded: [4]u8 = undefined;
+        std.mem.writeInt(u32, &encoded, tag, .little);
+        hash.update(&encoded);
+    }
+    return hash.finalResult();
+}
+
+fn cudaCompatibilityAlreadyAssessed(candidates: []const backends_mod.BackendType, requested: native_backend_choice.Choice, completed_assessment: bool) bool {
+    return completed_assessment and requested == .cuda and candidates.len == 1 and candidates[0] == .cuda;
 }
 
 fn compatibilityBackendsForSessionManager(
@@ -4926,10 +4962,11 @@ pub const Node = struct {
                     entry.release();
                     return err;
                 };
+                const bound_cached_signature = compatibilitySignatureForBackends(cached_signature, compatibility_backends);
                 const cache_hit = std.mem.eql(
                     u8,
                     entry.signature[0..],
-                    cached_signature[0..],
+                    bound_cached_signature[0..],
                 );
                 const cached_summary = entry.summary;
                 entry.release();
@@ -4938,7 +4975,7 @@ pub const Node = struct {
 
             var dependencies = try collectCompatibilityOnnxDependencies(allocator, &man);
             defer dependencies.deinit(allocator);
-            const artifact_signature = try computeCompatibilitySignatureWithDependencies(
+            const raw_artifact_signature = try computeCompatibilitySignatureWithDependencies(
                 allocator,
                 io,
                 model_path,
@@ -4946,6 +4983,7 @@ pub const Node = struct {
                 dependencies.paths.items,
                 dependencies.valid,
             );
+            const artifact_signature = compatibilitySignatureForBackends(raw_artifact_signature, compatibility_backends);
 
             const summary = try model_manager_mod.compatibilitySummaryForBackends(
                 allocator,
@@ -4964,7 +5002,7 @@ pub const Node = struct {
                 &verification_manifest,
             );
             defer verification_dependencies.deinit(allocator);
-            const verification_signature = try computeCompatibilitySignatureWithDependencies(
+            const raw_verification_signature = try computeCompatibilitySignatureWithDependencies(
                 allocator,
                 io,
                 model_path,
@@ -4972,6 +5010,7 @@ pub const Node = struct {
                 verification_dependencies.paths.items,
                 verification_dependencies.valid,
             );
+            const verification_signature = compatibilitySignatureForBackends(raw_verification_signature, compatibility_backends);
             if (!std.mem.eql(
                 u8,
                 artifact_signature[0..],
@@ -5492,6 +5531,17 @@ pub const Node = struct {
         texts: []const []const u8,
         supplied_control: InferenceExecutionControl,
     ) ![]DirectSparseEmbedding {
+        return self.embedSparseTextsDirectWithControlAndRevision(allocator, model_name, texts, supplied_control, null);
+    }
+
+    pub fn embedSparseTextsDirectWithControlAndRevision(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        texts: []const []const u8,
+        supplied_control: InferenceExecutionControl,
+        expected_revision: ?[32]u8,
+    ) ![]DirectSparseEmbedding {
         var control = self.bindExecutionControl(null, supplied_control);
         try control.check();
         if (texts.len == 0) return try allocator.alloc(DirectSparseEmbedding, 0);
@@ -5520,9 +5570,11 @@ pub const Node = struct {
             control: InferenceExecutionControl,
             vectors: ?[]DirectSparseEmbedding = null,
             node: *Node,
+            expected_revision: ?[32]u8,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                try requireLoadedEmbeddingRevision(attempt.expected_revision, model.resolution_revision);
                 if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                 const input_tokens = try maxTokenizerTextTokens(
                     attempt.allocator,
@@ -5561,6 +5613,7 @@ pub const Node = struct {
             .executor_contract = executor_contract,
             .control = control,
             .node = self,
+            .expected_revision = expected_revision,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{ .execution_control = control }, &attempt, Attempt.run);
         return attempt.vectors.?;
@@ -13416,7 +13469,9 @@ pub const Node = struct {
         // identity supplies its own measured ceiling. FP32 and Q8 evidence
         // independently cover the 1B's 1024-token budget.
         if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
-            options.classification_batch_items = gliner_decide_qualification.cuda_batch_items;
+            const policy = gliner_decide_qualification.executionBatchPolicy(qualified_identity.?, .cuda) orelse return error.UnsupportedGlinerDecisionArtifact;
+            options.classification_batch_items = policy.batch_items;
+            options.classification_batch_tokens = policy.padded_batch_tokens;
             options.max_sequences_per_item = 1;
         } else if (backend == .metal and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
             const policy = gliner_decide_qualification.metalExecutionPolicy(qualified_identity.?) orelse return error.UnsupportedGlinerDecisionArtifact;
@@ -16938,11 +16993,14 @@ pub const Node = struct {
         execution_control = model_path_selection.bind(execution_control);
         defer ctx.allocator.free(model_path);
         const manifest_started: ?i96 = if (admission_started != null) std.Io.Clock.awake.now(ctx.io).nanoseconds else null;
-        // The default route can inspect its resident generation without parsing
-        // GGUF tokenizer arrays on every request. Explicit backend requests keep
-        // artifact preflight until their selected publication is acquired below.
+        // Reuse immutable warm metadata without parsing GGUF tokenizer arrays
+        // per request. Explicit eager CUDA lookup uses execution's backend and
+        // load-policy keys; cold and compiled requests retain artifact preflight.
         const cached_manifest = if (body.backend == null)
             self.model_manager.copyCachedGenerationManifestWithControl(ctx.allocator, model_path, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
+                return modelLoadFailureResponse(ctx, err)
+        else if (body.backend == .cuda and body.mode == null and body.compiled_target == null)
+            self.model_manager.copyCachedGenerationManifestForBackendWithControl(ctx.allocator, model_path, .cuda, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
                 return modelLoadFailureResponse(ctx, err)
         else
             null;
@@ -17003,6 +17061,9 @@ pub const Node = struct {
             return remoteContentErrorResponse(ctx, err);
         };
         defer owned_messages.deinit();
+        if (admission_started) |started| {
+            std.debug.print("native_request_timing_ms: after_parse_messages={d}\n", .{@divTrunc(std.Io.Clock.awake.now(ctx.io).nanoseconds - started, std.time.ns_per_ms)});
+        }
 
         if (owned_messages.decoded_images.len > 0) {
             var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
@@ -17038,7 +17099,8 @@ pub const Node = struct {
             });
         };
 
-        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
+        var completed_compatibility_assessment = false;
+        if (try rejectDisallowedModelWithAssessment(self, ctx, model_path, &completed_compatibility_assessment)) |response| return response;
 
         // Tool prompting can mutate the message list; media ownership remains
         // with OwnedGenerateMessages while this list owns message text.
@@ -17287,7 +17349,7 @@ pub const Node = struct {
             .cache_dtype = body.cache_dtype orelse (if (native_transfer != null) "f16" else null),
             .cache_compaction_ratio = body.cache_compaction_ratio,
             .kv_cache_mode = if (selected_kv) .select_v1 else .exact_hybrid,
-            .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null and !want_stream,
+            .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null,
             .prompt_cache_key = prompt_cache_key,
         };
         const backend_selection = parseGenerateBackendSelection(body.backend, body.mode, body.compiled_target) catch |err| {
@@ -17309,13 +17371,24 @@ pub const Node = struct {
                 .message = "prompt caching requires eager generation; omit mode or set mode=eager",
             });
         };
-        if (try rejectExplicitBackendIncompatibility(
-            ctx,
-            model_path,
-            backend_selection.native_choice,
-            self.config.allow_unknown_models,
-        )) |response|
-            return response;
+        // rejectDisallowedModel already assessed the current artifacts under
+        // the node's default candidate set. An exact CUDA-only assessment also
+        // covers explicit CUDA placement; aggregate CPU/GPU assessments cannot
+        // establish that and retain the independent explicit inspection.
+        var assessed_backend_scratch: [1]backends_mod.BackendType = undefined;
+        const assessed_backends: []const backends_mod.BackendType = compatibilityBackendsForSessionManager(&self.session_manager, &assessed_backend_scratch) catch &.{};
+        if (!cudaCompatibilityAlreadyAssessed(assessed_backends, backend_selection.native_choice, completed_compatibility_assessment)) {
+            if (try rejectExplicitBackendIncompatibility(
+                ctx,
+                model_path,
+                backend_selection.native_choice,
+                self.config.allow_unknown_models,
+            )) |response| return response;
+        }
+
+        if (admission_started) |started| {
+            std.debug.print("native_request_timing_ms: after_compatibility={d}\n", .{@divTrunc(std.Io.Clock.awake.now(ctx.io).nanoseconds - started, std.time.ns_per_ms)});
+        }
 
         if (body.response_format) |rf| {
             if (std.mem.eql(u8, rf.type, "json_object")) {
@@ -17424,6 +17497,10 @@ pub const Node = struct {
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
+        if (admission_started) |started| {
+            std.debug.print("native_request_timing_ms: after_acquire_model={d}\n", .{@divTrunc(std.Io.Clock.awake.now(ctx.io).nanoseconds - started, std.time.ns_per_ms)});
+        }
+
         // A cached metadata copy does not pin the execution generation. A model
         // can retire between admission and acquisition, so enforce the actual
         // publication's contract before context processing or accelerator work.
@@ -17643,25 +17720,32 @@ pub const Node = struct {
             gpt_config,
             self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
         );
-        const cooperative_cuda = native_transfer == null and !selected_kv and self.config.cooperative_execution.enabledForRequest(
-            model.session.executionCapabilities(),
-            backend_selection.graph_mode_requested or graphModeEnabled() or effective_compiled_partition_backend != null,
-            effective_draft_model_name != null or auto_draft_sibling != null or config.speculation_requested,
-            config.prompt_cache_enabled,
-            generateMessagesHaveMedia(effective_messages),
-        );
+        const cooperative_cuda = native_transfer == null and !selected_kv and
+            (!config.prompt_cache_enabled or (kv_dtype == .f16 and config.cache_compaction_ratio == null)) and
+            self.config.cooperative_execution.enabledForRequest(
+                model.session.executionCapabilities(),
+                backend_selection.graph_mode_requested or graphModeEnabled() or effective_compiled_partition_backend != null,
+                effective_draft_model_name != null or auto_draft_sibling != null or config.speculation_requested,
+                config.prompt_cache_enabled,
+                generateMessagesHaveMedia(effective_messages),
+            );
         if (cooperative_cuda and self.config.generation_batching.mode == .on and self.config.generation_batching.max_step_items > model.session.executionCapabilities().max_batch_rows)
             return ctx.status(400).json(.{ .@"error" = "UNQUALIFIED_COOPERATIVE_BATCH", .message = "Requested row count exceeds the backend cooperative decode-batching capability" });
         const native_isolated = native_transfer == null and canIsolateGeneration(backend_kind, effective_compiled_partition_backend != null, effective_draft_model_name != null or auto_draft_sibling != null, config.prompt_cache_enabled, want_stream);
         // Queued callers own neither scheduler work nor device KV/scratch.
         // Exclusive requests fence the shared backend's cache/graph lifetime.
-        const generation_slot = model.generation_admission.acquire(
+        const queued_cached_tokens = if (config.prompt_cache_enabled and prompt_estimate != null and config.prompt_cache_key != null and !generateMessagesHaveMedia(effective_messages) and prompt_tokens <= prompt_estimate.?.encoded.ids.len)
+            model.prompt_prefix_cache.peekLongestPrefixForPool(config.prompt_cache_key.?, prompt_estimate.?.encoded.ids[0..prompt_tokens], prompt_tokens -| 16, generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced()))
+        else
+            0;
+        const generation_slot = model.generation_admission.acquireWithWork(
             execution_control,
             !cooperative_cuda and !native_isolated,
             runtime.scheduler.generation_admission.Limits.forRequests(
                 self.config.max_concurrent_requests,
                 if (cooperative_cuda) self.config.cooperative_execution.max_active_requests else null,
             ),
+            .{ .prefill_tokens = prompt_tokens - queued_cached_tokens, .decode_tokens = @intCast(configured_max_tokens) },
         ) catch |err| {
             if (err == error.GenerationQueueFull) return modelResourceBusyResponse(ctx);
             return inferenceFailureResponse(ctx, err);
@@ -18427,6 +18511,10 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         }
         var decode_state = generation.NativeDecodeState.initPaged(execution_allocator, active_kv_manager, pool_id, model.shared_moe_cache);
+        // Prefix-cache metadata and every attached sequence share one KV lock.
+        // GPU writes, cache lookup/publication and cleanup additionally own the
+        // model execution scope: lock order is model execution, then cache KV.
+        if (prompt_cache) |cache| decode_state.kv_lock = &cache.mutex;
         if (cooperative_cuda) {
             decode_state.execution_backend = cb;
             decode_state.execution_control = execution_control;
@@ -27082,6 +27170,68 @@ pub const Node = struct {
         return try instances.toOwnedSlice(allocator);
     }
 
+    /// Internal worker scheduling protocol, versioned independently of public
+    /// inference schemas. It pins only an already loaded generation, tokenizes
+    /// on the CPU and reads cache metadata; it never loads weights or creates KV.
+    pub fn estimateGeneratePlacement(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const control = httpInferenceExecutionControl(self, ctx);
+        try control.check();
+        const bytes = (try ctx.body()) orelse return ctx.status(400).json(.{ .@"error" = "missing_body" });
+        if (bytes.len > 2 * 1024 * 1024) return ctx.status(413).json(.{ .@"error" = "PLACEMENT_REQUEST_TOO_LARGE" });
+        var parsed = std.json.parseFromSlice(api.GenerateRequest, ctx.allocator, bytes, .{ .ignore_unknown_fields = true }) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST" });
+        defer parsed.deinit();
+        const body = parsed.value;
+        if (body.backend) |backend| if (backend != .cuda)
+            return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" });
+        // Keep unsupported transformations on ordinary routing. A partial
+        // estimate must never claim to describe the eventual rendered prompt.
+        if (body.messages.len == 0 or generateRequestHasNonTextContentParts(body) or body.tools != null or body.tool_choice != null or body.context_management != null or body.response_format != null or body.grammar != null or body.draft_model != null or body.kv_cache != null)
+            return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" });
+        if (try self.acquireSlotUnits(ctx, 1)) |response| return response;
+        defer self.releaseSlotUnits(1);
+        const selected = self.resolveRequestModelSelection(ctx.allocator, ctx.io, if (body.model.len > 0) body.model else null, "generators") catch |err| return requestModelResolutionError(ctx, err);
+        const path = selected.path;
+        defer ctx.allocator.free(path);
+        if (try rejectDisallowedModel(self, ctx, path)) |response| return response;
+        var handle = (self.model_manager.acquireCachedObservationFromDirWithControl(path, self.bindModelSelection(selected, control)) catch |err|
+            return modelLoadFailureResponse(ctx, err)) orelse return ctx.status(409).json(.{ .@"error" = "MODEL_NOT_LOADED" });
+        defer handle.release();
+        const model = handle.get();
+        if (!model.session.executionCapabilities().cooperative_steps) return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" });
+        const cfg = session_factory.getGptConfig(model.session) orelse return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" });
+        const numeric = parseGenerateNumericOptions(body.max_tokens, null) catch |err| return contextRequestFailure(ctx, err);
+        var owned = self.parseGenerateMessages(ctx.allocator, body) catch |err| return contextRequestFailure(ctx, err);
+        defer owned.deinit();
+        var estimate: ?NativePromptEstimate = null;
+        defer if (estimate) |*value| value.deinit();
+        const tokens = try self.estimateNativePromptTokens(ctx.allocator, path, model, cfg, owned.messages, numeric.max_tokens, 0, if (body.chat_template_kwargs) |kwargs| kwargs.enable_thinking else null, false, &estimate);
+        try control.check();
+        const dtype = if (body.cache_dtype) |name| runtime.kv.pool.parseKvDType(name) orelse return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" }) else session_factory.recommendedKvDTypeForSession(model.session, .cuda);
+        const cached = if (self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and body.prompt_cache_key != null and body.prompt_cache_key.?.len > 0)
+            model.prompt_prefix_cache.peekLongestPrefixForPool(body.prompt_cache_key.?, estimate.?.encoded.ids[0..tokens], tokens -| 16, generation.kvPoolConfig(.cuda, dtype, cfg, generationKvSlidingTrimForced()))
+        else
+            0;
+        const admission = model.generation_admission.snapshot();
+        const scheduled = if (model.native_generate_coordinator) |coordinator| coordinator.snapshot() else runtime.scheduler.native_generate.Snapshot{ .waiting_requests = 0, .prefill_requests = 0, .decode_requests = 0, .active_units = 0 };
+        return ctx.json(.{
+            .version = @as(u32, 1),
+            .model = body.model,
+            .instance_id = try std.fmt.allocPrint(ctx.allocator, "{x:0>32}", .{model.runtime_id}),
+            .requested_decode_tokens = numeric.max_tokens,
+            .prompt_tokens = tokens,
+            .cached_tokens = cached,
+            .uncached_prompt_tokens = tokens - cached,
+            .active_requests = admission.active,
+            .queued_requests = admission.waiting,
+            .queued_prefill_tokens = admission.queued_work.prefill_tokens,
+            .queued_decode_tokens = admission.queued_work.decode_tokens,
+            .active_decode_tokens = admission.active_work.decode_tokens,
+            .pending_prefill_tokens = scheduled.prefill_tokens,
+            .decode_context_tokens = scheduled.decode_context_tokens,
+        });
+    }
+
     pub fn listModelInstances(self: *Node, ctx: *httpx.Context) !httpx.Response {
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
@@ -27190,6 +27340,7 @@ pub const Node = struct {
     }
 
     pub fn listModels(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("X-Antfly-Generation-Placement-Version", "1");
         const catalog_publication = @import("../registry/catalog_publication.zig");
         const catalog_generation = catalog_publication.read(ctx.allocator, ctx.io, self.config.models_dir) catch |err| return requestModelResolutionError(ctx, err);
         const json_body = self.listModelsJsonAlloc(ctx.allocator, ctx.io) catch |err| {
@@ -27532,7 +27683,9 @@ pub const Node = struct {
                 try jsonEncodeString(&body, a, entry.path);
                 try body.appendSlice(a, ":{\"compatibility\":\"incompatible\",\"error\":{\"code\":");
                 try jsonEncodeString(&body, a, @errorName(rejected.err));
-                try body.appendSlice(a, ",\"message\":\"the model directory could not be read; repair or re-pull it\"}}");
+                try body.appendSlice(a, ",\"message\":");
+                try jsonEncodeString(&body, a, @import("../registry/pull_diagnostics.zig").glinerSpanConfigMessage(rejected.err) orelse "the model directory could not be read; repair or re-pull it");
+                try body.appendSlice(a, "}}");
                 model_count += 1;
             }
 
@@ -27854,6 +28007,8 @@ pub const Node = struct {
         // The AI prefix retains the host's inference authentication and permissions.
         try prefixed.get("/_antfarm/readers", httpx.Handler.bind(self, antfarmReaders));
         try prefixed.post("/_antfarm/readers/apple", httpx.Handler.bind(self, antfarmAppleOcr));
+        // Private worker scheduling metadata, under inference authentication.
+        try prefixed.post("/_placement/generate", httpx.Handler.bind(self, estimateGeneratePlacement));
         // Keep the retired endpoint deterministic when inference routes share
         // the standalone public server. Without an explicit tombstone, httpx
         // reports 405 because nearby generated routes match the path shape,
@@ -28956,6 +29111,8 @@ fn extractionV2FailureResponse(ctx: *httpx.Context, err: anyerror, failure: extr
 }
 
 fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (@import("../registry/pull_diagnostics.zig").glinerSpanConfigMessage(err) != null)
+        return modelLoadFailureResponse(ctx, err);
     if (err == error.UnsupportedConstrainedProbabilities) return generationErrorResponse(ctx, err);
     if (isInferenceExecutorContractError(err))
         return inferenceExecutorContractFailureResponse(ctx, err);
@@ -32269,12 +32426,43 @@ fn generateExecutorContractError(err: anyerror) GenerateExecutorContractFailure 
 }
 
 fn inferenceExecutorContractFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    // Resolving capabilities first reads the manifest. Preserve load/config
+    // failures instead of treating every failure as a request size violation.
+    if (!isInferenceExecutorContractError(err) and err != error.UnsupportedGlinerBoundaryRuntime)
+        return modelLoadFailureResponse(ctx, err);
     const failure = generateExecutorContractError(err);
     return ctx.status(failure.status).json(.{
         .@"error" = failure.batch.code,
         .message = failure.batch.message,
         .retryable = failure.batch.retryable,
     });
+}
+
+test "executor contract failures preserve configuration load and resource identities" {
+    const a = std.testing.allocator;
+    const Case = struct { err: anyerror, status: u16, code: []const u8 };
+    for ([_]Case{
+        .{ .err = error.MissingGlinerSpanEncoderConfig, .status = 400, .code = "INVALID_MODEL" },
+        .{ .err = error.InvalidGlinerSpanEncoderConfig, .status = 400, .code = "INVALID_MODEL" },
+        .{ .err = error.InferenceBatchTooLarge, .status = 413, .code = "BATCH_TOO_LARGE" },
+        .{ .err = error.InferenceInputTokensExceeded, .status = 413, .code = "INPUT_TOKEN_LIMIT_EXCEEDED" },
+        .{ .err = error.InvalidInferenceCapabilities, .status = 500, .code = "INVALID_MODEL_CAPABILITIES" },
+        .{ .err = error.UnsupportedGlinerBoundaryRuntime, .status = 400, .code = "MODEL_NOT_QUALIFIED" },
+        .{ .err = error.ResourceLimitExceeded, .status = 400, .code = "MODEL_RESOURCE_LIMIT" },
+        .{ .err = error.ResourceTemporarilyUnavailable, .status = 503, .code = "MODEL_RESOURCE_BUSY" },
+        .{ .err = error.Timeout, .status = 504, .code = "INFERENCE_TIMEOUT" },
+    }) |case| {
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try inferenceExecutorContractFailureResponse(&ctx, case.err);
+        defer response.deinit();
+        try std.testing.expectEqual(case.status, response.status.code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.code, parsed.value.object.get("error").?.string);
+    }
 }
 
 fn isInferenceExecutorContractError(err: anyerror) bool {
@@ -32847,6 +33035,7 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
             std.mem.eql(u8, path, "/generate/batch") or
             std.mem.eql(u8, path, "/models/instances") or
             std.mem.eql(u8, path, "/_antfarm/readers/apple") or
+            std.mem.eql(u8, path, "/_placement/generate") or
             std.mem.eql(u8, path, "/predict") or
             std.mem.eql(u8, path, "/read") or
             std.mem.eql(u8, path, "/read/execute") or
@@ -37935,15 +38124,48 @@ test "model listing reports an unreadable model per entry and keeps the others" 
     var node = try Node.init(allocator, .{ .models_dir = models_path });
     defer node.deinit();
 
-    const body = try node.listModelsJsonAlloc(allocator, io);
-    defer allocator.free(body);
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
-    defer parsed.deinit();
-    const root = parsed.value.object;
-    try std.testing.expect(root.get("generators").?.object.get("acme/demo") != null);
-    const broken = root.get("extractors").?.object.get("acme/broken-gliner").?.object;
-    try std.testing.expectEqualStrings("incompatible", broken.get("compatibility").?.string);
-    try std.testing.expectEqualStrings("MissingGlinerSpanEncoderConfig", broken.get("error").?.object.get("code").?.string);
+    // Exercise discovery and both HTTP versions with missing and malformed
+    // sidecars. A fresh inventory read must preserve each specific diagnosis.
+    for ([_]?[]const u8{ null, "{not valid JSON", "{}" }) |encoder_config| {
+        if (encoder_config) |bytes| {
+            try tmp.dir.createDirPath(io, "extractors/acme/broken-gliner/encoder_config");
+            try tmp.dir.writeFile(io, .{ .sub_path = "extractors/acme/broken-gliner/encoder_config/config.json", .data = bytes });
+        }
+        const body = try node.listModelsJsonAlloc(allocator, io);
+        defer allocator.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try std.testing.expect(root.get("generators").?.object.get("acme/demo") != null);
+        const broken = root.get("extractors").?.object.get("acme/broken-gliner").?.object;
+        try std.testing.expectEqualStrings("incompatible", broken.get("compatibility").?.string);
+        try std.testing.expectEqualStrings(if (encoder_config == null) "MissingGlinerSpanEncoderConfig" else "InvalidGlinerSpanEncoderConfig", broken.get("error").?.object.get("code").?.string);
+
+        // Both the legacy request from #1678 and explicit v2 must preserve the
+        // discovery diagnosis rather than inventing a request resource limit.
+        const diagnostic = broken.get("error").?.object;
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.get("message").?.string, "encoder_config/config.json") != null);
+        for ([_][]const u8{
+            "{\"model\":\"acme/broken-gliner\",\"schema\":{\"entities\":[\"email\"]},\"inputs\":[{\"content\":\"Contact custodian0@example.invalid.\"}]}",
+            "{\"schema_version\":2,\"model\":\"acme/broken-gliner\",\"schema\":{\"entities\":[\"email\"]},\"inputs\":[{\"content\":\"Contact custodian0@example.invalid.\"}]}",
+        }) |json| {
+            var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
+            defer request.deinit();
+            request.body = json;
+            var ctx = httpx.Context.init(allocator, io, &request);
+            defer ctx.deinit();
+            var response = try node.extractJSON(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 400), response.status.code);
+            var payload = try std.json.parseFromSlice(std.json.Value, allocator, response.body.?, .{});
+            defer payload.deinit();
+            const failure = payload.value.object;
+            try std.testing.expectEqualStrings("INVALID_MODEL", failure.get("error").?.string);
+            try std.testing.expectEqualStrings(diagnostic.get("code").?.string, failure.get("reason").?.string);
+            try std.testing.expectEqualStrings(diagnostic.get("message").?.string, failure.get("message").?.string);
+            try std.testing.expect(!failure.get("retryable").?.bool);
+        }
+    }
 
     // Readiness counts the usable model instead of collapsing to zero.
     try node.refreshReadinessInventory(io);
@@ -38231,6 +38453,10 @@ test "generation cooperative execution is independent of row batching and fences
     try std.testing.expect(!enabled.enabledForRequest(safe, true, false, false, false));
     try std.testing.expect(!enabled.enabledForRequest(safe, false, true, false, false));
     try std.testing.expect(!enabled.enabledForRequest(safe, false, false, true, false));
+    var cached = safe;
+    cached.cooperative_prompt_cache = true;
+    try std.testing.expect(enabled.enabledForRequest(cached, false, false, true, false));
+    try std.testing.expect(!enabled.enabledForRequest(cached, true, false, true, false));
     try std.testing.expect(!enabled.enabledForRequest(safe, false, false, false, true));
     try std.testing.expectError(error.InvalidCooperativeExecutionConfig, (CooperativeExecutionConfig{ .max_active_requests = 3 }).validate());
 }
@@ -54553,6 +54779,84 @@ test "Native generation cold recurrent state uses same additive primary actual F
     defer std.testing.allocator.free(managed);
 }
 
+test "generation placement empty request cannot activate model or reserve KV" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/_placement/generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.estimateGeneratePlacement(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expectEqual(InferenceHttpRouteAdmission.inference, inferenceHttpRouteAdmission("POST", "/_placement/generate"));
+}
+
+test "generation placement empty model resolves the default generator without loading" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/generators/default");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/generators/default/config.json",
+        .data = "{\"model_type\":\"llama\"}",
+    });
+    const tensor_header = "{\"probe\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    const tensor_header_size = comptime std.mem.alignForward(usize, tensor_header.len, 8);
+    var weights: [8 + tensor_header_size + 4]u8 = @splat(0);
+    std.mem.writeInt(u64, weights[0..8], tensor_header_size, .little);
+    @memset(weights[8..][0..tensor_header_size], ' ');
+    @memcpy(weights[8..][0..tensor_header.len], tensor_header);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/generators/default/model.safetensors",
+        .data = &weights,
+    });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true });
+    defer node.deinit();
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/_placement/generate");
+    defer request.deinit();
+    request.body =
+        \\{"model":"","messages":[{"role":"user","content":"hello"}]}
+    ;
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.estimateGeneratePlacement(&ctx);
+    defer response.deinit();
+    if (response.status.code != 409) std.debug.print("unexpected placement response: {s}\n", .{response.body orelse ""});
+    try std.testing.expectEqual(@as(u16, 409), response.status.code);
+    try std.testing.expectEqualStrings("{\"error\":\"MODEL_NOT_LOADED\"}", response.body.?);
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.in_flight_loads.count());
+}
+
+test "generation placement rejects grammar before model resolution" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+    for ([_][]const u8{
+        \\{"model":"missing","messages":[{"role":"user","content":"hello"}],"grammar":"json"}
+        ,
+        \\{"model":"missing","messages":[{"role":"user","content":"hello"}],"grammar":"root ::= \"ok\""}
+        ,
+        \\{"model":"missing","messages":[{"role":"user","content":"hello"}],"grammar":""}
+        ,
+    }) |body| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/_placement/generate");
+        defer request.deinit();
+        request.body = body;
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.estimateGeneratePlacement(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 422), response.status.code);
+        try std.testing.expectEqualStrings("{\"error\":\"PLACEMENT_UNAVAILABLE\"}", response.body.?);
+        try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+        try std.testing.expectEqual(@as(usize, 0), node.model_manager.in_flight_loads.count());
+    }
+}
+
 // No weights are loaded: these tests exercise the actual receipt, discovery,
 // request-resolution and activation boundaries used before execution.
 fn installModelSelectionFixture(dir: std.Io.Dir, leaf: []const u8, variant: []const u8, revision: ?[]const u8) !void {
@@ -56226,4 +56530,28 @@ test "reader direct generation entry point preserves pinned residency and cleans
         try std.testing.expectEqual(@as(usize, 0), slots_after.active);
         try std.testing.expectEqual(@as(usize, 1), model.active_handles);
     }
+}
+
+test "warm generator admission metadata reuses only exact CUDA compatibility assessments" {
+    try std.testing.expect(cudaCompatibilityAlreadyAssessed(&.{.cuda}, .cuda, true));
+    try std.testing.expect(!cudaCompatibilityAlreadyAssessed(&.{ .native, .cuda }, .cuda, true));
+    try std.testing.expect(!cudaCompatibilityAlreadyAssessed(&.{.native}, .cuda, true));
+    try std.testing.expect(!cudaCompatibilityAlreadyAssessed(&.{.metal}, .cuda, true));
+    try std.testing.expect(!cudaCompatibilityAlreadyAssessed(&.{}, .cuda, true));
+    try std.testing.expect(!cudaCompatibilityAlreadyAssessed(&.{.cuda}, .native, true));
+    try std.testing.expect(!cudaCompatibilityAlreadyAssessed(&.{.cuda}, .metal, true));
+    try std.testing.expect(!cudaCompatibilityAlreadyAssessed(&.{.cuda}, .auto, true));
+    try std.testing.expect(!cudaCompatibilityAlreadyAssessed(&.{.cuda}, .cuda, false));
+    const artifact: CompatibilitySignature = @splat(0x53);
+    const cuda = compatibilitySignatureForBackends(artifact, &.{.cuda});
+    const repeated = compatibilitySignatureForBackends(artifact, &.{.cuda});
+    try std.testing.expectEqualSlices(u8, &cuda, &repeated);
+    for ([_][]const backends_mod.BackendType{ &.{.native}, &.{.metal}, &.{ .native, .cuda }, &.{ .cuda, .native }, &.{} }) |candidates| {
+        const different = compatibilitySignatureForBackends(artifact, candidates);
+        try std.testing.expect(!std.mem.eql(u8, &cuda, &different));
+    }
+    var changed = artifact;
+    changed[0] ^= 1;
+    const changed_signature = compatibilitySignatureForBackends(changed, &.{.cuda});
+    try std.testing.expect(!std.mem.eql(u8, &cuda, &changed_signature));
 }

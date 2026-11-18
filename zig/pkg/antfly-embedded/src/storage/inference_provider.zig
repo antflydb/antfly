@@ -1017,9 +1017,11 @@ pub fn inferenceProviderEmbedSparseTextsWithContext(
     context: inference.managed_embedder.EmbeddingRequestContext,
 ) anyerror![]inference.managed_embedder.SparseEmbedding {
     try context.check();
-    return try invokeInferenceProvider([]inference.managed_embedder.SparseEmbedding, alloc, handle, .embed_sparse_texts, .{
+    return try invokeInferenceProvider([]inference.managed_embedder.SparseEmbedding, alloc, handle, .embed_sparse_texts_with_context, .{
         .model = model,
         .texts = texts,
+        .model_identity = context.model_identity,
+        .model_revision = context.model_revision,
     }, context.request);
 }
 

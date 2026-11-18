@@ -324,6 +324,7 @@ pub const SelectedRequest = struct {
     gpu_oracle: bool = false,
 
     pub const CommitContext = struct {
+        allow_metadata_scope: bool = false,
         execution: @import("../execution_control.zig").ExecutionAccess = .{},
         cleanup_owner: ?*const @import("cleanup_owner.zig").Owner = null,
         backend: *const ComputeBackend,
@@ -358,7 +359,9 @@ pub const SelectedRequest = struct {
         // the model's execution exclusion, even without shared KV metadata.
         if (!self.enabled and state.kv_lock == null) access.mutex = null;
         if (access.mutex != null and access.mutex == state.kv_lock) return error.InvalidDecodeStorageRequest;
-        var scope = try access.acquireScope();
+        const metadata_only = context.allow_metadata_scope and !self.enabled and
+            context.backend.execution_batch_drain != null;
+        var scope = try access.acquireScopeForPhase(if (metadata_only) .metadata else .step);
         defer if (scope) |*held| held.deinit();
         if (access.control) |control| try control.check();
         // A parked caller can rotate B while acquireScope waits. Read only the

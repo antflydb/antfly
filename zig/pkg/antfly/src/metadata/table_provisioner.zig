@@ -3901,3 +3901,26 @@ fn implementationTests() type {
 comptime {
     if (@import("builtin").is_test) _ = implementation_tests;
 }
+
+test "table provisioner preserves vector incarnations across JSON formatting" {
+    const alloc = std.testing.allocator;
+    for ([_]db_mod.types.IndexKind{ .dense_vector, .sparse_vector }) |kind| {
+        const original = db_mod.types.IndexConfig{ .name = "vectors", .kind = kind, .coverage_generation = 42, .config_json = "{ \"field\": \"embedding\", \"external\": true }" };
+        var desired = original;
+        desired.config_json = "{\"external\":true,\"field\":\"embedding\"}";
+        try std.testing.expect(try indexConfigsEqual(alloc, original, desired));
+        desired.config_json = "{\"field\":\"embedding\"}";
+        try std.testing.expect(!try indexConfigsEqual(alloc, original, desired));
+        desired.config_json = "{\"external\":true,\"field\":\"embedding\"}";
+        desired.config_json = "{\"external\":true,\"field\":\"embedding\",\"embedding_name\":\"vectors\"}";
+        try std.testing.expect(try indexConfigsEqual(alloc, original, desired));
+        desired.config_json = "{\"external\":true,\"field\":\"embedding\",\"embedding_name\":\"other\"}";
+        try std.testing.expect(!try indexConfigsEqual(alloc, original, desired));
+        desired.config_json = "{\"external\":true,\"field\":\"embedding\"}";
+        desired.coverage_generation += 1;
+        try std.testing.expect(!try indexConfigsEqual(alloc, original, desired));
+        desired.coverage_generation = original.coverage_generation;
+        desired.config_json = "{\"field\":\"embedding\",\"external\":false}";
+        try std.testing.expect(!try indexConfigsEqual(alloc, original, desired));
+    }
+}

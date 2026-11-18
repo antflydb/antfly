@@ -1940,6 +1940,10 @@ pub fn metadataApplyStoreProjection(
             };
             break :blk metadataProjectionJson(alloc, out_json, result);
         },
+        .poll_ha_outbox => blk: {
+            handle.store.pollHotStandbyOutbox() catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, true);
+        },
         .flush_ha_outbox => blk: {
             handle.store.flushHotStandbyOutbox() catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);
@@ -2266,6 +2270,24 @@ pub fn metadataApplyStoreProjection(
                 .sql_policy_begin_command => |input| {
                     const value = handle.store.sqlPolicyBeginCommandJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .has_index_aliases => {
+                    const value = handle.store.hasIndexAliases(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .has_index_alias_lifecycle_state => {
+                    const value = handle.store.hasIndexAliasLifecycleState(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .validate_table_index_mutation => |input| {
+                    const Validation = @import("../metadata/storage/raft_apply_contract.zig").TableIndexMutationValidation;
+                    const result: Validation = result: {
+                        handle.store.validateTableIndexMutation(group_id, input.before, input.after) catch |err| {
+                            break :result Validation.fromError(err) orelse break :blk storageOwnerStatusFromError(err);
+                        };
+                        break :result .valid;
+                    };
+                    break :blk metadataProjectionJson(alloc, out_json, result);
                 },
                 .require_policy_index_mutation_allowed => |input| {
                     handle.store.requirePolicyIndexMutationAllowed(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
@@ -3797,7 +3819,19 @@ pub fn storageOwnerOpen(
         const bootstrap = restore_bootstrap.?.value;
         bootstrap.validate() catch |err| return storageOwnerStatusFromError(err);
         const namespace = identity_namespace orelse return .invalid_argument;
-        if (!namespace.eql(bootstrap.scope.target_namespace) or !std.mem.eql(u8, bootstrap.table_name, table_name) or !std.mem.eql(u8, bootstrap.schema_json, request.schema_json.slice()) or !std.mem.eql(u8, bootstrap.indexes_json, request.indexes_json.slice())) return storageOwnerStatusFromError(error.RestoreStagingScopeChanged);
+        if (!namespace.eql(bootstrap.scope.target_namespace) or !std.mem.eql(u8, bootstrap.table_name, table_name) or !std.mem.eql(u8, bootstrap.schema_json, request.schema_json.slice()))
+            return storageOwnerStatusFromError(error.RestoreStagingScopeChanged);
+        if (!std.mem.eql(u8, bootstrap.indexes_json, request.indexes_json.slice())) {
+            // The immutable bootstrap binds the full metadata definition.
+            // A storage owner receives its cached physical projection, which
+            // excludes aliases, receipts and other metadata-only controls.
+            const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+            const physical = (aliases.physicalProjectionIfNeeded(alloc, bootstrap.indexes_json) catch |err| return storageOwnerStatusFromError(err)) orelse
+                return storageOwnerStatusFromError(error.RestoreStagingScopeChanged);
+            defer alloc.free(physical);
+            if (!std.mem.eql(u8, physical, request.indexes_json.slice()))
+                return storageOwnerStatusFromError(error.RestoreStagingScopeChanged);
+        }
     }
     var initial_child_bootstrap: ?std.json.Parsed(antfly.capi_dependencies.storage_db_relational_initial_child_publication.Bootstrap) = null;
     defer if (initial_child_bootstrap) |*parsed| parsed.deinit();
@@ -4097,6 +4131,24 @@ pub fn storageOwnerPreflightWriteAdmission(
     var batch = batch_api.parseInternalBatchRequest(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
     defer batch.deinit(handle.alloc);
     local_write.validateGroupedSourceBatch(handle.alloc, &handle.db, batch.req.writes, batch.req.deletes, batch.req.transforms) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerPrepareEnrichments(owner: ?*anyopaque, request: *const kernel_owner_abi.WriteAdmissionRequest, out_command: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out_command.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var owned = batch_api.parseOwnerBatchRequest(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    defer owned.deinit(handle.alloc);
+    const Adapter = struct {
+        fn canceled(ptr: *const anyopaque) bool {
+            const input: *const kernel_owner_abi.WriteAdmissionRequest = @ptrCast(@alignCast(ptr));
+            return if (input.cancellation_fn) |callback| callback(input.cancellation_ctx) != 0 else false;
+        }
+    };
+    const command = handle.db.prepareDirectEnrichmentsWithContext(handle.alloc, owned.req, .{ .io = handle.db.backend_runtime.io() orelse return storageOwnerStatusFromError(error.BackendRuntimeIoUnavailable), .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else null, .cancellation = .{ .ptr = request, .is_cancelled_fn = Adapter.canceled } }) catch |err| return storageOwnerStatusFromError(err);
+    out_command.* = .{ .ptr = command.ptr, .len = @intCast(command.len) };
     return .ok;
 }
 
@@ -4945,6 +4997,7 @@ pub fn prepareStorageRestore(
     var db = try local_write.openStorageKernelRestoreDb(
         alloc,
         staged.path(),
+        scope.manifest.value.schema_json,
         scope.manifest.value.indexes_json,
         request.lsm_root_generation,
         backend_runtime.ptr(),
@@ -4974,6 +5027,7 @@ pub fn prepareStorageRestore(
         var verify_db = try local_write.openStorageKernelRestoreDb(
             alloc,
             staged.path(),
+            scope.manifest.value.schema_json,
             scope.manifest.value.indexes_json,
             request.lsm_root_generation,
             backend_runtime.ptr(),

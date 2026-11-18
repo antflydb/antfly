@@ -387,7 +387,7 @@ pub const Runtime = struct {
         if (request.input_token_tensor) |tensor| {
             if (deviceTokenHandoffEnabled()) {
                 events.handoff_attempts += 1;
-                if (gatedTokenTensorEnabled() and (kind != .cuda or !gpt_arch.cudaDecodeGraphReplayRequired())) {
+                if (gatedTokenTensorEnabled() and (kind != .cuda or !gpt_arch.cudaDecodeGraphReplayPrefersGraph(self.context.cb))) {
                     if (try decoder_gated_runtime.forwardGreedyTokenFromTokenTensor(cb, allocator, model, model.num_hidden_layers, request.token_ids[request.sequence_length - 1], tensor, request.sequence_length, &decode)) |result| {
                         events.handoff_hits += 1;
                         return .{ .token = .{ .token = result.token_id, .token_tensor = result.token_tensor } };
@@ -416,7 +416,7 @@ pub const Runtime = struct {
         var decode = physical.makeDecodeContext(sequence_length, 1);
         try self.context.bindDecoderCleanup(&decode);
         events.handoff_attempts += 1;
-        if (gatedTokenTensorEnabled() and !gpt_arch.cudaDecodeGraphReplayRequired()) {
+        if (gatedTokenTensorEnabled() and !gpt_arch.cudaDecodeGraphReplayPrefersGraph(self.context.cb)) {
             if (try decoder_gated_runtime.forwardGreedyTokenTensorOnlyFromTokenTensor(cb, self.context.allocator, model, model.num_hidden_layers, 0, input, sequence_length, &decode)) |token| {
                 events.handoff_hits += 1;
                 return token;

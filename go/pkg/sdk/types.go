@@ -241,6 +241,7 @@ type (
 	FailedOperation       = oapi.FailedOperation
 	KeyRange              = oapi.KeyRange
 	SyncLevel             = oapi.SyncLevel
+	CommitRequires        = oapi.CommitRequires
 
 	// Transform types for MongoDB-style atomic updates
 	Transform       = oapi.Transform
@@ -844,6 +845,9 @@ const (
 
 	// LinearMergePageStatus values
 	LinearMergePageStatusSuccess = oapi.LinearMergePageStatusSuccess
+
+	CommitRequiresNone              = oapi.CommitRequiresNone
+	CommitRequiresDirectEnrichments = oapi.CommitRequiresDirectEnrichments
 
 	// SyncLevel values
 	SyncLevelPropose     = oapi.SyncLevelPropose

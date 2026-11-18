@@ -234,19 +234,19 @@ pub const Buffer = struct {
     }
 
     pub fn toFloat32(self: *const Buffer, allocator: std.mem.Allocator) ![]f32 {
-        return self.downloadFloat32(allocator, allocator, null);
+        return self.downloadTyped(f32, .float32, allocator, allocator, null);
     }
 
     pub fn toFloat32WithShape(self: *const Buffer, allocator: std.mem.Allocator, expected: []const i64) ![]f32 {
-        return self.downloadFloat32(allocator, allocator, expected);
+        return self.downloadTyped(f32, .float32, allocator, allocator, expected);
     }
 
     pub fn toFloat32WithShapeAndScratch(self: *const Buffer, allocator: std.mem.Allocator, scratch: std.mem.Allocator, expected: []const i64) ![]f32 {
-        return self.downloadFloat32(allocator, scratch, expected);
+        return self.downloadTyped(f32, .float32, allocator, scratch, expected);
     }
 
-    fn downloadFloat32(self: *const Buffer, allocator: std.mem.Allocator, scratch: std.mem.Allocator, expected: ?[]const i64) ![]f32 {
-        return self.downloadTyped(f32, .float32, allocator, scratch, expected);
+    pub fn toInt64WithShape(self: *const Buffer, allocator: std.mem.Allocator, expected: []const i64) ![]i64 {
+        return self.downloadTyped(i64, .int64, allocator, allocator, expected);
     }
 
     /// Exact dense host readback for graph state/control tensors. Physical type
@@ -687,6 +687,21 @@ pub const Client = struct {
     }
 
     pub fn compileWithOptions(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, target_device: *c.PjrtDevice, options: CompileOptions) PjrtError!LoadedExecutable {
+        const compile_options: []const u8 = switch (options.gpu_gemm) {
+            .provider_default => &strict_compile_options,
+            .vendor => &vendor_gemm_compile_options,
+            .vendor_deterministic => &deterministic_vendor_compile_options,
+        };
+        return self.compileForDeviceWithSerializedOptions(hlo_bytes, num_outputs, target_device, compile_options);
+    }
+
+    /// Explicit serialized options retain the same placement, output and
+    /// program-size validation as the typed compilation API.
+    pub fn compileWithSerializedOptions(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, compile_options: []const u8) PjrtError!LoadedExecutable {
+        return self.compileForDeviceWithSerializedOptions(hlo_bytes, num_outputs, self.device, compile_options);
+    }
+
+    fn compileForDeviceWithSerializedOptions(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, target_device: *c.PjrtDevice, compile_options: []const u8) PjrtError!LoadedExecutable {
         // HloModuleProto uses protobuf's signed 32-bit message-size limit.
         // Reject before the C boundary: some plugins throw a C++ exception
         // while constructing the oversized program instead of returning Error.
@@ -699,12 +714,6 @@ pub const Client = struct {
             .code_size = hlo_bytes.len,
             .format = format,
             .format_size = format.len,
-        };
-
-        const compile_options: []const u8 = switch (options.gpu_gemm) {
-            .provider_default => &strict_compile_options,
-            .vendor => &vendor_gemm_compile_options,
-            .vendor_deterministic => &deterministic_vendor_compile_options,
         };
 
         var args = c.ClientCompileArgs{
@@ -763,6 +772,17 @@ pub const Client = struct {
         dims: []const i64,
     ) PjrtError!Buffer {
         return self.uploadBuffer(@ptrCast(data.ptr), .float32, dims, self.device);
+    }
+
+    /// Upload IEEE bfloat16 payloads without expanding them to host/device f32.
+    pub fn bufferFromHostBFloat16(self: *const Client, data: []const u16, dims: []const i64) !Buffer {
+        var elements: usize = 1;
+        for (dims) |dim| {
+            const n = std.math.cast(usize, dim) orelse return error.InvalidDimensions;
+            elements = try std.math.mul(usize, elements, n);
+        }
+        if (elements != data.len) return error.InvalidDimensions;
+        return self.uploadBufferWithSemantics(@ptrCast(data.ptr), .bfloat16, dims, self.device, .immutable_until_transfer_completes);
     }
 
     /// Upload i64 data from host to device, returning a Buffer handle.
@@ -824,6 +844,10 @@ pub const Client = struct {
     /// can fail after a valid buffer has been returned, and callers cannot
     /// release a buffer that this helper never returns to them.
     fn uploadBuffer(self: *const Client, data: *const anyopaque, kind: c.BufferType, dims: []const i64, device: *c.PjrtDevice) PjrtError!Buffer {
+        return self.uploadBufferWithSemantics(data, kind, dims, device, .immutable_only_during_call);
+    }
+
+    fn uploadBufferWithSemantics(self: *const Client, data: *const anyopaque, kind: c.BufferType, dims: []const i64, device: *c.PjrtDevice, semantics: c.HostBufferSemantics) PjrtError!Buffer {
         var args = std.mem.zeroes(c.ClientBufferFromHostBufferArgs);
         args.struct_size = @sizeOf(@TypeOf(args));
         args.client = self.handle;
@@ -831,7 +855,7 @@ pub const Client = struct {
         args.buffer_type = kind;
         args.dims = dims.ptr;
         args.num_dims = dims.len;
-        args.host_buffer_semantics = .immutable_only_during_call;
+        args.host_buffer_semantics = semantics;
         args.device = device;
         try checkError(self.api, self.api.clientBufferFromHostBuffer(&args));
         defer if (args.done_with_host_buffer) |event| destroyEvent(self.api, event);
@@ -1599,7 +1623,11 @@ test "row major readback canonicalizes native layout and KV shape ignores paddin
             std.debug.assert(layout.layout.tiled.num_tiles == 0);
             std.debug.assert(std.mem.eql(i64, layout.layout.tiled.minor_to_major.?[0..2], &.{ 1, 0 }));
             if (args.dst == null) {
-                args.dst_size = 16;
+                args.dst_size = if (kind == .int64) 32 else 16;
+                return null;
+            }
+            if (kind == .int64) {
+                @memcpy(@as([*]u8, @ptrCast(args.dst.?))[0..32], std.mem.sliceAsBytes(&[_]i64{ (1 << 40) + 1, 0, -(1 << 45) + 3, 1 }));
                 return null;
             }
             // Native column-major storage would be [10,20,0,1]. The requested
@@ -1627,6 +1655,19 @@ test "row major readback canonicalizes native layout and KV shape ignores paddin
     defer std.testing.allocator.free(values);
     try std.testing.expectEqualSlices(f32, &.{ 10, 0, 20, 1 }, values);
     try std.testing.expect(values[2] > values[3]);
+    Fake.kind = .int64;
+    const tokens = try buffer.toInt64WithShape(std.testing.allocator, &.{ 2, 2 });
+    defer std.testing.allocator.free(tokens);
+    try std.testing.expectEqualSlices(i64, &.{ (1 << 40) + 1, 0, -(1 << 45) + 3, 1 }, tokens);
+    try std.testing.expectError(error.PjrtApiError, buffer.toInt64WithShape(std.testing.allocator, &.{4}));
+    try std.testing.expectError(error.PjrtApiError, buffer.toFloat32WithShape(std.testing.allocator, &.{ 2, 2 }));
+}
+
+test "BF16 upload rejects invalid shape before accessing the provider" {
+    const client = Client{ .lib = undefined, .api = undefined, .handle = undefined, .device = undefined };
+    try std.testing.expectError(error.InvalidDimensions, client.bufferFromHostBFloat16(&.{0x3f80}, &.{2}));
+    try std.testing.expectError(error.InvalidDimensions, client.bufferFromHostBFloat16(&.{0x3f80}, &.{-1}));
+    try std.testing.expectError(error.Overflow, client.bufferFromHostBFloat16(&.{0x3f80}, &.{ std.math.maxInt(i64), 3 }));
 }
 
 test "oversized HLO is rejected before entering the plugin" {

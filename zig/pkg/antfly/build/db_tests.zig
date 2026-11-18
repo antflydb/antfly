@@ -16,6 +16,7 @@
 const std = @import("std");
 const addRuntimeTestFilters = @import("../../../build_support/antfly/test_support.zig").addRuntimeTestFilters;
 const compileFiltersWithAnchors = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors;
+const addFilteredTestRunArtifactWithRuntimeFilters = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters;
 const addFilteredTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifact;
 const addCuratedTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addCuratedTestRunArtifact;
 const selectTestFilters = @import("../../../build_support/antfly/test_support.zig").selectTestFilters;
@@ -332,7 +333,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "native text neutral provenance owns nested JSON through allocation failure",
         "document extraction parses independent native text policy and quality",
         "document extraction client clone owns native metadata arrays",
-        "document extraction runtime fingerprints independent native quality and policy without OCR",
         "ordered artifact inventory typed unit payload",
         "public enrichment validation rejects invalid execution and producer config",
         "transcriber shorthand expands to a document extraction producer",
@@ -356,6 +356,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "recordings in video containers take the transcription route",
         "transcript spans split a timed phrase at sentence ends using its words",
         "db canonical hierarchy traversal rejects typed retrieval controls",
+        "leann synchronous document provenance pins revisions and tolerates inference float variation",
+        "db paper evaluation",
+        "db document extraction pins provider generation across batches rows and final preparation",
         "db templated dense artifact reuse follows the resolved model revision",
         "db templated dense backfill batches rendered text and preserves media",
         "db templated dense retry preserves document debt and independent text progress",
@@ -363,8 +366,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db templated dense batches respect provider item ceilings",
         "dense text batch boundary preserves limits order cancellation and allocation cleanup",
         "dense text planning retains metadata-only custom provider compatibility",
-        "dense text planning fences legacy model revisions before returning results",
-        "dense grouped parts fence revisions and consume the captured lease",
+        "commit requirements dense text rejects revision-bearing legacy execution before dispatch",
+        "commit requirements dense grouped parts require and consume the captured lease",
+        "commit requirements dense text batches reject a deployment after inference",
         "dense text metadata checks cancellation before and after its snapshot",
         "dense capability snapshots prefer controlled leases over legacy discovery",
         "dense text planning rejects expired requests before discovery",
@@ -613,7 +617,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "native text neutral provenance owns nested JSON through allocation failure",
         "document extraction parses independent native text policy and quality",
         "document extraction client clone owns native metadata arrays",
-        "document extraction runtime fingerprints independent native quality and policy without OCR",
         "ordered artifact inventory typed unit payload",
         "public enrichment validation rejects invalid execution and producer config",
         "transcriber shorthand expands to a document extraction producer",
@@ -637,6 +640,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "recordings in video containers take the transcription route",
         "transcript spans split a timed phrase at sentence ends using its words",
         "db canonical hierarchy traversal rejects typed retrieval controls",
+        "leann synchronous document provenance pins revisions and tolerates inference float variation",
+        "db paper evaluation",
+        "db document extraction pins provider generation across batches rows and final preparation",
         "db templated dense artifact reuse follows the resolved model revision",
         "db templated dense backfill batches rendered text and preserves media",
         "db templated dense retry preserves document debt and independent text progress",
@@ -644,8 +650,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db templated dense batches respect provider item ceilings",
         "dense text batch boundary preserves limits order cancellation and allocation cleanup",
         "dense text planning retains metadata-only custom provider compatibility",
-        "dense text planning fences legacy model revisions before returning results",
-        "dense grouped parts fence revisions and consume the captured lease",
+        "commit requirements dense text rejects revision-bearing legacy execution before dispatch",
+        "commit requirements dense grouped parts require and consume the captured lease",
+        "commit requirements dense text batches reject a deployment after inference",
         "dense text metadata checks cancellation before and after its snapshot",
         "dense capability snapshots prefer controlled leases over legacy discovery",
         "dense text planning rejects expired requests before discovery",
@@ -880,6 +887,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_db_result_shape_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{
+            "externalizeSearchResultArtifactIds",
             "native asset members hydrate source authority and revision identity",
             "native unit ancestry uses its configured producer name",
             "native member logical filters use parent values and shared verification budgets",
@@ -933,6 +941,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_lib_db_result_shape_tests = addFilteredTestRunArtifact(b, lib_db_result_shape_tests);
     lib_db_query_step.dependOn(&run_lib_db_result_shape_tests.step);
+    const alias_provenance_run = addFilteredTestRunArtifactWithRuntimeFilters(b, lib_db_result_shape_tests, &.{"externalizeSearchResultArtifactIds"});
+    b.step("antfly-index-alias-provenance-test", "Verify repeated member identity conversion and allocation cleanup")
+        .dependOn(&alias_provenance_run.step);
 
     const lib_db_reopen_tests = b.addTest(.{
         .root_module = antfly_test_mod,

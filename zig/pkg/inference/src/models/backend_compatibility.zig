@@ -167,6 +167,7 @@ pub fn validateGgufCompanionForBackend(
             .message = "a required companion GGUF is missing or unreadable",
         };
     };
+    mapped.preserveFileCacheOnDeinit();
     defer mapped.deinit();
 
     var file = gguf_format.parseStructure(allocator, mapped.data) catch |err| {

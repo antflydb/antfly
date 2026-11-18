@@ -804,9 +804,12 @@ pub const ExecutionAccess = struct {
 
     /// Preserve pause/FIFO acquisition and add the backend budget/state owner.
     pub fn acquireScope(self: ExecutionAccess) !?@import("ops/execution_scope.zig").Scope {
+        return self.acquireScopeForPhase(.step);
+    }
+    pub fn acquireScopeForPhase(self: ExecutionAccess, phase: @import("ops/execution_scope.zig").Phase) !?@import("ops/execution_scope.zig").Scope {
         if (self.mutex == null) return null;
         try self.acquire();
-        var scope = self.adoptScope(.step);
+        var scope = self.adoptScope(phase);
         errdefer scope.deinit();
         if (self.backend) |backend| try scope.bind(backend);
         return scope;

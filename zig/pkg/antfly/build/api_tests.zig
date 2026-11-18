@@ -76,6 +76,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const privacy_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{ "privacy", "artifact publication upload", "ordered artifact inventory publication queue", "snappy", "lsm.table_file", "vector replay coalescing cancels and revives" } });
     const privacy_step = b.step("antfly-privacy-test", "Run privacy scan, evidence and transport fence contracts");
     privacy_step.dependOn(&b.addRunArtifact(privacy_tests).step);
+    const privacy_transition_tests = b.addTest(.{
+        .root_module = privacy_mod,
+        .filters = &.{ "privacy API and transport contracts", "privacy policy replacement", "privacy new index migration", "privacy model migration", "index alias legacy incarnation", "index alias conditional deletion", "alias deletion rejects validators" },
+    });
+    b.step("antfly-privacy-transition-test", "Verify policy generation replacement and protected model migration")
+        .dependOn(&b.addRunArtifact(privacy_transition_tests).step);
+
     const owner_readiness_transport_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{"privacy compact owner readiness transport"} });
     b.step("cypher-owner-readiness-transport-test", "Verify compact selected-owner HTTP transport budgets and namespaces")
         .dependOn(&b.addRunArtifact(owner_readiness_transport_tests).step);
@@ -471,6 +478,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     run_lib_api_auth_tests.step.dependOn(&openapi_root_check.step);
     const lib_api_auth_test_step = b.step("antfly-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
+    const alias_http_tests = b.addTest(.{
+        .name = "index-alias-http-tests",
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = &.{ "index alias", "typed internal HTTP errors preserve conflict semantics", "hot-standby mutation inventory JSON", "hot-standby public non-GET route matrix" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_alias_http_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, alias_http_tests, &.{ "index alias", "typed internal HTTP errors preserve conflict semantics", "hot-standby mutation inventory JSON", "hot-standby public non-GET route matrix" });
+    b.step("antfly-index-alias-http-test", "Verify alias routes, table permissions and readiness over HTTP").dependOn(&run_alias_http_tests.step);
+    lib_api_auth_test_step.dependOn(&run_alias_http_tests.step);
 
     // The real MCP transport/database security regression does not need the
     // monolithic library discovery root or its full-suite memory reservation.
@@ -894,6 +910,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "encode query request serializes internal resolved doc filters with wire context",
             "simple vector shard request carries serializable resolved doc filter",
             "api http server preserves public query availability errors",
+            "api http query binding generation races return retryable unavailable",
             "api http server maps retrieval agent doc identity mismatch to unavailable",
             "api http server query builder maps doc identity mismatch to unavailable",
             "api http server surfaces structured doc identity conflicts for transaction commits",
@@ -1023,6 +1040,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configureConsumer(b, api_table_reads_docid_test_mod);
     api_table_reads_docid_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const index_alias_tests = @import("linked_tests.zig").add(b, .{
+        .name = "index-alias-tests",
+        .root_module = api_table_reads_docid_test_mod,
+        .filters = &.{"index alias"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-index-alias-test", "Verify alias admission, SQL graph binding, query pinning and HTTP registration").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, index_alias_tests.executable, &.{"index alias"}).step);
     const api_public_table_http_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_public_table_http_test_root.zig"),
         .target = target,
@@ -1674,7 +1698,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "source readiness distinguishes durable repair debt from runtime enrichment failure",
             "managed embeddings skipped terminal sources complete backfill without fabricating replay debt",
             "repair-free embeddings aggregate retains live dense catch-up",
-            "serviceable repair preserves sibling shard dense catch-up fallback",
+            "serviceable repair preserves sibling shard dense catch-up",
             "serviceable repair cannot mask sibling shard load failure",
             "index encoders preserve sibling replay debt during serviceable repair",
             "enrichment aggregation preserves telemetry and fences mixed checkpoint identity",
@@ -1684,6 +1708,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "api http server join planner uses complete fresh local stats before metadata publication",
             "external embeddings index readiness does not require table doc coverage",
             "api http server preserves public query availability errors",
+            "api http query binding generation races return retryable unavailable",
             "api http maps missing physical index only for rebuilding lifecycle",
             "api http classifies catalog-to-serving index convergence without runtime status",
             "remote rebuild quarantine preserves its source and index failure",
@@ -1741,6 +1766,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = @import("runtime_memory.zig").testCompileMaxRss("api-table-write-implementation-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const alias_hierarchy_run = b.addRunArtifact(write_implementation_tests);
+    @import("../../../build_support/antfly/test_support.zig").configureTestRun(alias_hierarchy_run);
+    alias_hierarchy_run.addArgs(&.{ "--test-filter", "hosted distributed grouped hierarchy expands the globally selected shard page" });
+    b.step("antfly-index-alias-hierarchy-test", "Verify grouped member provenance across shard and coordinator shaping")
+        .dependOn(&alias_hierarchy_run.step);
     const evaluation_graph_step = b.step("inference-evaluation-graph-test", "Verify final-ranked graph starts in public and cross-range queries");
     const evaluation_public_graph = b.addRunArtifact(if (focused_public_api_compile) public_api_parity_tests else public_api_integration.executable);
     evaluation_public_graph.addArgs(&.{ "--test-filter", "public api integration supports hybrid query pruner and reranker" });

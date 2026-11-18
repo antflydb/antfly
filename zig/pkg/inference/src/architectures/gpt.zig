@@ -1355,7 +1355,10 @@ pub fn forwardLastLogitsLastRowTensorFromEmbeddingsWithLayer0Overrides(
 ) !CT {
     const output: SharedKvPrefillOutput = if (batch == 1 and cb.kind() == .cuda and
         (getenvBool("ANTFLY_INFERENCE_CUDA_MULTIMODAL_SHARED_KV_PREFILL") or
-            @import("../execution/gemma4_native_plan.zig").selected() != null) and !disableSharedKvDebug() and
+            @import("../execution/gemma4_native_plan.zig").selected() != null or
+            (@import("../ops/cuda/cuda_compute.zig").CudaCompute.gemma4SharedKvPrefillEnabled(cb) and
+                platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_PREPARED_SHARED_KV_PREFILL", true) and
+                preparedSharedKvPrefillEligible(config, overrides, batch, seq_len, decode_context))) and !disableSharedKvDebug() and
         decode_context != null and
         decode_context.?.query_sequence_len == seq_len and decode_context.?.total_sequence_len == seq_len and
         sharedKvPrefillBoundary(config, decode_context.?.*) != null)
@@ -1865,6 +1868,58 @@ pub fn cudaDecodeGraphReplayRequired() bool {
     return cudaDecodeGraphReplayMode() == .required;
 }
 
+/// Automatic request replay must reach the graph-aware forward before an
+/// eager fused shortcut. Its failure policy remains automatic, not required.
+pub fn cudaDecodeGraphReplayPrefersGraph(cb: *const ComputeBackend) bool {
+    return cudaDecodeGraphReplayRequired() or cb.debugCudaGraphReplayRequested();
+}
+
+fn cudaDecodeGraphReplayRequestedForBackend(cb: *const ComputeBackend) bool {
+    return cudaDecodeGraphReplayRequested() or cb.debugCudaGraphReplayRequested();
+}
+
+test "Gemma4 CUDA request replay reaches architecture capture without global flags" {
+    const Probe = struct {
+        fn kind(_: *anyopaque) ops.BackendKind {
+            return .cuda;
+        }
+        fn cpu(_: *anyopaque) ops.BackendKind {
+            return .native;
+        }
+        fn requested(ctx: *anyopaque) bool {
+            const active: *const bool = @ptrCast(@alignCast(ctx));
+            return active.*;
+        }
+    };
+    var active = true;
+    var table = native_compute_mod.vtable_impl;
+    table.backendKind = &Probe.kind;
+    table.regions.replay.requested = &Probe.requested;
+    var cb = ComputeBackend{ .ptr = &active, .vtable = &table };
+    const context: DecodeContext = .{ .total_sequence_len = 32, .query_sequence_len = 1, .kv_sequence_len = 32 };
+    try std.testing.expect(cb.debugCudaGraphReplayRequested());
+    try std.testing.expect(cudaDecodeGraphReplayPrefersGraph(&cb));
+    try std.testing.expect(cudaCaptureFinalHiddenProbeEnabled(&cb, 1, 32, &context));
+    try std.testing.expect(cudaCaptureGreedyTokenProbeEnabled(&cb, 1, 32, &context));
+    try std.testing.expect(!cudaCaptureFinalHiddenProbeEnabled(&cb, 2, 32, &context));
+    var prefill = context;
+    prefill.query_sequence_len = 2;
+    try std.testing.expect(!cudaCaptureFinalHiddenProbeEnabled(&cb, 1, 32, &prefill));
+    cb.execution_owner = 7;
+    try std.testing.expect(!cb.debugCudaGraphReplayRequested());
+    try std.testing.expectEqual(cudaDecodeGraphReplayRequested(), cudaDecodeGraphReplayRequestedForBackend(&cb));
+    cb.execution_owner = 0;
+    active = false;
+    try std.testing.expectEqual(cudaDecodeGraphReplayRequired(), cudaDecodeGraphReplayPrefersGraph(&cb));
+    table.regions.replay.requested = null;
+    try std.testing.expect(!cb.debugCudaGraphReplayRequested());
+    table.regions.replay.requested = &Probe.requested;
+    table.backendKind = &Probe.cpu;
+    active = true;
+    try std.testing.expect(!cb.debugCudaGraphReplayRequested());
+    try std.testing.expect(!cudaCaptureFinalHiddenProbeEnabled(&cb, 1, 32, &context));
+}
+
 test "cuda decode graph replay mode parsing requires replay for unknown values" {
     try std.testing.expectEqual(CudaDecodeGraphReplayMode.off, cudaDecodeGraphReplayModeFromValue(null));
     try std.testing.expectEqual(CudaDecodeGraphReplayMode.required, cudaDecodeGraphReplayModeFromValue("unknown"));
@@ -1886,7 +1941,7 @@ fn cudaCaptureFinalHiddenProbeEnabled(
     decode_context: ?*const DecodeContext,
 ) bool {
     if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN", false) and
-        !cudaDecodeGraphReplayRequested()) return false;
+        !cudaDecodeGraphReplayRequestedForBackend(cb)) return false;
     if (cb.kind() != .cuda) return false;
     if (batch != 1) return false;
     return actualQuerySeqLen(seq_len, decode_context) == 1;
@@ -1900,7 +1955,7 @@ fn cudaCaptureGreedyTokenProbeEnabled(
 ) bool {
     if (!cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) return false;
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_GREEDY_TOKEN", false) or
-        cudaDecodeGraphReplayRequested();
+        cudaDecodeGraphReplayRequestedForBackend(cb);
 }
 
 fn forwardGreedyLastTokenTensorFromEmbeddingsWithLayer0Overrides(
@@ -2904,6 +2959,58 @@ fn sharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
     return geometry.donor_layers;
 }
 
+fn preparedSharedKvPrefillEligible(config: Config, overrides: Layer0DecoderOverrides, batch: usize, seq_len: usize, context: ?*const DecodeContext) bool {
+    if (batch != 1 or !layer0DecoderOverridesEmpty(overrides)) return false;
+    const dc = context orelse return false;
+    if (dc.total_sequence_len != seq_len) return false;
+    return sharedKvPrefillBoundary(config, dc.*) != null;
+}
+
+test "E4B shared KV prefill prepared rows preserve context and decline other consumers" {
+    const config: Config = .{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .num_kv_shared_layers = 18,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+    };
+    const dc: DecodeContext = .{
+        .attention_mode = .paged_prefill,
+        .total_sequence_len = 278,
+        .query_sequence_len = 278,
+        .kv_sequence_len = 278,
+        .kv_cache = .{ .sequence_id = 1, .pool_id = 0, .logical_block_count = 18, .tail_tokens = 6 },
+    };
+    try std.testing.expect(preparedSharedKvPrefillEligible(config, .{}, 1, 278, &dc));
+    try std.testing.expect(!preparedSharedKvPrefillEligible(config, .{}, 2, 278, &dc));
+    try std.testing.expect(!preparedSharedKvPrefillEligible(config, .{}, 1, 279, &dc));
+    try std.testing.expect(!preparedSharedKvPrefillEligible(config, .{}, 1, 278, null));
+    var other = dc;
+    other.attn_or_mask = &.{0};
+    try std.testing.expect(!preparedSharedKvPrefillEligible(config, .{}, 1, 278, &other));
+    other = dc;
+    other.kv_batch = &.{};
+    try std.testing.expect(!preparedSharedKvPrefillEligible(config, .{}, 1, 278, &other));
+    other = dc;
+    other.mrope_positions = &.{};
+    try std.testing.expect(!preparedSharedKvPrefillEligible(config, .{}, 1, 278, &other));
+    var override = Layer0DecoderOverrides{};
+    override.attn_norm_slots[0] = 1;
+    try std.testing.expect(!preparedSharedKvPrefillEligible(config, override, 1, 278, &dc));
+    var model = config;
+    model.position_encoding = .absolute;
+    try std.testing.expect(!preparedSharedKvPrefillEligible(model, .{}, 1, 278, &dc));
+    model = config;
+    model.num_kv_shared_layers = 0;
+    try std.testing.expect(!preparedSharedKvPrefillEligible(model, .{}, 1, 278, &dc));
+}
+
 fn sharedKvLastRowContext(dc: DecodeContext) DecodeContext {
     var result = dc;
     result.query_sequence_len = 1;
@@ -3014,7 +3121,7 @@ pub fn tryCudaSharedKvPrefill(
     dc: *const DecodeContext,
     want_last_logits: bool,
 ) !?SharedKvPrefillResult {
-    if (cb.kind() != .cuda or disableSharedKvDebug() or !getenvBool("ANTFLY_INFERENCE_CUDA_E4B_SHARED_KV_PREFILL")) return null;
+    if (cb.kind() != .cuda or disableSharedKvDebug() or !@import("../ops/cuda/cuda_compute.zig").CudaCompute.gemma4SharedKvPrefillEnabled(cb)) return null;
     if (config.isMultimodal() or dc.attn_or_mask != null) return null;
     _ = sharedKvPrefillBoundary(config, dc.*) orelse return null;
     if (input_ids.len != dc.query_sequence_len or seq_len != dc.total_sequence_len) return null;

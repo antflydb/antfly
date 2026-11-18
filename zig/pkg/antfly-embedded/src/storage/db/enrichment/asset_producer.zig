@@ -698,7 +698,12 @@ pub const Producer = struct {
                 return error.InferenceInvocationMemoryUnavailable;
             return null;
         }
-        return try self.resolveInvocationMemoryForRequests(alloc, requests);
+        var plan = try self.resolveInvocationMemoryForRequests(alloc, requests);
+        if (self.invocation_context.max_response_bytes) |limit| {
+            plan.max_result_bytes = @min(plan.max_result_bytes, limit);
+            plan.max_result_bytes_per_item = @min(plan.max_result_bytes_per_item, limit);
+        }
+        return plan;
     }
 
     /// Describes how the request set will execute. This preserves the important

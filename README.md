@@ -77,7 +77,7 @@ See [LICENSING.md](LICENSING.md) for third-party notices and source ownership.
 - **RAG agents** — built-in [retrieval-augmented generation](zig/pkg/antfly/src/api/retrieval_agent.zig) with streaming, multi-turn chat, tool calling (graph traversal, plus web search through an Exa connection), confidence scoring, and [TOON](docs/reference/toon-format.md) document rendering to cut prompt tokens
 - **Query-builder agent** — turns a natural-language question into a structured Antfly query
 - **Graph indexes** — automatic relationship extraction and [graph traversal](zig/pkg/antfly-embedded/src/graph) over your data
-- **Multimodal** — index and search [images, audio, and video](docs/guides/multimodal.mdx) with CLIP, CLAP, and vision-language models
+- **Multimodal** — index and search [images, audio, and video](docs/guides/multimodal.mdx) in one vector space with [EmbeddingGemma 2](docs/guides/models/embeddinggemma2.mdx)
 - **Reranking** — cross-encoder and [late-interaction](https://arxiv.org/abs/2004.12832) ([ColBERT](zig/pkg/inference/RERANKING.md), ColQwen2) reranking with score-based pruning to cut the noise
 - **Aggregations** — stats, terms facets, histogram, date histogram, range, and geo-distance [aggregations](zig/pkg/antfly-embedded/src/search/aggregation.zig) for analytics
 - **Transactions** — ACID transactions at the shard level with distributed coordination
@@ -100,10 +100,8 @@ See [LICENSING.md](LICENSING.md) for third-party notices and source ownership.
 - **MCP and A2A protocols** — [protocol adapters](zig/pkg/antfly/src/api/protocol_adapters.zig) let agents and LLMs use Antfly directly, and an [n8n guide](docs/guides/n8n.mdx) wires it into workflows
 - **Relational tables** — `storage_mode: relational` tables with typed packed rows, `relational` indexes, row query and mutate APIs, databases, a system catalog, and tablespaces
 - **Antfarm** — [web dashboard](ts/apps/antfarm) with playgrounds for search, RAG, chat, knowledge graphs, embeddings, reranking, chunking, extraction, OCR, transcription, and evals
-
-### In progress
-
-- **SQL and the Postgres wire protocol** — SQL lowered to native typed plans, a `psql`-compatible server, and lake tables over Iceberg and Parquet. Tracked in [#145](https://github.com/antflydb/antfly/pull/145)
+- **SQL and the Postgres wire protocol** — SQL lowered to native typed plans and an opt-in [`psql`-compatible server](zig/pkg/antfly/src/pgwire/README.md) with transactions, prepared statements, and cursors
+- **Lake tables** — query read-only [Parquet and Iceberg](zig/LAKES.md) data in object storage in place, with search indexes stored alongside it
 
 ## Documentation
 

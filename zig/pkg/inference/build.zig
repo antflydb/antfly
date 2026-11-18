@@ -1234,6 +1234,27 @@ pub fn build(b: *std.Build) void {
     );
     metal_prefill_bucket_bench_step.dependOn(&run_metal_prefill_bucket_bench.step);
 
+    const global_attention_bench = b.addExecutable(.{
+        .name = "antfly-embeddinggemma2-global-bench",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/bench_embeddinggemma2_global.zig"), .target = target, .optimize = optimize }),
+    });
+    global_attention_bench.root_module.addImport("build_options", build_options_mod);
+    var global_imports = inference_internal_mod.import_table.iterator();
+    while (global_imports.next()) |entry| {
+        if (!global_attention_bench.root_module.import_table.contains(entry.key_ptr.*)) global_attention_bench.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    }
+    runtime_graph.identities.addImports(global_attention_bench.root_module);
+    global_attention_bench.root_module.link_libc = true;
+    global_attention_bench.root_module.linkSystemLibrary("pthread", .{});
+    b.step("build-embeddinggemma2-global-bench", "Build isolated global MQA schedule benchmark").dependOn(&b.addInstallArtifact(global_attention_bench, .{}).step);
+
+    const global_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/test_embeddinggemma2_global.zig"), .target = target, .optimize = optimize }), .filters = &.{ "global MQA", "encoder replay invalidates", "embeddinggemma2 CUDA arithmetic", "embeddinggemma2 CUDA optimized identities" } });
+    var global_test_imports = global_attention_bench.root_module.import_table.iterator();
+    while (global_test_imports.next()) |entry| global_tests.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    global_tests.root_module.link_libc = true;
+    global_tests.root_module.linkSystemLibrary("pthread", .{});
+    b.step("test-embeddinggemma2-global", "Check global attention geometry, ownership, replay and identity").dependOn(&b.addRunArtifact(global_tests).step);
+
     const embeddinggemma2_bench = b.addExecutable(.{
         .name = "antfly-embeddinggemma2-bench",
         .root_module = b.createModule(.{
@@ -1248,6 +1269,12 @@ pub fn build(b: *std.Build) void {
     embeddinggemma2_bench.root_module.link_libc = true;
     const install_embeddinggemma2_bench = b.addInstallArtifact(embeddinggemma2_bench, .{});
     b.step("build-embeddinggemma2-bench", "Build the prepared-text encoder benchmark without running it").dependOn(&install_embeddinggemma2_bench.step);
+    const media_bench = b.addExecutable(.{ .name = "antfly-embeddinggemma2-media-bench", .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/embeddinggemma2_media.zig"), .target = target, .optimize = optimize }) });
+    media_bench.root_module.addImport("build_options", build_options_mod);
+    media_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(media_bench.root_module);
+    media_bench.root_module.link_libc = true;
+    b.step("build-embeddinggemma2-media-bench", "Build complete raw image/audio pipeline benchmark").dependOn(&b.addInstallArtifact(media_bench, .{}).step);
     const live_bench = b.addExecutable(.{ .name = "antfly-embeddinggemma2-live", .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/embeddinggemma2_live.zig"), .target = target, .optimize = optimize }) });
     live_bench.root_module.addImport("build_options", build_options_mod);
     live_bench.root_module.addImport("inference_internal", inference_internal_mod);

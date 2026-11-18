@@ -245,11 +245,34 @@ pub fn extractDownloadedStreamingWithLimitsWithFailure(
     sink: extraction.UnitSink,
     out_failure: *abi.FailureIdentity,
 ) !void {
+    return extractDownloadedStreamingControlled(alloc, downloaded, source_url, config_json, raw_document_json, pdf_decode_limits, sink, out_failure, null);
+}
+
+fn extractDownloadedStreamingControlled(
+    alloc: Allocator,
+    downloaded: anytype,
+    source_url: []const u8,
+    config_json: []const u8,
+    raw_document_json: []const u8,
+    pdf_decode_limits: @TypeOf((extraction.Config{}).pdf_decode_limits),
+    sink: extraction.UnitSink,
+    out_failure: *abi.FailureIdentity,
+    control: ?@import("antfly_inference_execution_context").RequestContext,
+) !void {
     out_failure.* = .{};
     var context = Context{ .alloc = alloc, .sink = sink };
     var failure: abi.FailureIdentity = .{};
     const allocator = abi.Allocator.fromStd(&alloc);
+    const Control = struct {
+        fn canceled(raw: ?*const anyopaque) callconv(.c) u8 {
+            const ctx: *const ?@import("antfly_inference_execution_context").RequestContext = @ptrCast(@alignCast(raw.?));
+            if (ctx.*) |value| value.check() catch return 1;
+            return 0;
+        }
+    };
+    if (control) |value| try value.check();
     const status = abi.antfly_enrichment_extract_stream(&.{
+        .cancellation = .{ .context = &control, .is_cancelled = Control.canceled },
         .allocator = &allocator,
         .downloaded = .fromSlice(downloaded.data),
         .downloaded_content_type = .fromSlice(downloaded.content_type),
@@ -330,6 +353,16 @@ pub fn extractDownloadedAllocWithLimitsWithFailure(
         out_failure,
     );
     return try collector.finish();
+}
+
+pub fn extractDownloadedControlledAlloc(alloc: Allocator, downloaded: anytype, source_url: []const u8, config_json: []const u8, raw_document_json: []const u8, limits: @TypeOf((extraction.Config{}).pdf_decode_limits), out_failure: *abi.FailureIdentity, control: ?@import("antfly_inference_execution_context").RequestContext) !extraction.Result {
+    var collector = ResultCollector{ .alloc = alloc };
+    defer collector.deinit();
+    extractDownloadedStreamingControlled(alloc, downloaded, source_url, config_json, raw_document_json, limits, collector.sink(), out_failure, control) catch |err| {
+        if (control) |value| try value.check();
+        return err;
+    };
+    return collector.finish();
 }
 
 pub fn renderPdfPagePngAdaptiveAlloc(

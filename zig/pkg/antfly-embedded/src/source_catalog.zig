@@ -739,6 +739,7 @@ pub const storage_db_document_read_scratch = @import("storage/db/document_read_s
 pub const storage_db_replay_vector_collectors = @import("storage/db/replay_vector_collectors.zig");
 pub const storage_db_owned_keys = @import("storage/db/owned_keys.zig");
 pub const storage_db_read_projection = @import("storage/db/read_projection.zig");
+pub const storage_db_privacy_read = @import("storage/db/privacy_read.zig");
 pub const storage_db_graph_endpoint_resolutions = @import("storage/db/graph_endpoint_resolutions.zig");
 pub const storage_db_graph_mention_projection = @import("storage/db/graph_mention_projection.zig");
 pub const storage_db_graph_field_plan = @import("storage/db/graph_field_plan.zig");
@@ -898,6 +899,8 @@ pub const storage_source_value_identity = @import("storage/source_value_identity
 
 pub const storage_db_mutation_commit_disposition_test = @import("storage/db/mutation_commit_disposition_test.zig");
 
+pub const storage_db_commit_requirements = @import("storage/db/commit_requirements.zig");
+pub const storage_db_prepared_producer_acceptance = @import("storage/db/prepared_producer_acceptance.zig");
 pub const storage_db_mutation_plan = @import("storage/db/mutation_plan.zig");
 
 pub const storage_db_query_cypher_projection = @import("storage/db/query/cypher_projection.zig");

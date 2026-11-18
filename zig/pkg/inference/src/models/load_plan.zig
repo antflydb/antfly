@@ -36,6 +36,7 @@ fn manifestHasNativeAssets(man: manifest_mod.ModelManifest) bool {
 pub const ModelLoadAdmissionPlan = struct {
     /// Maximum simultaneous bytes while parsing/importing/repacking.
     peak: runtime.tier.memory.AdmissionAmounts,
+    mapped_host_weight_bytes: usize = 0,
     /// Bytes retained by the completed backend session.
     resident: runtime.tier.memory.AdmissionAmounts,
     /// Minimum serving envelope justified by the same resolved load plan.
@@ -294,7 +295,7 @@ pub fn estimateModelLoadAdmission(
     laya_packed: bool,
 ) !ModelLoadAdmissionPlan {
     const base = try estimateBaseModelLoadAdmission(model_path, man, backend_runtime, a4b_request, laya_packed);
-    return withJinaAdapterAdmission(man, backend_runtime.backend, base);
+    return withNativeAuxiliaryAdmission(man, backend_runtime.backend, base);
 }
 
 pub fn a4bGpuModelLoadAdmission(
@@ -617,18 +618,40 @@ pub fn addMetalResidentHostSource(plan: *ModelLoadAdmissionPlan, bytes: usize) !
     plan.peak.host_weight_bytes = peak_host;
 }
 
-pub fn withJinaAdapterAdmission(man: manifest_mod.ModelManifest, backend: backends.BackendType, base: ModelLoadAdmissionPlan) !ModelLoadAdmissionPlan {
-    if (!session_factory.usesJinaRetrievalAdapter(man, backend)) return base;
-    const adapter = (try man.jinaRetrievalAdapter()) orelse return base;
+pub fn withNativeAuxiliaryAdmission(man: manifest_mod.ModelManifest, backend: backends.BackendType, base: ModelLoadAdmissionPlan) !ModelLoadAdmissionPlan {
+    return withNativeAuxiliaryAdmissionForPolicy(man, backend, base, @import("../ops/cuda/ple_host.zig").requested());
+}
+
+pub fn withNativeAuxiliaryAdmissionForPolicy(man: manifest_mod.ModelManifest, backend: backends.BackendType, base: ModelLoadAdmissionPlan, host_ple: bool) !ModelLoadAdmissionPlan {
+    var result = base;
+    if (backend == .cuda and host_ple and man.gguf_path != null) {
+        const host_bytes = try session_factory.cudaPleHostBytesForPolicy(man.allocator, man.source_root orelse std.fs.path.dirname(man.gguf_path.?) orelse ".", man, host_ple);
+        if (host_bytes != 0) {
+            const artifact_bytes = try estimateModelArtifactBytes(man);
+            const remaining = std.math.sub(usize, artifact_bytes, host_bytes) catch return error.ResourceLimitExceeded;
+            const before = try session_factory.estimateBackendWeightResidencyBytes(.cuda, artifact_bytes);
+            const after = try session_factory.estimateBackendWeightResidencyBytes(.cuda, remaining);
+            const discount = before - after;
+            result.peak.backend_weight_bytes = std.math.sub(usize, result.peak.backend_weight_bytes, discount) catch return error.ResourceLimitExceeded;
+            result.resident.backend_weight_bytes = std.math.sub(usize, result.resident.backend_weight_bytes, discount) catch return error.ResourceLimitExceeded;
+            try addMetalResidentHostSource(&result, host_bytes);
+            result.mapped_host_weight_bytes = host_bytes;
+        }
+    }
+    if (!session_factory.usesJinaRetrievalAdapter(man, backend)) return result;
+    const adapter = (try man.jinaRetrievalAdapter()) orelse return result;
     const weights = std.math.cast(usize, try c_file.fileSize(man.allocator, adapter.weights)) orelse return error.ResourceLimitExceeded;
     const config = std.math.cast(usize, try c_file.fileSize(man.allocator, adapter.config)) orelse return error.ResourceLimitExceeded;
     // Mapping/header parsing and F32 staging are temporary on CPU/CUDA. Metal
     // retains the adapter reader for lazy merges; its encoded mapping stays live.
     const peak = try checkedScaledBytes(weights, 5, try checkedScaledBytes(config, 13, 0));
-    var result = base;
     result.peak.host_weight_bytes = std.math.add(usize, result.peak.host_weight_bytes, peak) catch return error.ResourceLimitExceeded;
     if (backend == .metal) result.resident.host_weight_bytes = std.math.add(usize, result.resident.host_weight_bytes, weights) catch return error.ResourceLimitExceeded;
     return result;
+}
+
+pub fn withJinaAdapterAdmission(man: manifest_mod.ModelManifest, backend: backends.BackendType, base: ModelLoadAdmissionPlan) !ModelLoadAdmissionPlan {
+    return withNativeAuxiliaryAdmission(man, backend, base);
 }
 
 const safetensors_format = @import("safetensors.zig");
