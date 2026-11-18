@@ -22044,8 +22044,8 @@ pub const ApiHttpServer = struct {
                             return zig017_err;
                         });
                         defer self.alloc.free(statuses);
-                        for (targets, statuses[0..targets.len], 0..) |target, *status, index| {
-                            status.* = .{ .name = if (worker_state.value.source_kind == .query_population and index < table_names.len) table_names[index] else target.table.name, .status = "committed", .@"error" = null };
+                        for (targets, statuses[0..targets.len]) |target, *status| {
+                            status.* = .{ .name = if (worker_state.value.source_kind == .query_population and target.catalog_binding != null) target.catalog_binding.?.name else target.table.name, .status = "committed", .@"error" = null };
                         }
                         for (skipped, statuses[targets.len..]) |name, *status| {
                             status.* = .{ .name = name, .status = "skipped", .@"error" = null };
