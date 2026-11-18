@@ -48,10 +48,11 @@ validation, the terminal authority receipt, and publication effects in one
 physical transaction. The ordered graph publication writer invokes this path
 after its source and contender guards when a co-located binding exists for the
 producer incarnation. Binding installation and publication both require a
-visible active authority and its activation certificate. The catalog still
-needs to invoke binding provisioning under its activation fence. The
-activation-only parser supplies the declared DAG types and rejects ambiguous
-names. Regular index admission and direct graph-index open still reject DAG.
+visible active authority and its activation certificate. Binding provisioning
+checks that the activation proofs cover exactly the declared DAG types and
+stages every activation certificate with the binding. The catalog still
+needs to invoke provisioning under its source-write fence. Regular index
+admission and direct graph-index open still reject DAG.
 An existing distributed reservation remains under the original coordinator,
 and the publication coordinator still needs to enlist the authority under the source and contender guards, and document-derived
 and explicit writers still need to supply their final contributions. The authority also stages bounded activation pages into a private

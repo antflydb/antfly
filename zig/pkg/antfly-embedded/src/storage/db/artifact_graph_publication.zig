@@ -173,10 +173,14 @@ test "ordered artifact inventory graph publication validates guards generations 
             try std.testing.expectError(error.GraphConstraintNotReady, binding.stage(alloc, &writer, command));
             try dag.Storage.create(&writer, request.domain, 1);
             try std.testing.expectError(error.GraphConstraintNotReady, binding.stage(alloc, &writer, command));
-            try dag.Storage.activateNewIncarnation(&writer, request.domain, 1);
-            try publication.LocalDagBinding.stageFromConfig(alloc, &writer, command, @splat(2),
+            const config_json =
                 \\{"edge_types":[{"name":"unconstrained","topology":"graph"},{"name":"links","topology":"dag"}]}
-            );
+            ;
+            try std.testing.expectError(error.InvalidDagMutation, publication.LocalDagBinding.stageFromConfig(alloc, &writer, command, @splat(2), config_json, &.{}));
+            try std.testing.expectEqual(.validating, (try dag.Storage.load(&writer, request.domain)).phase);
+            const activations: []const publication.LocalDagBinding.Activation = &.{.{ .edge_type = "links", .owner_epoch = 1, .proof = .empty }};
+            try publication.LocalDagBinding.stageFromConfig(alloc, &writer, command, @splat(2), config_json, activations);
+            try publication.LocalDagBinding.stageFromConfig(alloc, &writer, command, @splat(2), config_json, activations);
             try binding.stage(alloc, &writer, command);
             try result.stageLocalDag(alloc, &writer, command);
             try writer.put(edge_key, edge);
