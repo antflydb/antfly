@@ -1406,6 +1406,7 @@ pub const Store = struct {
         abort_bulk_ingest_session: ?*const fn (*anyopaque) void = null,
         last_replay_sequence: ?*const fn (*anyopaque, u64) u64 = null,
         next_replay_sequence: ?*const fn (*anyopaque, u64) u64 = null,
+        adoption_epoch: ?*const fn (*anyopaque) u64 = null,
         append_replay_opaque: ?*const fn (Allocator, *anyopaque, u64, []const u8) anyerror!void = null,
         iterate_replay_from: ?*const fn (Allocator, *anyopaque, u64) anyerror![]ReplayEntry = null,
         for_each_replay_from: ?*const fn (*anyopaque, u64, ReplayVisitor) anyerror!void = null,
@@ -1557,6 +1558,14 @@ pub const Store = struct {
     pub fn nextReplaySequence(self: *Store, fallback_next: u64) u64 {
         if (self.vtable.next_replay_sequence) |f| return f(self.ptr, fallback_next);
         return fallback_next;
+    }
+
+    /// Changes whenever the backend adopts state it did not commit through
+    /// this store (another process's or instance's commits). 0 when the
+    /// backend never adopts.
+    pub fn adoptionEpoch(self: *Store) u64 {
+        if (self.vtable.adoption_epoch) |f| return f(self.ptr);
+        return 0;
     }
 
     pub fn appendReplayOpaque(self: *Store, alloc: Allocator, sequence: u64, payload: []const u8) !void {
@@ -2662,6 +2671,11 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return fallback_next;
         }
 
+        pub fn adoptionEpoch(ptr: *anyopaque) u64 {
+            if (@hasDecl(Handle, "adoptionEpoch")) return unbox(ptr).handle.adoptionEpoch();
+            return 0;
+        }
+
         pub fn appendReplayOpaque(alloc: Allocator, ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
             if (@hasDecl(Handle, "appendReplayOpaque")) {
                 return try unbox(ptr).handle.appendReplayOpaque(alloc, sequence, payload);
@@ -2778,6 +2792,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             .abort_bulk_ingest_session = vt.abortBulkIngestSession,
             .last_replay_sequence = vt.lastReplaySequence,
             .next_replay_sequence = vt.nextReplaySequence,
+            .adoption_epoch = vt.adoptionEpoch,
             .append_replay_opaque = vt.appendReplayOpaque,
             .iterate_replay_from = vt.iterateReplayFrom,
             .for_each_replay_from = vt.forEachReplayFrom,

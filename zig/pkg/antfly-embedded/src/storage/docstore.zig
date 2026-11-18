@@ -579,6 +579,9 @@ pub const DocStore = struct {
     // Reservations are not visibility. Zero means the durable committed cut
     // has not yet been loaded; intentional persisted replay floors count.
     committed_replay_next_cached: AtomicU64 = .init(0),
+    /// The backend adoption epoch these caches were derived under; see
+    /// `revalidateAdoptedState`.
+    adopted_epoch: AtomicU64 = .init(0),
     // A failed portable-import rollback leaves a durable recovery marker. Once
     // fenced, this handle must not expose the partial generation or accept
     // writes that restart recovery would later erase. Reopening constructs a
@@ -1708,6 +1711,7 @@ pub const DocStore = struct {
         self: *DocStore,
         admission: backend_types.Namespace.BlockCacheAdmission,
     ) !Txn {
+        self.revalidateAdoptedState();
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
         var txn = try self.beginReadTxnUncheckedWithBlockCacheAdmission(admission);
@@ -1763,6 +1767,7 @@ pub const DocStore = struct {
         self: *DocStore,
         admission: backend_types.Namespace.BlockCacheAdmission,
     ) !Txn {
+        self.revalidateAdoptedState();
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
         self.lockPayloadPolicy();
@@ -2382,6 +2387,7 @@ pub const DocStore = struct {
     }
 
     pub fn beginWriteTxn(self: *DocStore) !Txn {
+        self.revalidateAdoptedState();
         try self.ensurePortableImportOperational();
         const payload_session = try self.createWritePayloadSession();
         errdefer if (payload_session) |session| session.release();
@@ -2398,6 +2404,7 @@ pub const DocStore = struct {
     }
 
     pub fn beginWriteBatchWithOptions(self: *DocStore, options: backend_types.BatchOptions) !Batch {
+        self.revalidateAdoptedState();
         try self.ensurePortableImportOperational();
         const payload_session = try self.createWritePayloadSession();
         errdefer if (payload_session) |session| session.release();
@@ -3062,7 +3069,26 @@ pub const DocStore = struct {
         return self.ensureReplayNextSequenceCached(fallback_next);
     }
 
+    /// Caches here are derived from durable state and advanced by this
+    /// store's own commits. When the backend adopts commits it did not make
+    /// through this store (another process, or a forwarded writer), drop
+    /// them so the next use reloads, and bump the query revisions so result
+    /// caches built on the old state are not reused.
+    fn revalidateAdoptedState(self: *DocStore) void {
+        const epoch = self.runtime_store.adoptionEpoch();
+        const seen = self.adopted_epoch.load(.acquire);
+        if (seen == epoch) return;
+        if (self.adopted_epoch.cmpxchgStrong(seen, epoch, .acq_rel, .acquire) != null) return;
+        self.next_replay_sequence_cached.store(0, .release);
+        self.committed_replay_next_cached.store(0, .release);
+        if (self.replay_index_state.load(.monotonic) == replay_index_missing) self.replay_index_state.store(replay_index_unknown, .monotonic);
+        self.retained_effects_cache.store(0, .release);
+        _ = self.columnar_revision.fetchAdd(1, .acq_rel);
+        _ = self.query_generation_revision.fetchAdd(1, .acq_rel);
+    }
+
     pub fn reserveNextReplaySequence(self: *DocStore, fallback_next: u64) u64 {
+        self.revalidateAdoptedState();
         while (true) {
             if (self.next_replay_sequence_cached.load(.acquire) != 0) {
                 return self.next_replay_sequence_cached.fetchAdd(1, .acq_rel);
@@ -3086,6 +3112,7 @@ pub const DocStore = struct {
     }
 
     pub fn hasReplayEntries(self: *DocStore) !bool {
+        self.revalidateAdoptedState();
         switch (self.replay_index_state.load(.monotonic)) {
             replay_index_available => return true,
             replay_index_missing => return false,
@@ -3162,6 +3189,7 @@ pub const DocStore = struct {
     }
 
     fn ensureReplayNextSequenceCached(self: *DocStore, fallback_next: u64) u64 {
+        self.revalidateAdoptedState();
         const cached = self.next_replay_sequence_cached.load(.acquire);
         if (cached != 0) return cached;
 
@@ -3187,6 +3215,7 @@ pub const DocStore = struct {
     }
 
     fn ensureCommittedReplayNextCached(self: *DocStore, fallback_next: u64) u64 {
+        self.revalidateAdoptedState();
         const cached = self.committed_replay_next_cached.load(.acquire);
         if (cached != 0) return cached;
         // A transient probe/read failure is not a durable empty cut. Leave

@@ -645,17 +645,21 @@ fn canonicalPathAlloc(allocator: std.mem.Allocator, io: Io, path: []const u8) ![
 /// independently opened fd on the same inode. Paired with
 /// `releaseProcessFd`.
 fn acquireProcessFd(io: Io, region_path: []const u8) RegionError!*FdEntry {
-    const inode = (Io.Dir.cwd().statFile(io, region_path, .{}) catch return RegionError.RegionUnavailable).inode;
     fd_registry_mutex.lockUncancelable(io);
     defer fd_registry_mutex.unlock(io);
-    if (fd_registry.get(inode)) |entry| {
-        entry.refs += 1;
-        return entry;
-    }
+    if (Io.Dir.cwd().statFile(io, region_path, .{})) |st| {
+        if (fd_registry.get(st.inode)) |entry| {
+            entry.refs += 1;
+            return entry;
+        }
+    } else |err| if (err != error.FileNotFound) return RegionError.RegionUnavailable;
     // Opened read-write, close-on-exec so a forked-and-exec'd child never
-    // inherits a stale mapping/lock-backing descriptor.
-    const raw_fd = std.posix.openat(std.posix.AT.FDCWD, region_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch return RegionError.RegionUnavailable;
+    // inherits a stale mapping/lock-backing descriptor. Created here, not
+    // by a separate open: this process holds no fd on the file yet.
+    const raw_fd = std.posix.openat(std.posix.AT.FDCWD, region_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .CREAT = true }, 0o600) catch return RegionError.RegionUnavailable;
     errdefer _ = std.posix.system.close(raw_fd);
+    const setup_file: Io.File = .{ .handle = raw_fd, .flags = .{ .nonblocking = false } };
+    const inode = (setup_file.stat(io) catch return RegionError.RegionUnavailable).inode;
     const page = std.heap.page_allocator;
     const entry = page.create(FdEntry) catch return RegionError.RegionUnavailable;
     entry.* = .{ .inode = inode, .fd = raw_fd, .refs = 1 };
@@ -1119,30 +1123,26 @@ pub const Region = struct {
         // tied to a real file," never a mismatch.
         const db_inode: u64 = if (Io.Dir.cwd().statFile(io, canonical_db_path, .{})) |st| st.inode else |_| 0;
 
-        const dir = Io.Dir.cwd();
-        // Deliberately *not* a function-scoped `defer setup_file.close`:
-        // see the comment right before this file closes, a few lines
-        // below, for why it must close before `claimLivenessSlot` runs,
-        // not at function exit.
-        const setup_file = try dir.createFile(io, region_path, .{ .read = true, .truncate = false, .permissions = .fromMode(0o600) });
-        errdefer setup_file.close(io);
-
         // This process's one shared fd for this inode (see
         // `acquireProcessFd`'s own doc comment for why it must be shared,
         // never a second fd opened independently) -- used for the one-
         // time create/validate lock below, the corruption-liveness
         // probe, `claimLivenessSlot`, and later `mmap`; `Io.File` has no
-        // byte-range lock primitive of its own.
+        // byte-range lock primitive of its own. Setup reads and sizes the
+        // file through it too: closing *any* other fd on this file drops
+        // every `fcntl` lock this process holds on it, including the
+        // liveness slots of this process's other live handles, and a peer
+        // would then see their writer or tickets as dead.
         const fd_entry = try acquireProcessFd(io, region_path);
         const raw_fd = fd_entry.fd;
         errdefer releaseProcessFd(io, fd_entry);
+        const setup_file: Io.File = .{ .handle = raw_fd, .flags = .{ .nonblocking = false } };
         // The only blocking lock this module takes, and only here: an
         // `fcntl` byte-range lock (not `Io.File.lock`'s whole-file
         // `flock`; see `setup_lock_offset`'s own doc comment for why)
         // serializing create/validate/rebuild against every other
         // process's own `openSized` call on this same region. Released
-        // explicitly below, alongside `setup_file`'s own close -- not
-        // deferred to function exit, same reasoning.
+        // explicitly below, before this handle claims its liveness slot.
         try fcntlLockBlocking(io, raw_fd, setup_lock_offset, std.c.F.WRLCK);
         errdefer fcntlUnlock(raw_fd, setup_lock_offset);
 
@@ -1230,21 +1230,7 @@ pub const Region = struct {
         const map_len: usize = @intCast(final_header.region_bytes);
         const final_max_readers = final_header.max_readers;
 
-        // `setup_file` must close -- and the setup lock release -- here,
-        // *before* `claimLivenessSlot` below, not at function exit via
-        // `defer`: closing *any* fd this process holds on a file (even
-        // one, like `setup_file`, that never itself took a byte-range
-        // lock) releases *every* `fcntl` lock this process holds on that
-        // file, confirmed empirically on this kernel (a lock taken via
-        // one fd vanished the instant an entirely separate, never-locked
-        // fd on the same file was closed). A `defer` here would close
-        // `setup_file` only after `claimLivenessSlot` had already taken
-        // the real liveness lock this handle is supposed to hold for its
-        // whole lifetime, silently dropping it moments after acquiring
-        // it -- exactly the failure every one of this file's cross-
-        // process liveness tests hit before this reordering.
         fcntlUnlock(raw_fd, setup_lock_offset);
-        setup_file.close(io);
 
         const mapping = std.posix.mmap(null, map_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, raw_fd, 0) catch return RegionError.RegionUnavailable;
         errdefer std.posix.munmap(mapping);
@@ -3025,6 +3011,58 @@ test "shared lock region: closing one of two same-process handles does not drop 
 
     try std.testing.expectEqual(@as(u8, 1), report[0]);
     second.close();
+}
+
+test "shared lock region: opening a second same-process handle does not drop the first's liveness lock" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-second-open.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+    const region_path = try std.fmt.allocPrint(a, "{s}.aflite-lock", .{db_path});
+    defer a.free(region_path);
+
+    // Regression: `openSized` used to set up the file through a second fd
+    // and close it, and closing any fd drops every `fcntl` lock this
+    // process holds on the file -- `first`'s liveness slot included. A peer
+    // then saw `first`'s writer as dead and recovered it while it was live.
+    var first = try Region.open(a, io, db_path);
+    defer first.close();
+    var second = try Region.open(a, io, db_path);
+    defer second.close();
+
+    var pipe_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&pipe_fds));
+    const first_slot = first.own_liveness_slot;
+    const max_readers = first.header().max_readers;
+
+    const child_pid = std.c.fork();
+    if (child_pid == 0) {
+        _ = std.posix.system.close(pipe_fds[0]);
+        const raw_fd = std.posix.openat(std.posix.AT.FDCWD, region_path, .{ .ACCMODE = .RDWR }, 0) catch std.c._exit(1);
+        var fl: std.c.Flock = .{
+            .start = Region.livenessByteOffset(max_readers, first_slot),
+            .len = 1,
+            .pid = 0,
+            .type = std.c.F.WRLCK,
+            .whence = std.c.SEEK.SET,
+        };
+        const still_held: u8 = if (std.c.fcntl(raw_fd, std.c.F.SETLK, &fl) == -1) 1 else 0;
+        var report: [1]u8 = .{still_held};
+        _ = std.c.write(pipe_fds[1], @ptrCast(&report), 1);
+        std.c._exit(0);
+    }
+    _ = std.posix.system.close(pipe_fds[1]);
+    defer _ = std.posix.system.close(pipe_fds[0]);
+    var report: [1]u8 = undefined;
+    try readBounded(pipe_fds[0], &report, 2000);
+    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child_pid, 2000));
+
+    try std.testing.expectEqual(@as(u8, 1), report[0]);
 }
 
 // `max_readers`'s own doc comment explains why this module deliberately

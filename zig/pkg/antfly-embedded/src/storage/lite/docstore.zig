@@ -3013,6 +3013,9 @@ pub const Store = struct {
     workspaces: [2]?*ReadWorkspace = .{ null, null },
     file: native.NativeFile,
     read_generation: ?*ReadGeneration = null,
+    /// `file.adoptionEpoch()` as of the last read-checkpoint publication.
+    /// See `publishAdoptedTip`.
+    published_adoption_epoch: std.atomic.Value(u64) = .init(0),
     // Admission and release never wait for the writer's disk I/O.
     read_mutex: std.Io.Mutex = .init,
     reader_frontier: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
@@ -3885,7 +3888,21 @@ pub const Store = struct {
         self.read_mutex.lockUncancelable(io);
         defer self.read_mutex.unlock(io);
         if (self.read_generation) |generation| generation.checkpoint = self.file.activeCheckpoint();
+        self.published_adoption_epoch.store(self.file.adoptionEpoch(), .release);
         self.read_outcome_unknown = self.file.checkpoint_publication_uncertain or self.secret_store_uncertain;
+    }
+
+    /// Several paths adopt another process's commits into `file` without
+    /// publishing a read checkpoint (a write's base-staleness refresh, a
+    /// maintenance probe). A read must not keep the older cut after that:
+    /// derived caches revalidated against `NativeFile.adoption_epoch` would
+    /// reload state the file has already moved past.
+    fn publishAdoptedTip(self: *Store) void {
+        if (self.published_adoption_epoch.load(.acquire) == self.file.adoptionEpoch()) return;
+        lockStoreExclusive(self);
+        defer self.mutex.unlock();
+        if (self.file.transaction_header != null) return;
+        self.publishReadCheckpointAssumeLocked();
     }
 
     // Called with read_mutex held. Pins are ordered by published sequence.
@@ -6727,6 +6744,11 @@ pub const Store = struct {
         return txn;
     }
 
+    /// See `NativeFile.adoption_epoch`.
+    pub fn adoptionEpoch(self: *Store) u64 {
+        return self.file.adoptionEpoch();
+    }
+
     pub fn lastReplaySequence(self: *Store, fallback_last: u64) u64 {
         const next = self.nextReplaySequence(fallback_last + 1);
         return if (next <= 1) 0 else next - 1;
@@ -6884,6 +6906,10 @@ const RuntimeStore = struct {
 
     pub fn capabilities(self: *RuntimeStore) backend_types.Capabilities {
         return Store.capabilities(self.store);
+    }
+
+    pub fn adoptionEpoch(self: *RuntimeStore) u64 {
+        return self.store.adoptionEpoch();
     }
 
     pub fn beginRead(self: *RuntimeStore) !Txn {
@@ -7106,6 +7132,7 @@ pub const Txn = struct {
             const view = try native.ReadView.open(&store.file, store.file.runtime());
             return .{ .allocator = store.allocator, .store = store, .prefix = prefix, .checkpoint = view.checkpoint, .redo_read_view = view };
         }
+        store.publishAdoptedTip();
         const io = store.file.runtime();
         store.generation_lock.lockSharedUncancelable(io);
         defer store.generation_lock.unlockShared(io);

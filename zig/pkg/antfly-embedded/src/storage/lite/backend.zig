@@ -27,6 +27,9 @@ const capabilities = @import("capabilities.zig");
 const docstore = @import("docstore.zig");
 const index_storage = @import("index_storage.zig");
 const native_catalog_sink = @import("native_catalog_sink.zig");
+/// Key prefix of every native-catalog index record (index content, not
+/// definitions) in the index catalog.
+pub const native_catalog_prefix = native_catalog_sink.reserved_prefix;
 const resource_manager_mod = @import("../resource_manager.zig");
 
 const Allocator = std.mem.Allocator;

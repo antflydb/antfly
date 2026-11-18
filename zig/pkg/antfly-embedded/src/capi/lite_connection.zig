@@ -293,6 +293,7 @@ pub const PreparedPublication = struct {
             const captured_stat = snapshot.file.file.stat(snapshot.file.runtime()) catch null;
             const same_inode = live_stat != null and captured_stat != null and live_stat.?.inode == captured_stat.?.inode;
             if (same_inode) {
+                if (snapshot.file.indexCatalogChangedAfter(snapshot.file.activeCheckpoint().commit_sequence)) self.index_inputs_changed = true;
                 if (snapshot.file.activeCheckpoint().index_catalog_root_page != file.activeCheckpoint().index_catalog_root_page) {
                     const unchanged = self.indexInputsUnchanged(&snapshot.file, file) catch false;
                     if (!unchanged) self.index_inputs_changed = true;
@@ -1352,7 +1353,10 @@ pub const WriterLane = struct {
                 self.holder = std.Thread.getCurrentId();
                 const likely_root = self.last_root;
                 self.mutex.unlock(io);
+                // A suspended immutable query still borrows that root as its
+                // snapshot; only refresh may replace it for this call.
                 const take_fast_path = likely_root != null and likely_root == connection.owner.current and
+                    likely_root.?.immutable_query_borrows == 0 and
                     !mightNeedRefreshAdmission(connection, likely_root.?, intent);
                 if (take_fast_path) {
                     const root = likely_root.?;
@@ -1383,6 +1387,11 @@ pub const WriterLane = struct {
                     self.checked_out = false;
                     self.mutex.unlock(io);
                     self.signalReleased(io);
+                    if (err == error.MaintenanceTurnBusy) {
+                        try waitForMaintenanceTurn(io, local_wait_deadline, unconditional_wait, &backoff_ns);
+                        self.mutex.lockUncancelable(io);
+                        continue;
+                    }
                     return err;
                 };
                 connection.gate.mutex.unlock(io);
@@ -1423,6 +1432,11 @@ pub const WriterLane = struct {
                     self.checked_out = false;
                     self.mutex.unlock(io);
                     self.signalReleased(io);
+                    if (err == error.MaintenanceTurnBusy) {
+                        try waitForMaintenanceTurn(io, local_wait_deadline, unconditional_wait, &backoff_ns);
+                        self.mutex.lockUncancelable(io);
+                        continue;
+                    }
                     return err;
                 };
                 connection.gate.mutex.unlock(io);
@@ -1463,6 +1477,16 @@ pub const WriterLane = struct {
         }
     }
 
+    /// Backs off while a maintenance turn this checkout released the lane
+    /// to finishes, bounded by the checkout's own admission deadline.
+    fn waitForMaintenanceTurn(io: std.Io, deadline: i96, unconditional: bool, backoff_ns: *i96) !void {
+        const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+        if (!unconditional and remaining <= 0) return error.FileBusy;
+        const wait_ns = if (unconditional) @min(backoff_ns.*, poll_max_ns) else @min(backoff_ns.*, remaining);
+        io.sleep(.fromNanoseconds(@intCast(wait_ns)), .awake) catch return error.FileBusy;
+        backoff_ns.* = @min(backoff_ns.* * 2, poll_max_ns);
+    }
+
     pub const MaintenanceCheckout = union(enum) {
         /// Another holder has the lane checked out.
         busy,
@@ -1501,6 +1525,25 @@ pub const WriterLane = struct {
             return .{ .overdue = lease };
         }
         return .{ .parked = lease };
+    }
+
+    /// A call keeps the lane checked out across a commit whose sync level
+    /// applies derived work, and that work can host a maintenance turn which
+    /// borrows the lane again on the same thread. It runs under the outer
+    /// checkout: waiting would wait on this thread's own return.
+    fn heldByCurrentThread(self: *WriterLane) bool {
+        const io = h.handleLockIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.checked_out and self.holder == std.Thread.getCurrentId();
+    }
+
+    /// `PathWriterLock.ReturnTo.give_back` for the synthetic lease a nested
+    /// borrow gets (`heldByCurrentThread`): the outer checkout still owns
+    /// the real lease.
+    fn giveBackNested(ptr: *anyopaque, lease: native.PathWriterLock) void {
+        _ = ptr;
+        _ = lease;
     }
 
     /// Marks a lease this lane checked out so its `close` parks it back here.
@@ -1634,6 +1677,11 @@ pub const WriterLane = struct {
                 },
                 .fresh => break,
                 .busy => {
+                    if (self.heldByCurrentThread()) {
+                        var nested: native.PathWriterLock = .{ .io_impl = undefined, .borrowed_io = io, .file = null };
+                        nested.return_to = .{ .ptr = self, .give_back = giveBackNested };
+                        return .{ .lease = nested, .source = .handoff };
+                    }
                     const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
                     if (!unconditional and remaining <= 0) return error.FileBusy;
                     const wait_ns = if (unconditional) @min(backoff_ns, poll_max_ns) else @min(backoff_ns, remaining);
@@ -1919,6 +1967,17 @@ pub const WriterLane = struct {
     /// nothing parked left to check -- including right after this call
     /// releases it, so a released lease stops the loop from polling at
     /// all rather than spinning on an empty `parked`.
+    /// Test-only: releases a parked lease now, as its idle bound would, for
+    /// a test that then takes the kernel lease directly as another process.
+    pub fn releaseParkedForTest(self: *WriterLane) void {
+        std.debug.assert(h.builtin.is_test);
+        const io = h.handleLockIo();
+        self.mutex.lockUncancelable(io);
+        self.parked_since_ns -= parked_idle_release_ns + std.time.ns_per_s;
+        self.mutex.unlock(io);
+        _ = self.maintainParkedLease();
+    }
+
     pub fn maintainParkedLease(self: *WriterLane) ?i96 {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
@@ -2671,6 +2730,10 @@ pub const Owner = struct {
     }
 
     fn loadedIndexInputsUnchanged(root: *h.Handle, before: *native.NativeFile, after: *native.NativeFile) !bool {
+        // Another writer's index content (native catalog records under the
+        // redo log) is invisible to this root's loaded indexes, which cache
+        // it in memory. Reopen rather than keep serving and writing them.
+        if (before.indexCatalogChangedAfter(before.activeCheckpoint().commit_sequence)) return false;
         if (before.header.indexed_reclamation and after.header.indexed_reclamation) {
             if (std.mem.eql(u8, &before.activeCheckpoint().logical.indexes, &after.activeCheckpoint().logical.indexes)) return true;
             // Prefix comparisons dereference the old root. Its page numbers
@@ -2680,6 +2743,9 @@ pub const Owner = struct {
             } else false;
             if (!retained) return false;
         } else if (before.activeCheckpoint().index_catalog_root_page == after.activeCheckpoint().index_catalog_root_page) return true;
+        // A fold moved another writer's native-catalog index content into
+        // the tree; the per-index prefixes below cover only definitions.
+        if (!try before.indexCatalogPrefixUnchanged(after, h.lite_backend.native_catalog_prefix)) return false;
         if (!try databaseIndexInputsUnchanged(&root.db, before, after)) return false;
         var tables = root.embedded_tables.valueIterator();
         while (tables.next()) |table| if (!try databaseIndexInputsUnchanged(&table.*.db, before, after)) return false;
@@ -3164,6 +3230,15 @@ pub const Owner = struct {
             var latest = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             defer latest.close();
             if ((try latest.file.stat(latest.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
+            // A redo commit's index content leaves the index catalog root in
+            // place; this turn's indexes cached the content as captured.
+            if (file.indexCatalogChangedAfter(file.activeCheckpoint().commit_sequence)) {
+                publication.index_inputs_changed = true;
+                if (scope == .index) {
+                    self.publication_stats.index_input_refusals +|= 1;
+                    return error.EnrichmentWaitCanceled;
+                }
+            }
             if (file.activeCheckpoint().index_catalog_root_page != latest.activeCheckpoint().index_catalog_root_page) {
                 if (!try publication.indexInputsUnchanged(file, &latest)) {
                     publication.index_inputs_changed = true;
@@ -4840,6 +4915,14 @@ pub const Connection = struct {
     /// and refresh again, all within this call's busy timeout -- the same
     /// shape as the allocator-proof wait in `refresh`.
     fn refreshAfterMaintenanceTurn(self: *Connection, lease: *?native.PathWriterLock, skip_lane_wait: bool) !*h.Handle {
+        // A lane checkout cannot wait here: the turn it waits for borrows
+        // the lane this checkout holds. `WriterLane.checkout` checks the
+        // lane back in and retries instead.
+        if (skip_lane_wait) {
+            if (lease.*) |*held| held.close();
+            lease.* = null;
+            return error.MaintenanceTurnBusy;
+        }
         const io = h.handleLockIo();
         const deadline = self.admissionDeadline();
         var backoff_ns: i96 = 100 * std.time.ns_per_us;
@@ -5191,6 +5274,8 @@ test "capi native marker sweep survives foreground replacement while proof is bu
     markers.items[orphan.?].close(io);
     for (0..6) |turn| {
         {
+            // The stopped worker no longer releases the lane's parked lease.
+            owner.writer_lane.releaseParkedForTest();
             owner.gate.mutex.lockUncancelable(io);
             defer owner.gate.mutex.unlock(io);
             var lease = try native.lockWriterPathWithIo(a, io, path);
@@ -5320,6 +5405,9 @@ test "capi native unbounded writer admits reusable pool before a large request" 
             }
             fn publishForeign(self: *@This()) !void {
                 const lock_io = h.handleLockIo();
+                // The waiting writer's lease parks on its lane; release it
+                // as the idle bound would before publishing as a peer.
+                self.owner.writer_lane.releaseParkedForTest();
                 var lease = try native.lockWriterPathWithIo(alloc, lock_io, self.owner.path);
                 defer lease.close();
                 var file = try native.NativeFile.openWithIo(alloc, lock_io, self.owner.path, .{ .externally_locked = true, .no_sync = true });
@@ -7499,6 +7587,7 @@ test "capi native allocator proof issue1431 committed transform visibility timeo
     // A separate refusal before primary execution remains Busy and does not
     // apply the transform. Only derived completion was retried above.
     fixture.connection.options.busy_timeout_ms = 0;
+    fixture.connection.owner.writer_lane.releaseParkedForTest();
     {
         var lease = try native.lockWriterPathWithIo(alloc, h.handleLockIo(), fixture.path);
         defer lease.close();

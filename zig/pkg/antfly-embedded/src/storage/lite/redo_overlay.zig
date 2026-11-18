@@ -261,6 +261,12 @@ pub const SharedRedoOverlay = struct {
     /// written-once, never-updated-in-place chain has no "older version a
     /// pinned reader might still need" to preserve individually.
     pages: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
+    /// Highest commit sequence replayed from the log under each root: a
+    /// commit this process did not make itself (its own commits go through
+    /// `appendVersion`). A redo commit leaves the catalog roots in place, so
+    /// this is how an instance learns another process changed a root's
+    /// logical content after its own checkpoint (`replayedSequence`).
+    replayed_sequence: [3]std.atomic.Value(u64) = .{ .init(0), .init(0), .init(0) },
     /// The last checkpoint `checkpointRedoLog` durably published: any
     /// version with `sequence <= durable_checkpoint_sequence` is also
     /// already reflected in real, physical pages, so it survives in this
@@ -473,6 +479,10 @@ pub const SharedRedoOverlay = struct {
     /// enum). Takes ownership of `value` (already caller-allocated with
     /// the same allocator this overlay uses throughout); duplicates `key`
     /// only the first time it's seen for this root.
+    pub fn replayedSequence(self: *const SharedRedoOverlay, root: u8) u64 {
+        return self.replayed_sequence[root].load(.acquire);
+    }
+
     pub fn appendVersion(
         self: *SharedRedoOverlay,
         _: Allocator,
@@ -1121,6 +1131,7 @@ pub const SharedRedoOverlay = struct {
             errdefer self.entry_pool.destroy(node);
             node.* = decoded;
             const gop = try self.maps[root].getOrPut(allocator, key);
+            _ = self.replayed_sequence[root].fetchMax(sequence, .acq_rel);
             if (gop.found_existing) {
                 node.older = gop.value_ptr.*;
                 // Mirror `appendVersion`'s own accounting: chaining onto an
