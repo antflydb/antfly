@@ -304,6 +304,24 @@ pub const RecoveredWal = struct {
     bytes: []u8,
     replay: posting_wal.Replay,
 
+    /// Replay records borrow from bytes. Shrinking in place preserves those
+    /// pointers. If the allocator cannot shrink, rebuild from the same prefix.
+    fn retainCommittedPrefix(self: *RecoveredWal) !void {
+        const len = self.replay.committed_bytes;
+        if (self.alloc.resize(self.bytes, len)) {
+            self.bytes = if (len == 0) &.{} else self.bytes[0..len];
+            self.replay.valid_bytes = len;
+            return;
+        }
+        const bytes = try self.alloc.dupe(u8, self.bytes[0..len]);
+        errdefer self.alloc.free(bytes);
+        const replay = try posting_wal.Replay.parse(self.alloc, bytes);
+        self.replay.deinit();
+        self.alloc.free(self.bytes);
+        self.bytes = bytes;
+        self.replay = replay;
+    }
+
     pub fn deinit(self: *RecoveredWal) void {
         self.replay.deinit();
         self.alloc.free(self.bytes);
@@ -450,6 +468,7 @@ pub const Store = struct {
         if (recovered.bytes.len != recovered.replay.committed_bytes) {
             if (read_only) return error.PostingWalUncommittedTail;
             try store.replaceWal(recovered.bytes[0..recovered.replay.committed_bytes]);
+            if (retained_open != null) try recovered.retainCommittedPrefix();
         } else if ((mode == .writer or mode == .authoritative_read_only) and
             recovered.replay.committed_bytes > checkpoint.sealedWalBytes())
         {
@@ -1408,7 +1427,7 @@ pub const Store = struct {
     fn readSegmentRetainedFor(self: *Store, descriptor: posting_wal.Checkpoint.Segment) !RetainedSegment {
         const path = try self.segmentPathAlloc(descriptor.generation);
         defer self.alloc.free(path);
-        if (self.storage.mapImmutableArtifact(self.alloc, path)) |artifact| {
+        if (self.storage.mapDirectImmutableArtifact(self.alloc, path)) |artifact| {
             var payload = RetainedSegment{ .mapped = artifact };
             var payload_owned = true;
             defer if (payload_owned) payload.deinit(self.alloc);
@@ -1708,21 +1727,61 @@ test "storage.posting segment store truncates incomplete WAL tail before append"
         .payload = "one",
     }}, 1);
     const committed_bytes = store.wal_committed_bytes;
+    var tail = posting_wal.Writer.initAfterCommitted(alloc, 1, 1);
+    defer tail.deinit();
+    try tail.append(.base, 2, 3, 2, "uncommitted");
+    try memory.storage().appendFileAbsolute(alloc, "/posting-tail/wal-2.afpw", tail.bytes(), false);
     try memory.storage().appendFileAbsolute(alloc, "/posting-tail/wal-2.afpw", "partial", false);
     store.deinit();
 
-    store = try Store.open(alloc, memory.storage(), "/posting-tail");
-    defer store.deinit();
+    var opened = try Store.openAuthoritativeWithSegmentAlloc(alloc, memory.storage(), "/posting-tail", false);
+    defer opened.deinit();
     try std.testing.expectEqual(committed_bytes, try memory.storage().fileSize("/posting-tail/wal-2.afpw"));
-    try store.appendBatch(2, &.{.{
+    var snapshot = try opened.takeWal();
+    defer snapshot.deinit();
+    try std.testing.expectEqual(committed_bytes, snapshot.bytes.len);
+    try std.testing.expectEqual(committed_bytes, snapshot.replay.valid_bytes);
+    try std.testing.expectEqualStrings("one", snapshot.replay.latest(3, .base).?.payload);
+    try opened.store.appendBatch(2, &.{.{
         .kind = .base,
         .posting_id = 3,
         .source_sequence = 2,
         .payload = "two",
     }}, 2);
-    var replay = try store.recoverWal();
+    var replay = try opened.store.recoverWal();
     defer replay.deinit();
     try std.testing.expectEqualStrings("two", replay.replay.latest(3, .base).?.payload);
+}
+
+test "storage.posting validation skips materializing mappings" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const Mapper = struct {
+        fn map(_: *anyopaque, _: Allocator, _: []const u8) !@import("../segment_source.zig").MappedArtifact {
+            @panic("posting validation requested a materializing mapping");
+        }
+    };
+    var vtable = memory.storage().vtable.*;
+    vtable.map_immutable_artifact = Mapper.map;
+    var storage = memory.storage();
+    storage.vtable = &vtable;
+    {
+        var store = try Store.open(alloc, storage, "/posting-materialized");
+        defer store.deinit();
+        var segment_writer = posting_segment.Writer.init(alloc);
+        defer segment_writer.deinit();
+        try segment_writer.appendBaseAt(3, 0, "zero");
+        const segment = try segment_writer.build();
+        defer alloc.free(segment);
+        try store.publishCheckpoint(1, 0, segment);
+    }
+
+    var writer = try Store.open(alloc, storage, "/posting-materialized");
+    defer writer.deinit();
+    var reader = try Store.openWithSegmentAlloc(alloc, storage, "/posting-materialized");
+    defer reader.deinit();
+    try std.testing.expect(!reader.segments[0].isMapped());
 }
 
 test "storage.posting segment store orders maintenance batches independently from source coverage" {

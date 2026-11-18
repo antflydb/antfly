@@ -591,6 +591,8 @@ pub const Storage = struct {
         /// Optional contiguous, file-backed view. The caller owns the mapping
         /// and releases its lease with deinit; no provider lifetime is retained.
         map_immutable_artifact: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").MappedArtifact = null,
+        /// Mapping pins the existing backing file without copying it to scratch.
+        direct_immutable_mapping: bool = false,
         open_immutable_source: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").Source = null,
         /// Artifact-specific reclamation lease with provider-independent
         /// descriptor/runtime ownership. Persistent readers use this capability.
@@ -726,6 +728,11 @@ pub const Storage = struct {
     pub fn mapImmutableArtifact(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").MappedArtifact {
         const map = self.vtable.map_immutable_artifact orelse return error.MappedArtifactUnsupported;
         return BoundaryAbi.call("map_immutable_artifact", self.boundary_dispatch, map, .{ self.ptr, allocator, path });
+    }
+
+    pub fn mapDirectImmutableArtifact(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").MappedArtifact {
+        if (!self.vtable.direct_immutable_mapping) return error.MappedArtifactUnsupported;
+        return self.mapImmutableArtifact(allocator, path);
     }
 
     pub fn openLeasedImmutableSource(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").Source {
@@ -2800,6 +2807,7 @@ const ThreadedNativeStorage = struct {
     const threaded_only_vtable: Storage.VTable = .{
         .acquire_lease = acquireErasedLease,
         .map_immutable_artifact = if (supports_posix_fd_cache) NativeMappedArtifact.create else null,
+        .direct_immutable_mapping = supports_posix_fd_cache,
         .create_dir_path = createDirPath,
         .read_file_alloc = readFileAlloc,
         .read_file_range_alloc = readFileRangeAlloc,
@@ -5589,7 +5597,7 @@ test "native fd cache preserves saturated positional readers during cold mapping
     defer alloc.free(missing);
     try std.testing.expectError(error.FileNotFound, storage.mapImmutableArtifact(alloc, missing));
     for (0..3) |_| {
-        var artifact = try storage.mapImmutableArtifact(alloc, cold);
+        var artifact = try storage.mapDirectImmutableArtifact(alloc, cold);
         defer artifact.deinit();
         try std.testing.expectEqualStrings("cold", artifact.bytes);
         try std.testing.expectEqual(hot_count, pool.snapshotStats().fd_cache_entries);
