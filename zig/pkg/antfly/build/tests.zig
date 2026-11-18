@@ -267,9 +267,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "PDF embedding input public contract",
             "public table query returns hierarchy validation pointers",
             "embedding validation failures share",
+            "api http query parsing preserves operational embedding failures",
             "hierarchy validation body survives",
             "serverless create index normalization resolves and persists",
             "serverless aggregation errors preserve invalid and unsupported classes",
+            "serverless public table query adapter preserves structured error content type",
+            "serverless fallback semantic query reuses embeddings",
             "time series public aggregation failures retain client and operational classes",
         },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
@@ -781,6 +784,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "api http client encodes table name for repair cancel callback",
             "public api routes compile",
             "table repair job records bounded pass and continuation",
+            "table repair job continues bounded passes across restart",
+            "table repair job verifies earlier pending shards before success",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
@@ -2552,6 +2557,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     query_embedding_cache_test_mod.addImport("antfly_cache_budget", antfly_imports.cache_budget);
     query_embedding_cache_test_mod.addImport("antfly_platform", platform_mod);
+    query_embedding_cache_test_mod.addImport("antfly_cancellation", antfly_imports.cancellation);
     query_embedding_cache_test_mod.addImport("vopr", vopr_mod);
     const query_embedding_cache_tests = b.addTest(.{ .root_module = query_embedding_cache_test_mod });
     const run_query_embedding_cache_tests = b.addRunArtifact(query_embedding_cache_tests);
@@ -6064,6 +6070,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     shared_inference_contract_step.dependOn(&run_redirect_tests.step);
     unit_test_step.dependOn(&run_redirect_tests.step);
 
+    const capability_discovery_tests = b.addTest(.{ .root_module = antfly_imports.inference_remote_capabilities });
+    const run_capability_discovery_tests = b.addRunArtifact(capability_discovery_tests);
+    b.step("antfly-inference-capability-discovery-test", "Run remote capability discovery and activation contracts").dependOn(&run_capability_discovery_tests.step);
+    shared_inference_contract_step.dependOn(&run_capability_discovery_tests.step);
+    unit_test_step.dependOn(&run_capability_discovery_tests.step);
+
     inline for (.{ antfly_imports.cache_budget, antfly_imports.inference_types, antfly_imports.inference_work, antfly_imports.inference_local, antfly_imports.inference_vertex }) |mod| {
         const tests = b.addTest(.{ .root_module = mod });
         const run = b.addRunArtifact(tests);
@@ -7227,7 +7239,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const relational_index_lifecycle_step = b.step("antfly-relational-index-lifecycle-test", "Run relational index dependency and retirement admission tests");
     relational_index_lifecycle_step.dependOn(&addFilteredTestRunArtifact(b, relational_index_lifecycle_tests).step);
 
-    const generated_vector_contract_filters = &.{ "ordered artifact inventory publication projects every shared consumer", "embedding input kind generated selectors" };
+    const generated_vector_contract_filters = &.{ "ordered artifact inventory publication projects every shared consumer", "ordered artifact inventory compact proof preserves output CAS history", "embedding input kind generated selectors" };
     const generated_vector_contract_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = generated_vector_contract_filters,

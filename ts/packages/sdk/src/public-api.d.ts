@@ -9530,7 +9530,7 @@ export interface components {
              */
             limit?: number;
             /**
-             * @description When true, the server immediately attempts the first bounded repair pass before returning the job.
+             * @description When true, the server starts the job and continues bounded passes automatically, including after restart. When false, each pass requires an explicit advance request.
              * @default true
              */
             advance?: boolean;

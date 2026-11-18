@@ -1594,6 +1594,7 @@ pub extern fn antfly_storage_owner_restore_control_json(
 /// of JSON: process-local callbacks and absolute monotonic deadlines must not
 /// be lost or reconstructed as a fresh timeout at a compiled boundary.
 pub const QueryOperationRequest = query_abi.QueryOperationRequest;
+pub const query_request_version = query_abi.query_request_version;
 
 pub const ArtifactOperation = enum(u32) {
     corrupt_embedding = 0,

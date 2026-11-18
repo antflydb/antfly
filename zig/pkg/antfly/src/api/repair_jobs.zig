@@ -44,7 +44,7 @@ pub const StoreConfig = struct {
 
 pub const OpenedStore = struct {
     alloc: std.mem.Allocator,
-    path_z: [:0]u8,
+    path_z: ?[:0]u8,
     docstore: *docstore_mod.DocStore,
 
     pub fn open(alloc: std.mem.Allocator, path: []const u8) !OpenedStore {
@@ -64,7 +64,7 @@ pub const OpenedStore = struct {
     pub fn deinit(self: *OpenedStore) void {
         self.docstore.close();
         self.alloc.destroy(self.docstore);
-        self.alloc.free(self.path_z);
+        if (self.path_z) |path| self.alloc.free(path);
         self.* = undefined;
     }
 };
@@ -110,6 +110,13 @@ pub const JobState = struct {
     cursor: ?[]const u8 = null,
     limit: u32,
     force: bool = false,
+    auto_advance: ?bool = null,
+    /// Earliest bounded page with outstanding work. A null cursor means the
+    /// beginning of the table; a null observation means every prior page settled.
+    pending_observation: ?struct { cursor: ?[]const u8 = null } = null,
+    pending_index_groups: ?[]const u64 = null,
+    observe_index_groups: ?[]const u64 = null,
+    repair_groups: ?u64 = null,
     result: db_mod.types.ArtifactRepairResult = .{},
     last_error: ?[]const u8 = null,
     cancel_requested: bool = false,
@@ -244,10 +251,8 @@ pub const Store = struct {
         if (self.pending_maintenance_jobs.count() == 0) self.pending_maintenance_scan_cursor = null;
     }
 
-    /// Returns the next runnable durable control or cancellation without consuming it.
-    /// Inspection is round-robin within the bounded FIFO window; `beginAdvance`
-    /// removes the entry atomically with the queued-to-running transition, so
-    /// supervisor and explicit advances may race safely.
+    /// Returns queued work or an expired running lease without consuming it.
+    /// beginAdvance fences concurrent claims under the same store lock.
     pub fn nextPendingMaintenanceAlloc(self: *Store, alloc: std.mem.Allocator) !?[]u8 {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -277,7 +282,8 @@ pub const Store = struct {
                     self.pending_maintenance_head;
                 continue;
             };
-            var parsed = std.json.parseFromSlice(JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            var parsed = std.json.parseFromSlice(JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch |err| {
+                if (err == error.OutOfMemory) return err;
                 self.removePendingMaintenanceLocked(job_id);
                 job_id_opt = if (next_job_id) |next|
                     if (self.pending_maintenance_jobs.contains(next)) next else self.pending_maintenance_head
@@ -286,9 +292,8 @@ pub const Store = struct {
                 continue;
             };
             defer parsed.deinit();
-            if (!requiresAutomaticAdvance(parsed.value) or
-                !std.mem.eql(u8, parsed.value.phase, phaseString(.queued)))
-            {
+            const running = std.mem.eql(u8, parsed.value.phase, phaseString(.running));
+            if (!requiresAutomaticAdvance(parsed.value)) {
                 self.removePendingMaintenanceLocked(job_id);
                 job_id_opt = if (next_job_id) |next|
                     if (self.pending_maintenance_jobs.contains(next)) next else self.pending_maintenance_head
@@ -297,7 +302,9 @@ pub const Store = struct {
                 continue;
             }
             self.pending_maintenance_scan_cursor = next_job_id;
-            if (parsed.value.next_retry_at_millis > now_ms) {
+            if (parsed.value.next_retry_at_millis > now_ms or
+                (running and !leaseExpired(now_ms, parsed.value.last_updated_at_millis, running_lease_timeout_ms)))
+            {
                 job_id_opt = next_job_id;
                 continue;
             }
@@ -312,6 +319,17 @@ pub const Store = struct {
 
     pub fn quarantinedRecordCount(self: *const Store) u64 {
         return self.quarantined_record_count;
+    }
+
+    pub fn attachRuntime(self: *Store, runtime: *@import("antfly_local_sources").storage_backend_erased.Store) !void {
+        const opened = try self.alloc.create(OpenedStore);
+        errdefer self.alloc.destroy(opened);
+        const docstore = try self.alloc.create(docstore_mod.DocStore);
+        errdefer self.alloc.destroy(docstore);
+        docstore.* = try docstore_mod.DocStore.openRuntime(self.alloc, runtime);
+        errdefer docstore.close();
+        opened.* = .{ .alloc = self.alloc, .path_z = null, .docstore = docstore };
+        try self.attachOpenedStore(opened);
     }
 
     pub fn attachOpenedStore(self: *Store, opened: *OpenedStore) !void {
@@ -339,6 +357,7 @@ pub const Store = struct {
             .phase = phaseString(.queued),
             .repair_status = repairStatusForPhase(.queued, false, false),
             .target = req.target,
+            .auto_advance = if (req.advance) true else null,
             .control = req.control,
             .repair_id = req.repair_id,
             .kind = req.kind,
@@ -400,6 +419,11 @@ pub const Store = struct {
                 .phase = phaseString(.queued),
                 .repair_status = repairStatusForPhase(.queued, true, true),
                 .target = current.target,
+                .auto_advance = current.auto_advance,
+                .pending_observation = current.pending_observation,
+                .pending_index_groups = current.pending_index_groups,
+                .observe_index_groups = current.observe_index_groups,
+                .repair_groups = current.repair_groups,
                 .control = current.control,
                 .repair_id = current.repair_id,
                 .kind = current.kind,
@@ -427,6 +451,11 @@ pub const Store = struct {
             .phase = phaseString(phase),
             .repair_status = repairStatusForPhase(phase, previous.result.has_more, previous.result.debt_remaining),
             .target = previous.target,
+            .auto_advance = previous.auto_advance,
+            .pending_observation = previous.pending_observation,
+            .pending_index_groups = previous.pending_index_groups,
+            .observe_index_groups = previous.observe_index_groups,
+            .repair_groups = previous.repair_groups,
             .control = previous.control,
             .repair_id = previous.repair_id,
             .kind = previous.kind,
@@ -475,6 +504,11 @@ pub const Store = struct {
             .phase = phaseString(phase),
             .repair_status = repairStatusForPhase(phase, true, true),
             .target = current.target,
+            .auto_advance = current.auto_advance,
+            .pending_observation = current.pending_observation,
+            .pending_index_groups = current.pending_index_groups,
+            .observe_index_groups = current.observe_index_groups,
+            .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
             .kind = current.kind,
@@ -498,9 +532,55 @@ pub const Store = struct {
     pub fn recordPass(
         self: *Store,
         alloc: std.mem.Allocator,
-        previous: JobState,
-        pass: db_mod.types.ArtifactRepairResult,
+        previous_state: JobState,
+        pass_result: db_mod.types.ArtifactRepairResult,
     ) ![]u8 {
+        var previous = previous_state;
+        var pass = pass_result;
+        if (pass.observation_changed) {
+            // Durable repair intents survive a routing change. Rediscover the
+            // current groups without force so a completed rebuild stays put.
+            previous.pending_observation = null;
+            previous.pending_index_groups = null;
+            previous.observe_index_groups = null;
+            previous.cursor = null;
+            // Failures from the retired topology cannot describe the current
+            // traversal. Recount debt from the groups the restarted job sees.
+            previous.result.failed = 0;
+            previous.result.unsupported = 0;
+            previous.result.missing_source_docs = 0;
+            pass.failed = 0;
+            pass.unsupported = 0;
+            pass.missing_source_docs = 0;
+            pass.pending_index_groups = null;
+            pass.has_more = true;
+            pass.next_cursor = null;
+            pass.in_progress = 1;
+            pass.debt_remaining = true;
+        }
+        var pending_groups: std.ArrayList(u64) = .empty;
+        defer pending_groups.deinit(alloc);
+        if (previous.pending_index_groups) |groups| try pending_groups.appendSlice(alloc, groups);
+        if (pass.pending_index_groups) |groups| {
+            for (groups) |group| {
+                if (std.mem.indexOfScalar(u64, pending_groups.items, group) == null) try pending_groups.append(alloc, group);
+            }
+        }
+        const tracks_groups = pass.pending_index_groups != null or previous.observe_index_groups != null or previous.pending_index_groups != null;
+        var pending_observation = previous.pending_observation;
+        const stationary_page = pass.has_more and std.mem.eql(u8, previous.cursor orelse "", pass.next_cursor orelse "");
+        if (!tracks_groups and previous.control == null and pass.in_progress != 0 and !stationary_page and pending_observation == null) {
+            pending_observation = .{ .cursor = previous.cursor };
+        }
+        const revisit = !pass.has_more and pending_observation != null;
+        const observe_groups = !pass.has_more and !revisit and pending_groups.items.len != 0;
+        const rewind_cursor = if (revisit) blk: {
+            const cursor = pending_observation.?.cursor orelse break :blk null;
+            break :blk try alloc.dupe(u8, cursor);
+        } else null;
+        defer if (rewind_cursor) |cursor| alloc.free(cursor);
+        const next_cursor = if (revisit or observe_groups) rewind_cursor else pass.next_cursor;
+
         var total = previous.result;
         total.scanned +|= pass.scanned;
         total.groups_scanned +|= pass.groups_scanned;
@@ -526,12 +606,14 @@ pub const Store = struct {
         total.indexes_degraded_after = pass.indexes_degraded_after;
         total.controls_applied +|= pass.controls_applied;
         total.limit = pass.limit;
-        total.has_more = pass.has_more;
+        total.has_more = pass.has_more or revisit or observe_groups;
         // A later page may succeed while documents on an earlier page still
         // failed. Keep that outcome when the traversal reaches its last page.
-        total.debt_remaining = pass.debt_remaining or (previous.control == null and
+        total.debt_remaining = pass.debt_remaining or pending_observation != null or pending_groups.items.len != 0 or (previous.control == null and
             (total.failed != 0 or total.unsupported != 0 or total.missing_source_docs != 0));
-        total.next_cursor = pass.next_cursor;
+        total.next_cursor = next_cursor;
+        total.pending_index_groups = null;
+        if (pass.terminal_error) |reason| total.terminal_error = reason;
 
         // A failed source or shard must not finish the job while another
         // rebuild or provider submission still has work in progress.
@@ -544,7 +626,7 @@ pub const Store = struct {
             total.debt_remaining;
         const phase: JobPhase = if (previous.cancel_requested)
             .cancelled
-        else if (pass.has_more or retryable_in_progress)
+        else if (total.has_more)
             .queued
         else if (failed_debt)
             // Remaining document failures are a repair outcome, not a broken
@@ -552,7 +634,14 @@ pub const Store = struct {
             if (previous.control == null) .completed_with_failures else .failed
         else
             .succeeded;
-        const last_error: ?[]const u8 = if (phase == .cancelled) "cancel_requested" else if (phase == .failed) "repair_debt_remaining" else null;
+        const last_error: ?[]const u8 = if (phase == .cancelled)
+            "cancel_requested"
+        else if (total.failed != 0 and previous.control == null)
+            total.terminal_error orelse previous.last_error
+        else if (phase == .failed)
+            "repair_debt_remaining"
+        else
+            null;
         const now_ms = nowMillis();
 
         lockAtomic(&self.mutex);
@@ -572,6 +661,11 @@ pub const Store = struct {
                 .phase = phaseString(.queued),
                 .repair_status = repairStatusForPhase(.queued, true, true),
                 .target = current.target,
+                .auto_advance = current.auto_advance,
+                .pending_observation = current.pending_observation,
+                .pending_index_groups = current.pending_index_groups,
+                .observe_index_groups = current.observe_index_groups,
+                .repair_groups = current.repair_groups,
                 .control = current.control,
                 .repair_id = current.repair_id,
                 .kind = current.kind,
@@ -601,11 +695,16 @@ pub const Store = struct {
             .phase = phaseString(final_phase),
             .repair_status = repairStatusForPhase(final_phase, total.has_more, total.debt_remaining),
             .target = previous.target,
+            .auto_advance = previous.auto_advance,
+            .pending_observation = if (final_phase == .queued and !revisit) pending_observation else null,
+            .pending_index_groups = if (final_phase == .queued and !observe_groups and pending_groups.items.len != 0) pending_groups.items else null,
+            .observe_index_groups = if (final_phase != .queued) null else if (observe_groups) pending_groups.items else previous.observe_index_groups,
+            .repair_groups = pass.repair_groups orelse previous.repair_groups,
             .control = previous.control,
             .repair_id = previous.repair_id,
             .kind = previous.kind,
             .index = previous.index,
-            .cursor = pass.next_cursor,
+            .cursor = next_cursor,
             .limit = previous.limit,
             // Force is an edge-triggered dispatch policy. Keep it only while a
             // bounded table cursor has more groups that have not yet received
@@ -615,6 +714,10 @@ pub const Store = struct {
             .result = total,
             .last_error = final_last_error,
             .cancel_requested = cancel_requested,
+            .next_retry_at_millis = if (previous.auto_advance == true and final_phase == .queued and (revisit or observe_groups or (retryable_in_progress and stationary_page)))
+                now_ms +| repairObservationDelayMs(previous.job_id)
+            else
+                0,
             .created_at_millis = previous.created_at_millis,
             .last_updated_at_millis = now_ms,
             .expires_at_millis = now_ms + self.retentionMillis(),
@@ -647,7 +750,7 @@ pub const Store = struct {
         if (!is_running and current.next_retry_at_millis > now_ms) {
             return .{ .encoded = try alloc.dupe(u8, current_encoded), .started = false };
         }
-        if (!is_running and !jobStateTransitionTokenMatches(current, expected)) {
+        if (!jobStateTransitionTokenMatches(current, expected)) {
             return .{ .encoded = try alloc.dupe(u8, current_encoded), .started = false };
         }
 
@@ -658,6 +761,11 @@ pub const Store = struct {
             .phase = phaseString(.running),
             .repair_status = repairStatusForPhase(.running, current.result.has_more, current.result.debt_remaining),
             .target = current.target,
+            .auto_advance = current.auto_advance,
+            .pending_observation = current.pending_observation,
+            .pending_index_groups = current.pending_index_groups,
+            .observe_index_groups = current.observe_index_groups,
+            .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
             .kind = current.kind,
@@ -702,6 +810,11 @@ pub const Store = struct {
             .phase = current.phase,
             .repair_status = current.repair_status,
             .target = current.target,
+            .auto_advance = current.auto_advance,
+            .pending_observation = current.pending_observation,
+            .pending_index_groups = current.pending_index_groups,
+            .observe_index_groups = current.observe_index_groups,
+            .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
             .kind = current.kind,
@@ -747,6 +860,11 @@ pub const Store = struct {
             .phase = phaseString(phase),
             .repair_status = repairStatusForPhase(phase, current.result.has_more, current.result.debt_remaining),
             .target = current.target,
+            .auto_advance = current.auto_advance,
+            .pending_observation = current.pending_observation,
+            .pending_index_groups = current.pending_index_groups,
+            .observe_index_groups = current.observe_index_groups,
+            .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
             .kind = current.kind,
@@ -793,26 +911,31 @@ pub const Store = struct {
         total.unresolved = pass.unresolved;
         total.in_progress = pass.in_progress;
         total.limit = pass.limit;
-        total.has_more = pass.has_more;
-        total.debt_remaining = pass.has_more;
-        total.next_cursor = pass.next_cursor;
-        const phase: JobPhase = if (pass.has_more) .queued else .cancelled;
+        total.has_more = pass.has_more or pass.observation_changed;
+        total.debt_remaining = total.has_more;
+        total.next_cursor = if (pass.observation_changed) null else pass.next_cursor;
+        const phase: JobPhase = if (total.has_more) .queued else .cancelled;
         const encoded = try encodeState(alloc, .{
             .job_id = current.job_id,
             .attempt_id = current.attempt_id,
             .table_name = current.table_name,
             .phase = phaseString(phase),
-            .repair_status = repairStatusForPhase(phase, pass.has_more, pass.has_more),
+            .repair_status = repairStatusForPhase(phase, total.has_more, total.has_more),
             .target = current.target,
+            .auto_advance = current.auto_advance,
+            .pending_observation = current.pending_observation,
+            .pending_index_groups = current.pending_index_groups,
+            .observe_index_groups = current.observe_index_groups,
+            .repair_groups = pass.repair_groups orelse current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
             .kind = current.kind,
             .index = current.index,
-            .cursor = pass.next_cursor,
+            .cursor = total.next_cursor,
             .limit = current.limit,
             .force = false,
             .result = total,
-            .last_error = if (pass.has_more) "cancel_pending" else "cancel_requested",
+            .last_error = if (total.has_more) "cancel_pending" else "cancel_requested",
             .cancel_requested = true,
             .created_at_millis = current.created_at_millis,
             .last_updated_at_millis = now_ms,
@@ -833,6 +956,7 @@ pub const Store = struct {
         while (it.next()) |entry| {
             var parsed = std.json.parseFromSlice(JobState, self.alloc, entry.value_ptr.*, .{ .ignore_unknown_fields = true }) catch continue;
             defer parsed.deinit();
+            if (requiresAutomaticAdvance(parsed.value)) continue;
             if (parsed.value.expires_at_millis == 0 or parsed.value.expires_at_millis > now_ms) continue;
             expired.append(self.alloc, entry.key_ptr.*) catch continue;
         }
@@ -857,6 +981,7 @@ pub const Store = struct {
             for (durable_results) |kv| {
                 var parsed = std.json.parseFromSlice(JobState, self.alloc, kv.value, .{ .ignore_unknown_fields = true }) catch continue;
                 defer parsed.deinit();
+                if (requiresAutomaticAdvance(parsed.value)) continue;
                 if (parsed.value.expires_at_millis == 0 or parsed.value.expires_at_millis > now_ms) continue;
                 expired.append(self.alloc, parsed.value.job_id) catch continue;
                 const delete_key = self.alloc.dupe(u8, kv.key) catch continue;
@@ -937,7 +1062,7 @@ pub const Store = struct {
         // state. Once the store write succeeds, publishing the matching cache
         // value cannot fail and leave scheduler metadata out of sync.
         if (!self.jobs.contains(job_id)) try self.jobs.ensureUnusedCapacity(self.alloc, 1);
-        const queue_job = requiresAutomaticAdvance(parsed.value) and std.mem.eql(u8, parsed.value.phase, phaseString(.queued));
+        const queue_job = requiresAutomaticAdvance(parsed.value);
         const enqueued = if (queue_job) try self.enqueuePendingMaintenanceLocked(job_id) else false;
         errdefer if (enqueued) self.removePendingMaintenanceLocked(job_id);
         if (self.opened_store) |opened| {
@@ -1053,6 +1178,11 @@ pub const Store = struct {
                     .phase = phaseString(recovered_phase),
                     .repair_status = repairStatusForPhase(recovered_phase, parsed.value.result.has_more, parsed.value.result.debt_remaining),
                     .target = parsed.value.target,
+                    .auto_advance = parsed.value.auto_advance,
+                    .pending_observation = parsed.value.pending_observation,
+                    .pending_index_groups = parsed.value.pending_index_groups,
+                    .observe_index_groups = parsed.value.observe_index_groups,
+                    .repair_groups = parsed.value.repair_groups,
                     .control = parsed.value.control,
                     .repair_id = parsed.value.repair_id,
                     .kind = parsed.value.kind,
@@ -1097,7 +1227,7 @@ pub const Store = struct {
                 defer self.alloc.free(active_key);
                 try opened.docstore.putBatch(&.{}, &.{active_key});
             }
-            if (requiresAutomaticAdvance(parsed.value)) {
+            if (requiresAutomaticAdvance(parsed.value) and (was_running or std.mem.eql(u8, parsed.value.phase, phaseString(.queued)))) {
                 const enqueued = try self.enqueuePendingMaintenanceLocked(parsed.value.job_id);
                 errdefer if (enqueued) self.removePendingMaintenanceLocked(parsed.value.job_id);
             }
@@ -1145,6 +1275,11 @@ pub const Store = struct {
             .phase = phaseString(.cancelled),
             .repair_status = repairStatusForPhase(.cancelled, current.result.has_more, current.result.debt_remaining),
             .target = current.target,
+            .auto_advance = current.auto_advance,
+            .pending_observation = current.pending_observation,
+            .pending_index_groups = current.pending_index_groups,
+            .observe_index_groups = current.observe_index_groups,
+            .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
             .kind = current.kind,
@@ -1167,6 +1302,11 @@ pub const Store = struct {
 
 const running_lease_timeout_ms: u64 = 300_000;
 const pending_maintenance_scan_limit: usize = 64;
+
+fn repairObservationDelayMs(job_id: u64) u64 {
+    const interval_ms = 1000;
+    return interval_ms + (job_id % (interval_ms / 4));
+}
 
 fn retryDelayMs(job_id: u64, attempt_id: u64) u64 {
     return @import("job_retry.zig").retryDelayMs(job_id, attempt_id);
@@ -1243,11 +1383,11 @@ pub fn requiresDurableCancel(state: JobState) bool {
         !isTerminalPhase(state.phase);
 }
 
-/// Only durable controls and cancellation obligations are automatically advanced.
-/// Ordinary repair jobs retain their existing explicit-advance contract.
+/// Durable controls and started repair jobs continue through bounded passes.
+/// Jobs created with advance=false remain available for explicit advancement.
 pub fn requiresAutomaticAdvance(state: JobState) bool {
-    return requiresDurableCancel(state) or
-        (state.control != null and !state.cancel_requested and !isTerminalPhase(state.phase));
+    return !isTerminalPhase(state.phase) and
+        (state.auto_advance == true or requiresDurableCancel(state) or (state.control != null and !state.cancel_requested));
 }
 
 pub fn validateStartRequest(req: StartRequest) !void {
@@ -1423,7 +1563,9 @@ test "table repair job records bounded pass and continuation" {
 }
 
 fn runOnePassForTest(alloc: std.mem.Allocator, store: *Store, req: StartRequest, pass: db_mod.types.ArtifactRepairResult) !std.json.Parsed(JobState) {
-    const started = try store.startJob(alloc, "docs", req);
+    var manual = req;
+    manual.advance = false;
+    const started = try store.startJob(alloc, "docs", manual);
     defer alloc.free(started);
     var parsed_start = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
     defer parsed_start.deinit();
@@ -1712,6 +1854,11 @@ test "durable cancellation scan rotates past a backed off head window" {
             .phase = current.phase,
             .repair_status = current.repair_status,
             .target = current.target,
+            .auto_advance = current.auto_advance,
+            .pending_observation = current.pending_observation,
+            .pending_index_groups = current.pending_index_groups,
+            .observe_index_groups = current.observe_index_groups,
+            .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
             .kind = current.kind,
@@ -2267,4 +2414,201 @@ test "artifact repair final pass keeps earlier failures while clearing pending g
     try std.testing.expectEqual(@as(u64, 0), final.value.result.in_progress);
     try std.testing.expectEqual(@as(u64, 0), final.value.result.unresolved);
     try std.testing.expect(final.value.result.debt_remaining);
+}
+
+test "table repair job continues bounded passes across restart" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/repair-resume", .{tmp.sub_path});
+    defer a.free(path);
+
+    {
+        var store = Store.init(a, .{});
+        defer store.deinit();
+        try attachOpenedTestStore(&store, a, path);
+        const started = try store.startJob(a, "docs", .{ .target = "index", .index = "semantic", .limit = 100 });
+        defer a.free(started);
+        const state = try std.json.parseFromSlice(JobState, a, started, .{});
+        defer state.deinit();
+        const begin = try store.beginAdvance(a, state.value);
+        defer a.free(begin.encoded);
+        const running = try std.json.parseFromSlice(JobState, a, begin.encoded, .{});
+        defer running.deinit();
+        var cursor = "1:doc100".*;
+        const next = try store.recordPass(a, running.value, .{
+            .repaired = 100,
+            .has_more = true,
+            .next_cursor = &cursor,
+        });
+        defer a.free(next);
+    }
+
+    var store = Store.init(a, .{});
+    defer store.deinit();
+    try attachOpenedTestStore(&store, a, path);
+    const pending = (try store.nextPendingMaintenanceAlloc(a)) orelse return error.TestUnexpectedResult;
+    defer a.free(pending);
+    const state = try std.json.parseFromSlice(JobState, a, pending, .{});
+    defer state.deinit();
+    try std.testing.expectEqualStrings("1:doc100", state.value.cursor.?);
+    const begin = try store.beginAdvance(a, state.value);
+    defer a.free(begin.encoded);
+    const running = try std.json.parseFromSlice(JobState, a, begin.encoded, .{});
+    defer running.deinit();
+    const finished = try store.recordPass(a, running.value, .{ .repaired = 21 });
+    defer a.free(finished);
+    const complete = try std.json.parseFromSlice(JobState, a, finished, .{});
+    defer complete.deinit();
+    try std.testing.expectEqualStrings("succeeded", complete.value.phase);
+    try std.testing.expectEqual(@as(u64, 121), complete.value.result.repaired);
+    try std.testing.expect((try store.nextPendingMaintenanceAlloc(a)) == null);
+}
+
+test "automatic repair reclaims an expired lease and defers a stalled cursor" {
+    const a = std.testing.allocator;
+    var store = Store.init(a, .{});
+    defer store.deinit();
+    const initial = try store.startJob(a, "docs", .{ .cursor = "page" });
+    defer a.free(initial);
+    const started = try std.json.parseFromSlice(JobState, a, initial, .{});
+    defer started.deinit();
+    const claim = try store.beginAdvance(a, started.value);
+    defer a.free(claim.encoded);
+    const running = try std.json.parseFromSlice(JobState, a, claim.encoded, .{});
+    defer running.deinit();
+    try std.testing.expect((try store.nextPendingMaintenanceAlloc(a)) == null);
+
+    var expired = running.value;
+    expired.last_updated_at_millis = nowMillis() -| running_lease_timeout_ms;
+    const expired_json = try encodeState(a, expired);
+    defer a.free(expired_json);
+    try store.storeEncodedLocked(expired.job_id, expired_json, null);
+    const pending = (try store.nextPendingMaintenanceAlloc(a)) orelse return error.TestUnexpectedResult;
+    defer a.free(pending);
+    const reclaim = try store.beginAdvance(a, expired);
+    defer a.free(reclaim.encoded);
+    try std.testing.expect(reclaim.started);
+    const reclaimed = try std.json.parseFromSlice(JobState, a, reclaim.encoded, .{});
+    defer reclaimed.deinit();
+    try std.testing.expectEqual(expired.attempt_id + 1, reclaimed.value.attempt_id);
+
+    const observed = try store.recordPass(a, reclaimed.value, .{
+        .in_progress = 1,
+        .has_more = true,
+        .next_cursor = @constCast("page"),
+    });
+    defer a.free(observed);
+    const waiting = try std.json.parseFromSlice(JobState, a, observed, .{});
+    defer waiting.deinit();
+    try std.testing.expect(waiting.value.next_retry_at_millis > waiting.value.last_updated_at_millis);
+    try std.testing.expect((try store.nextPendingMaintenanceAlloc(a)) == null);
+}
+
+test "table repair job verifies earlier pending shards before success" {
+    const a = std.testing.allocator;
+    var store = Store.init(a, .{});
+    defer store.deinit();
+    var state = try store.startJob(a, "docs", .{ .target = "index", .index = "semantic", .limit = 1, .force = true, .advance = false });
+    defer a.free(state);
+    var next_shard = "2:".*;
+    const passes: []const db_mod.types.ArtifactRepairResult = &.{
+        .{ .scanned = 1, .in_progress = 1, .has_more = true, .debt_remaining = true, .next_cursor = &next_shard },
+        .{ .scanned = 1 },
+        .{ .scanned = 1 },
+    };
+    for (passes, 0..) |pass, i| {
+        const current = try std.json.parseFromSlice(JobState, a, state, .{});
+        defer current.deinit();
+        const claim = try store.beginAdvance(a, current.value);
+        defer a.free(claim.encoded);
+        try std.testing.expect(claim.started);
+        const running = try std.json.parseFromSlice(JobState, a, claim.encoded, .{});
+        defer running.deinit();
+        const updated = try store.recordPass(a, running.value, pass);
+        a.free(state);
+        state = updated;
+        const next = try std.json.parseFromSlice(JobState, a, state, .{});
+        defer next.deinit();
+        try std.testing.expectEqualStrings(if (i == passes.len - 1) "succeeded" else "queued", next.value.phase);
+        if (i == 0) {
+            try std.testing.expect(next.value.pending_observation != null);
+            try std.testing.expect(next.value.force);
+        }
+        if (i == 1) {
+            try std.testing.expect(next.value.cursor == null);
+            try std.testing.expect(next.value.pending_observation == null);
+            try std.testing.expect(!next.value.force);
+        }
+    }
+}
+
+test "table index repair polls only pending groups and records terminal failure" {
+    const a = std.testing.allocator;
+    var store = Store.init(a, .{});
+    defer store.deinit();
+    var state = try store.startJob(a, "docs", .{ .target = "index", .index = "semantic", .limit = 1, .force = true, .advance = false });
+    defer a.free(state);
+    var group = [_]u64{1};
+    var next = "2:".*;
+    var terminal = "IndexRepairConfigurationChanged".*;
+    const passes: []const db_mod.types.ArtifactRepairResult = &.{
+        .{ .scanned = 1, .in_progress = 1, .has_more = true, .debt_remaining = true, .next_cursor = &next, .pending_index_groups = &group },
+        .{ .scanned = 1, .pending_index_groups = &.{} },
+        .{ .scanned = 1, .failed = 1, .debt_remaining = true, .terminal_error = &terminal, .pending_index_groups = &.{} },
+    };
+    for (passes, 0..) |pass, i| {
+        const current = try std.json.parseFromSlice(JobState, a, state, .{});
+        defer current.deinit();
+        if (i == 2) {
+            try std.testing.expectEqualSlices(u64, &group, current.value.observe_index_groups.?);
+            try std.testing.expect(!current.value.force);
+            try std.testing.expect(current.value.cursor == null);
+        }
+        const claim = try store.beginAdvance(a, current.value);
+        defer a.free(claim.encoded);
+        try std.testing.expect(claim.started);
+        const running = try std.json.parseFromSlice(JobState, a, claim.encoded, .{});
+        defer running.deinit();
+        const updated = try store.recordPass(a, running.value, pass);
+        a.free(state);
+        state = updated;
+    }
+    const completed = try std.json.parseFromSlice(JobState, a, state, .{});
+    defer completed.deinit();
+    try std.testing.expectEqualStrings("completed_with_failures", completed.value.phase);
+    try std.testing.expectEqualStrings(&terminal, completed.value.last_error.?);
+}
+
+test "table index repair rediscovers groups when observation becomes stale" {
+    const a = std.testing.allocator;
+    var store = Store.init(a, .{});
+    defer store.deinit();
+    var state = try store.startJob(a, "docs", .{ .target = "index", .index = "semantic", .limit = 1, .force = true, .advance = false });
+    defer a.free(state);
+    var group = [_]u64{1};
+    const passes: []const db_mod.types.ArtifactRepairResult = &.{
+        .{ .scanned = 1, .in_progress = 1, .debt_remaining = true, .pending_index_groups = &group },
+        .{ .observed_only = true, .observation_changed = true, .pending_index_groups = &.{} },
+    };
+    for (passes, 0..) |pass, i| {
+        const current = try std.json.parseFromSlice(JobState, a, state, .{});
+        defer current.deinit();
+        if (i == 1) try std.testing.expectEqualSlices(u64, &group, current.value.observe_index_groups.?);
+        const claim = try store.beginAdvance(a, current.value);
+        defer a.free(claim.encoded);
+        try std.testing.expect(claim.started);
+        const running = try std.json.parseFromSlice(JobState, a, claim.encoded, .{});
+        defer running.deinit();
+        const updated = try store.recordPass(a, running.value, pass);
+        a.free(state);
+        state = updated;
+    }
+    const queued = try std.json.parseFromSlice(JobState, a, state, .{});
+    defer queued.deinit();
+    try std.testing.expectEqualStrings("queued", queued.value.phase);
+    try std.testing.expect(queued.value.observe_index_groups == null);
+    try std.testing.expect(queued.value.pending_index_groups == null);
+    try std.testing.expect(queued.value.cursor == null);
+    try std.testing.expect(!queued.value.force);
 }

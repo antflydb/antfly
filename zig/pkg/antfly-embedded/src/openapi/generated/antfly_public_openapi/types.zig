@@ -17160,7 +17160,7 @@ pub const TableRepairJobStartRequest = struct {
     force: ?bool = null,
     /// Maximum artifact repair records to attempt per pass. For target=index, any positive value permits one named index repair.
     limit: ?u32 = null,
-    /// When true, the server immediately attempts the first bounded repair pass before returning the job.
+    /// When true, the server starts the job and continues bounded passes automatically, including after restart. When false, each pass requires an explicit advance request.
     advance: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

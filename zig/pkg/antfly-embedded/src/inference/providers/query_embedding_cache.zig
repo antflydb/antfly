@@ -18,6 +18,7 @@ const cache_budget = @import("antfly_cache_budget");
 const platform_time = @import("antfly_platform").time;
 
 pub const Key = [32]u8;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const Config = struct {
     enabled: bool = true,
@@ -96,6 +97,7 @@ const Flight = struct {
     done: bool = false,
     result: ?[]f32 = null,
     err: ?anyerror = null,
+    retry_not_before_ns: u64 = 0,
     ready: std.Io.Event = .unset,
 };
 
@@ -212,6 +214,59 @@ pub const QueryEmbeddingCache = struct {
         context: *anyopaque,
         compute: ComputeFn,
     ) ![]f32 {
+        return self.getOrComputeWithCancellation(budget, caller_alloc, key, deadline_ns, .none, context, compute);
+    }
+
+    pub fn getOrComputeWithCancellation(
+        self: *QueryEmbeddingCache,
+        budget: *cache_budget.CacheBudget,
+        caller_alloc: std.mem.Allocator,
+        key: Key,
+        deadline_ns: ?u64,
+        cancellation: CancellationToken,
+        context: *anyopaque,
+        compute: ComputeFn,
+    ) ![]f32 {
+        return self.getOrComputeWithRetryHint(budget, caller_alloc, key, deadline_ns, cancellation, context, compute, null);
+    }
+
+    pub fn getOrComputeWithRetryHint(
+        self: *QueryEmbeddingCache,
+        budget: *cache_budget.CacheBudget,
+        caller_alloc: std.mem.Allocator,
+        key: Key,
+        deadline_ns: ?u64,
+        cancellation: CancellationToken,
+        context: *anyopaque,
+        compute: ComputeFn,
+        retry_not_before_ns: ?*u64,
+    ) ![]f32 {
+        while (true) {
+            if (retry_not_before_ns) |hint| hint.* = 0;
+            try cancellation.check();
+            if (deadlineExpiredAt(self.nowNs(), deadline_ns)) return error.Timeout;
+            const vector = self.getOrComputeOnce(budget, caller_alloc, key, deadline_ns, cancellation, context, compute, retry_not_before_ns) catch |err| {
+                if (err == error.QueryEmbeddingProducerAbandoned) continue;
+                return err;
+            };
+            errdefer caller_alloc.free(vector);
+            try cancellation.check();
+            if (deadlineExpiredAt(self.nowNs(), deadline_ns)) return error.Timeout;
+            return vector;
+        }
+    }
+
+    fn getOrComputeOnce(
+        self: *QueryEmbeddingCache,
+        budget: *cache_budget.CacheBudget,
+        caller_alloc: std.mem.Allocator,
+        key: Key,
+        deadline_ns: ?u64,
+        cancellation: CancellationToken,
+        context: *anyopaque,
+        compute: ComputeFn,
+        retry_not_before_ns: ?*u64,
+    ) ![]f32 {
         try self.chargeWork(.request, 1);
         if (deadlineExpiredAt(self.nowNs(), deadline_ns)) return error.Timeout;
         if (!self.config.enabled) return self.computeUncachedInner(caller_alloc, deadline_ns, context, compute);
@@ -256,6 +311,11 @@ pub const QueryEmbeddingCache = struct {
         }
 
         if (self.flights.get(key)) |flight| {
+            if (flight.done and (if (flight.err) |err| err == error.QueryEmbeddingProducerAbandoned else false)) {
+                self.mutex.unlock(io);
+                try io.sleep(.fromMilliseconds(1), .awake);
+                return error.QueryEmbeddingProducerAbandoned;
+            }
             flight.refs += 1;
             self.counters.coalesced_waiters +|= 1;
             self.mutex.unlock(io);
@@ -265,7 +325,7 @@ pub const QueryEmbeddingCache = struct {
                 self.mutex.unlock(io);
                 return err;
             };
-            self.waitForFlight(flight, deadline_ns) catch |err| {
+            self.waitForFlight(flight, deadline_ns, cancellation) catch |err| {
                 self.mutex.lockUncancelable(io);
                 if (err == error.Timeout) self.counters.waiter_timeouts +|= 1;
                 self.releaseFlightLocked(key, flight);
@@ -273,6 +333,7 @@ pub const QueryEmbeddingCache = struct {
                 return err;
             };
             const result = copyFlightResult(caller_alloc, flight) catch |err| {
+                if (retry_not_before_ns) |hint| hint.* = flight.retry_not_before_ns;
                 self.mutex.lockUncancelable(io);
                 self.releaseFlightLocked(key, flight);
                 self.mutex.unlock(io);
@@ -323,9 +384,11 @@ pub const QueryEmbeddingCache = struct {
             return err;
         };
         const computed = compute(context, self.alloc) catch |err| {
+            const abandoned = ownerStopped(self.nowNs(), deadline_ns, cancellation);
             self.mutex.lockUncancelable(io);
             self.recordProducerDurationLocked(compute_started_ns);
-            flight.err = err;
+            flight.err = if (abandoned) error.QueryEmbeddingProducerAbandoned else err;
+            flight.retry_not_before_ns = if (abandoned) 0 else if (retry_not_before_ns) |hint| hint.* else 0;
             flight.done = true;
             flight.ready.set(io);
             self.releaseFlightLocked(key, flight);
@@ -435,21 +498,23 @@ pub const QueryEmbeddingCache = struct {
         self.mutex.unlock(io);
     }
 
-    fn waitForFlight(self: *QueryEmbeddingCache, flight: *Flight, deadline_ns: ?u64) !void {
-        const deadline = deadline_ns orelse {
-            // A coalesced waiter is not the producer and owns no shared state
-            // that requires an uncancelable region. Let its enclosing std.Io
-            // task be canceled, then release its flight reference through the
-            // caller's existing error path.
-            try flight.ready.wait(self.io);
-            return;
-        };
+    fn ownerStopped(now_ns: u64, deadline_ns: ?u64, cancellation: CancellationToken) bool {
+        cancellation.check() catch return true;
+        return deadlineExpiredAt(now_ns, deadline_ns);
+    }
+
+    fn waitForFlight(self: *QueryEmbeddingCache, flight: *Flight, deadline_ns: ?u64, cancellation: CancellationToken) !void {
+        const cancelable = cancellation.check_fn != null or cancellation.is_cancelled_fn != null;
+        if (deadline_ns == null and !cancelable) return flight.ready.wait(self.io);
         while (!flight.ready.isSet()) {
+            try cancellation.check();
             const now = self.nowNs();
-            if (now >= deadline) return error.Timeout;
+            if (deadlineExpiredAt(now, deadline_ns)) return error.Timeout;
+            const maximum_wait = if (deadline_ns) |deadline| deadline - now else std.math.maxInt(i64);
+            const wait_ns = if (cancelable) @min(maximum_wait, 25 * std.time.ns_per_ms) else maximum_wait;
             flight.ready.waitTimeout(self.io, .{
                 .duration = .{
-                    .raw = std.Io.Duration.fromNanoseconds(@intCast(deadline - now)),
+                    .raw = std.Io.Duration.fromNanoseconds(@intCast(wait_ns)),
                     .clock = .awake,
                 },
             }) catch |err| switch (err) {
@@ -457,6 +522,8 @@ pub const QueryEmbeddingCache = struct {
                 error.Canceled => return error.Canceled,
             };
         }
+        try cancellation.check();
+        if (deadlineExpiredAt(self.nowNs(), deadline_ns)) return error.Timeout;
     }
 
     fn releaseFlightLocked(self: *QueryEmbeddingCache, key: Key, flight: *Flight) void {
@@ -741,6 +808,105 @@ pub fn testConcurrentCoalescing() !void {
 
 test "query embedding cache coalesces concurrent misses" {
     try testConcurrentCoalescing();
+}
+
+test "query embedding waiters can cancel independently and replace an abandoned producer" {
+    try testProducerFailureSharing(true);
+}
+
+test "query embedding waiters share provider cancellation when the producer is live" {
+    try testProducerFailureSharing(false);
+}
+
+fn testProducerFailureSharing(abandon_owner: bool) !void {
+    const Worker = struct {
+        cache: *QueryEmbeddingCache,
+        budget: *cache_budget.CacheBudget,
+        io: std.Io,
+        cancel: std.atomic.Value(bool) = .init(false),
+        entered: std.Io.Event = .unset,
+        block: bool = false,
+        request_can_cancel: bool = true,
+        failure: ?anyerror = null,
+        result: ?[]f32 = null,
+
+        fn compute(ptr: *anyopaque, a: std.mem.Allocator) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.set(self.io);
+            if (self.block) {
+                while (!self.cancel.load(.acquire)) try self.io.sleep(.fromMilliseconds(1), .awake);
+                return error.Canceled;
+            }
+            return a.dupe(f32, &.{2});
+        }
+
+        fn run(self: *@This()) void {
+            const deadline = self.cache.nowNs() + 3 * std.time.ns_per_s;
+            self.result = self.cache.getOrComputeWithCancellation(
+                self.budget,
+                std.heap.page_allocator,
+                @splat(0),
+                deadline,
+                if (self.request_can_cancel) CancellationToken.fromAtomic(&self.cancel) else .none,
+                self,
+                compute,
+            ) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    const a = std.heap.page_allocator;
+    const io = std.testing.io;
+    var budget = cache_budget.CacheBudget.init(1024 * 1024);
+    var cache = QueryEmbeddingCache.init(a, io, .{ .max_inflight = 1 });
+    defer cache.deinit(&budget);
+    var owner: Worker = .{ .cache = &cache, .budget = &budget, .io = io, .block = true, .request_can_cancel = abandon_owner };
+    var owner_task = try io.concurrent(Worker.run, .{&owner});
+    defer {
+        owner.cancel.store(true, .release);
+        owner_task.await(io);
+        if (owner.result) |vector| a.free(vector);
+    }
+    try owner.entered.wait(io);
+
+    var departing: Worker = .{ .cache = &cache, .budget = &budget, .io = io };
+    var departing_task = try io.concurrent(Worker.run, .{&departing});
+    defer {
+        departing.cancel.store(true, .release);
+        departing_task.await(io);
+        if (departing.result) |vector| a.free(vector);
+    }
+    const deadline = cache.nowNs() + std.time.ns_per_s;
+    while (cache.stats(&budget).coalesced_waiters < 1 and cache.nowNs() < deadline)
+        try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats(&budget).coalesced_waiters);
+    departing.cancel.store(true, .release);
+    departing_task.await(io);
+    try std.testing.expectEqual(error.Canceled, departing.failure.?);
+    try std.testing.expectEqual(@as(usize, 1), cache.stats(&budget).inflight);
+
+    var continuing: Worker = .{ .cache = &cache, .budget = &budget, .io = io };
+    var continuing_task = try io.concurrent(Worker.run, .{&continuing});
+    defer {
+        continuing.cancel.store(true, .release);
+        continuing_task.await(io);
+        if (continuing.result) |vector| a.free(vector);
+    }
+    const join_deadline = cache.nowNs() + std.time.ns_per_s;
+    while (cache.stats(&budget).coalesced_waiters < 2 and cache.nowNs() < join_deadline)
+        try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expectEqual(@as(u64, 2), cache.stats(&budget).coalesced_waiters);
+    owner.cancel.store(true, .release);
+    continuing_task.await(io);
+    if (abandon_owner) {
+        try std.testing.expectEqualSlices(f32, &.{2}, continuing.result orelse return error.TestUnexpectedResult);
+    } else {
+        try std.testing.expectEqual(error.Canceled, continuing.failure.?);
+        try std.testing.expect(!continuing.entered.isSet());
+    }
+    owner_task.await(io);
+    try std.testing.expectEqual(error.Canceled, owner.failure.?);
 }
 
 pub fn testInflightAdmissionBound() !void {

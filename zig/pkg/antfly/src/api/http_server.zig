@@ -1800,6 +1800,7 @@ pub const ApiHttpServerConfig = struct {
 
     research_job_retention_ms: ?u64 = null,
     repair_job_store_path: ?[]const u8 = null,
+    repair_job_store: ?*backend_erased.Store = null,
     repair_job_retention_ms: ?u64 = null,
     /// Engine-owned durable storage for restore jobs. The caller retains
     /// ownership and must keep the store alive until server deinit completes.
@@ -1934,6 +1935,7 @@ pub const SemanticStatusResolver = struct {
     query_embedding_security_scope: []const u8 = "internal",
     query_embedding_deadline_ns: ?u64 = null,
     query_cancellation: ?CancellationToken = null,
+    request_id: []const u8 = "",
 
     pub fn iface(self: *SemanticStatusResolver) query_contract.SemanticResolver {
         return .{
@@ -2011,6 +2013,8 @@ pub const SemanticStatusResolver = struct {
             .query_embedding_security_scope = self.query_embedding_security_scope,
             .query_embedding_deadline_ns = self.query_embedding_deadline_ns,
             .query_cancellation = self.query_cancellation,
+            .request_id = self.request_id,
+            .retry_not_before_ns = if (self.catalog_resolver) |resolver| &resolver.query_embedding_retry_not_before_ns else null,
         }, alloc, table_name, index_name, semantic_search, embedding_template, limit);
         try ensureRequestActive(self.query_cancellation);
         return planned;
@@ -5007,7 +5011,9 @@ pub const ApiHttpServer = struct {
             errdefer opened.deinit();
             try server.research_job_store.attachOpenedStore(opened);
         }
-        if (cfg.repair_job_store_path orelse cfg.session_store_path) |base_path| {
+        if (cfg.repair_job_store) |store| {
+            try server.repair_job_store.attachRuntime(store);
+        } else if (cfg.repair_job_store_path orelse cfg.session_store_path) |base_path| {
             const job_path = if (cfg.repair_job_store_path != null)
                 try alloc.dupe(u8, base_path)
             else
@@ -5750,7 +5756,7 @@ pub const ApiHttpServer = struct {
             std.log.warn("failed to resume pending index installation reconciliation err={s}", .{@errorName(err)});
         };
         try self.runLocalSessionMaintenanceOnce();
-        // Durable index controls and cancellation are server-owned work.
+        // Durable repairs and index controls are server-owned work.
         // Advance at most one queued pass per supervisor
         // tick; the repair-job FIFO and BackendRuntime maintenance queue keep
         // this O(1), bounded, and fair with other maintenance.
@@ -16280,7 +16286,10 @@ pub const ApiHttpServer = struct {
         defer resolver.native_capture_token = null;
         try ensureRequestActive(cancellation);
         var semantic_resolver = self.semanticStatusResolver(query_embedding_security_scope.domain, query_embedding_security_scope.value);
+        const query_started_ns = resolver.query_started_ns orelse platform_time.monotonicNs();
+        resolver.query_embedding_retry_not_before_ns = 0;
         semantic_resolver.catalog_resolver = resolver;
+        semantic_resolver.request_id = resolver.request_id;
         semantic_resolver.query_embedding_deadline_ns = request_deadline_ns;
         semantic_resolver.query_cancellation = cancellation;
         var query_req = query_api.parsePublicQueryRequestWithDeadline(
@@ -16299,11 +16308,12 @@ pub const ApiHttpServer = struct {
             {
                 std.log.warn("public table query parse failed table={s} err={}", .{ table_name, err });
             } else {
-                std.log.debug("public table query embedding failed table={s} err={}", .{ table_name, normalized });
+                std.log.debug("public table query embedding failed table={s} request_id={s} err={}", .{ table_name, resolver.request_id, err });
             }
             return normalized;
         };
         defer query_req.deinit(alloc);
+        query_req.req.public_query_started_ns = query_started_ns;
         self.applyGraphExecutionLimits(&query_req.req);
         if (request_deadline_ns) |deadline| {
             query_req.req.execution_deadline_ns = deadline;
@@ -22381,6 +22391,9 @@ pub const ApiHttpServer = struct {
     }
 
     const CatalogQueryResolver = struct {
+        query_embedding_retry_not_before_ns: u64 = 0,
+        request_id: []const u8 = "",
+        query_started_ns: ?u64 = null,
         native_capture_token: ?[]const u8 = null,
         lake_scope: ?*@import("lake_index_text_query.zig").Scope = null,
         arena: std.mem.Allocator,
@@ -23464,7 +23477,7 @@ pub const ApiHttpServer = struct {
     pub fn consumePublicTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, identity: ?AuthenticatedIdentity, cancellation: ?*const http_common.RequestCancellation, delivery: @import("antfly_local_sources").api_query_response.Delivery) !contextual_operations.OwnedResponse {
         if (!self.tryAcquireQuery()) return self.queryOverloadedResponse();
         defer self.releaseQuery();
-        return self.handleAdmittedPublicTableQueryWithDelivery(table_name, body, "application/json", identity, cancellation, delivery);
+        return self.handleAdmittedPublicTableQueryWithDelivery(table_name, body, "application/json", identity, cancellation, delivery, "");
     }
 
     /// Execute while the caller holds this server's query permit. Transport
@@ -23478,7 +23491,7 @@ pub const ApiHttpServer = struct {
         borrowed_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
-        return self.handleAdmittedPublicTableQueryWithDelivery(table_name, body, content_type, borrowed_identity, cancellation, null);
+        return self.handleAdmittedPublicTableQueryWithDelivery(table_name, body, content_type, borrowed_identity, cancellation, null, "");
     }
 
     pub fn handleAdmittedPublicTableQueryWithDelivery(
@@ -23489,8 +23502,9 @@ pub const ApiHttpServer = struct {
         borrowed_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
         delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
+        request_id: []const u8,
     ) !contextual_operations.OwnedResponse {
-        if (isNdjsonContentType(content_type)) return self.handlePublicTableMultiQueryWithCancellation(table_name, body, borrowed_identity, cancellation, null, null);
+        if (isNdjsonContentType(content_type)) return self.handlePublicTableMultiQueryWithCancellation(table_name, body, borrowed_identity, cancellation, null, null, request_id);
         const public_started = platform_time.monotonicNs();
         const public_active = self.lake_query_metrics.beginPublic(public_started);
         defer public_active.deinit();
@@ -23524,7 +23538,7 @@ pub const ApiHttpServer = struct {
             }
         };
         var bridge: ?Bridge = if (delivery) |target| .{ .server = self, .table_name = table_name, .target = target } else null;
-        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .delivery = if (bridge) |*value| .{ .ptr = value, .typed_result = if (value.target.typed_result != null) .{ .ptr = value, .consume = Bridge.consume } else null, .start_fn = Bridge.start, .write_fn = Bridge.write, .max_bytes = value.target.max_bytes, .preparation_bytes = value.target.preparation_bytes, .spill_io = self.embedding_provider_runtime.io, .consume_columns = value.target.typed_result == null } else null };
+        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .request_id = request_id, .query_started_ns = public_started, .delivery = if (bridge) |*value| .{ .ptr = value, .typed_result = if (value.target.typed_result != null) .{ .ptr = value, .consume = Bridge.consume } else null, .start_fn = Bridge.start, .write_fn = Bridge.write, .max_bytes = value.target.max_bytes, .preparation_bytes = value.target.preparation_bytes, .spill_io = self.embedding_provider_runtime.io, .consume_columns = value.target.typed_result == null } else null };
         var binding = bind: {
             const started = platform_time.monotonicNs();
             defer public_profile.record(&self.lake_query_metrics, .public_binding, started);
@@ -23630,6 +23644,10 @@ pub const ApiHttpServer = struct {
             .local_base_dir = self.cfg.native_lake_artifact_base_dir,
             .graph_execution_limits = self.cfg.graph_execution_limits,
             .remote_content = self.cfg.remote_content,
+            .embedding_cache = .{ .cache = &self.query_embedding_cache, .budget = self.inferenceCacheBudget() },
+            .embedding_runtime = &self.embedding_provider_runtime,
+            .inference_api_url = self.configuredInferenceAPIURL(),
+            .inference_api_key = self.cfg.inference_api_key,
         };
         var response = (if (options.index_resource) |resource|
             self.object_tables.handleIndexResource(self.owner_alloc, self.embedding_provider_runtime.io, bound, runtime_options, resource, context)
@@ -23668,7 +23686,7 @@ pub const ApiHttpServer = struct {
         bound_dispatch: ?BoundQueryDispatch,
     ) !contextual_operations.OwnedResponse {
         if (isNdjsonContentType(content_type)) {
-            return try self.handlePublicTableMultiQueryWithCancellation(table_name, body, authenticated_identity, cancellation, response_label, bound_join);
+            return try self.handlePublicTableMultiQueryWithCancellation(table_name, body, authenticated_identity, cancellation, response_label, bound_join, if (catalog_resolver) |resolver| resolver.request_id else "");
         }
         if (self.tryObjectTableQuery(table_name, body, authenticated_identity, cancellation, response_label, bound_join, catalog_resolver, bound_dispatch) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err)) |response| return response;
         return try self.handlePublicTableQueryWithCancellation(table_name, body, authenticated_identity, cancellation, response_label, bound_join, catalog_resolver);
@@ -23685,7 +23703,11 @@ pub const ApiHttpServer = struct {
             const foreign_sources = try foreign_sources_api.postgresSourceMapFromMetadataOpenApiResolvedWithSecrets(foreign_arena.allocator(), parsed_request.value.foreign_sources, self.cfg.secret_store);
             if (isForeignQueryPrimary(table_name, foreign_sources)) return null;
         }
-        const request_context = if (bound_dispatch) |binding| binding.context else api_operation.RequestContext{ .deadline_ns = try query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body), .cancellation = if (cancellation) |value| value.token() else .none };
+        const query_started_ns = if (catalog_resolver) |resolver| resolver.query_started_ns orelse platform_time.monotonicNs() else platform_time.monotonicNs();
+        var request_context = if (bound_dispatch) |binding| binding.context else api_operation.RequestContext{ .deadline_ns = try query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body), .cancellation = if (cancellation) |value| value.token() else .none };
+        request_context.query_started_ns = query_started_ns;
+        request_context.principal = if (authenticated_identity) |identity| .{ .kind = .user, .subject = identity.username } else null;
+        if (catalog_resolver) |resolver| request_context.request_id = resolver.request_id;
         if (try self.tryObjectTableRequestWithOptions(table_name, .post, "query", body, authenticated_identity, request_context, .{ .has_join = bound_join != null, .resolver = catalog_resolver, .incarnation = if (bound_dispatch) |binding| binding.incarnation else null })) |response| {
             var owned = response;
             errdefer owned.deinit(self.alloc);
@@ -23729,7 +23751,7 @@ pub const ApiHttpServer = struct {
     ) !contextual_operations.OwnedResponse {
         if (!self.tryAcquireQuery()) return try self.queryOverloadedResponse();
         defer self.releaseQuery();
-        return try self.handleAdmittedPublicGlobalMultiQueryWithCancellation(body, authenticated_identity, cancellation);
+        return try self.handleAdmittedPublicGlobalMultiQueryWithCancellation(body, authenticated_identity, cancellation, "");
     }
 
     pub fn handleAdmittedPublicGlobalMultiQueryWithCancellation(
@@ -23737,6 +23759,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
+        request_id: []const u8,
     ) !contextual_operations.OwnedResponse {
         const composed = @import("composed_query.zig");
         if (composed.hasSource(self.alloc, body) catch false) {
@@ -23779,6 +23802,7 @@ pub const ApiHttpServer = struct {
                 overlay: bool,
                 deadline: ?u64,
                 identity: ?AuthenticatedIdentity,
+                request_id: []const u8,
                 cancellation: ?*const http_common.RequestCancellation,
                 const Self = @This();
                 const SourceLane = struct {
@@ -23867,7 +23891,7 @@ pub const ApiHttpServer = struct {
                     } else query;
                     var identity = try cloneCatalogIdentity(a, runner.identity);
                     defer if (identity) |*owned| owned.deinit(a);
-                    var resolver = CatalogQueryResolver{ .arena = scratch, .lake_scope = &lane.scope };
+                    var resolver = CatalogQueryResolver{ .arena = scratch, .lake_scope = &lane.scope, .request_id = runner.request_id, .query_started_ns = leaf_started };
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = runner.deadline, .cancellation = lane.cancellation.token() };
                     var binding = binding: {
                         const started = @import("antfly_platform").time.monotonicNs();
@@ -23957,7 +23981,7 @@ pub const ApiHttpServer = struct {
                     return @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.digestHex(bytes);
                 }
             };
-            var runner: Runner = .{ .server = self, .profile = &composed_profile, .lake_scope = .init(self.alloc), .identity = authenticated_identity, .cancellation = cancellation, .overlay = overlay, .deadline = deadline };
+            var runner: Runner = .{ .server = self, .profile = &composed_profile, .lake_scope = .init(self.alloc), .identity = authenticated_identity, .request_id = request_id, .cancellation = cancellation, .overlay = overlay, .deadline = deadline };
             defer {
                 composed_profile.io = runner.lake_scope.ioSnapshot();
                 runner.lake_scope.deinit();
@@ -23968,7 +23992,31 @@ pub const ApiHttpServer = struct {
             }
             return composed.execute(self.alloc, composed_body, .{ .ptr = &runner, .execute = Runner.execute, .execute_many = Runner.executeMany, .checkpoint = Runner.checkpoint, .save_cursor = Runner.saveCursor, .load_cursor = Runner.loadCursor }) catch |err| return self.publicQueryOperationErrorResponse("", body, err);
         }
-        return try self.handlePublicTableMultiQueryWithCancellation(null, body, authenticated_identity, cancellation, null, null);
+        return try self.handlePublicTableMultiQueryWithCancellation(null, body, authenticated_identity, cancellation, null, null, request_id);
+    }
+
+    fn publicQueryOperationErrorResponseWithRetryHint(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        err: anyerror,
+        resolver: ?*const CatalogQueryResolver,
+    ) !contextual_operations.OwnedResponse {
+        var response = try self.publicQueryOperationErrorResponse(table_name, body, err);
+        errdefer response.deinit(self.alloc);
+        if (err == error.EmbedRateLimited or err == error.EmbedTransientFailure) {
+            if (resolver) |value| {
+                const seconds = api_operation.remainingRetryAfterSeconds(value.query_embedding_retry_not_before_ns) orelse return response;
+                for (response.headers) |*header| {
+                    if (!std.ascii.eqlIgnoreCase(header.name, "Retry-After")) continue;
+                    const replacement = try std.fmt.allocPrint(self.alloc, "{d}", .{seconds});
+                    self.alloc.free(header.value);
+                    header.value = replacement;
+                    break;
+                }
+            }
+        }
+        return response;
     }
 
     fn publicQueryOperationErrorResponse(
@@ -24175,7 +24223,7 @@ pub const ApiHttpServer = struct {
             response_label,
             bound_join,
             catalog_resolver,
-        ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, body, err);
+        ) catch |err| return try self.publicQueryOperationErrorResponseWithRetryHint(table_name, body, err, catalog_resolver);
         if (query_response.delivered_bytes == null) self.reachQueryResultLifecycle("public.table.query", table_name, query_response.json.len) catch |err| {
             query_response.deinit(self.alloc);
             return err;
@@ -24189,7 +24237,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
-        return try self.handlePublicTableMultiQueryWithCancellation(route_table_name, body, authenticated_identity, null, null, null);
+        return try self.handlePublicTableMultiQueryWithCancellation(route_table_name, body, authenticated_identity, null, null, null, "");
     }
 
     fn handlePublicTableMultiQueryWithCancellation(
@@ -24200,6 +24248,7 @@ pub const ApiHttpServer = struct {
         cancellation: ?*const http_common.RequestCancellation,
         response_label: ?[]const u8,
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
+        request_id: []const u8,
     ) !contextual_operations.OwnedResponse {
         var diagnostic_context: query_request_diagnostics.Context = .{};
         const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
@@ -24208,7 +24257,7 @@ pub const ApiHttpServer = struct {
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
-        var catalog_resolver = CatalogQueryResolver{ .arena = arena };
+        var catalog_resolver = CatalogQueryResolver{ .arena = arena, .request_id = request_id };
 
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
@@ -24272,7 +24321,7 @@ pub const ApiHttpServer = struct {
                     line_label,
                     if (binding.join) |*value| value else bound_join,
                     &catalog_resolver,
-                ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, line, err);
+                ) catch |err| return try self.publicQueryOperationErrorResponseWithRetryHint(table_name, line, err, &catalog_resolver);
             };
             defer query_response.deinit(self.alloc);
             try self.reachQueryResultLifecycle(
@@ -24851,8 +24900,7 @@ pub const ApiHttpServer = struct {
     fn continueDurableRepairMaintenance(self: *ApiHttpServer, table_name: []const u8, encoded: []const u8) !void {
         var parsed = try std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        if (!repair_jobs.requiresAutomaticAdvance(parsed.value) or
-            !std.mem.eql(u8, parsed.value.phase, repair_jobs.phaseString(.queued))) return;
+        if (!repair_jobs.requiresAutomaticAdvance(parsed.value)) return;
 
         const begin = try self.repair_job_store.beginAdvance(self.alloc, parsed.value);
         defer self.alloc.free(begin.encoded);
@@ -24881,7 +24929,8 @@ pub const ApiHttpServer = struct {
                 .limit = running_state.limit,
                 .cursor = running_state.cursor,
                 .control = .pause_automatic,
-            }, .{}) catch |err| switch (err) {
+                .repair_job_id = running_state.job_id,
+            }, .{ .expected_repair_groups = running_state.repair_groups }) catch |err| switch (err) {
                 error.InvalidArgument, error.NotFound => {
                     return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
                 },
@@ -24914,6 +24963,8 @@ pub const ApiHttpServer = struct {
             .repair_job_created_at_ms = running_state.created_at_millis,
             .operator_initiated = running_state.control == null,
         }, .{
+            .observe_index_groups = running_state.observe_index_groups,
+            .expected_repair_groups = running_state.repair_groups,
             .cancel_check = .{
                 .ptr = &cancel_probe,
                 .is_requested = TableRepairCancelProbe.check,
@@ -26103,6 +26154,11 @@ pub const ApiHttpServer = struct {
         const a = arena.allocator();
         var state = try std.json.parseFromSliceLeaky(State, a, encoded, .{ .ignore_unknown_fields = true });
         if (comptime State == repair_jobs.JobState) {
+            state.auto_advance = null;
+            state.pending_observation = null;
+            state.pending_index_groups = null;
+            state.observe_index_groups = null;
+            state.result.terminal_error = null;
             if (state.control == null and repair_jobs.isTerminalPhase(state.phase)) {
                 // Live from the repair issues, which stay the source of truth
                 // after the job finishes.
@@ -31031,32 +31087,7 @@ fn applyAuthenticatedIdentityToJoinRequest(
 }
 
 pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
-    return switch (err) {
-        error.ProviderTokenBudgetExceeded => error.QueryEmbeddingInputTooLarge,
-        error.ProviderQuotaRegistryFull => error.QueryEmbeddingOverloaded,
-        error.QueryEmbeddingInputTooLarge,
-        error.QueryEmbeddingOverloaded,
-        error.EmbedRateLimited,
-        error.EmbedTransientFailure,
-        error.Timeout,
-        => err,
-        error.EmbedRequestFailed,
-        error.EmptyEmbeddingResponse,
-        error.InvalidEmbeddingResponse,
-        error.InvalidEmbeddingDimensions,
-        error.SecretNotFound,
-        => error.EmbedUpstreamFailure,
-        error.ConnectionRefused,
-        error.ConnectionResetByPeer,
-        error.NetworkUnreachable,
-        error.HostUnreachable,
-        error.TemporaryNameServerFailure,
-        error.NameServerFailure,
-        error.ConnectionTimedOut,
-        error.Canceled,
-        => error.EmbedTransientFailure,
-        else => null,
-    };
+    return internal_query_operations.normalizeQueryEmbeddingOperationalError(err);
 }
 
 pub fn normalizeQueryOperationalError(err: anyerror) ?anyerror {
@@ -34822,6 +34853,11 @@ test "api http query parsing preserves operational embedding failures" {
     try std.testing.expectEqual(error.QueryEmbeddingOverloaded, normalizePublicQueryParseError(error.QueryEmbeddingOverloaded));
     try std.testing.expectEqual(error.EmbedRateLimited, normalizePublicQueryParseError(error.EmbedRateLimited));
     try std.testing.expectEqual(error.EmbedTransientFailure, normalizePublicQueryParseError(error.ConnectionRefused));
+    try std.testing.expectEqual(error.EmbedTransientFailure, normalizePublicQueryParseError(error.QueueFull));
+    try std.testing.expectEqual(error.EmbedTransientFailure, normalizePublicQueryParseError(error.TlsTransportReadFailed));
+    try std.testing.expectEqual(error.EmbedTransientFailure, normalizePublicQueryParseError(error.RemoteCapabilityDiscoveryTransient));
+    try std.testing.expectEqual(error.EmbedUpstreamFailure, normalizePublicQueryParseError(error.InferenceEndpointAccessDenied));
+    try std.testing.expectEqual(error.EmbedUpstreamFailure, normalizePublicQueryParseError(error.InvalidInferenceCapabilities));
     try std.testing.expectEqual(error.EmbedUpstreamFailure, normalizePublicQueryParseError(error.InvalidEmbeddingResponse));
     try std.testing.expectEqual(error.InvalidFilterQueryRequest, normalizePublicQueryParseError(error.InvalidFilterQueryRequest));
     try std.testing.expectEqual(error.UnsupportedExclusionQueryRequest, normalizePublicQueryParseError(error.UnsupportedExclusionQueryRequest));

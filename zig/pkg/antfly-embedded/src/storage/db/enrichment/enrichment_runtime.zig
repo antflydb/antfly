@@ -3061,6 +3061,13 @@ test "transient refusals do not spend the enrichment attempt budget" {
     // A request that can never fit the configured budget is permanent.
     try std.testing.expect(!isRetryableEnrichmentError(error.MemoryBudgetExceeded));
     try std.testing.expect(isRetryableEnrichmentError(error.ResourceTemporarilyUnavailable));
+
+    for ([_]anyerror{ error.QueueFull, error.InferenceCapacityUnavailable }) |err| {
+        try std.testing.expect(isRetryableEnrichmentError(err));
+        try std.testing.expect(enrichmentFailureSparesAttemptBudget(err));
+        try std.testing.expect(requestRetryBudgetAllows(std.math.maxInt(u32), 1, err));
+    }
+    try std.testing.expect(!requestRetryBudgetAllows(admission_wait_max_attempts, 1, error.ResourceTemporarilyUnavailable));
 }
 
 test "normalized local admission refusal is exempt but normalized provider transient failure is not" {
@@ -3275,22 +3282,18 @@ fn retryBudgetAllowsYield(consecutive_retry_count: u32, max_attempts: u32) bool 
 /// surfacing as repair debt. This ceiling is independent of
 /// `worker_retry_max_attempts` and deliberately generous: ordinary admission
 /// contention clears in a handful of backoffs.
-// With capped backoff this parks sustained contention after about five
-// minutes of scheduled waits, instead of more than eight hours.
+// Generic capacity refusals park after about five minutes of capped backoff.
 const admission_wait_max_attempts: u32 = 16;
 
 fn admissionWaitBudgetAllowsYield(waited_attempts: u32) bool {
     return retryBudgetAllowsYield(waited_attempts, admission_wait_max_attempts);
 }
 
-/// The budget an error should be checked against: the document's durable
-/// attempt budget for work that actually ran, or the separate, much larger
-/// admission-wait ceiling for admission refusals that never did. Keeping the
-/// yield decision and `recordRetryableError`'s accounting on the same
-/// `enrichmentFailureSparesAttemptBudget` classification is what lets an
-/// admission refusal retry past `worker_retry_max_attempts`.
-fn requestRetryBudgetAllows(prior_attempts: u32, max_attempts: u32, spares_attempt_budget: bool) bool {
-    return if (spares_attempt_budget)
+/// A full queue or a starting inference pool says nothing about the
+/// document. Keep these requests in durable backoff until admission opens.
+fn requestRetryBudgetAllows(prior_attempts: u32, max_attempts: u32, err: anyerror) bool {
+    if (err == error.QueueFull or err == error.InferenceCapacityUnavailable) return true;
+    return if (enrichmentFailureSparesAttemptBudget(err))
         admissionWaitBudgetAllowsYield(prior_attempts)
     else
         retryBudgetAllowsYield(prior_attempts, max_attempts);
@@ -3310,7 +3313,7 @@ fn activeRequestRetryBudgetAllowsYield(runtime: *EnrichmentRuntime, err: anyerro
         runtime.retry_failure_fingerprint,
         if (spares_attempt_budget) runtime.transient_retry_count else runtime.retry_failure_count,
     );
-    const allows_yield = requestRetryBudgetAllows(prior_attempts, runtime.config.worker_retry_max_attempts, spares_attempt_budget);
+    const allows_yield = requestRetryBudgetAllows(prior_attempts, runtime.config.worker_retry_max_attempts, err);
     runtime.retry_error_has_request_identity = allows_yield;
     return allows_yield;
 }
@@ -3329,7 +3332,7 @@ fn requestRetryBudgetAllowsYieldFor(runtime: *EnrichmentRuntime, fingerprint: u6
     const spares_attempt_budget = enrichmentFailureSparesAttemptBudget(err);
     const budget = retryBudgetFor(runtime, fingerprint);
     const prior_attempts = if (spares_attempt_budget) budget.waits else budget.failures;
-    return requestRetryBudgetAllows(prior_attempts, runtime.config.worker_retry_max_attempts, spares_attempt_budget);
+    return requestRetryBudgetAllows(prior_attempts, runtime.config.worker_retry_max_attempts, err);
 }
 
 /// `shouldYieldRequestError` for an explicit identity; see
@@ -4014,7 +4017,7 @@ const FailureScope = struct {
             self.current_attempt_number = @as(u64, budget.failures) +| 1;
             if (enrichmentErrorDisposition(err) == .terminal_request) return false;
             const transient = enrichmentFailureSparesAttemptBudget(err);
-            if (!requestRetryBudgetAllows(if (transient) budget.waits else budget.failures, runtime.config.worker_retry_max_attempts, transient)) return false;
+            if (!requestRetryBudgetAllows(if (transient) budget.waits else budget.failures, runtime.config.worker_retry_max_attempts, err)) return false;
             scheduler.park(runtime, owner, self.fingerprint, err) catch |save_err| return self.publicationFailure(save_err);
             const io = lockRuntime(runtime);
             runtime.error_count +|= 1;
@@ -4109,7 +4112,7 @@ fn workerLoopRetryScopeIfAllowed(runtime: *EnrichmentRuntime, err: anyerror) ?Wo
             runtime.retry_failure_fingerprint,
             if (spares_attempt_budget) runtime.transient_retry_count else runtime.retry_failure_count,
         );
-        return if (requestRetryBudgetAllows(request_prior_attempts, runtime.config.worker_retry_max_attempts, spares_attempt_budget))
+        return if (requestRetryBudgetAllows(request_prior_attempts, runtime.config.worker_retry_max_attempts, err))
             .request
         else
             null;

@@ -5569,7 +5569,7 @@ pub fn storageOwnerQueryJson(
 ) callconv(.c) kernel_owner_abi.Status {
     out_response.* = .{};
     out_failure.* = .{};
-    if (request.control.version != kernel_owner_abi.query_abi_version)
+    if (request.control.version != kernel_owner_abi.query_request_version)
         return localOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
     const handle = asHandle(owner) orelse
         return localOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);

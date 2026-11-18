@@ -41,6 +41,14 @@ pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
     return switch (err) {
         error.ProviderTokenBudgetExceeded => error.QueryEmbeddingInputTooLarge,
         error.ProviderQuotaRegistryFull => error.QueryEmbeddingOverloaded,
+        error.QueueFull,
+        error.EmbedAdmissionRefused,
+        error.InferenceCapacityUnavailable,
+        error.InferenceCapabilitiesStale,
+        error.RemoteCapabilityDiscoveryTransient,
+        error.RemoteCapabilitySelectorAbsent,
+        error.TlsTransportReadFailed,
+        => error.EmbedTransientFailure,
         error.QueryEmbeddingInputTooLarge,
         error.QueryEmbeddingOverloaded,
         error.EmbedRateLimited,
@@ -51,8 +59,18 @@ pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
         error.EmbedRequestFailed,
         error.EmptyEmbeddingResponse,
         error.InvalidEmbeddingResponse,
+        error.InvalidEmbeddingIdentity,
+        error.EmbeddingIdentityMismatch,
+        error.EmptyResponse,
         error.InvalidEmbeddingDimensions,
         error.SecretNotFound,
+        error.InferenceEndpointAccessDenied,
+        error.RemoteCapabilityDiscoveryRejected,
+        error.InvalidInferenceCapabilities,
+        error.IncompleteCapabilityLease,
+        error.InvalidCapabilityRoutingToken,
+        error.InvalidCapabilityRevision,
+        error.InferenceCapabilitiesUnavailable,
         => error.EmbedUpstreamFailure,
         error.ConnectionRefused,
         error.ConnectionResetByPeer,
@@ -129,6 +147,7 @@ pub const Context = struct {
 };
 
 pub const QueryPlanningContext = struct {
+    retry_not_before_ns: ?*u64 = null,
     /// Borrowed from the coordinator's immutable query catalog cut. Carrying
     /// the selected producer config avoids another metadata read after alias
     /// resolution and excludes control-state receipts from embedder parsing.
@@ -149,6 +168,7 @@ pub const QueryPlanningContext = struct {
     query_embedding_security_scope: []const u8 = "internal",
     query_embedding_deadline_ns: ?u64 = null,
     query_cancellation: ?CancellationToken = null,
+    request_id: []const u8 = "",
 
     fn adminSnapshot(self: QueryPlanningContext) !metadata_api.AdminSnapshot {
         return try self.admin_snapshot(self.ptr);
@@ -159,50 +179,78 @@ pub const QueryPlanningContext = struct {
     }
 };
 
-const DenseQueryComputeContext = struct {
-    runtime: *const managed_embedder.ManagedEmbedder,
-    index_name: []const u8,
+pub const QueryEmbeddingCache = struct {
+    cache: *query_embedding_cache.QueryEmbeddingCache,
+    budget: *cache_budget.CacheBudget,
+};
+
+pub const QueryEmbeddingOptions = struct {
+    retry_not_before_ns: ?*u64 = null,
+    storage: ?QueryEmbeddingCache = null,
+    domain: managed_embedder.QueryCacheSecurityDomain = .internal,
+    scope: []const u8 = "internal",
+    deadline_ns: ?u64 = null,
+    cancellation: ?CancellationToken = null,
+    request_id: []const u8 = "",
+};
+
+const QueryComputeContext = struct {
+    prepared: *const managed_embedder.ManagedEmbedder.PreparedQueryEmbedding,
     text: []const u8,
+    embedding_template: ?[]const u8,
+    retry_not_before_ns: ?*u64,
 
     fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return embedInteractive(self.runtime, alloc, self.index_name, self.text);
+        _ = db_mod.enrichment_types.interactive_embed_inflight.fetchAdd(1, .monotonic);
+        defer _ = db_mod.enrichment_types.interactive_embed_inflight.fetchSub(1, .monotonic);
+        return self.prepared.embedWithRetryHint(alloc, self.text, self.embedding_template, self.retry_not_before_ns);
     }
 };
 
-const TemplateQueryComputeContext = struct {
-    runtime: *const managed_embedder.ManagedEmbedder,
-    index_name: []const u8,
-    text: []const u8,
-    embedding_template: []const u8,
-
-    fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return embedTemplateInteractive(self.runtime, alloc, self.index_name, self.text, self.embedding_template);
-    }
-};
-
-fn embedInteractive(
+pub fn computeManagedQueryVector(
     runtime: *const managed_embedder.ManagedEmbedder,
     alloc: std.mem.Allocator,
     index_name: []const u8,
     text: []const u8,
+    embedding_template: ?[]const u8,
+    options: QueryEmbeddingOptions,
 ) ![]f32 {
-    _ = db_mod.enrichment_types.interactive_embed_inflight.fetchAdd(1, .monotonic);
-    defer _ = db_mod.enrichment_types.interactive_embed_inflight.fetchSub(1, .monotonic);
-    return try runtime.embedQuery(alloc, index_name, text);
+    if (text.len > max_query_embedding_input_bytes) return error.QueryEmbeddingInputTooLarge;
+    if (embedding_template) |value| {
+        if (value.len > max_query_embedding_template_bytes) return error.QueryEmbeddingInputTooLarge;
+    }
+    if (options.retry_not_before_ns) |hint| hint.* = 0;
+    const deadline = effectiveQueryEmbeddingDeadlineNs(options.deadline_ns, platform_time.monotonicNs());
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        if (deadline <= platform_time.monotonicNs()) return error.Timeout;
+        var prepared = runtime.prepareQueryEmbedding(alloc, index_name, deadline, options.cancellation, options.request_id, options.retry_not_before_ns) catch |err| {
+            if (err == error.InferenceCapabilitiesStale and attempt == 0) continue;
+            return err;
+        };
+        defer prepared.deinit(alloc);
+        var compute = QueryComputeContext{ .prepared = &prepared, .text = text, .embedding_template = embedding_template, .retry_not_before_ns = options.retry_not_before_ns };
+        const result = computePreparedQueryVector(&compute, alloc, options, deadline);
+        return result catch |err| {
+            // Never publish a different revision under the rejected cache key.
+            if (err == error.InferenceCapabilitiesStale and attempt == 0) continue;
+            return err;
+        };
+    }
 }
 
-fn embedTemplateInteractive(
-    runtime: *const managed_embedder.ManagedEmbedder,
-    alloc: std.mem.Allocator,
-    index_name: []const u8,
-    text: []const u8,
-    embedding_template: []const u8,
-) ![]f32 {
-    _ = db_mod.enrichment_types.interactive_embed_inflight.fetchAdd(1, .monotonic);
-    defer _ = db_mod.enrichment_types.interactive_embed_inflight.fetchSub(1, .monotonic);
-    return try runtime.embedQueryWithTemplate(alloc, index_name, text, embedding_template);
+fn computePreparedQueryVector(compute: *QueryComputeContext, alloc: std.mem.Allocator, options: QueryEmbeddingOptions, deadline: u64) ![]f32 {
+    const storage = options.storage orelse return QueryComputeContext.run(compute, alloc);
+    const cache_deadline = storage.cache.deadlineFromNative(deadline);
+    if (compute.embedding_template == null) {
+        const key = compute.prepared.cacheKey(options.domain, options.scope, compute.text) catch |err| switch (err) {
+            error.QueryEmbeddingNotCacheable => return storage.cache.computeUncached(alloc, cache_deadline, compute, QueryComputeContext.run),
+            else => return err,
+        };
+        return storage.cache.getOrComputeWithRetryHint(storage.budget, alloc, key, cache_deadline, options.cancellation orelse .none, compute, QueryComputeContext.run, options.retry_not_before_ns);
+    }
+    return storage.cache.computeUncached(alloc, cache_deadline, compute, QueryComputeContext.run);
 }
 
 fn effectiveQueryEmbeddingDeadlineNs(request_deadline_ns: ?u64, now_ns: u64) u64 {
@@ -239,36 +287,24 @@ pub fn planSemanticQuery(
         .inference_api_key = planning.inference_api_key,
         .secret_store = planning.secret_store,
         .provider_runtime = planning.provider_runtime,
+        .remote_capability_cache = if (planning.provider_runtime) |runtime| &runtime.remote_capability_cache else null,
+        .request_id = planning.request_id,
     });
     defer runtime.deinit();
 
     return .{
-        .vector = if (embedding_template) |value| blk: {
-            var compute_context = TemplateQueryComputeContext{
-                .runtime = &runtime,
-                .index_name = index_name,
-                .text = semantic_search,
-                .embedding_template = value,
-            };
-            const cache = planning.query_embedding_cache orelse
-                break :blk try TemplateQueryComputeContext.run(&compute_context, alloc);
-            break :blk try cache.computeUncached(alloc, cache.deadlineFromNative(embedding_deadline_ns), &compute_context, TemplateQueryComputeContext.run);
-        } else blk: {
-            var compute_context = DenseQueryComputeContext{
-                .runtime = &runtime,
-                .index_name = index_name,
-                .text = semantic_search,
-            };
-            const cache = planning.query_embedding_cache orelse
-                break :blk try DenseQueryComputeContext.run(&compute_context, alloc);
-            const budget = planning.query_embedding_budget orelse
-                break :blk try cache.computeUncached(alloc, cache.deadlineFromNative(embedding_deadline_ns), &compute_context, DenseQueryComputeContext.run);
-            const key = runtime.queryCacheKey(index_name, planning.query_embedding_security_domain, planning.query_embedding_security_scope, semantic_search) catch |err| switch (err) {
-                error.QueryEmbeddingNotCacheable => break :blk try cache.computeUncached(alloc, cache.deadlineFromNative(embedding_deadline_ns), &compute_context, DenseQueryComputeContext.run),
-                else => return err,
-            };
-            break :blk try cache.getOrCompute(budget, alloc, key, cache.deadlineFromNative(embedding_deadline_ns), &compute_context, DenseQueryComputeContext.run);
-        },
+        .vector = try computeManagedQueryVector(&runtime, alloc, index_name, semantic_search, embedding_template, .{
+            .storage = if (planning.query_embedding_cache) |cache|
+                if (planning.query_embedding_budget) |budget| .{ .cache = cache, .budget = budget } else null
+            else
+                null,
+            .domain = planning.query_embedding_security_domain,
+            .scope = planning.query_embedding_security_scope,
+            .deadline_ns = embedding_deadline_ns,
+            .cancellation = planning.query_cancellation,
+            .request_id = planning.request_id,
+            .retry_not_before_ns = planning.retry_not_before_ns,
+        }),
         .k = limit,
     };
 }
