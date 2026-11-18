@@ -120,6 +120,8 @@ pub const RangeRecord = struct {
     /// Durable, bounded idempotency provenance for the most recently
     /// completed restore. Active replica progress can be garbage-collected
     /// without making an exact job retry ambiguous.
+    /// Admission ownership retained through publication, cleanup and splits.
+    restore_admission_fingerprint: RestoreCompletionFingerprint = empty_restore_completion_fingerprint,
     completed_restore_fingerprint: RestoreCompletionFingerprint =
         empty_restore_completion_fingerprint,
 };

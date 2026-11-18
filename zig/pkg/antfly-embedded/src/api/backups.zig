@@ -2045,7 +2045,8 @@ pub fn readManifestFromLocationWithDigest(
         },
     };
     defer alloc.free(body);
-    const manifest = try parseTableBackupManifestWithArtifactBackupId(alloc, body, backup_id, artifact_backup_id);
+    var manifest = try parseTableBackupManifestWithArtifactBackupId(alloc, body, backup_id, artifact_backup_id);
+    manifest.restore_admission_fingerprint = null;
     if (digest) |out| std.crypto.hash.sha2.Sha256.hash(body, out, .{});
     return manifest;
 }
@@ -2079,7 +2080,9 @@ pub fn parseTableBackupManifestWithArtifactBackupId(
         var parsed = try std.json.parseFromSlice(TableBackupManifest, alloc, body, .{ .allocate = .alloc_always });
         defer parsed.deinit();
         try validatePublishedTableManifest(alloc, &parsed.value, backup_id);
-        return try cloneTableBackupManifest(alloc, parsed.value);
+        var source_manifest = try cloneTableBackupManifest(alloc, parsed.value);
+        source_manifest.restore_admission_fingerprint = null;
+        return source_manifest;
     }
     return try parseGoPortableTableManifest(alloc, root, backup_id, artifact_backup_id);
 }
@@ -3274,6 +3277,7 @@ pub fn cloneTableBackupManifest(alloc: std.mem.Allocator, manifest: TableBackupM
         .backup_id = try alloc.dupe(u8, manifest.backup_id),
         .table_name = try alloc.dupe(u8, manifest.table_name),
         .table_id = manifest.table_id,
+        .restore_admission_fingerprint = manifest.restore_admission_fingerprint,
         .description = try alloc.dupe(u8, manifest.description),
         .schema_json = try alloc.dupe(u8, manifest.schema_json),
         .read_schema_json = try alloc.dupe(u8, manifest.read_schema_json),

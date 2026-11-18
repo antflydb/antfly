@@ -2498,6 +2498,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = api_backup_restore_test_mod,
         .filters = &.{
             "public api standalone-like integration backs up drops and restores a table",
+            "api http server cluster restore rehydrates extension metadata",
             "public table backup handler exposes non-retryable fenced outcomes",
             "api restore rollback preserves a concurrently replaced table definition",
             "api http server cluster overwrite restores from read-only repository without dropping live table",

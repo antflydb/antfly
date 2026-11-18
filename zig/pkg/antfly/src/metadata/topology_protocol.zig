@@ -124,8 +124,18 @@ const std = @import("std");
 /// Version 91 admits lifecycle-scoped alias deletion validators.
 /// Version 92 admits durable restore jobs with backup bindings.
 /// Version 93 separates immutable restore inputs from mutable checkpoints.
-pub const pinned_restore_job_version: u16 = 93;
+/// Version 94 retains distributed restore admission ownership on ranges.
+pub const pinned_restore_job_version: u16 = 94;
 pub const current_version: u16 = pinned_restore_job_version;
+
+pub fn restoreAdmissionDecoderVersion(ranges: anytype, fallback: u16) u16 {
+    const empty: [32]u8 = @splat(0);
+    for (ranges) |range| {
+        if (!std.mem.eql(u8, &range.restore_admission_fingerprint, &empty)) return pinned_restore_job_version;
+    }
+    return fallback;
+}
+
 pub const index_aliases_version: u16 = 90;
 pub const index_alias_lifecycle_version: u16 = 91;
 pub fn indexAliasDecoderVersion(a: std.mem.Allocator, bytes: []const u8, envelope: bool) std.mem.Allocator.Error!u16 {

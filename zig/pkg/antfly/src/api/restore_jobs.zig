@@ -161,6 +161,7 @@ pub const ClusterRestoreBinding = struct {
     recovery_manifests_json: ?[]const u8 = null,
     manifest_json: ?[]const u8 = null,
     publication_nonce: ?[]const u8 = null,
+    distributed_admission_receipts: bool = false,
 };
 
 pub const StartRequest = struct {
@@ -1240,7 +1241,7 @@ pub const Store = struct {
             defer alloc.free(proposal);
             const key = try jobKey(alloc, job_id);
             defer alloc.free(key);
-            try self.reservePersistenceLocked(job_id, encoded.len);
+            try self.reservePersistenceLocked(job_id, admission_parts.record.len + (if (admission_parts.inputs) |bytes| bytes.len else 0));
             var retired_expired = false;
             while (true) {
                 self.fencePersistenceLocked(job_id);
@@ -1292,7 +1293,7 @@ pub const Store = struct {
                     retired_expired = true;
                     // Retirement resolved the old reservation. Reuse its
                     // preallocated slot before proposing the replacement.
-                    try self.reservePersistenceLocked(job_id, encoded.len);
+                    try self.reservePersistenceLocked(job_id, admission_parts.record.len + (if (admission_parts.inputs) |bytes| bytes.len else 0));
                     continue;
                 }
                 if (!std.mem.eql(u8, state.value.request_fingerprint, fingerprint)) {
@@ -1509,7 +1510,7 @@ pub const Store = struct {
     }
 
     pub fn load(self: *Store, alloc: std.mem.Allocator, job_id: u64) !?[]u8 {
-        try self.refreshReplicatedJob(alloc, job_id);
+        try self.refreshReplicatedJob(alloc, job_id, true);
         return try self.loadCached(alloc, job_id);
     }
 
@@ -1533,6 +1534,14 @@ pub const Store = struct {
             !std.mem.eql(u8, parsed.value.idempotency_key, key) or
             !std.mem.eql(u8, parsed.value.request_fingerprint, expected)) return error.IdempotencyConflict;
         return encoded;
+    }
+
+    /// Public status and authorization need only the compact mutable record.
+    pub fn loadRecord(self: *Store, alloc: std.mem.Allocator, job_id: u64) !?[]u8 {
+        try self.refreshReplicatedJob(alloc, job_id, false);
+        self.lock();
+        defer self.mutex.unlock();
+        return if (self.jobs.get(job_id)) |encoded| try alloc.dupe(u8, encoded) else null;
     }
 
     pub fn loadCached(self: *Store, alloc: std.mem.Allocator, job_id: u64) !?[]u8 {
@@ -1580,7 +1589,7 @@ pub const Store = struct {
         };
     }
 
-    fn refreshReplicatedJob(self: *Store, alloc: std.mem.Allocator, job_id: u64) !void {
+    fn refreshReplicatedJob(self: *Store, alloc: std.mem.Allocator, job_id: u64, include_inputs: bool) !void {
         const replicated = self.replicated orelse return;
         self.lock();
         const observation = self.observeRefreshLocked(job_id);
@@ -1601,7 +1610,7 @@ pub const Store = struct {
                 else => return error.CorruptRestoreJobStore,
             };
             defer header.deinit();
-            if (header.value.cluster_binding_sha256 != null) {
+            if (include_inputs and header.value.cluster_binding_sha256 != null) {
                 self.lock();
                 const known_inputs = self.inputs.contains(job_id);
                 self.mutex.unlock();
@@ -2254,7 +2263,15 @@ pub const Store = struct {
 
     fn storeOrCacheLocked(self: *Store, job_id: u64, encoded: []const u8, persist: bool) !void {
         const previous_len = if (self.jobs.get(job_id)) |previous| previous.len else 0;
+        const had_inputs = self.inputs.contains(job_id);
         const owned = try self.compactRecordLocked(job_id, encoded);
+        errdefer if (!had_inputs) {
+            if (self.inputs.fetchRemove(job_id)) |inserted| {
+                self.observeInputSizeLocked(job_id, inserted.value.len, 0);
+                self.input_bytes -= inserted.value.len;
+                self.alloc.free(inserted.value);
+            }
+        };
         const next_bytes = std.math.add(usize, self.retained_bytes - previous_len, owned.len) catch {
             self.alloc.free(owned);
             return error.RestoreJobCapacityExceeded;
@@ -2265,7 +2282,7 @@ pub const Store = struct {
         const key = try jobKey(self.alloc, job_id);
         defer self.alloc.free(key);
         if (persist) {
-            try self.reservePersistenceLocked(job_id, owned.len);
+            try self.reservePersistenceLocked(job_id, owned.len + self.inputSizeLocked(job_id));
             self.fencePersistenceLocked(job_id);
             try self.persistPutLocked(key, encoded);
         }
@@ -2419,6 +2436,9 @@ pub const Store = struct {
 
     fn removeHistoryLocked(self: *Store, job_id: u64) void {
         if (self.inputs.fetchRemove(job_id)) |previous| {
+            // A missing point read cannot discharge an uncertain proposal.
+            // Transfer removed cached input bytes back to that reservation.
+            self.observeInputSizeLocked(job_id, previous.value.len, 0);
             self.input_bytes -= previous.value.len;
             self.alloc.free(previous.value);
         }
@@ -2465,27 +2485,29 @@ pub const Store = struct {
     }
 
     fn reservePersistenceLocked(self: *Store, job_id: u64, size: usize) !void {
-        const cached_size = if (self.jobs.get(job_id)) |value| value.len else 0;
+        const cached_record_size = if (self.jobs.get(job_id)) |value| value.len else 0;
+        const cached_size = cached_record_size + self.inputSizeLocked(job_id);
         const previous = self.unconfirmed_sizes.get(job_id);
         const reserved = @max(previous orelse 0, size);
         const old_excess = (previous orelse 0) -| cached_size;
         const new_excess = reserved -| cached_size;
-        if (cached_size == 0 and previous == null and
+        if (cached_record_size == 0 and previous == null and
             self.jobs.count() + self.unconfirmed_new_jobs >= max_retained_restore_jobs)
             return error.RestoreJobCapacityExceeded;
-        const total = std.math.add(usize, self.retained_bytes, self.unconfirmed_bytes) catch return error.RestoreJobCapacityExceeded;
+        const total = std.math.add(usize, self.retained_bytes + self.input_bytes, self.unconfirmed_bytes) catch return error.RestoreJobCapacityExceeded;
         if (total > max_retained_restore_job_bytes or new_excess - old_excess > max_retained_restore_job_bytes - total)
             return error.RestoreJobCapacityExceeded;
         try self.unconfirmed_sizes.put(self.alloc, job_id, reserved);
         self.unconfirmed_bytes += new_excess - old_excess;
-        if (cached_size == 0 and previous == null) self.unconfirmed_new_jobs += 1;
+        if (cached_record_size == 0 and previous == null) self.unconfirmed_new_jobs += 1;
     }
 
     fn releaseReservationLocked(self: *Store, job_id: u64) void {
         const reservation = self.unconfirmed_sizes.fetchRemove(job_id) orelse return;
-        const cached_size = if (self.jobs.get(job_id)) |value| value.len else 0;
+        const cached_record_size = if (self.jobs.get(job_id)) |value| value.len else 0;
+        const cached_size = cached_record_size + self.inputSizeLocked(job_id);
         self.unconfirmed_bytes -= reservation.value -| cached_size;
-        if (cached_size == 0) self.unconfirmed_new_jobs -= 1;
+        if (cached_record_size == 0) self.unconfirmed_new_jobs -= 1;
     }
 
     fn checkCachedSizeLocked(self: *Store, job_id: u64, previous: usize, next: usize) !void {
@@ -2494,16 +2516,18 @@ pub const Store = struct {
             return error.RestoreJobCapacityExceeded;
         const reserved = self.unconfirmed_sizes.get(job_id) orelse 0;
         const accounted = self.retained_bytes + self.unconfirmed_bytes + self.input_bytes;
-        const old_charge = @max(previous, reserved);
-        const next_charge = @max(next, reserved);
+        const inputs = self.inputSizeLocked(job_id);
+        const old_charge = @max(previous + inputs, reserved);
+        const next_charge = @max(next + inputs, reserved);
         if (next_charge > old_charge and next_charge - old_charge > max_retained_restore_job_bytes -| accounted)
             return error.RestoreJobCapacityExceeded;
     }
 
     fn observeCachedSizeLocked(self: *Store, job_id: u64, previous: usize, next: usize) void {
         const reserved = self.unconfirmed_sizes.get(job_id) orelse return;
-        self.unconfirmed_bytes -= reserved -| previous;
-        self.unconfirmed_bytes += reserved -| next;
+        const inputs = self.inputSizeLocked(job_id);
+        self.unconfirmed_bytes -= reserved -| (previous + inputs);
+        self.unconfirmed_bytes += reserved -| (next + inputs);
         if (previous == 0 and next != 0) self.unconfirmed_new_jobs -= 1;
         if (previous != 0 and next == 0) self.unconfirmed_new_jobs += 1;
     }
@@ -2558,6 +2582,27 @@ pub const Store = struct {
         }
     }
 
+    fn inputSizeLocked(self: *Store, job_id: u64) usize {
+        return if (self.inputs.get(job_id)) |bytes| bytes.len else 0;
+    }
+
+    fn checkInputSizeLocked(self: *Store, job_id: u64, previous: usize, next: usize) !void {
+        const record = if (self.jobs.get(job_id)) |bytes| bytes.len else 0;
+        const reserved = self.unconfirmed_sizes.get(job_id) orelse 0;
+        const old_charge = @max(record + previous, reserved);
+        const new_charge = @max(record + next, reserved);
+        const total = self.retained_bytes + self.input_bytes + self.unconfirmed_bytes;
+        if (new_charge > old_charge and new_charge - old_charge > max_retained_restore_job_bytes -| total)
+            return error.RestoreJobCapacityExceeded;
+    }
+
+    fn observeInputSizeLocked(self: *Store, job_id: u64, previous: usize, next: usize) void {
+        const reserved = self.unconfirmed_sizes.get(job_id) orelse return;
+        const record = if (self.jobs.get(job_id)) |bytes| bytes.len else 0;
+        self.unconfirmed_bytes -= reserved -| (record + previous);
+        self.unconfirmed_bytes += reserved -| (record + next);
+    }
+
     fn compactRecordLocked(self: *Store, job_id: u64, encoded: []const u8) ![]u8 {
         const parts = try immutable_inputs.split(self.alloc, encoded);
         errdefer parts.deinit(self.alloc);
@@ -2566,8 +2611,9 @@ pub const Store = struct {
                 if (!std.mem.eql(u8, previous, bytes)) return error.CorruptRestoreJobStore;
                 self.alloc.free(bytes);
             } else {
-                if (bytes.len > max_retained_restore_job_bytes -| (self.input_bytes + self.retained_bytes)) return error.RestoreJobCapacityExceeded;
+                try self.checkInputSizeLocked(job_id, 0, bytes.len);
                 try self.inputs.put(self.alloc, job_id, bytes);
+                self.observeInputSizeLocked(job_id, 0, bytes.len);
                 self.input_bytes += bytes.len;
             }
         }
@@ -2580,10 +2626,11 @@ pub const Store = struct {
             return error.CorruptRestoreJobStore;
         const job_id = try std.fmt.parseInt(u64, key[key_prefix.len..][0..16], 16);
         const previous_bytes = if (self.inputs.get(job_id)) |previous| previous.len else 0;
-        if (bytes.len > max_retained_restore_job_bytes -| (self.input_bytes - previous_bytes + self.retained_bytes)) return error.RestoreJobCapacityExceeded;
+        try self.checkInputSizeLocked(job_id, previous_bytes, bytes.len);
         const owned = try self.alloc.dupe(u8, bytes);
         errdefer self.alloc.free(owned);
         if (try self.inputs.fetchPut(self.alloc, job_id, owned)) |previous| self.alloc.free(previous.value);
+        self.observeInputSizeLocked(job_id, previous_bytes, bytes.len);
         self.input_bytes = self.input_bytes - previous_bytes + bytes.len;
         return true;
     }
@@ -2867,6 +2914,11 @@ test "restore admission recovers generated identity and immutable inputs from a 
     old.* = try alloc.dupe(u8, parts.record);
     try persistence.rows.put(alloc, input_key, try alloc.dupe(u8, parts.inputs.?));
     store.clearInMemoryLocked();
+    var status_buffer: [16 * 1024]u8 = undefined;
+    var status_allocator = std.heap.FixedBufferAllocator.init(&status_buffer);
+    const status = (try store.loadRecord(status_allocator.allocator(), id)).?;
+    try std.testing.expect(std.mem.indexOf(u8, status, "cluster_binding_sha256") != null);
+    try std.testing.expectEqual(@as(usize, 0), store.input_bytes);
     const recovered = (try store.load(alloc, id)).?;
     defer alloc.free(recovered);
     var full = try std.json.parseFromSlice(JobState, alloc, recovered, .{});
@@ -2882,6 +2934,71 @@ test "restore admission recovers generated identity and immutable inputs from a 
     defer reloaded_state.deinit();
     try std.testing.expectEqual(Phase.queued, reloaded_state.value.phase);
     try std.testing.expectEqualStrings(parsed.value.cluster_binding.?.manifest_sha256, reloaded_state.value.cluster_binding.?.manifest_sha256);
+}
+
+test "restore admission recovers generated identity and reserves retained immutable inputs before commit" {
+    const alloc = std.testing.allocator;
+    var persistence = TestReplicatedPersistence.init(alloc);
+    defer persistence.deinit();
+    var store = Store.initWithIo(alloc, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+    const req: StartRequest = .{
+        .scope = .cluster,
+        .backup_id = "daily",
+        .location = "s3://archive/daily",
+        .connection = "archive",
+        .idempotency_namespace = "capacity",
+        .idempotency_key = "second",
+        .cluster_binding = .{ .manifest_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" },
+    };
+    // Simulate other jobs' retained inputs at the budget, without a 64 MiB fixture.
+    store.input_bytes = max_retained_restore_job_bytes - 1;
+    var submitted = false;
+    try std.testing.expectError(error.RestoreJobCapacityExceeded, store.startRecoverableObserved(alloc, req, true, &submitted));
+    try std.testing.expect(!submitted);
+    try std.testing.expectEqual(@as(u32, 0), persistence.rows.count());
+    try std.testing.expectEqual(@as(usize, 0), store.unconfirmed_bytes);
+    store.input_bytes = 0;
+    const accepted = try store.start(alloc, req);
+    defer alloc.free(accepted);
+    try std.testing.expect(store.input_bytes != 0);
+    try std.testing.expectEqual(@as(usize, 0), store.unconfirmed_bytes);
+    var admitted = try std.json.parseFromSlice(JobState, alloc, accepted, .{ .ignore_unknown_fields = true });
+    defer admitted.deinit();
+    const id = admitted.value.job_id;
+    // Model the atomic header/sidecar layout used by production persistence.
+    // The generic fault fixture otherwise stores opaque legacy rows verbatim.
+    const persisted_key = try jobKey(alloc, id);
+    defer alloc.free(persisted_key);
+    const parts = try immutable_inputs.split(alloc, accepted);
+    defer parts.deinit(alloc);
+    const initial_row = persistence.rows.getPtr(persisted_key).?;
+    alloc.free(initial_row.*);
+    initial_row.* = try alloc.dupe(u8, parts.record);
+    const sidecar = try std.fmt.allocPrint(alloc, "{s}{s}", .{ persisted_key, immutable_inputs.suffix });
+    try persistence.rows.put(alloc, sidecar, try alloc.dupe(u8, parts.inputs.?));
+    const footprint = store.retained_bytes + store.input_bytes;
+    try store.reservePersistenceLocked(id, footprint + 1024);
+    try std.testing.expectEqual(@as(usize, 1024), store.unconfirmed_bytes);
+    const key = try jobKey(alloc, id);
+    defer alloc.free(key);
+    const durable = try alloc.dupe(u8, persistence.rows.get(key).?);
+    defer alloc.free(durable);
+    try TestReplicatedPersistence.delete(&persistence, key, 0);
+    try std.testing.expect((try store.loadRecord(alloc, id)) == null);
+    try std.testing.expectEqual(footprint + 1024, store.unconfirmed_bytes);
+    try std.testing.expectEqual(@as(usize, 0), store.input_bytes);
+    try persistence.rows.put(alloc, try alloc.dupe(u8, key), try alloc.dupe(u8, durable));
+    const observed = (try store.load(alloc, id)).?;
+    defer alloc.free(observed);
+    try std.testing.expectEqual(@as(usize, 1024), store.unconfirmed_bytes);
+    const running = (try store.begin(alloc, id)).?;
+    defer alloc.free(running);
+    try std.testing.expectEqual(@as(usize, 0), store.unconfirmed_bytes);
+    try store.prepareReplicatedLeadership(alloc, 2);
+    try std.testing.expectEqual(@as(u32, 1), store.jobs.count());
+    try std.testing.expect(store.input_bytes != 0);
 }
 
 test "restore staging incarnation survives retries and cancellation waits for owner cleanup" {
@@ -5071,6 +5188,11 @@ test "restore runtime store persists checkpoints and requeues interrupted work" 
         var parsed_started = try std.json.parseFromSlice(JobState, alloc, started, .{});
         defer parsed_started.deinit();
         job_id = parsed_started.value.job_id;
+        var status_buffer: [8192]u8 = undefined;
+        var status_allocator = std.heap.FixedBufferAllocator.init(&status_buffer);
+        const status = (try first_store.loadRecord(status_allocator.allocator(), job_id)).?;
+        try std.testing.expect(status.len < status_buffer.len);
+        try std.testing.expect(std.mem.indexOf(u8, status, immutable_manifest_json) == null);
         const running = (try first_store.begin(alloc, job_id)).?;
         defer alloc.free(running);
         var parsed_running = try std.json.parseFromSlice(JobState, alloc, running, .{});

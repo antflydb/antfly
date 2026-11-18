@@ -13867,6 +13867,7 @@ pub const ApiHttpServer = struct {
                             location_uri,
                             manifest.backup_id,
                             artifact_backup_id,
+                            manifest.restore_admission_fingerprint,
                         ) catch |state_err| blk: {
                             if (metadata_authority.isRetryableError(state_err)) return state_err;
                             break :blk .missing;
@@ -13956,6 +13957,7 @@ pub const ApiHttpServer = struct {
         location_uri: []const u8,
         backup_id: []const u8,
         artifact_backup_id: []const u8,
+        admission_fingerprint: ?[32]u8,
     ) !DistributedRestoreIntentState {
         var snapshot = (try self.source.adminSnapshot()) orelse return .missing;
         defer self.source.freeAdminSnapshot(&snapshot);
@@ -13971,6 +13973,8 @@ pub const ApiHttpServer = struct {
         for (snapshot.ranges) |range| {
             if (range.table_id != table.table_id) continue;
             found_range = true;
+            const expected_admission = admission_fingerprint orelse metadata_table_manager.empty_restore_completion_fingerprint;
+            if (!std.mem.eql(u8, &range.restore_admission_fingerprint, &expected_admission)) return .conflicting;
             const has_active_restore =
                 range.restore_backup_id.len > 0 or
                 range.restore_artifact_backup_id.len > 0 or
@@ -14011,12 +14015,13 @@ pub const ApiHttpServer = struct {
         backup_id: []const u8,
         artifact_backup_id: []const u8,
         cancellation: ?RestoreCancellation,
+        admission_fingerprint: ?[32]u8,
     ) !void {
         const io = self.sharedApiIo() orelse return error.AsyncRestoreUnavailable;
         var poll_ms: u64 = 100;
         while (true) {
             try self.ensureRestoreActive(cancellation);
-            switch (try self.distributedRestoreIntentState(table_name, location_uri, backup_id, artifact_backup_id)) {
+            switch (try self.distributedRestoreIntentState(table_name, location_uri, backup_id, artifact_backup_id, admission_fingerprint)) {
                 .completed => return,
                 .pending => {},
                 .missing => return error.TableNotFound,
@@ -21811,6 +21816,7 @@ pub const ApiHttpServer = struct {
         if (restore_connection.len == 0 or restore_connection.len > 256) return error.InvalidRequest;
         const restore_io = self.backupLocationIo(location) orelse return error.InternalFailure;
 
+        var admission_fingerprint: ?[32]u8 = null;
         var publication_identity: ?[]u8 = null;
         defer if (publication_identity) |identity| op_alloc.free(identity);
         if (cancellation) |restore| {
@@ -21822,6 +21828,11 @@ pub const ApiHttpServer = struct {
                 state.value.cluster_binding != null and state.value.cluster_binding.?.recovery_manifests_json != null and
                 state.value.cluster_binding.?.publication_nonce != null)
                 publication_identity = backups_api.restorePublicationIdentityAlloc(op_alloc, state.value.job_id, state.value.cluster_binding.?.publication_nonce.?, req.location) catch return error.InvalidRequest;
+            if (publication_identity) |identity| if (state.value.cluster_binding.?.distributed_admission_receipts) {
+                var hash: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(identity, &hash, .{});
+                admission_fingerprint = hash;
+            };
             if (state.value.staging_attempt_id != 0) {
                 const id = @import("../metadata/restore_staging.zig").idForAttempt(restore.job_id, state.value.staging_attempt_id) catch return error.InternalFailure;
                 var staged_control = StagedRestoreControl{ .server = self, .restore = restore };
@@ -22016,14 +22027,14 @@ pub const ApiHttpServer = struct {
         if (req.admitted_child_pins != null) {
             // The metadata publication and the job checkpoint are separate
             // commits. Resolve an interrupted attempt before opening its source.
-            if (!is_overwrite and !self.cfg.deployment_mode.isStandalone()) {
+            if (admission_fingerprint != null and !is_overwrite and !self.cfg.deployment_mode.isStandalone()) {
                 for (destinations, 0..) |destination, index| {
                     const ordinal: u16 = @intCast(index);
                     if (ordinal != active_table_index and
                         !restore_jobs.containsTableIndex(durability_pending_table_ranges, ordinal)) continue;
                     try self.ensureRestoreActive(cancellation);
                     const entry = &manifest.tables[if (req.admitted_table_ordinals) |selected| selected[index] else index];
-                    switch (self.distributedRestoreIntentState(destination, req.location, entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id) catch |err| return metadataAccessFailure(err)) {
+                    switch (self.distributedRestoreIntentState(destination, req.location, entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id, admission_fingerprint) catch |err| return metadataAccessFailure(err)) {
                         .pending, .completed => {
                             self.checkpointRestoreTablePublished(cancellation, ordinal) catch |err| {
                                 if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.NotLeader;
@@ -22046,7 +22057,7 @@ pub const ApiHttpServer = struct {
                         (!published and ordinal != active_table_index and !restore_jobs.containsTableIndex(durability_pending_table_ranges, ordinal))) continue;
                     const entry = &manifest.tables[if (req.admitted_table_ordinals) |selected| selected[index] else index];
                     if (published and !is_overwrite and !self.cfg.deployment_mode.isStandalone()) {
-                        switch (self.distributedRestoreIntentState(destination, req.location, entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id) catch |err| return metadataAccessFailure(err)) {
+                        switch (self.distributedRestoreIntentState(destination, req.location, entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id, admission_fingerprint) catch |err| return metadataAccessFailure(err)) {
                             .pending, .completed => continue,
                             .missing, .conflicting => {},
                         }
@@ -22165,7 +22176,7 @@ pub const ApiHttpServer = struct {
                     else => return error.InvalidRequest,
                 };
                 if (!self.cfg.deployment_mode.isStandalone()) {
-                    self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id, artifact_backup_id, cancellation) catch |err| switch (err) {
+                    self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id, artifact_backup_id, cancellation, admission_fingerprint) catch |err| switch (err) {
                         error.NotLeader => return error.NotLeader,
                         error.Cancelled => return error.Cancelled,
                         else => {
@@ -22319,6 +22330,7 @@ pub const ApiHttpServer = struct {
                     else => return error.InvalidRequest,
                 };
 
+                table_manifest.restore_admission_fingerprint = admission_fingerprint;
                 const restored_via_metadata = self.restoreMetadataTableWithRetry(
                     alloc,
                     table_name,
@@ -22357,7 +22369,7 @@ pub const ApiHttpServer = struct {
                         if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.NotLeader;
                         return error.InternalFailure;
                     };
-                    self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id, artifact_backup_id, cancellation) catch |err| switch (err) {
+                    self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id, artifact_backup_id, cancellation, admission_fingerprint) catch |err| switch (err) {
                         error.NotLeader => return error.NotLeader,
                         error.Cancelled => return error.Cancelled,
                         else => {
@@ -25718,7 +25730,7 @@ pub const ApiHttpServer = struct {
                 return try contextualJsonErrorResponse(self.alloc, 422, "hot-standby restore requires a dependency-complete native cluster cohort");
             const ordinals = if (req.table_names) |names| try self.alloc.alloc(u16, names.len) else null;
             defer if (ordinals) |values| self.alloc.free(values);
-            start_request.cluster_binding = .{ .manifest_sha256 = &manifest_digest, .selected_ordinals = ordinals, .manifest_json = manifest_json };
+            start_request.cluster_binding = .{ .manifest_sha256 = &manifest_digest, .selected_ordinals = ordinals, .manifest_json = manifest_json, .distributed_admission_receipts = true };
             const selected = if (req.table_names) |names|
                 resolveClusterRestoreSelectionAlloc(self.alloc, &manifest, names, ordinals) catch |err| switch (err) {
                     error.InvalidRequest => return try contextualJsonErrorResponse(self.alloc, 400, "unknown, ambiguous, or duplicate backup table selection"),
@@ -26079,7 +26091,7 @@ pub const ApiHttpServer = struct {
         // this boundary still belong to the queued predecessor and must never
         // be sent through running-only terminalization.
         begin_established_out.* = true;
-        const worker_state = (try self.restore_job_store.loadCached(self.alloc, job_id)) orelse return error.RestoreJobFenced;
+        const worker_state = (try self.restore_job_store.load(self.alloc, job_id)) orelse return error.RestoreJobFenced;
         defer self.alloc.free(worker_state);
         var parsed = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, worker_state, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
@@ -26260,7 +26272,7 @@ pub const ApiHttpServer = struct {
                     // A resumed job may already have crossed publication. Infer
                     // which completion protocol owns it from durable metadata;
                     // local fallback restores intentionally have no such intent.
-                    restored_via_metadata = switch (try self.distributedRestoreIntentState(table_name, state.location, state.backup_id, state.backup_id)) {
+                    restored_via_metadata = switch (try self.distributedRestoreIntentState(table_name, state.location, state.backup_id, state.backup_id, null)) {
                         .pending, .completed => true,
                         .missing => false,
                         .conflicting => {
@@ -26271,7 +26283,7 @@ pub const ApiHttpServer = struct {
                     };
                 }
                 if (restored_via_metadata and !self.cfg.deployment_mode.isStandalone()) {
-                    self.waitForDistributedRestoreCompletion(table_name, state.location, state.backup_id, state.backup_id, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }) catch |err| {
+                    self.waitForDistributedRestoreCompletion(table_name, state.location, state.backup_id, state.backup_id, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, null) catch |err| {
                         if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                         const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                         self.alloc.free(failed);
@@ -26330,7 +26342,7 @@ pub const ApiHttpServer = struct {
                 return try contextualJsonErrorResponse(self.alloc, 404, "not found");
             self.signalRestoreRetryWakeup();
             break :blk cancelled;
-        } else (try self.restore_job_store.load(self.alloc, job_id)) orelse return try contextualJsonErrorResponse(self.alloc, 404, "not found");
+        } else (try self.restore_job_store.loadRecord(self.alloc, job_id)) orelse return try contextualJsonErrorResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         return try self.restoreJobResponse(200, encoded);
     }
@@ -26498,7 +26510,7 @@ pub const ApiHttpServer = struct {
     };
 
     pub fn restoreJobAllowed(self: *ApiHttpServer, alloc: std.mem.Allocator, identity: AuthenticatedIdentity, job_id: u64) !bool {
-        const encoded = (try self.restore_job_store.load(alloc, job_id)) orelse return false;
+        const encoded = (try self.restore_job_store.loadRecord(alloc, job_id)) orelse return false;
         defer alloc.free(encoded);
         var parsed = try std.json.parseFromSlice(restore_jobs.JobState, alloc, encoded, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
@@ -55850,6 +55862,7 @@ test "api http server cluster restore rehydrates extension metadata" {
                     artifact_backup_id,
                     location_uri_arg,
                 );
+            self.state.ranges[0].restore_admission_fingerprint = manifest.restore_admission_fingerprint orelse metadata_table_manager.empty_restore_completion_fingerprint;
             self.state.table_restored = true;
         }
 
@@ -55912,6 +55925,18 @@ test "api http server cluster restore rehydrates extension metadata" {
     try std.testing.expectEqual(@as(usize, 1), state.installed_count);
     try std.testing.expectEqual(@as(usize, 1), state.member_count);
     try std.testing.expectEqual(@as(usize, 1), state.dependency_count);
+    // A second admission to the same archive must not adopt the first job's
+    // completion, or its pending publication during the checkpoint gap.
+    const first_witness = state.ranges[0].restore_admission_fingerprint;
+    const other_witness: [32]u8 = @splat(0x5a);
+    try std.testing.expect(!std.mem.eql(u8, &first_witness, &metadata_table_manager.empty_restore_completion_fingerprint));
+    try std.testing.expectEqual(ApiHttpServer.DistributedRestoreIntentState.completed, try server.distributedRestoreIntentState("docs", location_uri, "docs-snap-cluster", "docs-snap-cluster", first_witness));
+    try std.testing.expectEqual(ApiHttpServer.DistributedRestoreIntentState.conflicting, try server.distributedRestoreIntentState("docs", location_uri, "docs-snap-cluster", "docs-snap-cluster", other_witness));
+    state.ranges[0].restore_backup_id = "docs-snap-cluster";
+    state.ranges[0].restore_artifact_backup_id = "docs-snap-cluster";
+    state.ranges[0].restore_location = location_uri;
+    try std.testing.expectEqual(ApiHttpServer.DistributedRestoreIntentState.pending, try server.distributedRestoreIntentState("docs", location_uri, "docs-snap-cluster", "docs-snap-cluster", first_witness));
+    try std.testing.expectEqual(ApiHttpServer.DistributedRestoreIntentState.conflicting, try server.distributedRestoreIntentState("docs", location_uri, "docs-snap-cluster", "docs-snap-cluster", other_witness));
 }
 
 test "api http server prefers metadata-owned restore over inline write-source restore" {

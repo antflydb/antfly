@@ -407,6 +407,7 @@ pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
         std.mem.eql(u8, lhs.restore_artifact_sha256, rhs.restore_artifact_sha256) and
         lhs.restore_native_manifest_size_bytes == rhs.restore_native_manifest_size_bytes and
         std.mem.eql(u8, lhs.restore_native_manifest_sha256, rhs.restore_native_manifest_sha256) and
+        std.mem.eql(u8, &lhs.restore_admission_fingerprint, &rhs.restore_admission_fingerprint) and
         std.mem.eql(
             u8,
             &lhs.completed_restore_fingerprint,
@@ -455,6 +456,7 @@ pub fn rangeMatchesRestorePublication(
         projected.doc_identity_shard_id == expected.doc_identity_shard_id and
         projected.doc_identity_range_id == expected.doc_identity_range_id and
         projected.split_attempt_epoch == expected.split_attempt_epoch and
+        std.mem.eql(u8, &projected.restore_admission_fingerprint, &expected.restore_admission_fingerprint) and
         rangeRestoreCompletionMatches(
             projected,
             expected.restore_backup_id,
@@ -1956,6 +1958,7 @@ pub const TableManager = struct {
         const identity_range_id = rangeDocIdentityRangeId(source);
         const table_id = source.table_id;
         const completion_fingerprint = source.completed_restore_fingerprint;
+        const admission_fingerprint = source.restore_admission_fingerprint;
 
         if (!source_already_narrowed) {
             try self.upsertRange(.{
@@ -1968,6 +1971,7 @@ pub const TableManager = struct {
                 .doc_identity_range_id = source.doc_identity_range_id,
                 .split_attempt_epoch = source.split_attempt_epoch,
                 .completed_restore_fingerprint = completion_fingerprint,
+                .restore_admission_fingerprint = admission_fingerprint,
             });
         }
 
@@ -1977,6 +1981,7 @@ pub const TableManager = struct {
                 !std.mem.eql(u8, destination.start_key, split_key) or
                 !optionalBytesEqual(destination.end_key, record.source_range_end) or
                 destination.split_attempt_epoch != 0 or
+                !std.mem.eql(u8, &destination.restore_admission_fingerprint, &admission_fingerprint) or
                 !rangeMatchesTransitionIdentity(
                     destination,
                     record.table_contract.target_identity,
@@ -2000,6 +2005,7 @@ pub const TableManager = struct {
                 .doc_identity_range_id = identity_range_id,
                 .split_attempt_epoch = 0,
                 .completed_restore_fingerprint = completion_fingerprint,
+                .restore_admission_fingerprint = admission_fingerprint,
             });
         }
     }
@@ -2044,6 +2050,10 @@ pub const TableManager = struct {
             receiver.completed_restore_fingerprint
         else
             empty_restore_completion_fingerprint;
+        const restore_admission_fingerprint = if (std.mem.eql(u8, &donor.restore_admission_fingerprint, &receiver.restore_admission_fingerprint))
+            receiver.restore_admission_fingerprint
+        else
+            empty_restore_completion_fingerprint;
         const receiver_already_merged =
             std.mem.eql(u8, receiver.start_key, merged_start) and
             optionalBytesEqual(receiver.end_key, merged_end);
@@ -2051,6 +2061,7 @@ pub const TableManager = struct {
             return error.TransitionTopologyConflict;
 
         if (receiver_already_merged) {
+            if (!std.mem.eql(u8, &receiver.restore_admission_fingerprint, &restore_admission_fingerprint)) return error.TransitionTopologyConflict;
             if (!std.mem.eql(
                 u8,
                 &receiver.completed_restore_fingerprint,
@@ -2068,6 +2079,7 @@ pub const TableManager = struct {
                 .doc_identity_shard_id = receiver.doc_identity_shard_id,
                 .doc_identity_range_id = receiver.doc_identity_range_id,
                 .completed_restore_fingerprint = completed_restore_fingerprint,
+                .restore_admission_fingerprint = restore_admission_fingerprint,
             });
         }
         _ = self.removeRange(donor.group_id);
@@ -2348,6 +2360,7 @@ pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
         .restore_native_manifest_size_bytes = record.restore_native_manifest_size_bytes,
         .restore_native_manifest_sha256 = restore_native_manifest_sha256,
         .completed_restore_fingerprint = record.completed_restore_fingerprint,
+        .restore_admission_fingerprint = record.restore_admission_fingerprint,
     };
 }
 

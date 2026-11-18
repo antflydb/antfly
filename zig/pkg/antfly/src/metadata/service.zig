@@ -18411,6 +18411,7 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
         hasher.update(std.mem.asBytes(&range.restore_native_manifest_size_bytes));
         hashProjectedProvisioningBytes(&hasher, range.restore_native_manifest_sha256);
         hasher.update(&range.completed_restore_fingerprint);
+        hasher.update(&range.restore_admission_fingerprint);
     }
 
     const placements = try service.listProjectedPlacementIntents(alloc);

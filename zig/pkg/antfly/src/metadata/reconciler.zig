@@ -3995,6 +3995,7 @@ fn rangeRecordsEqual(a: table_manager.RangeRecord, b: table_manager.RangeRecord)
         std.mem.eql(u8, a.restore_artifact_sha256, b.restore_artifact_sha256) and
         a.restore_native_manifest_size_bytes == b.restore_native_manifest_size_bytes and
         std.mem.eql(u8, a.restore_native_manifest_sha256, b.restore_native_manifest_sha256) and
+        std.mem.eql(u8, &a.restore_admission_fingerprint, &b.restore_admission_fingerprint) and
         std.mem.eql(
             u8,
             &a.completed_restore_fingerprint,

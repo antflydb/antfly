@@ -11560,6 +11560,7 @@ pub fn deriveRestoreRanges(
             artifact_backup_id,
             shard,
         );
+        ranges[i].restore_admission_fingerprint = manifest.restore_admission_fingerprint orelse metadata_table_manager.empty_restore_completion_fingerprint;
         initialized += 1;
     }
     return ranges;

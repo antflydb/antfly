@@ -6456,6 +6456,43 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
     }
 }
 
+test "metadata raft apply store round trips admission ownership and retains it through completion" {
+    const alloc = std.testing.allocator;
+    const witness: [32]u8 = @splat(0x5a);
+    const encoded = try encodeRangeRecord(alloc, .{
+        .group_id = 901,
+        .table_id = 903,
+        .start_key = "",
+        .restore_backup_id = "daily",
+        .restore_artifact_backup_id = "artifact",
+        .restore_location = "s3://archive/daily",
+        .restore_admission_fingerprint = witness,
+    });
+    defer alloc.free(encoded);
+    var decoded = try decodeRangeRecord(alloc, encoded);
+    defer metadata_table_manager.freeRange(alloc, decoded);
+    try std.testing.expectEqual(witness, decoded.restore_admission_fingerprint);
+    try metadata_table_manager.clearOwnedRangeRestoreIntent(alloc, &decoded);
+    const completed = try encodeRangeRecord(alloc, decoded);
+    defer alloc.free(completed);
+    const reloaded = try decodeRangeRecord(alloc, completed);
+    defer metadata_table_manager.freeRange(alloc, reloaded);
+    try std.testing.expectEqual(witness, reloaded.restore_admission_fingerprint);
+    try std.testing.expect(metadata_table_manager.rangeRestoreCompletionMatches(reloaded, "daily", "artifact", "s3://archive/daily"));
+    const cloned = try metadata_table_manager.cloneRange(alloc, reloaded);
+    defer metadata_table_manager.freeRange(alloc, cloned);
+    try std.testing.expectEqual(witness, cloned.restore_admission_fingerprint);
+    var expected = decoded;
+    expected.restore_backup_id = "daily";
+    expected.restore_artifact_backup_id = "artifact";
+    expected.restore_location = "s3://archive/daily";
+    try std.testing.expect(metadata_table_manager.rangeMatchesRestorePublication(reloaded, expected));
+    expected.restore_admission_fingerprint = @splat(0x5b);
+    try std.testing.expect(!metadata_table_manager.rangeMatchesRestorePublication(reloaded, expected));
+    try std.testing.expectEqual(topology_protocol.pinned_restore_job_version, topology_protocol.restoreAdmissionDecoderVersion(&[_]metadata.RangeRecord{reloaded}, topology_protocol.atomic_table_topology_version));
+    try std.testing.expectEqual(topology_protocol.atomic_table_topology_version, topology_protocol.restoreAdmissionDecoderVersion(&[_]metadata.RangeRecord{.{ .group_id = 1, .table_id = 2, .start_key = "" }}, topology_protocol.atomic_table_topology_version));
+}
+
 test "metadata raft apply store decodes range values before split attempt epochs" {
     const encoded = try encodeRangeRecord(std.testing.allocator, .{
         .group_id = 901,
@@ -22358,6 +22395,7 @@ pub const RaftApplyStore = struct {
                     // never the ordinary backup_restore bootstrap shortcut.
                     try metadata_table_manager.clearOwnedRangeRestoreIntent(alloc, &owned_range);
                     owned_range.completed_restore_fingerprint = metadata_table_manager.empty_restore_completion_fingerprint;
+                    owned_range.restore_admission_fingerprint = metadata_table_manager.empty_restore_completion_fingerprint;
                     ranges.appendAssumeCapacity(owned_range);
                 }
             }
@@ -31718,10 +31756,14 @@ fn appendRangeRecord(
     try appendInt(alloc, out, u32, @intCast(record.restore_artifact_backup_id.len));
     try out.appendSlice(alloc, record.restore_artifact_backup_id);
     try out.appendSlice(alloc, &record.completed_restore_fingerprint);
-    if (record.restore_native_manifest_size_bytes != 0 or record.restore_native_manifest_sha256.len != 0) {
+    if (record.restore_native_manifest_size_bytes != 0 or record.restore_native_manifest_sha256.len != 0 or
+        !std.mem.eql(u8, &record.restore_admission_fingerprint, &metadata_table_manager.empty_restore_completion_fingerprint))
+    {
         try appendInt(alloc, out, u64, record.restore_native_manifest_size_bytes);
         try appendInt(alloc, out, u32, @intCast(record.restore_native_manifest_sha256.len));
         try out.appendSlice(alloc, record.restore_native_manifest_sha256);
+        if (!std.mem.eql(u8, &record.restore_admission_fingerprint, &metadata_table_manager.empty_restore_completion_fingerprint))
+            try out.appendSlice(alloc, &record.restore_admission_fingerprint);
     }
 }
 
@@ -32438,6 +32480,12 @@ fn readRangeRecord(
     else
         try alloc.dupe(u8, "");
     errdefer alloc.free(restore_native_manifest_sha256);
+    var restore_admission_fingerprint = metadata_table_manager.empty_restore_completion_fingerprint;
+    if (pos.* < encoded.len) {
+        if (encoded.len - pos.* != 32) return error.InvalidMetadataTransitionEncoding;
+        @memcpy(&restore_admission_fingerprint, encoded[pos.*..][0..32]);
+        pos.* += 32;
+    }
     return .{
         .group_id = group_id,
         .range_id = if (range_id == 0) group_id else range_id,
@@ -32457,6 +32505,7 @@ fn readRangeRecord(
         .restore_native_manifest_size_bytes = restore_native_manifest_size_bytes,
         .restore_native_manifest_sha256 = restore_native_manifest_sha256,
         .completed_restore_fingerprint = completed_restore_fingerprint,
+        .restore_admission_fingerprint = restore_admission_fingerprint,
     };
 }
 
