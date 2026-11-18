@@ -2233,13 +2233,19 @@ jobs:
       (needs.e2e-base-build.result == 'success' || needs.e2e-full-build.result == 'success') }}
     name: e2e / plan
     needs: [admission, changes, e2e-base-build, e2e-full-build]
-    runs-on: arc-antfly-standard-runtime
+    # Planning only collects Python tests and balances their duration history.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
+          sparse-checkout: |
+            py/packages/embedded
+            scripts/ci
+            zig/e2e/antfly
+            zig/scripts
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
       - name: Restore common E2E duration history
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
