@@ -963,7 +963,7 @@ fn metadataRestoreJobPut(ptr: *anyopaque, key: []const u8, value: []const u8, le
         leadership_term,
     );
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    const committed = (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) orelse
+    const committed = (try store.getRestoreJobRecord(svc.alloc, svc.metadata_group_id, key)) orelse
         return error.RestoreJobCommitNotApplied;
     defer svc.alloc.free(committed);
     if (!std.mem.eql(u8, committed, value)) return error.RestoreJobCommitNotApplied;

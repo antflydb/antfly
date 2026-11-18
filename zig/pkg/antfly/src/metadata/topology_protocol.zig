@@ -122,8 +122,9 @@ const std = @import("std");
 /// Version 88 admits bounded inline map navigation in reader protocol 101.
 /// Version 90 admits table-scoped index aliases and durable retry receipts.
 /// Version 91 admits lifecycle-scoped alias deletion validators.
-/// Version 92 admits durable restore jobs with immutable backup bindings.
-pub const pinned_restore_job_version: u16 = 92;
+/// Version 92 admits durable restore jobs with backup bindings.
+/// Version 93 separates immutable restore inputs from mutable checkpoints.
+pub const pinned_restore_job_version: u16 = 93;
 pub const current_version: u16 = pinned_restore_job_version;
 pub const index_aliases_version: u16 = 90;
 pub const index_alias_lifecycle_version: u16 = 91;

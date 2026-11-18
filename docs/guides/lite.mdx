@@ -292,7 +292,9 @@ name has the same format as a selector, use the listed selector for that table.
 New cluster restore jobs use a durable format that requires workers with
 manifest binding support. In standalone hot-standby deployments, the primary
 waits for the standby replication slots on its timeline to report support
-before admitting these jobs.
+before admitting these jobs. Immutable source identities and the aggregate
+manifest are retained with the job. Progress checkpoints reference those inputs,
+and recovery can finish a published restore after its repository is removed.
 
 For paginated backup listings, keep following `next_cursor` until it is
 absent. A page can be empty if its window contains only skipped manifests.

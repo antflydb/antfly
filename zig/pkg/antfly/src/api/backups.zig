@@ -63,6 +63,8 @@ pub const ClusterRestoreRequest = struct {
     admitted_table_ordinals: ?[]const u16 = null,
     admitted_children_sha256: ?[]const u8 = null,
     admitted_child_pins: ?[]const u8 = null,
+    admitted_recovery_manifests_json: ?[]const u8 = null,
+    admitted_manifest_json: ?[]const u8 = null,
 };
 
 pub const format_version = @import("antfly_local_sources").api_local_backups.format_version;
@@ -2273,7 +2275,7 @@ pub fn manifestExistsAtLocationWithIoAndCancellation(
 
 const parseTableBackupManifest = @import("antfly_local_sources").api_local_backups.parseTableBackupManifest;
 
-const parseTableBackupManifestWithArtifactBackupId = @import("antfly_local_sources").api_local_backups.parseTableBackupManifestWithArtifactBackupId;
+pub const parseTableBackupManifestWithArtifactBackupId = @import("antfly_local_sources").api_local_backups.parseTableBackupManifestWithArtifactBackupId;
 
 pub const validateTableManifest = @import("antfly_local_sources").api_local_backups.validateTableManifest;
 
@@ -9743,7 +9745,7 @@ fn readClusterManifestFromRemoteKey(
     return try parseClusterManifestBytes(alloc, body, backup_id);
 }
 
-fn parseClusterManifestBytes(
+pub fn parseClusterManifestBytes(
     alloc: std.mem.Allocator,
     body: []const u8,
     backup_id: []const u8,

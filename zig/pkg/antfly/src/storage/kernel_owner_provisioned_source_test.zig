@@ -1873,6 +1873,9 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         var reconcile_plan = restore_plan;
         reconcile_plan.reconcile_only = true;
         reconcile_plan.replace_existing = false;
+        // The receipt on the published generation is sufficient even when
+        // the original archive root can no longer be opened.
+        reconcile_plan.backup_root = "missing-repository-after-publication";
         try std.testing.expect((try write_source.source().restoreTable(
             alloc,
             "articles",
