@@ -18,6 +18,7 @@ const http = @import("http_server.zig");
 const control = @import("../metadata/changefeed_control.zig");
 const delivery = @import("../metadata/changefeed_delivery.zig");
 const native = @import("../metadata/native_changefeed_delivery.zig");
+const catalog = @import("antfly_local_sources").system_catalog_domain;
 const roots = @import("../metadata/native_changefeed_root.zig");
 const config = @import("changefeed_metadata.zig");
 const local = @import("antfly_local_sources");
@@ -36,6 +37,7 @@ const Policy = struct {
     api: *http.ApiHttpServer,
     credential: http.AuthenticatedRequest,
     table: []const u8,
+    permission_name: []const u8,
     filter: ?[]const u8,
 
     pub fn authorize(self: *Policy, state: control.State, request: Context) !void {
@@ -44,10 +46,13 @@ const Policy = struct {
         var identity = try authenticate(self.api, self.credential);
         defer identity.deinit(self.api.alloc);
         try requireOwner(identity, definition);
-        if (!try http.tablePermissionCurrentlyAllowed(identity, self.table, .replicate)) return error.Forbidden;
-        const filter = try http.resolveEffectiveRowFilterJson(self.api.alloc, identity, self.table);
+        const current_name = try resolvePermissionName(self.api, self.api.alloc, self.table, request);
+        defer self.api.alloc.free(current_name);
+        if (!std.mem.eql(u8, current_name, self.permission_name)) return error.ChangefeedResynchronizationRequired;
+        if (!try http.tablePermissionCurrentlyAllowed(identity, current_name, .replicate)) return error.Forbidden;
+        const filter = try http.resolveEffectiveRowFilterJson(self.api.alloc, identity, self.permission_name);
         defer if (filter) |bytes| self.api.alloc.free(bytes);
-        if (!optionalEqual(self.filter, filter) or !same(definition.authorization, authorization(identity, definition.tables, filter)))
+        if (!optionalEqual(self.filter, filter) or !same(definition.authorization, authorization(identity, definition.tables, self.table, self.permission_name, filter)))
             return error.ChangefeedResynchronizationRequired;
         try request.ensureActive();
     }
@@ -108,13 +113,42 @@ fn requireOwner(identity: http.AuthenticatedIdentity, definition: control.Defini
     if (!same(definition.owner, try durableOwner(identity))) return error.Forbidden;
 }
 
-fn authorization(identity: http.AuthenticatedIdentity, tables: []const control.Table, filter: ?[]const u8) control.Digest {
+fn authorization(identity: http.AuthenticatedIdentity, tables: []const control.Table, table: []const u8, permission_name: []const u8, filter: ?[]const u8) control.Digest {
+    if (!std.mem.eql(u8, table, permission_name)) return control.hash(.{
+        .domain = "antfly:changefeed-catalog-authorization:v1",
+        .credential = identity.credential_principal,
+        .tables = tables,
+        .permission_name = permission_name,
+        .filter = filter,
+    });
     return control.hash(.{
         .domain = "antfly:changefeed-authorization:v1",
         .credential = identity.credential_principal,
         .tables = tables,
         .filter = filter,
     });
+}
+
+fn resolveStorageName(api: *http.ApiHttpServer, a: A, logical: []const u8, context: Context) ![]const u8 {
+    if (api.source.vtable.system_catalog == null) return a.dupe(u8, logical);
+    const target = try catalog.Target.parse(logical);
+    const bytes = try api.source.systemCatalog(a, context, .{ .resolve = target });
+    defer a.free(bytes);
+    var result = try std.json.parseFromSlice(?catalog.ResolvedTable, a, bytes, .{});
+    defer result.deinit();
+    const table = result.value orelse return error.Forbidden;
+    if (table.native_service != null) return error.Forbidden;
+    return a.dupe(u8, table.name);
+}
+
+fn resolvePermissionName(api: *http.ApiHttpServer, a: A, storage_name: []const u8, context: Context) ![]const u8 {
+    if (api.source.vtable.system_catalog == null) return a.dupe(u8, storage_name);
+    const bytes = try api.source.systemCatalog(a, context, .{ .resolve_many = .{ .storage_names = &.{storage_name} } });
+    defer a.free(bytes);
+    var result = try std.json.parseFromSlice(catalog.ResolvedMany, a, bytes, .{});
+    defer result.deinit();
+    if (result.value.logical_names.len != 1) return error.ChangefeedCapabilityUnsupported;
+    return a.dupe(u8, result.value.logical_names[0] orelse return error.ChangefeedResynchronizationRequired);
 }
 
 pub const Result = union(enum) {
@@ -153,9 +187,11 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
     defer captured.deinit();
     var root = try roots.Routed.init(source, &captured);
     const table = captured.roots[0].table_name;
-    const filter = try http.resolveEffectiveRowFilterJson(a, identity, table);
+    const permission_name = try resolvePermissionName(api, a, table, internal);
+    defer a.free(permission_name);
+    const filter = try http.resolveEffectiveRowFilterJson(a, identity, permission_name);
     defer if (filter) |value| a.free(value);
-    var policy: Policy = .{ .api = api, .credential = credential, .table = table, .filter = filter };
+    var policy: Policy = .{ .api = api, .credential = credential, .table = table, .permission_name = permission_name, .filter = filter };
     var provider: native.ProviderFor(roots.Routed, Policy) = .{ .root = &root, .policy = &policy };
     if (limits) |bounds|
         return .{ .page = try delivery.pull(&client, &provider, a, selection.id, selection.after, bounds, internal) };
@@ -279,7 +315,15 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    const record = (try api.source.tableRecord(scratch, requested)) orelse return error.Forbidden;
+    const table_name = try resolveStorageName(api, scratch, requested, internal);
+    const record = (try api.source.tableRecord(scratch, table_name)) orelse return error.Forbidden;
+    const permission_name = try resolvePermissionName(api, scratch, table_name, internal);
+    const requested_target = try catalog.Target.parse(requested);
+    const permission_target = try catalog.Target.parse(permission_name);
+    if (!std.mem.eql(u8, requested_target.database, permission_target.database) or
+        !std.mem.eql(u8, requested_target.namespace, permission_target.namespace) or
+        !std.mem.eql(u8, requested_target.table, permission_target.table))
+        return error.ChangefeedResynchronizationRequired;
     if (record.storage.engine != .local) return error.ChangefeedCapabilityUnsupported;
     const filter = try http.resolveEffectiveRowFilterJson(scratch, identity, requested);
     const tables: []const control.Table = &.{.{
@@ -290,7 +334,7 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
     }};
     const definition: control.Definition = .{
         .owner = caller,
-        .authorization = authorization(identity, tables, filter),
+        .authorization = authorization(identity, tables, table_name, permission_name, filter),
         .tables = tables,
         .projection = input.include,
     };
@@ -298,12 +342,12 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
     defer captured.deinit();
     if (captured.roots.len != 1) return error.ChangefeedCapabilityUnsupported;
     const root = captured.roots[0];
-    if (!std.mem.eql(u8, root.table_name, requested)) return error.TopologyChanged;
+    if (!std.mem.eql(u8, root.table_name, table_name)) return error.TopologyChanged;
     const authority = try @import("history_policy_provisioning.zig").authority(root.fence);
     const id: control.Id = control.hash(.{ .domain = "antfly:public-changefeed-create:v1", .owner = caller, .key = key })[0..16].*;
     var client: config.Client = .{ .port = meta };
     var policy: RootPolicy(Policy) = .{
-        .access = .{ .api = api, .credential = credential, .table = root.table_name, .filter = filter },
+        .access = .{ .api = api, .credential = credential, .table = root.table_name, .permission_name = permission_name, .filter = filter },
         .io = api.inferenceIo(),
         .source = source,
         .allocator = a,
@@ -393,7 +437,7 @@ pub fn close(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReque
         }
 
         var policy: RootPolicy(Policy) = .{
-            .access = .{ .api = api, .credential = credential, .table = "", .filter = null },
+            .access = .{ .api = api, .credential = credential, .table = "", .permission_name = "", .filter = null },
             .io = api.inferenceIo(),
             .source = source,
             .allocator = a,

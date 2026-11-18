@@ -45417,13 +45417,35 @@ fn consumerTests() type {
                     const api = @import("../api/changefeed_public.zig");
                     const Http = @import("../api/http_server.zig");
                     const Table = antfly.metadata.table_manager.TableRecord;
+                    const domain = @import("antfly_local_sources").system_catalog_domain;
+                    const FeedCatalog = struct {
+                        table: Table,
+                        logical_name: []const u8 = "feed_docs",
+                    };
                     fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
                         return .{ .metadata_group_id = 1, .metrics = .{} };
                     }
                     fn record(raw: *anyopaque, allocator: std.mem.Allocator, name: []const u8) !?Table {
-                        const table: *Table = @ptrCast(@alignCast(raw));
-                        if (!std.mem.eql(u8, table.name, name)) return null;
-                        return try antfly.metadata.table_manager.cloneTable(allocator, table.*);
+                        const feed_catalog: *const FeedCatalog = @ptrCast(@alignCast(raw));
+                        if (!std.mem.eql(u8, feed_catalog.table.name, name)) return null;
+                        return try antfly.metadata.table_manager.cloneTable(allocator, feed_catalog.table);
+                    }
+                    fn systemCatalog(raw: *anyopaque, allocator: std.mem.Allocator, _: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+                        const feed_catalog: *const FeedCatalog = @ptrCast(@alignCast(raw));
+                        switch (call) {
+                            .resolve => |target| {
+                                const matched = std.mem.eql(u8, target.table, feed_catalog.logical_name);
+                                const resolved: ?domain.ResolvedTable = if (matched) .fromTable(feed_catalog.table) else null;
+                                return std.json.Stringify.valueAlloc(allocator, resolved, .{});
+                            },
+                            .resolve_many => |input| {
+                                try std.testing.expectEqual(@as(usize, 1), input.storage_names.len);
+                                try std.testing.expectEqualStrings(feed_catalog.table.name, input.storage_names[0]);
+                                const resolved: domain.ResolvedMany = .{ .revision = 1, .tables = &.{}, .logical_names = &.{feed_catalog.logical_name} };
+                                return std.json.Stringify.valueAlloc(allocator, resolved, .{});
+                            },
+                            else => return error.TestUnexpectedResult,
+                        }
                     }
                     noinline fn run(allocator: std.mem.Allocator, svc: *feed_fixture.Service, source: @import("../api/history_roots.zig").Source, table: Table, node: *DataServer, fence: antfly.metadata_api.CatalogRouteFence) !void {
                         var auth_storage = antfly.lsm_backend.Backend.init(allocator, .{ .flush_threshold = 1 });
@@ -45434,21 +45456,21 @@ fn consumerTests() type {
                         var access = antfly.usermgr.StorageCasbinAdapter.init(allocator, store);
                         var manager = try antfly.usermgr.UserManager.init(allocator, users.iface(), try antfly.usermgr.initDefaultEnforcer(allocator, access.iface()));
                         defer manager.deinit();
-                        var grant_permission = try antfly.usermgr.Permission.initOwned(allocator, .table, table.name, .replicate);
+                        var feed_catalog: FeedCatalog = .{ .table = table };
+                        var grant_permission = try antfly.usermgr.Permission.initOwned(allocator, .table, feed_catalog.logical_name, .replicate);
                         defer grant_permission.deinit(allocator);
                         var user = try manager.createUser("alice", "test-password", &.{grant_permission});
                         defer user.deinit(allocator);
                         const http_api = try allocator.create(Http.ApiHttpServer);
                         defer allocator.destroy(http_api);
-                        var record_value = table;
                         http_api.* = try Http.ApiHttpServer.initWithConfig(allocator, .{ .auth_enabled = true, .user_manager = &manager, .native_history_roots = source, .backend_runtime = node.backend_runtime }, .{
-                            .ptr = &record_value,
-                            .vtable = &.{ .status = status, .table_record = record },
+                            .ptr = &feed_catalog,
+                            .vtable = &.{ .status = status, .table_record = record, .system_catalog = systemCatalog },
                             .changefeeds = @import("../api/changefeed_metadata.zig").Port.fromService(svc),
                         }, null, null);
                         defer http_api.deinit();
                         const credential: Http.AuthenticatedRequest = .{ .authorization = "Basic YWxpY2U6dGVzdC1wYXNzd29yZA==" };
-                        const definition: api.Create = .{ .tables = &.{table.name} };
+                        const definition: api.Create = .{ .tables = &.{feed_catalog.logical_name} };
                         const created = try api.create(http_api, allocator, credential, "live-feed", definition, .{});
                         const repeated = try api.create(http_api, allocator, credential, "live-feed", definition, .{});
                         try std.testing.expectEqualDeep(created, repeated);
@@ -45482,6 +45504,9 @@ fn consumerTests() type {
                             defer node.data_raft_mutex.unlock();
                             try std.testing.expectEqual(before_collect + 1, node.data_raft.?.host.http_host.host.raftStatus(fence.route.group_id).?.last_index);
                         }
+                        feed_catalog.logical_name = "renamed_docs";
+                        try std.testing.expectError(error.Forbidden, api.execute(http_api, allocator, credential, .{ .id = created.id, .after = ack.acknowledged }, .{}, .{}));
+                        feed_catalog.logical_name = "feed_docs";
                         try api.close(http_api, allocator, credential, created.id, .{});
                         try api.close(http_api, allocator, credential, created.id, .{});
                         const observation = try source.grants.read(allocator, fence, table.name, .{
