@@ -2052,6 +2052,25 @@ pub fn tableGroupDescriptorProjection(
 /// One catalog-clock budget covers eventual capture, authoritative miss
 /// confirmation, and projection. Cancellation prevents admission after a
 /// completed capture; the original deadline bounds capture I/O itself.
+/// Capture the applied point projection without a quorum barrier or an admin
+/// scan. Storage owner admission can already hold a structural read lease.
+pub fn appliedTableGroupDescriptor(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    budget: RoutingBudget,
+) !?TableGroupDescriptorProjection {
+    try budget.checkpoint();
+    const capture = catalog.vtable.table_routing_snapshot orelse return error.CatalogRoutingUnavailable;
+    if (catalog.vtable.free_routing_snapshot == unsupportedFreeRoutingSnapshot)
+        return error.CatalogRoutingUnavailable;
+    var snapshot = try capture(catalog.ptr, table_name, budget.deadline_ns);
+    defer catalog.vtable.free_routing_snapshot(catalog.ptr, &snapshot);
+    try budget.checkpoint();
+    return descriptorProjectionFromRoutingSnapshot(alloc, snapshot, table_name, group_id);
+}
+
 pub fn tableGroupDescriptorProjectionControlled(
     alloc: std.mem.Allocator,
     catalog: CatalogSource,

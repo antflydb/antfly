@@ -215,6 +215,11 @@ pub const TableApi = struct {
         IncompletePublishedSnapshot,
         ReembedBudgetExceeded,
         ReembedSetupRetry,
+        ForeignConnectionFailed,
+        ForeignQueryFailed,
+        ForeignAuthFailed,
+        ForeignTableNotFound,
+        LibpqUnavailable,
         InternalFailure,
     };
 
@@ -919,6 +924,35 @@ test "highlight query cancellation classification preserves deadline identity be
     try std.testing.expectEqual(error.Canceled, queryCancellationError(error.Cancelled).?);
     try std.testing.expect(queryCancellationError(error.ConnectionResetByPeer) == null);
     try std.testing.expect(queryCancellationError(error.OutOfMemory) == null);
+}
+
+/// Do not expose libpq's raw diagnostic: it can contain a credential-bearing DSN.
+pub const ForeignSourceFailure = enum { connection, driver, execution, authentication, missing_relation };
+
+pub fn foreignSourceFailureOwnedResponse(alloc: std.mem.Allocator, source: []const u8, failure: ForeignSourceFailure) !OwnedResponse {
+    const code, const message = switch (failure) {
+        .driver => .{ "foreign_source_driver_unavailable", "PostgreSQL foreign source driver is unavailable on this server" },
+        .connection => .{ "foreign_source_unavailable", "foreign source could not connect; check the source connection and availability" },
+        .execution => .{ "foreign_source_query_failed", "foreign source could not execute the query; check the remote relation and permissions" },
+        .authentication => .{ "foreign_source_auth_failed", "foreign source rejected authentication; check the configured credentials" },
+        .missing_relation => .{ "foreign_source_relation_not_found", "foreign source relation was not found; check the configured remote schema and table" },
+    };
+    // libpq does not expose a reliable SQLSTATE for startup failures.
+    // A failed connection can therefore be a permanent credential rejection.
+    return .{
+        .status = switch (failure) {
+            .connection, .driver => 503,
+            else => 502,
+        },
+        .body = try std.json.Stringify.valueAlloc(alloc, .{
+            .code = code,
+            .@"error" = code,
+            .source = source,
+            .message = message,
+            .retryable = false,
+        }, .{}),
+        .json = true,
+    };
 }
 
 pub fn queryDependencyErrorOwnedResponse(
@@ -2178,6 +2212,11 @@ pub fn handleTableQueryRequest(
             },
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.ForeignConnectionFailed => return try foreignSourceFailureOwnedResponse(alloc, table_name, .connection),
+            error.ForeignQueryFailed => return try foreignSourceFailureOwnedResponse(alloc, table_name, .execution),
+            error.ForeignAuthFailed => return try foreignSourceFailureOwnedResponse(alloc, table_name, .authentication),
+            error.ForeignTableNotFound => return try foreignSourceFailureOwnedResponse(alloc, table_name, .missing_relation),
+            error.LibpqUnavailable => return try foreignSourceFailureOwnedResponse(alloc, table_name, .driver),
             error.InternalFailure => {
                 std.log.err("public table query failed table={s} err={}", .{ table_name, err });
                 return .{ .status = 500, .body = try alloc.dupe(u8, "query failed") };

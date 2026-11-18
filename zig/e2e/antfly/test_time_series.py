@@ -528,11 +528,12 @@ def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
     )
     timings.mark("table-admission")
     count = 100_001
-    for first in range(0, count, 1000):
-        # Coalesce setup writes, but bound replay debt so a visibility fence
-        # fits the ordinary request budget even in a Debug build. Each fence
-        # covers all earlier sequences; the scale and final query are unchanged.
-        fence = (first + 1000) % 5000 == 0 or first + 1000 >= count
+    population_batch_rows = 5000
+    for first in range(0, count, population_batch_rows):
+        # Populate one visibility cohort per request. Smaller write-only batches
+        # repeated admission and publication preparation five times for the same
+        # fence. Retain all 100,001 rows and the 5,000-row replay-debt bound.
+        end = min(first + population_batch_rows, count)
         api.batch_write_with_timeout(
             name,
             timeout_s=120,
@@ -543,12 +544,11 @@ def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
                     "observed_at": "2026-11-06T12:01:00Z",
                     "temperature": 1,
                 }
-                for i in range(first, min(first + 1000, count))
+                for i in range(first, end)
             },
-            sync_level="full_index" if fence else "write",
+            sync_level="full_index",
         )
-        if fence:
-            timings.observe("population-fence", rows=min(first + 1000, count))
+        timings.observe("population-fence", rows=end)
     timings.mark("population-and-indexing")
     payload = api.post("/query", dict(fixture["query"], table=name))
     result = payload.get("responses", [payload])[0]

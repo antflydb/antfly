@@ -1873,6 +1873,9 @@ class RuntimeCacheTest(unittest.TestCase):
                         "src/ops/cuda/kernels.zig",
                         "src/ops/cuda/kernels/rms_q8_1_2560.cuh",
                         "src/ops/cuda/kernels/gemma4_e4b_prefetch.cuh",
+                        "src/ops/cuda/kernels/gemma4_q4_prefill.cuh",
+                        "src/ops/cuda/kernels/gemma4_vision_norm_rope.cuh",
+                        "src/ops/cuda/kernels/gemma4_vision_attention.cuh",
                     ]
                 ) + ["src/graph/kernel_jit.zig", "src/graph/quant_kernel_compiler.zig"]
                 if backend == "cuda":
@@ -1891,6 +1894,9 @@ class RuntimeCacheTest(unittest.TestCase):
                                 "src/ops/cuda/cuda_compute.zig",
                                 "src/ops/cuda/kernels/rms_q8_1_2560.cuh",
                                 "src/ops/cuda/kernels/gemma4_e4b_prefetch.cuh",
+                                "src/ops/cuda/kernels/gemma4_q4_prefill.cuh",
+                                "src/ops/cuda/kernels/gemma4_vision_norm_rope.cuh",
+                                "src/ops/cuda/kernels/gemma4_vision_attention.cuh",
                                 "src/graph/quant_kernel_compiler.zig",
                                 "src/graph/quant_matmul.zig",
                                 "src/gguf/tensor_types.zig",
@@ -1909,6 +1915,28 @@ class RuntimeCacheTest(unittest.TestCase):
                 )
                 self.assertNotEqual(self.probe(output, label).split()[1], after[1])
                 self.assert_compile(output, "cli", "cached")
+                if backend == "cuda":
+                    for header in (
+                        "gemma4_q4_prefill.cuh",
+                        "gemma4_vision_norm_rope.cuh",
+                        "gemma4_vision_attention.cuh",
+                    ):
+                        before_header = self.probe(output, label).split()
+                        header_source = self.own(
+                            "zig/pkg/inference/src/ops/cuda/kernels/" + header
+                        )
+                        header_source.write_bytes(
+                            header_source.read_bytes() + b"\n// kernel policy edit\n"
+                        )
+                        output = self.build(
+                            "cache-identity", "runtime-unit-cli", backend=backend
+                        )
+                        after_header = self.probe(output, label).split()
+                        self.assertEqual(after_header[0], before_header[0])
+                        self.assertNotEqual(after_header[1], before_header[1])
+                        self.assertNotEqual(after_header[2], before_header[2])
+                        self.assertEqual(after_header[1], self.bundle_digest(qualifier))
+                        self.assert_compile(output, "cli", "cached")
                 if metal_options is not None:
                     before_options = self.probe(output, label).split()
                     metal_options.write_bytes(

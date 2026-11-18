@@ -16,7 +16,7 @@
 const std = @import("std");
 
 // Keep default execution disjoint from the focused ownership roots.
-const execution_batch_filters = [_][]const u8{ "ops.execution_scope.test.", "ops.execution_batch.test.execution batch", "pipelines.generation.test.cooperative decode publication", "pipelines.generation.test.execution batch", "ops.cuda.cuda_compute.test.cooperative decode batches", "runtime.scheduler.native_generate.test." };
+const execution_batch_filters = [_][]const u8{ "ops.execution_scope.test.", "ops.execution_batch.test.execution batch", "pipelines.generation.test.cooperative decode publication", "pipelines.generation.test.execution batch", "ops.cuda.cuda_compute.test.cooperative decode batches", "runtime.scheduler.native_generate.test.", "ops.cuda.gemma_decode_head.test.cooperative decode batches", "server.server.test.generation cooperative execution", "runtime.scheduler.generation_admission.test.generation admission work", "runtime.kv.prompt_cache.test.prompt cache", "pipelines.generation.test.execution scope", "pipelines.generation.test.prompt cache" };
 const cuda_lifecycle_filters = [_][]const u8{ "ops.cuda.buffer.test.CUDA physical OOM", "ops.cuda.buffer.test.CUDA quarantine", "ops.cuda.allocation_ledger.test.CUDA ", "ops.cuda.allocation_budget.test.CUDA boundary physical allocation budget", "test_cuda_allocation_lifecycle.test.CUDA quarantine" };
 const executor_microbatch_filters = [_][]const u8{ "gliner microbatch", "executor microbatch", "executor_microbatch.test.", "embedding text batch", "gliner span v2 batch admission", "tensor microbatch" };
 const Context = @import("context.zig").Context;
@@ -329,19 +329,17 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     var batch_imports = suite.tests.root_module.import_table.iterator();
     while (batch_imports.next()) |entry| batch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
     batch_root.link_libc = true;
-    // Native Apple Silicon Metal Debug peaked at 3,872,571,392 bytes with a
-    // cold local cache; 4,352 MiB adds 18% measured headroom. Keep the
-    // CUDA and other platform profiles independent. Native CPU Debug now
-    // peaks at 2,852,749,312 bytes; 3,072 MiB retains 13% measured headroom.
-    const native_debug_metal_batch = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
-        ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and ctx.optimize == .debug and
-        ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
-    const native_debug_cpu_batch = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
-        ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and ctx.optimize == .debug and !ctx.hasAccelerator();
-    const batch_tests = b.addTest(.{ .max_rss = @as(usize, if (native_debug_metal_batch) 4_352 else if (native_debug_cpu_batch) 3_072 else 2_048) * 1024 * 1024, .root_module = batch_root, .filters = &(execution_batch_filters ++ [_][]const u8{"test_0"}) });
+    // The expanded aarch64 Debug suite peaks at 3.7 GB; reserve 6 GiB for cold CI.
+    const batch_tests = b.addTest(.{ .max_rss = 6 * 1024 * 1024 * 1024, .root_module = batch_root, .filters = &(execution_batch_filters ++ [_][]const u8{"test_0"}) });
     const run_batch_tests = ctx.addRunArtifact(batch_tests);
     test_step.dependOn(&run_batch_tests.step);
     ctx.step("test-execution-batch", "Verify cohort budgets, scope retirement and decode arithmetic without a GPU").dependOn(&run_batch_tests.step);
+    const placement_tests = b.addTest(.{ .max_rss = 6 * 1024 * 1024 * 1024, .root_module = batch_root, .filters = &.{"generation placement"} });
+    ctx.step("test-generation-placement", "Verify worker placement metadata without loading models").dependOn(&ctx.addRunArtifact(placement_tests).step);
+    const head_tests = b.addTest(.{ .max_rss = 6 * 1024 * 1024 * 1024, .root_module = batch_root, .filters = &.{"CUDA E4B paired head hardware arithmetic"} });
+    const run_head = ctx.addRunArtifact(head_tests);
+    run_head.setEnvironmentVariable("ANTFLY_TEST_CUDA_GEMMA_PAIRED_HEAD", "1");
+    ctx.step("test-gemma-paired-head", "Verify paired Gemma output-head arithmetic on CUDA hardware").dependOn(&run_head.step);
     const lifecycle_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_allocation_lifecycle.zig"), .target = ctx.target, .optimize = ctx.optimize });
     var lifecycle_imports = suite.tests.root_module.import_table.iterator();
     while (lifecycle_imports.next()) |entry| lifecycle_root.addImport(entry.key_ptr.*, entry.value_ptr.*);

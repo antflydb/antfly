@@ -690,6 +690,47 @@ extern "C" __global__ void termite_embedding_gemma2_attention_softmax_bf16(
             __bfloat162float(probs[matrix_offset + (size_t)row * sequence + key]) * inverse);
 }
 
+// Global text attention rounds only the final normalized probability. Keep
+// the historical vision entry point above byte-for-byte unchanged.
+extern "C" __global__ void termite_embedding_gemma2_attention_normalized_softmax_bf16(
+    __nv_bfloat16* probs, const float* scores, const long long* mask,
+    unsigned int sequence, unsigned int query_base, unsigned int rows,
+    unsigned int batch_index, unsigned int tile_capacity) {
+    unsigned int row = blockIdx.x % rows;
+    size_t matrix_offset = (size_t)(blockIdx.x / rows) * tile_capacity * sequence;
+    unsigned int lane = threadIdx.x, query = query_base + row;
+    bool query_valid = !mask || mask[(size_t)batch_index * sequence + query] != 0;
+    extern __shared__ float reduce[];
+    float local_max = -INFINITY;
+    for (unsigned int key = lane; key < sequence; key += blockDim.x)
+        if (query_valid && (!mask || mask[(size_t)batch_index * sequence + key]))
+            local_max = fmaxf(local_max, scores[matrix_offset + (size_t)row * sequence + key]);
+    reduce[lane] = local_max; __syncthreads();
+    for (unsigned int stride = blockDim.x / 2; stride; stride >>= 1) {
+        if (lane < stride) reduce[lane] = fmaxf(reduce[lane], reduce[lane + stride]);
+        __syncthreads();
+    }
+    float row_max = reduce[0], local_sum = 0.0f;
+    for (unsigned int key = lane; key < sequence; key += blockDim.x) {
+        bool visible = query_valid && (!mask || mask[(size_t)batch_index * sequence + key]);
+        float value = visible ? expf(scores[matrix_offset + (size_t)row * sequence + key] - row_max) : 0.0f;
+        local_sum += value;
+    }
+    reduce[lane] = local_sum; __syncthreads();
+    for (unsigned int stride = blockDim.x / 2; stride; stride >>= 1) {
+        if (lane < stride) reduce[lane] += reduce[lane + stride];
+        __syncthreads();
+    }
+    float inverse = reduce[0] > 0.0f ? 1.0f / reduce[0] : 0.0f;
+    // Round the normalized probability once. Staging exp(score) in BF16 first
+    // introduces a second rounding boundary absent from the model reference.
+    for (unsigned int key = lane; key < sequence; key += blockDim.x) {
+        bool visible = query_valid && (!mask || mask[(size_t)batch_index * sequence + key]);
+        float value = visible ? expf(scores[matrix_offset + (size_t)row * sequence + key] - row_max) * inverse : 0.0f;
+        probs[matrix_offset + (size_t)row * sequence + key] = __float2bfloat16_rn(value);
+    }
+}
+
 extern "C" __global__ void termite_embedding_gemma2_matmul_bf16(
     __nv_bfloat16* out, const __nv_bfloat16* input, const __nv_bfloat16* weight,
     unsigned int rows, unsigned int in_dim, unsigned int out_dim) {
