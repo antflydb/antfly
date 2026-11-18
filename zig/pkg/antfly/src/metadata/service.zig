@@ -13829,7 +13829,7 @@ test "metadata table topology protocol fences namespace writers and restored dec
     try std.testing.expect(tableTopologyProtocolCompatible(predecessor, 42, 7, incarnation, version));
 }
 
-test "metadata table topology protocol checks the command's required version and exact replica" {
+test "metadata service table topology protocol checks the command's required version and exact replica" {
     const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     var status = MetadataStatus{
         .metadata_group_id = 42,
