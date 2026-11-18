@@ -984,7 +984,7 @@ fn metadataRestoreJobCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []co
         leadership_term,
     );
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    return (try store.getRestoreJobValue(alloc, svc.metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
+    return (try store.getRestoreJobRecord(alloc, svc.metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
 }
 
 fn metadataRestoreJobCreateWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan_json: []const u8, leadership_term: u64) ![]u8 {
@@ -997,7 +997,7 @@ fn metadataRestoreJobCreateWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator
     try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);
     _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan_json } }, leadership_term);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    return (try store.getRestoreJobValue(alloc, svc.metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
+    return (try store.getRestoreJobRecord(alloc, svc.metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
 }
 
 fn metadataRestoreJobDeleteMatching(ptr: *anyopaque, key: []const u8, value_hash: []const u8, leadership_term: u64) !bool {

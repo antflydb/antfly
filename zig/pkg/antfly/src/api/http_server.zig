@@ -21726,7 +21726,7 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn resolveStagedRestoreWithoutSource(self: *ApiHttpServer, state: restore_jobs.JobState) ![]u8 {
+    fn resolveStagedRestoreWithoutSource(self: *ApiHttpServer, state: restore_jobs.JobState) !?[]u8 {
         const stages = @import("../metadata/restore_staging.zig");
         const restore: RestoreCancellation = .{ .job_id = state.job_id, .attempt_id = state.attempt_id };
         var control = StagedRestoreControl{ .server = self, .restore = restore };
@@ -21734,9 +21734,9 @@ pub const ApiHttpServer = struct {
         const id = try stages.idForAttempt(state.job_id, state.staging_attempt_id);
         if (try self.source.getRestoreStaging(self.alloc, id, context)) |existing| {
             defer self.alloc.free(existing);
-            return self.driveStagedRestore(restore, state.staging_attempt_id, existing);
+            return try self.driveStagedRestore(restore, state.staging_attempt_id, existing);
         }
-        if (!state.cancel_requested and state.staging_failure.len == 0) return error.RestoreValidationPending;
+        if (!state.cancel_requested and state.staging_failure.len == 0) return null;
         const command = try std.json.Stringify.valueAlloc(self.alloc, stages.Command{ .id = id, .action = .cancel_reservation }, .{});
         defer self.alloc.free(command);
         const result = try self.source.applyRestoreStaging(self.alloc, command, context);
@@ -26103,7 +26103,7 @@ pub const ApiHttpServer = struct {
             self.alloc.free(failed);
             return;
         }
-        if (state.staging_attempt_id != 0 and (state.source_kind == .schema_rewrite or state.source_kind == .empty_generation or state.cancel_requested or state.staging_failure.len != 0 or state.staging_resolution == .published)) {
+        if (state.staging_attempt_id != 0) {
             // Owner cleanup/publication never requires source repository
             // credentials or availability after a staging attempt exists.
             const result = self.resolveStagedRestoreWithoutSource(state) catch |err| {
@@ -26113,14 +26113,25 @@ pub const ApiHttpServer = struct {
                     return;
                 }
                 if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
-                const retry = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(err), restoreRetryDelayNs(err, state.job_id, state.attempt_id));
+                // Match archive-backed staging: routing gaps and owner
+                // contention resume the same durable cooperative attempt.
+                const staged_err = stagedRestoreError(err);
+                const retry = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(staged_err), restoreRetryDelayNs(staged_err, state.job_id, state.attempt_id));
                 self.alloc.free(retry);
                 self.wakeRequeuedRestoreJobs();
                 return;
             };
-            defer self.alloc.free(result);
-            try self.finishRestoreJobResult(state, result, true);
-            return;
+            if (result) |encoded| {
+                defer self.alloc.free(encoded);
+                try self.finishRestoreJobResult(state, encoded, true);
+                return;
+            }
+            // The staging ID can be durable before its reservation. Only
+            // archive-backed admissions may reopen the source in that gap.
+            if (state.source_kind == .schema_rewrite or state.source_kind == .empty_generation or state.staging_resolution == .published) {
+                try self.handleRestoreExecutionFailure(state, error.RestoreValidationPending);
+                return;
+            }
         }
         if (state.scope == .cluster) if (state.cluster_binding) |binding| {
             if (binding.publication_nonce != null and binding.recovery_manifests_json != null and binding.manifest_json != null and
@@ -26989,6 +27000,9 @@ test "staged restore worker publishes a dependency complete mixed native cohort"
     try @import("restore_worker_fixture.zig").run(RestoreWorkerTestDriver, false);
     try @import("restore_worker_fixture.zig").run(RestoreWorkerTestDriver, true);
     try @import("restore_worker_fixture.zig").runWithPolicy(RestoreWorkerTestDriver, false, null, null, .{ .validation_route_gaps = 3 });
+    for ([_]bool{ false, true }) |table_restore| {
+        try @import("restore_worker_fixture.zig").runWithPolicy(RestoreWorkerTestDriver, false, null, null, .{ .table_restore = table_restore, .remove_connection_after_publication = true });
+    }
 }
 
 test "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners" {

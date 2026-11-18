@@ -297,7 +297,12 @@ manifest are retained with the job. Progress checkpoints reference those inputs,
 and recovery can finish a published restore after its repository is removed.
 Distributed legacy restores also retain an admission fingerprint on their ranges,
 so recovery cannot adopt another job's publication of the same archive. These
-jobs require metadata protocol version 94 before admission.
+jobs require metadata protocol version 94 before admission. Empty range fingerprints
+keep the canonical encoding and digest of existing staged plans. Plans that
+carry admission fingerprints are placed only on data workers advertising native
+restore reader version 2. Existing staged restores consult their durable plan
+before resolving the archive connection, including recovery after metadata
+publication and before the job checkpoint.
 
 For paginated backup listings, keep following `next_cursor` until it is
 absent. A page can be empty if its window contains only skipped manifests.

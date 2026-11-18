@@ -36,11 +36,36 @@ pub fn digest(bytes: []const u8) [64]u8 {
     return std.fmt.bytesToHex(hash, .lower);
 }
 
-pub fn packAdmission(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
-    const parts = try split(alloc, encoded);
-    defer parts.deinit(alloc);
-    const inputs = parts.inputs orelse return alloc.dupe(u8, encoded);
-    if (inputs.len < 64 * 1024) return alloc.dupe(u8, encoded);
+/// Immutable work prepared once without the mutable job-store lock.
+pub const Prepared = struct {
+    bytes: []u8,
+    hash: [64]u8,
+    deflate: ?[]u8 = null,
+
+    pub fn deinit(self: Prepared, alloc: std.mem.Allocator) void {
+        alloc.free(self.bytes);
+        if (self.deflate) |bytes| alloc.free(bytes);
+    }
+};
+
+pub fn encodedSize(value: anytype) !usize {
+    var buffer: [4096]u8 = undefined;
+    var sink = std.Io.Writer.Discarding.init(&buffer);
+    try sink.writer.print("{f}", .{std.json.fmt(value, .{ .emit_null_optional_fields = false })});
+    const count = sink.fullCount();
+    if (count > max_bytes) return error.RestoreJobRecordTooLarge;
+    return @intCast(count);
+}
+
+pub fn prepare(alloc: std.mem.Allocator, value: anytype, transport_limit: ?usize) !Prepared {
+    const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false });
+    errdefer alloc.free(bytes);
+    if (bytes.len > max_bytes) return error.RestoreJobRecordTooLarge;
+    return .{ .bytes = bytes, .hash = digest(bytes), .deflate = if (transport_limit) |limit| try compressInput(alloc, bytes, limit) else null };
+}
+
+fn compressInput(alloc: std.mem.Allocator, inputs: []const u8, limit: usize) !?[]u8 {
+    if (inputs.len < 64 * 1024) return null;
     var compressed = try std.Io.Writer.Allocating.initCapacity(alloc, 4096);
     defer compressed.deinit();
     const history = try alloc.alloc(u8, std.compress.flate.max_window_len);
@@ -48,13 +73,35 @@ pub fn packAdmission(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
     var compressor = try std.compress.flate.Compress.init(&compressed.writer, history, .zlib, .default);
     try compressor.writer.writeAll(inputs);
     try compressor.finish();
-    const base64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(compressed.written().len));
-    defer alloc.free(base64);
+    const size = std.base64.standard.Encoder.calcSize(compressed.written().len);
+    if (size > limit) return error.RestoreJobRecordTooLarge;
+    const base64 = try alloc.alloc(u8, size);
     _ = std.base64.standard.Encoder.encode(base64, compressed.written());
-    var tree = try std.json.parseFromSlice(std.json.Value, alloc, parts.record, .{});
+    return base64;
+}
+
+/// Only the small mutable header is encoded here. Large input compression and
+/// hashing have already finished outside the store lock.
+pub fn packPrepared(alloc: std.mem.Allocator, record: []const u8, prepared: *const Prepared) ![]u8 {
+    var tree = try std.json.parseFromSlice(std.json.Value, alloc, record, .{});
     defer tree.deinit();
-    try tree.value.object.put(tree.arena.allocator(), "cluster_binding_deflate", .{ .string = base64 });
+    if (prepared.deflate) |bytes| {
+        try tree.value.object.put(tree.arena.allocator(), "cluster_binding_deflate", .{ .string = bytes });
+        return std.json.Stringify.valueAlloc(alloc, tree.value, .{});
+    }
+    var binding = try std.json.parseFromSlice(std.json.Value, alloc, prepared.bytes, .{});
+    defer binding.deinit();
+    try tree.value.object.put(tree.arena.allocator(), "cluster_binding", binding.value);
     return std.json.Stringify.valueAlloc(alloc, tree.value, .{});
+}
+
+pub fn packAdmission(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    const parts = try split(alloc, encoded);
+    defer parts.deinit(alloc);
+    const inputs = parts.inputs orelse return alloc.dupe(u8, encoded);
+    const prepared: Prepared = .{ .bytes = @constCast(inputs), .hash = digest(inputs), .deflate = try compressInput(alloc, inputs, max_bytes) };
+    defer if (prepared.deflate) |bytes| alloc.free(bytes);
+    return packPrepared(alloc, parts.record, &prepared);
 }
 
 pub fn split(alloc: std.mem.Allocator, encoded: []const u8) !Split {
