@@ -549,6 +549,8 @@ pub const Store = struct {
             previous.result.failed = 0;
             previous.result.unsupported = 0;
             previous.result.missing_source_docs = 0;
+            previous.result.terminal_error = null;
+            pass.terminal_error = null;
             pass.failed = 0;
             pass.unsupported = 0;
             pass.missing_source_docs = 0;
@@ -2588,8 +2590,8 @@ test "table index repair rediscovers groups when observation becomes stale" {
     defer a.free(state);
     var group = [_]u64{1};
     const passes: []const db_mod.types.ArtifactRepairResult = &.{
-        .{ .scanned = 1, .in_progress = 1, .debt_remaining = true, .pending_index_groups = &group },
-        .{ .observed_only = true, .observation_changed = true, .pending_index_groups = &.{} },
+        .{ .scanned = 1, .failed = 1, .in_progress = 1, .debt_remaining = true, .pending_index_groups = &group },
+        .{ .observed_only = true, .failed = 1, .observation_changed = true, .pending_index_groups = &.{} },
     };
     for (passes, 0..) |pass, i| {
         const current = try std.json.parseFromSlice(JobState, a, state, .{});
@@ -2611,4 +2613,16 @@ test "table index repair rediscovers groups when observation becomes stale" {
     try std.testing.expect(queued.value.pending_index_groups == null);
     try std.testing.expect(queued.value.cursor == null);
     try std.testing.expect(!queued.value.force);
+    try std.testing.expectEqual(@as(u64, 0), queued.value.result.failed);
+    const resumed = try store.beginAdvance(a, queued.value);
+    defer a.free(resumed.encoded);
+    try std.testing.expect(resumed.started);
+    const resumed_state = try std.json.parseFromSlice(JobState, a, resumed.encoded, .{});
+    defer resumed_state.deinit();
+    const final = try store.recordPass(a, resumed_state.value, .{ .scanned = 1 });
+    defer a.free(final);
+    const parsed_final = try std.json.parseFromSlice(JobState, a, final, .{});
+    defer parsed_final.deinit();
+    try std.testing.expectEqualStrings("succeeded", parsed_final.value.phase);
+    try std.testing.expect(!parsed_final.value.result.debt_remaining);
 }
