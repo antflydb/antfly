@@ -4390,7 +4390,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // ticket is actually outstanding: `primary_ticket` xor
             // `txn_ticket` (never both -- the transaction-resolution branch
             // above never populates `primary_ticket`, and vice versa).
-            if (primary_ticket != null or txn_ticket != null) {
+            //
+            // Only when nothing after the wait writes. A sync level past
+            // `.write` applies this call's derived work below, and a child
+            // range outbox drains: those commit, and a commit needs the
+            // lease. Once released, another process (or another instance on
+            // this inode) can write, and this runtime's in-memory index state
+            // would then be stale.
+            const commits_after_wait = (effective_req.sync_level != .write and effective_req.sync_level != .propose) or opts.document_child_range_dispatcher != null;
+            if ((primary_ticket != null or txn_ticket != null) and !commits_after_wait) {
                 if (opts.writer_lane_release_before_wait) |hook| hook.release(hook.ptr);
             }
             // WS3: wait for the primary write's durability only now, with the

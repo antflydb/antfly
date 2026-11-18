@@ -161,6 +161,9 @@ test "capi native memory resource reader follows a resumed storage generation" {
         // acts as an independent writer. They take the same gate before the
         // kernel lease, so contention cannot make this handoff timing-dependent.
         const gate = guard.connection.?.gate;
+        // The setup write's lease parked on the writer lane; release it as
+        // its idle bound would, so this fixture can take the kernel lease.
+        guard.connection.?.owner.writer_lane.releaseParkedForTest();
         gate.mutex.lockUncancelable(h.handleLockIo());
         defer gate.mutex.unlock(h.handleLockIo());
         var lease = try @import("../storage/lite/native.zig").lockWriterPathWithIo(a, h.handleLockIo(), path);
