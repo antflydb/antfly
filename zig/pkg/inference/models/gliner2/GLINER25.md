@@ -840,6 +840,6 @@ those bands must match exactly. This policy permits bounded BF16 differences;
 it does not assert FP32-equivalent raw logits or task accuracy.
 
 Reproduction tools and measured scope are documented in
-[`zig/lib/pjrt/tools/README.md`](../../../../lib/pjrt/tools/README.md).
+[`zig/lib/pjrt/tools/GLINER25.md`](../../../../lib/pjrt/tools/GLINER25.md).
 Base BF16 currently exceeds this confidence band on some cases and remains a
 diagnostic profile; its qualified automatic path retains FP32 state and weights.

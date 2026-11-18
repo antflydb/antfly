@@ -1,6 +1,6 @@
 # Optimized GLiNER2.5 CUDA versus native PJRT on L4
 
-Measured on NVIDIA L4 SM89, driver 580.159.03, using the same checkpoints and prepared graphs as the [original baseline](RESULTS.md). Native computation remains FP32. This records the completed FP32 campaign; subsequent explicit BF16 experiments are reported in [BF16_RESULTS.md](BF16_RESULTS.md).
+Measured on NVIDIA L4 SM89, driver 580.159.03, using the same checkpoints and prepared graphs as the [original baseline](GLINER25_RESULTS.md). Native computation remains FP32. This records the completed FP32 campaign; subsequent explicit BF16 experiments are reported in [BF16_RESULTS.md](BF16_RESULTS.md).
 
 ## Implementation
 
@@ -67,4 +67,4 @@ Native remains FP32. BF16 PJRT changes precision and does not pass the full stri
 - Kernel artifacts regenerated using the pinned CUDA toolchain for portable PTX/fatbin and SM89 cubin.
 - No Q8_0, end-to-end HTTP, other-GPU or diverse task-accuracy campaign was run. Native BF16/F16 eligibility is unchanged.
 
-See [README.md](README.md) for reproduction, [gliner25-optimized-l4.json](gliner25-optimized-l4.json) for compact metrics, hashes and route counters, and [the baseline report](RESULTS.md) for checkpoint provenance and BF16 CPU preflight details. Models, tensors, HLO, executable caches and traces remain ignored local artifacts.
+See [GLINER25.md](GLINER25.md) for reproduction, [gliner25-optimized-l4.json](gliner25-optimized-l4.json) for compact metrics, hashes and route counters, and [the baseline report](GLINER25_RESULTS.md) for checkpoint provenance and BF16 CPU preflight details. Models, tensors, HLO, executable caches and traces remain ignored local artifacts.

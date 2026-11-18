@@ -11829,7 +11829,7 @@ export interface components {
             backup_id: string;
             /**
              * @description Storage location for the backup. Supports multiple backends:
-             *     - Scoped filesystem connection: `file:///logical/path`
+             *     - Scoped filesystem connection: an absolute `file:///path/inside/connection/root`
              *     - Amazon S3: `s3://bucket-name/path/to/backup`
              *     - Google Cloud Storage: `gs://bucket-name/path/to/backup`
              *
@@ -11891,7 +11891,7 @@ export interface components {
             backup_id: string;
             /**
              * @description Storage location for the backup. Supports multiple backends:
-             *     - Scoped filesystem connection: `file:///logical/path`
+             *     - Scoped filesystem connection: an absolute `file:///path/inside/connection/root`
              *     - Amazon S3: `s3://bucket-name/path/to/backup`
              *     - Google Cloud Storage: `gs://bucket-name/path/to/backup`
              *
@@ -12155,6 +12155,15 @@ export interface components {
              *     ]
              */
             tables: string[];
+            /** @description Exact restore selectors paired with display names, in the same order as tables. Use selector in ClusterRestoreRequest.table_names to disambiguate identical display names. */
+            table_selectors?: {
+                /** @description Display name of the backed-up table. */
+                name: string;
+                /** @description Opaque identifier accepted by restore for this backup. */
+                selector: string;
+            }[];
+            /** @description True when the listing returned only backup metadata because table details exceeded the page size. */
+            table_details_omitted?: boolean;
             /**
              * @description Storage location of the backup
              * @example s3://mybucket/antfly-backups/cluster/2025-01-15
@@ -15951,12 +15960,6 @@ export interface components {
         User: {
             /** @example johndoe */
             username: string;
-            /**
-             * Format: byte
-             * @description Base64 encoded password hash. Exposing this is a security risk.
-             * @example JGFyZ29uMm...
-             */
-            password_hash: string;
             /**
              * @description Server-side auth metadata available to stored row-filter policies through $auth metadata paths.
              * @example {

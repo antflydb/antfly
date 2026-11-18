@@ -310,12 +310,9 @@ fn persistOwnerCatalogContract(alloc: std.mem.Allocator, db: *db_mod.DB, indexes
 
 fn persistPrivacyExecution(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !void {
     if (indexes_json.len == 0) return;
-    var tree = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-    defer tree.deinit();
-    var resource = (try @import("../privacy/catalog.zig").current(alloc, tree.value)) orelse return;
-    defer resource.deinit();
+    const execution = (try @import("../privacy/catalog.zig").ownerExecution(alloc, indexes_json)) orelse return;
     const document = @import("../privacy/document.zig");
-    const raw = try std.json.Stringify.valueAlloc(alloc, document.ExecutionOverride{ .policy_version = resource.value.policy_version, .execution = resource.value.policy.execution }, .{});
+    const raw = try std.json.Stringify.valueAlloc(alloc, execution, .{});
     defer alloc.free(raw);
     const prior = try db.core.getStoreValue(alloc, document.execution_key);
     defer if (prior) |value| alloc.free(value);
@@ -1892,13 +1889,14 @@ test "fenced owner reopen defers index deletion until exact cancellation" {
 pub fn openStorageKernelRestoreDb(
     alloc: std.mem.Allocator,
     path: []const u8,
+    schema_json: []const u8,
     indexes_json: []const u8,
     lsm_root_generation: u64,
     backend_runtime: *db_mod.background_runtime.BackendRuntime,
     identity_namespace: ?doc_identity.Namespace,
     prepared_restore: *const backup_restore.PreparedRestore,
 ) !db_mod.DB {
-    if (comptime storage_engine.enabled) return storage_engine.call("writeOpenStorageKernelRestoreDb", .{ alloc, path, indexes_json, lsm_root_generation, backend_runtime, identity_namespace, prepared_restore });
+    if (comptime storage_engine.enabled) return storage_engine.call("writeOpenStorageKernelRestoreDb", .{ alloc, path, schema_json, indexes_json, lsm_root_generation, backend_runtime, identity_namespace, prepared_restore });
     return try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
         alloc,
         path,
@@ -1914,6 +1912,9 @@ pub fn openStorageKernelRestoreDb(
         null,
         identity_namespace,
         .{
+            // Destination schema must own the first reconstructed postings.
+            // Installing it after repair strands a schema-less Lite projection.
+            .schema_json_before_index_load = schema_json,
             .staged_generation = prepared_restore.stagedGeneration(),
             .native_restore_open_plan = prepared_restore.nativeOpenPlan(),
         },

@@ -155,6 +155,7 @@ pub fn provisioningFingerprint(
         hasher.update(std.mem.asBytes(&range.restore_native_manifest_size_bytes));
         hashBytes(&hasher, range.restore_native_manifest_sha256);
         hasher.update(&range.completed_restore_fingerprint);
+        hasher.update(&range.restore_admission_fingerprint);
         hasher.update(std.mem.asBytes(&table.table_id));
         hashBytes(&hasher, table.name);
         if (table.storage.dense_embeddings != .primary_lsm) hashBytes(&hasher, @tagName(table.storage.dense_embeddings));
@@ -3900,4 +3901,27 @@ fn implementationTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = implementation_tests;
+}
+
+test "table provisioner preserves vector incarnations across JSON formatting" {
+    const alloc = std.testing.allocator;
+    for ([_]db_mod.types.IndexKind{ .dense_vector, .sparse_vector }) |kind| {
+        const original = db_mod.types.IndexConfig{ .name = "vectors", .kind = kind, .coverage_generation = 42, .config_json = "{ \"field\": \"embedding\", \"external\": true }" };
+        var desired = original;
+        desired.config_json = "{\"external\":true,\"field\":\"embedding\"}";
+        try std.testing.expect(try indexConfigsEqual(alloc, original, desired));
+        desired.config_json = "{\"field\":\"embedding\"}";
+        try std.testing.expect(!try indexConfigsEqual(alloc, original, desired));
+        desired.config_json = "{\"external\":true,\"field\":\"embedding\"}";
+        desired.config_json = "{\"external\":true,\"field\":\"embedding\",\"embedding_name\":\"vectors\"}";
+        try std.testing.expect(try indexConfigsEqual(alloc, original, desired));
+        desired.config_json = "{\"external\":true,\"field\":\"embedding\",\"embedding_name\":\"other\"}";
+        try std.testing.expect(!try indexConfigsEqual(alloc, original, desired));
+        desired.config_json = "{\"external\":true,\"field\":\"embedding\"}";
+        desired.coverage_generation += 1;
+        try std.testing.expect(!try indexConfigsEqual(alloc, original, desired));
+        desired.coverage_generation = original.coverage_generation;
+        desired.config_json = "{\"field\":\"embedding\",\"external\":false}";
+        try std.testing.expect(!try indexConfigsEqual(alloc, original, desired));
+    }
 }

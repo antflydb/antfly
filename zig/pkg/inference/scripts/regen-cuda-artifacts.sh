@@ -241,6 +241,7 @@ required_symbols=(
   termite_embedding_gemma2_attention_bf16
   termite_embedding_gemma2_attention_local_flash_bf16
   termite_embedding_gemma2_attention_softmax_bf16
+  termite_embedding_gemma2_attention_normalized_softmax_bf16
   termite_embedding_gemma2_matmul_bf16
   termite_embedding_gemma2_gelu_mul_bf16
   termite_embedding_gemma2_gelu_mul_vjp_f32

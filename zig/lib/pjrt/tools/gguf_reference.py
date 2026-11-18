@@ -1,0 +1,141 @@
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Bounded-host-memory import of the benchmark GGUF into dense BF16 HF weights."""
+
+import ctypes, gc, json, math, mmap, time
+from pathlib import Path
+import numpy as np
+import torch
+from gguf import GGUFReader, dequantize, GGML_QUANT_SIZES
+from transformers import Gemma4TextConfig
+from transformers.models.gemma4.modeling_gemma4 import Gemma4TextRotaryEmbedding
+from transformers.modeling_gguf_pytorch_utils import (
+    get_gguf_hf_weights_map,
+    TensorProcessor,
+)
+from gemma4_graph import configure_model, patch_casts
+
+
+def load(path, config, backend):
+    patch_casts()
+    started = time.perf_counter()
+    print("initializing_meta_model", flush=True)
+    cfg = Gemma4TextConfig(**json.loads(Path(config).read_text())["text_config"])
+    model = configure_model(cfg)
+    model.model.rotary_emb = Gemma4TextRotaryEmbedding(cfg, device="cpu")
+    for module in model.modules():
+        if hasattr(module, "scalar_embed_scale"):
+            module.embed_scale = torch.tensor(
+                module.scalar_embed_scale, dtype=torch.float32
+            )
+    print("meta_model_ready", flush=True)
+    mapping = get_gguf_hf_weights_map(model, TensorProcessor())
+    expected = dict(model.named_parameters())
+    persistent = set(model.state_dict())
+    expected.update({n: t for n, t in model.named_buffers() if n in persistent})
+    for name, value in model.named_buffers():
+        if name not in expected and value.is_meta:
+            raise ValueError(("uninitialized derived buffer", name))
+    reader = GGUFReader(str(path))
+    params = {}
+    loaded = []
+    skipped = []
+    print("GGUF_header_loaded", flush=True)
+    tensors = sorted(reader.tensors, key=lambda t: math.prod(t.shape), reverse=True)
+    for i, t in enumerate(tensors):
+        name = t.name
+        if name == "rope_freqs.weight":
+            # GGUF carries an unused, derivable rotary-frequency table.
+            skipped.append(name)
+            continue
+        if ".layer_output_scale.weight" in name:
+            name = name.removesuffix(".weight")
+        target = mapping.get(name)
+        if target not in expected:
+            raise ValueError(("unmapped", t.name, target))
+        shape = tuple(expected[target].shape)
+        size = math.prod(shape)
+        if size != math.prod(t.shape):
+            raise ValueError(("shape", t.name, shape, t.shape))
+        cpu = torch.empty(size, dtype=torch.bfloat16)
+        block, block_bytes = GGML_QUANT_SIZES[t.tensor_type]
+        # Raw storage types must retain their element dtype for dequantize().
+        flat = t.data.reshape(-1)
+        if block == 1:
+            step = 1 << 22
+            for start in range(0, size, step):
+                values = dequantize(flat[start : start + step], t.tensor_type).reshape(
+                    -1
+                )
+                cpu[start : start + len(values)].copy_(torch.from_numpy(values.copy()))
+        else:
+            blocks_per_chunk = (1 << 22) // block
+            raw = flat.view(np.uint8)
+            for start in range(0, len(raw), blocks_per_chunk * block_bytes):
+                values = dequantize(
+                    raw[start : start + blocks_per_chunk * block_bytes], t.tensor_type
+                ).reshape(-1)
+                offset = start // block_bytes * block
+                cpu[offset : offset + len(values)].copy_(torch.from_numpy(values))
+        del values
+        try:
+            reader.data._mmap.madvise(mmap.MADV_DONTNEED)
+        except AttributeError:
+            pass
+        params[target] = backend.upload(cpu.reshape(shape))
+        loaded.append(target)
+        del cpu
+        # Tensor storage is reference-counted; scanning the GGUF vocabulary
+        # on every tiny norm tensor makes loading unnecessarily slow.
+        if i % 100 == 0:
+            gc.collect()
+            ctypes.CDLL(None).malloc_trim(0)
+        if i % 25 == 0:
+            print(
+                json.dumps(
+                    {
+                        "load_index": i,
+                        "tensor": target,
+                        "elapsed_s": time.perf_counter() - started,
+                    }
+                ),
+                flush=True,
+            )
+    missing = set(expected) - set(params)
+    if missing:
+        raise ValueError(("missing HF weights", sorted(missing)))
+    # Nonpersistent rotary constants are regenerated by the official implementation.
+    for name, t in model.named_buffers():
+        if name in params:
+            continue
+        if t.is_meta:
+            raise ValueError(("meta buffer", name))
+        params[name] = backend.upload(t.detach())
+    del reader, tensors
+    gc.collect()
+    ctypes.CDLL(None).malloc_trim(0)
+    return (
+        model,
+        params,
+        {
+            "load_s": time.perf_counter() - started,
+            "loaded_parameters": len(loaded),
+            "dense_weight_bytes": sum(
+                v.numel() * v.element_size() for k, v in params.items() if k in expected
+            ),
+            "skipped_derived_tensors": skipped,
+        },
+    )

@@ -111,10 +111,29 @@ fn envelopeValue(a: A, value: V) A.Error!bool {
     return false;
 }
 
+// Privacy job cursors and coverage hints belong to the authoritative metadata
+// controller. They are not serving evidence or storage-owner configuration.
+// Reuse its exact allowlist; policy, generation, consumer recipes and unknown
+// fields remain in the descriptor so semantic changes still replace owners.
+fn removePrivacyProgress(root: *V) bool {
+    if (root.* != .object) return false;
+    const resource = root.object.getPtr("_privacy") orelse return false;
+    if (resource.* != .object) return false;
+    const before = resource.object.count();
+    @import("../privacy/catalog.zig").removeProgress(root);
+    return before != resource.object.count();
+}
+
+pub fn mayContainOwnerControls(bytes: []const u8) bool {
+    return std.mem.indexOfScalar(u8, bytes, '\\') != null or
+        std.mem.indexOf(u8, bytes, "_index_alias") != null or
+        std.mem.indexOf(u8, bytes, "_privacy") != null;
+}
+
 /// Null means the original bytes are already the physical recipe. The fast
 /// path allocates nothing; catalogs containing controls are parsed only once.
 pub fn physicalProjectionIfNeeded(out: A, bytes: []const u8) !?[]u8 {
-    if (std.mem.indexOfScalar(u8, bytes, '\\') == null and std.mem.indexOf(u8, bytes, "_index_alias") == null) return null;
+    if (!mayContainOwnerControls(bytes)) return null;
     var arena = std.heap.ArenaAllocator.init(out);
     defer arena.deinit();
     var root = try std.json.parseFromSliceLeaky(V, arena.allocator(), bytes, .{});
@@ -122,7 +141,8 @@ pub fn physicalProjectionIfNeeded(out: A, bytes: []const u8) !?[]u8 {
     const removed_aliases = root.object.orderedRemove(key);
     const removed_receipts = root.object.orderedRemove(receipts_key);
     const removed_epoch = root.object.orderedRemove("_index_alias_epoch");
-    if (!removed_aliases and !removed_receipts and !removed_epoch) return null;
+    const removed_privacy_progress = removePrivacyProgress(&root);
+    if (!removed_aliases and !removed_receipts and !removed_epoch and !removed_privacy_progress) return null;
     return try std.json.Stringify.valueAlloc(out, root, .{});
 }
 pub fn physicalProjection(out: A, bytes: []const u8) ![]u8 {
@@ -131,13 +151,14 @@ pub fn physicalProjection(out: A, bytes: []const u8) ![]u8 {
 
 /// Materialize at catalog publication, never on the query hot path.
 pub fn queryProjectionIfNeeded(out: A, bytes: []const u8) !?[]u8 {
-    if (std.mem.indexOfScalar(u8, bytes, '\\') == null and std.mem.indexOf(u8, bytes, "_index_alias") == null) return null;
+    if (!mayContainOwnerControls(bytes)) return null;
     var arena = std.heap.ArenaAllocator.init(out);
     defer arena.deinit();
     const a = arena.allocator();
     var root = try std.json.parseFromSliceLeaky(V, a, bytes, .{});
     if (root != .object) return error.InvalidTableIndexMetadata;
-    if (!root.object.contains(key) and !root.object.contains(receipts_key) and !root.object.contains("_index_alias_epoch")) return null;
+    const removed_privacy_progress = removePrivacyProgress(&root);
+    if (!root.object.contains(key) and !root.object.contains(receipts_key) and !root.object.contains("_index_alias_epoch") and !removed_privacy_progress) return null;
     _ = root.object.orderedRemove("_index_alias_epoch");
     _ = root.object.orderedRemove(receipts_key);
     if (root.object.getPtr(key)) |declarations| {
@@ -316,6 +337,8 @@ pub fn validateDependencyMutation(out: A, before: []const u8, after: []const u8)
     const a = arena.allocator();
     const old = try parse(a, if (before.len == 0) "{}" else before);
     const next = try parse(a, if (after.len == 0) "{}" else after);
+    try normalizeInheritedEmbeddingRecipes(a, old.value);
+    try normalizeInheritedEmbeddingRecipes(a, next.value);
     if (old.value.object.get(key)) |bindings| if (bindings == .object) {
         const current_bindings = next.value.object.get(key);
         for (bindings.object.keys()) |alias| {
@@ -346,6 +369,39 @@ pub fn validateDependencyMutation(out: A, before: []const u8, after: []const u8)
         // An aliased owner also needs protection when only inline enrichment
         // declarations change (these are absent from its runtime config hash).
         try prior.checkSources(a, replacement, config, &checked);
+    }
+}
+
+// Compare the effective producer contract. Registering an already inherited
+// identity is representation-only; changing it still invalidates every reader.
+fn normalizeInheritedEmbeddingRecipes(a: A, root: V) !void {
+    for (root.object.values()) |*config| {
+        if (config.* != .object or config.object.get("embedder") == null) continue;
+        const semantic = config.object.get("semantic_producer") orelse continue;
+        if (semantic != .string or semantic.string.len == 0) continue;
+        const definitions = config.object.getPtr("enrichments") orelse continue;
+        if (definitions.* != .array) continue;
+        for (definitions.array.items) |*definition| {
+            if (definition.* != .object) continue;
+            if (definition.object.get("kind")) |kind| {
+                if (kind != .string or !std.mem.eql(u8, kind.string, "embedding")) continue;
+            }
+            if (definition.object.get("producer_json")) |producer| {
+                if (producer != .string) continue;
+                if (producer.string.len != 0) {
+                    const declared = std.json.parseFromSliceLeaky(V, a, producer.string, .{}) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        continue;
+                    };
+                    const inherited = std.json.parseFromSliceLeaky(V, a, semantic.string, .{}) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        continue;
+                    };
+                    if (!recipeEqual(declared, inherited)) continue;
+                }
+            }
+            try definition.object.put(a, "producer_json", semantic);
+        }
     }
 }
 
@@ -927,4 +983,29 @@ test "index alias physical configuration equality ignores lifecycle epochs" {
     try std.testing.expect(try configurationEqual(a, physical, aliased));
     try std.testing.expect(try configurationEqual(a, aliased, physical));
     try std.testing.expect(!try configurationEqual(a, aliased, "{\"b\":{\"type\":\"full_text\"}}"));
+}
+
+test "index alias dependency recipes preserve inherited embedding identity registration" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const identity_json = "{\"version\":2,\"model\":\"A\"}";
+    const before = try std.json.Stringify.valueAlloc(scratch, .{
+        .P = .{ .type = "embeddings", ._index_incarnation = @as(u64, 1), .embedder = .{ .model = "A" }, .semantic_producer = identity_json, .enrichments = .{.{ .name = "X", .kind = "embedding", .field = "body", .expected_dims = @as(u32, 3) }} },
+        .C = .{ .type = "embeddings", ._index_incarnation = @as(u64, 2), .sources = .{.{ .artifact = "X" }} },
+        ._index_aliases = .{ .live = .{ .index = "P" } },
+    }, .{});
+    var next = try std.json.parseFromSliceLeaky(V, scratch, before, .{});
+    const definition = &next.object.getPtr("P").?.object.getPtr("enrichments").?.array.items[0];
+    // JSON formatting and key order do not change a durable producer identity.
+    try definition.object.put(scratch, "producer_json", .{ .string = " { \"model\": \"A\", \"version\": 2 } " });
+    const registered = try std.json.Stringify.valueAlloc(scratch, next, .{});
+    try validateDependencyMutation(a, before, registered);
+    try validateDependencyMutation(a, registered, before);
+    try definition.object.put(scratch, "field", .{ .string = "other" });
+    try std.testing.expectError(error.IndexReferencedByAlias, validateDependencyMutation(a, before, try std.json.Stringify.valueAlloc(scratch, next, .{})));
+    try definition.object.put(scratch, "field", .{ .string = "body" });
+    try definition.object.put(scratch, "producer_json", .{ .string = "{\"version\":2,\"model\":\"B\"}" });
+    try std.testing.expectError(error.IndexReferencedByAlias, validateDependencyMutation(a, before, try std.json.Stringify.valueAlloc(scratch, next, .{})));
 }

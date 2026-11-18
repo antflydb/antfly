@@ -53,6 +53,7 @@ pub const Stats = struct {
     packed_projection_launches: u64 = 0,
     fused_vision_launches: u64 = 0,
     extended_flash_launches: u64 = 0,
+    global_gemm_calls: u64 = 0,
     fused_backbone_launches: u64 = 0,
     packed_ple_groups: u64 = 0,
     packed_head_launches: u64 = 0,
@@ -114,6 +115,7 @@ pub const Module = struct {
     attention: driver.CUfunction,
     local_flash_attention: driver.CUfunction,
     attention_softmax: driver.CUfunction,
+    attention_normalized_softmax: driver.CUfunction,
     matmul: driver.CUfunction,
     gelu_mul: driver.CUfunction,
     gelu_mul_vjp: driver.CUfunction,
@@ -188,6 +190,7 @@ pub const Module = struct {
             .attention = try function(ctx, m, "termite_embedding_gemma2_attention_bf16"),
             .local_flash_attention = try function(ctx, m, "termite_embedding_gemma2_attention_local_flash_bf16"),
             .attention_softmax = try function(ctx, m, "termite_embedding_gemma2_attention_softmax_bf16"),
+            .attention_normalized_softmax = try function(ctx, m, "termite_embedding_gemma2_attention_normalized_softmax_bf16"),
             .matmul = try function(ctx, m, "termite_embedding_gemma2_matmul_bf16"),
             .gelu_mul = try function(ctx, m, "termite_embedding_gemma2_gelu_mul_bf16"),
             .gelu_mul_vjp = try function(ctx, m, "termite_embedding_gemma2_gelu_mul_vjp_f32"),
@@ -242,6 +245,9 @@ pub const Module = struct {
     }
     pub fn noteFusedVision(self: *Module) void {
         self.stats_.fused_vision_launches += 1;
+    }
+    pub fn noteGlobalGemm(self: *Module) void {
+        self.stats_.global_gemm_calls += 1;
     }
     pub fn noteExtendedFlash(self: *Module) void {
         self.stats_.extended_flash_launches += 1;
@@ -972,6 +978,25 @@ pub const Module = struct {
         var tc = tile_capacity;
         var args = [_]?*anyopaque{ @ptrCast(&pp), @ptrCast(&sp), @ptrCast(&mp), @ptrCast(&s), @ptrCast(&qb), @ptrCast(&r), @ptrCast(&bi), @ptrCast(&tc) };
         try launchShared(ctx, self.attention_softmax, &args, .{ rows * heads, 1, 1 }, .{ 256, 1, 1 }, 256 * 4);
+        self.stats_.launches += 1;
+    }
+
+    pub fn launchGlobalAttentionSoftmax(self: *Module, ctx: *Context, probs: Buffer, scores: Buffer, mask: Buffer, sequence: u32, query_base: u32, rows: u32, batch_index: u32, heads: u32, tile_capacity: u32) !void {
+        if (sequence == 0 or sequence > 8192 or tile_capacity == 0 or tile_capacity > 2048 or rows == 0 or rows > tile_capacity or query_base > sequence or rows > sequence - query_base or heads == 0 or heads > 64) return error.InvalidEmbeddingGemma2Shape;
+        const elements = try std.math.mul(usize, try std.math.mul(usize, heads, tile_capacity), sequence);
+        try require(scores, try std.math.mul(usize, elements, 4));
+        try require(probs, try std.math.mul(usize, elements, 2));
+        if (mask.ptr != 0) try require(mask, (@as(usize, batch_index) + 1) * sequence * 8);
+        var pp = probs.ptr;
+        var sp = scores.ptr;
+        var mp = mask.ptr;
+        var s = sequence;
+        var qb = query_base;
+        var r = rows;
+        var bi = batch_index;
+        var tc = tile_capacity;
+        var args = [_]?*anyopaque{ @ptrCast(&pp), @ptrCast(&sp), @ptrCast(&mp), @ptrCast(&s), @ptrCast(&qb), @ptrCast(&r), @ptrCast(&bi), @ptrCast(&tc) };
+        try launchShared(ctx, self.attention_normalized_softmax, &args, .{ rows * heads, 1, 1 }, .{ 256, 1, 1 }, 256 * 4);
         self.stats_.launches += 1;
     }
 

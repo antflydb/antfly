@@ -47,6 +47,7 @@ pub fn main(init: std.process.Init) !void {
     var suite_path: ?[]const u8 = null;
     var output: ?[]const u8 = null;
     var metal = true;
+    var cuda = false;
     var warmups: usize = 2;
     var iterations: usize = 20;
     var long_iterations: usize = 5;
@@ -57,8 +58,9 @@ pub fn main(init: std.process.Init) !void {
         const key = args[i];
         const value = args[i + 1];
         if (std.mem.eql(u8, key, "--model")) model = value else if (std.mem.eql(u8, key, "--suite")) suite_path = value else if (std.mem.eql(u8, key, "--output")) output = value else if (std.mem.eql(u8, key, "--case")) try selected.append(a, value) else if (std.mem.eql(u8, key, "--warmups")) warmups = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--iterations")) iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--long-iterations")) long_iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--backend")) {
-            if (!std.mem.eql(u8, value, "metal") and !std.mem.eql(u8, value, "native")) return error.InvalidBackend;
+            if (!std.mem.eql(u8, value, "metal") and !std.mem.eql(u8, value, "native") and !std.mem.eql(u8, value, "cuda")) return error.InvalidBackend;
             metal = std.mem.eql(u8, value, "metal");
+            cuda = std.mem.eql(u8, value, "cuda");
         } else return error.UnknownArgument;
     }
     if (iterations == 0 or iterations > 100 or long_iterations == 0 or long_iterations > 100 or warmups > 100) return error.InvalidIterations;
@@ -72,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
         };
         if (!found) return error.UnknownCase;
     }
-    const session = if (metal) try factory.createMetalSession(a, model orelse return error.MissingModel) else try factory.createNativeSession(a, model orelse return error.MissingModel);
+    const session = if (metal) try factory.createMetalSession(a, model orelse return error.MissingModel) else if (cuda) try factory.createCudaSession(a, model orelse return error.MissingModel) else try factory.createNativeSession(a, model orelse return error.MissingModel);
     defer session.close();
     if (!metal) factory.attachIo(session, init.io);
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.WrongArchitecture;
@@ -101,7 +103,10 @@ pub fn main(init: std.process.Init) !void {
         var peak: usize = 0;
         var vm_before: [3]u64 = @splat(0);
         var vm_after: [3]u64 = @splat(0);
+        var profile: ?std.DynLib = null;
+        defer stopProfile(&profile);
         for (0..warmups + n) |iteration| {
+            if (cuda and iteration == warmups) profile = try startProfile();
             var bounded = Bounded{ .backing = pipeline.workspaceBackingAllocator(session.backend()), .limit = 512 * 1024 * 1024 };
             {
                 var permit = try session.admit(.{ .batch = 1, .sequence = case.token_ids.len, .workspace_bytes = if (metal) 768 * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = 768 * 4 });
@@ -113,7 +118,10 @@ pub fn main(init: std.process.Init) !void {
                 defer cb.deinit();
                 if (iteration == warmups) vm_before = try vmCounters();
                 const started = try now();
-                const current = try pipeline.preparedText(&cb, bounded.allocator(), cfg, case.token_ids, mask, case.dimensions);
+                const current = if (cuda) blk: {
+                    const compute: *internal.native_compute.cuda.CudaCompute = @ptrCast(@alignCast(cb.ptr));
+                    break :blk try compute.runEmbeddingGemma2(bounded.allocator(), cfg.resident orelse return error.MissingResidentConfig, .{ .token_ids = case.token_ids }, mask, 1, case.token_ids.len, case.dimensions, null);
+                } else try pipeline.preparedText(&cb, bounded.allocator(), cfg, case.token_ids, mask, case.dimensions);
                 defer bounded.allocator().free(current);
                 const elapsed = try now() - started;
                 if (iteration + 1 == warmups + n) vm_after = try vmCounters();
@@ -129,10 +137,31 @@ pub fn main(init: std.process.Init) !void {
             if (bounded.live != 0) return error.WorkspaceLeak;
             peak = @max(peak, bounded.peak);
         }
+        stopProfile(&profile);
         try measurements.append(a, .{ .name = case.name, .tokens = case.token_ids.len, .samples_seconds = samples, .vector = vector, .host_peak_bytes = peak, .host_live_after_release = 0, .gpu_memory = gpu_memory, .vm_measured_before = vm_before, .vm_measured_after = vm_after });
         std.debug.print("encoder {s}: {d} samples, host peak {d}\n", .{ case.name, n, peak });
     }
     if (measurements.items.len == 0) return error.NoCases;
-    const report = try std.json.Stringify.valueAlloc(a, .{ .version = 1, .timing_scope = "prepared IDs/mask: embedding lookup, encoder, pooling, normalization and synchronized vector readback", .backend = if (metal) "metal" else "native", .warmups = warmups, .vm_counters_available = @import("build_options").enable_metal, .cases = measurements.items }, .{ .whitespace = .indent_2 });
+    const report = try std.json.Stringify.valueAlloc(a, .{ .version = 1, .timing_scope = "prepared IDs/mask: embedding lookup, encoder, pooling, normalization and synchronized vector readback", .backend = if (metal) "metal" else if (cuda) "cuda" else "native", .warmups = warmups, .vm_counters_available = @import("build_options").enable_metal, .cases = measurements.items }, .{ .whitespace = .indent_2 });
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output orelse return error.MissingOutput, .data = report });
+}
+
+// Benchmark-only capture: loading, autotuning and warmups stay outside traces.
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+fn startProfile() !?std.DynLib {
+    const enabled = getenv("ANTFLY_CUDA_PROFILE") orelse return null;
+    if (!std.mem.eql(u8, std.mem.span(enabled), "1")) return null;
+    var lib = try std.DynLib.open("libcuda.so.1");
+    errdefer lib.close();
+    const start = lib.lookup(*const fn () callconv(.c) c_int, "cuProfilerStart") orelse return error.ProfilerUnavailable;
+    if (start() != 0) return error.ProfilerStartFailed;
+    return lib;
+}
+fn stopProfile(profile: *?std.DynLib) void {
+    if (profile.*) |*lib| {
+        const stop = lib.lookup(*const fn () callconv(.c) c_int, "cuProfilerStop") orelse unreachable;
+        _ = stop();
+        lib.close();
+        profile.* = null;
+    }
 }

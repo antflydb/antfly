@@ -32382,7 +32382,7 @@ components:
           description: >
             Storage location for the backup. Supports multiple backends:
 
-            - Scoped filesystem connection: `file:///logical/path`
+            - Scoped filesystem connection: an absolute `file:///path/inside/connection/root`
 
             - Amazon S3: `s3://bucket-name/path/to/backup`
 
@@ -32489,7 +32489,7 @@ components:
           description: >
             Storage location for the backup. Supports multiple backends:
 
-            - Scoped filesystem connection: `file:///logical/path`
+            - Scoped filesystem connection: an absolute `file:///path/inside/connection/root`
 
             - Amazon S3: `s3://bucket-name/path/to/backup`
 
@@ -32949,6 +32949,26 @@ components:
           example:
             - users
             - products
+        table_selectors:
+          type: array
+          description: Exact restore selectors paired with display names, in the same order as tables.
+            Use selector in ClusterRestoreRequest.table_names to disambiguate identical display names.
+          items:
+            type: object
+            required:
+              - name
+              - selector
+            properties:
+              name:
+                type: string
+                description: Display name of the backed-up table.
+              selector:
+                type: string
+                description: Opaque identifier accepted by restore for this backup.
+        table_details_omitted:
+          type: boolean
+          description: True when the listing returned only backup metadata because table details exceeded
+            the page size.
         location:
           type: string
           description: Storage location of the backup
@@ -39493,11 +39513,6 @@ components:
         username:
           type: string
           example: johndoe
-        password_hash:
-          type: string
-          format: byte
-          description: Base64 encoded password hash. Exposing this is a security risk.
-          example: JGFyZ29uMm...
         metadata:
           type: object
           additionalProperties: {}
@@ -39509,7 +39524,6 @@ components:
             department: eng
       required:
         - username
-        - password_hash
     ResourceType:
       type: string
       enum:

@@ -26,7 +26,7 @@ The reference uses the unchanged checkpoint, stock Python CUDA BF16 reduced
 precision reduction, inference mode and no autocast. Qualification measures
 confidence drift, not FP32 raw-logit equality or task accuracy. The threshold
 band is 0.02; an argmax change permits a reference gap <= 0.04 because each label
-may move by 0.02. See [README.md](README.md#automatic-decide-bf16-qualification)
+may move by 0.02. See [GLINER25.md](GLINER25.md#automatic-decide-bf16-qualification)
 for reproducible fixture preparation and qualification commands.
 
 ## Latency

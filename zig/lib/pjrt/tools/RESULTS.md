@@ -1,120 +1,162 @@
-# GLiNER2.5 CUDA versus native PJRT on L4
+# L4 native CUDA / PJRT comparison, 2026-11-16
 
-Measured 2026-11-17 on an NVIDIA L4 (SM89, 23,034 MiB), driver
-580.159.03. Baseline: Antfly main `e86f0d2756`. This report records the unoptimized native baseline. The branch also adds a
-qualified native CUDA optimization; its fresh comparison is recorded separately
-in [OPTIMIZATION_RESULTS.md](OPTIMIZATION_RESULTS.md). Production precision is
-unchanged.
+Both models execute successfully through the new native Zig/PJRT artifact runner.
+Gemma 4 favors Antfly's native CUDA Q4 path for decode throughput and memory.
+EmbeddingGemma2 favors PJRT for warm latency, while native CUDA uses less memory.
 
-## Scope
+These are **native prepared-HLO CLI** PJRT results, not Python frontend timings
+and not the HTTP server's existing XLA backend. Server integration remains open.
 
-Both workers start with identical prepared host tensors and finish with
-synchronized F32 head outputs. Timing includes input upload, the encoder and
-requested heads, and output readback. It excludes rendering, tokenization, final
-result decoding, HTTP, model loading, request setup and cleanup. The base worker
-uses the production boundary engine and its reference-v1 CUDA policy. Extraction
-also downloads intermediate head outputs for comparison. These are core timings,
-not HTTP throughput or extraction-quality benchmarks.
+## Method
 
-Classification uses the same 14-label hotel intent/topic/urgency schema for both
-models. Extraction uses the base model's five-label entity schema, including
-candidate proposal and pair scoring. Each geometry has one synthetic input;
-batch rows repeat that input. The measurements characterize shapes rather than
-a diverse accuracy corpus.
+NVIDIA L4 (23,034 MiB), SM89, driver 580.159.03; 4 vCPU, 16 GiB host, no swap.
+PJRT CUDA plugin/JAX 0.10.2, CUDA runtime 12.8, cuDNN 9.8. Worktree base:
+`3682e4426baf3d7891a4b0ffbd34ca76bf7aef7e`.
 
-Three fresh-process rounds alternate native/PJRT order. Each case has three
-warmups and eight measured forwards per round: 24 samples per arm. Medians pool
-those samples. All checkpoint parameters remain resident, including unused heads.
-PJRT graphs are exported offline through torchax, then execute through Antfly's
-Zig PJRT C API; Python does not execute timed inference.
+The native CUDA control is the existing V15 server binary, SHA256
+`2c1b08ce31d7b6a30be9051497afe1542d60e74d73b43cbffb1d6327b648e7dc`,
+source `9f775620c84be17414fe5c07990956287b4e1d56`. Relevant CUDA model paths
+were checked unchanged against this worktree's base. It is not a binary built
+from this branch. CUDA timings include the full HTTP request, preprocessing and
+response parsing; PJRT starts with token IDs and ends after output readback.
+The observed speed ratios include that entrypoint difference.
 
-PJRT FP32 uses highest JAX matmul precision. The separate BF16 experiment compares
-PJRT BF16 against native FP32. Native DeBERTa's precision gate is preserved.
+Runs were serialized with no other GPU compute process. Each case used one
+input and one fixed shape, one process lifecycle, with loading, compilation
+and warmups excluded from reported medians. There are four measured Gemma calls
+per shape and eight embedding calls per shape. This is a local characterization,
+not a randomized multi-lifecycle production performance qualification.
 
-## FP32 performance
+## Gemma 4 E4B
 
-Median milliseconds; speedup is native time divided by PJRT time. Values below
-1 mean native CUDA is faster.
+Same source Q4 GGUF, SHA256
+`676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee`.
+Native CUDA retains Q4 weights with F16 KV; PJRT receives the same GGUF tensors
+**dequantized to dense BF16**, with BF16 KV. This comparison does not isolate
+compiler/runtime effects from storage precision. Greedy fixed output lengths,
+no prompt reuse, thinking disabled. The retained fixture supplies exact prompts
+and token IDs.
 
-| Workload | Tokens | Batch | Native FP32 ms | PJRT FP32 ms | PJRT speedup |
+| Prompt / output tokens | CUDA HTTP ms | PJRT native ms | CUDA decode tok/s | PJRT decode tok/s | CUDA completion speedup |
 |---|---:|---:|---:|---:|---:|
-| Decide classification | 128 | 1 | 19.54 | 22.55 | 0.87× |
-| Decide classification | 128 | 8 | 101.29 | 93.17 | 1.09× |
-| Decide classification | 512 | 1 | 96.57 | 63.05 | 1.53× |
-| Decide classification | 512 | 8 | 642.01 | 445.46 | 1.44× |
-| Base classification | 128 | 1 | 8.88 | 6.55 | 1.36× |
-| Base classification | 128 | 8 | 41.11 | 30.34 | 1.36× |
-| Base classification | 512 | 1 | 49.46 | 20.11 | 2.46× |
-| Base classification | 512 | 8 | 358.75 | 148.15 | 2.42× |
-| Base extraction | 128 | 1 | 10.02 | 7.11 | 1.41× |
-| Base extraction | 512 | 1 | 50.45 | 20.88 | 2.42× |
+| 32 / 256 | 3,629 | 11,705 | 71.51 | 21.87 | 3.23× |
+| 419 / 128 | 1,907 | 5,993 | 70.75 | 21.49 | 3.14× |
+| 1,775 / 64 | 1,234 | 3,232 | 69.79 | 20.76 | 2.62× |
 
-All ten FP32 cases pass the frozen 0.002 raw-output tolerance and exact decision
-or candidate-routing checks. Largest observed native/PJRT output difference:
-**0.000145**. Independent CPU references cover the shortest singleton only.
+PJRT prefill TTFT was lower: 43.7 / 83.4 / 197.9 ms, versus CUDA HTTP
+63.1 / 113.4 / 331.2 ms. Native TTFT ends before token readback, whereas HTTP
+TTFT includes serving and streaming. PJRT retained 14.926 GB of device weights.
+Peak GPU use was **19.587 GB PJRT versus 7.086 GB CUDA**. Peak sampled PSS plus
+NVML was 22.585 GB versus 8.124 GB. Peaks include loading/compilation and all
+three shapes; host feeder memory is excluded from PJRT's process tree.
 
-## PJRT BF16 characterization
+Gemma's native CUDA control enabled `ANTFLY_INFERENCE_CUDA_RMS_Q8_1_MIRROR=1`
+and `ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX=1`.
 
-Native remains FP32. These timings include a precision change and **do not pass
-full numerical qualification**.
+The performance campaign's free-running token IDs were repeatable across warm
+calls, but differed from the retained Torchax oracle starting at token indices
+205, 101 and 63 respectively. A separate 216-step teacher-forced BF16 logit
+campaign, with explicit JAX SPMD/Shardy compiler options and the CUDA 12.8 tool
+directory, had **216/216 identical argmax choices**, minimum logit cosine
+**0.999947974**, maximum relative L2 **0.0116636**, and maximum absolute logit
+error **0.372202**. First prefill logits matched exactly. These are distinct
+compiler-option campaigns; exact free-running parity is not established for the
+performance configuration. A separate tiny CPU-BF16 model oracle matched all
+three generated tokens exactly, including cached decode.
 
-| Workload | Tokens | Batch | Native FP32 ms | PJRT BF16 ms | PJRT speedup | Numerical gate |
-|---|---:|---:|---:|---:|---:|---|
-| Decide classification | 128 | 1 | 20.20 | 8.13 | 2.48× | Fail |
-| Decide classification | 128 | 8 | 104.25 | 26.07 | 4.00× | Pass |
-| Decide classification | 512 | 1 | 99.19 | 16.93 | 5.86× | Pass |
-| Decide classification | 512 | 8 | 655.31 | 131.44 | 4.99× | Pass |
-| Base classification | 128 | 1 | 9.06 | 2.90 | 3.12× | Fail |
-| Base classification | 128 | 8 | 41.62 | 7.59 | 5.48× | Fail |
-| Base classification | 512 | 1 | 50.99 | 5.30 | 9.61× | Fail |
-| Base classification | 512 | 8 | 363.93 | 45.62 | 7.98× | Fail |
+PJRT load/stream time was 132.6 s and total compilation 224.4 s for six graphs;
+these costs are not included in the warm table.
 
-Both BF16 profiles fail the 0.02 raw-output gate. Per-case errors and decision
-checks are retained in the aggregate JSON; label agreement alone does not qualify
-the changed precision. All tested classification decisions agree, but the maximum
-probability difference reaches 0.00294 for Decide and 0.02142 for base. Separate
-BF16 CPU/PJRT preflights also fail on the short
-singleton (0.09375 Decide; 0.171875 base).
+## EmbeddingGemma2 text
 
-## Memory
+Same original BF16 safetensors checkpoint and exact document-prefix tokens.
+CUDA loads the complete multimodal checkpoint; PJRT selects the 413 text
+weight tensors plus derived constants, totaling 542,008,372 resident bytes.
+The memory comparison consequently does not isolate allocator efficiency.
 
-Median of three fresh-process peaks, in MiB; each row covers its whole campaign,
-including model loading and cached executable deserialization. It is not memory
-for one individual geometry. Cold XLA compilation was prepared separately and is
-excluded here. PSS+GPU is a simultaneous peak, not a sum of independent maxima.
+The inputs repeat `river` to obtain the specified token counts after
+`title: none | text: ` rendering. These isolate length scaling and are not
+semantic retrieval-quality measurements. Both routes compute BF16 model
+forwards with 768-dimensional normalized text outputs. CUDA usage confirmed
+128 / 512 / 2048 / 8192 prompt tokens exactly.
 
-| Campaign | Native GPU | PJRT GPU | Native PSS+GPU | PJRT PSS+GPU |
+| Tokens | CUDA default HTTP ms | CUDA opt-in HTTP ms | PJRT native ms | PJRT speedup vs opt-in |
 |---|---:|---:|---:|---:|
-| Decide classification (FP32) | 2432 | 4480 | 3353 | 5918 |
-| Base classification (FP32) | 1234 | 2304 | 1718 | 3525 |
-| Base extraction (FP32) | 1082 | 1272 | 1685 | 2810 |
-| Decide classification (PJRT BF16) | 2432 | 2362 | 3274 | 3459 |
-| Base classification (PJRT BF16) | 1234 | 1276 | 1711 | 2049 |
+| 128 | 14.56 | 11.00 | 3.73 | 2.95× |
+| 512 | 26.33 | 22.01 | 6.94 | 3.17× |
+| 2,048 | 243.53 | 89.89 | 32.97 | 2.73× |
+| 8,192 | 2,970.14 | 659.97 | 333.12 | 1.98× |
 
-Memory includes the common Python feeder/harness for both workers. Native base
-startup also initializes its tokenizer/processor. Different runtime inventories
-and retained workspaces mean this does not isolate allocator efficiency.
+Opt-in CUDA enabled these existing flags (each `=1`):
 
-## Validation
+- `ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_EXTENDED_FLASH`
+- `ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_PACKED_PROJECTIONS`
+- `ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_GRAPH_REPLAY`
+- `ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_FUSED_BACKBONE`
+- `ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_TUNED_GEMM`
 
-- Native CUDA and native PJRT ReleaseFast benchmark builds pass.
-- PJRT library: 38 focused tests pass.
-- Six Python protocol/numerical tests, Ruff, Zig formatting and diff whitespace checks pass.
-- All FP32 campaigns pass; both BF16 campaigns intentionally retain failing numerical status.
+Counters confirmed their consumers ran. The opt-in 8192-token case used 157
+cuBLASLt matmuls and 219 kernel launches, with **zero scalar matmul or attention
+fallbacks**. Default CUDA's 2048/8192 cases used four scalar attention fallbacks.
+The default result therefore is not the best measured CUDA path.
 
-## Reproduction and provenance
+| Whole-campaign sampled peak | CUDA default | CUDA opt-in | PJRT |
+|---|---:|---:|---:|
+| GPU GB | 2.013 | 2.345 | 4.538 |
+| PSS + GPU GB | 3.693 | 3.675 | 5.848 |
 
-See [README.md](README.md) for build/export/run commands and
-[gliner25-l4.json](gliner25-l4.json) for aggregate timings, numerical checks,
-per-round memory peaks, dependency versions and artifact hashes. Raw vectors,
-models, HLO, executable caches and traces remain in ignored local directories.
+GB means decimal bytes / 1e9. Memory sampling used process-tree smaps_rollup PSS
+plus NVML every 0.2 seconds, including load and compilation. All samplers marked
+their data valid with no errors. Peak components need not occur simultaneously.
 
-The base checkpoint is `fastino/gliner2.5-base-v1` at revision
-`07d99c0ba5d15cb3b24e0a236fa99bdd4ef87a5c`. Decide uses the retained original
-`fastino/GLiNER2.5-Decide` checkpoint; its weights match revision
-`9d1bfb848cd16d93ee56ccbc59cd92bf0f284d90`, while its retained configuration
-sidecars differ from the current HF serialization. Exact local sidecar hashes
-are recorded; this is not a claim that Decide used a fresh current snapshot.
+PJRT vectors matched the separate Torchax/JAX BF16 oracle to printed cosine
+1.0 at every length. CUDA default oracle cosine ranged from 0.999615 to
+0.999937; CUDA opt-in ranged from 0.999595 to 0.999943. All vectors had the
+expected dimension and finite, normalized values. This validates the synthetic
+cases and does not establish accuracy on a retrieval evaluation set.
 
-No Q8_0 or end-to-end HTTP campaign was run. These measurements do not establish
-task accuracy, generalize to other GPUs, or qualify BF16 for production.
+PJRT weight streaming/load took 1.07 s; compilation totaled 191.9 s across the
+four static shapes. Native CUDA's model load took about 9 s. Warm speedups must
+not be interpreted as first-request speedups.
+
+## Evidence and reproduction
+
+[README.md](README.md) contains build/export/oracle/measurement commands.
+[results-l4.json](results-l4.json) retains unrounded metrics, measured binary
+hashes, policies and limitations. In the worktree, full raw data is retained
+under ignored `evidence/`:
+
+- `gemma4-native-results.json`, `gemma4-native-memory.json`, and `gemma4-native.log`.
+- `gemma4-validation-results.json`, validation HLO/oracles and all failed earlier
+  numerical experiments. Early strict token/absolute-error gates failed; the
+  complete later teacher-forced statistics above are retained separately.
+- `embedding-native-results.json`, `embedding-native-memory.json`, and native logs.
+- `embedding-cuda/` and `embedding-cuda-opt/`: every vector, usage, request time,
+  model identity, server route counters and memory timeline.
+- `public-export-*` and `public-native-smoke/`: checks of the self-contained
+  export/stream/benchmark tools. Exported parameter manifests match the measured
+  artifacts exactly.
+- `tiny-model/final-results-v2.json`: final-runner CPU-oracle decode canary.
+- `pjrt-tests-final.log`: 25/25 reported CPU tests passed, upload-failure executable
+  passed; plugin-dependent library integration checks skipped without a configured
+  test plugin. Actual CUDA execution is established by the separate GPU campaigns.
+
+The earlier Gemma native CUDA control remains in the neighboring
+`perf-gemma4-cuda/evidence/xla/native-text-v1/` worktree. Its relevant aggregate
+metrics and binary identity are copied into `results-l4.json`.
+
+## Current CUDA qualification
+
+The [CUDA qualification index](../../../pkg/inference/scripts/embeddinggemma2/profiling/README.md)
+links the final operator, media and automatic-default campaigns. The earlier
+tables above retain their original HTTP timing scope and explicit configurations.
+
+The [native global-attention follow-up](../../../pkg/inference/scripts/embeddinggemma2/profiling/GLOBAL_ATTENTION.md)
+records the opt-in CUDA implementation, final paired timings, memory and vector
+checks. Its 8192-token forward now beats the fresh native PJRT measurement.
+
+The local Gemma4 logit oracle is retained losslessly compressed to save disk.
+Restore it before repeating that validation with
+`gzip -dk evidence/gemma4-artifact/oracle-logits.f32.gz`.
+`evidence/gemma4-artifact/oracle-compression.json` retains its original checksum
+and byte count.

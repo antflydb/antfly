@@ -172,3 +172,37 @@ def test_pgwire_scoped_filters_survive_mixed_qualified_bindings(
                 ]
     finally:
         server.stop()
+
+
+@pytest.mark.e2e_resource("antfly_process")
+def test_pgwire_rejections_preserve_feature_cause():
+    psycopg = pytest.importorskip("psycopg")
+    binary = harness.resolve_binary_path(
+        os.environ.get("ANTFLY_BIN", str(harness.DEFAULT_ANTFLY_BIN))
+    )
+    server = harness.StandaloneAntflyServer(binary, "127.0.0.1", 0, pgwire=True)
+    try:
+        with psycopg.connect(
+            host="127.0.0.1",
+            port=server.pgwire_port,
+            dbname="default",
+            user="admin",
+            password=harness.AUTH_BOOTSTRAP_PASSWORD,
+            sslmode="disable",
+            autocommit=True,
+        ) as conn:
+            conn.execute("CREATE TABLE searchable (id TEXT PRIMARY KEY)")
+            conn.execute("BEGIN")
+            with pytest.raises(psycopg.Error) as rejected:
+                conn.execute("CREATE TABLE forbidden_in_tx (id TEXT PRIMARY KEY)")
+            assert rejected.value.sqlstate == "25001"
+            assert "transaction block" in str(rejected.value)
+            conn.execute("ROLLBACK")
+            with pytest.raises(psycopg.Error) as rejected:
+                conn.execute("SELECT * FROM antfly_search('searchable','alpha',10) s")
+            assert rejected.value.sqlstate == "0A000"
+            assert "antfly_search" in str(rejected.value)
+            assert "REST" in str(rejected.value)
+            assert conn.execute("SELECT 1").fetchone() == (1,)
+    finally:
+        server.stop()

@@ -115,6 +115,7 @@ pub fn inspectInputJsonAllocWithLiteInspector(allocator: Allocator, input_path: 
             error.SourceFileChanged => "source_changed",
             error.WriterLocked => "source_busy",
             error.BackupBaseRequired => "base_required",
+            error.BackupArtifactIntegrityMismatch => "artifact_integrity_mismatch",
             error.UnsupportedLiteInspectionLayout, error.StandaloneLiteCatalogRequiresApi => "unsupported_lite_layout",
             error.UnsupportedReplicationInspection => "unsupported_replication_source",
             else => "input_uninspectable",
@@ -178,6 +179,7 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
                 var manifest = try backups_api.readManifest(allocator, scratch, root.value.backup_id);
                 defer manifest.deinit(allocator);
                 if (manifest.format != .native or !std.mem.eql(u8, manifest.table_name, root.value.table_name)) return error.BackupArtifactFormatMismatch;
+                if (hasActiveMigration(&manifest)) report.restore_blocker = "unsupported_schema_migration";
                 // The table manifest is executable metadata as well as the
                 // per-shard catalogs. Inspect it independently before all shards.
                 var inspector: preflight.Inspector = .{ .allocator = allocator, .report = report, .options = options };
@@ -186,9 +188,8 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
                 try inspector.replicationSourcesJson(manifest.replication_sources_json);
                 for (manifest.shards) |shard| {
                     try options.cancellation.check();
-                    const canonical_path = try backups_api.shardSnapshotRelPath(allocator, manifest.backup_id, shard.group_id);
-                    defer allocator.free(canonical_path);
-                    if (!std.mem.eql(u8, canonical_path, shard.snapshot_path)) return error.InvalidBackupManifest;
+                    // Backup IDs and immutable artifact generation IDs differ.
+                    try backups_api.validateArtifactRelativePath(shard.snapshot_path);
                     const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ scratch, shard.snapshot_path }, 0);
                     defer allocator.free(path);
                     var store = try @import("../docstore.zig").DocStore.open(allocator, path, .{ .read_only = true });
@@ -199,7 +200,21 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
         }
         if (!native) {
             report.format = "portable";
-            _ = try inspectPortableCatalogs(allocator, io, source, options, report, .{});
+            var catalog_digest: ?preflight.Digest = null;
+            var companion = try readPortableCompanion(allocator, input_path, &catalog_digest);
+            defer if (companion) |*manifest| manifest.deinit(allocator);
+            report.catalog_source = if (companion != null) "companion" else "archive";
+            if (companion) |manifest| {
+                try verifyPortableCompanion(&manifest, initial.size, &digest);
+                report.catalog_sha256 = catalog_digest;
+                if (hasActiveMigration(&manifest))
+                    report.restore_blocker = "unsupported_schema_migration";
+            }
+            const catalogs: InspectionCatalogs = if (companion) |manifest|
+                .{ .indexes_json = manifest.indexes_json, .replication_sources_json = manifest.replication_sources_json }
+            else
+                .{};
+            _ = try inspectPortableCatalogs(allocator, io, source, options, report, catalogs);
         }
     } else return error.InvalidMagic;
     if (!backups_api.localArtifactStatsEqual(initial, try source.stat(io))) return error.SourceFileChanged;
@@ -566,15 +581,23 @@ fn stagePortableFile(
     try backups_api.validateBackupId(portable_backup_id);
     const initial_stat = try source.stat(io);
     if (initial_stat.size > max_prepared_bytes) return error.BackupExpansionLimitExceeded;
-    const metadata = try portableFileMetadataAlloc(allocator, io, source, .{
-        .max_input_bytes = max_input_bytes,
-        .max_logical_bytes = max_prepared_bytes,
-    });
-    var metadata_owned = true;
-    defer if (metadata_owned) {
-        allocator.free(metadata.schema_json);
-        allocator.free(metadata.indexes_json);
-    };
+    var detached = try readPortableCompanion(allocator, path, null);
+    defer if (detached) |*manifest| manifest.deinit(allocator);
+    if (detached) |*manifest| {
+        if (manifest.shards[0].artifact_size_bytes != initial_stat.size)
+            return error.BackupArtifactIntegrityMismatch;
+        if (hasActiveMigration(manifest)) {
+            // Verify the same pinned descriptor without consuming scratch space
+            // for a backup detached restore cannot accept.
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            try backups_api.hashFileContents(io, source, initial_stat, &hasher);
+            var digest: [32]u8 = undefined;
+            hasher.final(&digest);
+            const hex = std.fmt.bytesToHex(digest, .lower);
+            try verifyPortableCompanion(manifest, initial_stat.size, &hex);
+            return error.UnsupportedBackupMigrationState;
+        }
+    }
 
     // Pin the verified file in private scratch before opening a remote location.
     // Copy + hash is bounded and rejects a replaced or changed input descriptor.
@@ -597,9 +620,30 @@ fn stagePortableFile(
     defer if (integrity_owned) allocator.free(integrity.sha256);
     const snapshot_path = try std.fmt.allocPrint(allocator, "{s}.afb", .{portable_backup_id});
     errdefer allocator.free(snapshot_path);
-    const manifest = try manifestFromParts(allocator, table_name, portable_backup_id, snapshot_path, integrity, metadata.schema_json, metadata.indexes_json, "Restored from portable Antfly backup");
-    metadata_owned = false;
-    integrity_owned = false;
+    if (detached) |*manifest| {
+        try verifyPortableCompanion(manifest, integrity.size_bytes, integrity.sha256);
+        try rebasePortableCompanion(allocator, manifest, table_name, portable_backup_id, snapshot_path);
+    }
+    const inspection_options: portable_backup.FileInspectionOptions = .{
+        .max_input_bytes = max_input_bytes,
+        .max_logical_bytes = max_prepared_bytes,
+    };
+    // Validate exactly the bytes that will be published. A companion only
+    // supplies the public table definition and cannot relax archive limits.
+    const pinned = try std.Io.Dir.cwd().openFile(io, scratch, .{});
+    defer pinned.close(io);
+    const manifest = if (detached) |original| blk: {
+        try portable_backup.validatePortableFileWithLimits(allocator, io, pinned, inspection_options);
+        detached = null;
+        break :blk original;
+    } else blk: {
+        const metadata = try portableFileMetadataAlloc(allocator, io, pinned, inspection_options);
+        errdefer allocator.free(metadata.schema_json);
+        errdefer allocator.free(metadata.indexes_json);
+        const synthesized = try manifestFromParts(allocator, table_name, portable_backup_id, snapshot_path, integrity, metadata.schema_json, metadata.indexes_json, "Restored from portable Antfly backup");
+        integrity_owned = false;
+        break :blk synthesized;
+    };
     defer freeManifest(allocator, manifest);
     var location = try backups_api.openBackupLocation(allocator, location_uri);
     defer location.deinit(allocator);
@@ -620,6 +664,61 @@ fn stagePortableFile(
     };
 }
 
+/// Read a companion once. The caller must verify its declared artifact
+/// identity against the exact bytes inspected or staged.
+fn readPortableCompanion(
+    allocator: Allocator,
+    path: []const u8,
+    companion_digest: ?*?preflight.Digest,
+) !?backups_api.TableBackupManifest {
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}.manifest.json", .{path});
+    defer allocator.free(manifest_path);
+    const bytes = readFileAlloc(allocator, manifest_path, backups_api.max_backup_manifest_bytes) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    const Header = struct { backup_id: []const u8 };
+    const header = try std.json.parseFromSlice(Header, allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer header.deinit();
+    var manifest = try backups_api.parseTableBackupManifest(allocator, bytes, header.value.backup_id);
+    errdefer manifest.deinit(allocator);
+    if (manifest.format != .portable or manifest.shards.len != 1) return error.BackupArtifactFormatMismatch;
+    if (companion_digest) |output| output.* = preflight.hash(bytes);
+    return manifest;
+}
+
+fn verifyPortableCompanion(manifest: *const backups_api.TableBackupManifest, size_bytes: u64, sha256: []const u8) !void {
+    const shard = manifest.shards[0];
+    if (shard.artifact_size_bytes != size_bytes or !std.mem.eql(u8, shard.artifact_sha256, sha256))
+        return error.BackupArtifactIntegrityMismatch;
+}
+
+fn hasActiveMigration(manifest: *const backups_api.TableBackupManifest) bool {
+    return manifest.read_schema_json.len != 0;
+}
+
+fn rebasePortableCompanion(
+    allocator: Allocator,
+    manifest: *backups_api.TableBackupManifest,
+    table_name: []const u8,
+    backup_id: []const u8,
+    snapshot_path: []const u8,
+) !void {
+    const shard = &@constCast(manifest.shards)[0];
+    const owned_table = try allocator.dupe(u8, table_name);
+    errdefer allocator.free(owned_table);
+    const owned_id = try allocator.dupe(u8, backup_id);
+    errdefer allocator.free(owned_id);
+    const owned_path = try allocator.dupe(u8, snapshot_path);
+    allocator.free(manifest.table_name);
+    allocator.free(manifest.backup_id);
+    allocator.free(shard.snapshot_path);
+    manifest.table_name = owned_table;
+    manifest.backup_id = owned_id;
+    shard.snapshot_path = owned_path;
+}
+
 fn stageNativeAfbRestoreBackup(
     allocator: Allocator,
     io: std.Io,
@@ -638,6 +737,18 @@ fn stageNativeAfbRestoreBackup(
     // The caller holds the shared lock and supplies the stat from before its
     // header/manifest reads. Also reject writers that ignore advisory locks.
     if (!backups_api.localArtifactStatsEqual(try source.stat(io), initial_stat)) return error.SourceFileChanged;
+    {
+        const metadata_path = try std.fmt.allocPrint(allocator, "{s}-metadata.json", .{root_manifest.backup_id});
+        defer allocator.free(metadata_path);
+        const bytes = try backup_bundle_io.readNativeObjectAlloc(allocator, io, source, initial_stat.size, root_manifest, metadata_path, backups_api.max_backup_manifest_bytes);
+        defer allocator.free(bytes);
+        var embedded = try backups_api.parseTableBackupManifest(allocator, bytes, root_manifest.backup_id);
+        defer embedded.deinit(allocator);
+        if (embedded.format != .native or !std.mem.eql(u8, embedded.table_name, root_manifest.table_name))
+            return error.BackupArtifactFormatMismatch;
+        if (!backups_api.localArtifactStatsEqual(try source.stat(io), initial_stat)) return error.SourceFileChanged;
+        if (hasActiveMigration(&embedded)) return error.UnsupportedBackupMigrationState;
+    }
     const staging_root = try temporaryPreparationPath(allocator, io, "antfly-afb2-", "");
     defer allocator.free(staging_root);
     defer std.Io.Dir.cwd().deleteTree(io, staging_root) catch {};
@@ -649,12 +760,14 @@ fn stageNativeAfbRestoreBackup(
         return error.BackupArtifactFormatMismatch;
 
     if (!backups_api.localArtifactStatsEqual(try source.stat(io), initial_stat)) return error.SourceFileChanged;
+    if (hasActiveMigration(&source_manifest)) return error.UnsupportedBackupMigrationState;
     var location = try backups_api.openBackupLocation(allocator, location_uri);
     defer location.deinit(allocator);
+    // Server manifests name immutable artifact generations independently of
+    // their public backup ID. Extraction validates every archive path; validate
+    // manifest references too, then rebase copies into this staging repository.
     for (source_manifest.shards) |shard| {
-        const canonical_path = try backups_api.shardSnapshotRelPath(allocator, source_manifest.backup_id, shard.group_id);
-        defer allocator.free(canonical_path);
-        if (!std.mem.eql(u8, canonical_path, shard.snapshot_path)) return error.InvalidBackupManifest;
+        try backups_api.validateArtifactRelativePath(shard.snapshot_path);
         const extracted_shard = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ staging_root, shard.snapshot_path });
         defer allocator.free(extracted_shard);
         try backups_api.copyDirectoryToLocation(allocator, &location, source_manifest.backup_id, shard.group_id, extracted_shard);
@@ -665,6 +778,11 @@ fn stageNativeAfbRestoreBackup(
         target_table_name,
     );
     defer target_manifest.deinit(allocator);
+    for (@constCast(target_manifest.shards)) |*shard| {
+        const staged_path = try backups_api.shardSnapshotRelPath(allocator, target_manifest.backup_id, shard.group_id);
+        allocator.free(@constCast(shard.snapshot_path));
+        shard.snapshot_path = staged_path;
+    }
     try backups_api.writeManifestToLocation(allocator, &location, &target_manifest);
 
     return .{
@@ -676,7 +794,10 @@ fn stageNativeAfbRestoreBackup(
 }
 
 fn portableFileMetadataAlloc(allocator: Allocator, io: std.Io, file: std.Io.File, options: portable_backup.FileInspectionOptions) !PortableManifestMetadata {
-    var schema_json = try allocator.dupe(u8, "{}");
+    // A schema-less embedded owner is served with the public default contract.
+    // Publish that exact contract so metadata readiness compares the same
+    // definition that table creation installs.
+    var schema_json = try allocator.dupe(u8, tables_api.default_schema_json);
     errdefer allocator.free(schema_json);
     var raw_indexes_json: ?[]u8 = null;
     defer if (raw_indexes_json) |value| allocator.free(value);
@@ -688,21 +809,29 @@ fn portableFileMetadataAlloc(allocator: Allocator, io: std.Io, file: std.Io.File
         schema_json: *[]u8,
         raw_indexes_json: *?[]u8,
         raw_enrichments_json: *?[]u8,
+        has_runtime_schema: bool = false,
+        has_public_schema: bool = false,
 
         fn visit(self: *@This(), block_type: backup_codec.BlockType, payload: []const u8) !void {
             if (block_type != .metadata_batch) return;
             const entries = try backup_codec.decodeKeyValueBatch(self.allocator, payload);
             defer freeKeyValueEntries(self.allocator, entries);
             for (entries) |entry| {
-                if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:schema_json")) {
+                if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:schema")) {
+                    self.has_runtime_schema = true;
+                } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:schema_json")) {
+                    self.has_public_schema = true;
+                    const replacement = try self.allocator.dupe(u8, entry.value);
                     self.allocator.free(self.schema_json.*);
-                    self.schema_json.* = try self.allocator.dupe(u8, entry.value);
+                    self.schema_json.* = replacement;
                 } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:indexes")) {
+                    const replacement = try self.allocator.dupe(u8, entry.value);
                     if (self.raw_indexes_json.*) |value| self.allocator.free(value);
-                    self.raw_indexes_json.* = try self.allocator.dupe(u8, entry.value);
+                    self.raw_indexes_json.* = replacement;
                 } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:enrichments")) {
+                    const replacement = try self.allocator.dupe(u8, entry.value);
                     if (self.raw_enrichments_json.*) |value| self.allocator.free(value);
-                    self.raw_enrichments_json.* = try self.allocator.dupe(u8, entry.value);
+                    self.raw_enrichments_json.* = replacement;
                 }
             }
         }
@@ -715,7 +844,13 @@ fn portableFileMetadataAlloc(allocator: Allocator, io: std.Io, file: std.Io.File
     };
     _ = try portable_backup.inspectPortableFileBlocks(allocator, io, file, options, &visitor, Visitor.visit);
 
-    const indexes_json = try tableIndexesJsonFromPortableMetadata(allocator, raw_indexes_json, raw_enrichments_json);
+    // A binary-only schema has no lossless public inverse. Do not replace it
+    // with the schema-less default while publishing a server table definition.
+    if (visitor.has_runtime_schema and !visitor.has_public_schema) return error.UnsupportedEmbeddedLiteSchema;
+
+    const stored_indexes = try tableIndexesJsonFromPortableMetadata(allocator, raw_indexes_json, raw_enrichments_json);
+    defer allocator.free(stored_indexes);
+    const indexes_json = try @import("portable_metadata.zig").publicTableIndexesJsonAlloc(allocator, stored_indexes, .table_restore);
     errdefer allocator.free(indexes_json);
 
     return .{
@@ -809,32 +944,7 @@ pub fn embeddedTableDefinition(
     if (indexes != null or enrichments != null) {
         const stored = try tableIndexesJsonFromPortableMetadata(alloc, indexes, enrichments);
         defer alloc.free(stored);
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
-        defer parsed.deinit();
-        const arena = parsed.arena.allocator();
-        var it = parsed.value.object.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
-            const value = entry.value_ptr.*;
-            if (value != .object) return error.InvalidEmbeddedLiteIndex;
-            const kind = value.object.get("kind") orelse return error.InvalidEmbeddedLiteIndex;
-            // Native vector/graph configs need an explicit public catalog
-            // translation. Fail closed until that translation is qualified;
-            // never reinterpret a native index as the default full-text kind.
-            if (kind != .string or !std.mem.eql(u8, kind.string, "full_text")) {
-                std.log.err("embedded Lite adoption cannot translate index {s}; serve a supported full-text fixture or prepare an explicitly supported public catalog before transfer", .{entry.key_ptr.*});
-                return error.UnsupportedEmbeddedLiteIndex;
-            }
-            const raw = value.object.get("config_json") orelse return error.InvalidEmbeddedLiteIndex;
-            if (raw != .string) return error.InvalidEmbeddedLiteIndex;
-            var config = try std.json.parseFromSliceLeaky(std.json.Value, arena, raw.string, .{});
-            if (config != .object) return error.InvalidEmbeddedLiteIndex;
-            try config.object.put(arena, "type", .{ .string = "full_text" });
-            if (value.object.get("coverage_generation")) |generation|
-                try config.object.put(arena, "_index_incarnation", generation);
-            entry.value_ptr.* = config;
-        }
-        definition.indexes_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+        definition.indexes_json = try @import("portable_metadata.zig").publicTableIndexesJsonAlloc(alloc, stored, .embedded_adoption);
     }
     return definition;
 }
@@ -1308,7 +1418,7 @@ test "lite restore staging preserves portable afb schema index and enrichment me
     try std.testing.expect(parsed_indexes.value == .object);
     const ft_body = parsed_indexes.value.object.get("ft_body") orelse return error.TestExpectedEqual;
     try std.testing.expect(ft_body == .object);
-    try std.testing.expect(ft_body.object.get("coverage_generation") != null);
+    try std.testing.expect(ft_body.object.get("_index_incarnation") != null);
     const enrichments = parsed_indexes.value.object.get("enrichments") orelse return error.TestExpectedEqual;
     try std.testing.expect(enrichments == .array);
     try std.testing.expectEqual(@as(usize, 1), enrichments.array.items.len);
@@ -1386,7 +1496,7 @@ test "lite restore staging expands a self-contained native AFB2 bundle" {
     const bundle_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/native-table.afb2", .{tmp.sub_path});
     defer allocator.free(bundle_path);
     const backup_id = "native-bundle-test";
-    const snapshot_path = try backups_api.shardSnapshotRelPath(allocator, backup_id, 9);
+    const snapshot_path = try backups_api.shardSnapshotRelPath(allocator, "afbg-0123456789abcdef0123456789abcdef", 9);
     defer allocator.free(snapshot_path);
     const source_shard = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source_root, snapshot_path });
     defer allocator.free(source_shard);
@@ -1460,7 +1570,10 @@ test "lite restore staging expands a self-contained native AFB2 bundle" {
     const restore_table = try backups_api.deriveRestoreTableRecord(allocator, "restored_docs", target_location, &target);
     defer @import("antfly_server_test_sources").local_test_sources.metadata_table_manager.freeTable(allocator, restore_table);
     try std.testing.expectEqualStrings("restored_docs", restore_table.name);
-    const restored_payload = try std.fmt.allocPrint(allocator, "{s}/{s}/primary.bin", .{ target_root, snapshot_path });
+    const canonical_path = try backups_api.shardSnapshotRelPath(allocator, backup_id, 9);
+    defer allocator.free(canonical_path);
+    try std.testing.expectEqualStrings(canonical_path, target.shards[0].snapshot_path);
+    const restored_payload = try std.fmt.allocPrint(allocator, "{s}/{s}/primary.bin", .{ target_root, canonical_path });
     defer allocator.free(restored_payload);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, restored_payload, allocator, .limited(128));
     defer allocator.free(bytes);
@@ -2407,7 +2520,7 @@ test "backup preflight native multishard scans later shards and table producers"
         .table_name = "docs",
         .description = "",
         .schema_json = "{}",
-        .read_schema_json = "",
+        .read_schema_json = "{}",
         .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"${secret:replication.pg}\",\"postgres_table\":\"public.documents\"}]",
         .indexes_json = "{\"default\":{\"type\":\"embeddings\",\"field\":\"media\",\"dimension\":3,\"embedder\":{\"model\":\"mock\"}},\"enrichments\":[{\"name\":\"pdf\",\"kind\":\"asset\",\"field\":\"media\",\"producer\":{\"type\":\"reader\"}}]}",
         .shards = &shards,
@@ -2433,6 +2546,37 @@ test "backup preflight native multishard scans later shards and table producers"
     try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"replication_source\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "replication.pg") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"document_id\":\"z\"") != null);
+
+    const compatibility = parsed.value.object.get("compatibility").?.object;
+    try std.testing.expectEqualStrings("blocked", compatibility.get("verdict").?.string);
+    try std.testing.expectEqualStrings("unsupported_schema_migration", compatibility.get("restore_blocker").?.string);
+    const target = try std.fs.path.join(a, &.{ root, "migration-blocked" });
+    defer a.free(target);
+    const location = try std.fmt.allocPrint(a, "file://{s}", .{target});
+    defer a.free(location);
+    if (comptime builtin.link_libc and builtin.os.tag != .windows) {
+        const Environment = struct {
+            extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+            extern fn unsetenv(name: [*:0]const u8) c_int;
+        };
+        const env = @import("antfly_platform").env;
+        const saved = if (env.getenv("TMPDIR")) |value| try a.dupeSentinel(u8, value, 0) else null;
+        defer if (saved) |value| a.free(value);
+        defer {
+            if (saved) |value| {
+                _ = Environment.setenv("TMPDIR", value, 1);
+            } else {
+                _ = Environment.unsetenv("TMPDIR");
+            }
+        }
+        // The archive is a regular file, so it cannot hold scratch output.
+        const unavailable = try a.dupeSentinel(u8, bundle_path, 0);
+        defer a.free(unavailable);
+        try std.testing.expectEqual(@as(c_int, 0), Environment.setenv("TMPDIR", unavailable, 1));
+        try std.testing.expectError(error.UnsupportedBackupMigrationState, stageInputRestoreBackup(a, bundle_path, "restored", "", location));
+    }
+    try std.testing.expectError(error.UnsupportedBackupMigrationState, stageInputRestoreBackup(a, bundle_path, "restored", "", location));
+    try std.testing.expect(!fileExists(io, target));
 }
 
 test "backup preflight AFB1 corruption cancellation and missing capabilities cannot certify" {
@@ -2758,7 +2902,7 @@ test "lite restore staging refuses binary-only or mismatched schemas before owne
 }
 
 test "lite restore staging standalone adoption preserves full text incarnation and rejects unsupported catalogs" {
-    @import("antfly_test_error_logs").expectErrorLogs(5);
+    @import("antfly_test_error_logs").expectErrorLogs(1);
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -216,6 +216,8 @@ const CandidateSubmission = enum {
 const default_tensor_core_plans = 256;
 const maximum_tensor_core_plans = 4096;
 
+const maximum_attention_plans = 64;
+
 const AttentionPlanKey = struct {
     rows: usize,
     n: usize,
@@ -235,6 +237,7 @@ const AttentionPlanKey = struct {
     alignments: [3]u32,
 };
 const AttentionPlan = struct {
+    last_used: u64 = 0,
     op: MatmulDesc,
     a: MatrixLayout,
     b: MatrixLayout,
@@ -263,6 +266,8 @@ pub const CublasLt = struct {
     attention_plans_mutex: std.atomic.Mutex = .unlocked,
     attention_plan_cache_hits: usize = 0,
     attention_plan_cache_misses: usize = 0,
+    attention_plan_cache_evictions: usize = 0,
+    attention_plan_clock: u64 = 0,
     allocator: ?std.mem.Allocator = null,
     lib: std.DynLib,
     handle: Handle,
@@ -409,11 +414,7 @@ pub const CublasLt = struct {
     }
 
     pub fn deinit(self: *CublasLt) void {
-        var attention_plans = self.attention_plans.valueIterator();
-        while (attention_plans.next()) |plan| {
-            _ = self.fns.cublasLtMatmulDescDestroy(plan.op);
-            for ([_]MatrixLayout{ plan.a, plan.b, plan.d }) |layout| _ = self.fns.cublasLtMatrixLayoutDestroy(layout);
-        }
+        self.clearAttentionPlans();
         if (self.allocator) |allocator| self.attention_plans.deinit(allocator);
 
         // Like other allocator/driver objects in this backend, deinit requires
@@ -1235,8 +1236,8 @@ pub const CublasLt = struct {
     }
 
     /// Bounded attention tile GEMM over strided BSHD views. This intentionally
-    /// creates invocation-specific descriptors: query tail rows and sequence
-    /// strides vary, while the resident encoder's request lock serializes use.
+    /// caches exact-shape descriptors with bounded LRU replacement: query tail
+    /// rows and sequence strides vary across requests.
     pub fn matmulEmbeddingGemma2Attention(
         self: *CublasLt,
         ctx: *context_mod.CudaContext,
@@ -1327,14 +1328,18 @@ pub const CublasLt = struct {
         if (!std.math.isFinite(alpha_value)) return error.CublasLtUnsupported;
         const use_cache = self.attention_plan_cache_enabled and self.allocator != null;
         const key = AttentionPlanKey{ .rows = rows, .n = n, .k = k, .lda = lda, .ldb = ldb, .ldd = ldd, .batches = batch_count_usize, .stride_a = stride_a_usize, .stride_b = stride_b_usize, .stride_d = stride_d_usize, .workspace = workspace.len, .transpose_a = transpose_a, .transpose_b = transpose_b, .input_f16 = input_f16, .output_f32 = output_f32, .alignments = .{ stridedPointerAlignment(a.ptr, stride_a_usize, 2, batch_count_usize), stridedPointerAlignment(b.ptr, stride_b_usize, 2, batch_count_usize), stridedPointerAlignment(dst.ptr, stride_d_usize, output_bytes_per_element, batch_count_usize) } };
-        // Descriptors are immutable and never evicted. Bound host metadata and
-        // serialize first-use discovery so concurrent calls cannot leak plans.
+        // Hold the lock through submission, discovery and replacement: no
+        // caller may still be borrowing a descriptor when it is evicted.
+        // cuBLAS consumes host descriptors during submission; device buffers
+        // and workspace retain their separate stream/graph lifetimes.
         if (use_cache) spinLock(&self.attention_plans_mutex);
         defer if (use_cache) self.attention_plans_mutex.unlock();
         if (use_cache) {
-            if (self.attention_plans.get(key)) |plan| {
+            self.attention_plan_clock +%= 1;
+            if (self.attention_plans.getPtr(key)) |plan| {
                 self.attention_plan_cache_hits += 1;
-                return self.submitAttentionPlan(ctx, plan, dst, a, b, workspace, alpha_value);
+                plan.last_used = self.attention_plan_clock;
+                return self.submitAttentionPlan(ctx, plan.*, dst, a, b, workspace, alpha_value);
             }
             self.attention_plan_cache_misses += 1;
         }
@@ -1385,16 +1390,38 @@ pub const CublasLt = struct {
         var heuristic: MatmulHeuristicResult = undefined;
         var returned: c_int = 0;
         try self.check(self.fns.cublasLtMatmulAlgoGetHeuristic(self.handle, op, ad, bd, dd, dd, pref, 1, @ptrCast(&heuristic), &returned));
-        if (returned != 1 or heuristic.state != CUBLAS_STATUS_SUCCESS or heuristic.workspace_size > workspace.len)
-            return error.CublasLtUnsupported;
-        const plan = AttentionPlan{ .op = op, .a = ad, .b = bd, .d = dd, .algo = heuristic.algo, .workspace = heuristic.workspace_size };
+        if (returned != 1) return error.CublasLtUnsupported;
+        try self.check(heuristic.state);
+        if (heuristic.workspace_size > workspace.len) return error.CublasLtUnsupported;
+        const plan = AttentionPlan{ .op = op, .a = ad, .b = bd, .d = dd, .algo = heuristic.algo, .workspace = heuristic.workspace_size, .last_used = self.attention_plan_clock };
         try self.submitAttentionPlan(ctx, plan, dst, a, b, workspace, alpha_value);
-        if (use_cache and self.attention_plans.count() < 64) {
+        if (use_cache) {
+            if (self.attention_plans.count() == maximum_attention_plans) {
+                var entries = self.attention_plans.iterator();
+                var oldest = entries.next().?;
+                while (entries.next()) |entry| {
+                    if (entry.value_ptr.last_used < oldest.value_ptr.last_used) oldest = entry;
+                }
+                const evicted = self.attention_plans.fetchRemove(oldest.key_ptr.*).?;
+                self.destroyAttentionPlan(evicted.value);
+                self.attention_plan_cache_evictions += 1;
+            }
             // A metadata-allocation failure preserves the successful result;
             // ordinary transient descriptor cleanup is still safe after submit.
             self.attention_plans.put(self.allocator.?, key, plan) catch return;
             retained = true;
         }
+    }
+
+    fn destroyAttentionPlan(self: *CublasLt, plan: AttentionPlan) void {
+        _ = self.fns.cublasLtMatmulDescDestroy(plan.op);
+        for ([_]MatrixLayout{ plan.a, plan.b, plan.d }) |layout| _ = self.fns.cublasLtMatrixLayoutDestroy(layout);
+    }
+
+    fn clearAttentionPlans(self: *CublasLt) void {
+        var plans = self.attention_plans.valueIterator();
+        while (plans.next()) |plan| self.destroyAttentionPlan(plan.*);
+        self.attention_plans.clearRetainingCapacity();
     }
 
     fn submitAttentionPlan(self: *CublasLt, ctx: *context_mod.CudaContext, plan: AttentionPlan, dst: buffer_mod.DeviceBuffer, a: buffer_mod.DeviceBuffer, b: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, alpha_value: f32) Error!void {
@@ -1448,7 +1475,13 @@ pub const CublasLt = struct {
 
     fn check(self: *const CublasLt, status: Status) Error!void {
         _ = self;
-        if (status != CUBLAS_STATUS_SUCCESS) return error.CublasLtError;
+        // Unsupported library configurations decline to the caller's fallback.
+        // Allocation, initialization and execution failures must still surface.
+        return switch (status) {
+            CUBLAS_STATUS_SUCCESS => {},
+            CUBLAS_STATUS_NOT_SUPPORTED => error.CublasLtUnsupported,
+            else => error.CublasLtError,
+        };
     }
 
     fn validateContext(self: *const CublasLt, ctx: *context_mod.CudaContext) Error!void {
@@ -1464,6 +1497,187 @@ fn openLibrary() !std.DynLib {
         std.DynLib.open("libcublasLt.so") catch
         std.DynLib.open("libcublasLt.so.11") catch
         std.DynLib.open("libcublasLt.so.12");
+}
+
+// Exercise the real descriptor, discovery, submission and cache paths without
+// CUDA. Any unexpected driver/library call still fails through an undefined
+// table entry, rather than silently bypassing the production path.
+const AttentionTest = struct {
+    const Stage = enum { none, op_create, op_attribute, layout_create, layout_attribute, preference_create, preference_attribute, heuristic, heuristic_state, submit };
+    var stage: Stage = .none;
+    var status: Status = CUBLAS_STATUS_NOT_SUPPORTED;
+    var descriptors: usize = 0;
+    var destroyed: usize = 0;
+    var heuristics: usize = 0;
+    var submissions: usize = 0;
+
+    fn reset() void {
+        stage = .none;
+        status = CUBLAS_STATUS_NOT_SUPPORTED;
+        descriptors = 0;
+        destroyed = 0;
+        heuristics = 0;
+        submissions = 0;
+    }
+    fn at(point: Stage) Status {
+        return if (stage == point) status else CUBLAS_STATUS_SUCCESS;
+    }
+    fn create(out: *?*anyopaque, point: Stage) Status {
+        if (at(point) != CUBLAS_STATUS_SUCCESS) return status;
+        descriptors += 1;
+        out.* = @ptrFromInt(descriptors * 256);
+        return CUBLAS_STATUS_SUCCESS;
+    }
+    fn destroy(_: ?*anyopaque) callconv(.c) Status {
+        destroyed += 1;
+        return CUBLAS_STATUS_SUCCESS;
+    }
+    fn opCreate(out: *MatmulDesc, _: c_int, _: c_int) callconv(.c) Status {
+        return create(out, .op_create);
+    }
+    fn opAttribute(_: MatmulDesc, _: c_int, _: ?*const anyopaque, _: usize) callconv(.c) Status {
+        return at(.op_attribute);
+    }
+    fn layoutCreate(out: *MatrixLayout, _: c_int, _: u64, _: u64, _: i64) callconv(.c) Status {
+        return create(out, .layout_create);
+    }
+    fn layoutAttribute(_: MatrixLayout, _: c_int, _: ?*const anyopaque, _: usize) callconv(.c) Status {
+        return at(.layout_attribute);
+    }
+    fn preferenceCreate(out: *MatmulPreference) callconv(.c) Status {
+        return create(out, .preference_create);
+    }
+    fn preferenceAttribute(_: MatmulPreference, _: c_int, _: ?*const anyopaque, _: usize) callconv(.c) Status {
+        return at(.preference_attribute);
+    }
+    fn heuristic(_: Handle, _: MatmulDesc, _: MatrixLayout, _: MatrixLayout, _: MatrixLayout, _: MatrixLayout, _: MatmulPreference, _: c_int, out: [*]MatmulHeuristicResult, count: *c_int) callconv(.c) Status {
+        heuristics += 1;
+        if (at(.heuristic) != CUBLAS_STATUS_SUCCESS) return status;
+        out[0] = std.mem.zeroes(MatmulHeuristicResult);
+        out[0].state = at(.heuristic_state);
+        count.* = 1;
+        return CUBLAS_STATUS_SUCCESS;
+    }
+    fn submit(_: Handle, _: MatmulDesc, _: ?*const anyopaque, _: ?*const anyopaque, _: MatrixLayout, _: ?*const anyopaque, _: MatrixLayout, _: ?*const anyopaque, _: ?*const anyopaque, _: MatrixLayout, _: ?*anyopaque, _: MatrixLayout, _: ?*const MatmulAlgo, _: ?*anyopaque, _: usize, _: driver_mod.CUstream) callconv(.c) Status {
+        submissions += 1;
+        return at(.submit);
+    }
+    fn setCurrent(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+        return driver_mod.CUDA_SUCCESS;
+    }
+    fn context() context_mod.CudaContext {
+        var ctx: context_mod.CudaContext = undefined;
+        ctx.ctx = @ptrFromInt(256);
+        ctx.device = 0;
+        ctx.stream = null;
+        ctx.driver.fns.cuCtxSetCurrent = setCurrent;
+        ctx.driver.fns.cuStreamIsCapturing = null;
+        ctx.debug_graph_capture_active = false;
+        return ctx;
+    }
+    fn blas(ctx: *context_mod.CudaContext) CublasLt {
+        var result = CublasLt{
+            .lib = undefined,
+            .handle = null,
+            .owner_context = ctx.ctx,
+            .owner_device = ctx.device,
+            .fns = undefined,
+            .allocator = std.testing.allocator,
+            .attention_plan_cache_enabled = true,
+        };
+        result.fns.cublasLtMatmulDescCreate = opCreate;
+        result.fns.cublasLtMatmulDescDestroy = destroy;
+        result.fns.cublasLtMatmulDescSetAttribute = opAttribute;
+        result.fns.cublasLtMatrixLayoutCreate = layoutCreate;
+        result.fns.cublasLtMatrixLayoutDestroy = destroy;
+        result.fns.cublasLtMatrixLayoutSetAttribute = layoutAttribute;
+        result.fns.cublasLtMatmulPreferenceCreate = preferenceCreate;
+        result.fns.cublasLtMatmulPreferenceDestroy = destroy;
+        result.fns.cublasLtMatmulPreferenceSetAttribute = preferenceAttribute;
+        result.fns.cublasLtMatmulAlgoGetHeuristic = heuristic;
+        result.fns.cublasLtMatmul = submit;
+        return result;
+    }
+    fn deinit(cublas: *CublasLt) void {
+        cublas.clearAttentionPlans();
+        cublas.attention_plans.deinit(std.testing.allocator);
+    }
+    fn qk(cublas: *CublasLt, ctx: *context_mod.CudaContext, sequence: usize) !void {
+        const rows: usize = if (sequence >= 4096) 128 else 256;
+        try cublas.matmulEmbeddingGemma2Attention(ctx, .{ .ptr = 0x10000000, .len = 4 * rows * sequence * 4 }, .{ .ptr = 0x20000000, .len = 4 * rows * 512 * 2 }, .{ .ptr = 0x30000000, .len = sequence * 512 * 2 }, .{}, rows, sequence, 512, 512, 512, sequence, 4, rows * 512, 0, rows * sequence, false, true, true, 1);
+    }
+    fn pv(cublas: *CublasLt, ctx: *context_mod.CudaContext, sequence: usize) !void {
+        const rows: usize = if (sequence >= 4096) 128 else 256;
+        try cublas.matmulEmbeddingGemma2Attention(ctx, .{ .ptr = 0x10000000, .len = 4 * rows * 512 * 2 }, .{ .ptr = 0x20000000, .len = 4 * rows * sequence * 2 }, .{ .ptr = 0x30000000, .len = sequence * 512 * 2 }, .{}, rows, 512, sequence, sequence, 512, 512, 4, rows * sequence, 0, rows * 512, false, false, false, 1);
+    }
+};
+
+test "global MQA cuBLAS unsupported faults decline and execution faults propagate" {
+    for (std.enums.values(AttentionTest.Stage)) |stage| {
+        if (stage == .none) continue;
+        for ([_]Status{ CUBLAS_STATUS_NOT_SUPPORTED, 13 }) |status| {
+            AttentionTest.reset();
+            var ctx = AttentionTest.context();
+            var blas = AttentionTest.blas(&ctx);
+            defer AttentionTest.deinit(&blas);
+            AttentionTest.stage = stage;
+            AttentionTest.status = status;
+            const expected = if (status == CUBLAS_STATUS_NOT_SUPPORTED) error.CublasLtUnsupported else error.CublasLtError;
+            try std.testing.expectError(expected, AttentionTest.qk(&blas, &ctx, 512));
+            try std.testing.expectEqual(@as(usize, 0), blas.attention_plans.count());
+            try std.testing.expectEqual(AttentionTest.descriptors, AttentionTest.destroyed);
+        }
+    }
+    // Cover submission faults on the cached-plan fast path as well.
+    AttentionTest.reset();
+    var ctx = AttentionTest.context();
+    var blas = AttentionTest.blas(&ctx);
+    defer AttentionTest.deinit(&blas);
+    try AttentionTest.qk(&blas, &ctx, 512);
+    AttentionTest.stage = .submit;
+    try std.testing.expectError(error.CublasLtUnsupported, AttentionTest.qk(&blas, &ctx, 512));
+    AttentionTest.status = 13;
+    try std.testing.expectError(error.CublasLtError, AttentionTest.qk(&blas, &ctx, 512));
+    try std.testing.expectEqual(@as(usize, 1), AttentionTest.heuristics);
+}
+
+test "global MQA plans retain tile reuse after varied length cache saturation" {
+    AttentionTest.reset();
+    var ctx = AttentionTest.context();
+    var blas = AttentionTest.blas(&ctx);
+    defer AttentionTest.deinit(&blas);
+    for (0..40) |i| {
+        try AttentionTest.qk(&blas, &ctx, 512 + i * 32);
+        try AttentionTest.pv(&blas, &ctx, 512 + i * 32);
+    }
+    try std.testing.expectEqual(@as(usize, maximum_attention_plans), blas.attention_plans.count());
+    const before = AttentionTest.heuristics;
+    // Model all 64 tiles in each of four 8192-token global-attention layers.
+    for (0..4 * 64) |_| {
+        try AttentionTest.qk(&blas, &ctx, 8192);
+        try AttentionTest.pv(&blas, &ctx, 8192);
+    }
+    try std.testing.expectEqual(before + 2, AttentionTest.heuristics);
+    try std.testing.expectEqual(@as(usize, 18), blas.attention_plan_cache_evictions);
+    try std.testing.expectEqual(@as(usize, maximum_attention_plans), blas.attention_plans.count());
+    // Hits promote both hot plans ahead of every newly introduced length.
+    const hot = AttentionTest.heuristics;
+    for (0..40) |i| {
+        try AttentionTest.qk(&blas, &ctx, 512 + i * 32);
+        try AttentionTest.pv(&blas, &ctx, 512 + i * 32);
+        try AttentionTest.qk(&blas, &ctx, 8192);
+        try AttentionTest.pv(&blas, &ctx, 8192);
+    }
+    try std.testing.expectEqual(hot + 80, AttentionTest.heuristics);
+    // Capture hits reuse plans; capture misses must not discover or evict.
+    ctx.debug_graph_capture_active = true;
+    try AttentionTest.qk(&blas, &ctx, 8192);
+    const evictions = blas.attention_plan_cache_evictions;
+    try std.testing.expectError(error.CublasLtUnsupported, AttentionTest.qk(&blas, &ctx, 8160));
+    try std.testing.expectEqual(evictions, blas.attention_plan_cache_evictions);
+    try std.testing.expectEqual(hot + 80, AttentionTest.heuristics);
+    blas.clearAttentionPlans();
+    try std.testing.expectEqual(AttentionTest.descriptors, AttentionTest.destroyed);
 }
 
 fn lookup(lib: *std.DynLib, comptime T: type, name: [:0]const u8) Error!T {
