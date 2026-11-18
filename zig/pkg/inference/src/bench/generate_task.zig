@@ -89,6 +89,11 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
     const requests = try std.math.mul(usize, try std.math.add(usize, options.warmup, options.iterations), if (comparison) @as(usize, 2) else 1);
     const cuda_before = factory.getCudaRuntimeStats(model.session);
     var cuda_before_measured: @TypeOf(cuda_before) = null;
+    // Cooperative stepping keeps two warmed providers resident while a
+    // controller alternates requests. Waits and protocol I/O stay outside the
+    // timer; ordinary invocation and cleanup are identical to ungated runs.
+    var control_buffer: [64]u8 = undefined;
+    var control = std.Io.File.stdin().readerStreaming(init.io, &control_buffer);
     for (0..requests) |i| {
         const mode: usize = if (comparison and (i % 4 == 1 or i % 4 == 2)) 1 else 0;
         if (comparison) pipeline.pjrt_decoder_cache = mode == 1;
@@ -97,6 +102,11 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         // construction must not be attributed to steady-state GPU work.
         // The interleaved comparison is PJRT-only and has no CUDA counters.
         if (!comparison and i == options.warmup) cuda_before_measured = factory.getCudaRuntimeStats(model.session);
+        if (options.generate_control_stdin and i >= options.warmup) {
+            if (i == options.warmup) try std.Io.File.stderr().writeStreamingAll(init.io, "GENERATION_MEASURE_READY\n");
+            const command = (try control.interface.takeDelimiter('\n')) orelse return error.MeasurementControlClosed;
+            if (!std.mem.eql(u8, command, "run")) return error.InvalidMeasurementControl;
+        }
         const start = inference.platform.time.awakeNs(init.io);
         // This benchmark reuses one backend, whereas serving acquires it for
         // each request. Reset captured temporaries before media/prompt tensors
@@ -130,6 +140,15 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
                 if (!std.mem.eql(i32, tokens, result.token_ids orelse return error.GenerationResetOutputChanged)) return error.GenerationResetOutputChanged;
             }
         } else reference = result;
+        if (options.generate_control_stdin and i >= options.warmup) {
+            var response_buffer: [128]u8 = undefined;
+            const response = try std.fmt.bufPrint(&response_buffer, "GENERATION_MEASURE_SAMPLE {d} {d}\n", .{ i - options.warmup, elapsed });
+            try std.Io.File.stderr().writeStreamingAll(init.io, response);
+        }
+    }
+    if (options.generate_control_stdin) {
+        const command = (try control.interface.takeDelimiter('\n')) orelse return error.MeasurementControlClosed;
+        if (!std.mem.eql(u8, command, "finish")) return error.InvalidMeasurementControl;
     }
     const cuda_after = factory.getCudaRuntimeStats(model.session);
     const cuda_counts = if (cuda_before != null and cuda_after != null) factory.cudaStatsDelta(cuda_after.?, cuda_before.?) else null;
@@ -152,6 +171,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .kv_cached = !is_pjrt or pipeline.pjrt_decoder_cache_used,
         .native_kv_dtype = pipeline.kv_dtype,
         .model_load_in_timing = false,
+        .measurement_control = if (options.generate_control_stdin) "stdin_after_warmup" else "uncontrolled",
         .model_chat_template = model.chat_tmpl != null,
         .runtime_capabilities = if (cache.compiled_model_runtime) |*runtime| runtime.capabilities() else null,
         .compiled_stage_shapes = factory.getPjrtSpecializationCount(model.session),
