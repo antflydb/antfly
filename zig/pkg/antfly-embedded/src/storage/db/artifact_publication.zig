@@ -1186,11 +1186,92 @@ pub const PreparedEffects = struct {
         };
     }
 
+    /// The writer already owns the publication source and contender guards.
+    pub fn stageLocalDag(self: *@This(), alloc: std.mem.Allocator, txn: anytype, command: Command) !void {
+        if (command.mode != .publish or command.producer_kind != .graph) return;
+        const raw = txn.get(&localDagBindingKey(command)) catch |err| {
+            if (err == error.NotFound) return;
+            return err;
+        };
+        if (raw.len > local_dag_max_bytes) return error.InvalidDagAuthority;
+        const parsed = std.json.parseFromSlice(LocalDagBinding, alloc, raw, .{ .allocate = .alloc_always }) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return error.InvalidDagAuthority;
+        };
+        defer parsed.deinit();
+        const binding = parsed.value;
+        try binding.validate();
+
+        const dag = @import("../../graph/dag_authority.zig");
+        const validation = @import("../../graph/dag_validation.zig");
+        const Clock = struct {
+            fn now(_: *anyopaque) u64 {
+                return 0;
+            }
+        };
+        const transaction = command.publication_digest[0..16].*;
+        var budget: validation.Budget = .{ .clock = .{ .context = self, .now = Clock.now } };
+        var witness: validation.Witness = .{};
+        for (binding.edge_types) |edge_type| {
+            const id = try dag.domain(binding.table_identity, command.producer_generation, command.producer_name, edge_type);
+            const state = dag.Storage.load(txn, id) catch |err| {
+                if (err == error.NotFound) return error.GraphConstraintNotReady;
+                return err;
+            };
+            const vote = (try self.dagPrepare(command, binding.table_identity, edge_type, state.owner_epoch, state.revision, transaction)) orelse continue;
+            _ = try vote.stagePublication(alloc, txn, &budget, &witness);
+        }
+    }
+
     pub fn deinit(self: *@This()) void {
         self.arena.deinit();
         self.* = undefined;
     }
 };
+
+const local_dag_prefix = "\x00\x00__metadata__:dag-publication-owner:";
+const local_dag_max_bytes = 64 * 1024;
+
+/// The catalog installs this binding in the same transaction as the co-located
+/// authority. Shard-separated owners use transaction enlistment.
+pub const LocalDagBinding = struct {
+    table_identity: [16]u8,
+    edge_types: []const []const u8,
+
+    fn validate(self: LocalDagBinding) !void {
+        if (self.edge_types.len == 0 or self.edge_types.len > 64) return error.InvalidDagAuthority;
+        for (self.edge_types, 0..) |edge_type, i| {
+            if (edge_type.len == 0) return error.InvalidDagAuthority;
+            if (i != 0 and std.mem.order(u8, self.edge_types[i - 1], edge_type) != .lt) return error.InvalidDagAuthority;
+        }
+    }
+
+    pub fn stage(self: LocalDagBinding, alloc: std.mem.Allocator, txn: anytype, command: Command) !void {
+        if (command.producer_kind != .graph or command.producer_generation == 0) return error.InvalidDagDomain;
+        try self.validate();
+        const raw = try std.json.Stringify.valueAlloc(alloc, self, .{ .emit_strings_as_arrays = true });
+        defer alloc.free(raw);
+        if (raw.len > local_dag_max_bytes) return error.GraphConstraintCapacity;
+        const key = localDagBindingKey(command);
+        if (txn.get(&key)) |old| {
+            if (!std.mem.eql(u8, old, raw)) return error.GraphConstraintAttemptConflict;
+            return;
+        } else |err| if (err != error.NotFound) return err;
+        try txn.put(&key, raw);
+    }
+};
+
+fn localDagBindingKey(command: Command) [local_dag_prefix.len + 32]u8 {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update(local_dag_prefix);
+    hash.update(&command.namespace);
+    bytes(&hash, command.producer_name);
+    number(&hash, command.producer_generation);
+    var key: [local_dag_prefix.len + 32]u8 = undefined;
+    key[0..local_dag_prefix.len].* = local_dag_prefix.*;
+    hash.final(key[local_dag_prefix.len..]);
+    return key;
+}
 
 pub const PreparedBaseVectors = PreparedEffects;
 pub const Coverage = struct { index_name: []const u8, generation: u64, document_key: []const u8, artifact_names: []const []const u8 = &.{}, artifact_keys: []const []const u8 = &.{}, outcome: ?enum { produced, skipped } = null };

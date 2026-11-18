@@ -159,6 +159,29 @@ test "ordered artifact inventory graph publication validates guards generations 
         const next = (try result.dagPrepare(command, @splat(2), "links", 2, 1, @splat(4))).?;
         try std.testing.expect(!std.mem.eql(u8, &request.attempt.id, &next.attempt.id));
         try std.testing.expect((try result.dagPrepare(command, @splat(2), "unknown", 1, 0, @splat(3))) == null);
+        const memory = @import("../mem_backend.zig");
+        const docstore = @import("../docstore.zig");
+        const dag = @import("../../graph/dag_authority.zig");
+        var backend = memory.Backend.init(alloc, .{});
+        defer backend.close();
+        var store = try docstore.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        {
+            var writer = try store.beginWriteTxn();
+            errdefer writer.abort();
+            try dag.Storage.create(&writer, request.domain, 1);
+            try dag.Storage.activateNewIncarnation(&writer, request.domain, 1);
+            try (publication.LocalDagBinding{ .table_identity = @splat(2), .edge_types = &.{"links"} }).stage(alloc, &writer, command);
+            try result.stageLocalDag(alloc, &writer, command);
+            try writer.put(edge_key, edge);
+            try writer.commit();
+        }
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u64, 1), (try dag.Storage.load(&read, request.domain)).revision);
+            try std.testing.expectEqualSlices(u8, edge, try read.get(edge_key));
+        }
     }
     const guards = command.mutation_preconditions;
     command.mutation_preconditions = guards[0..1];
