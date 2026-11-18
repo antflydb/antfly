@@ -6346,6 +6346,15 @@ pub const Store = struct {
     }
 
     fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool) !void {
+        // A forwarded request commits in the writer store's group, which
+        // enters that store's admission, not this one's. The detached work
+        // that built it must still hold the writer lease and pass this
+        // store's publication checks, as its own direct commit would:
+        // otherwise it lands while another process holds the lease, built
+        // from state that process has since changed.
+        const forwarded_admission = if (self.forwardedWriter() != null) self.writer_admission else null;
+        if (forwarded_admission) |admission| try admission.enter(admission.ptr, if (artifact_lease) .artifact_lease else if (index_only) .index else .primary);
+        defer if (forwarded_admission) |admission| admission.leave(admission.ptr);
         const ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
         ticket.wait() catch |err| {
             // §9.7f: a redo-log file's own fixed log-capacity reservation
