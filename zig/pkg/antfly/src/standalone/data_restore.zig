@@ -37,6 +37,12 @@ pub fn restoreJsonAlloc(a: Allocator, input: []const u8, output: []const u8, tab
     defer a.free(schema_json);
     const indexes_json = try std.json.Stringify.valueAlloc(a, definition.value.indexes, .{});
     defer a.free(indexes_json);
+    // The newly built projections and standalone catalog share fresh native
+    // lifecycle identities. They never inherit the upload's incarnations.
+    const output_indexes_json = try local.api_coverage_policy.withMissingIncarnationsAlloc(a, indexes_json);
+    defer a.free(output_indexes_json);
+    var output_indexes = try std.json.parseFromSlice(Value, a, output_indexes_json, .{});
+    defer output_indexes.deinit();
 
     var io_impl = std.Io.Threaded.init(a, .{});
     defer io_impl.deinit();
@@ -123,6 +129,18 @@ pub fn restoreJsonAlloc(a: Allocator, input: []const u8, output: []const u8, tab
         var target = try openDestination(a, temporary, true);
         defer target.close();
         try target.db.setSchemaJson(a, schema_json);
+        // Only caller-owned indexes exist while copying data. Use normal
+        // native mutations so artifact cardinality and publication counters
+        // are maintained together with the document/vector records.
+        var it = output_indexes.value.object.iterator();
+        while (it.next()) |entry| {
+            const public_json = try std.json.Stringify.valueAlloc(a, entry.value_ptr.*, .{});
+            defer a.free(public_json);
+            const config = try local.api_table_index_config.parseIndexConfig(a, entry.key_ptr.*, public_json);
+            defer a.free(config.name);
+            defer a.free(config.config_json);
+            try target.db.addIndex(config);
+        }
         var copy: Copy = .{ .a = a, .target = &target, .definition = definition.value, .options = options };
         defer copy.decoder.deinit(a);
         const inspection_options: portable.FileInspectionOptions = .{
@@ -137,19 +155,9 @@ pub fn restoreJsonAlloc(a: Allocator, input: []const u8, output: []const u8, tab
         // Restore documents first, then validate/copy vectors against those keys.
         copy.vectors_only = true;
         _ = try portable.inspectPortableFileBlocks(a, io, archive, inspection_options, &copy, Copy.visit);
-        // Indexes are built only from the caller's definition, after all
-        // records validate. No source catalog is ever installed in this DB.
-        var it = definition.value.indexes.object.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.key_ptr.*, "full_text_index_v0")) continue;
-            const public_json = try std.json.Stringify.valueAlloc(a, entry.value_ptr.*, .{});
-            defer a.free(public_json);
-            const config = try local.api_table_index_config.parseIndexConfig(a, entry.key_ptr.*, public_json);
-            defer a.free(config.name);
-            defer a.free(config.config_json);
-            try target.db.addIndex(config);
-        }
-        try staging.finalizeRestoredLiteDb(a, &target.db);
+        try target.db.runUntilIdle();
+        try target.db.sync(true);
+        try target.db.syncIndexes(true);
         documents = copy.documents;
         vectors = copy.vectors;
         // Assign the public name to the fresh standalone table. Its native
@@ -160,7 +168,7 @@ pub fn restoreJsonAlloc(a: Allocator, input: []const u8, output: []const u8, tab
         try target_catalog.updateStandaloneCatalog(local.common_group_ids.main_metadata_group_id, 0, .{
             .replace = true,
             .auxiliary_json = "{}",
-            .tables = &.{.{ .table_id = identity.table_id, .name = table_name, .schema_json = schema_json, .indexes_json = indexes_json, .desired_replica_count = 1 }},
+            .tables = &.{.{ .table_id = identity.table_id, .name = table_name, .schema_json = schema_json, .indexes_json = output_indexes_json, .desired_replica_count = 1 }},
             .ranges = &.{.{ .table_id = identity.table_id, .group_id = identity.shard_id, .range_id = identity.range_id, .doc_identity_shard_id = identity.shard_id, .doc_identity_range_id = identity.range_id, .start_key = "" }},
         });
         try target.backend.markStandaloneArtifact();
@@ -193,16 +201,17 @@ fn openDestination(a: Allocator, path: []const u8, create: bool) !connection.Con
     var backend = if (create)
         try backend_mod.Handle.create(a, path, true)
     else
-        try backend_mod.Handle.open(a, path, .{ .read_only = true });
+        try backend_mod.Handle.open(a, path, .{});
     errdefer backend.deinit();
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const identity = connection.embeddedRootIdentity();
     const namespace = try std.fmt.allocPrint(a, "group-{d}/table-db", .{identity.shard_id});
     defer a.free(namespace);
     var options: db_mod.OpenOptions = .{
-        .open_mode = if (create) .writer else .query_readonly,
+        .open_mode = .writer,
         .external_derived_checkpoints = false,
         .identity_namespace = identity,
+        .online_source_authority = .native,
     };
     // Construct directly in the standalone namespace. Adopting an embedded
     // root after index construction changes its durable root incarnation and
@@ -210,7 +219,6 @@ fn openDestination(a: Allocator, path: []const u8, create: bool) !connection.Con
     try backend.configureDbOpenOptionsForNamespace(&options, namespace);
     var db = try db_mod.DB.open(a, namespace, options);
     errdefer db.close();
-    if (create) try connection.provisionDefaultFullTextIndex(&db);
     return .{ .backend = backend, .db = db, .open_mode = options.open_mode };
 }
 
@@ -321,7 +329,7 @@ const Copy = struct {
         if (vector.len != dims.integer) return error.InvalidBackupRequest;
         for (vector) |v| if (!std.math.isFinite(v)) return error.InvalidBackupRequest;
         var doc = (try self.target.db.lookup(self.a, doc_key, .{})) orelse return error.InvalidBackupRequest;
-        doc.deinit(self.a);
+        defer doc.deinit(self.a);
         const key = try local.storage_internal_keys.embeddingArtifactKeyForDocumentAlloc(self.a, doc_key, name);
         defer self.a.free(key);
         const prior = self.target.db.core.store.get(self.a, key) catch |err| switch (err) {
@@ -332,9 +340,32 @@ const Copy = struct {
             self.a.free(bytes);
             return error.InvalidBackupRequest;
         }
-        const value = try local.storage_db_enrichment_artifact_codec.encodeAuthoredDenseEmbeddingAlloc(self.a, vector);
-        defer self.a.free(value);
-        try self.target.db.core.store.putBatch(&.{.{ .key = key, .value = value }}, &.{});
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var document = try std.json.parseFromSliceLeaky(Value, a, doc.json, .{});
+        var embeddings: Value = .{ .object = .empty };
+        // A document may have vectors in more than one caller-owned index.
+        // Preserve previously copied vectors when submitting its next mutation.
+        var it = self.definition.indexes.object.iterator();
+        while (it.next()) |entry| {
+            const index_name = entry.key_ptr.*;
+            if (!entry.value_ptr.object.contains("dimension")) continue;
+            const values = if (std.mem.eql(u8, index_name, name)) vector else existing: {
+                const other_key = try local.storage_internal_keys.embeddingArtifactKeyForDocumentAlloc(a, doc_key, index_name);
+                const bytes = self.target.db.core.store.get(a, other_key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                break :existing try local.storage_db_enrichment_artifact_codec.decodeDenseEmbeddingAlloc(a, bytes);
+            };
+            var array: Value = .{ .array = std.json.Array.init(a) };
+            for (values) |v| try array.array.append(.{ .float = @floatCast(v) });
+            try embeddings.object.put(a, index_name, array);
+        }
+        try document.object.put(a, "_embeddings", embeddings);
+        const value = try std.json.Stringify.valueAlloc(a, document, .{});
+        try self.target.db.batch(.{ .writes = &.{.{ .key = doc_key, .value = value }}, .sync_level = .write });
         self.vectors += 1;
     }
 };
@@ -404,19 +435,21 @@ fn fileDigest(io: std.Io, file: std.Io.File, size: u64) ![64]u8 {
 }
 
 const test_schema = "{\"version\":0,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"properties\":{\"content\":{\"type\":\"string\",\"x-antfly-types\":[\"text\"]}}}}}}";
-const test_indexes = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"},\"vectors\":{\"name\":\"vectors\",\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"distance_metric\":\"cosine\"}}";
+const test_indexes = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"},\"vectors\":{\"name\":\"vectors\",\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"distance_metric\":\"cosine\"},\"vectors_alt\":{\"name\":\"vectors_alt\",\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"distance_metric\":\"cosine\"}}";
 const test_definition = "{\"schema\":" ++ test_schema ++ ",\"indexes\":" ++ test_indexes ++ "}";
 
 fn createTestSource(a: Allocator, path: []const u8, producer: bool) !void {
     var source = try connection.Connection.create(a, path, true);
     defer source.close();
     try source.db.setSchemaJson(a, test_schema);
-    const config = try local.api_table_index_config.parseIndexConfig(a, "vectors", "{\"name\":\"vectors\",\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"distance_metric\":\"cosine\"}");
-    defer a.free(config.name);
-    defer a.free(config.config_json);
-    try source.db.addIndex(config);
+    for ([_][]const u8{ "vectors", "vectors_alt" }) |name| {
+        const config = try local.api_table_index_config.parseIndexConfig(a, name, "{\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"distance_metric\":\"cosine\"}");
+        defer a.free(config.name);
+        defer a.free(config.config_json);
+        try source.db.addIndex(config);
+    }
     try source.db.batch(.{ .writes = &.{
-        .{ .key = "one", .value = "{\"content\":\"first searchable record\",\"_embeddings\":{\"vectors\":[1,0]}}" },
+        .{ .key = "one", .value = "{\"content\":\"first searchable record\",\"_embeddings\":{\"vectors\":[1,0],\"vectors_alt\":[0,1]}}" },
         .{ .key = "two", .value = "{\"content\":\"keyword only record\"}" },
     }, .sync_level = .write });
     try source.db.sync(true);
@@ -464,12 +497,19 @@ test "data restore preserves documents and partial external vectors without sour
     var parsed = try std.json.parseFromSlice(Value, a, report, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("inventory").?.object.get("documents").?.integer);
-    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("inventory").?.object.get("artifact_records").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("inventory").?.object.get("artifact_records").?.integer);
     try std.testing.expectEqualStrings(&before, parsed.value.object.get("source").?.object.get("sha256").?.string);
     try std.testing.expectEqualStrings(&before, &try fileDigest(io, source, (try source.stat(io)).size));
     var result = try openDestination(a, output, false);
     defer result.close();
     try std.testing.expect(result.db.core.index_manager.vectorBlockReadyForDenseIndex("vectors"));
+    const stats = try result.db.stats(a);
+    defer local.storage_db_types.freeDBStats(a, stats);
+    for (stats.indexes) |index| if (index.kind == .dense_vector) {
+        try std.testing.expect(index.publication_target_ready);
+        try std.testing.expectEqual(@as(u64, 1), index.publication_target_count);
+        try std.testing.expectEqual(@as(u64, 1), index.doc_count);
+    };
     var one = (try result.db.lookup(a, "one", .{})) orelse return error.MissingDocument;
     defer one.deinit(a);
     try std.testing.expect(std.mem.indexOf(u8, one.json, "first searchable record") != null);
@@ -483,6 +523,7 @@ test "data restore preserves documents and partial external vectors without sour
     for ([_]struct { request: []const u8, expected: []const u8 }{
         .{ .request = "{\"full_text_search\":{\"match\":\"keyword\",\"field\":\"content\"},\"indexes\":[\"full_text_index_v0\"],\"limit\":10}", .expected = "\"two\"" },
         .{ .request = "{\"embeddings\":{\"vectors\":[1,0]},\"indexes\":[\"vectors\"],\"limit\":1}", .expected = "\"one\"" },
+        .{ .request = "{\"embeddings\":{\"vectors_alt\":[0,1]},\"indexes\":[\"vectors_alt\"],\"limit\":1}", .expected = "\"one\"" },
     }) |query| {
         var request = try local.api_query.parsePublicQueryRequest(a, null, "records", query.request);
         defer request.deinit(a);

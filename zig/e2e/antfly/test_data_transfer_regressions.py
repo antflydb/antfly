@@ -33,6 +33,125 @@ from helpers import wait_until
 pytestmark = pytest.mark.e2e_resource("antfly_process")
 
 
+@pytest.mark.parametrize("vector_count", [0, 1, 2])
+def test_data_only_restore_serves_partial_vectors_after_restart(tmp_path, vector_count):
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0, storage_engine="lite")
+    definition = {
+        "schema": {
+            "version": 0,
+            "default_type": "doc",
+            "enforce_types": False,
+            "document_schemas": {
+                "doc": {
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": True,
+                        "x-antfly-dynamic-indexing": {"mode": "infer_types"},
+                    }
+                }
+            },
+        },
+        "indexes": {
+            "full_text_index_v0": {"name": "full_text_index_v0", "type": "full_text"},
+            "vectors": {
+                "name": "vectors",
+                "type": "embeddings",
+                "external": True,
+                "dimension": 768,
+                "distance_metric": "cosine",
+            },
+        },
+    }
+    vector = [1.0] + [0.0] * 767
+    failed = True
+    try:
+        response = requests.post(
+            server.api_url + "/tables/records",
+            json={
+                "schema": {k: v for k, v in definition["schema"].items() if k != "version"},
+                "indexes": {"vectors": definition["indexes"]["vectors"]},
+            },
+            timeout=30,
+        )
+        assert response.ok, response.text
+        records = {
+            name: {
+                "content": "alpha searchable" if i == 0 else "beta searchable",
+                **({"_embeddings": {"vectors": vector}} if i < vector_count else {}),
+            }
+            for i, name in enumerate(("a", "b"))
+        }
+        response = requests.post(
+            server.api_url + "/tables/records/batch",
+            json={"inserts": records, "sync_level": "full_index"},
+            timeout=30,
+        )
+        assert response.ok, response.text
+        server.pause()
+        source = server.root / "db.aflite"
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        trusted = tmp_path / "definition.json"
+        trusted.write_text(json.dumps(definition))
+        output = tmp_path / "prepared.aflite"
+        result = subprocess.run(
+            [
+                binary, "--no-agent", "restore", "--data-only", "--input", str(source),
+                "--out", str(output), "--table", "records", "--definition", str(trusted),
+            ],
+            env={**os.environ, "ANTFLY_URL": "://invalid-server-url"},
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        report = json.loads(result.stdout)
+        assert report["inventory"] == {
+            "documents": 2, "artifact_records": vector_count, "shards": 1
+        }
+        assert report["source"]["sha256"] == source_hash
+        assert hashlib.sha256(source.read_bytes()).hexdigest() == source_hash
+        assert hashlib.sha256(output.read_bytes()).hexdigest() == report["output"]["sha256"]
+        os.replace(output, source)
+        server.resume()
+
+        for reopen in range(2):
+            if reopen:
+                server.restart()
+            last = {}
+
+            def ready():
+                response = requests.get(
+                    server.api_url + "/tables/records/indexes/vectors", timeout=10
+                )
+                last["index"] = (response.status_code, response.text)
+                if response.status_code in (404, 503):
+                    return False
+                assert response.ok, response.text
+                status = response.json()["status"]
+                return (
+                    status["total_indexed"] == vector_count
+                    and not status["backfill_active"]
+                    and not status["rebuilding"]
+                    and not status.get("dense_publish_pending", False)
+                )
+
+            assert wait_until(ready, timeout_s=30, interval_s=0.2), last
+            for query, expected in (
+                ({"full_text_search": {"match": "searchable", "field": "content"}}, 2),
+                ({"embeddings": {"vectors": vector}, "indexes": ["vectors"]}, vector_count),
+            ):
+                response = requests.post(
+                    server.api_url + "/tables/records/query", json=query, timeout=10
+                )
+                assert response.ok, response.text
+                hits = response.json()["responses"][0]["hits"]["hits"]
+                assert len(hits) == expected, response.text
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
 @pytest.mark.parametrize(
     "schema_version,direct_sparse", [(0, False), (3, False), (0, True)]
 )
