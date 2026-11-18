@@ -1,0 +1,223 @@
+{
+  "gpu": "NVIDIA L4",
+  "compute_capability": "8.9",
+  "measured_cublas_version": 130401,
+  "qualified_cublas_versions": [
+    130400,
+    130401
+  ],
+  "scope": "prepared encoder + classifier; synchronized float32 readback; excludes tokenization, decoding, HTTP, loading and warmup",
+  "method": "three rotated fresh-process rounds, eight measured forwards per geometry and arm, shared GPU lock, foreign-process monitor",
+  "fp32_control": "same release executable, auto, ANTFLY_INFERENCE_CUDA_DISABLE_GLINER_BF16=1; existing compensated FP32 policy, not the original release baseline",
+  "qualification": [
+    {
+      "runtime": 130401,
+      "round": 0,
+      "cases": 89,
+      "max_confidence_delta": 0.009570133540495629,
+      "report_sha256": "cae3efa9b77eca2911b6bea11a00c0e82f8075108f570668a714d413e44d1498"
+    },
+    {
+      "runtime": 130401,
+      "round": 1,
+      "cases": 89,
+      "max_confidence_delta": 0.009570133540495629,
+      "report_sha256": "57cbf8dfb4833ca2ce5b72430be14a3ab9e47b957f7260f66e8d65a25b3dbf17"
+    },
+    {
+      "runtime": 130401,
+      "round": 2,
+      "cases": 89,
+      "max_confidence_delta": 0.009570133540495629,
+      "report_sha256": "3a44a2b03eedeb3fe454f44aa72fc72d9143d03aecf8135f0d1a3cd685fc75a1"
+    },
+    {
+      "runtime": 130400,
+      "round": 0,
+      "cases": 89,
+      "max_confidence_delta": 0.009570133540495629,
+      "report_sha256": "447c4f12141bf52df59df891b98a0394a4b1322c491c778ee31264c4d60911fd"
+    },
+    {
+      "runtime": 130400,
+      "round": 1,
+      "cases": 89,
+      "max_confidence_delta": 0.009570133540495629,
+      "report_sha256": "bce0a9c4c7b06395ff221b546dfeef4b8492d43bd4d26253702de79158dffa04"
+    },
+    {
+      "runtime": 130400,
+      "round": 2,
+      "cases": 89,
+      "max_confidence_delta": 0.009570133540495629,
+      "report_sha256": "f696475195c2d4a40d79413b3fc7af1a54f6319680f4f10a6d51b0da88ccc87f"
+    }
+  ],
+  "boundary_changes": [
+    {
+      "id": "classification_0_b8_s107",
+      "row": 4,
+      "task": "urgent",
+      "reference_probability_gap": 0.0021972620888914274
+    },
+    {
+      "id": "classification_4_b1_s70",
+      "row": 0,
+      "task": "urgent",
+      "reference_probability_gap": 0.0013427726304756082
+    }
+  ],
+  "memory_median_process_peaks": {
+    "native": {
+      "peak_gpu_bytes": 1956642816,
+      "peak_footprint_bytes": 3727185920
+    },
+    "control": {
+      "peak_gpu_bytes": 2558525440,
+      "peak_footprint_bytes": 3536501760
+    },
+    "pjrt": {
+      "peak_gpu_bytes": 2476736512,
+      "peak_footprint_bytes": 3624033280
+    }
+  },
+  "latency": [
+    {
+      "role": "decide",
+      "id": "classification_s128_b1",
+      "ms": {
+        "native": 4.7822205,
+        "control": 14.929214499999999,
+        "pjrt": 7.8419635
+      },
+      "native_speedup_over_pjrt": 1.6398163781866604,
+      "native_speedup_over_fp32_control": 3.121816423981286,
+      "decisions_match_python_bf16": {
+        "native": true,
+        "control": true,
+        "pjrt": true
+      },
+      "max_logit_error_vs_python_bf16": {
+        "native": 0.015625,
+        "control": 0.03331756591796875,
+        "pjrt": 0.0625
+      },
+      "max_confidence_error_vs_python_bf16": {
+        "native": 0.0015921920721542748,
+        "control": 0.002861035841400128,
+        "pjrt": 0.00439713813793996
+      }
+    },
+    {
+      "role": "decide",
+      "id": "classification_s128_b8",
+      "ms": {
+        "native": 24.014389,
+        "control": 73.185526,
+        "pjrt": 25.443378499999998
+      },
+      "native_speedup_over_pjrt": 1.05950555310818,
+      "native_speedup_over_fp32_control": 3.0475697716065144,
+      "decisions_match_python_bf16": {
+        "native": true,
+        "control": true,
+        "pjrt": true
+      },
+      "max_logit_error_vs_python_bf16": {
+        "native": 0.046875,
+        "control": 0.02896404266357422,
+        "pjrt": 0.03125
+      },
+      "max_confidence_error_vs_python_bf16": {
+        "native": 0.001981626310735618,
+        "control": 0.0012013001559771364,
+        "pjrt": 0.002192882926988382
+      }
+    },
+    {
+      "role": "decide",
+      "id": "classification_s512_b1",
+      "ms": {
+        "native": 16.144873499999996,
+        "control": 49.329447,
+        "pjrt": 16.248777
+      },
+      "native_speedup_over_pjrt": 1.0064356961359904,
+      "native_speedup_over_fp32_control": 3.055424807137697,
+      "decisions_match_python_bf16": {
+        "native": true,
+        "control": true,
+        "pjrt": true
+      },
+      "max_logit_error_vs_python_bf16": {
+        "native": 0.03125,
+        "control": 0.022310256958007812,
+        "pjrt": 0.03125
+      },
+      "max_confidence_error_vs_python_bf16": {
+        "native": 0.0066950071750122575,
+        "control": 0.00228885590549599,
+        "pjrt": 0.004300929681372634
+      }
+    },
+    {
+      "role": "decide",
+      "id": "classification_s512_b8",
+      "ms": {
+        "native": 118.1144685,
+        "control": 342.72507750000005,
+        "pjrt": 128.8096775
+      },
+      "native_speedup_over_pjrt": 1.0905495248450445,
+      "native_speedup_over_fp32_control": 2.901635014342041,
+      "decisions_match_python_bf16": {
+        "native": true,
+        "control": true,
+        "pjrt": true
+      },
+      "max_logit_error_vs_python_bf16": {
+        "native": 0.044921875,
+        "control": 0.03544586896896362,
+        "pjrt": 0.0234375
+      },
+      "max_confidence_error_vs_python_bf16": {
+        "native": 0.010968494362291192,
+        "control": 0.008648579945117252,
+        "pjrt": 0.005713321009400696
+      }
+    }
+  ],
+  "provenance": {
+    "zig/pkg/inference/src/architectures/session_factory.zig": "0181e48e4f41d009313d544f17df13f08cf2bfcb31164851263b4a2d48466e36",
+    "zig/pkg/inference/src/models/gliner25_bf16_policy.zig": "7081f68f1f2708fbd092bccd7506b5f294c4e5245eb635793fbc3142511db520",
+    "zig/pkg/inference/src/ops/cuda/cuda_compute.zig": "7482fd6950ee9ddce0ce2b8af332b925a47542fe1483e54f710fe684b681d3f3",
+    "zig/pkg/inference/src/ops/cuda/libraries.zig": "56a98e1a0591168882351388041d74be71d4ee71408c03fae25d903696c3a2a3",
+    "zig/pkg/inference/src/ops/cuda/gliner25_bf16_ffn.zig": "9d5193ca53dd33346da1d723c4087070cdee160038922fb49ededa398c2262ac",
+    "zig/pkg/inference/src/ops/cuda/gliner25_bf16_attention.zig": "3ac5c7f971a23bac01ae5d66565e4965b8aafe3402979d63c4f7ce3772f033ed",
+    "zig/pkg/inference/src/ops/cuda/gliner25_bf16_full.zig": "96c94ada922e30aa9982c97fb310c9fecab5d5b74b5039c5d2eadd99202607e8",
+    "zig/pkg/inference/src/ops/cuda/gliner25_bf16_projections.zig": "ab198c3e9ebaf74093c30b8d363e41b428fc4bb59a0d69d57da2e5ad9c2e63ee",
+    "zig/pkg/inference/src/ops/cuda/kernels/gliner25_bf16_full.cu": "6f2504441ac6dd4250397c1c4f9178a4b3edeecbc3b734340ebd6c01bbd8f4bc",
+    "zig/pkg/inference/src/ops/cuda/artifacts/gliner25_bf16_full_sm89.cubin": "eb81c9eb9650feafead4ca0c8e049e884529635bc75120ff6575635b959ef1d5",
+    ".tools/gliner25-qualified-release": "55722b0ae8c58d93dd124829cca9670280627b10780f7d2e229312bdba4fb2eb",
+    ".tools/gliner25-qualified-pipeline-debug": "4064463f285115fe58922ec51f25ddd6b5f323f80374468848dc0e736874cb48",
+    "final_dispatch_policy_sha256": "010d8dbbba6341b590a3e3e3b082db502afd46cbaa9595ef19fb46c41d10e9d9"
+  },
+  "system_automatic_selection": {
+    "encoder_dtype": "bf16",
+    "passed_cases": 89,
+    "max_confidence_delta": 0.009570133540495629,
+    "attention_calls": 4416,
+    "ffn_calls": 4416,
+    "native_sha256": "34bb2ba32894b37eb57e359cf9e441911eaa8555c4a31e54c8e389fefe4f8e85",
+    "qualification_sha256": "8a5360909844f5651e50116c8b5bf3a61495b2c03eee640b3608e3b1953ad921",
+    "binary_sha256": "73005aa0c7c55b80f410a700cb6ffed3b7031c80b10d6467b20959c3c50631ab"
+  },
+  "validation": {
+    "focused_cuda_enabled_tests": 40,
+    "python_tests": 18,
+    "cuda_server_type_check": "pass",
+    "cubin_reproducibility": "pass",
+    "loaded_pipeline_cases": 89,
+    "batch32_observed_forwards": 4
+  }
+}

@@ -8076,7 +8076,7 @@ pub const Node = struct {
         var longest: usize = 0;
         for (items) |item| longest = @max(longest, item.payloadAs(DecideClassifyTicket).sample.input_ids.len);
         const variant = try gliner_decide_qualification.require(try session_factory.getGlinerDecisionIdentity(first.model.session));
-        const workspace_bytes: usize = if (variant == .decide_deberta or variant == .decide_deberta_q8) gliner_specialty.cuda_matmul_workspace_bytes else 0;
+        const workspace_bytes: usize = if (variant == .decide_deberta and (session_factory.glinerCudaBf16Enabled(first.model.session) orelse true)) @import("../models/gliner25_bf16_policy.zig").workspace_bytes else if (variant == .decide_deberta or variant == .decide_deberta_q8) gliner_specialty.cuda_matmul_workspace_bytes else 0;
         var budget = gliner_microbatch.classificationBudget(first.limits, first.config, longest, items.len, workspace_bytes) catch |err| {
             if (err == error.MemoryBudgetExceeded) return error.ClassificationMicrobatchCapacity;
             return err;
@@ -13075,7 +13075,7 @@ pub const Node = struct {
                 try std.math.add(
                     usize,
                     try std.math.mul(usize, try span_v2_executor.deviceScratchUpperBound(config, longest), span_v2_executor.classificationBatchItems(request, &request_plan, options)),
-                    if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) gliner_specialty.cuda_matmul_workspace_bytes else 0,
+                    if (backend == .cuda and qualified_variant == .decide_deberta and (session_factory.glinerCudaBf16Enabled(loaded.session) orelse true)) @import("../models/gliner25_bf16_policy.zig").workspace_bytes else if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) gliner_specialty.cuda_matmul_workspace_bytes else 0,
                 );
             const device_limits = try runtime.tier.memory.withAutomaticScratchFloor(
                 self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(if (gpu) .gpu else .cpu)),

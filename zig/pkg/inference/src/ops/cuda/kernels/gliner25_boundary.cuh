@@ -38,6 +38,15 @@ extern "C" __global__ void termite_gliner25_boundary_f32(
         for(uint d=lane;d<N;d+=32u) out[row*N+d]=(a0[row*N+d]-mean)*inv*a1[d]+a2[d];
         break;
     }
+    case 51u: {
+        uint row=gid/32u;if(row>=B)return;uint base=row*N;
+        float sum=0.0f;for(uint d=lane;d<N;d+=32u)sum+=a0[base+d]+a1[base+d];
+        float mean=gliner25_warp_sum(sum)/float(N),sq=0.0f;
+        for(uint d=lane;d<N;d+=32u){float x=(a0[base+d]+a1[base+d])-mean;sq+=x*x;}
+        float inv=rsqrtf(gliner25_warp_sum(sq)/float(N)+p.scalars[0]);
+        for(uint d=lane;d<N;d+=32u){float x=a0[base+d]+a1[base+d];out[base+d]=(x-mean)*inv*a2[d]+a3[d];if(C)out[B*N+base+d]=x;}
+        break;
+    }
     case 2u: {
         uint h=gid%C, row=gid/C, pos=row%(N+1u), b=row/(N+1u);
         int raw=((const int*)a3)[b]; uint len=uint(gliner25_clamp(raw,0,int(N)));
@@ -271,4 +280,103 @@ extern "C" __global__ void termite_gliner25_boundary_f32(
         out[gid]=score;break;
     }
     }
+}
+
+// Explicit BF16 experiment: F32 boundary-head attention, parallel over the
+// bounded band. Eight warps share one query; no dense score workspace.
+extern "C" __global__ void termite_gliner25_boundary_banded_f32_v1(
+    const float *a0, const float *a1, const float *a2, const float *a3,
+    const float *a4, const float *a5, const float *a6, const float *a7,
+    const float *a8, const float *a9, float *out,
+    Gliner25BoundaryParams p, unsigned int work_items) {
+ const unsigned lane=threadIdx.x%32,warp=threadIdx.x/32,N=p.dims[1],C=p.dims[2],D=p.dims[3],h=blockIdx.x%C,q=(blockIdx.x/C)%N,b=blockIdx.x/(C*N),hidden=C*D;
+ const unsigned len=min(N,unsigned(max(0,((const int*)a1)[b])));
+ if(q>=len){if(!warp&&lane<D)out[(b*N+q)*hidden+h*D+lane]=0;return;}
+ const unsigned lo=q>p.dims[4]?q-p.dims[4]:0,hi=min(N-1,q+p.dims[4]),count=hi-lo+1;
+ __shared__ float scores[257],reductions[8],parts[8*32];
+ const float query=lane<D?a0[(b*N+q)*3*hidden+h*D+lane]:0;
+ for(unsigned k=lo+warp;k<=hi;k+=8){float key=lane<D?a0[(b*N+k)*3*hidden+hidden+h*D+lane]:0;float s=gliner25_warp_sum(query*key)*rsqrtf(float(D));if(!lane)scores[k-lo]=k<len?s:-INFINITY;}
+ __syncthreads();
+ float v=-INFINITY;for(unsigned i=threadIdx.x;i<count;i+=256)v=fmaxf(v,scores[i]);v=gliner25_warp_max(v);if(!lane)reductions[warp]=v;__syncthreads();
+ v=lane<8?reductions[lane]:-INFINITY;v=gliner25_warp_max(v);__syncthreads();float s=0;for(unsigned i=threadIdx.x;i<count;i+=256){float e=expf(scores[i]-v);scores[i]=e;s+=e;}s=gliner25_warp_sum(s);if(!lane)reductions[warp]=s;__syncthreads();
+ s=lane<8?reductions[lane]:0;s=gliner25_warp_sum(s);
+ float acc=0;for(unsigned k=lo+warp;k<=hi;k+=8){float value=lane<D?a0[(b*N+k)*3*hidden+2*hidden+h*D+lane]:0;acc+=scores[k-lo]*value;}parts[warp*32+lane]=acc;__syncthreads();
+ if(!warp&&lane<D){float value=0;for(unsigned w=0;w<8;w++)value+=parts[w*32+lane];out[(b*N+q)*hidden+h*D+lane]=value/s;}
+}
+
+// Preserve each existing F32 normalization boundary and emit its RNE BF16
+// value in the same pass. Flavors 0/1 use the boundary head's centered warp
+// reduction; 2/3 preserve the generic add/plain block reduction respectively.
+extern "C" __global__ void termite_gliner25_norm_bf16_mirror_v1(
+    float* output, __nv_bfloat16* mirror, const float* a, const float* b,
+    const float* gamma, const float* beta, unsigned rows, unsigned width,
+    float eps, unsigned flavor) {
+    const bool add = flavor == 1u || flavor == 2u;
+    if (flavor < 2u) {
+        const unsigned lane = threadIdx.x & 31u;
+        const unsigned row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+        if (row >= rows) return;
+        const unsigned base = row * width;
+        float sum = 0.0f;
+        for (unsigned d = lane; d < width; d += 32u)
+            sum += (add ? a[base+d] + b[base+d] : a[base+d]);
+        const float mean = gliner25_warp_sum(sum) / float(width);
+        float square = 0.0f;
+        for (unsigned d = lane; d < width; d += 32u) {
+            const float x = ((add ? a[base+d] + b[base+d] : a[base+d])) - mean;
+            square += x*x;
+        }
+        const float inv = rsqrtf(gliner25_warp_sum(square) / float(width) + eps);
+        for (unsigned d = lane; d < width; d += 32u) {
+            const float x = (add ? a[base+d] + b[base+d] : a[base+d]);
+            const float value = (x-mean) * inv * gamma[d] + beta[d];
+            output[base+d] = value;
+            mirror[base+d] = __float2bfloat16_rn(value);
+        }
+        return;
+    }
+    const unsigned row = blockIdx.x, tid = threadIdx.x;
+    if (row >= rows) return;
+    const unsigned base = row * width;
+    __shared__ float sums[256], squares[256];
+    float sum = 0.0f, square = 0.0f;
+    for (unsigned d = tid; d < width; d += blockDim.x) {
+        const float x = (add ? a[base+d] + b[base+d] : a[base+d]);
+        sum += x;
+        square += x*x;
+    }
+    sums[tid] = sum;
+    squares[tid] = square;
+    __syncthreads();
+    for (unsigned stride = blockDim.x >> 1u; stride; stride >>= 1u) {
+        if (tid < stride) {
+            sums[tid] += sums[tid+stride];
+            squares[tid] += squares[tid+stride];
+        }
+        __syncthreads();
+    }
+    const float mean = sums[0] / float(width);
+    // Keep the original kernel's rounded square/subtraction. With the extra
+    // BF16 output, ptxas otherwise contracts these into a different FFMA.
+    const float mean_square = __fmul_rn(mean, mean);
+    const float variance = fmaxf(__fsub_rn(__fdiv_rn(squares[0], float(width)), mean_square), 0.0f);
+    const float inv = rsqrtf(variance + eps);
+    for (unsigned d = tid; d < width; d += blockDim.x) {
+        const float x = (add ? a[base+d] + b[base+d] : a[base+d]);
+        const float value = (x-mean) * inv * gamma[d] + beta[d];
+        output[base+d] = value;
+        mirror[base+d] = __float2bfloat16_rn(value);
+    }
+}
+
+// Explicit BF16 experiment only: bounded head reductions and scans.
+// Padded words are never loaded; prefix padding carries the last valid sum.
+__device__ __forceinline__ float gliner25_warp_prefix(float x){unsigned lane=threadIdx.x&31;for(unsigned d=1;d<32;d*=2){float y=__shfl_up_sync(0xffffffff,x,d);if(lane>=d)x+=y;}return x;}
+__device__ __forceinline__ float gliner25_block_prefix(float x,float* sums){unsigned lane=threadIdx.x&31,warp=threadIdx.x>>5;x=gliner25_warp_prefix(x);if(lane==31)sums[warp]=x;__syncthreads();if(!warp){float y=lane<16?sums[lane]:0;y=gliner25_warp_prefix(y);if(lane<16)sums[lane]=y;}__syncthreads();return x+(warp?sums[warp-1]:0);}
+extern "C" __global__ void termite_gliner25_boundary_parallel_f32_v1(const float* a0,const float* a1,const float* a2,const float* a3,const float* a4,const float* a5,const float* a6,const float* a7,const float* a8,const float* a9,float* out,Gliner25BoundaryParams p,unsigned work){
+ const unsigned lane=threadIdx.x&31,B=p.dims[0],N=p.dims[1],C=p.dims[2],D=p.dims[3];
+ if(p.kind==8){unsigned row=blockIdx.x*8+(threadIdx.x>>5);if(row>=B*C*N)return;unsigned pos=row%N,qi=row/N,b=qi/C;int len=((const int*)a2)[b];if(((const int*)a3)[qi]==0||int(pos)>=len+int(p.dims[4])){if(!lane)out[row]=-10000;return;}float x=0;for(unsigned d=lane;d<D;d+=32)x+=a0[(b*N+pos)*D+d]*a1[qi*D+d];for(unsigned d=16;d;d>>=1)x+=__shfl_xor_sync(0xffffffff,x,d);if(!lane)out[row]=x*rsqrtf(float(D));return;}
+ __shared__ float sums[16];const unsigned t=threadIdx.x,row=blockIdx.x;
+ if(p.kind==9){unsigned b=row/C;unsigned len=unsigned(min(max(((const int*)a1)[b],0),int(N)));if(((const int*)a2)[row]==0)len=0;float x=t<len?a0[row*N+t]:0;float inclusive=gliner25_block_prefix(x,sums);float mean=sums[15]/float(max(len,1u));__syncthreads();float centered=t<len?x-mean:0;inclusive=gliner25_block_prefix(centered,sums);if(!t){out[row*(N+2)]=0;out[row*(N+2)+N+1]=mean;}if(t<N)out[row*(N+2)+t+1]=inclusive;return;}
+ if(p.kind==10){unsigned b=row/C,d=row%C,len=unsigned(min(max(((const int*)a1)[b],0),int(N)));float x=t<len?a0[(b*N+t)*C+d]:0;float inclusive=gliner25_block_prefix(x,sums);if(!t)out[b*(N+1)*C+d]=0;if(t<N)out[(b*(N+1)+t+1)*C+d]=inclusive;}
 }

@@ -147,6 +147,25 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("antfly_runtime_abi", ctx.graph.runtime_abi_mod);
     tests.root_module.addImport("antfly_reader_config", ctx.graph.reader_config_mod);
     tests.root_module.addImport("inference_internal", tests.root_module);
+    if (ctx.backend.enable_cuda) {
+        const fast_root = b.createModule(.{ .root_source_file = ctx.path("src/test_gliner25_fast_f32.zig"), .target = ctx.target, .optimize = ctx.optimize });
+        var fast_imports = tests.root_module.import_table.iterator();
+        while (fast_imports.next()) |entry| fast_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        fast_root.link_libc = true;
+        const fast_tests = b.addTest(.{ .root_module = fast_root, .filters = &.{"GLiNER fast FP32"} });
+        const fast_run = ctx.addRunArtifact(fast_tests);
+        fast_run.setEnvironmentVariable("TERMITE_REQUIRE_CUDA_TESTS", "1");
+        ctx.step("test-gliner25-fast-f32", "Require CUDA and validate accurate Tensor Core projections").dependOn(&fast_run.step);
+        const attention_root = b.createModule(.{ .root_source_file = ctx.path("src/test_gliner25_fp32_attention.zig"), .target = ctx.target, .optimize = ctx.optimize });
+        var imports = tests.root_module.import_table.iterator();
+        while (imports.next()) |entry| attention_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        attention_root.link_libc = true;
+        const attention_tests = b.addTest(.{ .root_module = attention_root, .filters = &.{ "GLiNER FP32 attention", "GLiNER fast FP32", "GLiNER BF16 attention", "GLiNER BF16 projections", "GLiNER BF16 relative cache", "GLiNER BF16 bias", "GLiNER BF16 norm", "gliner boundary shared pool stable ties", "GLiNER experimental banded", "GLiNER experimental parallel", "GLiNER shared pool", "GLiNER BF16 FFN", "GLiNER BF16 encoder upload", "GLiNER BF16 optional", "DeBERTa native bucketed relative", "GPU boundary request groups distinct ragged inputs within physical limits", "gliner boundary optimized required outputs preserve only requested record work" } });
+        ctx.step("gliner25-fp32-attention-test-build", "Build focused GLiNER CUDA tests for a serialized GPU run").dependOn(&b.addInstallArtifact(attention_tests, .{}).step);
+        const attention_run = ctx.addRunArtifact(attention_tests);
+        attention_run.setEnvironmentVariable("TERMITE_REQUIRE_CUDA_TESTS", "1");
+        ctx.step("test-gliner25-fp32-attention", "Require CUDA and validate bounded FP32 attention against CPU").dependOn(&attention_run.step);
+    }
     if (ctx.graph.inference_client_mod) |mod| {
         tests.root_module.addImport("inference_client", mod);
     }

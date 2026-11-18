@@ -468,10 +468,20 @@ pub const CublasLt = struct {
         _ = try self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_16BF, CUDA_R_32F, .{}, .dense_bias, bias);
     }
 
+    /// Explicit offline BF16 profiles may time bounded candidates during warmup.
+    /// Bias submission remains locked and participates in the cached plan key.
+    pub fn matmulBf16WeightBiasF32OutWithTuning(self: *CublasLt, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, bias: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize, tuning: MatmulTuning) Error!MatmulSelection {
+        return self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_16BF, CUDA_R_32F, tuning, .dense_bias, bias);
+    }
+
     /// BF16 activations and checkpoint bias retain their BF16 storage. The
     /// output type in the plan key keeps this descriptor separate from F32.
     pub fn matmulBf16WeightBiasBf16Out(self: *CublasLt, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, bias: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) Error!void {
         _ = try self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_16BF, CUDA_R_16BF, .{}, .dense_bias, bias);
+    }
+
+    pub fn matmulBf16WeightBiasBf16OutWithTuning(self: *CublasLt, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, bias: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize, tuning: MatmulTuning) Error!MatmulSelection {
+        return self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_16BF, CUDA_R_16BF, tuning, .dense_bias, bias);
     }
 
     /// Shape/alignment/workspace-specific bounded tuning, cached for replay.
@@ -584,7 +594,7 @@ pub const CublasLt = struct {
         };
         if (residual != null and (tuning.enabled or bias != null or kind != .dense or input_type != CUDA_R_16BF or output_type != CUDA_R_32F)) return error.CublasLtUnsupported;
         if (bias != null) {
-            if ((input_type != CUDA_R_32F and input_type != CUDA_R_16F and input_type != CUDA_R_16BF) or (output_type != CUDA_R_32F and !(input_type == CUDA_R_16BF and output_type == CUDA_R_16BF)) or tuning.enabled) return error.CublasLtUnsupported;
+            if ((input_type != CUDA_R_32F and input_type != CUDA_R_16F and input_type != CUDA_R_16BF) or (output_type != CUDA_R_32F and !(input_type == CUDA_R_16BF and output_type == CUDA_R_16BF)) or (tuning.enabled and input_type != CUDA_R_16BF)) return error.CublasLtUnsupported;
             spinLock(&self.bias_submission_mutex);
         }
         defer if (bias != null) self.bias_submission_mutex.unlock();

@@ -1101,7 +1101,7 @@ pub fn createSessionFromManifestWithHostLease(
                 try requireQualifiedGlinerCudaPrecision(value, allow_unqualified_precision);
                 try requireGlinerCudaPrecisionManifest(manifest);
             }
-            break :blk createCudaSessionWithRequiredProfileAndHostLease(allocator, model_path, null, jit, load_context, a4b, null, precision orelse .fp32, manifest, host_lease);
+            break :blk createCudaSessionWithRequiredProfileAndHostLease(allocator, model_path, null, jit, load_context, a4b, null, precision orelse .auto, manifest, host_lease);
         },
         else => error.UnsupportedBackend,
     };
@@ -1840,10 +1840,10 @@ pub fn createCudaSession(allocator: std.mem.Allocator, model_path: []const u8) !
     return createCudaSessionWithKernelJit(allocator, model_path, .{});
 }
 
-pub const GlinerCudaPrecision = enum { auto, fp32, fp16, bf16 };
+pub const GlinerCudaPrecision = enum { auto, fp32, fp16, bf16, bf16_full };
 
 /// Explicit precision for qualification and model owners. Automatic selection
-/// remains FP32 until a measured artifact/profile is added to release policy.
+/// applies source-pinned, hardware-qualified FP32 or BF16 operators.
 pub fn createGlinerCudaSessionWithPrecision(allocator: std.mem.Allocator, model_path: []const u8, precision: GlinerCudaPrecision) !Session {
     return createCudaSessionWithRequiredProfile(allocator, model_path, null, .{}, .dynamic, null, null, precision, null);
 }
@@ -1864,7 +1864,7 @@ pub fn createCudaSessionWithGlinerPrecisionForTest(allocator: std.mem.Allocator,
 }
 
 fn requireQualifiedGlinerCudaPrecision(precision: GlinerCudaPrecision, allow_unqualified: bool) !void {
-    if ((precision == .fp16 or precision == .bf16) and !(@import("builtin").is_test and allow_unqualified)) return error.UnqualifiedGlinerCudaPrecision;
+    if ((precision == .fp16 or precision == .bf16 or precision == .bf16_full) and !(@import("builtin").is_test and allow_unqualified)) return error.UnqualifiedGlinerCudaPrecision;
 }
 
 fn requireGlinerCudaPrecisionManifest(manifest: *const manifest_mod.ModelManifest) !void {
@@ -2062,7 +2062,7 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
     load_context: kernel_jit.LoadContext,
     a4b_request: ?backend_contracts.A4bInferenceRequest,
 ) !Session {
-    return createCudaSessionWithRequiredProfile(allocator, model_path, override, config, load_context, a4b_request, null, .fp32, null);
+    return createCudaSessionWithRequiredProfile(allocator, model_path, override, config, load_context, a4b_request, null, .auto, null);
 }
 
 /// Create a Gemma 4 CUDA session with the stronger compiled-training kernel
@@ -2097,7 +2097,7 @@ fn createCudaSessionWithRequiredProfileAndHostLease(
     load_context: kernel_jit.LoadContext,
     a4b_request: ?backend_contracts.A4bInferenceRequest,
     required_profile_override: ?CudaCapabilityProfile,
-    gliner_precision: GlinerCudaPrecision,
+    requested_gliner_precision: GlinerCudaPrecision,
     borrowed_manifest: ?*const manifest_mod.ModelManifest,
     host_lease: ?*?@import("../runtime/tier/memory.zig").AdmissionLease,
 ) !Session {
@@ -2210,7 +2210,9 @@ fn createCudaSessionWithRequiredProfileAndHostLease(
         if (training_config.usesMoe()) return error.UnsupportedGemmaMoeTraining;
     }
     const cuda_profile = required_profile_override orelse architecture_profile;
-    if (gliner_precision != .auto and gliner_precision != .fp32 and cuda_profile != .gliner25_modern_bert)
+    var gliner_precision = requested_gliner_precision;
+    var experimental_deberta_bf16 = (gliner_precision == .bf16 or gliner_precision == .bf16_full) and (cuda_profile == .gliner25_boundary or (model_manifest.gliner_classification_head == .label_marker_mlp and native_impl.arch_config == .gliner));
+    if (gliner_precision != .auto and gliner_precision != .fp32 and cuda_profile != .gliner25_modern_bert and !experimental_deberta_bf16)
         return error.UnsupportedGlinerCudaPrecision;
     const jit_scope = cuda_compute_mod.kernelJitRouteScopeForLoadedWeights(
         cuda_profile,
@@ -2236,6 +2238,13 @@ fn createCudaSessionWithRequiredProfileAndHostLease(
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
+    const automatic_gliner_bf16 = requested_gliner_precision == .auto and required_profile_override == null and
+        @import("../models/gliner25_bf16_policy.zig").sourceEligible(native_impl.gliner_decision_identity) and
+        !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_GLINER_BF16") and cuda_compute.prepareQualifiedGlinerBf16();
+    if (automatic_gliner_bf16) {
+        gliner_precision = .bf16_full;
+        experimental_deberta_bf16 = true;
+    }
     // The raw Q4 route is qualified for dense Gemma 4 text checkpoints.
     // Other Gemma generations, expert stores and MTP retain their defaults.
     const dense_gemma4 = cuda_profile == .gemma4 and native_impl.arch_config == .gpt and native_impl.arch_config.gpt.usesGemma4Channels() and
@@ -2256,7 +2265,19 @@ fn createCudaSessionWithRequiredProfileAndHostLease(
     const glide_fp32 = model_manifest.glide_declared and platform.env.getenvBool("ANTFLY_GLIDE_CUDA_FP32");
     cuda_compute.strict_f32_weights = glide_fp32 or (!model_manifest.glide_declared and (cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert or model_manifest.gliner_specialty_profile != null or decide_fp32));
     cuda_compute.qualified_span_fp32 = model_manifest.gliner_specialty_profile != null;
-    cuda_compute.qualified_decide_fp32 = decide_fp32;
+    cuda_compute.qualified_decide_fp32 = decide_fp32 and !experimental_deberta_bf16;
+    // Source-pinned accurate Tensor Core projections. Explicit FP32 remains
+    // a diagnostic control; training and unsupported hardware keep that route.
+    cuda_compute.gliner25_fast_f32_enabled = gliner_precision == .auto and required_profile_override == null and
+        @import("../models/gliner25_fast_f32_policy.zig").identityEligible(native_impl.boundary_identity, native_impl.gliner_decision_identity) and
+        @import("../ops/cuda/gliner25_fast_f32.zig").deviceSupported(cuda_compute.ctx.info.compute_major, cuda_compute.ctx.info.compute_minor) and
+        !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_GLINER_FAST_F32");
+    cuda_compute.gliner_deberta_bf16 = experimental_deberta_bf16;
+    cuda_compute.gliner_bf16_reference = gliner_precision == .bf16_full;
+    if (cuda_compute.gliner_bf16_reference) {
+        cuda_compute.gliner_bf16_full.flags = if (automatic_gliner_bf16) @import("../models/gliner25_bf16_policy.zig").qualified_flags else @intCast(platform.env.getenvUsize("ANTFLY_GLINER25_BF16_SEMANTIC_FLAGS") orelse @import("../ops/cuda/gliner25_bf16_full.zig").python_bf16_flags);
+        try cuda_compute.gliner_bf16_full.init(&cuda_compute.ctx);
+    }
     cuda_compute.qualified_decide_q8 = if (native_impl.gliner_decision_identity) |identity|
         gliner_decide_qualification.qualifiedVariant(identity) == .decide_deberta_q8
     else
@@ -2475,20 +2496,32 @@ test "GLiDE CUDA compact projections recognize encoder and wrapped decoder names
 }
 
 fn uploadGlinerCudaWeight(compute: anytype, name: []const u8, loaded: *const LoadedWeight, precision: GlinerCudaPrecision) !void {
+    // Only the explicit DeBERTa experiment also converts classifier/boundary
+    // linear weights. Embedding and normalization storage stays FP32.
     // Packed-only weights have no dense tensor shape. Check the requested
     // policy before the rank gate so explicit mixed precision cannot silently
     // execute the default Q8 route or change only attention precision.
     if (precision != .auto and precision != .fp32 and (loaded.quantized or loaded.quantized_storage != null))
         return error.UnsupportedGlinerCudaPrecision;
-    // Preserve embeddings, normalization, biases and the decision head in FP32.
-    // Only encoder matrix products use lower precision; accumulation and all
-    // externally visible logits remain FP32.
+    // Preserve embeddings, normalization and bias storage. Ordinary reduced
+    // encoder profiles retain FP32 heads; the explicit DeBERTa experiment
+    // additionally lowers dense classifier/boundary projection matrices.
+    // Accumulation and externally visible logits remain FP32.
+    const experimental_enabled = if (@hasField(@TypeOf(compute.*), "gliner_deberta_bf16")) compute.gliner_deberta_bf16 else false;
+    const experimental_head = (precision == .bf16 or precision == .bf16_full) and experimental_enabled and
+        (std.mem.startsWith(u8, name, "boundary_head.") or std.mem.startsWith(u8, name, "classifier."));
     if (precision == .auto or precision == .fp32 or loaded.tensor.shape.len != 2 or
-        !std.mem.startsWith(u8, name, "model.layers.") or !std.mem.endsWith(u8, name, ".weight"))
-        return compute.insertWeightFromLoaded(name, loaded);
+        (!experimental_head and !std.mem.startsWith(u8, name, "model.layers.") and !std.mem.startsWith(u8, name, "encoder.layer.")) or !std.mem.endsWith(u8, name, ".weight"))
+    {
+        try compute.insertWeightFromLoaded(name, loaded);
+        if (precision == .bf16_full) {
+            if (comptime @hasDecl(@TypeOf(compute.*), "roundGlinerBf16Weight")) try compute.roundGlinerBf16Weight(name) else return error.UnsupportedGlinerCudaPrecision;
+        }
+        return;
+    }
     if (loaded.quantized or loaded.quantized_storage != null or loaded.tensor.dtype != .f32)
         return error.UnsupportedGlinerCudaPrecision;
-    if (precision == .bf16) return compute.insertBf16WeightFromF32Tensor(name, &loaded.tensor);
+    if (precision == .bf16 or precision == .bf16_full) return compute.insertBf16WeightFromF32Tensor(name, &loaded.tensor);
     const values = loaded.tensor.asFloat32();
     const half = try compute.allocator.alloc(f16, values.len);
     defer compute.allocator.free(half);
@@ -2500,6 +2533,44 @@ fn uploadGlinerCudaWeight(compute: anytype, name: []const u8, loaded: *const Loa
     tensor.dtype = .f16;
     tensor.data = std.mem.sliceAsBytes(half);
     return compute.insertF16WeightFromTensor(name, &tensor);
+}
+
+test "GLiNER BF16 encoder upload protects embeddings and gates head experiment" {
+    try std.testing.expectError(error.UnqualifiedGlinerCudaPrecision, requireQualifiedGlinerCudaPrecision(.bf16, false));
+    const Fake = struct {
+        allocator: std.mem.Allocator,
+        reduced: usize = 0,
+        protected: usize = 0,
+        gliner_deberta_bf16: bool = false,
+        fn insertWeightFromLoaded(self: *@This(), _: []const u8, _: *const LoadedWeight) !void {
+            self.protected += 1;
+        }
+        fn insertBf16WeightFromF32Tensor(self: *@This(), _: []const u8, _: *const Tensor) !void {
+            self.reduced += 1;
+        }
+        fn insertF16WeightFromTensor(_: *@This(), _: []const u8, _: *const Tensor) !void {
+            return error.UnexpectedPrecision;
+        }
+    };
+    var compute = Fake{ .allocator = std.testing.allocator };
+    var values = [_]f32{ 1, 2, 3, 4 };
+    var loaded = LoadedWeight{ .tensor = .{ .data = std.mem.sliceAsBytes(&values), .dtype = .f32, .shape = &.{ 2, 2 }, .name = "", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false } };
+    try uploadGlinerCudaWeight(&compute, "encoder.layer.0.attention.self.query_proj.weight", &loaded, .bf16);
+    try uploadGlinerCudaWeight(&compute, "model.layers.0.attn.Wqkv.weight", &loaded, .bf16);
+    try uploadGlinerCudaWeight(&compute, "embeddings.word_embeddings.weight", &loaded, .bf16);
+    try uploadGlinerCudaWeight(&compute, "encoder.LayerNorm.weight", &loaded, .bf16);
+    try uploadGlinerCudaWeight(&compute, "label_classifier.0.weight", &loaded, .bf16);
+    try uploadGlinerCudaWeight(&compute, "encoder.layer.0.attention.self.query_proj.weight", &loaded, .fp32);
+    try std.testing.expectEqual(@as(usize, 2), compute.reduced);
+    try std.testing.expectEqual(@as(usize, 4), compute.protected);
+    try uploadGlinerCudaWeight(&compute, "classifier.0.weight", &loaded, .bf16);
+    try std.testing.expectEqual(@as(usize, 5), compute.protected);
+    compute.gliner_deberta_bf16 = true;
+    try uploadGlinerCudaWeight(&compute, "classifier.0.weight", &loaded, .bf16);
+    try uploadGlinerCudaWeight(&compute, "boundary_head.boundary_encoder.left_projection.weight", &loaded, .bf16);
+    try uploadGlinerCudaWeight(&compute, "encoder.rel_embeddings.weight", &loaded, .bf16);
+    try std.testing.expectEqual(@as(usize, 4), compute.reduced);
+    try std.testing.expectEqual(@as(usize, 6), compute.protected);
 }
 
 test "GLiNER Decide CUDA mixed precision rejects packed-only weights before upload" {
@@ -8965,6 +9036,15 @@ pub fn getEmbeddingGemma2CudaPolicy(session: Session) ?@import("../ops/cuda/embe
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     if (self.backend_type != .cuda or self.arch_config != .embedding_gemma2) return null;
     return self.backend_data.cuda.compute.embedding_gemma2_policy;
+}
+
+/// Immutable load-time precision, for admission before the execution lock.
+/// A remote/foreign session returns null so callers reserve conservatively.
+pub fn glinerCudaBf16Enabled(session: Session) ?bool {
+    if (comptime !build_options.enable_cuda) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return if (self.backend_type == .cuda) self.backend_data.cuda.compute.gliner_bf16_reference else null;
 }
 
 pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {

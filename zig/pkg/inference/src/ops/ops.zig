@@ -128,6 +128,29 @@ pub const LinearNoBiasPairResult = struct {
     second: CT,
 };
 
+/// Offline BF16 DeBERTa projection strip. The backend may emit BF16 only
+/// when its paired attention operator supports the complete request geometry.
+/// Identifies a canonical normalized relative table derived solely from the
+/// immutable checkpoint and this layout/configuration. Never use for text QKV.
+pub const DebertaBf16RelativePolicy = struct {
+    layout: enum { unique_padded_v1, boundary_padded_v1 },
+    normalization_eps: f32,
+    position_buckets: u32,
+    max_position: u32,
+};
+pub const DebertaBf16ProjectionsRequest = struct {
+    input: CT,
+    relative_policy: ?DebertaBf16RelativePolicy = null,
+    weights: [3]CT,
+    biases: [3]CT,
+    count: usize,
+    rows: usize,
+    hidden: usize,
+    batch: usize,
+    sequence: usize,
+};
+pub const DebertaBf16ProjectionsResult = [3]?CT;
+
 pub const LinearPairResult = struct {
     first: CT,
     second: CT,
@@ -2111,6 +2134,8 @@ pub const ComputeBackend = struct {
         /// DeBERTa FFN block: activation(X @ W1^T + b1) @ W2^T + b2,
         /// residual add, then LayerNorm. Backends may keep the entire strip
         /// resident; callers fall back to the generic ops sequence.
+        debertaBf16Projections: ?*const fn (ctx: *anyopaque, request: *const DebertaBf16ProjectionsRequest) anyerror!?DebertaBf16ProjectionsResult = null,
+
         denseFfnLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DenseFfnLayerNormRequest) anyerror!?CT = null,
 
         /// Dense projection, residual add, then LayerNorm. Used by DeBERTa
@@ -2674,6 +2699,8 @@ pub const ComputeBackend = struct {
         /// Q_r/K_r are [2*seq_len-1, num_heads*head_dim].
         /// Returns [batch*seq_len, num_heads*head_dim].
         disentangledRelativeAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT,
+        disentangledRelativeAttentionCompact: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, relative_ids: []const i64, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!?CT = null,
+        compactDebertaRelativeProjectionEnabled: ?*const fn (ctx: *anyopaque, seq_len: usize) bool = null,
 
         /// Optional cooperative form. The control is borrowed synchronously;
         /// tiled native kernels check it between bounded GEMM calls. Backends
@@ -4440,6 +4467,11 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    pub fn debertaBf16Projections(self: *const ComputeBackend, request: *const DebertaBf16ProjectionsRequest) !?DebertaBf16ProjectionsResult {
+        const op = self.vtable.debertaBf16Projections orelse return null;
+        return op(self.ptr, request);
+    }
+
     pub fn denseFfnLayerNorm(self: *const ComputeBackend, request: *const DenseFfnLayerNormRequest) !?CT {
         if (self.vtable.denseFfnLayerNorm) |f| return f(self.ptr, request);
         return null;
@@ -4693,6 +4725,20 @@ pub const ComputeBackend = struct {
     pub fn disentangledRelativeAttentionPacked(self: *const ComputeBackend, qkv: CT, qr_kr: CT, attn_bias: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {
         const op = self.vtable.disentangledRelativeAttentionPacked orelse return null;
         return try op(self.ptr, qkv, qr_kr, attn_bias, batch, seq_len, num_heads, head_dim);
+    }
+
+    pub fn compactDebertaRelativeProjectionEnabled(self: *const ComputeBackend, seq_len: usize) bool {
+        const op = self.vtable.compactDebertaRelativeProjectionEnabled orelse return false;
+        return op(self.ptr, seq_len);
+    }
+
+    pub fn disentangledRelativeAttentionCompact(self: *const ComputeBackend, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, relative_ids: []const i64, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {
+        const op = self.vtable.disentangledRelativeAttentionCompact orelse return null;
+        try self.checkExecutionControl();
+        const output = try op(self.ptr, Q, K, V, Q_r, K_r, relative_ids, mask, batch, seq_len, num_heads, head_dim);
+        errdefer if (output) |value| self.free(value);
+        try self.checkExecutionControl();
+        return output;
     }
 
     pub fn debertaTrainingAttentionV1(self: *const ComputeBackend, qkv: CT, relative: CT, control_i32: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs) !CT {

@@ -48,6 +48,15 @@ pub fn build(b: *std.Build) void {
     pjrt_mod.addImport("protobuf", protobuf_mod);
     pjrt_mod.addImport("xla_proto", xla_proto_mod);
 
+    const gliner = b.addExecutable(.{ .name = "antfly-pjrt-gliner25", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/gliner25_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "protobuf", .module = protobuf_mod }, .{ .name = "xla_proto", .module = xla_proto_mod } },
+    }) });
+    gliner.root_module.link_libc = true;
+    b.step("gliner25-runner", "Build native GLiNER2.5 CUDA/PJRT benchmark worker").dependOn(&b.addInstallArtifact(gliner, .{}).step);
+
     // Tests
     const test_step = b.step("test", "Run unit tests");
 

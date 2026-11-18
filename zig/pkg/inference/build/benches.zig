@@ -211,6 +211,15 @@ pub fn createBge(ctx: Context) CreateBgeResult {
 /// Return the trained worker module so its protocol tests use the same imports.
 pub fn addGliner25(ctx: Context) *std.Build.Module {
     const b = ctx.b;
+    const core_bench = b.addExecutable(.{ .name = "antfly-gliner25-core", .root_module = b.createModule(.{
+        .root_source_file = ctx.path("src/bench/gliner25_core.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    }) });
+    core_bench.root_module.strip = ctx.strip;
+    core_bench.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    core_bench.root_module.link_libc = true;
+    ctx.step("bench-gliner25-core-build", "Build prepared GLiNER2.5 encoder/classifier comparison").dependOn(&b.addInstallArtifact(core_bench, .{}).step);
     const decide_bench = b.addExecutable(.{
         .name = "antfly-inference-gliner25-decide-bench",
         .root_module = b.createModule(.{

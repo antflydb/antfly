@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
     var microbatch: usize = 64;
     var batch_tokens: usize = 16384;
     var worker = false;
-    var precision: factory.GlinerCudaPrecision = .fp32;
+    var precision: factory.GlinerCudaPrecision = .auto;
     while (args.next()) |arg| {
         const value = args.next() orelse return error.MissingArgument;
         if (std.mem.eql(u8, arg, "--batch-tokens")) {
@@ -100,7 +100,7 @@ pub fn main(init: std.process.Init) !void {
     };
     if (worker) {
         if (cases_path == null or !std.mem.eql(u8, selected, "cuda")) return error.InvalidArgument;
-        const ready = try std.json.Stringify.valueAlloc(a, .{ .event = "ready", .backend = selected, .precision = if (precision == .auto) "fp32" else @tagName(precision), .build_mode = @tagName(builtin.mode), .max_position_embeddings = manifest.max_position_embeddings, .timing_boundary = "public_batch_api_loaded_model", .qualification = false }, .{});
+        const ready = try std.json.Stringify.valueAlloc(a, .{ .event = "ready", .backend = selected, .precision = effectivePrecision(session, precision), .requested_precision = @tagName(precision), .build_mode = @tagName(builtin.mode), .max_position_embeddings = manifest.max_position_embeddings, .timing_boundary = "public_batch_api_loaded_model", .qualification = false }, .{});
         defer a.free(ready);
         try std.Io.File.stdout().writeStreamingAll(init.io, ready);
         try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
@@ -177,7 +177,7 @@ fn runCase(io: std.Io, pipeline: *gliner.GlinerPipeline, selected: []const u8, p
         }
         if (i >= warmup) samples[i - warmup] = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     }
-    const CudaEvidence = struct { kernel_launches: usize, h2d_bytes: usize, d2h_bytes: usize, downloads: usize, stream_f32_attention_calls: usize, materialized_f16_attention_calls: usize, f16_cublaslt_linear_calls: usize };
+    const CudaEvidence = struct { kernel_launches: usize, h2d_bytes: usize, d2h_bytes: usize, downloads: usize, stream_f32_attention_calls: usize, materialized_f16_attention_calls: usize, f16_cublaslt_linear_calls: usize, bf16_attention_calls: usize, bf16_ffn_calls: usize };
     const cuda_transfers: ?CudaEvidence = if (comptime factory.CudaRuntimeStats != void) blk: {
         const before = stats_before orelse break :blk null;
         factory.drainCudaProfile(pipeline.session);
@@ -186,7 +186,7 @@ fn runCase(io: std.Io, pipeline: *gliner.GlinerPipeline, selected: []const u8, p
             var buffer: [768]u8 = undefined;
             std.debug.print("{s}\n", .{factory.formatCudaPrefillProfileLine(&buffer, delta)});
         }
-        break :blk .{ .kernel_launches = delta.kernel_launches, .h2d_bytes = delta.h2d_bytes, .d2h_bytes = delta.d2h_bytes, .downloads = delta.to_float32_calls, .stream_f32_attention_calls = delta.deberta_stream_f32_attention_calls, .materialized_f16_attention_calls = delta.deberta_materialized_f16_attention_calls, .f16_cublaslt_linear_calls = delta.f16_cublaslt_linear_calls };
+        break :blk .{ .kernel_launches = delta.kernel_launches, .h2d_bytes = delta.h2d_bytes, .d2h_bytes = delta.d2h_bytes, .downloads = delta.to_float32_calls, .stream_f32_attention_calls = delta.deberta_stream_f32_attention_calls, .materialized_f16_attention_calls = delta.deberta_materialized_f16_attention_calls, .f16_cublaslt_linear_calls = delta.f16_cublaslt_linear_calls, .bf16_attention_calls = delta.gliner25_bf16_attention_calls, .bf16_ffn_calls = delta.gliner25_bf16_ffn_calls };
     } else null;
     std.mem.sort(f64, samples, {}, struct {
         fn less(_: void, left: f64, right: f64) bool {
@@ -196,16 +196,29 @@ fn runCase(io: std.Io, pipeline: *gliner.GlinerPipeline, selected: []const u8, p
     const median = if (reps % 2 == 0) (samples[reps / 2 - 1] + samples[reps / 2]) / 2 else samples[reps / 2];
     const p95 = samples[@min(reps - 1, (reps * 95 + 99) / 100 - 1)];
     const identity: ?inference.models.gliner_decide_qualification.Identity = factory.getGlinerDecisionIdentity(pipeline.session) catch null;
+    // This source-pinned checkpoint has 24 FFN layers per physical forward.
+    // Report observed execution, so batch-32 checks cannot pass on policy alone.
+    const bf16_physical_forwards: ?usize = if (identity != null and
+        inference.models.gliner_decide_qualification.qualifiedVariant(identity.?) == .decide_deberta and
+        (factory.glinerCudaBf16Enabled(pipeline.session) orelse false))
+    blk: {
+        const stats = cuda_transfers orelse return error.MissingCudaEvidence;
+        const layers_per_call = 24 * (warmup + reps);
+        if (stats.bf16_ffn_calls % layers_per_call != 0) return error.InvalidCudaEvidence;
+        break :blk stats.bf16_ffn_calls / layers_per_call;
+    } else null;
     const output = try std.json.Stringify.valueAlloc(a, .{
         .implementation = "antfly_gliner25_decide",
         .request_id = request_id,
         .duration_ns = @as(u64, @intFromFloat(median * std.time.ns_per_ms)),
         .backend = selected,
-        .precision = if (precision == .auto) "fp32" else @tagName(precision),
+        .precision = effectivePrecision(pipeline.session, precision),
+        .requested_precision = @tagName(precision),
         .model_variant = if (identity) |loaded| inference.models.gliner_decide_qualification.qualifiedVariant(loaded) else null,
         .case_index = case_index,
         .batch_size = requests.len,
         .physical_batch_limit = pipeline.config.decision_batch_size,
+        .bf16_physical_forwards_per_call = bf16_physical_forwards,
         .physical_batch_token_limit = pipeline.config.decision_batch_tokens,
         .physical_reuse_batch_padding = pipeline.config.decision_reuse_batch_padding,
         .controlled = pipeline.execution_control != null,
@@ -275,4 +288,9 @@ fn loadCase(a: std.mem.Allocator, path: []const u8, index: usize) ![]const gline
     const requests = try a.alloc(gliner.DecisionRequest, case.texts.len);
     for (case.texts, requests) |text, *dest| dest.* = .{ .text = text, .tasks = tasks };
     return requests;
+}
+
+fn effectivePrecision(session: inference.backends.Session, requested: factory.GlinerCudaPrecision) []const u8 {
+    if (factory.glinerCudaBf16Enabled(session) orelse false) return "bf16_full";
+    return if (requested == .auto) "fp32" else @tagName(requested);
 }

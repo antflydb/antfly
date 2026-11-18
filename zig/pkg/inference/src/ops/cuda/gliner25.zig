@@ -135,9 +135,9 @@ fn check(self: *Compute, ct: CT, dtype: ?@import("../../backends/tensor.zig").DT
     const t = tensor(ct);
     if (t.resident_owner != self) return error.ForeignResidentTrainingTensor;
     if (t.quant_type != null or (dtype != null and t.dtype != dtype.?) or
-        (t.dtype != .f32 and t.dtype != .i32 and t.dtype != .f16)) return error.UnsupportedResidentTrainingDType;
+        (t.dtype != .f32 and t.dtype != .i32 and t.dtype != .f16 and t.dtype != .bf16)) return error.UnsupportedResidentTrainingDType;
     const count = try resident.shapeElements(i64, t.shape, limits);
-    if (count != t.elem_count or t.buffer.ptr == 0 or t.buffer.len < count * @as(usize, if (t.dtype == .f16) 2 else 4)) return error.InvalidResidentTrainingShape;
+    if (count != t.elem_count or t.buffer.ptr == 0 or t.buffer.len < count * @as(usize, if (t.dtype == .f16 or t.dtype == .bf16) 2 else 4)) return error.InvalidResidentTrainingShape;
     return t;
 }
 
@@ -145,7 +145,7 @@ fn allocate(self: *Compute, shape: []const i64, dtype: @import("../../backends/t
     const count = try resident.shapeElements(i64, shape, limits);
     const owned_shape = try self.allocator.dupe(i64, shape);
     errdefer self.allocator.free(owned_shape);
-    var device = try api.allocDeviceBuffer(self, count * @as(usize, if (dtype == .f16) 2 else 4));
+    var device = try api.allocDeviceBuffer(self, count * @as(usize, if (dtype == .f16 or dtype == .bf16) 2 else 4));
     errdefer device.free(&self.ctx);
     const result = try api.createTensorWithDType(self, device, owned_shape, count, dtype);
     tensor(result).resident_owner = self;
@@ -228,7 +228,7 @@ fn copy(self: *Compute, ct: CT, shape: []const i32, limits: resident.Limits) !CT
     for (shape, 0..) |d, i| dims[i] = d;
     const result = try allocate(self, dims[0..shape.len], source.dtype, limits);
     errdefer api.freeTensor(self, result);
-    try api.copyFromDeviceTracked(self, tensor(result).buffer, source.buffer, count * @as(usize, if (source.dtype == .f16) 2 else 4));
+    try api.copyFromDeviceTracked(self, tensor(result).buffer, source.buffer, count * @as(usize, if (source.dtype == .f16 or source.dtype == .bf16) 2 else 4));
     if (source.resident_indices) |indices| tensor(result).resident_indices = try self.allocator.dupe(i32, indices);
     return result;
 }
@@ -237,17 +237,34 @@ fn kernelInto(self: *Compute, request: boundary.Kernel, output: CT) !void {
     const layout = try request.layout();
     const out = try check(self, output, .f32, .{});
     if (out.elem_count != layout.output_elements) return error.InvalidBoundaryDeviceShape;
+    self.gliner_relative_cache.invalidateNormForWrite(out.buffer.ptr, out.elem_count * 4);
+    out.gliner_norm_generation = null;
     var inputs: [10]buffer.DeviceBuffer = @splat(.{});
+    var bf16_inputs: u32 = 0;
     for (request.inputs, 0..) |input, i| {
         if (layout.input_elements[i] == 0) {
             if (input != null) return error.InvalidBoundaryDeviceShape;
             continue;
         }
-        const t = try check(self, input orelse return error.InvalidBoundaryDeviceShape, if (request.kind == .cast_half and i == 0) .f16 else if (layout.integer_inputs & (@as(u16, 1) << @intCast(i)) != 0) .i32 else .f32, .{});
+        const native_bf16 = request.kind == .deberta_attention and i < 5 and self.gliner_deberta_bf16 and tensor(input orelse return error.InvalidBoundaryDeviceShape).dtype == .bf16;
+        if (native_bf16) bf16_inputs |= @as(u32, 1) << @intCast(i);
+        const t = try check(self, input orelse return error.InvalidBoundaryDeviceShape, if (native_bf16) .bf16 else if (request.kind == .cast_half and i == 0) .f16 else if (layout.integer_inputs & (@as(u16, 1) << @intCast(i)) != 0) .i32 else .f32, .{});
         if (t.elem_count != layout.input_elements[i]) return error.InvalidBoundaryDeviceShape;
         inputs[i] = t.buffer;
     }
-    try self.launchGlinerBoundaryKernel(inputs, out.buffer, request.params(), layout.work_items);
+    if (bf16_inputs != 0 and bf16_inputs != 31) return error.UnsupportedResidentTrainingDType;
+    var params = request.params();
+    if (request.kind == .deberta_attention) params.dims[5] = bf16_inputs;
+    if (self.gliner_deberta_bf16 and (request.kind == .norm or (request.kind == .add_norm_centered and request.dims[2] == 0))) {
+        const norm_inputs = if (request.kind == .norm) [4]buffer.DeviceBuffer{ inputs[0], .{}, inputs[1], inputs[2] } else inputs[0..4].*;
+        if (try cuda.gliner25NormMirror(self, out.buffer, norm_inputs, request.dims[0], request.dims[1], request.scalars[0], if (request.kind == .norm) 0 else 1)) |generation| {
+            out.gliner_norm_generation = generation.generation;
+            self.stats.launch_other += 1;
+            self.boundary_scope.stats.dispatches +|= 1;
+            return;
+        }
+    }
+    try self.launchGlinerBoundaryKernel(inputs, out.buffer, params, layout.work_items);
     self.stats.launch_other += 1;
     self.boundary_scope.stats.dispatches +|= 1;
 }
@@ -537,6 +554,7 @@ fn validateMatrix(self: *Compute, ct: CT, rows: usize, columns: usize, precision
     const valid = switch (precision) {
         .f32 => t.dtype == .f32 and t.quant_type == null,
         .f16 => t.dtype == .f16 and t.quant_type == null,
+        .bf16 => t.dtype == .bf16 and t.quant_type == null,
         .q8_0, .q4_0, .q4_k => if (t.quant_type) |q| switch (q) {
             .known => |k| k == @as(@TypeOf(k), switch (precision) {
                 .q8_0 => .Q8_0,

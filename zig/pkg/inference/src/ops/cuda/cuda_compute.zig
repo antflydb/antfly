@@ -70,6 +70,7 @@ const gliner25 = @import("gliner25.zig");
 pub const CudaTensor = struct {
     resident_owner: ?*CudaCompute = null,
     strict_resident_training: bool = false,
+    gliner25_encoder_projection: bool = false,
     resident_indices: ?[]i32 = null,
     owns_resident_indices: bool = true,
     resident_parent: ?*CudaTensor = null,
@@ -82,6 +83,7 @@ pub const CudaTensor = struct {
 
     buffer: buffer_mod.DeviceBuffer,
     bf16_mirror: buffer_mod.DeviceBuffer = .{},
+    gliner_norm_generation: ?u64 = null,
     /// Exact Q8_1 representation of an immutable RMS output. Views resolve
     /// through resident_parent instead of copying this validity bit.
     q8_1_mirror: buffer_mod.DeviceBuffer = .{},
@@ -1338,6 +1340,25 @@ pub const RuntimeStats = struct {
     deberta_fused_attention_calls: usize = 0,
     deberta_fused_attention_fallbacks: usize = 0,
     deberta_stream_f32_attention_calls: usize = 0,
+    gliner25_gemm_fp32_attention_calls: usize = 0,
+    gliner25_compact_fp32_attention_calls: usize = 0,
+    gliner25_pointer_fp32_attention_calls: usize = 0,
+    gliner25_fused_fp32_bias_calls: usize = 0,
+    gliner25_compact_boundary_attention_calls: usize = 0,
+    gliner25_bf16_attention_calls: usize = 0,
+    gliner25_bf16_projection_calls: usize = 0,
+    gliner25_bf16_relative_cache_hits: usize = 0,
+    gliner25_bf16_relative_cache_misses: usize = 0,
+    gliner25_bf16_relative_cache_bytes: usize = 0,
+    gliner25_bf16_banded_attention_calls: usize = 0,
+    gliner25_bf16_parallel_head_calls: usize = 0,
+    gliner25_bf16_bias_cache_hits: usize = 0,
+    gliner25_bf16_norm_mirror_calls: usize = 0,
+    gliner25_bf16_norm_mirror_hits: usize = 0,
+    gliner25_bf16_bias_calls: usize = 0,
+    gliner25_bf16_ffn_calls: usize = 0,
+    gliner25_bf16_classic_linear_calls: usize = 0,
+    gliner25_fast_f32_calls: usize = 0,
     deberta_stream_f16_attention_calls: usize = 0,
     deberta_stream_f16_attention_fallbacks: usize = 0,
     deberta_stream_f16_staging_calls: usize = 0,
@@ -4136,13 +4157,39 @@ pub const CudaCompute = struct {
         return output;
     }
 
+    /// Prepare only the runtime used by the qualified serving profile. Failure
+    /// leaves the FP32 policy in place before any model weights are uploaded.
+    pub fn prepareQualifiedGlinerBf16(self: *CudaCompute) bool {
+        const policy = @import("../../models/gliner25_bf16_policy.zig");
+        if (self.cublaslt == null or self.kernels.gliner25_norm_bf16_mirror == null or
+            self.kernels.gliner25_ffn_bias_gelu_bf16 == null or
+            self.kernels.gliner25_attention_softmax_bf16 == null or
+            self.kernels.gliner25_attention_pointer_views_bf16 == null) return false;
+        const blas = trainingBlas(self) catch return false;
+        if (!policy.runtimeEligible(self.ctx.info.nameSlice(), self.ctx.info.compute_major, self.ctx.info.compute_minor, self.ctx.info.driver_version, blas.version) or
+            !blas.supportsWorkspace() or !blas.supportsBf16PointerBatches() or !blas.supportsBf16Linears()) return false;
+        self.gliner_bf16_full.flags = policy.qualified_flags;
+        self.gliner_bf16_full.init(&self.ctx) catch return false;
+        return true;
+    }
+
     pub fn launchGlinerBoundaryKernel(self: *CudaCompute, inputs: [10]buffer_mod.DeviceBuffer, output: buffer_mod.DeviceBuffer, descriptor: ops.gliner_boundary_device.Params, work: usize) !void {
         var profile = if (descriptor.kind == 30)
             beginPrefillProfile(self, .attention, @as(usize, descriptor.dims[0]) * descriptor.dims[1])
         else
             null;
         defer if (profile) |*scope| scope.end();
-        try self.kernels.launchGliner25Boundary(&self.ctx, inputs, output, descriptor, work, self.gliner_boundary_inference, self.gliner_mixed_attention);
+        if (self.gliner_boundary_inference and !self.gliner_mixed_attention and descriptor.kind == 30 and descriptor.dims[3] == 64) {
+            if (descriptor.dims[5] == 31) {
+                if (!self.gliner_deberta_bf16) return error.UnsupportedTensorType;
+                if (try tryGliner25Bf16Attention(self, output, inputs[0..7].*, descriptor.dims[0], descriptor.dims[1], descriptor.dims[2], descriptor.dims[4], true, true)) return;
+                return error.CudaKernelUnavailable;
+            }
+            if (try tryGliner25GemmAttention(self, output, inputs[0..7].*, descriptor.dims[0], descriptor.dims[1], descriptor.dims[2], descriptor.dims[4], true)) return;
+        }
+        if (try self.kernels.launchGliner25Boundary(&self.ctx, inputs, output, descriptor, work, self.gliner_boundary_inference, self.gliner_mixed_attention, self.gliner_deberta_bf16)) {
+            if (descriptor.kind == 6) self.stats.gliner25_bf16_banded_attention_calls += 1 else self.stats.gliner25_bf16_parallel_head_calls += 1;
+        }
         if (self.gliner_boundary_inference and self.gliner_mixed_attention and descriptor.kind == 30 and
             descriptor.dims[3] == 64 and descriptor.dims[1] >= 512 and
             self.kernels.gliner_boundary_attention_f32 != null and
@@ -4157,12 +4204,21 @@ pub const CudaCompute = struct {
 
     /// Laya parity requires FP32 execution even for reduced-storage source tensors.
     strict_f32_weights: bool = false,
+    // Explicit offline candidate; managed precision policy still rejects BF16.
+    gliner_deberta_bf16: bool = false,
+    gliner_bf16_reference: bool = false,
+    gliner_bf16_full: @import("gliner25_bf16_full.zig").Module = .{},
+    gliner_relative_generation: u64 = 0,
+    gliner_relative_cache: @import("gliner25_relative_cache.zig").Cache = .{},
     glide_cuda: bool = false,
     /// Artifact-qualified specialty span models retain FP32 attention even
     /// when global diagnostic environment switches request reduced precision.
     qualified_span_fp32: bool = false,
     /// Exact original Decide identity; independent of other GLiNER profiles.
     qualified_decide_fp32: bool = false,
+    gliner25_fast_f32_enabled: bool = false,
+    gliner25_fast_f32_unavailable: bool = false,
+    gliner25_fast_f32: @import("gliner25_fast_f32.zig").Module = .{},
     qualified_decide_q8: bool = false,
     laya_optimizations: bool = false,
     gliner_encoder_attention: bool = false,
@@ -5512,6 +5568,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn deinit(self: *CudaCompute) void {
+        self.gliner_relative_cache.deinit(self.allocator, &self.ctx);
         // The context owns final driver disposal, including transfer to failed-
         // allocation quarantine. Keep its entry points alive through the host
         // cleanup below, even after releaseResources retires the GPU wrapper.
@@ -5771,9 +5828,9 @@ pub const CudaCompute = struct {
         self.deberta_materialized_scratch.deinit(&self.ctx);
         self.embedding_gemma2_vision_attention_scratch.deinit(&self.ctx);
         self.embedding_gemma2_cudnn_attention_scratch.deinit(&self.ctx);
-        self.cublaslt_workspace_scratch.deinit(&self.ctx);
         if (self.training_blas) |*blas| blas.deinit();
         self.training_blas = null;
+        self.cublaslt_workspace_scratch.deinit(&self.ctx);
         if (self.embedding_gemma2) |*module| module.deinit(&self.ctx);
         self.embedding_gemma2 = null;
         if (self.embedding_gemma2_cudnn) |*module| {
@@ -5804,6 +5861,8 @@ pub const CudaCompute = struct {
             blas.deinit();
             self.cublaslt = null;
         }
+        self.gliner_bf16_full.deinit(&self.ctx);
+        self.gliner25_fast_f32.deinit(&self.ctx);
         self.kernels.unload(&self.ctx);
         // Resident views and graph executables are gone. Keep host ownership
         // through that boundary, then transfer any uncertain drain/free.
@@ -6835,6 +6894,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn insertWeightFromLoaded(self: *CudaCompute, owned_key: []const u8, loaded: *const weight_source_mod.LoadedWeight) !void {
+        self.gliner_relative_generation +%= 1;
         if (self.strict_f32_weights and !glinerQ8EncoderWeight(self.gliner_encoder_attention, owned_key, loaded)) {
             if (loaded.quantized or loaded.quantized_storage != null) return error.UnsupportedTensorType;
             if (loaded.tensor.dtype == .f32) return self.insertWeightFromTensor(owned_key, &loaded.tensor);
@@ -7154,6 +7214,7 @@ pub const CudaCompute = struct {
     /// GLiDE owns one dense device copy and no training/decode mirrors. Consume
     /// the key on every path, including allocation failures before upload.
     pub fn insertGlideWeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        self.gliner_relative_generation +%= 1;
         errdefer self.allocator.free(owned_key);
         if (!self.glide_cuda or (tensor.dtype != .f32 and tensor.dtype != .f16 and tensor.dtype != .bf16)) return error.UnsupportedTensorType;
         const count = try elementCountFromShape(tensor.shape);
@@ -7178,6 +7239,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn insertBf16WeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        self.gliner_relative_generation +%= 1;
         // This API consumes the key on every path. Keeping ownership here
         // makes loader error handling unambiguous and avoids both early-path
         // leaks and caller-side double frees after a map insertion failure.
@@ -7205,6 +7267,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn insertF16WeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        self.gliner_relative_generation +%= 1;
         errdefer self.allocator.free(owned_key);
         if (tensor.dtype != .f16) return error.UnsupportedTensorType;
         const elem_count = tensor.elementCount();
@@ -7301,6 +7364,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn insertBf16WeightFromF32Tensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        self.gliner_relative_generation +%= 1;
         if (tensor.dtype != .f32) return error.UnsupportedTensorType;
         const data = tensor.asFloat32();
         const bf16_data = try self.allocator.alloc(u16, data.len);
@@ -7316,6 +7380,7 @@ pub const CudaCompute = struct {
         self.stats.resident_weight_bytes += bf16_data.len * @sizeOf(u16);
         errdefer self.allocator.free(owned_key);
         try self.resident_weights.put(self.allocator, owned_key, .{
+            .gliner25_encoder_projection = tensor.shape.len == 2 and std.mem.startsWith(u8, owned_key, "encoder.layer.") and std.mem.endsWith(u8, owned_key, ".weight"),
             .buffer = device,
             .dtype = .bf16,
             .shape = shape,
@@ -7327,7 +7392,14 @@ pub const CudaCompute = struct {
         });
     }
 
+    pub fn roundGlinerBf16Weight(self: *CudaCompute, name: []const u8) !void {
+        const weight = self.resident_weights.getPtr(name) orelse return error.MissingWeight;
+        if (weight.dtype != .f32) return error.UnsupportedTensorType;
+        try self.gliner_bf16_full.round(&self.ctx, weight.buffer, weight.elem_count);
+    }
+
     pub fn insertWeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        self.gliner_relative_generation +%= 1;
         if (tensor.dtype != .f32) return error.UnsupportedTensorType;
         const data = tensor.asFloat32();
         const shape = try self.allocator.dupe(i64, tensor.shape);
@@ -7361,6 +7433,7 @@ pub const CudaCompute = struct {
         self.stats.resident_weight_bytes += data.len * @sizeOf(f32);
         errdefer self.allocator.free(owned_key);
         try self.resident_weights.put(self.allocator, owned_key, .{
+            .gliner25_encoder_projection = tensor.shape.len == 2 and std.mem.startsWith(u8, owned_key, "encoder.layer.") and std.mem.endsWith(u8, owned_key, ".weight"),
             .buffer = device,
             .dtype = .f32,
             .shape = shape,
@@ -11367,6 +11440,7 @@ fn stageBf16ActivationForCublasLt(
     if (self.cublaslt == null) return null;
     const count = try checkedMul(rows, in_dim);
     const bytes = try checkedMul(count, @sizeOf(u16));
+    if (input.elem_count == count) if (gliner25NormInput(self, input)) |value| return value;
     if (input.dtype == .f32 and input.elem_count == count and input.bf16_mirror.ptr != 0 and input.bf16_mirror.len >= bytes) {
         self.stats.bf16_cublaslt_activation_mirror_hits += 1;
         return .{ .ptr = input.bf16_mirror.ptr, .len = bytes };
@@ -12559,6 +12633,20 @@ fn tryCublasLtF16LinearPair(
     return true;
 }
 
+fn tryGliner25F32BiasLinear(self: *CudaCompute, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, bias: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) !bool {
+    if ((!self.qualified_decide_fp32 and !self.gliner_boundary_inference) or !cudaCublasLtEnabled() or
+        self.ctx.info.compute_major != 8 or self.ctx.info.compute_minor != 9 or
+        self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+        platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_GLINER_FP32_BIAS") or
+        rows < 128 or rows > 4096 or (in_dim != 768 and in_dim != 1024) or
+        (out_dim != in_dim and out_dim != 4 * in_dim)) return false;
+    const blas = &(self.cublaslt orelse return false);
+    const workspace = self.cublaslt_workspace_scratch.acquire(&self.ctx, @import("gliner25_fp32_attention.zig").workspace_limit) catch return false;
+    blas.matmulF32BiasF32Out(&self.ctx, dst, input, weight, bias, workspace, rows, in_dim, out_dim) catch return false;
+    self.stats.gliner25_fused_fp32_bias_calls += 1;
+    return true;
+}
+
 fn tryCublasLtF32Linear(
     self: *CudaCompute,
     dst: buffer_mod.DeviceBuffer,
@@ -12580,7 +12668,7 @@ fn tryCublasLtF32Linear(
     // Zero-workspace plans exclude the faster strict FP32 SGEMM schedules on
     // GB10. Reuse one bounded buffer, included in specialty request admission.
     // Allocation failure keeps the existing zero-workspace correctness path.
-    const workspace = if (self.qualified_span_fp32 or self.qualified_decide_fp32)
+    const workspace = if (self.qualified_span_fp32 or self.qualified_decide_fp32 or self.gliner_boundary_inference)
         self.cublaslt_workspace_scratch.acquire(&self.ctx, @import("../../models/gliner_specialty_qualification.zig").cuda_matmul_workspace_bytes) catch buffer_mod.DeviceBuffer{}
     else
         buffer_mod.DeviceBuffer{};
@@ -16957,6 +17045,7 @@ fn borrowRmsQ8Mirror(tensor: *const CudaTensor, rows: usize, in_dim: usize) ?buf
 
 fn invalidateRmsQ8Mirror(tensor: *CudaTensor) void {
     tensor.q8_1_mirror_valid = false;
+    tensor.gliner_norm_generation = null;
     // Keep the owned allocation until normal tensor teardown. Its stream-
     // ordered consumers may still be in flight when a later write is queued.
     if (tensor.resident_parent) |parent| invalidateRmsQ8Mirror(parent);
@@ -18722,6 +18811,20 @@ fn ensureF32F16Bf16OrQuantized(tensor: *const CudaTensor) !void {
     if (tensor.dtype != .f32 and tensor.dtype != .f16 and tensor.dtype != .bf16) return error.UnsupportedTensorType;
 }
 
+test "GLiNER BF16 optional fused kernels decline unsupported precision" {
+    // An unsupported optional dtype must decline before reading backend state
+    // or touching GPU allocations. No driver is needed for this contract.
+    var compute: CudaCompute = undefined;
+    var shape = [_]i64{ 64, 64 };
+    var weight = CudaTensor{ .buffer = .{}, .dtype = .bf16, .shape = &shape, .elem_count = 4096 };
+    const ct: CT = @ptrCast(&weight);
+    // Decline before any input allocation or kernel dispatch. The generic
+    // encoder composes BF16 linear with F32 GELU/residual/ReLU instead.
+    try std.testing.expect((try linearGelu(&compute, ct, ct, ct, 128, 64, 64)) == null);
+    try std.testing.expect((try linearAdd(&compute, ct, ct, ct, ct, 128, 64, 64)) == null);
+    try std.testing.expect((try linearRelu(&compute, ct, ct, ct, 128, 64, 64)) == null);
+}
+
 test "CUDA biased dense linear dtype gate accepts resident BF16 weights" {
     var shape = [_]i64{ 3072, 1024 };
     const weight = CudaTensor{
@@ -19862,6 +19965,30 @@ test "GLiNER Decide CUDA Q8 execution mirror is a borrowed dense view" {
     try std.testing.expect(boundaryMixedWeight(&compute, &weight) == null);
 }
 
+fn tryGliner25FastF32Linear(self: *CudaCompute, input: *const CudaTensor, weight: *const CudaTensor, bias: ?*const CudaTensor, rows: usize, in_dim: usize, out_dim: usize) !?CT {
+    // Check the immutable encoder tag first: unrelated callers may use a
+    // partial compute fixture and must not touch this optional state.
+    if (!weight.gliner25_encoder_projection or weight.dtype != .f32 or weight.quant_type != null or
+        input.buffer.ptr % 16 != 0 or weight.buffer.ptr % 16 != 0 or (if (bias) |b| b.buffer.ptr % 16 != 0 else false)) return null;
+    const fast = @import("gliner25_fast_f32.zig");
+    if (!self.gliner25_fast_f32_enabled or self.gliner25_fast_f32_unavailable or self.resident_training_cache or
+        self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+        !fast.deviceSupported(self.ctx.info.compute_major, self.ctx.info.compute_minor) or fast.plan(rows, in_dim, out_dim) == null) return null;
+    self.gliner25_fast_f32.init(&self.ctx) catch {
+        self.gliner25_fast_f32_unavailable = true;
+        return null;
+    };
+    const shape = try allocShape2(self.allocator, rows, out_dim);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, rows * out_dim * @sizeOf(f32));
+    errdefer releaseDeviceBuffer(self, &device);
+    try self.gliner25_fast_f32.run(&self.ctx, device, input.buffer, weight.buffer, if (bias) |b| b.buffer else null, rows, in_dim, out_dim);
+    self.stats.gliner25_fast_f32_calls += 1;
+    self.stats.launch_linear += 1;
+    self.dispatch_stats.note(self.allocator, if (bias != null) .linear else .linear_no_bias, .f32, .dense_cuda, if (bias != null) .bias else .none, .none, rows, in_dim, out_dim, 0);
+    return try createTensor(self, device, shape, rows * out_dim);
+}
+
 fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
@@ -19888,6 +20015,8 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
         if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=linear bias_elems={d} out_dim={d}", .{ bias_tensor.elem_count, out_dim });
         return error.InvalidShape;
     }
+
+    if (try tryGliner25FastF32Linear(self, input_tensor, weight_tensor, bias_tensor, rows, in_dim, out_dim)) |result| return result;
 
     // Encoder GGUFs commonly use Q4_0 weights together with learned biases.
     // Reuse the proven generated/no-bias Q4_0 dispatch and apply the bias in
@@ -19945,6 +20074,66 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
         return result;
     }
     if (isBf16Weight(weight_tensor)) {
+        if (self.gliner_bf16_reference and self.gliner_bf16_full.flags & 4 == 0) {
+            const staged = (try stageBf16ActivationForCublasLt(self, input_tensor, rows, in_dim)) orelse return error.UnsupportedGlinerCudaPrecision;
+            const shape = try allocShape2(self.allocator, rows, out_dim);
+            errdefer self.allocator.free(shape);
+            var device = try allocDeviceBuffer(self, rows * out_dim * 4);
+            errdefer releaseDeviceBuffer(self, &device);
+            const workspace = try self.cublaslt_workspace_scratch.acquire(&self.ctx, @import("gliner25_bf16_attention.zig").workspace_limit);
+            var contracted = false;
+            for ([_]bool{ true, false }) |tune| {
+                if (self.cublaslt.?.matmulBf16WeightBiasF32OutWithTuning(&self.ctx, device, staged, weight_tensor.buffer, bias_tensor.buffer, workspace, rows, in_dim, out_dim, .{ .enabled = tune, .candidate_count = 16, .warmups = 2, .iterations = 5 })) |_| {
+                    contracted = true;
+                    break;
+                } else |err| switch (err) {
+                    error.CublasLtUnsupported, error.CublasLtTuningInsufficientCandidates => {},
+                    else => return err,
+                }
+            }
+            if (!contracted) {
+                // Small entity-scoring matrices can have unaligned K.
+                // Keep BF16 input values when falling back to the SIMT
+                // contraction; its activation operand has F32 storage.
+                const input_bytes = try checkedMul(try checkedMul(rows, in_dim), 4);
+                var rounded = try allocDeviceBuffer(self, input_bytes);
+                defer releaseDeviceBuffer(self, &rounded);
+                try rounded.copyFromDevice(&self.ctx, input_tensor.buffer, input_bytes);
+                try self.gliner_bf16_full.round(&self.ctx, rounded, rows * in_dim);
+                try self.kernels.launchLinearBf16WeightF32Tiled(&self.ctx, device, rounded, weight_tensor.buffer, rows, in_dim, out_dim);
+                try self.kernels.launchAddBiasRowsF32(&self.ctx, device, bias_tensor.buffer, rows, out_dim);
+                self.stats.bf16_cublaslt_fallbacks += 1;
+                self.stats.bf16_scalar_linear_calls += 1;
+            }
+            try self.gliner_bf16_full.round(&self.ctx, device, rows * out_dim);
+            self.stats.launch_linear += 1;
+            return try createTensor(self, device, shape, rows * out_dim);
+        }
+        if (self.gliner_bf16_reference) {
+            const result = try linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
+            errdefer freeTensor(ctx, result);
+            const tensor = tensorFromCt(result);
+            try self.kernels.launchAddBiasRowsF32(&self.ctx, tensor.buffer, bias_tensor.buffer, rows, out_dim);
+            try self.gliner_bf16_full.round(&self.ctx, tensor.buffer, tensor.elem_count);
+            return result;
+        }
+        if (self.gliner_deberta_bf16 and rows > 0 and rows <= 4096 and in_dim >= 64 and out_dim >= 64 and
+            !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active)
+        {
+            if (try stageBf16ActivationForCublasLt(self, input_tensor, rows, in_dim)) |staged| {
+                const blas = &(self.cublaslt orelse return error.InvalidCudaState);
+                const workspace = try self.cublaslt_workspace_scratch.acquire(&self.ctx, @import("gliner25_bf16_attention.zig").workspace_limit);
+                var device = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, out_dim), 4));
+                errdefer releaseDeviceBuffer(self, &device);
+                const shape = try allocShape2(self.allocator, rows, out_dim);
+                errdefer self.allocator.free(shape);
+                _ = try blas.matmulBf16WeightBiasF32OutWithTuning(&self.ctx, device, staged, weight_tensor.buffer, bias_tensor.buffer, workspace, rows, in_dim, out_dim, .{ .enabled = true, .candidate_count = 16, .warmups = 2, .iterations = 5 });
+                self.stats.gliner25_bf16_bias_calls += 1;
+                self.stats.bf16_cublaslt_linear_calls += 1;
+                self.dispatch_stats.note(self.allocator, .linear, .bf16, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
+                return try createTensor(self, device, shape, rows * out_dim);
+            }
+        }
         // Vision QKV and output projections already round their inputs to
         // BF16 and accumulate into F32. Keep those boundaries while applying
         // their F32 bias in the GEMM epilogue instead of a second matrix pass.
@@ -20025,7 +20214,9 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
             else => return error.UnsupportedTensorType,
         }
     } else {
-        if (try tryCublasLtF32Linear(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
+        if (try tryGliner25F32BiasLinear(self, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim)) {
+            self.dispatch_stats.note(self.allocator, .linear, .f32, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
+        } else if (try tryCublasLtF32Linear(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
             try self.kernels.launchAddBiasRowsF32(&self.ctx, device, bias_tensor.buffer, rows, out_dim);
             self.dispatch_stats.note(self.allocator, .linear, .f32, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
         } else if (rows >= 2 and in_dim >= 256 and out_dim >= 4) {
@@ -20083,6 +20274,9 @@ fn linearRelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
+    // This optional fused operator has F32/F16/quantized implementations.
+    // Native BF16 weights use the ordinary BF16 linear plus F32 epilogue.
+    if (isBf16Weight(weight_tensor)) return null;
     if (boundaryMixedWeight(self, weight_tensor)) |reduced| {
         var view = reduced;
         return linearRelu(ctx, input, @ptrCast(&view), bias, rows, in_dim, out_dim);
@@ -20156,6 +20350,9 @@ fn linearGelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
+    // This optional fused operator has F32/F16/quantized implementations.
+    // Native BF16 weights use the ordinary BF16 linear plus F32 epilogue.
+    if (isBf16Weight(weight_tensor)) return null;
     if (self.capability_profile == .whisper and rows == 1 and isF16Weight(weight_tensor)) {
         const bias_tensor = tensorFromCt(bias);
         try ensureF32(input_tensor);
@@ -20216,6 +20413,9 @@ fn linearAdd(ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, row
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
+    // This optional fused operator has F32/F16/quantized implementations.
+    // Native BF16 weights use the ordinary BF16 linear plus F32 epilogue.
+    if (isBf16Weight(weight_tensor)) return null;
     if (boundaryMixedWeight(self, weight_tensor) != null) return null;
     // The encoder composes plain linear + residual layer norm when declined.
     // Its strict FP32 cuBLASLt projection is much faster than the small fused
@@ -20550,6 +20750,10 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
         return error.InvalidShape;
     }
 
+    if (!primitive_training) {
+        if (try tryGliner25FastF32Linear(self, input_tensor, weight_tensor, null, rows, in_dim, out_dim)) |result| return result;
+    }
+
     const out_count = try checkedMul(rows, out_dim);
     const shape = try allocShape2(self.allocator, rows, out_dim);
     errdefer self.allocator.free(shape);
@@ -20858,6 +21062,7 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .f32_cuda, .none, .none, rows, in_dim, out_dim, 0);
         }
     }
+    if (self.gliner_bf16_reference and !primitive_training) try self.gliner_bf16_full.round(&self.ctx, device, out_count);
     self.stats.launch_linear += 1;
     return createTensor(self, device, shape, out_count);
 }
@@ -23474,10 +23679,13 @@ fn layerNorm(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    try self.kernels.launchLayerNormF32(&self.ctx, device, input_tensor.buffer, gamma_tensor.buffer, beta_tensor.buffer, input_tensor.elem_count / dim, dim, eps);
+    const generation = try gliner25NormMirror(self, device, .{ input_tensor.buffer, .{}, gamma_tensor.buffer, beta_tensor.buffer }, input_tensor.elem_count / dim, dim, eps, 3);
+    if (generation == null) try self.kernels.launchLayerNormF32(&self.ctx, device, input_tensor.buffer, gamma_tensor.buffer, beta_tensor.buffer, input_tensor.elem_count / dim, dim, eps);
     self.stats.launch_norm += 1;
     self.stats.launch_norm_layer += 1;
-    return createTensor(self, device, shape, input_tensor.elem_count);
+    const result = try createTensor(self, device, shape, input_tensor.elem_count);
+    tensorFromCt(result).gliner_norm_generation = if (generation) |norm| norm.generation else null;
+    return result;
 }
 
 fn whisperAllocLikeF32(self: *CudaCompute, input: *const CudaTensor) !CT {
@@ -23532,10 +23740,13 @@ fn addLayerNorm(ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, 
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, a_tensor.elem_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    try self.kernels.launchAddLayerNormF32(&self.ctx, device, a_tensor.buffer, b_tensor.buffer, gamma_tensor.buffer, beta_tensor.buffer, a_tensor.elem_count / dim, dim, eps);
+    const generation = try gliner25NormMirror(self, device, .{ a_tensor.buffer, b_tensor.buffer, gamma_tensor.buffer, beta_tensor.buffer }, a_tensor.elem_count / dim, dim, eps, 2);
+    if (generation == null) try self.kernels.launchAddLayerNormF32(&self.ctx, device, a_tensor.buffer, b_tensor.buffer, gamma_tensor.buffer, beta_tensor.buffer, a_tensor.elem_count / dim, dim, eps);
     self.stats.launch_norm += 1;
     self.stats.launch_norm_add_layer += 1;
-    return try createTensor(self, device, shape, a_tensor.elem_count);
+    const result = try createTensor(self, device, shape, a_tensor.elem_count);
+    tensorFromCt(result).gliner_norm_generation = if (generation) |norm| norm.generation else null;
+    return result;
 }
 
 fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT {
@@ -23878,6 +24089,7 @@ fn unaryHost(ctx: *anyopaque, input: CT, op: UnaryOp) anyerror!CT {
         .tanh => .tanh,
     };
     try self.kernels.launchElementwiseF32(&self.ctx, device, input_tensor.buffer, .{}, input_tensor.elem_count, kernel_op);
+    if (self.gliner_bf16_reference and op != .relu) try self.gliner_bf16_full.round(&self.ctx, device, input_tensor.elem_count);
     self.stats.launch_elementwise += 1;
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
@@ -27465,6 +27677,407 @@ fn crossAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: []con
 fn relativePositionBias(_: *anyopaque, _: CT, _: usize, _: usize, _: usize, _: usize, _: usize, _: bool) anyerror!CT {
     return unsupportedCt();
 }
+fn gliner25Bf16FfnAvailable(ctx: *anyopaque) bool {
+    const self: *const CudaCompute = @ptrCast(@alignCast(ctx));
+    return self.gliner_deberta_bf16 and self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9 and self.cublaslt != null and
+        self.kernels.gliner25_ffn_bias_gelu_bf16 != null and !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active;
+}
+
+test "GLiNER BF16 projections narrow scoring fallback rounds activations" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = CudaCompute.init(a) catch |err| {
+        if (platform.env.getenvBool("TERMITE_REQUIRE_CUDA_TESTS")) return err;
+        return error.SkipZigTest;
+    };
+    defer compute.deinit();
+    if (compute.ctx.info.compute_major != 8 or compute.ctx.info.compute_minor != 9) return error.SkipZigTest;
+    compute.gliner_bf16_reference = true;
+    try compute.gliner_bf16_full.init(&compute.ctx);
+    var cb = compute.computeBackend();
+    const weights = [_]f32{ 0.5, -0.25, 0.125 };
+    var weight = try tensor_mod.Tensor.initFloat32(a, "tiny.weight", &.{ 1, 3 }, &weights);
+    defer weight.deinit();
+    try compute.insertBf16WeightFromF32Tensor(try a.dupe(u8, "tiny.weight"), &weight);
+    const w = try cb.getWeight("tiny.weight");
+    defer cb.free(w);
+    try std.testing.expect(!tensorFromCt(w).gliner25_encoder_projection);
+    const projection_name = "encoder.layer.0.attention.output.dense.weight";
+    try compute.insertBf16WeightFromF32Tensor(try a.dupe(u8, projection_name), &weight);
+    const projection = try cb.acquireWeight(projection_name);
+    defer cb.free(projection);
+    try std.testing.expect(tensorFromCt(projection).gliner25_encoder_projection);
+    const values = [_]f32{ 0.1001, 0.2003, -0.3006, -0.1234, 0.4567, 0.8912 };
+    const input = try cb.fromFloat32Shape(&values, &.{ 2, 3 });
+    defer cb.free(input);
+    const bias = try cb.fromFloat32Shape(&.{0.0625}, &.{1});
+    defer cb.free(bias);
+    const result = try cb.linear(input, w, bias, 2, 3, 1);
+    defer cb.free(result);
+    const actual = try cb.toFloat32(result, a);
+    defer a.free(actual);
+    for (actual, 0..) |got, row| {
+        var expected: f32 = 0.0625;
+        for (weights, 0..) |v, col| {
+            const input_bits: u32 = @as(u32, f32ToBf16BitsRoundNearestEven(values[row * 3 + col])) << 16;
+            expected += @as(f32, @bitCast(input_bits)) * v;
+        }
+        const output_bits: u32 = @as(u32, f32ToBf16BitsRoundNearestEven(expected)) << 16;
+        try std.testing.expectEqual(output_bits, @as(u32, @bitCast(got)));
+    }
+}
+
+fn gliner25DenseFfnLayerNorm(ctx: *anyopaque, request: *const ops.DenseFfnLayerNormRequest) anyerror!?CT {
+    if (!gliner25Bf16FfnAvailable(ctx)) return null;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const ffn = @import("gliner25_bf16_ffn.zig");
+    _ = ffn.plan(request.rows, request.hidden_size, request.intermediate_size) orelse return null;
+    if (request.activation != .gelu and request.activation != .gelu_exact) return null;
+    const values = [_]*const CudaTensor{ tensorFromCt(request.input), tensorFromCt(request.residual), tensorFromCt(request.first_weight), tensorFromCt(request.first_bias), tensorFromCt(request.second_weight), tensorFromCt(request.second_bias), tensorFromCt(request.layer_norm_weight), tensorFromCt(request.layer_norm_bias) };
+    if (!isBf16Weight(values[2]) or !isBf16Weight(values[4])) return null;
+    for ([_]usize{ 0, 1, 3, 5, 6, 7 }) |i| try ensureF32(values[i]);
+    const expected = [_]usize{ request.rows * request.hidden_size, request.rows * request.hidden_size, request.hidden_size * request.intermediate_size, request.intermediate_size, request.hidden_size * request.intermediate_size, request.hidden_size, request.hidden_size, request.hidden_size };
+    for (values, expected) |value, n| try ensureCount(value, n);
+    // The fused bias epilogue rounds once at the PyTorch Linear boundary.
+    // If the immutable BF16 bias cache is denied, retain those semantics using
+    // the F32 dot temporary and the subsequent bias/cast/GELU kernel instead.
+    var reference = self.gliner_bf16_full;
+    var first_bias_bf16: buffer_mod.DeviceBuffer = .{};
+    if (self.gliner_bf16_reference and reference.flags & 2097152 != 0) {
+        first_bias_bf16 = try gliner25ProjectionBias(self, values[3], request.intermediate_size);
+        if (first_bias_bf16.ptr == 0) {
+            reference.flags = (reference.flags & ~@as(u32, 2097152)) | 131072;
+        }
+    }
+    const p = ffn.planWithFloatDot(request.rows, request.hidden_size, request.intermediate_size, self.gliner_bf16_reference and reference.flags & 131072 != 0 and reference.flags & 2097152 == 0) orelse return null;
+    const shape = try allocShape2(self.allocator, request.rows, request.hidden_size);
+    errdefer self.allocator.free(shape);
+    var temporary: [4]buffer_mod.DeviceBuffer = @splat(.{});
+    defer for (temporary[1..]) |value| {
+        var buffer = value;
+        releaseDeviceBuffer(self, &buffer);
+    };
+    const output_mirror = if (self.kernels.gliner25_norm_bf16_mirror != null) try self.gliner_relative_cache.reserveNorm(&self.ctx, request.rows * request.hidden_size) else null;
+    const input_mirror = gliner25NormInput(self, values[0]);
+    temporary[0] = input_mirror orelse try self.bf16_activation_scratch.acquire(&self.ctx, p.staged);
+    for (temporary[1..], [_]usize{ p.gemm_output_bytes, p.wide, p.narrow }, 1..) |_, n, i| temporary[i] = try allocDeviceBuffer(self, n);
+    var output = try allocDeviceBuffer(self, p.narrow);
+    errdefer releaseDeviceBuffer(self, &output);
+    const workspace = try self.cublaslt_workspace_scratch.acquire(&self.ctx, @import("gliner25_bf16_attention.zig").workspace_limit);
+    var inputs: [8]buffer_mod.DeviceBuffer = undefined;
+    for (&inputs, values) |*buffer, value| buffer.* = value.buffer;
+    if (output_mirror != null) self.gliner_relative_cache.invalidateNorm();
+    const classic_down = try ffn.runWithReference(&self.ctx, &self.cublaslt.?, &self.kernels, workspace, output, temporary, inputs, input_mirror != null, output_mirror orelse .{}, request.rows, request.hidden_size, request.intermediate_size, request.eps, request.activation == .gelu_exact, if (self.gliner_bf16_reference) &reference else null, first_bias_bf16, if (self.gliner_bf16_reference and reference.flags & @import("gliner25_bf16_full.zig").separate_output_bias_flag != 0) try trainingBlas(self) else null);
+    self.stats.gliner25_bf16_ffn_calls += 1;
+    self.stats.gliner25_bf16_classic_linear_calls += @intFromBool(classic_down);
+    self.stats.bf16_cublaslt_linear_calls += if (classic_down) @as(usize, 1) else 2;
+    if (input_mirror == null) self.stats.bf16_cublaslt_activation_staging_calls += 1;
+    self.stats.launch_linear += 2;
+    self.stats.launch_elementwise += 1;
+    self.stats.launch_norm += 1;
+    self.stats.launch_norm_add_layer += 1;
+    const result = try createTensor(self, output, shape, request.rows * request.hidden_size);
+    if (output_mirror != null) {
+        tensorFromCt(result).gliner_norm_generation = self.gliner_relative_cache.publishNorm(output.ptr, request.rows * request.hidden_size);
+        self.stats.gliner25_bf16_norm_mirror_calls += 1;
+        self.stats.gliner25_bf16_relative_cache_bytes = self.gliner_relative_cache.bytes;
+    }
+    return result;
+}
+
+fn gliner25NormInput(self: *CudaCompute, input: *const CudaTensor) ?buffer_mod.DeviceBuffer {
+    if (!self.gliner_deberta_bf16 or input.dtype != .f32) return null;
+    const generation = input.gliner_norm_generation orelse return null;
+    var ancestor = input.resident_parent;
+    while (ancestor) |parent| {
+        if (parent.gliner_norm_generation != generation) return null;
+        ancestor = parent.resident_parent;
+    }
+    const value = self.gliner_relative_cache.normInput(input.buffer.ptr, input.elem_count, input.gliner_norm_generation) orelse return null;
+    self.stats.gliner25_bf16_norm_mirror_hits += 1;
+    return value;
+}
+test "GLiNER BF16 norm alias mutation invalidates siblings and reused addresses" {
+    var shape = [_]i64{8};
+    var owner = CudaTensor{ .dtype = .f32, .shape = &shape, .elem_count = 8, .buffer = .{ .ptr = 100, .len = 32 }, .gliner_norm_generation = 7 };
+    var view = owner;
+    view.resident_parent = &owner;
+    var sibling = view;
+    var compute: CudaCompute = undefined;
+    compute.gliner_deberta_bf16 = true;
+    compute.stats = .{};
+    compute.gliner_relative_cache = .{ .norm = .{ .ptr = 200, .len = 16 }, .norm_generation = 7, .norm_source = 100, .norm_count = 8 };
+    try std.testing.expect(gliner25NormInput(&compute, &view) != null);
+    var slice = view;
+    slice.elem_count = 4;
+    try std.testing.expect(gliner25NormInput(&compute, &slice) == null);
+    invalidateRmsQ8Mirror(&sibling);
+    try std.testing.expect(owner.gliner_norm_generation == null);
+    try std.testing.expect(gliner25NormInput(&compute, &view) == null);
+    owner.gliner_norm_generation = compute.gliner_relative_cache.publishNorm(100, 8);
+    try std.testing.expect(gliner25NormInput(&compute, &view) == null);
+    try std.testing.expect(gliner25NormInput(&compute, &owner) != null);
+}
+
+pub const Gliner25NormResult = struct { generation: ?u64 };
+pub fn gliner25NormMirror(self: *CudaCompute, output: buffer_mod.DeviceBuffer, inputs: [4]buffer_mod.DeviceBuffer, rows: usize, width: usize, eps: f32, flavor: u32) !?Gliner25NormResult {
+    if (!self.gliner_deberta_bf16 or self.ctx.info.compute_major != 8 or self.ctx.info.compute_minor != 9 or self.kernels.gliner25_norm_bf16_mirror == null or
+        rows == 0 or rows > 4096 or width == 0 or width > 1024 or !std.math.isFinite(eps) or eps <= 0 or flavor > 3) return null;
+    const count = rows * width;
+    const mirror = (try self.gliner_relative_cache.reserveNorm(&self.ctx, count)) orelse {
+        if (!self.gliner_bf16_reference) return null;
+        // The mirror is optional; full-BF16 normalization is not. Returning
+        // null here would make the caller recompute a legacy F32 norm.
+        try self.gliner_bf16_full.norm(&self.ctx, output, .{}, .{ inputs[0], if (flavor == 1 or flavor == 2) inputs[1] else .{}, inputs[2], inputs[3] }, rows, width, eps);
+        return .{ .generation = null };
+    };
+    self.gliner_relative_cache.invalidateNorm();
+    if (self.gliner_bf16_reference) {
+        try self.gliner_bf16_full.norm(&self.ctx, output, mirror, .{ inputs[0], if (flavor == 1 or flavor == 2) inputs[1] else .{}, inputs[2], inputs[3] }, rows, width, eps);
+    } else try self.kernels.launchGliner25NormBf16Mirror(&self.ctx, output, mirror, inputs, rows, width, eps, flavor);
+    self.stats.gliner25_bf16_norm_mirror_calls += 1;
+    self.stats.gliner25_bf16_relative_cache_bytes = self.gliner_relative_cache.bytes;
+    return .{ .generation = self.gliner_relative_cache.publishNorm(output.ptr, count) };
+}
+
+fn gliner25RelativeKey(self: *CudaCompute, request: *const ops.DebertaBf16ProjectionsRequest) ?@import("gliner25_relative_cache.zig").Key {
+    const policy = request.relative_policy orelse return null;
+    if (request.count != 2 or self.resident_training_cache or self.lazy_host_store != null or !std.math.isFinite(policy.normalization_eps) or policy.normalization_eps <= 0) return null;
+    const table = self.resident_weights.get("encoder.rel_embeddings.weight") orelse return null;
+    const norm_weight = self.resident_weights.get("encoder.LayerNorm.weight") orelse return null;
+    const norm_bias = self.resident_weights.get("encoder.LayerNorm.bias") orelse return null;
+    if (table.dtype != .f32 or table.elem_count != @as(usize, policy.max_position) * request.hidden or norm_weight.dtype != .f32 or norm_weight.elem_count != request.hidden or norm_bias.dtype != .f32 or norm_bias.elem_count != request.hidden) return null;
+    var sources: [7]u64 = .{ table.buffer.ptr, norm_weight.buffer.ptr, norm_bias.buffer.ptr, 0, 0, 0, 0 };
+    const handles = [_]CT{ request.weights[0], request.biases[0], request.weights[1], request.biases[1] };
+    for (handles, 3..) |handle, i| sources[i] = tensorFromCt(handle).buffer.ptr;
+    const key: @import("gliner25_relative_cache.zig").Key = .{ .sources = sources, .generation = self.gliner_relative_generation, .sequence = request.sequence, .rows = request.rows, .hidden = request.hidden, .layout = @backingInt(policy.layout), .eps_bits = @bitCast(policy.normalization_eps), .buckets = policy.position_buckets, .positions = policy.max_position };
+    // A hit was already proved to reference resident immutable model weights
+    // at publication. Keep the O(weight-count) membership scan cold-only.
+    if (self.gliner_relative_cache.get(key) != null) return key;
+    for (handles) |handle| {
+        const source = tensorFromCt(handle);
+        var resident = self.resident_weights.valueIterator();
+        var found = false;
+        while (resident.next()) |value| if (value.buffer.ptr == source.buffer.ptr and value.dtype == source.dtype and value.elem_count == source.elem_count) {
+            found = true;
+            break;
+        };
+        if (!found) return null;
+    }
+    return key;
+}
+fn gliner25ProjectionBias(self: *CudaCompute, tensor: *const CudaTensor, hidden: usize) !buffer_mod.DeviceBuffer {
+    const cache = &self.gliner_relative_cache;
+    const key = @import("gliner25_relative_cache.zig").BiasKey{ .source = tensor.buffer.ptr, .generation = self.gliner_relative_generation, .count = hidden };
+    if (cache.getBias(key)) |value| {
+        self.stats.gliner25_bf16_bias_cache_hits += 1;
+        return value;
+    }
+    // Publication is restricted to immutable resident checkpoint sources.
+    var resident = self.resident_weights.valueIterator();
+    var found = false;
+    while (resident.next()) |value| if (value.buffer.ptr == tensor.buffer.ptr and value.dtype == .f32 and value.elem_count == hidden) {
+        found = true;
+        break;
+    };
+    if (!found) return .{};
+    const result = try cache.publishBias(self.allocator, &self.ctx, &self.kernels, key, tensor.buffer);
+    self.stats.gliner25_bf16_relative_cache_bytes = cache.bytes;
+    return result orelse .{};
+}
+
+fn gliner25BorrowRelative(self: *CudaCompute, buffers: [2]buffer_mod.DeviceBuffer, rows: usize, hidden: usize) !ops.DebertaBf16ProjectionsResult {
+    var result: ops.DebertaBf16ProjectionsResult = @splat(null);
+    errdefer for (result) |value| if (value) |tensor| freeTensor(self, tensor);
+    for (buffers, 0..) |buffer, i| {
+        const shape = try allocShape2(self.allocator, rows, hidden);
+        const tensor = createTensorWithDType(self, buffer, shape, rows * hidden, .bf16) catch |err| {
+            self.allocator.free(shape);
+            return err;
+        };
+        tensorFromCt(tensor).owns_buffer = false;
+        tensorFromCt(tensor).resident_owner = self;
+        tensorFromCt(tensor).strict_resident_training = true;
+        result[i] = tensor;
+    }
+    return result;
+}
+
+fn gliner25Bf16Projections(ctx: *anyopaque, request: *const ops.DebertaBf16ProjectionsRequest) anyerror!?ops.DebertaBf16ProjectionsResult {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const helper = @import("gliner25_bf16_projections.zig");
+    if (!self.gliner_deberta_bf16 or self.ctx.info.compute_major != 8 or self.ctx.info.compute_minor != 9 or
+        platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_GLINER_FP32_ATTENTION") or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or self.cublaslt == null or
+        self.kernels.gliner25_attention_softmax_bf16 == null or self.kernels.gliner25_attention_pointer_views_bf16 == null or
+        request.batch == 0 or request.batch > 8 or request.sequence == 0 or request.sequence > 512 or (!self.gliner_bf16_reference and request.sequence % 8 != 0) or
+        helper.plan(request.rows, request.hidden, request.count) == null) return null;
+    const blas = trainingBlas(self) catch return null;
+    if (!blas.supportsWorkspace() or !blas.supportsBf16PointerBatches()) return null;
+    const workspace = self.cublaslt_workspace_scratch.acquire(&self.ctx, @import("gliner25_bf16_attention.zig").workspace_limit) catch return null;
+    const input = tensorFromCt(request.input);
+    try ensureF32(input);
+    try ensureCount(input, request.rows * request.hidden);
+    var weights: [3]buffer_mod.DeviceBuffer = @splat(.{});
+    var biases: [3]buffer_mod.DeviceBuffer = @splat(.{});
+    for (0..request.count) |i| {
+        const weight = tensorFromCt(request.weights[i]);
+        const bias = tensorFromCt(request.biases[i]);
+        if (!isBf16Weight(weight)) return null;
+        try ensureCount(weight, request.hidden * request.hidden);
+        try ensureF32(bias);
+        try ensureCount(bias, request.hidden);
+        weights[i] = weight.buffer;
+        biases[i] = bias.buffer;
+    }
+    const cache_key = gliner25RelativeKey(self, request);
+    if (cache_key) |key| {
+        if (self.gliner_relative_cache.get(key)) |cached| {
+            self.stats.gliner25_bf16_relative_cache_hits += 1;
+            return try gliner25BorrowRelative(self, cached, request.rows, request.hidden);
+        }
+        self.stats.gliner25_bf16_relative_cache_misses += 1;
+    }
+    var outputs: [3]buffer_mod.DeviceBuffer = @splat(.{});
+    defer for (&outputs) |*value| if (value.ptr != 0) releaseDeviceBuffer(self, value);
+    const p = helper.plan(request.rows, request.hidden, request.count).?;
+    for (outputs[0..request.count]) |*value| value.* = try allocDeviceBuffer(self, p.output_bytes);
+    var cached_biases: [3]buffer_mod.DeviceBuffer = @splat(.{});
+    for (0..request.count) |i| cached_biases[i] = try gliner25ProjectionBias(self, tensorFromCt(request.biases[i]), request.hidden);
+    const native_input = gliner25NormInput(self, input) orelse buffer_mod.DeviceBuffer{};
+    // A warm norm mirror and immutable bias cache already own every operand.
+    // Avoid allocating an unused staging buffer on each encoder layer.
+    var temporary = if (helper.needsTemporary(native_input, cached_biases, request.count)) try allocDeviceBuffer(self, p.temporary_bytes) else buffer_mod.DeviceBuffer{};
+    defer releaseDeviceBuffer(self, &temporary);
+    try helper.run(&self.ctx, &self.cublaslt.?, &self.kernels, workspace, outputs, temporary, input.buffer, weights, biases, cached_biases, native_input, request.rows, request.hidden, request.count);
+    var result: ops.DebertaBf16ProjectionsResult = @splat(null);
+    errdefer for (result) |value| if (value) |tensor| freeTensor(ctx, tensor);
+    for (0..request.count) |i| {
+        const shape = try allocShape2(self.allocator, request.rows, request.hidden);
+        result[i] = createTensorWithDType(self, outputs[i], shape, request.rows * request.hidden, .bf16) catch |err| {
+            self.allocator.free(shape);
+            return err;
+        };
+        outputs[i] = .{};
+        tensorFromCt(result[i].?).resident_owner = self;
+        tensorFromCt(result[i].?).strict_resident_training = true;
+    }
+    if (cache_key) |key| {
+        _ = try self.gliner_relative_cache.publish(self.allocator, &self.ctx, key, .{ tensorFromCt(result[0].?).buffer, tensorFromCt(result[1].?).buffer });
+        self.stats.gliner25_bf16_relative_cache_bytes = self.gliner_relative_cache.bytes;
+    }
+    self.stats.gliner25_bf16_projection_calls += 1;
+    return result;
+}
+
+fn gliner25BoundaryFusedFfn(ctx: *anyopaque, request: *const ops.gliner_boundary_device.FusedFfnRequest) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const output = try gliner25DenseFfnLayerNorm(ctx, &.{ .input = request.input, .residual = request.residual, .first_weight = request.first_weight, .first_bias = request.first_bias, .second_weight = request.second_weight, .second_bias = request.second_bias, .layer_norm_weight = request.norm_weight, .layer_norm_bias = request.norm_bias, .rows = request.rows, .hidden_size = request.hidden, .intermediate_size = request.intermediate, .eps = request.eps, .activation = .gelu_exact }) orelse return error.UnsupportedGlinerBoundaryFusedFfn;
+    tensorFromCt(output).resident_owner = self;
+    tensorFromCt(output).strict_resident_training = true;
+    self.boundary_scope.stats.dispatches +|= 5;
+    return output;
+}
+
+fn tryGliner25Bf16Attention(self: *CudaCompute, output: buffer_mod.DeviceBuffer, inputs: [7]buffer_mod.DeviceBuffer, batch: usize, sequence: usize, heads: usize, relative: usize, boundary: bool, native: bool) !bool {
+    const attention = @import("gliner25_bf16_attention.zig");
+    if (self.ctx.info.compute_major != 8 or self.ctx.info.compute_minor != 9 or
+        self.kernels.gliner25_attention_stage_bf16 == null or self.kernels.gliner25_attention_pointer_views_bf16 == null or self.kernels.gliner25_attention_softmax_bf16 == null or
+        self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or attention.planWithReference(batch, sequence, heads, 64, relative, native, self.gliner_bf16_reference) == null) return false;
+    const blas = trainingBlas(self) catch return false;
+    if (!blas.supportsWorkspace() or !blas.supportsBf16PointerBatches()) return false;
+    const workspace = self.cublaslt_workspace_scratch.acquire(&self.ctx, attention.workspace_limit) catch return false;
+    try attention.runWithReference(&self.ctx, blas, &self.kernels, workspace, output, inputs, batch, sequence, heads, relative, boundary, native, if (self.gliner_bf16_reference) &self.gliner_bf16_full else null);
+    self.stats.gliner25_bf16_attention_calls += 1;
+    return true;
+}
+
+fn tryGliner25GemmAttention(self: *CudaCompute, output: buffer_mod.DeviceBuffer, inputs: [7]buffer_mod.DeviceBuffer, batch: usize, sequence: usize, heads: usize, relative: usize, boundary: bool) !bool {
+    if (self.gliner_deberta_bf16) return tryGliner25Bf16Attention(self, output, inputs, batch, sequence, heads, relative, boundary, false);
+    const attention = @import("gliner25_fp32_attention.zig");
+    if (self.ctx.info.compute_major != 8 or self.ctx.info.compute_minor != 9 or
+        self.kernels.gliner25_attention_softmax_f32 == null or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+        platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_GLINER_FP32_ATTENTION")) return false;
+    _ = attention.plan(batch, sequence, heads, 64, relative) orelse return false;
+    // The same 32 MiB serves projection GEMMs and attention sequentially on
+    // ctx.stream. Growth is admitted by the shared physical allocation ledger;
+    // inability to reserve it preserves the existing bounded attention path.
+    const blas = trainingBlas(self) catch return false;
+    if (!blas.supportsWorkspace()) return false;
+    const workspace = self.cublaslt_workspace_scratch.acquire(&self.ctx, attention.workspace_limit) catch return false;
+    if (try attention.run(&self.ctx, blas, &self.kernels, workspace, output, inputs, batch, sequence, heads, relative, boundary)) self.stats.gliner25_pointer_fp32_attention_calls += 1;
+    self.stats.gliner25_gemm_fp32_attention_calls += 1;
+    if (boundary and relative < 512) self.stats.gliner25_compact_boundary_attention_calls += 1;
+    return true;
+}
+
+fn compactDebertaRelativeProjectionEnabled(ctx: *anyopaque, sequence: usize) bool {
+    const self: *const CudaCompute = @ptrCast(@alignCast(ctx));
+    return (self.qualified_decide_fp32 or self.gliner_boundary_inference or self.gliner_deberta_bf16) and sequence > 0 and sequence <= 512 and
+        self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9 and
+        self.kernels.gliner25_attention_softmax_f32 != null and
+        !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active and
+        !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_GLINER_FP32_ATTENTION");
+}
+
+fn debertaDisentangledAttentionCompact(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q_r_ct: CT, k_r_ct: CT, relative_ids: []const i64, mask: []const i64, batch: usize, sequence: usize, heads: usize, head_dim: usize) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const attention = @import("gliner25_fp32_attention.zig");
+    if ((!self.qualified_span_fp32 and !self.qualified_decide_fp32 and !self.gliner_deberta_bf16) or
+        self.ctx.info.compute_major != 8 or self.ctx.info.compute_minor != 9 or
+        self.kernels.gliner25_attention_softmax_f32 == null or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+        platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_GLINER_FP32_ATTENTION") or
+        attention.plan(batch, sequence, heads, head_dim, 1) == null) return null;
+    const hidden = heads * head_dim;
+    const q = tensorFromCt(q_ct);
+    const k = tensorFromCt(k_ct);
+    const v = tensorFromCt(v_ct);
+    const qr = tensorFromCt(q_r_ct);
+    const kr = tensorFromCt(k_r_ct);
+    const native_bf16 = self.gliner_deberta_bf16 and q.dtype == .bf16;
+    for ([_]*const CudaTensor{ q, k, v, qr, kr }) |t| {
+        if (native_bf16) {
+            if (t.dtype != .bf16 or t.quant_type != null) return error.UnsupportedTensorType;
+        } else try ensureF32(t);
+    }
+    const count = batch * sequence * hidden;
+    for ([_]*const CudaTensor{ q, k, v }) |t| try ensureCount(t, count);
+    if (qr.elem_count % hidden != 0) return error.InvalidShape;
+    const relative = qr.elem_count / hidden;
+    if (attention.plan(batch, sequence, heads, head_dim, relative) == null) return null;
+    try ensureCount(kr, qr.elem_count);
+    if (relative_ids.len != 2 * sequence - 1 or mask.len < batch * sequence) return error.InvalidShape;
+    var ids: [1023]i32 = undefined;
+    for (relative_ids, ids[0..relative_ids.len]) |id, *out| {
+        if (id < 0 or id >= relative) return error.InvalidShape;
+        out.* = @intCast(id);
+    }
+    const mask_device = try uploadCachedAttentionMaskI64(self, mask);
+    // Reuse the metadata scratch already needed by expanded relative gathers.
+    // Pinned staging owns the copied stack bytes until the stream consumes them;
+    // the pageable fallback synchronizes before this stack frame can return.
+    const bytes = std.mem.sliceAsBytes(ids[0..relative_ids.len]);
+    const ids_device = try self.temp_ids_masks.acquire(&self.ctx, bytes.len);
+    if (!try copyFromPinnedUploadArena(self, ids_device, bytes)) {
+        try copyFromHostTracked(self, ids_device, bytes);
+        try synchronizeAndDrainDeferredDeviceFrees(self);
+    }
+    const shape = try dupeShape(self.allocator, q.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, count * 4);
+    errdefer device.free(&self.ctx);
+    const buffers = [7]buffer_mod.DeviceBuffer{ q.buffer, k.buffer, v.buffer, qr.buffer, kr.buffer, ids_device, mask_device };
+    const launched = if (native_bf16) try tryGliner25Bf16Attention(self, device, buffers, batch, sequence, heads, relative, false, true) else try tryGliner25GemmAttention(self, device, buffers, batch, sequence, heads, relative, false);
+    if (!launched) {
+        if (native_bf16) return error.CudaKernelUnavailable;
+        releaseDeviceBuffer(self, &device);
+        self.allocator.free(shape);
+        return null;
+    }
+    self.stats.gliner25_compact_fp32_attention_calls += 1;
+    self.stats.launch_attention += 1;
+    return createTensor(self, device, shape, count);
+}
+
 fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q_r_ct: CT, k_r_ct: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const q_tensor = tensorFromCt(q_ct);
@@ -27496,7 +28109,13 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
     errdefer device.free(&self.ctx);
     // Both immutable FP32 profiles must bypass automatic half-precision
     // attention: the 128-token transition can change Decide classifications.
-    const attention_mode = debertaAttentionExecutionMode(self.qualified_span_fp32, self.qualified_decide_fp32 or self.qualified_decide_q8, cudaDebertaAttentionMode());
+    const attention_mode = debertaAttentionExecutionMode(self.qualified_span_fp32, self.qualified_decide_fp32 or self.qualified_decide_q8 or self.gliner_deberta_bf16, cudaDebertaAttentionMode());
+    if ((self.qualified_span_fp32 or self.qualified_decide_fp32 or self.gliner_deberta_bf16) and head_dim == 64) {
+        if (try tryGliner25GemmAttention(self, device, .{ q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, q_r_tensor.buffer, k_r_tensor.buffer, .{}, mask_device }, batch, seq_len, num_heads, rel_positions, false)) {
+            self.stats.launch_attention += 1;
+            return createTensor(self, device, shape, count);
+        }
+    }
     if ((attention_mode == .generated_tc or (attention_mode == .auto and cudaDebertaGeneratedTcAutoEnabled())) and seq_len <= 256 and head_dim == 64) {
         const requested_variant = cudaDebertaGeneratedTcVariant();
         const launched_m32 = if (requested_variant != .m16)
@@ -31708,6 +32327,8 @@ const vtable = ops.ComputeBackend.VTable{
     .crossAttention = &crossAttention,
     .relativePositionBias = &relativePositionBias,
     .disentangledRelativeAttention = &debertaDisentangledAttention,
+    .disentangledRelativeAttentionCompact = &debertaDisentangledAttentionCompact,
+    .compactDebertaRelativeProjectionEnabled = &compactDebertaRelativeProjectionEnabled,
     .disentangledRelativeAttentionPacked = &debertaDisentangledAttentionPacked,
     .disentangledRelativeAttentionBackward = &debertaDisentangledAttentionBackward,
     .disentangledRelativeAttentionBackwardPacked = &debertaDisentangledAttentionBackwardPacked,
@@ -31755,6 +32376,10 @@ const vtable = ops.ComputeBackend.VTable{
     .residentTrainingValidate = &gliner25.residentTrainingValidate,
     .residentTrainingInstruction = &gliner25.residentTrainingInstruction,
     .glinerBoundaryDevice = &gliner25.glinerBoundaryDevice,
+    .glinerBoundaryFusedFfnAvailable = &gliner25Bf16FfnAvailable,
+    .glinerBoundaryFusedFfn = &gliner25BoundaryFusedFfn,
+    .denseFfnLayerNorm = &gliner25DenseFfnLayerNorm,
+    .debertaBf16Projections = &gliner25Bf16Projections,
     .glinerBoundaryDownload = &gliner25.glinerBoundaryDownload,
     .elementwiseLossGradient = &gliner25.elementwiseLossGradient,
     .consistencyLossGradient = &gliner25.consistencyLossGradient,

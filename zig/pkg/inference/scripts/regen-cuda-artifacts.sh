@@ -120,6 +120,10 @@ check_source_policy() {
 }
 
 check_source_policy
+if [ "$source_policy_only" = "true" ] || [ "$mode" = "check" ]; then
+  python3 "$script_dir/regen-gliner25-fast-f32.py" --check-source-policy
+  python3 "$script_dir/regen-gliner25-bf16.py" --check-source-policy
+fi
 if [ "$source_policy_only" = "true" ]; then
   printf 'CUDA artifact source policy passes: %s (%s compiler-managed dev-only runtime-wired candidates included)\n' \
     "$src" "$CUDA_RUNTIME_WIRED_DEV_CANDIDATE_COUNT"
@@ -270,6 +274,15 @@ required_symbols=(
   termite_gliner_encoder_attention_tc_f16
   termite_gliner_encoder_attention_tc_f16_m64
   termite_gliner_boundary_attention_f32
+  termite_gliner25_attention_softmax_f32_v2
+  termite_gliner25_attention_pointer_views_f32_v1
+  termite_gliner25_attention_stage_bf16_v1
+  termite_gliner25_attention_pointer_views_bf16_v2
+  termite_gliner25_attention_softmax_bf16_v2
+  termite_gliner25_ffn_bias_gelu_bf16_v1
+  termite_gliner25_boundary_parallel_f32_v1
+  termite_gliner25_boundary_banded_f32_v1
+  termite_gliner25_norm_bf16_mirror_v1
   termite_gliner_boundary_attention_tc_f16
   termite_gliner_boundary_attention_tc_f16_m64
   termite_gliner_boundary_attention_tc_f16_compact
@@ -646,3 +659,5 @@ case "$artifact_mode" in
     exit 2
     ;;
 esac
+
+python3 "$script_dir/regen-gliner25-fast-f32.py" "--$mode"

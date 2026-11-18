@@ -9695,7 +9695,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn boundaryValidateMatrix(input: CT, rows: usize, columns: usize, precision: ops.gliner_boundary_device.WeightPrecision) !void {
         const expected_bytes = try precision.byteLen(rows, columns);
-        if (precision == .f32) return error.UnsupportedGlinerBoundaryPrecision;
+        if (precision == .f32 or precision == .bf16) return error.UnsupportedGlinerBoundaryPrecision;
         const buf = toBuf(input);
         if (buf.integer_storage or buf.lazy_multiply != null or buf.view_index_map != null or
             buf.view_strides != null or buf.logical_view_strides != null or buf.view_base_offset != 0 or buf.data.len != 0)

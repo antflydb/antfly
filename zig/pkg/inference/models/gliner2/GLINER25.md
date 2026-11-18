@@ -769,3 +769,77 @@ on native and Metal. Unsupported structures/attributes, joint decoding and
 relation endpoint constraints remain rejected. Pull metadata publishes
 `qualified_limits` for verified artifacts; refresh older pulls to record it.
 See [Lite knowledge-graph pipelines](../../../../LITE.md#embedded-library) and [entity resolution](../../../../RESOLUTION.md#query-keys-aliases-and-migration-lite-native).
+
+### Accurate CUDA Tensor Core projections
+
+Automatic CUDA inference uses compensated Tensor Core projections for the exact
+pinned `fastino/gliner2.5-base-v1` artifact on SM89 (measured on NVIDIA L4),
+and the original FP32 `fastino/GLiNER2.5-Decide` artifact when its automatic BF16
+policy below is unavailable. Weights, activation state, attention,
+biases and readout remain FP32. Selected encoder projections use BF16x3 or
+TF32x3 products with FP32 accumulation. This is an operator optimization, not a
+BF16 model-storage variant. Explicit BF16 and FP16 serving profiles remain
+gated; automatic Decide selection has its own qualification below.
+
+The projection policy admits selected 768/1024-wide encoder matrices with
+64–4096 flattened rows. Classifier heads, other artifacts, unsupported shapes or
+hardware, training and graph capture keep their existing routes. The four
+kernels add no global scratch or weight mirrors. An optional-module load failure
+falls back to FP32. `ANTFLY_INFERENCE_CUDA_DISABLE_GLINER_FAST_F32=1` disables the
+route; an explicit FP32 session remains the benchmark control.
+
+Qualification covers 115 independent CPU FP32 cases, heterogeneous physical
+batches, short/Unicode inputs, exact classifications and entity candidate sets,
+and the Decide batch-32/four-forward contract. All cases pass the unchanged
+0.002 raw-output limit in three alternating rounds with four measured samples;
+the largest CPU-oracle error is 0.000241. Ten additional 128/512-token prepared
+geometries pass against the same-build FP32 control. Core latency improvements
+on L4 are 1.17–1.39× for Base classification, 1.14–1.25× for Decide and
+1.22–1.24× for entities. These compare with the already optimized FP32 route,
+exclude HTTP/tokenization, and include synchronized output readback. Sampled
+peak GPU memory is unchanged. Combined startup PSS+GPU peaks are timing-sensitive;
+these results do not establish an unchanged combined startup peak or a win over
+PJRT BF16.
+
+The focused gate is `test-gliner25-fast-f32` with CUDA enabled. Independent oracle
+preparation and full-model qualification use
+`zig/lib/pjrt/tools/qualify_gliner25.py`; the prepared native benchmark's `auto`
+mode uses the production loading constructor. The separate 51 KiB SM89 cubin is
+reproducible with `zig/pkg/inference/scripts/regen-gliner25-fast-f32.py` and pinned
+CUDA 13.2/CUTLASS inputs. Header downloads are hash-verified, stored only in the
+worktree's `.zig-cache/cuda-deps`, and unnecessary for ordinary builds. The
+source-policy check verifies the checked-in source, metadata, cubin and license
+without a compiler or network access.
+
+### Qualified Decide BF16 default on NVIDIA L4
+
+The original dense `fastino/GLiNER2.5-Decide` checkpoint automatically uses the
+qualified BF16 profile on NVIDIA L4 (SM89), CUDA driver API version at least
+13000 and cuBLAS handle version 130400 or 130401. Qualification pins the complete source
+weight and tokenizer/configuration identity; Base, Q8_0, Decide-1B, training and
+other GPUs/runtimes retain their existing policies. Optional kernel/runtime
+preparation happens before weight upload; failure preserves the FP32 route.
+`ANTFLY_INFERENCE_CUDA_DISABLE_GLINER_BF16=1` selects the accurate FP32 fallback.
+Diagnostic BF16 semantic flags cannot alter the automatic profile.
+
+Projection weights use BF16 storage. Rounded linear, residual, attention and
+GELU boundaries follow the qualified profile, with FP32 reductions and output
+buffers. Physical forwards remain limited to eight rows and 512 tokens;
+a 32-item request uses four forwards. The shared admission estimate reserves
+64 MiB of vendor/attention workspace. FFN temporaries are bounded by 88 MiB,
+or 120 MiB when a denied bias-cache reservation requires the F32-dot fallback.
+Relative snapshots, bias snapshots and the norm mirror share a 96 MiB retained
+allocation cap and admission ownership; denied caches preserve computation.
+
+The numerical reference is upstream Python CUDA BF16 with its stock reduced
+precision reduction setting. Qualification limits absolute confidence drift to
+0.02 for every label. A threshold crossing is permitted only within 0.02 of the
+reference threshold; an argmax change requires a reference probability gap no
+larger than 0.04, since each probability may move by 0.02. Decisions outside
+those bands must match exactly. This policy permits bounded BF16 differences;
+it does not assert FP32-equivalent raw logits or task accuracy.
+
+Reproduction tools and measured scope are documented in
+[`zig/lib/pjrt/tools/README.md`](../../../../lib/pjrt/tools/README.md).
+Base BF16 currently exceeds this confidence band on some cases and remains a
+diagnostic profile; its qualified automatic path retains FP32 state and weights.
