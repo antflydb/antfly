@@ -427,7 +427,20 @@ pub fn stageOrdered(alloc: std.mem.Allocator, txn: anytype, command: Command, ap
     const raw = try prepareOrdered(alloc, txn, command, applied_index);
     defer if (raw) |value| alloc.free(value);
     if (raw) |value| {
-        if (command.dag_activations) |activations| try checkDagCatalog(alloc, txn, command, activations, true);
+        const SourceFence = @import("../../graph/dag_authority.zig").SourceFence;
+        if (command.dag_activations) |activations| {
+            const fence = (try SourceFence.read(txn)) orelse return error.InvalidArtifactCatalogCommand;
+            for (activations) |activation| {
+                for (activation.proofs) |proof| switch (proof.proof) {
+                    .empty => return error.InvalidArtifactCatalogCommand,
+                    .scanned => |scan| if (!std.mem.eql(u8, &scan.snapshot, &fence.snapshot))
+                        return error.InvalidArtifactCatalogCommand,
+                };
+            }
+            try checkDagCatalog(alloc, txn, command, activations, true);
+        } else {
+            try SourceFence.requireWritable(txn);
+        }
         try txn.put(ordered_key, value);
     }
     try @import("artifact_catalog_activation.zig").stage(alloc, txn, command);

@@ -64,18 +64,17 @@ other, and topology drain includes authority-only prepared participants.
 The private ordered source-fence command commits acquisition, release, scan
 initialization, or a bounded scan page with its apply receipt. It rejects delayed
 acquisitions for released attempts and checks the full fence identity before
-staging scan work. Raft protocol version 31 gates these commands, DAG-bearing
-transaction prepare, and catalog activation proofs. The command currently
-requires a root without asynchronous standby mirroring. The activation
-coordinator still needs to execute the protocol across roots, enumerate the
-pinned graph, and certify end of input. Regular index admission and direct
+staging scan work. An active source fence allows an ordered catalog change only
+when activation proofs match its pinned snapshot. Raft protocol version 31
+gates these commands, DAG-bearing transaction prepare, and catalog activation
+proofs. The source-fence command currently requires a root without asynchronous
+standby mirroring. The activation coordinator still needs to execute the
+protocol across roots, enumerate the pinned graph, and certify end of input. Regular index admission and direct
 graph-index open still reject DAG.
 An existing distributed reservation remains under the original coordinator,
-and the publication coordinator still needs to enlist the authority under the source and contender guards, and document-derived
-and explicit writers still need to supply their final contributions. The authority also stages bounded activation pages into a private
-ledger and persists the pinned snapshot and scan cursor atomically with each
-page. The catalog still needs to fence writes, enumerate the stable snapshot
-completely, and certify end of input before the authority becomes active.
+and the publication coordinator still needs to enlist the authority under
+the source and contender guards. Document-derived and explicit writers still
+need to supply their final contributions.
 
 ## Constraint domain and authority
 

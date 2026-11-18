@@ -178,7 +178,12 @@ test "ordered artifact inventory graph publication validates guards generations 
             ;
             try std.testing.expectError(error.InvalidDagMutation, publication.LocalDagBinding.stageFromConfig(alloc, &writer, command, @splat(2), config_json, &.{}));
             try std.testing.expectEqual(.validating, (try dag.Storage.load(&writer, request.domain)).phase);
-            const activations: []const publication.LocalDagBinding.Activation = &.{.{ .edge_type = "links", .owner_epoch = 1, .proof = .empty }};
+            const fence: dag.SourceFence = .{ .activation = @splat(3), .snapshot = @splat(4) };
+            const activations: []const publication.LocalDagBinding.Activation = &.{.{
+                .edge_type = "links",
+                .owner_epoch = 1,
+                .proof = .{ .scanned = .{ .snapshot = fence.snapshot, .after = "" } },
+            }};
             var declared: std.ArrayList(u8) = .empty;
             defer declared.deinit(alloc);
             try declared.appendSlice(alloc, bytes.items[0 .. bytes.items.len - config.len - 12]);
@@ -200,14 +205,24 @@ test "ordered artifact inventory graph publication validates guards generations 
             try std.testing.expectError(error.InvalidArtifactCatalogCommand, inventory.stageOrdered(alloc, &writer, missing, 1));
             try std.testing.expect((try inventory.load(alloc, &writer)) == null);
             try std.testing.expectEqual(.validating, (try dag.Storage.load(&writer, request.domain)).phase);
+            try std.testing.expectError(error.InvalidArtifactCatalogCommand, inventory.stageOrdered(alloc, &writer, ordered, 1));
+            try fence.acquire(&writer);
+            try dag.Contributions.beginActivation(&writer, request.domain, 1, fence.snapshot);
             try inventory.stageOrdered(alloc, &writer, ordered, 1);
             try inventory.stageOrdered(alloc, &writer, ordered, 1);
             ordered.dag_activations = &.{.{ .index_name = "g", .table_identity = @splat(9), .proofs = activations }};
             try std.testing.expectError(error.ArtifactCatalogEpochChanged, inventory.stageOrdered(alloc, &writer, ordered, 1));
             missing.previous = ordered.binding;
             missing.binding.epoch += 1;
+            try std.testing.expectError(error.GraphConstraintBusy, inventory.stageOrdered(alloc, &writer, missing, 2));
+            try fence.release(&writer);
             try inventory.stageOrdered(alloc, &writer, missing, 2);
             try binding.stage(alloc, &writer, command);
+            try writer.commit();
+        }
+        {
+            var writer = try store.beginWriteTxn();
+            errdefer writer.abort();
             try result.stageLocalDag(alloc, &writer, command);
             try writer.put(edge_key, edge);
             try writer.commit();

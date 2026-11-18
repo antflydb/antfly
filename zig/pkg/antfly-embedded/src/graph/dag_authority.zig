@@ -121,12 +121,12 @@ pub const SourceFenceCommand = struct {
     }
 
     pub fn stageRelease(self: SourceFenceCommand, txn: anytype) !void {
-        try self.fence.release(txn);
         const key = completed_prefix.* ++ self.fence.activation;
         if (txn.get(&key)) |snapshot| {
             if (!std.mem.eql(u8, snapshot, &self.fence.snapshot)) return error.GraphConstraintAttemptConflict;
             return;
         } else |err| if (err != error.NotFound) return err;
+        try self.fence.release(txn);
         try txn.put(&key, &self.fence.snapshot);
     }
 
@@ -1742,7 +1742,13 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, empty_id, 2));
     try Contributions.finishActivation(&txn, empty_id, 2, versions, "");
     try Contributions.finishActivation(&txn, empty_id, 2, versions, "");
-    try fence.release(&txn);
+    const release: SourceFenceCommand = .{ .namespace = @splat(0), .action = .release, .fence = fence };
+    try release.stageRelease(&txn);
+    const subsequent: SourceFence = .{ .activation = @splat(10), .snapshot = @splat(11) };
+    try subsequent.acquire(&txn);
+    try release.stageRelease(&txn);
+    try std.testing.expectEqualDeep(subsequent, (try SourceFence.read(&txn)).?);
+    try subsequent.release(&txn);
 
     try Storage.retire(&txn, id, epoch);
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, id, epoch));
