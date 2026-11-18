@@ -2454,6 +2454,10 @@ pub const Owner = struct {
             // a sibling connection on their own: every fast path here must
             // also agree on this logical watermark before reusing `current`.
             const sequence_unchanged = probe.committedSequence() == file.committedSequence();
+            // Something other than this refresh adopted newer state into the
+            // root's file, so the comparisons below would see a match the
+            // root's runtime does not have. Only a reopen reconciles it.
+            const adopted_unseen = file.adoptionEpoch() != current.lite_refresh_adoption_epoch;
             // A hosted/non-independent `maintenanceTurn` sets `root` to
             // `self.current` itself and bumps *its own* `maintenance_references`
             // for the turn's duration (see that field's own doc comment). A
@@ -2468,7 +2472,7 @@ pub const Owner = struct {
             // An uncertain publication can fail before writing anything, so an
             // unchanged header does not prove the runtime is reusable: reopen
             // to reconcile from durable state.
-            if (!self.foreground_runtime_stale and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and sequence_unchanged and std.meta.eql(probe.header, file.header)) {
+            if (!self.foreground_runtime_stale and !adopted_unseen and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and sequence_unchanged and std.meta.eql(probe.header, file.header)) {
                 if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
                     try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                 return current;
@@ -2487,7 +2491,7 @@ pub const Owner = struct {
             // the physical one for `sequence_unchanged` to protect.
             const fast2_metadata_unchanged = try file.runtimeMetadataUnchanged(&probe);
             const fast2_index_unchanged = try loadedIndexInputsUnchanged(current, file, &probe);
-            if (!self.foreground_runtime_stale and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and (sequence_unchanged or file.redo == null) and
+            if (!self.foreground_runtime_stale and !adopted_unseen and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and (sequence_unchanged or file.redo == null) and
                 fast2_metadata_unchanged and fast2_index_unchanged)
             {
                 // Lease bookkeeping and unpublished shadow files do not change
@@ -2499,6 +2503,8 @@ pub const Owner = struct {
                     _ = try self.copyIdleSnapshotLedger(file);
                     _ = try file.inheritAllocatorCertificate();
                 }
+                current.lite_refresh_adoption_epoch = file.adoptionEpoch();
+                current.lite_runtime_sequence = @max(current.lite_runtime_sequence, probe.committedSequence());
                 return current;
             }
             if (self.maintenance_snapshot) |snapshot| {
@@ -2642,6 +2648,8 @@ pub const Owner = struct {
         // may still be draining when it is replaced (W5).
         if (self.current) |outgoing| if (outgoing.owned_lite_backend.?.native_docstore) |outgoing_store| outgoing_store.ensureDurableForReuse();
         self.foreground_runtime_stale = false;
+        replacement.lite_refresh_adoption_epoch = replacement.owned_lite_backend.?.native_docstore.?.file.adoptionEpoch();
+        replacement.lite_runtime_sequence = replacement.owned_lite_backend.?.native_docstore.?.file.committedSequence();
         self.current = replacement;
         for (self.connections.items) |connection| {
             connection.current = replacement;
@@ -2733,7 +2741,7 @@ pub const Owner = struct {
         // Another writer's index content (native catalog records under the
         // redo log) is invisible to this root's loaded indexes, which cache
         // it in memory. Reopen rather than keep serving and writing them.
-        if (before.indexCatalogChangedAfter(before.activeCheckpoint().commit_sequence)) return false;
+        if (before.indexCatalogChangedAfter(root.lite_runtime_sequence)) return false;
         if (before.header.indexed_reclamation and after.header.indexed_reclamation) {
             if (std.mem.eql(u8, &before.activeCheckpoint().logical.indexes, &after.activeCheckpoint().logical.indexes)) return true;
             // Prefix comparisons dereference the old root. Its page numbers
@@ -5169,6 +5177,10 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         // the process signal owner alive until this executor has joined too.
         @import("io_lifetime.zig").acquire();
         owner.* = .{ .path = gate.path, .gate = gate, .options = resolved_options, .current = initial, .owned_ttl_owner_id = ttl_owner_id, .owned_models_dir = models_dir, .path_lock_io = std.Io.Threaded.init(alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) }) };
+        if (initial) |root| {
+            root.lite_refresh_adoption_epoch = root.owned_lite_backend.?.native_docstore.?.file.adoptionEpoch();
+            root.lite_runtime_sequence = root.owned_lite_backend.?.native_docstore.?.file.committedSequence();
+        }
     }
     errdefer if (existing == null) @import("io_lifetime.zig").release();
     errdefer if (existing == null) owner.path_lock_io.deinit();
