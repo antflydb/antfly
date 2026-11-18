@@ -1537,11 +1537,22 @@ const LocalStandaloneMetadata = struct {
         defer self.alloc.free(actual);
         if (!std.mem.eql(u8, actual, value)) return error.RestoreJobCommitNotApplied;
     }
+    fn requireStandbyRestoreJobFormatLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, value: []const u8) !void {
+        const server = self.hot_standby_catalog_server orelse return;
+        const jobs = antfly.public_api.restore_jobs;
+        if (!try jobs.requiresPinnedRestoreWorker(alloc, value)) return;
+        lockAtomic(&server.hot_standby_state_mutex);
+        defer server.hot_standby_state_mutex.unlock();
+        const primary = server.hot_standby_cfg.internal_primary orelse return error.NotLeader;
+        if (!primary.slots.supportsRestoreJobFormat(primary.identity.timeline_id, jobs.pinned_restore_job_format_version))
+            return error.TableTopologyProtocolUpgradeRequired;
+    }
     fn restoreJobsCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, term: u64) ![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         var locked = try self.lockMutation();
         defer locked.deinit();
         try self.requireRestoreJobTermLocked(term);
+        try self.requireStandbyRestoreJobFormatLocked(alloc, value);
         try self.applyJobCommandLocked(.{ .create_restore_job = .{ .key = key, .value = value } });
         return (try self.lifecycle_store.?.getRestoreJobValue(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
     }
@@ -1551,6 +1562,7 @@ const LocalStandaloneMetadata = struct {
         defer locked.deinit();
         if (!self.coordinated_lifecycle_allowed) return error.CoordinatedStandaloneHAMetadataRequired;
         try self.requireRestoreJobTermLocked(term);
+        try self.requireStandbyRestoreJobFormatLocked(alloc, value);
         try self.applyJobCommandLocked(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan_json } });
         return (try self.lifecycle_store.?.getRestoreJobValue(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
     }

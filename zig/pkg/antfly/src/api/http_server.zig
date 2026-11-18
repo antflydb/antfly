@@ -27182,7 +27182,7 @@ fn restoreJobStartErrorResponse(alloc: std.mem.Allocator, err: anyerror) !contex
         error.IdempotencyConflict => try contextualJsonErrorResponse(alloc, 409, "idempotency key reused for a different restore"),
         error.RestoreStagingPrincipalImmutable => try contextualJsonErrorResponse(alloc, 409, "restore targets are reserved under a different principal; cancel this restore and start a new restore to change its authorization identity"),
         error.AsyncRestoreUnavailable => try contextualJsonErrorResponse(alloc, 503, "asynchronous restore worker unavailable"),
-        error.TableTopologyProtocolUpgradeRequired => try contextualJsonErrorResponse(alloc, 503, "pinned restore jobs require upgraded metadata voters"),
+        error.TableTopologyProtocolUpgradeRequired => try contextualJsonErrorResponse(alloc, 503, "pinned restore jobs require compatible failover peers"),
         error.RestoreJobPersistenceUnavailable => try contextualJsonErrorResponse(alloc, 503, "durable restore store unavailable"),
         error.RestoreJobCapacityExceeded => try contextualJsonErrorResponse(alloc, 503, "restore job history is at capacity"),
         error.RestoreJobRecordTooLarge, error.TooManyRestoreTables => try contextualJsonErrorResponse(alloc, 400, "restore request is too large"),

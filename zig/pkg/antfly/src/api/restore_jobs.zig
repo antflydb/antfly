@@ -44,7 +44,7 @@ const max_cluster_failure_error_bytes: usize = 256;
 const restore_job_format_version: u32 = 4;
 // Workers that only understand v4 must reject these rows instead of
 // checkpointing a job while dropping its source binding.
-const pinned_restore_job_format_version: u32 = 5;
+pub const pinned_restore_job_format_version: u32 = 5;
 
 pub fn requiresPinnedRestoreWorker(alloc: std.mem.Allocator, encoded: []const u8) !bool {
     const parsed = try std.json.parseFromSlice(struct { format_version: u32 }, alloc, encoded, .{ .ignore_unknown_fields = true });
