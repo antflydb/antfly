@@ -54,8 +54,10 @@ stages every activation certificate with the binding. The private ordered
 artifact catalog command can carry these proofs and install them with the
 catalog watermark. Catalog changes without new proofs can reuse a binding
 only when it covers the declared types and their certified authorities.
-The activation coordinator still needs to pin and scan
-the source graph, fence writes, and propose that command. Regular index
+The authority persists the scanner's snapshot before its first page, so a
+new owner can resume even when no page has committed yet. The activation
+coordinator still needs to fence source writes, read the pinned graph, and
+propose the completion command. Regular index
 admission and direct graph-index open still reject DAG.
 An existing distributed reservation remains under the original coordinator,
 and the publication coordinator still needs to enlist the authority under the source and contender guards, and document-derived

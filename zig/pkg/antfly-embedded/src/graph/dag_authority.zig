@@ -952,6 +952,24 @@ pub const Contributions = struct {
         return state;
     }
 
+    /// Persist the scanner's source snapshot before fetching its first page.
+    /// The catalog must hold the corresponding source-write fence.
+    pub fn beginActivation(txn: anytype, id: Digest, epoch: u64, snapshot: Digest) !void {
+        _ = try activationState(txn, id, epoch);
+        if (try readActivationProgress(txn, id)) |progress| {
+            if (!std.mem.eql(u8, &progress.snapshot, &snapshot)) return error.GraphConstraintRevisionChanged;
+            return;
+        }
+        try Storage.requireEmptyLedger(txn, id);
+        try txn.put(&activationKey(id), &snapshot);
+    }
+
+    pub fn activationSnapshot(txn: anytype, id: Digest, epoch: u64) !?Digest {
+        _ = try activationState(txn, id, epoch);
+        const progress = (try readActivationProgress(txn, id)) orelse return null;
+        return progress.snapshot;
+    }
+
     /// The catalog must fence writes and pin the authoritative contribution
     /// snapshot before invoking this function. The cursor is the concatenation
     /// of the last owner digest and source. Each page commits atomically with
@@ -969,7 +987,6 @@ pub const Contributions = struct {
     ) !void {
         _ = try activationState(txn, id, epoch);
         try requireActivationCursor(txn, id, snapshot, expected_after);
-        if (expected_after == null) try Storage.requireEmptyLedger(txn, id);
         if (replacements.len == 0) return error.InvalidDagMutation;
         const first = replacements[0];
         if (expected_after) |after| {
@@ -1005,25 +1022,31 @@ pub const Contributions = struct {
     /// Load the persisted cursor for the pinned snapshot when resuming work.
     pub fn activationCursor(alloc: A, txn: anytype, id: Digest, epoch: u64, snapshot: Digest) !?[]u8 {
         _ = try activationState(txn, id, epoch);
+        const progress = (try readActivationProgress(txn, id)) orelse return null;
+        if (!std.mem.eql(u8, &progress.snapshot, &snapshot)) return error.GraphConstraintRevisionChanged;
+        const after = progress.after orelse return null;
+        return try alloc.dupe(u8, after);
+    }
+
+    const ActivationProgress = struct { snapshot: Digest, after: ?[]const u8 };
+
+    fn readActivationProgress(txn: anytype, id: Digest) !?ActivationProgress {
         const raw = txn.get(&activationKey(id)) catch |err| {
             if (err == error.NotFound) return null;
             return err;
         };
-        if (raw.len < 2 * @sizeOf(Digest)) return error.InvalidDagAuthority;
-        if (!std.mem.eql(u8, raw[0..@sizeOf(Digest)], &snapshot)) return error.GraphConstraintRevisionChanged;
-        return try alloc.dupe(u8, raw[@sizeOf(Digest)..]);
+        const width = @sizeOf(Digest);
+        if (raw.len != width and raw.len < 2 * width) return error.InvalidDagAuthority;
+        return .{ .snapshot = raw[0..width].*, .after = if (raw.len == width) null else raw[width..] };
     }
 
     fn requireActivationCursor(txn: anytype, id: Digest, snapshot: Digest, expected_after: ?[]const u8) !void {
-        const raw = txn.get(&activationKey(id)) catch |err| {
-            if (err != error.NotFound) return err;
-            if (expected_after != null) return error.GraphConstraintRevisionChanged;
-            return;
-        };
-        if (raw.len < 2 * @sizeOf(Digest)) return error.InvalidDagAuthority;
-        const after = expected_after orelse return error.GraphConstraintRevisionChanged;
-        if (!std.mem.eql(u8, raw[0..@sizeOf(Digest)], &snapshot) or
-            !std.mem.eql(u8, raw[@sizeOf(Digest)..], after)) return error.GraphConstraintRevisionChanged;
+        const progress = (try readActivationProgress(txn, id)) orelse return error.GraphConstraintNotReady;
+        if (!std.mem.eql(u8, &progress.snapshot, &snapshot)) return error.GraphConstraintRevisionChanged;
+        if ((progress.after == null) != (expected_after == null)) return error.GraphConstraintRevisionChanged;
+        if (progress.after) |after| {
+            if (!std.mem.eql(u8, after, expected_after.?)) return error.GraphConstraintRevisionChanged;
+        }
     }
 
     const ActivationProof = struct { snapshot: Digest, after: []const u8 };
@@ -1065,7 +1088,8 @@ pub const Contributions = struct {
     }
 
     /// Call only after the fenced snapshot reader has certified end of input
-    /// at this exact cursor. Publish the catalog's enforcing state in the same
+    /// at this exact cursor. An empty cursor certifies a pinned empty scan.
+    /// Publish the catalog's enforcing state in the same
     /// transaction or through its authoritative terminal decision.
     pub fn finishActivation(txn: anytype, id: Digest, epoch: u64, snapshot: Digest, after: []const u8) !void {
         var state = try Storage.load(txn, id);
@@ -1073,7 +1097,7 @@ pub const Contributions = struct {
         const proof: ActivationProof = .{ .snapshot = snapshot, .after = after };
         if (state.phase == .active) return requireActivationCertificate(txn, id, proof);
         if (state.phase != .validating or state.revision != 0) return error.GraphConstraintNotReady;
-        try requireActivationCursor(txn, id, snapshot, after);
+        try requireActivationCursor(txn, id, snapshot, if (after.len == 0) null else after);
         try saveActivationCertificate(txn, id, proof);
         try txn.delete(&activationKey(id));
         state.phase = .active;
@@ -1540,6 +1564,12 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     try Storage.create(&txn, existing_id, 1);
     var budget: Contributions.validation.Budget = .{ .clock = .{ .now = Txn.now, .context = &txn } };
     var witness: Contributions.validation.Witness = .{};
+    try std.testing.expectError(error.GraphConstraintNotReady, Contributions.seedActivationPage(alloc, &txn, existing_id, 1, versions, null, &initial, &budget, &witness));
+    try Contributions.beginActivation(&txn, existing_id, 1, versions);
+    try Contributions.beginActivation(&txn, existing_id, 1, versions);
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, Contributions.beginActivation(&txn, existing_id, 1, @splat(9)));
+    try std.testing.expectEqualDeep(versions, (try Contributions.activationSnapshot(&txn, existing_id, 1)).?);
+    try std.testing.expect((try Contributions.activationCursor(alloc, &txn, existing_id, 1, versions)) == null);
     try Contributions.seedActivationPage(alloc, &txn, existing_id, 1, versions, null, &initial, &budget, &witness);
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, existing_id, 1));
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.begin(&txn, existing_id, 1, 0, testAttempt(7)));
@@ -1564,6 +1594,16 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     try std.testing.expectError(error.GraphConstraintRevisionChanged, Storage.activateNewIncarnation(&txn, existing_id, 2));
     try Storage.activateNewIncarnation(&txn, id, epoch);
     _ = try Storage.begin(&txn, existing_id, 2, 0, testAttempt(7));
+
+    const empty_id: Digest = @splat(3);
+    try Storage.create(&txn, empty_id, 1);
+    try std.testing.expectError(error.GraphConstraintNotReady, Contributions.finishActivation(&txn, empty_id, 1, versions, ""));
+    try Contributions.beginActivation(&txn, empty_id, 1, versions);
+    try Storage.takeover(&txn, empty_id, 1, 2);
+    try std.testing.expectEqualDeep(versions, (try Contributions.activationSnapshot(&txn, empty_id, 2)).?);
+    try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, empty_id, 2));
+    try Contributions.finishActivation(&txn, empty_id, 2, versions, "");
+    try Contributions.finishActivation(&txn, empty_id, 2, versions, "");
 
     try Storage.retire(&txn, id, epoch);
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, id, epoch));
