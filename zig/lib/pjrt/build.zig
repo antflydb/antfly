@@ -48,6 +48,15 @@ pub fn build(b: *std.Build) void {
     pjrt_mod.addImport("protobuf", protobuf_mod);
     pjrt_mod.addImport("xla_proto", xla_proto_mod);
 
+    const gemma = b.addExecutable(.{ .name = "antfly-pjrt-gemma4", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/gemma4_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "protobuf", .module = protobuf_mod }, .{ .name = "xla_proto", .module = xla_proto_mod } },
+    }) });
+    gemma.root_module.link_libc = true;
+    b.step("gemma4-runner", "Build native Gemma 4 CUDA/PJRT benchmark worker").dependOn(&b.addInstallArtifact(gemma, .{}).step);
+
     // Tests
     const test_step = b.step("test", "Run unit tests");
 
