@@ -466,7 +466,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         indexes_json: []u8,
         // A prepared apply must remain resumable after cache replacement.
         apply_projection: ?@import("owner_catalog_projection.zig").Cache.Lease = null,
-        apply_handoff_until_ns: u64 = 0,
+        apply_handoff_until_ns: std.atomic.Value(u64) = .init(0),
         restore_bootstrap_json: []u8,
         initial_child_bootstrap_json: []u8,
         initial_range: ?db_types.ByteRange = null,
@@ -1687,6 +1687,20 @@ pub const ProvisionedKernelOwnerSource = struct {
         raft_term: u64,
         raft_index: u64,
     ) !void {
+        return self.applyPreparedReplicatedBatchClassified(alloc, group_id, table_name, descriptor, req, raft_term, raft_index, null);
+    }
+
+    pub fn applyPreparedReplicatedBatchClassified(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        req: db_types.BatchRequest,
+        raft_term: u64,
+        raft_index: u64,
+        terminal_failure: ?*const fn (anyerror, db_types.BatchRequest) bool,
+    ) !void {
         // The Raft progress driver owns the committed entry and its retry
         // checkpoint. Yield admission conflicts to it immediately: waiting for
         // another owner lease here stalls unrelated groups and can deadlock a
@@ -1711,12 +1725,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer lease.deinit();
         const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         defer alloc.free(request_json);
-        var response = try lease.owner().replicatedBatchAtRaftEntryJson(
+        var response = lease.owner().replicatedBatchAtRaftEntryJson(
             table_name,
             request_json,
             raft_term,
             raft_index,
-        );
+        ) catch |err| {
+            if (terminal_failure) |classify| {
+                if (classify(err, req)) lease.entry.apply_handoff_until_ns.store(0, .release);
+            }
+            return err;
+        };
+        lease.entry.apply_handoff_until_ns.store(0, .release);
         defer response.deinit();
     }
 
@@ -4185,7 +4205,6 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (exactApplyDescriptor(entry, descriptor) and
                 tryReserveEntryLeaseLocked(entry, .shared))
             {
-                entry.apply_handoff_until_ns = 0;
                 entry.resident = true;
                 entry.transient_retirement_pending = false;
                 _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
@@ -4281,14 +4300,6 @@ pub const ProvisionedKernelOwnerSource = struct {
                 }
                 return error.StorageKernelOwnerTransitionRequired;
             }
-            // A control open reserves the owner for the ordered entry until
-            // apply claims it. A new root or explicit retirement can still
-            // supersede it. Bound abandoned handoffs, including leadership
-            // changes that leave the committed descriptor unused here.
-            if (!controls.historical_raft_apply and !self.apply_control_stopping and
-                entry.apply_handoff_until_ns != 0 and
-                platform_time.monotonicNs() < entry.apply_handoff_until_ns)
-                return error.StorageReadTemporarilyUnavailable;
             if (entry.catalog_deferred and !controls.allow_deferred_catalog and !controls.historical_raft_apply)
                 return error.StorageReadTemporarilyUnavailable;
             if ((controls.prepare_graph_indexes and !entry.graph_replay_indexes_prepared) or
@@ -4302,6 +4313,12 @@ pub const ProvisionedKernelOwnerSource = struct {
                 entry.restore_ha_replay != descriptor.restore_ha_replay or
                 !std.meta.eql(entry.table_storage, descriptor.table_storage))
             {
+                // Compatible acquisitions take the shared path below.
+                // Protect only the replacement of the prepared owner.
+                const handoff_until = entry.apply_handoff_until_ns.load(.acquire);
+                if (!controls.historical_raft_apply and !self.apply_control_stopping and handoff_until != 0 and
+                    platform_time.monotonicNs() < handoff_until)
+                    return error.StorageReadTemporarilyUnavailable;
                 // Catalog definition changes do not necessarily publish a new
                 // physical root generation. An API lease is not the only DB
                 // activity: index reconciliation may have handed durable work
@@ -4329,7 +4346,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 entry.transient_retirement_pending = false;
             }
             if (controls.prepare_apply_handoff)
-                entry.apply_handoff_until_ns = platform_time.monotonicNs() +| apply_handoff_timeout_ns;
+                entry.apply_handoff_until_ns.store(platform_time.monotonicNs() +| apply_handoff_timeout_ns, .release);
             if (controls.historical_raft_apply) {
                 const pin = physical.pin();
                 if (entry.apply_projection) |*previous| previous.deinit();
@@ -4432,7 +4449,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .identity = descriptor.identity,
             .schema_json = owned_schema_json,
             .indexes_json = owned_indexes_json,
-            .apply_handoff_until_ns = if (controls.prepare_apply_handoff) platform_time.monotonicNs() +| apply_handoff_timeout_ns else 0,
+            .apply_handoff_until_ns = .init(if (controls.prepare_apply_handoff) platform_time.monotonicNs() +| apply_handoff_timeout_ns else 0),
             .apply_projection = if (controls.historical_raft_apply) physical.pin() else null,
             .restore_bootstrap_json = owned_restore_bootstrap_json,
             .initial_child_bootstrap_json = owned_initial_child_bootstrap_json,
@@ -7124,7 +7141,7 @@ test "committed owner apply never opens or closes storage under the raft apply l
             const pinned = entry.apply_projection orelse return error.TestWarmOwnerDidNotAdmit;
             try std.testing.expect(pinned.matchesRaw(first.indexes_json));
             try std.testing.expectEqualStrings("{}", pinned.bytes);
-            try std.testing.expect(entry.apply_handoff_until_ns != 0);
+            try std.testing.expect(entry.apply_handoff_until_ns.load(.acquire) != 0);
             break :blk true;
         };
         if (prepared) break;
@@ -7138,12 +7155,18 @@ test "committed owner apply never opens or closes storage under the raft apply l
     {
         try std.testing.expect(source.physical_catalogs.mutex.tryLock());
         defer source.physical_catalogs.mutex.unlock();
+        var fail_encoding = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(fail_encoding.allocator(), 1, "docs", first, first_batch, 1, 1));
+        Source.lock(&source.mutex);
+        const still_reserved = source.entries.items[0].apply_handoff_until_ns.load(.acquire) != 0;
+        source.mutex.unlock();
+        try std.testing.expect(still_reserved);
         try gate.applyCommitted(&source, first, first_batch, 1);
     }
     {
         Source.lock(&source.mutex);
         defer source.mutex.unlock();
-        try std.testing.expectEqual(@as(u64, 0), source.entries.items[0].apply_handoff_until_ns);
+        try std.testing.expectEqual(@as(u64, 0), source.entries.items[0].apply_handoff_until_ns.load(.acquire));
         try std.testing.expect(!source.entries.items[0].retired);
     }
 
