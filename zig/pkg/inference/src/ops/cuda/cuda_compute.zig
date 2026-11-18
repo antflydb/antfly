@@ -4670,6 +4670,23 @@ pub const CudaCompute = struct {
         return (try preprocessEmbeddingGemma2Patches(self, &.{}, tensor.buffer, width, height, @as(usize, width) * 3, target_width, target_height, null)) orelse error.UnsupportedVideoBackend;
     }
 
+    /// Gemma 4's upstream video processor uses bicubic RGB8 resize, then [0, 1]
+    /// rescaling and the GGUF convolution's planar patch layout.
+    pub fn preprocessGemma4ResidentRgb(self: *CudaCompute, rgb: CT, width: u32, height: u32, target_width: u32, target_height: u32) !CT {
+        if (self.capability_profile != .gemma4) return error.InvalidShape;
+        const cb = self.computeBackend();
+        const centered = try self.preprocessEmbeddingGemma2ResidentRgb(rgb, width, height, target_width, target_height);
+        defer cb.free(centered);
+        const scaled = (try cb.multiplyScalar(centered, 0.5)) orelse return error.UnsupportedVideoBackend;
+        defer cb.free(scaled);
+        const pixels = (try cb.addScalar(scaled, 0.5)) orelse return error.UnsupportedVideoBackend;
+        defer cb.free(pixels);
+        const rows: i64 = @as(i64, target_width / 16) * (target_height / 16);
+        const planar = try cb.primTranspose(pixels, &.{ 0, 2, 1 }, &.{ rows, 256, 3 });
+        defer cb.free(planar);
+        return cb.primReshape(planar, &.{ rows, 768 });
+    }
+
     pub fn createEmbeddingGemma2Tensor(self: *CudaCompute, shape: []const i64, dtype: tensor_mod.DType) !CT {
         var count: usize = 1;
         for (shape) |dim| {
@@ -25305,7 +25322,7 @@ fn preprocessEmbeddingGemma2ImagePatchesOp(ctx: *anyopaque, rgb: []const u8, wid
 }
 
 fn preprocessEmbeddingGemma2Patches(self: *CudaCompute, rgb: []const u8, resident: ?buffer_mod.DeviceBuffer, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32, destination: ?buffer_mod.DeviceBuffer) !?CT {
-    if (self.capability_profile != .embedding_gemma2 or self.ctx.info.compute_major < 8) return null;
+    if ((self.capability_profile != .embedding_gemma2 and !(self.capability_profile == .gemma4 and resident != null)) or self.ctx.info.compute_major < 8) return null;
     if (width == 0 or height == 0 or target_width == 0 or target_height == 0 or target_width % 16 != 0 or target_height % 16 != 0) return error.InvalidShape;
     const row_bytes = try checkedMul(width, 3);
     if (stride < row_bytes) return error.InvalidShape;
@@ -25374,7 +25391,7 @@ fn embeddingGemma2ResizeCachePressure(err: anyerror) bool {
 
 // Optional retention must never make an otherwise admissible request fail.
 fn preprocessEmbeddingGemma2PatchesUncached(self: *CudaCompute, rgb: []const u8, resident: ?buffer_mod.DeviceBuffer, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32, destination: ?buffer_mod.DeviceBuffer) !?CT {
-    if (self.capability_profile != .embedding_gemma2 or self.ctx.info.compute_major < 8) return null;
+    if ((self.capability_profile != .embedding_gemma2 and !(self.capability_profile == .gemma4 and resident != null)) or self.ctx.info.compute_major < 8) return null;
     if (width == 0 or height == 0 or target_width == 0 or target_height == 0 or target_width % 16 != 0 or target_height % 16 != 0) return error.InvalidShape;
     const row_bytes = try checkedMul(width, 3);
     if (stride < row_bytes) return error.InvalidShape;

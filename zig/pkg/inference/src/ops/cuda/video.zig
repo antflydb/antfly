@@ -1299,6 +1299,19 @@ test "embeddinggemma2 video CUDA RGB and bicubic patches match the CPU torchvisi
                 const expected = 2 * (reference[c * size[0] * size[1] + (gy * 16 + py) * size[0] + gx * 16 + px] - 0.5);
                 try std.testing.expectEqual(expected, actual[index]);
             };
+            compute.capability_profile = .gemma4;
+            const gemma_before = cb.trainingRuntimeStats();
+            const gemma = try compute.preprocessGemma4ResidentRgb(resident_rgb, width, height, size[0], size[1]);
+            defer cb.free(gemma);
+            compute.capability_profile = .embedding_gemma2;
+            try std.testing.expectEqual(gemma_before.d2h_bytes, cb.trainingRuntimeStats().d2h_bytes);
+            const gemma_actual = try cb.toFloat32(gemma, a);
+            defer a.free(gemma_actual);
+            for (0..size[1] / 16) |gy| for (0..size[0] / 16) |gx| for (0..16) |py| for (0..16) |px| for (0..3) |c| {
+                const index = ((gy * (size[0] / 16) + gx) * 3 + c) * 256 + py * 16 + px;
+                const expected = reference[c * size[0] * size[1] + (gy * 16 + py) * size[0] + gx * 16 + px];
+                try std.testing.expectApproxEqAbs(expected, gemma_actual[index], 1e-7);
+            };
         }
     };
 }
