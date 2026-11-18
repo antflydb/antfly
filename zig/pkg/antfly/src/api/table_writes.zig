@@ -61130,6 +61130,14 @@ fn implementationTests() type {
         }
 
         test "hosted write cache opens current visible root generation" {
+            try runHostedRepairObservationFixture(false);
+        }
+
+        test "hosted repair observes a real terminal shard without dispatching it" {
+            try runHostedRepairObservationFixture(true);
+        }
+
+        fn runHostedRepairObservationFixture(comptime observe_terminal: bool) !void {
             const alloc = std.testing.allocator;
 
             var tmp = std.testing.tmpDir(.{});
@@ -61161,7 +61169,7 @@ fn implementationTests() type {
                             .table_id = 7,
                             .name = "docs",
                             .placement_role = "data",
-                            .indexes_json = "{\"indexes\":[]}",
+                            .indexes_json = if (observe_terminal) "{\"text\":{\"type\":\"full_text\"}}" else "{\"indexes\":[]}",
                         }})[0..]),
                         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
                             .group_id = 7001,
@@ -61232,6 +61240,64 @@ fn implementationTests() type {
             var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), Router.iface(), Executor.iface());
             _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
             defer source.invalidateManagedCache("docs");
+
+            if (observe_terminal) {
+                const table = source.source();
+                const request: db_mod.types.ArtifactRepairRunRequest = .{
+                    .target = .index,
+                    .index_name = "text",
+                    .operator_initiated = true,
+                    .force = true,
+                    .repair_job_id = 1,
+                    .repair_job_created_at_ms = 1,
+                };
+                var dispatched = (try table.repairArtifactIssuesControlled(alloc, "docs", request, .{ .defer_durable_index_repair_execution = true })).?;
+                defer dispatched.deinit(alloc);
+                try std.testing.expectEqualSlices(u64, &.{7001}, dispatched.pending_index_groups.?);
+
+                const repair_state = @import("antfly_source_root").antfly_sources.storage_db_derived_index_repair_state;
+                const repair_cache = try hostedManagedDbCacheForRoot(replica_root_dir);
+                {
+                    var writer = try source.getOrOpenCachedDbMode(repair_cache, path, 7001, "docs", .default);
+                    defer writer.deinit(repair_cache.write_cache.alloc);
+                    const checkpoint = writer.db.async_context.index_repair_checkpoint.?;
+                    var state = try repair_state.loadAt(alloc, checkpoint);
+                    defer state.deinit(alloc);
+                    const existing = state.entries.items[state.findIndex("text").?];
+                    const old = existing.intent;
+                    var terminal = existing;
+                    terminal.intent.phase = .terminal;
+                    var message = "UnsupportedOperation".*;
+                    terminal.intent.last_error = &message;
+                    _ = try repair_state.putEntryAt(alloc, checkpoint, state.identity, .{
+                        .repair_id = old.repair_id,
+                        .revision = old.revision,
+                        .phase = old.phase,
+                        .config_hash = old.config_hash,
+                        .root_generation = old.root_generation,
+                        .owner_epoch = old.owner_epoch,
+                    }, terminal);
+                }
+
+                var observed = (try table.repairArtifactIssuesControlled(alloc, "docs", request, .{
+                    .defer_durable_index_repair_execution = true,
+                    .observe_index_groups = dispatched.pending_index_groups,
+                    .expected_repair_groups = dispatched.repair_groups,
+                })).?;
+                defer observed.deinit(alloc);
+                try std.testing.expect(observed.observed_only);
+                try std.testing.expectEqual(@as(u64, 0), observed.in_progress);
+                try std.testing.expectEqual(@as(u64, 1), observed.failed);
+                try std.testing.expectEqualStrings("UnsupportedOperation", observed.terminal_error.?);
+                try std.testing.expectEqualSlices(u64, &.{}, observed.pending_index_groups.?);
+
+                var writer = try source.getOrOpenCachedDbMode(repair_cache, path, 7001, "docs", .default);
+                defer writer.deinit(repair_cache.write_cache.alloc);
+                var after = try writer.db.loadIndexRepairState(alloc);
+                defer after.deinit(alloc);
+                try std.testing.expectEqual(repair_state.Phase.terminal, after.entries.items[after.findIndex("text").?].intent.phase);
+                return;
+            }
 
             const hosted_cache = try hostedManagedDbCacheForRoot(replica_root_dir);
             var cached_first = try source.getOrOpenCachedDbMode(hosted_cache, path, 7001, "docs", .default_async);

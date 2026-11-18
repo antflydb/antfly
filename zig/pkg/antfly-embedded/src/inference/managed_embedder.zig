@@ -1607,6 +1607,13 @@ pub const ManagedEmbedder = struct {
             self.entry.auth_header_cache.deinit(alloc);
         }
 
+        pub fn cacheHasFixedExpiration(self: *const PreparedQueryEmbedding) bool {
+            if (!self.entry.remote_query_workload) return false;
+            const lease = self.entry.planned_embedding_lease orelse return true;
+            const caps = lease.capabilities orelse return true;
+            return !caps.model_revision_pinning or caps.model_revision == null;
+        }
+
         pub fn cacheKey(self: *const PreparedQueryEmbedding, domain: QueryCacheSecurityDomain, scope: []const u8, text: []const u8) ![32]u8 {
             const base = try queryCacheKeyForEntry(&self.entry, domain, scope, text);
             if (!self.entry.remote_query_workload) return base;
@@ -1619,9 +1626,9 @@ pub const ManagedEmbedder = struct {
             // cache contract as an unversioned embedding endpoint. Keep that
             // namespace distinct from every advertised physical revision.
             hash.update(&routing_scope);
-            if (caps.model_revision) |revision| {
+            if (!self.cacheHasFixedExpiration()) {
                 hash.update(&.{1});
-                hash.update(&revision);
+                hash.update(&caps.model_revision.?);
             } else {
                 hash.update(&.{0});
                 if (lease.descriptor_revision) |descriptor| hash.update(descriptor.slice());

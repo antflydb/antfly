@@ -17236,6 +17236,7 @@ pub const DB = struct {
         lease_authority: IndexRepairLeaseAuthority,
     ) !types.ArtifactRepairResult {
         try checkArtifactRepairCancelled(options);
+        if (req.observe_index_repair) return self.observeIndexRepair(alloc, req);
         if (req.target == .index) return try self.repairIndexIssuesWithRequest(
             alloc,
             req,
@@ -17487,6 +17488,46 @@ pub const DB = struct {
             };
             try self.runArtifactRepairMetadataMaintenanceUntilIdle();
         }
+        return result;
+    }
+
+    /// An observation reports durable state without creating, resuming, or
+    /// dispatching a repair. A worker can retire its intent between polls.
+    fn observeIndexRepair(self: *DB, alloc: Allocator, req: types.ArtifactRepairRunRequest) !types.ArtifactRepairResult {
+        if (req.target != .index or req.control != null or req.repair_id != null) return error.InvalidArgument;
+        const name = req.index_name orelse return error.InvalidArgument;
+        const cfg = self.core.index_manager.get(name) orelse return error.NotFound;
+        const config_hash = types.indexConfigHash(cfg.*);
+        var result: types.ArtifactRepairResult = .{
+            .limit = if (req.limit == 0) 100 else req.limit,
+            .scanned = 1,
+            .observed_only = true,
+        };
+        var state: ?index_repair_state.State = self.loadIndexRepairState(alloc) catch |err| switch (err) {
+            error.FileNotFound, error.DurableIndexRepairStateUnavailable => null,
+            else => return err,
+        };
+        defer if (state) |*loaded| loaded.deinit(alloc);
+        if (state) |*loaded| if (loaded.findIndex(name)) |index| {
+            const intent = loaded.entries.items[index].intent;
+            if (intent.root_generation != self.core.root_generation or intent.group_id != self.localRepairGroupId() or intent.config_hash != config_hash) {
+                result.observation_changed = true;
+                return result;
+            }
+            result.indexes_degraded_before = 1;
+            result.indexes_degraded_after = 1;
+            result.unresolved = 1;
+            result.debt_remaining = true;
+            if (indexRepairActionRequired(intent)) {
+                result.failed = 1;
+                const fallback = if (intent.automation == .paused) "index_repair_paused" else "index_repair_failed";
+                result.terminal_error = try alloc.dupe(u8, intent.last_error orelse fallback);
+            } else {
+                result.in_progress = 1;
+            }
+            return result;
+        };
+        if (try self.indexGenerationRepairRequired(alloc, name)) result.observation_changed = true;
         return result;
     }
 

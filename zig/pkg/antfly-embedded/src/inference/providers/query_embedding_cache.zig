@@ -18,6 +18,7 @@ const cache_budget = @import("antfly_cache_budget");
 const platform_time = @import("antfly_platform").time;
 
 pub const Key = [32]u8;
+pub const Expiration = enum { sliding, fixed };
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const Config = struct {
@@ -86,6 +87,7 @@ const Entry = struct {
     vector: []f32,
     charge_bytes: usize,
     expires_at_ns: u64,
+    expiration: Expiration,
     pins: usize = 0,
     retired: bool = false,
     newer: ?*Entry = null,
@@ -199,7 +201,7 @@ pub const QueryEmbeddingCache = struct {
             if (self.nowNs() < entry.expires_at_ns) return;
             self.removeEntryLocked(entry, budget, true);
         }
-        self.admitLocked(key, vector, budget) catch {
+        self.admitLocked(key, vector, budget, .sliding) catch {
             self.counters.rejected_admissions +|= 1;
         };
     }
@@ -227,7 +229,7 @@ pub const QueryEmbeddingCache = struct {
         context: *anyopaque,
         compute: ComputeFn,
     ) ![]f32 {
-        return self.getOrComputeWithRetryHint(budget, caller_alloc, key, deadline_ns, cancellation, context, compute, null);
+        return self.getOrComputeWithRetryHint(budget, caller_alloc, key, deadline_ns, cancellation, context, compute, null, .sliding);
     }
 
     pub fn getOrComputeWithRetryHint(
@@ -240,12 +242,13 @@ pub const QueryEmbeddingCache = struct {
         context: *anyopaque,
         compute: ComputeFn,
         retry_not_before_ns: ?*u64,
+        expiration: Expiration,
     ) ![]f32 {
         while (true) {
             if (retry_not_before_ns) |hint| hint.* = 0;
             try cancellation.check();
             if (deadlineExpiredAt(self.nowNs(), deadline_ns)) return error.Timeout;
-            const vector = self.getOrComputeOnce(budget, caller_alloc, key, deadline_ns, cancellation, context, compute, retry_not_before_ns) catch |err| {
+            const vector = self.getOrComputeOnce(budget, caller_alloc, key, deadline_ns, cancellation, context, compute, retry_not_before_ns, expiration) catch |err| {
                 if (err == error.QueryEmbeddingProducerAbandoned) continue;
                 return err;
             };
@@ -266,6 +269,7 @@ pub const QueryEmbeddingCache = struct {
         context: *anyopaque,
         compute: ComputeFn,
         retry_not_before_ns: ?*u64,
+        expiration: Expiration,
     ) ![]f32 {
         try self.chargeWork(.request, 1);
         if (deadlineExpiredAt(self.nowNs(), deadline_ns)) return error.Timeout;
@@ -400,7 +404,7 @@ pub const QueryEmbeddingCache = struct {
         self.recordProducerDurationLocked(compute_started_ns);
         flight.result = computed;
         flight.done = true;
-        self.admitLocked(key, computed, budget) catch {
+        self.admitLocked(key, computed, budget, expiration) catch {
             self.counters.rejected_admissions +|= 1;
         };
         flight.ready.set(io);
@@ -536,7 +540,7 @@ pub const QueryEmbeddingCache = struct {
         self.alloc.destroy(flight);
     }
 
-    fn admitLocked(self: *QueryEmbeddingCache, key: Key, vector: []const f32, budget: *cache_budget.CacheBudget) !void {
+    fn admitLocked(self: *QueryEmbeddingCache, key: Key, vector: []const f32, budget: *cache_budget.CacheBudget, expiration: Expiration) !void {
         if (self.config.max_bytes == 0 or self.config.ttl_ns == 0) return;
         const charge = entryCharge(vector.len);
         if (charge > self.config.max_bytes) {
@@ -566,6 +570,7 @@ pub const QueryEmbeddingCache = struct {
             .vector = owned_vector,
             .charge_bytes = charge,
             .expires_at_ns = self.nowNs() +| self.config.ttl_ns,
+            .expiration = expiration,
         };
         try self.entries.put(self.alloc, key, entry);
         self.linkNewestLocked(entry);
@@ -580,7 +585,7 @@ pub const QueryEmbeddingCache = struct {
     }
 
     fn touchLocked(self: *QueryEmbeddingCache, entry: *Entry, now_ns: u64) void {
-        entry.expires_at_ns = now_ns +| self.config.ttl_ns;
+        if (entry.expiration == .sliding) entry.expires_at_ns = now_ns +| self.config.ttl_ns;
         if (self.newest == entry) return;
         self.unlinkLocked(entry);
         self.linkNewestLocked(entry);
@@ -604,6 +609,9 @@ pub const QueryEmbeddingCache = struct {
         var expired: usize = 0;
         while (expired < max_entries) : (expired += 1) {
             const entry = self.oldest orelse return;
+            // Fixed-expiry entries can be newer than this LRU position.
+            // Lookups enforce their individual deadlines. Stop the sweep
+            // here to keep maintenance bounded by the expired LRU prefix.
             if (now_ns < entry.expires_at_ns) return;
             self.removeEntryLocked(entry, budget, true);
         }
@@ -1176,6 +1184,33 @@ pub fn testStatsExpireIdleEntries() !void {
     try std.testing.expectEqual(@as(u64, 0), current.expirations);
     try std.testing.expectEqual(@as(u64, 0), current.rejected_admissions);
     try std.testing.expectEqual(@as(usize, 0), budget.stats().used_bytes);
+}
+
+test "query embedding cache fixed TTL survives hot hits without renewal" {
+    const alloc = std.testing.allocator;
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer clock.deinit();
+    var budget = cache_budget.CacheBudget.init(1024 * 1024);
+    var cache = QueryEmbeddingCache.init(alloc, clock.io(), .{ .ttl_ns = 50 });
+    defer cache.deinit(&budget);
+    var compute = TestCompute{ .value = 3 };
+    const key: Key = @splat(7);
+
+    alloc.free(try cache.getOrComputeWithRetryHint(&budget, alloc, key, null, .none, &compute, TestCompute.run, null, .fixed));
+    compute.value = 4;
+    for (0..4) |_| {
+        try clock.advance(10);
+        const hit = try cache.getOrComputeWithRetryHint(&budget, alloc, key, null, .none, &compute, TestCompute.run, null, .fixed);
+        defer alloc.free(hit);
+        try std.testing.expectEqual(@as(f32, 3), hit[0]);
+    }
+    try std.testing.expectEqual(@as(u64, 1), cache.stats(&budget).producer_computations);
+
+    try clock.advance(10);
+    const recomputed = try cache.getOrComputeWithRetryHint(&budget, alloc, key, null, .none, &compute, TestCompute.run, null, .fixed);
+    defer alloc.free(recomputed);
+    try std.testing.expectEqual(@as(f32, 4), recomputed[0]);
+    try std.testing.expectEqual(@as(u64, 2), cache.stats(&budget).producer_computations);
 }
 
 test "query embedding cache skips zero TTL retention" {

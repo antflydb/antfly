@@ -248,7 +248,7 @@ fn computePreparedQueryVector(compute: *QueryComputeContext, alloc: std.mem.Allo
             error.QueryEmbeddingNotCacheable => return storage.cache.computeUncached(alloc, cache_deadline, compute, QueryComputeContext.run),
             else => return err,
         };
-        return storage.cache.getOrComputeWithRetryHint(storage.budget, alloc, key, cache_deadline, options.cancellation orelse .none, compute, QueryComputeContext.run, options.retry_not_before_ns);
+        return storage.cache.getOrComputeWithRetryHint(storage.budget, alloc, key, cache_deadline, options.cancellation orelse .none, compute, QueryComputeContext.run, options.retry_not_before_ns, if (compute.prepared.cacheHasFixedExpiration()) .fixed else .sliding);
     }
     return storage.cache.computeUncached(alloc, cache_deadline, compute, QueryComputeContext.run);
 }
