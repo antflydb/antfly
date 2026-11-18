@@ -98,6 +98,16 @@ const CountingOutput = struct {
     }
 };
 
+pub const VerifiedNativeTree = struct {
+    path: []const u8,
+    stat_digest: [Sha256.digest_length]u8,
+};
+
+pub const VerifiedNativeManifest = struct {
+    path: []const u8,
+    sha256: [Sha256.digest_length]u8,
+};
+
 pub const PackOptions = struct {
     header_backup_id: [16]u8 = @as([16]u8, @splat(0)),
     backup_id: []const u8 = "",
@@ -105,6 +115,8 @@ pub const PackOptions = struct {
     created_at_unix_ns: i64 = 0,
     storage_engine: []const u8 = "antfly-native",
     capture: bundle.CaptureMode = .full,
+    verified_trees: []const VerifiedNativeTree = &.{},
+    verified_manifest: ?VerifiedNativeManifest = null,
 };
 
 pub fn readManifestFromFile(
@@ -189,6 +201,14 @@ pub fn packNativePathsToWriter(
         files.deinit(alloc);
     }
     if (files.items.len == 0) return error.BackupArtifactMissing;
+
+    if (options.verified_manifest) |expected| {
+        const index = sourceFileLowerBound(files.items, expected.path);
+        if (index == files.items.len or !std.mem.eql(u8, files.items[index].logical_path, expected.path) or
+            !std.mem.eql(u8, &files.items[index].sha256, &expected.sha256))
+            return error.BackupArtifactIntegrityMismatch;
+    }
+    for (options.verified_trees) |tree| try verifyNativeTreeGeneration(alloc, files.items, tree);
 
     const objects = try alloc.alloc(bundle.ObjectDescriptor, files.items.len);
     defer alloc.free(objects);
@@ -330,6 +350,34 @@ pub fn packNativePathsToWriter(
         .footer_payload_size = footer.len,
     });
     try sink.writeAll(&trailer);
+}
+
+fn sourceFileLowerBound(files: []const SourceFile, key: []const u8) usize {
+    var lo: usize = 0;
+    var hi = files.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (std.mem.lessThan(u8, files[mid].logical_path, key)) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+fn verifyNativeTreeGeneration(alloc: std.mem.Allocator, files: []const SourceFile, tree: VerifiedNativeTree) !void {
+    const backups = @import("../api/backups.zig");
+    const prefix = try std.fmt.allocPrint(alloc, "{s}/", .{tree.path});
+    defer alloc.free(prefix);
+    const start = sourceFileLowerBound(files, prefix);
+    var end = start;
+    while (end < files.len and std.mem.startsWith(u8, files[end].logical_path, prefix)) : (end += 1) {}
+    var hasher = Sha256.init(.{});
+    backups.hashArtifactU64(&hasher, @intCast(end - start));
+    for (files[start..end]) |file| {
+        backups.hashArtifactBytes(&hasher, file.logical_path[prefix.len..]);
+        backups.hashLocalArtifactStat(&hasher, file.stat);
+    }
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    if (!std.mem.eql(u8, &digest, &tree.stat_digest)) return error.SourceFileChanged;
 }
 
 fn collectSourceFiles(

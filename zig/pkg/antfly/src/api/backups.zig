@@ -1955,10 +1955,16 @@ pub const ClusterTableRestoreStatus = struct {
     @"error": ?[]const u8 = null,
 };
 
+pub const BackupTableSelector = struct {
+    name: []const u8,
+    selector: []const u8,
+};
+
 pub const BackupInfo = struct {
     backup_id: []const u8,
     timestamp: []const u8,
     tables: []const []const u8,
+    table_selectors: []const BackupTableSelector = &.{},
     location: []const u8,
     antfly_version: []const u8,
 };
@@ -2138,13 +2144,25 @@ test "filesystem backup location returns the canonical authorized identity" {
     defer alloc.free(alias);
     try std.Io.Dir.symLinkAbsolute(io, physical, alias, .{ .is_directory = true });
 
-    // A connection-scoped file URI is rooted at configured_root; its URI path
-    // is intentionally relative to that capability root.
-    const resolved = try resolveFilesystemLocationAlloc(alloc, root, "file:///alias/new/backup", io);
+    const location = try std.fmt.allocPrint(alloc, "file://{s}/alias/new/backup", .{root});
+    defer alloc.free(location);
+    const resolved = try resolveFilesystemLocationAlloc(alloc, root, location, io);
+    try std.testing.expectError(error.ConnectionPrefixDenied, resolveFilesystemLocationAlloc(alloc, root, "file:///outside-capability-root/new", io));
     defer alloc.free(resolved);
     const expected = try std.fs.path.join(alloc, &.{ physical, "new", "backup" });
     defer alloc.free(expected);
     try std.testing.expectEqualStrings(expected, resolved);
+
+    var outside = std.testing.tmpDir(.{});
+    defer outside.cleanup();
+    const outside_root = try outside.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(outside_root);
+    const escape = try std.fs.path.join(alloc, &.{ root, "escape" });
+    defer alloc.free(escape);
+    try std.Io.Dir.symLinkAbsolute(io, outside_root, escape, .{ .is_directory = true });
+    const escaped_location = try std.fmt.allocPrint(alloc, "file://{s}/escape/new", .{root});
+    defer alloc.free(escaped_location);
+    try std.testing.expectError(error.ConnectionPrefixDenied, resolveFilesystemLocationAlloc(alloc, root, escaped_location, io));
 
     var opened = try openOrCreateBackupRootNoFollow(io, resolved);
     opened.close(io);
@@ -10906,6 +10924,16 @@ fn backupInfoFromManifest(alloc: std.mem.Allocator, manifest: *const ClusterBack
         tables[i] = if (table.catalog_target) |target| try target.displayNameAlloc(alloc) else try alloc.dupe(u8, table.name);
         initialized_tables += 1;
     }
+    const table_selectors = try alloc.alloc(BackupTableSelector, manifest.tables.len);
+    var initialized_selectors: usize = 0;
+    errdefer {
+        for (table_selectors[0..initialized_selectors]) |entry| alloc.free(entry.selector);
+        alloc.free(table_selectors);
+    }
+    for (manifest.tables, tables, table_selectors) |table, name, *entry| {
+        entry.* = .{ .name = name, .selector = try alloc.dupe(u8, table.name) };
+        initialized_selectors += 1;
+    }
     const backup_id = try alloc.dupe(u8, manifest.backup_id);
     errdefer alloc.free(backup_id);
     const timestamp = try alloc.dupe(u8, manifest.timestamp);
@@ -10917,6 +10945,7 @@ fn backupInfoFromManifest(alloc: std.mem.Allocator, manifest: *const ClusterBack
         .backup_id = backup_id,
         .timestamp = timestamp,
         .tables = tables,
+        .table_selectors = table_selectors,
         .location = owned_location,
         .antfly_version = version,
     };
@@ -11276,13 +11305,43 @@ pub fn findClusterTable(
     manifest: *const ClusterBackupManifest,
     table_name: []const u8,
 ) ?*const ClusterTableBackupEntry {
+    // Exact storage selectors are authoritative. Human-readable names are
+    // considered only when no exact selector matches.
     for (manifest.tables) |*table| {
         if (std.mem.eql(u8, table.name, table_name)) return table;
-        if (table.catalog_target) |target| {
-            if (target.isDefault() and std.mem.eql(u8, target.table, table_name)) return table;
-        }
     }
-    return null;
+    const domain = @import("antfly_local_sources").system_catalog_domain;
+    const explicit_target = if (std.mem.startsWith(u8, table_name, domain.target_key_prefix))
+        domain.Target.parse(table_name) catch return null
+    else
+        null;
+    var match: ?*const ClusterTableBackupEntry = null;
+    for (manifest.tables) |*table| {
+        const matches = if (table.catalog_target) |target|
+            if (explicit_target) |explicit|
+                std.mem.eql(u8, target.database, explicit.database) and std.mem.eql(u8, target.namespace, explicit.namespace) and std.mem.eql(u8, target.table, explicit.table)
+            else if (target.isDefault())
+                std.mem.eql(u8, target.table, table_name)
+            else
+                clusterBackupDisplayNameMatches(target, table_name)
+        else
+            false;
+        if (!matches) continue;
+        // Dotted public display names can collide with literal names or
+        // another display name. The caller must use an exact identity then.
+        if (match != null) return null;
+        match = table;
+    }
+    return match;
+}
+
+fn clusterBackupDisplayNameMatches(target: @import("antfly_local_sources").system_catalog_domain.Target, name: []const u8) bool {
+    var rest = name;
+    for ([_][]const u8{ target.database, target.namespace }) |part| {
+        if (rest.len <= part.len or !std.mem.startsWith(u8, rest, part) or rest[part.len] != '.') return false;
+        rest = rest[part.len + 1 ..];
+    }
+    return std.mem.eql(u8, target.table, rest);
 }
 
 pub const createTableRequestFromManifest = @import("antfly_local_sources").api_local_backups.createTableRequestFromManifest;
@@ -12032,6 +12091,8 @@ pub fn freeBackupInfo(alloc: std.mem.Allocator, info: BackupInfo) void {
     alloc.free(@constCast(info.backup_id));
     alloc.free(@constCast(info.timestamp));
     for (info.tables) |table| alloc.free(@constCast(table));
+    for (info.table_selectors) |entry| alloc.free(entry.selector);
+    alloc.free(info.table_selectors);
     alloc.free(info.tables);
     alloc.free(@constCast(info.location));
     alloc.free(@constCast(info.antfly_version));

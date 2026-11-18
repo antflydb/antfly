@@ -377,6 +377,8 @@ pub const StepItem = struct {
 };
 
 pub const Snapshot = struct {
+    prefill_tokens: usize = 0,
+    decode_context_tokens: usize = 0,
     waiting_requests: usize,
     prefill_requests: usize,
     decode_requests: usize,
@@ -1451,7 +1453,12 @@ pub const NativeGenerateCoordinator = struct {
         var waiting_requests: usize = 0;
         var prefill_requests: usize = 0;
         var decode_requests: usize = 0;
+        var prefill_tokens: usize = 0;
+        var decode_context_tokens: usize = 0;
         for (self.entries.items) |entry| {
+            if (entry.phase == .decode) {
+                decode_context_tokens +|= entry.total_prompt_tokens +| entry.generated_tokens;
+            } else prefill_tokens +|= entry.prompt_tokens -| entry.prompt_tokens_processed;
             switch (entry.phase) {
                 .waiting => waiting_requests += 1,
                 .prefill => prefill_requests += 1,
@@ -1459,6 +1466,8 @@ pub const NativeGenerateCoordinator = struct {
             }
         }
         return .{
+            .prefill_tokens = prefill_tokens,
+            .decode_context_tokens = decode_context_tokens,
             .waiting_requests = waiting_requests,
             .prefill_requests = prefill_requests,
             .decode_requests = decode_requests,

@@ -201,6 +201,45 @@ func TestKnowledgeQueryRevalidatesAndPreservesNumbers(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestKnowledgeQueryRecapturesOnlyDiscardedReads(t *testing.T) {
+	for _, mode := range []string{"settles", "keeps-changing", "expires", "canceled"} {
+		t.Run(mode, func(t *testing.T) {
+			plan, k := knowledgeFixture(t)
+			expires := time.Now().Add(time.Minute).Unix()
+			b := Binding{ID: testSourceID, Table: "docs", Knowledge: &k, Status: "searchable", ValidUntil: &expires}
+			c := &knowledgeClient{config: plan.Indexes[0].Config, complete: true, generation: 1 << 53, response: `{"responses":[{"graph_results":{"source_knowledge":{"nodes":[]}}}],"live_read":true}`}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			queries := 0
+			c.onQuery = func() {
+				queries++
+				if queries == 1 || mode == "keeps-changing" {
+					c.generation++
+				}
+				if mode == "expires" {
+					expires = time.Now().Unix() - 1
+				}
+				if mode == "canceled" {
+					cancel()
+				}
+			}
+			raw, err := QueryKnowledge(ctx, c, b, KnowledgeRequest{Graph: "facts", Start: []string{"a"}}, "research")
+			if mode == "settles" {
+				require.NoError(t, err)
+				require.Contains(t, string(raw), "source_knowledge")
+			} else {
+				require.Error(t, err)
+				require.Empty(t, raw)
+			}
+			expected := 2
+			if mode == "expires" || mode == "canceled" {
+				expected = 1
+			}
+			require.Equal(t, expected, queries)
+		})
+	}
+}
+
 func TestKnowledgeLegacyUpdatePreservesAndExplicitClear(t *testing.T) {
 	s, _, _ := serviceFixture(t)
 	_, k := knowledgeFixture(t)

@@ -24263,13 +24263,7 @@ pub const IndexManager = struct {
                     cfg,
                     runtime_schema,
                 );
-                const historical_projection = [_]TextProjectionProvenance{
-                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 0),
-                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 1),
-                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 2),
-                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 3),
-                };
-                ensureTextProjectionProvenance(self.alloc, &persistent, projection_provenance, historical_projection, read_only) catch |err| {
+                ensureTextProjectionProvenance(self.alloc, &persistent, projection_provenance, cfg, runtime_schema, read_only) catch |err| {
                     std.log.warn("full_text open failed step=projection_provenance name={s} err={s}", .{
                         cfg.name,
                         @errorName(err),
@@ -40435,11 +40429,27 @@ fn saveTextProjectionProvenance(
     try persistent.writeGenerationMetadata(persistent_mod.text_projection_provenance_meta_key, data);
 }
 
+// Embedded files without an explicit public schema use the schema-less
+// mapper. Adoption supplies the public default schema. Qualify only that exact
+// transition for a private rebuild; arbitrary schema or analyzer drift must
+// continue to fail closed.
+fn embeddedSchemalessProjectionWitness(alloc: Allocator, cfg: types.IndexConfig, schema: ?schema_mod.TableSchema, expected: TextProjectionProvenance) !TextProjectionProvenance {
+    const current = schema orelse return expected;
+    const tables = @import("../../../api/tables.zig");
+    var public = try tables.parseValidatedTableSchema(alloc, tables.default_schema_json);
+    defer public.deinit(alloc);
+    const defaults = try tables.deriveRuntimeTableSchema(alloc, public);
+    defer schema_mod.freeSchema(alloc, defaults);
+    if (!try schema_mod.schemasEqualForPublicBinding(alloc, current, defaults)) return expected;
+    return try TextProjectionProvenance.fromRuntimeSchema(alloc, cfg, null);
+}
+
 fn ensureTextProjectionProvenance(
     alloc: Allocator,
     persistent: *persistent_mod.PersistentIndex,
     expected: TextProjectionProvenance,
-    historical: [4]TextProjectionProvenance,
+    cfg: types.IndexConfig,
+    runtime_schema: ?schema_mod.TableSchema,
     read_only: bool,
 ) !void {
     const encoded = try persistent.readGenerationMetadataAlloc(
@@ -40453,9 +40463,16 @@ fn ensureTextProjectionProvenance(
     if (persistent.hasPhysicalSegments()) {
         // Only the exact prior projection witness authorizes an automatic
         // private replacement. Unknown drift remains manual repair debt.
-        if (persisted) |witness| for (historical) |prior| {
-            if (!prior.eql(expected) and witness.eql(prior)) return error.TextProjectionUpgradeRequired;
-        };
+        if (persisted) |witness| {
+            // Qualify migration witnesses only after the common matching and
+            // empty-generation paths. Healthy opens never derive old schemas.
+            const schemaless = try embeddedSchemalessProjectionWitness(alloc, cfg, runtime_schema, expected);
+            if (!schemaless.eql(expected) and witness.eql(schemaless)) return error.TextProjectionUpgradeRequired;
+            inline for (0..4) |minor| {
+                const prior = try TextProjectionProvenance.fromRuntimeSchemaSemantics(alloc, cfg, runtime_schema, 2, minor);
+                if (!prior.eql(expected) and witness.eql(prior)) return error.TextProjectionUpgradeRequired;
+            }
+        }
         // There is no trustworthy upgrade witness for legacy postings. Keep
         // the configured index visible through load status, but do not attach
         // analyzers that may interpret its postings under different semantics.
