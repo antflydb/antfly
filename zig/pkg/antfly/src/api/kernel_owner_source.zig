@@ -344,6 +344,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []u8,
         path: []u8,
         descriptor: descriptor_contract.Descriptor,
+        entry: ?db_types.OrderedApplyReceipt = null,
+        claimed: bool = false, // Protected by the owner registry mutex.
         prepare_graph_indexes: bool = false,
         retry_delay_ms: u32 = 2,
         next_log_ns: u64 = 0,
@@ -660,7 +662,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 if (hooks.before_open) |before_open| before_open(hooks.ptr);
             };
             const opened = blk: {
-                var lease = self.acquireDescriptorOnce(request.group_id, request.table_name, request.path, request.descriptor, .shared, .resident, .{ .historical_raft_apply = true, .prepare_apply_handoff = true, .prepare_graph_indexes = request.prepare_graph_indexes }) catch |err| {
+                var lease = self.acquireDescriptorOnce(request.group_id, request.table_name, request.path, request.descriptor, .shared, .resident, .{ .historical_raft_apply = true, .apply_open = request, .prepare_graph_indexes = request.prepare_graph_indexes }) catch |err| {
                     switch (err) {
                         error.StorageKernelOwnerTransitionRequired,
                         error.StorageReadTemporarilyUnavailable,
@@ -702,6 +704,11 @@ pub const ProvisionedKernelOwnerSource = struct {
                 self.mutex.unlock();
                 request.deinit(self.alloc);
                 return;
+            }
+            if (request.claimed) {
+                self.mutex.unlock();
+                request.deinit(self.alloc);
+                continue;
             }
             // A queued group owns one slot until its exact descriptor opens;
             // retrying a transition does not allocate or grow the backlog.
@@ -1710,7 +1717,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const needs_index_catalog = req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
             req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.transaction != null;
         var lease = if (!@import("builtin").is_test or self.apply_control_started.load(.acquire))
-            try self.acquireApplyOnlyWithCatalog(group_id, table_name, descriptor, needs_index_catalog)
+            try self.acquireApplyOnlyWithCatalog(group_id, table_name, descriptor, needs_index_catalog, .{ .term = raft_term, .index = raft_index })
         else blk: {
             // Direct owner tests and non-hosted callers have no progress
             // driver or borrowed control executor. Hosted Raft always binds
@@ -3150,7 +3157,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         execution_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
         cancellation: ?db_types.CancellationToken = null,
         historical_raft_apply: bool = false,
-        prepare_apply_handoff: bool = false,
+        apply_open: ?*const ApplyOpen = null,
         prepare_graph_indexes: bool = false,
         allow_deferred_catalog: bool = false,
 
@@ -4129,7 +4136,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         descriptor: descriptor_contract.Descriptor,
     ) !Lease {
-        return self.acquireApplyOnlyWithCatalog(group_id, table_name, descriptor, false);
+        return self.acquireApplyOnlyWithCatalog(group_id, table_name, descriptor, false, null);
     }
 
     fn acquireApplyOnlyWithCatalog(
@@ -4138,12 +4145,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         raw_descriptor: descriptor_contract.Descriptor,
         needs_index_catalog: bool,
+        entry: ?db_types.OrderedApplyReceipt,
     ) !Lease {
         var physical = self.physical_catalogs.lookup(group_id, raw_descriptor.indexes_json) catch null;
         defer if (physical) |*projection| projection.deinit();
 
         if (!self.mutex.tryLock()) return error.RaftApplyWriterUnavailable;
         const initial = self.tryAcquireWarmApplyLocked(group_id, table_name, raw_descriptor, if (physical) |cut| cut.bytes else null, needs_index_catalog);
+        if (initial) |lease| self.claimApplyOpenLocked(lease.entry, entry);
         const may_queue = !self.quiescing and !self.apply_control_stopping and
             !self.publicationPendingLocked(group_id, table_name) and self.apply_control_io != null and
             !self.applyRequestPendingLocked(group_id, table_name) and
@@ -4159,6 +4168,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         // Prepare graph namespaces on the control executor before deriving
         // document field edges or applying graph mutations. Historical opens
         // keep newer schemas and sibling indexes intact.
+        pending.entry = entry;
         pending.prepare_graph_indexes = needs_index_catalog;
         var pending_owned = true;
         defer if (pending_owned) pending.deinit(self.alloc);
@@ -4170,7 +4180,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         // prepared the queue item. Recheck without building a projection.
         if (physical == null)
             physical = self.physical_catalogs.lookup(group_id, raw_descriptor.indexes_json) catch null;
-        if (self.tryAcquireWarmApplyLocked(group_id, table_name, raw_descriptor, if (physical) |cut| cut.bytes else null, needs_index_catalog)) |lease| return lease;
+        if (self.tryAcquireWarmApplyLocked(group_id, table_name, raw_descriptor, if (physical) |cut| cut.bytes else null, needs_index_catalog)) |lease| {
+            self.claimApplyOpenLocked(lease.entry, entry);
+            return lease;
+        }
         if (self.apply_control_io == null or self.applyRequestPendingLocked(group_id, table_name) or
             self.apply_control_pending.items.len + @as(usize, @intFromBool(self.apply_control_active != null)) >= apply_control_max_pending)
             return error.RaftApplyWriterUnavailable;
@@ -4178,6 +4191,33 @@ pub const ProvisionedKernelOwnerSource = struct {
         pending_owned = false;
         self.apply_control_wake.set(self.apply_control_io.?);
         return error.RaftApplyWriterUnavailable;
+    }
+
+    fn claimApplyOpenLocked(self: *ProvisionedKernelOwnerSource, owner: *Entry, entry: ?db_types.OrderedApplyReceipt) void {
+        const receipt = entry orelse return;
+        const Match = struct {
+            fn same(request: *const ApplyOpen, expected: *const Entry, position: db_types.OrderedApplyReceipt) bool {
+                const queued = request.entry orelse return false;
+                return request.group_id == expected.group_id and std.mem.eql(u8, request.table_name, expected.table_name) and
+                    queued.term == position.term and queued.index == position.index;
+            }
+        };
+        var claimed = false;
+        if (self.apply_control_active) |active| {
+            if (!active.claimed and Match.same(active, owner, receipt)) {
+                active.claimed = true;
+                claimed = true;
+            }
+        }
+        for (self.apply_control_pending.items) |pending| {
+            if (!pending.claimed and Match.same(pending, owner, receipt)) {
+                pending.claimed = true;
+                claimed = true;
+                break;
+            }
+        }
+        if (claimed and owner.apply_handoff_until_ns.load(.acquire) == 0)
+            owner.apply_handoff_until_ns.store(platform_time.monotonicNs() +| apply_handoff_timeout_ns, .release);
     }
 
     const apply_handoff_timeout_ns = 5 * std.time.ns_per_s;
@@ -4246,6 +4286,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!self.mutex.tryLock()) return error.StorageKernelOwnerTransitionRequired;
         defer self.mutex.unlock();
         if (self.quiescing) return error.Canceled;
+        if (controls.apply_open) |request| {
+            if (request.claimed or self.apply_control_stopping) return error.Canceled;
+        }
         if (!controls.historical_raft_apply) if (controls.catalog_observation) |incoming| {
             const observation = try self.catalog_observations.getOrPut(self.alloc, group_id);
             var stale = false;
@@ -4345,7 +4388,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 entry.resident = true;
                 entry.transient_retirement_pending = false;
             }
-            if (controls.prepare_apply_handoff)
+            if (controls.apply_open != null)
                 entry.apply_handoff_until_ns.store(platform_time.monotonicNs() +| apply_handoff_timeout_ns, .release);
             if (controls.historical_raft_apply) {
                 const pin = physical.pin();
@@ -4449,7 +4492,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .identity = descriptor.identity,
             .schema_json = owned_schema_json,
             .indexes_json = owned_indexes_json,
-            .apply_handoff_until_ns = .init(if (controls.prepare_apply_handoff) platform_time.monotonicNs() +| apply_handoff_timeout_ns else 0),
+            .apply_handoff_until_ns = .init(if (controls.apply_open != null) platform_time.monotonicNs() +| apply_handoff_timeout_ns else 0),
             .apply_projection = if (controls.historical_raft_apply) physical.pin() else null,
             .restore_bootstrap_json = owned_restore_bootstrap_json,
             .initial_child_bootstrap_json = owned_initial_child_bootstrap_json,
@@ -7254,6 +7297,71 @@ test "committed owner apply never opens or closes storage under the raft apply l
     try std.testing.expect(std.mem.indexOf(u8, value.bytes(), "\"count\":1") != null);
 }
 
+test "committed owner apply consumes an independently opened owner before delayed control work" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Source = ProvisionedKernelOwnerSource;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-1/table-db", .{root});
+    defer alloc.free(path);
+    var source = Source.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    const Gate = struct {
+        io: std.Io,
+        entered: std.Io.Event = .unset,
+        proceed: std.Io.Event = .unset,
+        fn beforeOpen(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.set(self.io);
+            self.proceed.waitUncancelable(self.io);
+        }
+    };
+    var gate = Gate{ .io = io };
+    defer gate.proceed.set(io);
+    source.test_apply_control_hooks = .{ .ptr = &gate, .before_open = Gate.beforeOpen };
+    try source.startApplyControl(io);
+    const descriptor: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .schema_json = "{\"version\":0}",
+    };
+    const batch: db_types.BatchRequest = .{ .writes = &.{.{ .key = "doc:a", .value = "{}" }} };
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!gate.entered.isSet()) {
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, batch, 2, 1));
+        if (platform_time.monotonicNs() >= deadline) return error.TestColdOwnerDidNotQueue;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    var foreground = try source.acquireDescriptorOnce(1, "docs", path, descriptor, .shared, .resident, .{});
+    foreground.deinit();
+    while (true) {
+        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, batch, 2, 1) catch |err| {
+            if (err != error.RaftApplyWriterUnavailable) return err;
+            if (platform_time.monotonicNs() >= deadline) return error.TestWarmOwnerDidNotAdmit;
+            try io.sleep(.fromMilliseconds(1), .awake);
+            continue;
+        };
+        break;
+    }
+    gate.proceed.set(io);
+    while (true) {
+        const done = blk: {
+            Source.lock(&source.mutex);
+            defer source.mutex.unlock();
+            if (source.apply_control_active != null or source.apply_control_pending.items.len != 0) break :blk false;
+            try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
+            try std.testing.expectEqual(@as(u64, 0), source.entries.items[0].apply_handoff_until_ns.load(.acquire));
+            break :blk true;
+        };
+        if (done) break;
+        if (platform_time.monotonicNs() >= deadline) return error.TestApplyControlDidNotFinish;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
 test "owner shutdown joins recovery close while raft progress remains available" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
@@ -7972,7 +8080,7 @@ test "owner descriptor alias swaps retain a warm leased physical owner across ca
         try std.testing.expect(!entry.retired);
         try std.testing.expectEqual(@as(usize, 2), entry.active_users);
     }
-    var apply = try source.acquireApplyOnlyWithCatalog(1, "docs", descriptor, false);
+    var apply = try source.acquireApplyOnlyWithCatalog(1, "docs", descriptor, false, null);
     defer apply.deinit();
     try std.testing.expect(apply.entry == &entry);
     try std.testing.expectEqual(@as(u64, 0), source.owner_cache_misses.load(.monotonic));
@@ -8726,7 +8834,7 @@ test "source owner privacy progress keeps writer and apply leases warm" {
         var applied = try source.acquireDescriptorOnce(1, "docs", path, descriptor, .shared, .resident, .{ .historical_raft_apply = true });
         defer applied.deinit();
         try std.testing.expectEqual(writer.entry, applied.entry);
-        var warm_apply = try source.acquireApplyOnlyWithCatalog(1, "docs", descriptor, false);
+        var warm_apply = try source.acquireApplyOnlyWithCatalog(1, "docs", descriptor, false, null);
         defer warm_apply.deinit();
         try std.testing.expectEqual(writer.entry, warm_apply.entry);
         try std.testing.expect(!writer.entry.retired);
@@ -8826,7 +8934,7 @@ test "source owner privacy projection abandoned admissions retain no groups" {
         const blocked = source.acquireDescriptorOnce(group, "docs", "/unused", descriptor, .shared, .resident, .{});
         source.mutex.unlock();
         try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, blocked);
-        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.acquireApplyOnlyWithCatalog(group, "docs", descriptor, false));
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.acquireApplyOnlyWithCatalog(group, "docs", descriptor, false, null));
         try std.testing.expectEqual(@as(usize, 0), source.physical_catalogs.entries.count());
         try source.retireGroupAndWait(group, "docs");
     }
