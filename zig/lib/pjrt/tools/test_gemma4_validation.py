@@ -45,6 +45,13 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(report["passed"])
         self.assertEqual(len(report["rows"]), 2)
 
+    def test_later_step_reference_cannot_validate_prefill(self):
+        (self.cpu / "reference.json").write_text(
+            json.dumps({"logit_position": "teacher_forced_last_before_eos"})
+        )
+        with self.assertRaisesRegex(ValueError, "first-step"):
+            self.validate()
+
     def test_missing_engine_cannot_pass(self):
         directory = self.campaign / "r0-pjrt"
         (directory / "text-1.f32").unlink()

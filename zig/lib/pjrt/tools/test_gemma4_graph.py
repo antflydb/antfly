@@ -9,6 +9,7 @@ import unittest
 import torch
 from gemma4_graph import (
     cache_state,
+    enable_f32_text_residuals,
     make_multimodal_step,
     make_step,
     media_metadata,
@@ -77,7 +78,12 @@ class FunctionalCacheTests(unittest.TestCase):
 
     def test_prefill_and_decode_match_official_cache_across_sliding_wraps(self):
         torch.set_num_threads(1)
-        for window, n in ((4, 1), (4, 7), (8, 12)):
+        for window, n, f32_residual in (
+            (4, 1, False),
+            (4, 7, False),
+            (8, 12, False),
+            (4, 7, True),
+        ):
             torch.manual_seed(11)
             cfg = Gemma4TextConfig(
                 vocab_size=64,
@@ -106,6 +112,8 @@ class FunctionalCacheTests(unittest.TestCase):
             cfg._attn_implementation = "eager"
             reference = Gemma4ForCausalLM(cfg).eval().requires_grad_(False)
             model = Wrapper(reference).eval()
+            if f32_residual:
+                enable_f32_text_residuals(model)
             params = {**dict(model.named_parameters()), **dict(model.named_buffers())}
             ids = torch.tensor([[5 + i % 20 for i in range(n)]], dtype=torch.int64)
             values = {"input_ids": ids}

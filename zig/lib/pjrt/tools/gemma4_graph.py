@@ -20,7 +20,7 @@ def patch_casts():
     Gemma4RMSNorm.forward = norm
 
 
-def load_multimodal_meta(config):
+def load_multimodal_meta(config, precision_policy="bf16"):
     """Official modules; only GGUF representation and static export adapters."""
     import textwrap
 
@@ -63,7 +63,60 @@ def load_multimodal_meta(config):
             mod.softcap = torch.tensor(
                 mod.attention_logits_soft_cap, dtype=torch.float32
             )
+    if precision_policy == "f32-residual-media":
+        enable_f32_text_residuals(model)
+    elif precision_policy != "bf16":
+        raise ValueError("Unknown graph precision policy")
     return model
+
+
+def enable_f32_text_residuals(model):
+    """PR #1404's separate residual publication policy, with BF16 matrix inputs.
+
+    This changes only the export candidate. The independent Transformers oracle
+    remains unmodified. Media tower parameter precision is selected by the exporter.
+    """
+    import types
+
+    def forward(
+        self,
+        hidden_states,
+        per_layer_input=None,
+        shared_kv_states=None,
+        position_embeddings=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        **kwargs,
+    ):
+        dtype = self.self_attn.q_proj.weight.dtype
+        residual = hidden_states.float()
+        hidden = self.input_layernorm(hidden_states).to(dtype=dtype)
+        hidden, _ = self.self_attn(
+            hidden_states=hidden,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            shared_kv_states=shared_kv_states,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+        hidden = residual + self.post_attention_layernorm(hidden).float()
+        residual = hidden
+        branch = self.pre_feedforward_layernorm(hidden).to(dtype=dtype)
+        branch = self.post_feedforward_layernorm(self.mlp(branch))
+        hidden = residual + branch.float()
+        if self.hidden_size_per_layer_input:
+            residual = hidden
+            branch = self.act_fn(self.per_layer_input_gate(hidden.to(dtype=dtype)))
+            branch = self.per_layer_projection(branch * per_layer_input.to(dtype=dtype))
+            hidden = residual + self.post_per_layer_input_norm(branch).float()
+        return hidden * self.layer_scalar.float()
+
+    for layer in model.model.language_model.layers:
+        if layer.enable_moe_block:
+            raise ValueError("The residual precision adapter qualifies dense E4B only")
+        layer.forward = types.MethodType(forward, layer)
 
 
 def state_shapes(config, capacity):
@@ -149,11 +202,13 @@ def _embed_media(model, values, meta):
         selected = torch.cat(
             [hidden[b, :count] for b, count in enumerate(meta[kind + "_counts"])], dim=0
         ).unsqueeze(0)
-        projected = mm.embed_vision(selected.to(embeddings.dtype))
+        projected = mm.embed_vision(
+            selected.to(mm.embed_vision.embedding_projection.weight.dtype)
+        )
         if projected.shape[1] != len(slots):
             raise ValueError(("vision slot geometry", projected.shape, len(slots)))
         embeddings = embeddings.index_copy(
-            1, torch.tensor(slots, device=ids.device), projected
+            1, torch.tensor(slots, device=ids.device), projected.to(embeddings.dtype)
         )
     if meta["slots"]["audio"]:
         tower = mm.audio_tower
@@ -267,7 +322,9 @@ def make_multimodal_step(model, capacity, meta, prefill, logits=False):
             use_cache=True,
             logits_to_keep=1,
         )
-        result = self.lm_head(output.last_hidden_state[:, -1:])
+        result = self.lm_head(
+            output.last_hidden_state[:, -1:].to(dtype=self.lm_head.weight.dtype)
+        )
         cap = cfg.final_logit_softcapping
         if cap is not None:
             result = torch.tanh(result / cap) * cap

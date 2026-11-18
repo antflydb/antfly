@@ -7,19 +7,77 @@ const factory = inference.architectures.session_factory;
 const generation = inference.pipelines.generation;
 const runtime = inference.runtime;
 const a = std.heap.c_allocator;
-const Case = struct { id: []const u8, text: []const u8, kind: enum { text, image, audio, video } = .text, path: ?[]const u8 = null, max_tokens: i32, logits_path: ?[]const u8 = null, expected_prompt_tokens: ?usize = null };
-const Suite = struct { warmups: usize = 2, repeats: usize = 3, context_tokens: u32 = 8192, cases: []const Case };
+const Case = struct { id: []const u8, text: []const u8, kind: enum { text, image, audio, video } = .text, path: ?[]const u8 = null, max_tokens: i32, logits_path: ?[]const u8 = null, ple_input_path: ?[]const u8 = null, expected_prompt_tokens: ?usize = null };
+const Suite = struct { warmups: usize = 2, repeats: usize = 3, context_tokens: u32 = 8192, legacy_ple_normalization: bool = false, kv_dtype: enum { f16, f32 } = .f16, cases: []const Case };
 const Row = struct { id: []const u8, repeat: usize, ms: f64, prompt_tokens: usize, completion_tokens: usize, tokens: []i32, text: []const u8, phases: ?generation.GenerationTimingMs };
 fn now() u64 {
     return inference.platform.time.monotonicNs();
 }
 const ops = inference.ops;
 extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+// Benchmark-only control: restore the pre-fix PLE epsilon in the same binary.
+// Both arms traverse these wrappers; production code and kernel bodies are shared.
+const PleControl = struct {
+    var legacy: bool = false;
+    var eps: f32 = 0;
+    var old_eps: f32 = 0;
+    var dim: usize = 0;
+    var calls: usize = 0;
+    var norm: @FieldType(ops.ComputeBackend.VTable, "rmsNorm") = undefined;
+    var fused: @FieldType(ops.ComputeBackend.VTable, "rmsNormAddWeightedEmbeddingTensor") = null;
+    var prepared: @FieldType(ops.ComputeBackend.VTable, "decoderRuntimeApplyRmsNorm") = null;
+    fn effective(size: usize, epsilon: f32) f32 {
+        if (size == dim and epsilon == eps) {
+            calls += 1;
+            return if (legacy) old_eps else epsilon;
+        }
+        return epsilon;
+    }
+    fn rms(ctx: *anyopaque, input: ops.CT, weight: ops.CT, size: usize, epsilon: f32) anyerror!ops.CT {
+        return norm(ctx, input, weight, size, effective(size, epsilon));
+    }
+    fn combined(ctx: *anyopaque, input: ops.CT, norm_weight: ops.CT, embedding_weight: ops.CT, ids: ops.CT, total: usize, groups: usize, size: usize, epsilon: f32, lhs: f32, rhs: f32) anyerror!?ops.CT {
+        const function = fused orelse return null;
+        return function(ctx, input, norm_weight, embedding_weight, ids, total, groups, size, effective(size, epsilon), lhs, rhs);
+    }
+    fn cached(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyRmsNormRequest) anyerror!?ops.CT {
+        const function = prepared orelse return null;
+        var adjusted = request.*;
+        adjusted.eps = effective(request.hidden_size, request.eps);
+        return function(ctx, &adjusted);
+    }
+};
 const Capture = struct {
     values: ?[]f32 = null,
     reads: usize = 0,
+    io: std.Io = undefined,
+    input_path: ?[]const u8 = null,
+    input_captured: bool = false,
+    hidden_size: usize = 0,
+    projection_size: usize = 0,
     var active: ?*Capture = null;
     var original: *const fn (*anyopaque, ops.CT, std.mem.Allocator) anyerror![]f32 = undefined;
+    var linear: @FieldType(ops.ComputeBackend.VTable, "linearNoBias") = undefined;
+    var prepared: @FieldType(ops.ComputeBackend.VTable, "decoderRuntimeApplyLinear") = null;
+    fn input(ctx: *anyopaque, tensor: ops.CT, rows: usize, in_dim: usize, out_dim: usize) !void {
+        const self = active orelse return;
+        const path = self.input_path orelse return;
+        if (self.input_captured or in_dim != self.hidden_size or out_dim != self.projection_size) return;
+        const values = try original(ctx, tensor, a);
+        defer a.free(values);
+        if (values.len == 0 or values.len % in_dim != 0 or (rows != 0 and values.len != rows * in_dim)) return error.InvalidPleCapture;
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = std.mem.sliceAsBytes(values) });
+        self.input_captured = true;
+    }
+    fn project(ctx: *anyopaque, tensor: ops.CT, weight: ops.CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.CT {
+        try input(ctx, tensor, rows, in_dim, out_dim);
+        return linear(ctx, tensor, weight, rows, in_dim, out_dim);
+    }
+    fn projectPrepared(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearRequest) anyerror!?ops.CT {
+        const function = prepared orelse return null;
+        try input(ctx, request.input, 0, request.in_dim, request.out_dim);
+        return function(ctx, request);
+    }
     fn read(ctx: *anyopaque, tensor: ops.CT, allocator: std.mem.Allocator) ![]f32 {
         const values = try original(ctx, tensor, allocator);
         errdefer allocator.free(values);
@@ -37,6 +95,7 @@ const Runner = struct {
     pool: runtime.kv.block.KvPoolId,
     io: std.Io,
     base: []const u8,
+    kv_dtype: []const u8,
     fn run(self: *@This(), case: Case, repeat: usize) !Row {
         var state = generation.NativeDecodeState.initPaged(a, self.manager, self.pool, null);
         state.kv_storage = self.storage;
@@ -45,13 +104,21 @@ const Runner = struct {
         defer self.pipeline.decode_state = null;
         const original_vtable = self.pipeline.cb.vtable;
         var capture_vtable = original_vtable.*;
-        var capture = Capture{};
+        const input_path = if (case.ple_input_path) |p| try std.fs.path.join(a, &.{ self.base, p }) else null;
+        defer if (input_path) |p| a.free(p);
+        var capture = Capture{ .io = self.io, .input_path = input_path, .hidden_size = self.pipeline.gpt_config.hidden_size, .projection_size = self.pipeline.gpt_config.ple_hidden_size * self.pipeline.gpt_config.num_hidden_layers };
         defer if (capture.values) |values| a.free(values);
         if (case.logits_path != null) {
             if (case.max_tokens != 1) return error.LogitCaptureNeedsOneToken;
             Capture.original = original_vtable.toFloat32;
             Capture.active = &capture;
             capture_vtable.toFloat32 = Capture.read;
+            if (input_path != null) {
+                Capture.linear = original_vtable.linearNoBias;
+                Capture.prepared = original_vtable.decoderRuntimeApplyLinear;
+                capture_vtable.linearNoBias = Capture.project;
+                if (Capture.prepared != null) capture_vtable.decoderRuntimeApplyLinear = Capture.projectPrepared;
+            }
             self.pipeline.cb.vtable = &capture_vtable;
         }
         defer {
@@ -67,9 +134,10 @@ const Runner = struct {
         defer if (data) |bytes| a.free(bytes);
         const media = [_][]const u8{data orelse &.{}};
         const message = generation.Message{ .role = "user", .content = case.text, .image_bytes = if (case.kind == .image) &media else null, .audio_bytes = if (case.kind == .audio) &media else null, .video_bytes = if (case.kind == .video) data else null };
-        var result = try self.pipeline.generate(&.{message}, .{ .max_tokens = case.max_tokens, .temperature = 0, .top_k = 0, .top_p = 0, .repetition_penalty = 1, .cache_dtype = "f16", .prompt_cache_enabled = false, .ignore_eos = true, .enable_thinking = false });
+        var result = try self.pipeline.generate(&.{message}, .{ .max_tokens = case.max_tokens, .temperature = 0, .top_k = 0, .top_p = 0, .repetition_penalty = 1, .cache_dtype = self.kv_dtype, .prompt_cache_enabled = false, .ignore_eos = true, .enable_thinking = false });
         defer result.deinit();
         const finished = now();
+        if (input_path != null and !capture.input_captured) return error.MissingPleInputCapture;
         if (case.logits_path) |p| {
             const values = capture.values orelse return error.MissingLogitCapture;
             if (capture.reads != 1 or values.len != self.pipeline.gpt_config.vocab_size) return error.InvalidLogitCapture;
@@ -106,6 +174,7 @@ pub fn main(init: std.process.Init) !void {
     for (suite.cases) |case| if (case.max_tokens <= 0 or case.max_tokens > 8192 or (case.kind != .text and case.path == null)) return error.InvalidCase;
     const validation = suite.cases[0].logits_path != null;
     for (suite.cases) |case| if ((case.logits_path != null) != validation) return error.MixedValidationSuite;
+    for (suite.cases) |case| if (case.ple_input_path != null and case.logits_path == null) return error.PleCaptureNeedsValidation;
     if (validation) {
         // Validation alone requests complete host logits. Timed runs retain defaults.
         if (setenv("ANTFLY_INFERENCE_CUDA_PREFILL_GREEDY_TOKEN", "0", 1) != 0 or
@@ -120,6 +189,19 @@ pub fn main(init: std.process.Init) !void {
     defer cb.deinit();
     if (cb.kind() != .cuda) return error.RequiredCuda;
     var cfg = factory.getGptConfig(session) orelse return error.WrongArchitecture;
+    if (!cfg.hasPle() or cfg.hidden_size == 0) return error.WrongArchitecture;
+    var controlled_vtable = cb.vtable.*;
+    PleControl.legacy = suite.legacy_ple_normalization;
+    PleControl.eps = cfg.pleProjectionNormEps();
+    PleControl.old_eps = cfg.norm_eps;
+    PleControl.dim = cfg.ple_hidden_size;
+    PleControl.norm = controlled_vtable.rmsNorm;
+    PleControl.fused = controlled_vtable.rmsNormAddWeightedEmbeddingTensor;
+    PleControl.prepared = controlled_vtable.decoderRuntimeApplyRmsNorm;
+    controlled_vtable.rmsNorm = PleControl.rms;
+    if (PleControl.fused != null) controlled_vtable.rmsNormAddWeightedEmbeddingTensor = PleControl.combined;
+    if (PleControl.prepared != null) controlled_vtable.decoderRuntimeApplyRmsNorm = PleControl.cached;
+    cb.vtable = &controlled_vtable;
     cfg.max_position_embeddings = @min(cfg.max_position_embeddings, suite.context_tokens);
     const tok_raw = try std.Io.Dir.cwd().readFileAlloc(init.io, args[2], a, .limited(64 * 1024 * 1024));
     defer a.free(tok_raw);
@@ -134,14 +216,15 @@ pub fn main(init: std.process.Init) !void {
     defer projector.close();
     var manager = runtime.kv.manager.KvManager.init(a);
     defer manager.deinit();
-    const pool_config = generation.kvPoolConfig(.cuda, .f16, cfg, false);
+    const kv_dtype: runtime.kv.pool.KvDType = if (suite.kv_dtype == .f32) .f32 else .f16;
+    const pool_config = generation.kvPoolConfig(.cuda, kv_dtype, cfg, false);
     const pool = try manager.addPool(generation.requestKvManagerPoolConfig(pool_config));
     var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, pool_config);
     defer storage.deinit();
     try cb.provisionKvDeviceWriteHook(&storage);
-    var pipeline = generation.NativeGenerationPipeline{ .allocator = a, .io = init.io, .cb = cb, .session = session, .gpt_config = cfg, .kv_dtype = .f16, .tokenizer = tok, .add_bos_token = true, .bos_token = "<bos>", .chat_template = &template, .gguf_projector_path = args[4], .projector_store = projector, .return_raw_token_ids = true };
+    var pipeline = generation.NativeGenerationPipeline{ .allocator = a, .io = init.io, .cb = cb, .session = session, .gpt_config = cfg, .kv_dtype = kv_dtype, .tokenizer = tok, .add_bos_token = true, .bos_token = "<bos>", .chat_template = &template, .gguf_projector_path = args[4], .projector_store = projector, .return_raw_token_ids = true };
     defer pipeline.deinit();
-    var runner = Runner{ .pipeline = &pipeline, .manager = &manager, .storage = &storage, .pool = pool, .io = init.io, .base = std.fs.path.dirname(args[5]) orelse "." };
+    var runner = Runner{ .pipeline = &pipeline, .manager = &manager, .storage = &storage, .pool = pool, .io = init.io, .base = std.fs.path.dirname(args[5]) orelse ".", .kv_dtype = @tagName(suite.kv_dtype) };
     // Prime every requested modality before measuring so tower weights do not
     // become a text-only resident-inventory advantage for the native arm.
     for (suite.cases) |case| {
@@ -165,7 +248,8 @@ pub fn main(init: std.process.Init) !void {
             a.free(row.text);
         } else try rows.append(a, row);
     };
-    const output = try std.json.Stringify.valueAlloc(a, .{ .backend = "native CUDA", .weights = "QAT Q4_0 GGUF", .kv_dtype = "f16", .context_tokens = suite.context_tokens, .validation_logits = for (suite.cases) |case| {
+    if (PleControl.calls == 0) return error.PleControlNotExercised;
+    const output = try std.json.Stringify.valueAlloc(a, .{ .backend = "native CUDA", .weights = "QAT Q4_0 GGUF", .kv_dtype = @tagName(suite.kv_dtype), .context_tokens = suite.context_tokens, .legacy_ple_normalization = suite.legacy_ple_normalization, .ple_control_calls = PleControl.calls, .validation_logits = for (suite.cases) |case| {
         if (case.logits_path != null) break true;
     } else false, .scope = "encoded file read, preprocessing, towers, prompt construction, prefill, fixed-budget decode and synchronized token readback; excludes HTTP, loading and post-readback cleanup", .rows = rows.items, .cuda = factory.getCudaRuntimeStats(session) }, .{ .whitespace = .indent_2 });
     defer a.free(output);

@@ -18,7 +18,7 @@ From the worktree root, using the repository's pinned Zig:
 ```sh
 export ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/global"
 zig build --build-file zig/pkg/inference/build.zig bench-gemma4-core-build \
-  -Doptimize=ReleaseFast -Dcuda=true -Dcuda-artifacts=sm89 \
+  -Doptimize=ReleaseFast -Dstrip=true -Dcuda=true -Dcuda-artifacts=sm89 \
   --cache-dir .zig-cache/native --prefix zig-out -j1
 zig build --build-file zig/lib/pjrt/build.zig gemma4-runner \
   -Doptimize=ReleaseFast --cache-dir .zig-cache/pjrt --prefix zig-out -j1
@@ -114,6 +114,13 @@ Run `gemma4_cpu.py` with the exporter's model/processor/suite arguments and a fr
 layers and gathers token/PLE rows, so the complete dense model need not fit in
 host RAM. `--only CASE` can partition the checks. This CPU reference uses the
 official full forward, not the functional exported KV/media forward.
+`gemma4_reference.py` verifies the installed modeling source against the wheel's
+RECORD and rejects replaced forward methods. It does not import the export
+adapter. GGUF's folded audio query scale is inverted at weight loading so the
+unmodified official attention applies softplus once. References record the
+Transformers version and modeling-source hash in `reference.json`.
+`--capture-ple-input` additionally observes the merged text/media embeddings
+through an official-module pre-hook for stage comparisons.
 
 Then run the benchmark with `--validate --rounds 1 --iterations 1` into a fresh
 campaign directory and compare it using:
@@ -121,7 +128,7 @@ campaign directory and compare it using:
 ```sh
 python zig/lib/pjrt/tools/validate_gemma4.py --campaign "$VALIDATION" \
   --cpu "$CPU_REFERENCE" --out evidence/validation.json
-python -m unittest discover -s zig/lib/pjrt/tools -p 'test_gemma4*.py'
+python -m unittest discover -s zig/lib/pjrt/tools
 ```
 
 The comparator reports cosine, relative L2, maximum absolute error, exact argmax,
@@ -135,6 +142,22 @@ widening the gate. Invalid memory sampling also fails the benchmark campaign.
 Large artifacts, media, vectors, HLO, executable caches and full logs belong under
 ignored `evidence/`; keep only compact results/provenance in the branch.
 
+For a later native decision, run the CPU tool with a completed native result:
+
+```sh
+python zig/lib/pjrt/tools/gemma4_cpu.py --config "$CONFIG" \
+  --processor "$PROCESSOR" --suite "$SUITE" --gguf "$GGUF" --mmproj "$MMPROJ" \
+  --native-tokens "$PERFORMANCE/r0-native/result.json" --out evidence/generated-end
+```
+
+It checks the final decision through the first configured EOS or fixed budget,
+teacher-forcing the preceding native tokens and excluding the predicted label.
+It extends text attention/type masks while retaining the original media inputs,
+rejects inconsistent repeats, binds the native result by hash, saves
+`generation-check.json` and exits nonzero on an argmax mismatch. This checks one
+later decision per case, not every intermediate token or free-running parity.
+Reference-position metadata prevents these vectors from validating prefill.
+
 ## Native PLE normalization correction
 
 The comparison exposed a native PLE context-projection discrepancy. The official
@@ -147,6 +170,61 @@ formula at zero and nonzero epsilon, including low-variance projection rows.
 CUDA qualification is measured here; live Metal validation is not available on
 this Linux host.
 
+The benchmark worker accepts `legacy_ple_normalization: true` to restore the old
+epsilon in the same binary. Both arms use the same wrapper and kernel code;
+`ple_control_calls` must be nonzero. This is a benchmark control, not a serving
+option. Run a paired campaign against the independent reference directories:
+
+```sh
+python zig/lib/pjrt/tools/qualify_native_gemma4.py \
+  --native zig-out/bin/antfly-gemma4-core --gguf "$GGUF" --mmproj "$MMPROJ" \
+  --tokenizer "$TOKENIZER" --template "$TEMPLATE" --suite "$SUITE" \
+  --cpu "$CPU_REFERENCE" --out evidence/paired-ple --measure
+```
+
+Repeat `--cpu` for partitioned references. The tool freezes accuracy and latency
+criteria before execution, retains raw samples, and separates improvement from
+the absolute reference gate. An improved result that still fails the absolute
+gate exits nonzero. Timings require an idle GPU and no concurrent compiler or
+CPU-oracle jobs. Diagnostic suite fields `kv_dtype: "f32"` and per-case
+`ple_input_path` support precision/stage bisection; defaults remain F16 KV and no
+stage capture. Stage capture requires one-token logit validation.
+
+`--control video-resize` compares bilinear and bicubic video with corrected PLE
+in both arms. `--control branch` restores both old behaviors in the legacy arm
+and enables both corrections in the candidate. These are controls in one binary,
+not a separately built main binary. Every declared fixture is hash-checked before
+execution. The recorded arm environment identifies the resize override.
+
+## Native video resizing and accuracy profile
+
+The upstream processor specifies bicubic video resizing. On SM80+ with the
+standard 16-pixel patches and `[0,1]` normalization, native CUDA now converts the
+resident frame to RGB8 and reuses the existing resident bicubic resize. It
+converts the result to GGUF's planar patch order before projection. Pixels stay
+on the GPU. `ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC=0` restores bilinear
+preprocessing for paired checks. Other normalization/patch geometries retain
+their existing route. The focused GPU regression checks normalization and patch
+layout across 12 matrix/range/size combinations without a pixel readback.
+
+The following common profile passes all eight retained **first-step** numerical
+and argmax gates against unmodified Transformers 5.23.0. It retains Q4 text
+weights and F16 KV; it is not an all-F32 decoder:
+
+```sh
+export ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_COMPACT=0
+export ANTFLY_INFERENCE_CUDA_GEMMA4_VISION_F16=0
+export ANTFLY_INFERENCE_CUDA_Q4_0_PLE_GATE_FUSION=0
+export ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1=0
+```
+
+This uses F32 media weights/vision attention, the ordinary PLE gate path and
+exact LM-head multiplication. Apply the same profile to validation and timing;
+campaign provenance records every override. These are explicit qualification
+settings, not new serving defaults. Eight passing first-step gates do not
+establish whole-generation or task-quality parity. The default fast profile
+still has numerical failures on this corpus.
+
 Build and run the focused native CPU regression with a compile-time filter:
 
 ```sh
@@ -158,6 +236,48 @@ zig-out/bin/antfly-inference-tests --test-filter "Gemma4 PLE context normalizati
 
 Passing only the filter after `--` selects runtime execution and still compiles
 the complete test binary.
+
+## PJRT residual precision experiment
+
+[PR #1404](https://github.com/antflydb/antfly/pull/1404) separates F32 residual
+accumulation from BF16 branch/matrix and KV publication. The multimodal exporter
+can test that design with `--precision-policy f32-residual-media`: dense E4B
+decoder residual sums/scaling use F32, text matrices and KV remain BF16, and
+media parameters use F32. The default remains `bf16`. This additional F32 media
+policy is an experiment, not an exact reproduction of the PR's runtime.
+The manifest records the policy and actual parameter dtypes, and the executable
+cache identity changes with it. Export and validate into separate directories.
+The adapter rejects MoE models; the independent oracle is unchanged.
+
+The PR's posted timings use GB10 and a different generation harness. That
+harness defaults to eight output tokens and allows EOS stopping; this suite
+forces 64–256 output tokens. Exact commands and output counts are needed before
+comparing the posted totals with L4 results. This runner already retains donor
+KV buffers on the GPU; it does not recompute the full prefix per decode step.
+
+## Optional llama.cpp oracle
+
+`llama_gemma4_reference.cpp` uses the unmodified llama/libmtmd C APIs. Build it
+against matching llama.cpp headers and libraries (the review used b12387):
+
+```sh
+c++ -std=c++17 -O2 -I"$LLAMA_HEADERS" zig/lib/pjrt/tools/llama_gemma4_reference.cpp \
+  -L"$LLAMA_LIB" -lllama -lmtmd -lggml-base -lggml -o llama-gemma4-reference
+GGML_BACKEND_PATH="$LLAMA_LIB" ./llama-gemma4-reference \
+  "$GGUF" "$MMPROJ" "$REFERENCE_INPUTS" "$REFERENCE_OUTPUTS"
+```
+
+Each input-directory `cases.tsv` row contains whitespace-separated case ID,
+kind (`text`, `image`, `audio`), absolute media path (`-` for text), expected prompt tokens and output-token
+budget. `<id>.prompt` contains the exact rendered prompt, with
+`[ANTFLY_REFERENCE_MEDIA]` at the media location. The wrapper checks prompt
+geometry, saves full first-step logits and fixed-budget greedy tokens, and
+records prepared prompt IDs and audio embeddings. Its vision budget is 256–280
+soft tokens, context 8192, F16 KV and flash attention. It does not measure
+performance. Video uses the Transformers oracle. Treat frontend disagreements as investigation results; do not
+switch oracle per case to obtain a passing gate.
+Use libraries built for the host's libc; the retained b12387 binaries required an
+existing compatible runtime loader on this host.
 
 The manifest records export-time source hashes; campaign provenance separately
 records the timed preparer and workers. Token IDs are variable program inputs.

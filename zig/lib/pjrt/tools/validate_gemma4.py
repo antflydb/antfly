@@ -60,6 +60,13 @@ def validate_campaign(campaign, cpu):
         raise ValueError("Incomplete validation rounds/arms")
     references = {}
     for directory in cpu:
+        metadata = directory / "reference.json"
+        if (
+            metadata.exists()
+            and json.loads(metadata.read_text()).get("logit_position", "first_step")
+            != "first_step"
+        ):
+            raise ValueError("Expected first-step CPU references")
         for path in directory.glob("*.f32"):
             if path.stem in references:
                 raise ValueError("Duplicate CPU case: " + path.stem)

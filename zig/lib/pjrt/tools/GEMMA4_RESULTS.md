@@ -35,7 +35,7 @@ The runtime representations and weight inventories differ. Combined peaks includ
 | native | 5/8 | 8/8 |
 | pjrt | 6/8 | 8/8 |
 
-Gate: cosine ≥0.9999 and relative L2 ≤0.02 against the independent official FP32 CPU forward from the same dequantized source GGUF. Native diagnostic readback bypasses device-greedy/replay fast paths. Numerical failures are retained below; the gate was not widened.
+Gate: cosine ≥0.9999 and relative L2 ≤0.02 against the FP32 CPU forward from the same dequantized source GGUF. The independent unmodified-forward regeneration below confirms the historical gate results. Native diagnostic readback bypasses device-greedy/replay fast paths. Numerical failures are retained below; the gate was not widened.
 
 - r0-native audio_1s_64: cosine 0.9998950, relative L2 0.01474, max absolute difference 0.4001.
 - r0-native audio_30s_64: cosine 0.9998628, relative L2 0.01681, max absolute difference 0.5912.
@@ -65,8 +65,9 @@ Reproduction and artifact preparation: [GEMMA4.md](GEMMA4.md).
 
 ## PR scope and remaining qualification
 
-The production change on this branch is the PLE projection-normalization epsilon
-correction across direct, fused, graph and prepared decoder paths. The CUDA
+The historical campaign above covers the PLE projection-normalization epsilon
+correction across direct, fused, graph and prepared decoder paths. The follow-up
+below also corrects CUDA video resizing. The CUDA
 performance optimizations measured above were already present on the base
 commit. This campaign establishes a comparison with this PJRT artifact runner;
 it does not isolate a branch-versus-main performance improvement.
@@ -117,3 +118,121 @@ executable compatibility checks. An initial compatibility startup stopped during
 its largest parameter upload without a worker diagnostic; the retry succeeded
 after host compilation freed memory. These are functional checks, with no new
 performance measurements or cross-engine whole-generation parity claim.
+
+## Independent qualification and PR #1404 follow-up
+
+All eight CPU references were regenerated using the unmodified Transformers
+5.23.0 forward. The reference module now checks the installed modeling source
+against its wheel RECORD and verifies runtime forward origins. It shares strict
+GGUF layout/name conversion with export, but imports no graph adapter and applies
+no export forward patches. Folded GGUF audio scales are inverted when loading
+weights so official attention applies softplus once. Video logits reproduce the
+previous reference exactly; audio differences are below 6.5e-6 relative L2.
+The original native gate failures therefore remain reproducible with this oracle.
+
+[PR #1404](https://github.com/antflydb/antfly/pull/1404), reviewed at
+`d723d594addf34ed5d0178b7fb0b7c83da332208`, keeps donor KV state resident and
+separates F32 residual sums/scaling from BF16 branches and KV. This artifact
+runner already retains donor KV buffers on the GPU. The PR's posted GB10 totals
+cannot be compared directly with this L4 campaign: its benchmark defaults to
+eight generated tokens with EOS stopping, while this suite forces 64–256. The
+exact command and output counts for those posted rows were not available.
+
+An opt-in `f32-residual-media` export tests F32 text residual accumulation plus
+F32 media parameters, retaining BF16 text matrices and KV. This is inspired by
+the PR, with an additional media precision experiment. On the two historically
+failing PJRT cases:
+
+| Case | BF16 relative L2 | Experimental relative L2 | Experimental cosine | Gate |
+|---|---:|---:|---:|---|
+| audio_30s_64 | 0.03706 | 0.00758 | 0.9999714 | pass |
+| long2k_summary_64 | 0.03384 | 0.03443 | 0.9998003 | fail |
+
+Both first-token argmaxes match. The experiment is not promoted or declared
+qualified; the six other cases were not exported under this policy. It increases
+resident parameter bytes from 15,882,208,908 to 16,838,385,676. Compilation and
+validation overlapped host work, so their timings are not performance evidence.
+
+The unmodified llama.cpp b12387 C API oracle also ran seven matched text, image
+and audio cases, with fixed output budgets. It matches first-token argmax on six
+of seven and the frozen numerical gate on three of seven. Its 1-second audio
+projected embeddings differ from Transformers by 0.2836 relative L2 before the
+decoder, despite identical prepared prompt tokens. This is an unresolved frontend
+disagreement, not a diagnosed llama.cpp bug. Transformers remains the audio
+source of truth. No new llama.cpp performance claim is made from these checks.
+
+The [qualification record](gemma4-l4-qualification.json) retains independent
+reference identities, vectors' hashes, precision experiments and rollback
+results. All 31 Python checks pass, including oracle identity and the distinction
+between improvement and absolute qualification. Watch builds panicked after
+reporting success with both incremental and ordinary modes; the worker was
+rebuilt with a one-shot command. The benchmark now honors `-Dstrip`.
+
+
+## Matched native branch controls and accuracy profile
+
+The completed same-binary campaign restores both the old PLE epsilon and bilinear
+video in its legacy arm, then enables both corrections. Three alternating fresh
+process rounds, one warmup and three measured calls per case yield nine samples
+per case per arm. Both arms prime every modality; builds and CPU oracles were
+stopped during timing. All 144 calls complete their fixed budgets, and all memory
+samples are valid.
+
+Every case passes the declared latency guardrail (candidate median ≤1.05× legacy,
+p95 ≤1.10×). Median ratios range from 0.9948 to 1.0000 and the largest p95 ratio
+is 1.0025: latency is effectively unchanged, with observed median reductions of
+up to 0.52%. This is a controlled restoration of the old behaviors in one binary,
+not a separately built main binary. Accuracy improves on all eight inputs.
+The default candidate still passes only 5/8 frozen numerical gates, with 8/8
+first-token decisions matching.
+
+The CUDA video correction keeps pixels resident, uses the upstream bicubic
+resize and preserves GGUF planar patch order. Its focused GPU regression passes
+12 matrix/range/size combinations within 1e-7, with no pixel readback. On the real
+video fixture, merged-embedding relative L2 improves from 0.12291 to 0.05000 and
+logit relative L2 from 0.02346 to 0.01656. Its default-profile cosine remains below
+the frozen gate; the resize correction alone does not close full-model qualification.
+
+The common four-override profile documented in [GEMMA4.md](GEMMA4.md) passes all
+8/8 independent Transformers first-step numerical gates and argmax checks.
+It uses F32 media weights/vision attention, ordinary PLE gates and exact LM-head
+multiplication, retaining Q4 text weights and F16 KV. Its three fresh rounds
+also complete all 72 measured calls, with 72/72 reference first-token matches
+and identical complete sequences across all nine repeats per case.
+
+| Workload | Accuracy-profile median ms | Cost versus fresh default | Speedup versus retained BF16 PJRT |
+|---|---:|---:|---:|
+| audio_12s_64 | 1496.16 | 1.35× | 2.01× |
+| audio_1s_64 | 1387.90 | 1.37× | 2.13× |
+| audio_30s_64 | 1673.25 | 1.31× | 1.84× |
+| image_64 | 1811.02 | 1.63× | 1.70× |
+| long2k_summary_64 | 1497.15 | 1.17× | 2.13× |
+| page_summary_128 | 2442.18 | 1.24× | 2.47× |
+| text_short_256 | 4692.32 | 1.25× | 2.52× |
+| video_6s_64 | 1630.95 | 1.42× | 1.97× |
+
+The accuracy settings cost 17–63% latency depending on the workload. The
+1.70–2.52× PJRT ratios compare fresh native measurements with the retained PJRT
+campaign; they are not a fresh interleaved comparison or a reproduction of PR
+#1404. Median native-profile campaign peaks are 7.96 GiB GPU and 10.48 GiB
+process-tree PSS plus GPU, including the benchmark controller.
+
+The independent CPU forward also checks the final native decision through the
+first EOS or fixed budget, without including the predicted label in its input.
+All 8/8 decisions match: text at steps 256/128/55, image at 64, audio at 4/7/7,
+and video at 64. These are teacher-forced endpoint checks, not proof of every
+intermediate decision or free-running generation parity. Late references carry
+separate position metadata and cannot validate a first-step campaign.
+
+Current checks: 31 Python tests pass; Ruff, Zig formatting and whitespace pass;
+the final CUDA worker build succeeds in all 15 steps. The existing real-checkpoint
+CUDA audio diagnostic also runs with zero skips: its component F32 projected
+features match the unmodified CPU reference within 0.000301 relative L2. This
+component result does not certify the default production precision policy.
+
+The changes are reviewable as accuracy corrections and a qualification harness.
+The broad performance target remains open: default numerical failures, broader
+task-quality/intermediate-generation coverage, and matched current llama.cpp and
+PR #1404 timing are still unresolved. No claim of a current all-modality win over
+llama.cpp is established by this work. PR #1404's head was rechecked and remains
+the reviewed revision.

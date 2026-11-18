@@ -3,6 +3,7 @@
 """Independent official CPU forwards with streamed QAT weights and lazy PLE rows."""
 
 import argparse
+import hashlib
 import json
 import math
 import mmap
@@ -10,8 +11,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from gemma4_graph import load_multimodal_meta
 from gemma4_inputs import prepare, processor
+from gemma4_reference import (
+    load_reference_model,
+    official_source_identity,
+    reference_weight,
+)
 from gemma4_weights import parameter_specs
 from gguf import GGML_QUANT_SIZES, GGUFReader, dequantize
 
@@ -65,7 +70,7 @@ class Weights:
             raise ValueError("Unsupported transform")
         if size * 4 >= 1 << 20:
             self.discard()
-        return result.reshape(spec["shape"])
+        return reference_weight(spec["name"], result.reshape(spec["shape"]))
 
     def rows(self, spec, indices):
         tensor = self.tensors[spec["file"]][spec["source"]]
@@ -139,15 +144,63 @@ def assign(model, name, value):
         raise ValueError(("Unknown model member", name))
 
 
+def teacher_forced_inputs(inputs, tokens, eos_ids):
+    """Predict the final token before stopping, without exposing that label."""
+    if not tokens or any(
+        type(token) is not int or not 0 <= token < 262144 for token in tokens
+    ):
+        raise ValueError("Invalid native continuation")
+    step = next(
+        (i + 1 for i, token in enumerate(tokens) if token in eos_ids), len(tokens)
+    )
+    result = dict(inputs)
+    shape = inputs["input_ids"].shape
+    if len(shape) != 2 or shape[0] != 1:
+        raise ValueError("Expected one reference prompt")
+    for key, fill in (
+        ("input_ids", None),
+        ("attention_mask", 1),
+        ("mm_token_type_ids", 0),
+    ):
+        if key not in inputs:
+            continue
+        if inputs[key].shape != shape:
+            raise ValueError("Invalid aligned sequence input: " + key)
+        tail = (
+            torch.tensor([tokens[: step - 1]], dtype=inputs[key].dtype)
+            if fill is None
+            else torch.full((1, step - 1), fill, dtype=inputs[key].dtype)
+        )
+        result[key] = torch.cat((inputs[key], tail), dim=1)
+    return result, step, tokens[step - 1]
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ("config", "processor", "suite", "gguf", "mmproj", "out"):
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--only", action="append", default=[])
+    p.add_argument("--capture-ple-input", action="store_true")
+    p.add_argument(
+        "--native-tokens",
+        type=Path,
+        help="Teacher-force a saved native result through its first EOS or final budget token",
+    )
     a = p.parse_args()
     a.out.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(2)
-    model = load_multimodal_meta(json.loads(a.config.read_text()))
+    config = json.loads(a.config.read_text())
+    model = load_reference_model(config)
+    identity = official_source_identity()
+    identity["logit_position"] = (
+        "teacher_forced_last_before_eos" if a.native_tokens else "first_step"
+    )
+    native_rows = None
+    if a.native_tokens:
+        raw = a.native_tokens.read_bytes()
+        identity["native_tokens_sha256"] = hashlib.sha256(raw).hexdigest()
+        native_rows = json.loads(raw)["rows"]
+    (a.out / "reference.json").write_text(json.dumps(identity, indent=2) + "\n")
     specs = parameter_specs(model, a.gguf, a.mmproj)
     by_name = {s["name"]: s for s in specs}
     weights = Weights(a.gguf, a.mmproj)
@@ -181,6 +234,20 @@ def main():
     text.embed_tokens_per_layer = LazyEmbedding(weights, ple, ple_scale)
     model.lm_head = StreamedHead(weights, by_name.get("lm_head.weight", token))
     hooks = []
+    active_case = [None]
+    if a.capture_ple_input:
+        (a.out / "stages").mkdir()
+
+        def capture_input(module, inputs):
+            values = inputs[0].detach().float().numpy()
+            values.tofile(a.out / "stages" / (active_case[0] + ".f32"))
+            (a.out / "stages" / (active_case[0] + ".json")).write_text(
+                json.dumps({"shape": list(values.shape)}) + "\n"
+            )
+
+        hooks.append(
+            text.per_layer_model_projection.register_forward_pre_hook(capture_input)
+        )
     for i, layer in enumerate(text.layers):
         group = [s for s in specs if s["name"].startswith(f"{prefix}{i}.")]
 
@@ -208,15 +275,32 @@ def main():
     print("CPU media/constants ready", flush=True)
     suite = json.loads(a.suite.read_text())
     proc = processor(a.processor)
+    generation_checks = []
     for case in suite["cases"]:
         if a.only and case["id"] not in a.only:
             continue
         print("CPU case", case["id"], flush=True)
+        active_case[0] = case["id"]
         inputs, meta = prepare(proc, case, a.suite.parent)
         # The wire protocol uses i64 masks, but the official model indexes the
         # projected audio batch with this mask and requires boolean semantics.
         if "input_features_mask" in inputs:
             inputs["input_features_mask"] = inputs["input_features_mask"].bool()
+        expected = None
+        if native_rows is not None:
+            rows = [row for row in native_rows if row["id"] == case["id"]]
+            if not rows or any(row["tokens"] != rows[0]["tokens"] for row in rows):
+                raise ValueError("Missing or nondeterministic native continuation")
+            tokens = rows[0]["tokens"]
+            if len(tokens) != case["max_tokens"] or any(
+                row["prompt_tokens"] != inputs["input_ids"].shape[1] for row in rows
+            ):
+                raise ValueError("Native/reference input or budget differs")
+            eos_ids = config["eos_token_id"]
+            if isinstance(eos_ids, int):
+                eos_ids = [eos_ids]
+            inputs, step, expected = teacher_forced_inputs(inputs, tokens, eos_ids)
+            meta["teacher_forced_step"] = step
         with torch.inference_mode():
             output = model(**inputs, use_cache=False, logits_to_keep=1)
         logits = output.logits[:, -1].float().numpy()
@@ -230,11 +314,36 @@ def main():
             "precision": "FP32 CPU from same dequantized QAT GGUF",
             "metadata": meta,
         }
+        if expected is not None:
+            info.update(
+                native_token=expected,
+                argmax_matches=int(logits.argmax()) == expected,
+                reference_argmax_gap=float(logits.max() - logits[0, expected]),
+            )
+            generation_checks.append(info)
         (a.out / (case["id"] + ".json")).write_text(json.dumps(info, indent=2) + "\n")
         print(info, flush=True)
     for hook in hooks:
         hook.remove()
+    if a.native_tokens:
+        if not generation_checks:
+            raise ValueError("No generation checks")
+        passed = all(row["argmax_matches"] for row in generation_checks)
+        (a.out / "generation-check.json").write_text(
+            json.dumps(
+                {
+                    "scope": "teacher-forced final native decision through first EOS or fixed budget; not free-running generation parity",
+                    "reference": identity,
+                    "passed": passed,
+                    "rows": generation_checks,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        return 0 if passed else 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

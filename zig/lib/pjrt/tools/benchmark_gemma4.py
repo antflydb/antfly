@@ -283,7 +283,9 @@ def main():
         },
         "precision": {
             "native": "QAT Q4_0 / F16 KV",
-            "pjrt": "dense BF16 from same GGUF / BF16 KV",
+            "pjrt": "dense BF16 from same GGUF / BF16 KV"
+            if manifest.get("precision_policy", "bf16") == "bf16"
+            else "BF16 text weights/KV; F32 residuals/media from same GGUF",
         },
         "cold_compile_excluded": not a.prepare_only,
         "validation_only": a.validate,
@@ -317,6 +319,8 @@ def main():
             in (
                 "CUDA_VISIBLE_DEVICES",
                 "NVIDIA_TF32_OVERRIDE",
+                "ANTFLY_CUDA_QMATMUL_VARIANT",
+                "TERMITE_GEMMA4_AUDIO_HOST_OPS",
                 "TERMITE_DISABLE_PLE",
                 "TERMITE_DISABLE_SHARED_KV",
                 "TERMITE_DISABLE_SLIDING_ATTENTION",

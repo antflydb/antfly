@@ -39,11 +39,25 @@ def main():
     for name in ("config", "processor", "suite", "gguf", "mmproj", "out"):
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--only", action="append", default=[])
+    p.add_argument(
+        "--precision-policy", choices=("bf16", "f32-residual-media"), default="bf16"
+    )
     a = p.parse_args()
     a.out.mkdir(parents=True, exist_ok=False)
     config = json.loads(a.config.read_text())
-    m = load_multimodal_meta(config)
+    m = load_multimodal_meta(config, a.precision_policy)
     specs = parameter_specs(m, a.gguf, a.mmproj)
+    if a.precision_policy == "f32-residual-media":
+        for spec in specs:
+            if spec["name"].startswith(
+                (
+                    "model.vision_tower.",
+                    "model.audio_tower.",
+                    "model.embed_vision.",
+                    "model.embed_audio.",
+                )
+            ):
+                spec["dtype"] = "float32"
     shapes = {
         s["name"]: jax.ShapeDtypeStruct(
             s["shape"], jax.numpy.bfloat16 if s["dtype"] == "bfloat16" else np.float32
@@ -55,7 +69,8 @@ def main():
     manifest = {
         "version": 2,
         "family": "gemma4",
-        "precision": "bf16",
+        "precision": "bf16" if a.precision_policy == "bf16" else "mixed_bf16_f32",
+        "precision_policy": a.precision_policy,
         "parameters": specs,
         "cases": [],
         "context_limit": suite["context_tokens"],
