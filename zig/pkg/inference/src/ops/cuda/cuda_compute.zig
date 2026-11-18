@@ -11017,6 +11017,29 @@ pub fn installAttentionMatchWithOptions(self: *CudaCompute, storage: *kv_storage
     }
 }
 
+/// The page-table ABI and the data allocation grant independent bounds.
+/// Spare allocated bytes cannot authorize a graph to address unbound pages.
+fn cudaKvReplayAddressableCapacity(physical_tokens: usize, mapped_blocks: ?usize, page_size: usize, forced: ?usize) !usize {
+    var capacity = physical_tokens;
+    if (mapped_blocks) |blocks| {
+        if (page_size == 0) return error.InvalidPagedKvState;
+        capacity = @min(capacity, try std.math.mul(usize, blocks, page_size));
+    }
+    return if (forced) |limit| @min(capacity, limit) else capacity;
+}
+
+test "CUDA borrowed quantized metadata replay bounds retained KV capacity by the current page table" {
+    // A first request grew the backing to 64; a fresh request has bound only
+    // two pages. This must not authorize replay across token 32.
+    try std.testing.expectEqual(@as(usize, 32), try cudaKvReplayAddressableCapacity(64, 2, 16, null));
+    try std.testing.expectEqual(@as(usize, 48), try cudaKvReplayAddressableCapacity(64, 3, 16, null));
+    try std.testing.expectEqual(@as(usize, 64), try cudaKvReplayAddressableCapacity(64, 8, 16, null));
+    try std.testing.expectEqual(@as(usize, 24), try cudaKvReplayAddressableCapacity(64, 2, 16, 24));
+    try std.testing.expectEqual(@as(usize, 64), try cudaKvReplayAddressableCapacity(64, null, 0, null));
+    try std.testing.expectError(error.InvalidPagedKvState, cudaKvReplayAddressableCapacity(64, 2, 0, null));
+    try std.testing.expectError(error.Overflow, cudaKvReplayAddressableCapacity(64, std.math.maxInt(usize), 16, null));
+}
+
 const CudaKvDeviceStorage = struct {
     allocator: std.mem.Allocator,
     compute: *CudaCompute,
@@ -11263,11 +11286,15 @@ const CudaKvDeviceStorage = struct {
             layer.v = new_v;
             layer.capacity_tokens = new_capacity;
         }
+        if (compressed_format != null) {
+            const logical_blocks = write.logical_blocks orelse return error.InvalidPagedKvState;
+            try self.ensureLayerBlockTable(layer, logical_blocks, write.total_token_count, write.page_size_tokens, write.device_capacity_limit_tokens);
+        }
         if (cudaDebugGraphPersistentReplayEnabled(self.compute) and self.compute.debug_cuda_graph_capture_active) {
-            const replay_capacity = if (cudaDebugGraphForcedKvReplayCapacityTokens()) |forced|
-                @min(layer.capacity_tokens, forced)
-            else
-                layer.capacity_tokens;
+            // A retained buffer can be larger than this request's uploaded
+            // page table. Captured writer/attention arguments freeze that
+            // table's length, including the identity-table fast path.
+            const replay_capacity = try cudaKvReplayAddressableCapacity(layer.capacity_tokens, if (compressed_format != null) layer.block_table_len else null, write.page_size_tokens, cudaDebugGraphForcedKvReplayCapacityTokens());
             if (self.compute.debug_cuda_graph_active_slot) |slot_idx| {
                 const slot = &self.compute.debug_cuda_graph_slots[slot_idx];
                 if (!slot.kv_replay_capacity_valid or replay_capacity < slot.kv_replay_capacity_tokens) {
@@ -11275,10 +11302,6 @@ const CudaKvDeviceStorage = struct {
                     slot.kv_replay_capacity_valid = true;
                 }
             }
-        }
-        if (compressed_format != null) {
-            const logical_blocks = write.logical_blocks orelse return error.InvalidPagedKvState;
-            try self.ensureLayerBlockTable(layer, logical_blocks, write.total_token_count, write.page_size_tokens, write.device_capacity_limit_tokens);
         }
         return layer;
     }
@@ -19598,6 +19621,51 @@ fn noteCapturedTempAllocationsReplayed(self: *CudaCompute, allocation_count: usi
     self.temp_trace_seq +%= allocation_count;
 }
 
+/// Crossing a captured KV extent is a retirement boundary, not a reusable
+/// cache miss. Release that exec's captured resources before eager fallback;
+/// a later capture must prove the new extent rather than keep selecting it.
+fn cudaGraphReplayCapacityReady(self: *CudaCompute, slot_idx: usize) !bool {
+    const slot = &self.debug_cuda_graph_slots[slot_idx];
+    if (!slot.kv_replay_capacity_valid or self.debug_cuda_graph_decode_kv_seq_len <= slot.kv_replay_capacity_tokens) return true;
+    self.stats.cuda_graph_capture_capacity_skips += 1;
+    std.log.warn("cuda_graph_capture_probe: persistent_replay_kv_capacity_exceeded slot={d} kv_seq_len={d} capacity={d}", .{ slot_idx, self.debug_cuda_graph_decode_kv_seq_len, slot.kv_replay_capacity_tokens });
+    resetCudaGraphReplaySlotMetadata(self, slot);
+    try flushDeferredDecodeScalarUpload(self);
+    return false;
+}
+
+test "CUDA replay retains input storage while retiring an exec at its addressable KV boundary" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    const slot = &compute.debug_cuda_graph_slots[0];
+    slot.input_storage = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 16);
+    const original = slot.input_storage.ptr;
+    try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
+    try compute.kernels.launchFillF32(&compute.ctx, slot.input_storage, 4, 7);
+    const graph = try compute.ctx.endStreamCapture();
+    defer compute.ctx.destroyGraph(graph);
+    slot.exec = try compute.ctx.instantiateGraph(graph);
+    slot.shape = try a.dupe(i64, &.{4});
+    slot.valid = true;
+    slot.input_valid = true;
+    slot.kv_replay_capacity_valid = true;
+    slot.kv_replay_capacity_tokens = try cudaKvReplayAddressableCapacity(64, 2, 16, null);
+    compute.debug_cuda_graph_decode_kv_seq_len = 32;
+    try std.testing.expect(try cudaGraphReplayCapacityReady(&compute, 0));
+    try compute.ctx.launchGraph(slot.exec);
+    compute.debug_cuda_graph_decode_kv_seq_len = 33;
+    try std.testing.expect(!try cudaGraphReplayCapacityReady(&compute, 0));
+    try std.testing.expect(slot.exec == null and slot.shape == null and !slot.valid and !slot.kv_replay_capacity_valid);
+    try std.testing.expectEqual(original, slot.input_storage.ptr);
+    var actual: [4]f32 = undefined;
+    try slot.input_storage.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
+    try compute.ctx.synchronize();
+    try std.testing.expectEqualSlices(f32, &.{ 7, 7, 7, 7 }, &actual);
+    try std.testing.expectEqual(@as(usize, 1), compute.stats.cuda_graph_capture_capacity_skips);
+}
+
 fn debugCudaGraphReplayFinalHidden(ctx: *anyopaque, input: CT) !?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (!cudaDebugGraphPersistentReplayEnabled(self)) {
@@ -19637,16 +19705,7 @@ fn debugCudaGraphReplayFinalHidden(ctx: *anyopaque, input: CT) !?CT {
         try flushDeferredDecodeScalarUpload(self);
         return null;
     };
-    if (slot.kv_replay_capacity_valid and self.debug_cuda_graph_decode_kv_seq_len > slot.kv_replay_capacity_tokens) {
-        self.stats.cuda_graph_capture_capacity_skips += 1;
-        std.log.warn("cuda_graph_capture_probe: persistent_replay_kv_capacity_exceeded slot={d} kv_seq_len={d} capacity={d}", .{
-            slot_idx,
-            self.debug_cuda_graph_decode_kv_seq_len,
-            slot.kv_replay_capacity_tokens,
-        });
-        try flushDeferredDecodeScalarUpload(self);
-        return null;
-    }
+    if (!try cudaGraphReplayCapacityReady(self, slot_idx)) return null;
 
     const input_tensor = tensorFromCt(input);
     if (input_tensor.buffer.ptr != slot.input.ptr or input_tensor.buffer.len != slot.input.len) {
@@ -19752,16 +19811,7 @@ fn debugCudaGraphReplayFinalHiddenDiscard(ctx: *anyopaque, input: CT) !bool {
         try flushDeferredDecodeScalarUpload(self);
         return false;
     }
-    if (slot.kv_replay_capacity_valid and self.debug_cuda_graph_decode_kv_seq_len > slot.kv_replay_capacity_tokens) {
-        self.stats.cuda_graph_capture_capacity_skips += 1;
-        std.log.warn("cuda_graph_capture_probe: persistent_replay_kv_capacity_exceeded slot={d} kv_seq_len={d} capacity={d}", .{
-            slot_idx,
-            self.debug_cuda_graph_decode_kv_seq_len,
-            slot.kv_replay_capacity_tokens,
-        });
-        try flushDeferredDecodeScalarUpload(self);
-        return false;
-    }
+    if (!try cudaGraphReplayCapacityReady(self, slot_idx)) return false;
 
     const input_tensor = tensorFromCt(input);
     if (input_tensor.buffer.ptr != slot.input.ptr or input_tensor.buffer.len != slot.input.len) {
