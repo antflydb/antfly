@@ -75,6 +75,24 @@ test "ordered artifact inventory private batch roundtrip rejects public and mixe
     accept.merge_replication.?.transition_id += 1;
     try std.testing.expectError(error.InvalidArtifactCatalogCommand, encodeBatchRequest(alloc, accept));
 }
+
+test "distributed txn private control wire carries only an isolated DAG source fence" {
+    const alloc = std.testing.allocator;
+    const request: db_mod.types.BatchRequest = .{ .dag_source_fence = .{
+        .namespace = @splat(1),
+        .action = .acquire,
+        .fence = .{ .activation = @splat(2), .snapshot = @splat(3) },
+    } };
+    const encoded = try encodeBatchRequest(alloc, request);
+    defer alloc.free(encoded);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+    var parsed = try parseInternalBatchRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqualDeep(request.dag_source_fence, parsed.req.dag_source_fence);
+    var mixed = request;
+    mixed.writes = &.{.{ .key = "row", .value = "{}" }};
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, mixed));
+}
 test "internal isolated controls preserve neutral document versions across owner and forwarded codecs" {
     const a = std.testing.allocator;
     const inventory = @import("../storage/db/artifact_inventory.zig");
@@ -952,6 +970,16 @@ fn parseBatchRequestWithOptions(
         break :control @as(?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command), try std.json.parseFromValue(@import("../storage/db/online_source_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (online_source) |*control| control.deinit();
+    const dag_source_fence = if (root.get("_dag_source_fence")) |value| control: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
+        if (marker != .object) return error.InvalidBatchRequest;
+        const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "dag_source_fence_v1")) return error.InvalidBatchRequest;
+        const parsed_fence = try std.json.parseFromValue(@import("../graph/dag_authority.zig").SourceFenceCommand, alloc, value, .{});
+        defer parsed_fence.deinit();
+        break :control parsed_fence.value;
+    } else null;
     var artifact_catalog = if (root.get("_artifact_catalog")) |value| control: {
         if (!allow_internal) return error.InvalidBatchRequest;
         const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
@@ -1425,6 +1453,10 @@ fn parseBatchRequestWithOptions(
             if (restore_staging == null or object.count() != 1) return error.InvalidBatchRequest;
             break :merge null;
         }
+        if (std.mem.eql(u8, kind_value.string, "dag_source_fence_v1")) {
+            if (dag_source_fence == null or object.count() != 1) return error.InvalidBatchRequest;
+            break :merge null;
+        }
         if (std.mem.eql(u8, kind_value.string, "artifact_catalog_v1") or std.mem.eql(u8, kind_value.string, "artifact_catalog_dag_v1")) {
             if (artifact_catalog == null or object.count() != 1) return error.InvalidBatchRequest;
             break :merge null;
@@ -1773,6 +1805,7 @@ fn parseBatchRequestWithOptions(
             .online_source = if (online_source) |control| control.value else null,
             .group_source = if (group_source) |control| control.value else null,
             .resolver_review = if (resolver_review) |control| control.value else null,
+            .dag_source_fence = dag_source_fence,
             .artifact_catalog = if (artifact_catalog) |control| control.value else null,
             .artifact_publication = if (artifact_publication) |control| control.value else null,
             .artifact_publication_transport = if (artifact_publication_transport) |control| control.value else null,
@@ -1811,6 +1844,7 @@ fn parseBatchRequestWithOptions(
             .transaction = transaction,
         },
     };
+    try @import("../graph/dag_authority.zig").SourceFenceCommand.validateRequest(result_value.req);
     try @import("../storage/range_protection.zig").validateRequest(result_value.req);
     try db_mod.types.validateLeannRecordCommand(result_value.req);
     if (!allow_internal) {
@@ -2147,6 +2181,11 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
         defer alloc.free(encoded);
         try writer.writeAll(encoded);
+    }
+    try @import("../graph/dag_authority.zig").SourceFenceCommand.validateRequest(req);
+    if (req.dag_source_fence) |control| {
+        try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"dag_source_fence_v1\"},\"_dag_source_fence\":");
+        try writer.print("{f}", .{std.json.fmt(control, .{ .emit_strings_as_arrays = true })});
     }
     if (req.artifact_catalog) |control| {
         if (control.dag_activations != null) {

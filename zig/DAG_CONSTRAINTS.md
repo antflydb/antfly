@@ -61,7 +61,10 @@ installed. Scan progress and completion require that fence. Each root installs
 its fence only after draining prepared writers, in the same serialized writer
 that excludes new votes. Topology admission and activation fences exclude each
 other, and topology drain includes authority-only prepared participants.
-The activation coordinator still needs to drive
+The private ordered source-fence command commits acquisition or release with
+the apply receipt and rejects a delayed acquisition for an already released
+attempt. The command currently requires a root without asynchronous standby
+mirroring. The activation coordinator still needs to drive
 that protocol across roots, read the pinned graph, and propose completion. Regular index
 admission and direct graph-index open still reject DAG.
 An existing distributed reservation remains under the original coordinator,

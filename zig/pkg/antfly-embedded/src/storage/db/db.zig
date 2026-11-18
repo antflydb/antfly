@@ -9210,6 +9210,7 @@ pub const DB = struct {
         }
         if (req.leann_record != null) return self.applyLeannRecordBatch(req, opts);
         if (req.merge_proof_adoption != null) return self.applyMergeProofAdoptionBatch(req, opts);
+        if (req.dag_source_fence != null) return self.applyDagSourceFence(req, opts);
         if (req.artifact_catalog != null and req.online_source == null and req.merge_checkpoint == null) return self.applyArtifactCatalogBatch(req, opts);
         if (req.artifact_publication != null) return self.applyArtifactPublicationBatch(req, opts);
         if (req.artifact_publication_transport != null) return self.applyArtifactPublicationTransportBatch(req, opts);
@@ -28793,6 +28794,43 @@ pub const DB = struct {
             defer self.core.unlockApply();
             try applyDerivedBatchInlineAssumeApply(&batch_ctx, prepared_value.batch);
         }
+    }
+
+    fn applyDagSourceFence(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
+        try @import("../../graph/dag_authority.zig").SourceFenceCommand.validateRequest(req);
+        const command = req.dag_source_fence orelse return error.InvalidBatchRequest;
+        const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
+        if (opts.replication_applied_lsn_marker != null or self.local_execution.replication_async_batch_mirror != null)
+            return error.GraphConstraintNotReady;
+
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.tryLockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
+        if (!std.mem.eql(u8, &command.namespace, &@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace)))
+            return error.GraphConstraintRevisionChanged;
+
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        switch (command.action) {
+            .acquire => {
+                try command.requireIncomplete(&txn);
+                try transactions_mod.TxnManager.stageDagSourceFence(&txn, command.fence);
+            },
+            .release => try command.stageRelease(&txn),
+        }
+        for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
+        for (opts.extra_store_deletes) |key| try txn.delete(key);
+        if (opts.outcome_marker_write) |write| try txn.put(write.key, write.value);
+        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+        try txn.put(marker.key, marker.value);
+        try txn.commit();
     }
 
     fn applyArtifactCatalogBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
@@ -155951,6 +155989,36 @@ test "privacy scoped readiness status isolates shared catch-up telemetry" {
     pending.projection_checkpoint_status = "rebuilding";
     try std.testing.expect(DB.denseCatchUpAffectsIndex(pending, progress));
     try std.testing.expect(!DB.denseCatchUpAffectsIndex(pending, .{}));
+}
+
+test "db ordered DAG source fence persists with the apply receipt" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("dag-source-fence-ordered");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    const dag = @import("../../graph/dag_authority.zig");
+    const fence: dag.SourceFence = .{ .activation = @splat(3), .snapshot = @splat(4) };
+    var request: types.BatchRequest = .{ .dag_source_fence = .{
+        .namespace = @import("online_source_contract.zig").namespaceBytes(db.core.identity_namespace),
+        .action = .acquire,
+        .fence = fence,
+    } };
+    try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 1 }, true);
+    try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 1 }, true);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualDeep(fence, (try dag.SourceFence.read(&read)).?);
+    }
+    request.dag_source_fence.?.action = .release;
+    try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 2 }, true);
+    request.dag_source_fence.?.action = .acquire;
+    try std.testing.expectError(error.GraphConstraintAttemptConflict, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 3 }, true));
+    try std.testing.expectEqualDeep(@as(OrderedApplyReceipt, .{ .term = 1, .index = 2 }), (try db.orderedApplyReceipt()).?);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect((try dag.SourceFence.read(&read)) == null);
 }
 
 test "db DAG authority prepare commits through the native transaction path" {

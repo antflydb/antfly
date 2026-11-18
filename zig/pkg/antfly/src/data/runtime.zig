@@ -1444,6 +1444,12 @@ const RaftTableApplyStateMachine = struct {
         }
 
         fn forRequest(err: anyerror, req: antfly.db.types.BatchRequest) ?ExpectedApplyFailure {
+            if (req.dag_source_fence != null) switch (err) {
+                error.GraphConstraintAttemptConflict => return .GraphConstraintAttemptConflict,
+                error.GraphConstraintRevisionChanged => return .GraphConstraintRevisionChanged,
+                error.GraphConstraintNotReady => return .GraphConstraintNotReady,
+                else => {},
+            };
             if (err == error.GraphConstraintBusy) {
                 if (req.transaction) |control| {
                     if (control == .resolve and control.resolve.status == .committed) return null;
@@ -12700,7 +12706,7 @@ pub const DataServer = struct {
         // Source-bound pages carry certified per-row timestamps. Ordered
         // artifact admission is a catalog-only command with no row timestamp.
         // A wall-clock override would change either command's replay contract.
-        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null or proposal_req.leann_record != null or proposal_req.row_policy_publication != null) return proposal_req;
+        if (proposal_req.dag_source_fence != null or proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null or proposal_req.leann_record != null or proposal_req.row_policy_publication != null) return proposal_req;
         // DB.batch treats zero as "read realtime now". Materialize that value
         // once before any forwarding or Raft encoding so every replica applies
         // identical document versions and TTL deadlines. Preserve zero as the
@@ -12733,6 +12739,8 @@ pub const DataServer = struct {
     }
 
     fn raftBatchRequestForActiveProtocol(req: antfly.db.types.BatchRequest, active_protocol_version: u16, realtime_ns: u64) !antfly.db.types.BatchRequest {
+        if (batchRequiresDagConstraintProtocol(req) and active_protocol_version < @import("../common/data_raft_protocol.zig").batch_dag_constraint_protocol_version)
+            return error.Unavailable;
         // Old v27 decoders reinterpret the neutral cleanup scheme as legacy
         // and reject it. Never prepare such a proposal before its all-member
         // barrier; matching document-revision support is insufficient.
@@ -12749,7 +12757,15 @@ pub const DataServer = struct {
         return proposal;
     }
 
+    fn batchRequiresDagConstraintProtocol(req: antfly.db.types.BatchRequest) bool {
+        if (req.dag_source_fence != null) return true;
+        if (req.artifact_catalog) |catalog| if (catalog.dag_activations != null) return true;
+        if (req.transaction) |txn| if (txn == .prepare) return txn.prepare.dag_domains.len != 0;
+        return false;
+    }
+
     pub fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (batchRequiresDagConstraintProtocol(req)) return @import("../common/data_raft_protocol.zig").batch_dag_constraint_protocol_version;
         if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null)
             return @import("../common/data_raft_protocol.zig").batch_prepared_enrichments_protocol_version;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))
@@ -42757,6 +42773,18 @@ fn consumerTests() type {
                 invalid.writes = &.{.{ .key = "ordinary", .value = "{}" }};
                 try std.testing.expectError(error.InvalidBatchRequest, antfly.db.types.validateGraphEndpointCleanupCommand(invalid));
             }
+        }
+
+        test "raft DAG source fence waits for a compatible protocol without assigning document versions" {
+            const dag = @import("../common/data_raft_protocol.zig").batch_dag_constraint_protocol_version;
+            const request: antfly.db.types.BatchRequest = .{ .dag_source_fence = .{
+                .namespace = @splat(1),
+                .action = .acquire,
+                .fence = .{ .activation = @splat(2), .snapshot = @splat(3) },
+            } };
+            try std.testing.expectEqual(dag, DataServer.requiredRaftBatchProtocolVersion(request));
+            try std.testing.expectError(error.Unavailable, DataServer.raftBatchRequestForActiveProtocol(request, dag - 1, 999));
+            try std.testing.expectEqualDeep(request, try DataServer.raftBatchRequestForActiveProtocol(request, dag, 999));
         }
 
         test "raft cleanup protocol preflight rejects mixed decoders and rechecks upgraded peers" {

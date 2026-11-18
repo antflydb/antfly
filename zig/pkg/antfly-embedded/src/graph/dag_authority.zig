@@ -71,6 +71,46 @@ pub const SourceFence = struct {
     }
 };
 
+pub const SourceFenceCommand = struct {
+    namespace: [24]u8,
+    action: enum { acquire, release },
+    fence: SourceFence,
+
+    const completed_prefix = "\x00\x00__metadata__:dag-source-fence-completed:";
+
+    pub fn requireIncomplete(self: SourceFenceCommand, txn: anytype) !void {
+        const key = completed_prefix.* ++ self.fence.activation;
+        if (txn.get(&key)) |_| {
+            return error.GraphConstraintAttemptConflict;
+        } else |err| if (err != error.NotFound) return err;
+    }
+
+    pub fn stageRelease(self: SourceFenceCommand, txn: anytype) !void {
+        try self.fence.release(txn);
+        const key = completed_prefix.* ++ self.fence.activation;
+        if (txn.get(&key)) |snapshot| {
+            if (!std.mem.eql(u8, snapshot, &self.fence.snapshot)) return error.GraphConstraintAttemptConflict;
+            return;
+        } else |err| if (err != error.NotFound) return err;
+        try txn.put(&key, &self.fence.snapshot);
+    }
+
+    pub fn validateRequest(req: anytype) !void {
+        if (req.dag_source_fence == null) return;
+        const empty: @TypeOf(req) = .{};
+        inline for (comptime std.meta.fieldNames(@TypeOf(req))) |name| {
+            if (comptime !std.mem.eql(u8, name, "dag_source_fence") and
+                !std.mem.eql(u8, name, "sync_level") and !std.mem.eql(u8, name, "document_version_scheme"))
+            {
+                const value = @field(req, name);
+                if (comptime @typeInfo(@TypeOf(value)) == .pointer and @typeInfo(@TypeOf(value)).pointer.size == .slice) {
+                    if (value.len != 0) return error.InvalidBatchRequest;
+                } else if (!std.meta.eql(value, @field(empty, name))) return error.InvalidBatchRequest;
+            }
+        }
+    }
+};
+
 /// Hash the immutable table identity, index incarnation, and declared edge type.
 /// Shard IDs are deliberately absent: splitting cannot create weaker domains.
 pub fn domain(table: [16]u8, index_incarnation: u64, index: []const u8, edge_type: []const u8) !Digest {

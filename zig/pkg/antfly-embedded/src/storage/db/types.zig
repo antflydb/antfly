@@ -281,6 +281,7 @@ pub const BatchRequest = struct {
     online_source: ?@import("online_source_contract.zig").Command = null,
     /// Ordered complete artifact catalog; accepted only by private Raft ingress.
     artifact_catalog: ?@import("artifact_inventory.zig").Command = null,
+    dag_source_fence: ?@import("../../graph/dag_authority.zig").SourceFenceCommand = null,
     /// Private grouped-source control; public batch JSON cannot populate it.
     group_source: ?@import("group_source_contract.zig").Command = null,
     /// Exact producer result; only authenticated owner-leader Raft ingress.
