@@ -41,6 +41,25 @@ pub fn admit(request: Request) bool {
 pub fn preparedRows(rows: usize, input_width: usize, output_width: usize, blas: bool) bool {
     return !blas and rows >= 32 and input_width >= 64 and output_width >= 64;
 }
+/// Wide short-row projections can be bandwidth-bound even at one row. Keep
+/// weights and accumulators F32; vendor admission implies no conversion.
+/// The caller opts into the short-row schedule.
+pub fn f32VendorRows(rows: usize, input_width: usize, output_width: usize, short_rows: bool) bool {
+    if (rows == 0 or input_width < 64 or output_width < 64) return false;
+    const minimum_input = std.math.divCeil(usize, 1024 * 1024, output_width) catch return false;
+    return rows >= 128 or (short_rows and input_width >= minimum_input);
+}
+
+test "F32 vendor admission bounds short-row schedules" {
+    try std.testing.expect(f32VendorRows(85, 2560, 10752, true));
+    try std.testing.expect(f32VendorRows(1, 2560, 10752, true));
+    try std.testing.expect(!f32VendorRows(85, 2560, 10752, false));
+    try std.testing.expect(!f32VendorRows(1, 256, 256, true));
+    try std.testing.expect(!f32VendorRows(0, 2560, 10752, true));
+    try std.testing.expect(!f32VendorRows(128, 63, 10752, true));
+    try std.testing.expect(f32VendorRows(128, 64, 64, false));
+}
+
 test "dense projection admission is driven by workload shape and physical layout" {
     var request = Request{ .workload = .encoder, .rows = 16, .out_dim = 512, .supported_quant = true, .low_bit_k = true, .packed_expert = false };
     try std.testing.expect(admit(request));

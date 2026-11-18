@@ -213,6 +213,35 @@ const ImageFeatures = struct {
     resident: ?ops.CT = null,
 };
 
+fn copyMediaPromptRows(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    prompt: ops.CT,
+    offsets: []const usize,
+    counts: []const usize,
+    width: usize,
+    resident: ?ops.CT,
+    host: []const f32,
+) !void {
+    const source = resident orelse uploaded: {
+        var rows: usize = 0;
+        for (counts) |count| rows = try std.math.add(usize, rows, count);
+        const shape = [_]i32{
+            std.math.cast(i32, rows) orelse return error.InvalidTensorShape,
+            std.math.cast(i32, width) orelse return error.InvalidTensorShape,
+        };
+        break :uploaded try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(host, &shape));
+    };
+    defer if (resident == null) cb.free(source);
+    var source_row: usize = 0;
+    for (offsets, counts) |offset, count| {
+        try cb.checkExecutionControl();
+        if (count != 0 and !try cb.copyRows2D(allocator, prompt, offset, source, source_row, count, width))
+            return error.ResidentImageOperationUnavailable;
+        source_row += count;
+    }
+}
+
 fn preparePromptEmbeddings(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -317,31 +346,20 @@ fn preparePromptEmbeddings(
     defer cb.free(base_embeddings);
 
     const hidden_size: usize = config.hidden_size;
-    if (projected_images) |projected| if (projected.resident) |features| {
-        const scale = config.tokenEmbeddingScale();
-        const scaled = try cb.multiplyScalar(base_embeddings, scale) orelse return error.ResidentImageOperationUnavailable;
+    const resident_image = if (projected_images) |projected| projected.resident else null;
+    const resident_audio = if (projected_audio) |projected| projected.resident else null;
+    if (resident_image != null or resident_audio != null) {
+        const scaled = try cb.multiplyScalar(base_embeddings, config.tokenEmbeddingScale()) orelse return error.ResidentImageOperationUnavailable;
         const input_embeddings = try cb.ensureDeviceResidentOwned(scaled);
         errdefer cb.free(input_embeddings);
-        var source_row: usize = 0;
-        for (image_offsets, projected.tokens_per_image) |offset, count| {
-            try cb.checkExecutionControl();
-            if (!try cb.copyRows2D(allocator, input_embeddings, offset, features, source_row, count, hidden_size)) return error.ResidentImageOperationUnavailable;
-            source_row += count;
+        if (projected_images) |projected| {
+            try copyMediaPromptRows(cb, allocator, input_embeddings, image_offsets, projected.tokens_per_image, hidden_size, resident_image, projected.host orelse &.{});
         }
-        if (projected_audio) |audio| {
-            var rows: usize = 0;
-            for (audio.tokens_per_audio) |count| rows += count;
-            const shape = [_]i32{ @intCast(rows), @intCast(hidden_size) };
-            const audio_tensor = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(audio.embeddings, &shape));
-            defer cb.free(audio_tensor);
-            source_row = 0;
-            for (audio_offsets, audio.tokens_per_audio) |offset, count| {
-                if (count > 0 and !try cb.copyRows2D(allocator, input_embeddings, offset, audio_tensor, source_row, count, hidden_size)) return error.ResidentImageOperationUnavailable;
-                source_row += count;
-            }
+        if (projected_audio) |projected| {
+            try copyMediaPromptRows(cb, allocator, input_embeddings, audio_offsets, projected.tokens_per_audio, hidden_size, if (resident_audio) |resident| resident.rows else null, projected.embeddings);
         }
         return .{ .allocator = allocator, .token_ids = token_ids, .ple_token_ids = ple_token_ids, .input_embeddings = input_embeddings, .attn_or_mask = null };
-    };
+    }
 
     const prompt_embeddings = try cb.toFloat32(base_embeddings, allocator);
     defer allocator.free(prompt_embeddings);

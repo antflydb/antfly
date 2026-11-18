@@ -145,8 +145,10 @@ pub const ProjectedAudio = struct {
     embeddings: []f32,
     tokens_per_audio: []usize,
     hidden_size: usize,
+    resident: ?struct { backend: *const ComputeBackend, rows: CT } = null,
 
     pub fn deinit(self: *ProjectedAudio) void {
+        if (self.resident) |resident| resident.backend.free(resident.rows);
         self.allocator.free(self.embeddings);
         self.allocator.free(self.tokens_per_audio);
     }
@@ -310,6 +312,17 @@ pub const ProjectedVideo = struct {
 /// Decode one bounded MP4 clip and project each selected frame directly from
 /// CUDA memory. Only timestamp/count metadata is retained on the host.
 pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, bytes: []const u8, grow_automatic_scratch: bool) !ProjectedVideo {
+    return encodeProjectedVideoWithSession(cb, allocator, projector, bytes, grow_automatic_scratch, null);
+}
+
+pub fn encodeProjectedVideoWithSession(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    projector: *ProjectorStore,
+    bytes: []const u8,
+    grow_automatic_scratch: bool,
+    session: ?@import("../backends/session.zig").Session,
+) !ProjectedVideo {
     if (comptime !@import("build_options").enable_cuda or @import("builtin").os.tag != .linux) return error.UnsupportedVideoBackend;
     if (cb.kind() != .cuda or !cb.supportsCopyRows2D() or cb.vtable.sliceRows2D == null) return error.UnsupportedVideoBackend;
     const video = @import("../ops/cuda/video.zig");
@@ -325,6 +338,20 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
     defer weights.deinit();
     var cfg = try parseConfig(&projector.gguf.parsed);
     cfg.max_image_tokens = 70;
+    var batch_permit: ?@import("../backends/session.zig").RunPermit = null;
+    defer if (batch_permit) |*permit| {
+        compute.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+        permit.deinit();
+    };
+    if (session) |source| {
+        if (!cfg.direct_unified and @import("../execution/gemma4_native_plan.zig").selected() != null) {
+            const patches = try std.math.mul(usize, cfg.maxPatchCount(), 2);
+            const patch_width = try std.math.mul(usize, cfg.patch_size, cfg.patch_size * 3);
+            const ingress_bytes = try std.math.mul(usize, patches, try std.math.mul(usize, patch_width, 2 * @sizeOf(f32)));
+            const scratch = try std.math.add(usize, ingress_bytes, try imageScratchBytes(cfg, patches));
+            batch_permit = source.withAdmissionControl(cb.execution_control).admitRetainedMedia(0, scratch) catch null;
+        }
+    }
     var preprocessor = try video.Preprocessor.init(allocator, &compute.ctx);
     defer preprocessor.deinit();
     const State = struct {
@@ -338,6 +365,51 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
         timestamps: [video.max_frames]i64 = undefined,
         count: usize = 0,
         rows: usize = 0,
+        pending: [2]PendingFrame = undefined,
+        pending_count: usize = 0,
+        geometry: ?Geometry = null,
+        capacity: usize,
+        batches: usize = 0,
+        max_batch: usize = 0,
+
+        const PendingFrame = struct { patches: CT, timestamp: i64, repetitions: usize };
+
+        fn flush(self: *@This()) !void {
+            const count = self.pending_count;
+            if (count == 0) return;
+            const g = self.geometry.?;
+            const patch_rows = g.grid_x * g.grid_y;
+            const patch_width = self.cfg.patch_size * self.cfg.patch_size * 3;
+            const patches = if (count == 1) self.pending[0].patches else joined: {
+                const merged = (try self.cb.allocUninitF32Shape(&.{ @intCast(2 * patch_rows), @intCast(patch_width) })) orelse return error.UnsupportedVideoBackend;
+                errdefer self.cb.free(merged);
+                for (self.pending[0..count], 0..) |entry, slot| {
+                    if (!try self.cb.copyRows2D(self.allocator, merged, slot * patch_rows, entry.patches, 0, patch_rows, patch_width))
+                        return error.UnsupportedVideoBackend;
+                }
+                break :joined merged;
+            };
+            defer if (count != 1) self.cb.free(patches);
+            const projected = try encodeResidentPatchBatch(self.cb, self.allocator, self.weights, self.cfg, patches, g, count);
+            defer self.cb.free(projected.embeddings);
+            if (self.output == null) self.output = (try self.cb.allocUninitF32Shape(&.{ @intCast(video.max_frames * 70), @intCast(self.cfg.text_hidden) })) orelse return error.UnsupportedVideoBackend;
+            for (self.pending[0..count], 0..) |entry, slot| {
+                if (entry.repetitions == 0 or entry.repetitions > video.max_frames - self.count) return error.InvalidVideoGeometry;
+                for (0..entry.repetitions) |_| {
+                    if (!try self.cb.copyRows2D(self.allocator, self.output.?, self.rows, projected.embeddings, slot * projected.tokens, projected.tokens, self.cfg.text_hidden))
+                        return error.UnsupportedVideoBackend;
+                    self.tokens[self.count] = projected.tokens;
+                    self.timestamps[self.count] = entry.timestamp;
+                    self.count += 1;
+                    self.rows += projected.tokens;
+                }
+            }
+            for (self.pending[0..count]) |entry| self.cb.free(entry.patches);
+            self.pending_count = 0;
+            self.batches += 1;
+            self.max_batch = @max(self.max_batch, count);
+        }
+
         fn check(user_data: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(user_data));
             try self.cb.checkExecutionControl();
@@ -346,27 +418,28 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
             const self: *@This() = @ptrCast(@alignCast(user_data));
             const display = try frame.displaySize();
             const g = targetGeometry(self.cfg, display[0], display[1]);
+            if (self.geometry) |previous| if (!std.meta.eql(previous, g)) try self.flush();
+            self.geometry = g;
             const patches = try self.preprocess.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
-            defer self.cb.free(patches);
-            const projected = try encodeResidentPatches(self.cb, self.allocator, self.weights, self.cfg, patches, g);
-            defer self.cb.free(projected.embeddings);
-            if (self.output == null) self.output = (try self.cb.allocUninitF32Shape(&.{ @intCast(video.max_frames * 70), @intCast(self.cfg.text_hidden) })) orelse return error.UnsupportedVideoBackend;
-            if (!try self.cb.copyRows2D(self.allocator, self.output.?, self.rows, projected.embeddings, 0, projected.tokens, self.cfg.text_hidden)) return error.UnsupportedVideoBackend;
-            self.tokens[self.count] = projected.tokens;
-            self.timestamps[self.count] = frame.timestamp_us;
-            self.count += 1;
-            self.rows += projected.tokens;
+            self.pending[self.pending_count] = .{ .patches = patches, .timestamp = frame.timestamp_us, .repetitions = frame.repetitions };
+            self.pending_count += 1;
+            if (self.pending_count == self.capacity) try self.flush();
         }
     };
-    var state = State{ .cb = cb, .allocator = allocator, .weights = &weights, .cfg = cfg, .preprocess = &preprocessor };
-    defer if (state.output) |out| cb.free(out);
-    const stats = try video.decodeMp4(allocator, &compute.ctx, bytes, .{ .context = &state, .consume = State.consume, .check = State.check });
-    const embeddings = try ownVideoRows(cb, allocator, state.output.?, state.rows, cfg.text_hidden);
+    var state = State{ .cb = cb, .allocator = allocator, .weights = &weights, .cfg = cfg, .preprocess = &preprocessor, .capacity = if (batch_permit != null) 2 else 1 };
+    defer {
+        for (state.pending[0..state.pending_count]) |entry| cb.free(entry.patches);
+        if (state.output) |out| cb.free(out);
+    }
+    const stats = try video.decodeMp4(allocator, &compute.ctx, bytes, .{ .context = &state, .consume = State.consume, .check = State.check, .coalesce_repetitions = batch_permit != null });
+    try state.flush();
+    const output = state.output orelse return error.InvalidVideoGeometry;
+    const embeddings = try ownVideoRows(cb, allocator, output, state.rows, cfg.text_hidden);
     errdefer cb.free(embeddings);
     const counts = try allocator.dupe(usize, state.tokens[0..state.count]);
     errdefer allocator.free(counts);
     const timestamps = try allocator.dupe(i64, state.timestamps[0..state.count]);
-    return .{ .images = .{ .allocator = allocator, .backend = cb, .embeddings = embeddings, .tokens_per_image = counts, .hidden_size = cfg.text_hidden, .batches_executed = state.count, .max_batch_executed = 1 }, .timestamps_us = timestamps, .stats = stats };
+    return .{ .images = .{ .allocator = allocator, .backend = cb, .embeddings = embeddings, .tokens_per_image = counts, .hidden_size = cfg.text_hidden, .batches_executed = state.batches, .max_batch_executed = state.max_batch }, .timestamps_us = timestamps, .stats = stats };
 }
 
 /// Frames decoded by the portable or Apple routes. Decoders call `prepare` from
@@ -600,6 +673,10 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
 }
 
 fn encodeResidentPatches(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, patches: CT, g: Geometry) !ResidentImage {
+    return encodeResidentPatchBatch(cb, a, store, cfg, patches, g, 1);
+}
+
+fn encodeResidentPatchBatch(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, patches: CT, g: Geometry, batch: usize) !ResidentImage {
     const dim = cfg.patch_size * cfg.patch_size * 3;
     if (cfg.direct_unified) {
         const normalized = try layerNormVisionTensor(cb, a, store, patches, g.tokenCount(), dim, "v.patch_norm.1");
@@ -613,8 +690,8 @@ fn encodeResidentPatches(cb: *const ComputeBackend, a: std.mem.Allocator, store:
     const weight = try store.cachedWeightCt("v.patch_embd.weight");
     const matrix = try cb.reshape2D(a, weight, cfg.vision_hidden, dim, cfg.vision_hidden, dim);
     defer cb.free(matrix);
-    const hidden = try cb.linearNoBias(centered, matrix, g.grid_x * g.grid_y, dim, cfg.vision_hidden);
-    return encodeVisionHiddenResident(cb, a, store, cfg, hidden, g, 1);
+    const hidden = try cb.linearNoBias(centered, matrix, batch * g.grid_x * g.grid_y, dim, cfg.vision_hidden);
+    return encodeVisionHiddenResident(cb, a, store, cfg, hidden, g, batch);
 }
 
 /// A projector file kept open for a model's loaded lifetime. Parsing the
@@ -624,7 +701,10 @@ fn encodeResidentPatches(cb: *const ComputeBackend, a: std.mem.Allocator, store:
 /// Reads are lock-free (the store is a read-only mapping); the scalar clamp
 /// bounds resolved on first use share a small mutex. Allocations come from
 /// the owner's allocator, never from a request.
+var next_projector_cache_identity: std.atomic.Value(u64) = .init(1);
+
 pub const ProjectorStore = struct {
+    cache_identity: u64,
     allocator: std.mem.Allocator,
     path: []u8,
     gguf: *tensor_store_mod.GgufStore,
@@ -638,7 +718,7 @@ pub const ProjectorStore = struct {
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
         const gguf = try tensor_store_mod.GgufStore.initAbsolute(allocator, path);
-        self.* = .{ .allocator = allocator, .path = owned_path, .gguf = gguf };
+        self.* = .{ .allocator = allocator, .path = owned_path, .gguf = gguf, .cache_identity = next_projector_cache_identity.fetchAdd(1, .monotonic) };
         return self;
     }
 
@@ -702,7 +782,13 @@ const ProjectorWeights = struct {
 
     fn weightCt(self: *ProjectorWeights, tensor_name: []const u8) !CT {
         if (self.require_resident_weights) return self.cb.getWeight(tensor_name);
-        if (self.gguf) |gguf| return loadWeightCt(self.cb, self.allocator, gguf, tensor_name);
+        if (self.gguf) |gguf| {
+            var buffer: [256]u8 = undefined;
+            const key = self.cudaWeightKey(&buffer, "raw", tensor_name);
+            if (key) |name| if (try self.cb.modelConstant(name, null)) |hit| return hit;
+            const weight = try loadWeightCt(self.cb, self.allocator, gguf, tensor_name);
+            return self.publishCudaWeight(key, weight);
+        }
         const mapped = try @import("embedding_gemma2_media_weights.zig").name(self.allocator, tensor_name);
         defer self.allocator.free(mapped);
         return self.cb.getWeight(mapped);
@@ -747,11 +833,38 @@ const ProjectorWeights = struct {
             }
             return error.InvalidTensorShape;
         }
-        if (self.gguf) |gguf| return loadLinearWeightCt(self.cb, self.allocator, gguf, tensor_name, in_dim, out_dim);
+        if (self.gguf) |gguf| {
+            var layout: [64]u8 = undefined;
+            const compact = self.cb.kind() == .cuda and (platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_COMPACT_PROJECTOR") or
+                @import("../execution/gemma4_native_plan.zig").selected() != null);
+            const kind = try std.fmt.bufPrint(&layout, "linear:{d}:{d}:{s}", .{ in_dim, out_dim, if (compact) "compact" else "f32" });
+            var buffer: [256]u8 = undefined;
+            const key = self.cudaWeightKey(&buffer, kind, tensor_name);
+            if (key) |name| if (try self.cb.modelConstant(name, null)) |hit| return hit;
+            const weight = try loadProjectorLinearWeight(self.cb, self.allocator, gguf, tensor_name, in_dim, out_dim, compact);
+            return self.publishCudaWeight(key, weight);
+        }
         const tensor = try self.weightCt(tensor_name);
         errdefer self.cb.free(tensor);
         if (!(try self.cb.tensorShapeMatches(tensor, &.{ @intCast(out_dim), @intCast(in_dim) }) orelse false)) return error.InvalidTensorShape;
         return tensor;
+    }
+
+    fn cudaWeightKey(self: *const ProjectorWeights, buffer: []u8, layout: []const u8, name: []const u8) ?[]const u8 {
+        const owner = self.owner orelse return null;
+        if (self.cb.kind() != .cuda or (!platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_PROJECTOR_RESIDENCY") and
+            @import("../execution/gemma4_native_plan.zig").selected() == null)) return null;
+        return std.fmt.bufPrint(buffer, "projector.weight.{d}:{s}:{s}", .{ owner.cache_identity, layout, name }) catch null;
+    }
+
+    fn publishCudaWeight(self: *const ProjectorWeights, key: ?[]const u8, weight: CT) !CT {
+        const name = key orelse return weight;
+        errdefer self.cb.free(weight);
+        if (try self.cb.modelConstant(name, weight)) |resident| {
+            self.cb.free(weight);
+            return resident;
+        }
+        return weight;
     }
 
     fn tensorF32(self: *ProjectorWeights, tensor_name: []const u8) !ProjectorF32 {
@@ -1738,6 +1851,52 @@ pub fn encodeProjectedAudioInputs(cb: *const ComputeBackend, allocator: std.mem.
     return encodeProjectedAudioInputsWithWeights(cb, allocator, &weights, inputs);
 }
 
+/// Prompt projection can keep output rows on the same CUDA stream as the decoder.
+pub fn encodeProjectedAudioForPrompt(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, inputs: []const AudioInput) !ProjectedAudio {
+    if (cb.kind() != .cuda or @import("../execution/gemma4_native_plan.zig").selected() == null)
+        return encodeProjectedAudioInputs(cb, allocator, projector, inputs);
+    const cfg = try parseAudioConfig(&projector.gguf.parsed);
+    if (cfg.direct_unified) return encodeProjectedAudioInputs(cb, allocator, projector, inputs);
+    if (inputs.len == 0) return error.EmptyEmbeddingInput;
+    var weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector);
+    defer weights.deinit();
+    const counts = try allocator.alloc(usize, inputs.len);
+    errdefer allocator.free(counts);
+    const clips = try allocator.alloc(ResidentEncodedAudio, inputs.len);
+    defer allocator.free(clips);
+    var initialized: usize = 0;
+    defer for (clips[0..initialized]) |clip| cb.free(clip.embeddings);
+    var total: usize = 0;
+    for (inputs, clips, counts) |input, *clip, *count| {
+        clip.* = switch (input) {
+            .encoded => |bytes| try encodeSingleAudioResident(cb, allocator, &weights, cfg, bytes),
+            .pcm => |pcm| try encodeSingleAudioPcmResident(cb, allocator, &weights, cfg, pcm),
+        };
+        initialized += 1;
+        count.* = clip.tokens;
+        total = try std.math.add(usize, total, clip.tokens);
+    }
+    const rows = if (clips.len == 1) single: {
+        initialized = 0;
+        break :single clips[0].embeddings;
+    } else merged: {
+        const shape = [_]i32{
+            std.math.cast(i32, total) orelse return error.InvalidTensorShape,
+            std.math.cast(i32, cfg.text_hidden) orelse return error.InvalidTensorShape,
+        };
+        const output = (try cb.allocUninitF32Shape(&shape)) orelse return error.UnsupportedResidentGemma4Audio;
+        errdefer cb.free(output);
+        var offset: usize = 0;
+        for (clips) |clip| {
+            if (!try cb.copyRows2D(allocator, output, offset, clip.embeddings, 0, clip.tokens, cfg.text_hidden))
+                return error.UnsupportedResidentGemma4Audio;
+            offset += clip.tokens;
+        }
+        break :merged output;
+    };
+    return .{ .allocator = allocator, .embeddings = &.{}, .tokens_per_audio = counts, .hidden_size = cfg.text_hidden, .resident = .{ .backend = cb, .rows = rows } };
+}
+
 fn encodeProjectedAudioWithWeights(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -1832,19 +1991,24 @@ fn encodeSingleAudio(cb: *const ComputeBackend, allocator: std.mem.Allocator, st
 }
 
 fn encodeSingleAudioPcm(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, pcm: audio.PcmAudio) !EncodedAudio {
-    for (pcm.samples) |sample| if (!std.math.isFinite(sample)) return error.InvalidAudioSamples;
     if (cfg.direct_unified) {
+        for (pcm.samples) |sample| if (!std.math.isFinite(sample)) return error.InvalidAudioSamples;
         const frames = try prepareGemma4RawAudioFramesPcm(allocator, pcm, cfg.raw_samples_per_token, cfg.max_direct_audio_tokens);
         defer allocator.free(frames);
         return encodeUnifiedDirectAudioFrames(cb, allocator, store, cfg, frames);
     }
+    const result = try encodeSingleAudioPcmResident(cb, allocator, store, cfg, pcm);
+    defer cb.free(result.embeddings);
+    return .{ .embeddings = try cb.toFloat32(result.embeddings, allocator), .tokens = result.tokens };
+}
+
+fn encodeSingleAudioPcmResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, pcm: audio.PcmAudio) !ResidentEncodedAudio {
+    for (pcm.samples) |sample| if (!std.math.isFinite(sample)) return error.InvalidAudioSamples;
     var prepared = try prepareAudioPcmBounded(allocator, pcm, cfg.mel_bins, cfg.reject_audio_truncation, !audioHostOps().features and supportsGemma4LogMel(cb), cfg.max_audio_samples, false);
     defer prepared.deinit();
     var features = try audioFeaturesFromPrepared(cb, allocator, &prepared);
     defer features.deinit();
-    const result = try encodeAudioFeaturesResident(cb, allocator, store, cfg, &features);
-    defer cb.free(result.embeddings);
-    return .{ .embeddings = try cb.toFloat32(result.embeddings, allocator), .tokens = result.tokens };
+    return encodeAudioFeaturesResident(cb, allocator, store, cfg, &features);
 }
 
 pub fn encodeEmbeddingGemma2AudioResidentBounded(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8, decode_options: audio.DecodeOptions, max_decode_working_bytes: usize) !ResidentEncodedAudio {
@@ -7258,6 +7422,18 @@ pub fn loadLinearWeightCt(
     in_dim: usize,
     out_dim: usize,
 ) !CT {
+    return loadProjectorLinearWeight(cb, allocator, store, name, in_dim, out_dim, false);
+}
+
+fn loadProjectorLinearWeight(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    store: anytype,
+    name: []const u8,
+    in_dim: usize,
+    out_dim: usize,
+    compact: bool,
+) !CT {
     const source = projectorWeightSource(store);
     if (source.backend) |backend| {
         var buffer: [256]u8 = undefined;
@@ -7278,7 +7454,9 @@ pub fn loadLinearWeightCt(
                 const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
                 const rows = loaded.tensor.shape[0];
                 const cols = loaded.tensor.shape[1];
-                if (rows == out_dim and cols == in_dim) return compute.upload16BitAsF32(&loaded.tensor);
+                if (rows == out_dim and cols == in_dim) {
+                    return if (compact) compute.uploadProjectorMatrix16(&loaded.tensor) else compute.upload16BitAsF32(&loaded.tensor);
+                }
                 if (rows == in_dim and cols == out_dim) {
                     const uploaded = try compute.upload16BitAsF32(&loaded.tensor);
                     defer cb.free(uploaded);

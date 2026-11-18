@@ -3403,7 +3403,7 @@ pub const NativeGenerationPipeline = struct {
                     defer projected_images.releaseHost();
                     const image_rows: ?decoder_prefill.ProjectedInputRows = if (projected_video) |*video| video.images.promptRows() else try projected_images.rows();
                     var projected_audio = if (audio_clips.len > 0)
-                        (if (self.usesPjrtSession()) try @import("../execution/media_projection.zig").companionAudio(self.session.?, allocator, audio_clips, self.execution_control) else try gemma4_projector.encodeProjectedAudioInputs(&self.cb, allocator, projector, audio_clips))
+                        (if (self.usesPjrtSession()) try @import("../execution/media_projection.zig").companionAudio(self.session.?, allocator, audio_clips, self.execution_control) else try gemma4_projector.encodeProjectedAudioForPrompt(&self.cb, allocator, projector, audio_clips))
                     else
                         null;
                     defer if (projected_audio) |*projected| projected.deinit();

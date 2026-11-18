@@ -1378,7 +1378,19 @@ pub fn forwardLastLogitsLastRowTensorFromEmbeddingsWithLayer0Overrides(
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
 ) !CT {
-    const hidden_result = try forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
+    const output: SharedKvPrefillOutput = if (batch == 1 and cb.kind() == .cuda and
+        (getenvBool("ANTFLY_INFERENCE_CUDA_MULTIMODAL_SHARED_KV_PREFILL") or
+            @import("../execution/gemma4_native_plan.zig").selected() != null) and !disableSharedKvDebug() and
+        decode_context != null and
+        decode_context.?.query_sequence_len == seq_len and decode_context.?.total_sequence_len == seq_len and
+        sharedKvPrefillBoundary(config, decode_context.?.*) != null)
+        .last
+    else
+        .all;
+    if (output == .last) std.log.info("cuda_multimodal_shared_kv_prefill rows={d} donor_layers={d}", .{
+        seq_len, config.num_hidden_layers - config.num_kv_shared_layers,
+    });
+    const hidden_result = try forwardFinalHiddenWithSharedKvOutput(
         cb,
         allocator,
         config,
@@ -1388,6 +1400,9 @@ pub fn forwardLastLogitsLastRowTensorFromEmbeddingsWithLayer0Overrides(
         seq_len,
         decode_context,
         ple_vectors,
+        null,
+        null,
+        output,
     );
     const hidden = hidden_result.hidden;
     defer cb.free(hidden);
@@ -2896,33 +2911,25 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0OverridesAndTrace(
 const SharedKvPrefillOutput = enum { all, last, kv_only };
 
 fn sharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
-    // Keep this initial route specific to the measured text E4B geometry.
-    // Query collection needs every consumer's queries, including shared layers.
-    if (config.family != .gemma or config.hidden_size != 2560 or config.num_hidden_layers != 42 or
-        config.num_kv_shared_layers != 18 or config.num_attention_heads != 8 or
-        config.num_key_value_heads != 2 or config.attention_head_dim != 256 or
-        config.global_head_dim != 512 or config.position_encoding != .rope or
-        config.gemma4_mtp_assistant or config.usesMoe() or config.isMultimodal()) return null;
+    const geometry = @import("../execution/gemma4_native_plan.zig").Geometry.resolve(config) orelse return null;
     if (dc.attention_mode != .paged_prefill or dc.query_sequence_len <= 1 or
         dc.query_sequence_len > dc.total_sequence_len or dc.kv_cache == null or
-        dc.kv_batch != null or dc.attn_or_mask != null or dc.selection_query_capture != null or
+        dc.kv_batch != null or dc.selection_query_capture != null or
         dc.mrope_positions != null or dc.qwen3vl_visual_mask != null or
         dc.qwen3vl_deepstack_embeddings != null) return null;
-    if (dc.input_ids) |ids| if (ids.len == 0) return null;
-    const boundary = config.num_hidden_layers - config.num_kv_shared_layers;
-    for (boundary..config.num_hidden_layers) |layer| {
-        const donor = config.kvDonorLayerIndex(layer) orelse return null;
-        if (donor >= boundary or config.layerSharesKv(donor) or
-            config.effectiveHeadDimForLayer(donor) != config.effectiveHeadDimForLayer(layer) or
-            config.effectiveKVHeadsForLayer(donor) != config.effectiveKVHeadsForLayer(layer) or
-            config.layerUsesSlidingAttention(donor) != config.layerUsesSlidingAttention(layer)) return null;
+    if (dc.attn_or_mask) |mask| {
+        if (dc.query_sequence_len != dc.total_sequence_len or
+            mask.len != (std.math.mul(usize, dc.total_sequence_len, dc.total_sequence_len) catch return null)) return null;
     }
-    return boundary;
+    if (dc.input_ids) |ids| if (ids.len == 0) return null;
+    return geometry.donor_layers;
 }
 
 fn sharedKvLastRowContext(dc: DecodeContext) DecodeContext {
     var result = dc;
     result.query_sequence_len = 1;
+    // The visibility override only adds future keys. The final query has none.
+    result.attn_or_mask = null;
     if (result.input_ids) |ids| result.input_ids = ids[ids.len - 1 ..];
     return result;
 }
@@ -3029,6 +3036,7 @@ pub fn tryCudaSharedKvPrefill(
     want_last_logits: bool,
 ) !?SharedKvPrefillResult {
     if (cb.kind() != .cuda or disableSharedKvDebug() or !getenvBool("ANTFLY_INFERENCE_CUDA_E4B_SHARED_KV_PREFILL")) return null;
+    if (config.isMultimodal() or dc.attn_or_mask != null) return null;
     _ = sharedKvPrefillBoundary(config, dc.*) orelse return null;
     if (input_ids.len != dc.query_sequence_len or seq_len != dc.total_sequence_len) return null;
     const embed_w = try getEmbeddingWeight(cb, config);

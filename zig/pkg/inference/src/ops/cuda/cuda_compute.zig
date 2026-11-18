@@ -3162,8 +3162,8 @@ pub const CudaCompute = struct {
         defer self.unlockConstantMetadata();
         if (self.cacheRetirementPending()) return error.QueueFull;
         const policy = @import("../../models/embedding_gemma2_weight_cache.zig");
-        var remaining = if (sameCacheAdmission(self.constant_policy, desired)) policy.prepared_max_bytes - self.embedding_gemma2_constant_bytes.load(.acquire) else policy.prepared_max_bytes;
-        var slots = if (sameCacheAdmission(self.constant_policy, desired)) policy.prepared_max_entries - self.embedding_gemma2_constant_count.load(.acquire) else policy.prepared_max_entries;
+        var remaining = if (sameCacheAdmission(self.constant_policy, desired)) policy.prepared_max_bytes -| self.embedding_gemma2_constant_bytes.load(.acquire) else policy.prepared_max_bytes;
+        var slots = if (sameCacheAdmission(self.constant_policy, desired)) policy.prepared_max_entries -| self.embedding_gemma2_constant_count.load(.acquire) else policy.prepared_max_entries;
         var projection_slots = 32 - self.lighton_projection_cache.count();
         var pair_slots = 32 - self.lighton_gate_up_cache.count();
         for (funding.entries, 0..) |entry, index| {
@@ -5983,6 +5983,7 @@ pub const CudaCompute = struct {
     resident_training_cache: bool = false,
     allocator: std.mem.Allocator,
     capability_profile: ?CapabilityProfile = null,
+    gemma4_native_plan: ?@import("../../execution/gemma4_native_plan.zig").Plan = null,
     ctx: context_mod.CudaContext,
     scalar_clamp_kernel: @import("scalar_clamp.zig").Kernel = .{},
     row_selection_stats: @import("row_selection_stats.zig").Module = .{},
@@ -6759,7 +6760,7 @@ pub const CudaCompute = struct {
         if (self.embedding_gemma2_constants.capacity() == 0) return;
         if (!context_destroyed and self.embedding_gemma2_constants.count() != 0) try self.ctx.synchronize();
         const Entry = struct { key: []const u8, root: *CudaTensor };
-        var entries: [@import("../../models/embedding_gemma2_weight_cache.zig").prepared_max_entries]Entry = undefined;
+        var entries: [projector_constant_max_entries]Entry = undefined;
         self.lockConstantMetadata();
         const count = self.embedding_gemma2_constants.count();
         std.debug.assert(count <= entries.len);
@@ -7208,11 +7209,11 @@ pub const CudaCompute = struct {
                 CacheRetirement.buffer(&hash, entry.value_ptr.buffer);
                 leases += try CacheRetirement.leaseWord(&hash, entry.value_ptr.quota.peek(), &controller);
             }
-            if (expected.embedding_gemma2_constants.count() > 128) return error.CacheRetirementCapacityChanged;
+            if (expected.embedding_gemma2_constants.count() > projector_constant_max_entries) return error.CacheRetirementCapacityChanged;
             var constants = expected.embedding_gemma2_constants.iterator();
             while (constants.next()) |entry| {
                 const root = entry.value_ptr.*;
-                if (!root.model_constant or root.cache_retirement_slot != null or root.storage_retirement != null or root.resident_parent != null or root.quant_type != null or root.dtype != .f32 or root.tc_quant != null or root.bf16_mirror.ptr != 0 or root.resident_indices != null or root.training_upload_host.ptr != null or root.physical_lease != null or root.foreign_payload_owner != null or root.foreign_clone_owner != null) return error.UnsupportedCachedConstantRetirement;
+                if (!root.model_constant or root.cache_retirement_slot != null or root.storage_retirement != null or root.resident_parent != null or root.quant_type != null or (root.dtype != .f32 and root.dtype != .f16 and root.dtype != .bf16) or root.tc_quant != null or root.bf16_mirror.ptr != 0 or root.resident_indices != null or root.training_upload_host.ptr != null or root.physical_lease != null or root.foreign_payload_owner != null or root.foreign_clone_owner != null) return error.UnsupportedCachedConstantRetirement;
                 for (root.auxiliary_leases) |value| if (value != null) return error.UnsupportedCachedConstantRetirement;
                 hash.update(entry.key_ptr.*);
                 CacheRetirement.word(&hash, @intFromPtr(root));
@@ -7345,7 +7346,7 @@ pub const CudaCompute = struct {
                     while (root.resident_parent) |parent| root = parent;
                     return .{ .quota = &root.model_constant_quota };
                 }
-                if (span.bytes == 0 or span.bytes > constant_policy.prepared_max_bytes - self.embedding_gemma2_constant_bytes.load(.acquire) or self.embedding_gemma2_constant_count.load(.acquire) >= constant_policy.prepared_max_entries) return .{};
+                if (span.bytes == 0 or span.bytes > constant_policy.prepared_max_bytes -| self.embedding_gemma2_constant_bytes.load(.acquire) or self.embedding_gemma2_constant_count.load(.acquire) >= constant_policy.prepared_max_entries) return .{};
                 return .{ .miss = true, .amounts = .{ .backend_scratch_bytes = span.bytes } };
             },
         }
@@ -7433,8 +7434,8 @@ pub const CudaCompute = struct {
         const timeline = try expected.planArenaTimeline(funding);
         var packed_remaining = @import("embedding_gemma2_execution.zig").packed_limit - expected.embedding_gemma2_execution.packed_bytes;
         const constant_policy = @import("../../models/embedding_gemma2_weight_cache.zig");
-        var constant_remaining = constant_policy.prepared_max_bytes - expected.embedding_gemma2_constant_bytes.load(.acquire);
-        var constant_slots = constant_policy.prepared_max_entries - expected.embedding_gemma2_constant_count.load(.acquire);
+        var constant_remaining = constant_policy.prepared_max_bytes -| expected.embedding_gemma2_constant_bytes.load(.acquire);
+        var constant_slots = constant_policy.prepared_max_entries -| expected.embedding_gemma2_constant_count.load(.acquire);
         funding.admission = expected.ctx.video_cache_budget.admission;
         for (funding.entries, 0..) |*entry, index| {
             entry.miss = false;
@@ -7477,8 +7478,8 @@ pub const CudaCompute = struct {
         const timeline = try expected.planArenaTimeline(&work);
         var packed_remaining = @import("embedding_gemma2_execution.zig").packed_limit - expected.embedding_gemma2_execution.packed_bytes;
         const constant_policy = @import("../../models/embedding_gemma2_weight_cache.zig");
-        var constant_remaining = constant_policy.prepared_max_bytes - expected.embedding_gemma2_constant_bytes.load(.acquire);
-        var constant_slots = constant_policy.prepared_max_entries - expected.embedding_gemma2_constant_count.load(.acquire);
+        var constant_remaining = constant_policy.prepared_max_bytes -| expected.embedding_gemma2_constant_bytes.load(.acquire);
+        var constant_slots = constant_policy.prepared_max_entries -| expected.embedding_gemma2_constant_count.load(.acquire);
         for (work.requests, 0..) |request, index| {
             var actual = try expected.cacheRequestWithTimeline(request, index, &timeline);
             // A raw peer publication cannot enter the compatibility path.
@@ -10298,6 +10299,25 @@ pub const CudaCompute = struct {
         self.stats.resident_weight_bytes += tensor.data.len;
     }
 
+    /// Upload the original matrix bits for the reduced-precision GEMM routes.
+    pub fn uploadProjectorMatrix16(self: *CudaCompute, tensor: *const tensor_mod.Tensor) !CT {
+        if (tensor.dtype != .f16 and tensor.dtype != .bf16) return error.UnsupportedTensorType;
+        if (tensor.shape.len != 2) return error.InvalidShape;
+        const count = try elementCountFromShape(tensor.shape);
+        if (tensor.data.len != try checkedMul(count, @sizeOf(u16))) return error.InvalidShape;
+        if (tensor.mmap_source_bytes != null) c_file.MmapRegion.adviseBytesSequential(tensor.data);
+        const shape = try dupeShape(self.allocator, tensor.shape);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, tensor.data.len);
+        errdefer releaseDeviceBuffer(self, &device);
+        var upload_pending = true;
+        errdefer if (upload_pending) self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+        try copyFromHostTracked(self, device, tensor.data);
+        try synchronizeAndDrainDeferredDeviceFrees(self);
+        upload_pending = false;
+        return createTensorWithDType(self, device, shape, count, tensor.dtype);
+    }
+
     /// Upload compact F16/BF16 weights and widen exactly on device. The caller owns
     /// the returned F32 tensor; the source can be released when this returns.
     pub fn upload16BitAsF32(self: *CudaCompute, tensor: *const tensor_mod.Tensor) !CT {
@@ -12020,6 +12040,12 @@ fn cudaShouldAttachBf16MirrorToQ4Weight(
     // route prefill to the scalar BF16 fallback — slower than the retained
     // Q4 kernels — while still inflating VRAM at load admission.
     if (self.cublaslt == null) return false;
+    if (self.gemma4_native_plan) |plan| {
+        return plan.projection == .bf16_donors and plan.geometry.mirrorsWeight(name) and
+            !cudaDequantizeQ4_0MatrixWeightsToBf16OnUpload() and !cudaShouldDequantizeWeightOnUpload(name, storage) and
+            isKnownQuantStorage(storage, .Q4_0) and storage.shape.len == 2 and
+            storage.shape[0] > 0 and storage.shape[1] > 0;
+    }
     return cudaQ4WeightBf16MirrorPolicyEnabled(
         name,
         storage,
@@ -15971,6 +15997,13 @@ fn tryCublasLtF16LinearPair(
     return true;
 }
 
+fn f32VendorRowsEligible(self: *const CudaCompute, rows: usize, in_dim: usize, out_dim: usize) bool {
+    if (rows == 0 or in_dim < 64 or out_dim < 64) return false;
+    const short_rows = if (self.gemma4_native_plan) |plan| plan.wide_f32_vendor else false;
+    return self.strict_f32_weights or
+        @import("../dense_projection_policy.zig").f32VendorRows(rows, in_dim, out_dim, short_rows);
+}
+
 fn tryCublasLtF32Linear(
     self: *CudaCompute,
     dst: buffer_mod.DeviceBuffer,
@@ -15984,7 +16017,7 @@ fn tryCublasLtF32Linear(
     if (self.ctx.info.compute_major < 8) return false;
     // Laya keeps FP32 weights resident, including short encoder sequences.
     // Its wide projections benefit from cuBLASLt below the general 128-row gate.
-    if ((!self.strict_f32_weights and rows < 128) or in_dim < 64 or out_dim < 64) return false;
+    if (!f32VendorRowsEligible(self, rows, in_dim, out_dim)) return false;
     const blas = &(self.cublaslt orelse return false);
     // Reuse the admitted generic workspace policy for qualified F32 plans.
     const workspace = if (cublasLtF32WorkspaceBytes(self) != 0) cublasLtWorkspace(self) else buffer_mod.DeviceBuffer{};
@@ -17595,10 +17628,12 @@ fn evictTempBufferUnlockedUsing(self: *CudaCompute, buffer: *buffer_mod.DeviceBu
     if (checked) _ = try buffer.freeChecked(&self.ctx) else buffer.free(&self.ctx);
 }
 
+const projector_constant_max_entries = 512;
+
 fn borrowModelConstant(self: *CudaCompute, parent: *CudaTensor) !CT {
     const shape = try self.allocator.dupe(i64, parent.shape);
     errdefer self.allocator.free(shape);
-    const result = try createTensor(self, parent.buffer, shape, parent.elem_count);
+    const result = try createTensorWithDType(self, parent.buffer, shape, parent.elem_count, parent.dtype);
     const tensor = tensorFromCt(result);
     tensor.owns_buffer = false;
     tensor.resident_parent = parent;
@@ -17611,14 +17646,17 @@ fn modelConstantOp(ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT {
     const policy = @import("../../models/embedding_gemma2_weight_cache.zig");
     const embedding_key = self.capability_profile == .embedding_gemma2 and std.mem.startsWith(u8, key, "audio_tower.prepared.");
     const lighton_key = self.capability_profile == .lightonocr3 and self.lighton_norm_weight_cache_enabled and std.mem.startsWith(u8, key, "lighton.norm_weight.");
-    if (key.len > 256 or (!embedding_key and !lighton_key)) return null;
+    const projector_key = self.capability_profile == .gemma4 and
+        (self.gemma4_native_plan != null or platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_PROJECTOR_RESIDENCY")) and
+        std.mem.startsWith(u8, key, "projector.weight.");
+    if (key.len > 256 or (!embedding_key and !lighton_key and !projector_key)) return null;
     self.lockConstantMetadata();
     const cached = self.embedding_gemma2_constants.get(key);
     self.unlockConstantMetadata();
     if (cached) |snapshot| {
         if (value) |input| {
             const candidate = tensorFromCt(input);
-            if (candidate.dtype != .f32 or !std.mem.eql(i64, candidate.shape, snapshot.shape)) return error.InvalidShape;
+            if (candidate.dtype != snapshot.dtype or !std.mem.eql(i64, candidate.shape, snapshot.shape)) return error.InvalidShape;
         }
         self.embedding_gemma2_constant_hits += 1;
         if (std.mem.startsWith(u8, key, "audio_tower.prepared.query_scale.")) self.embedding_gemma2_audio_constant_hits += 1;
@@ -17628,9 +17666,13 @@ fn modelConstantOp(ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT {
     self.embedding_gemma2_constant_misses += 1;
     const source = tensorFromCt(value orelse return null);
     if (lighton_key and !self.managedNormMissFunded(key, try checkedMul(source.elem_count, 4))) return null;
-    try ensureF32(source);
-    const bytes = try checkedMul(source.elem_count, @sizeOf(f32));
-    if (bytes == 0 or bytes > policy.prepared_max_bytes - self.embedding_gemma2_constant_bytes.load(.acquire) or self.embedding_gemma2_constant_count.load(.acquire) >= policy.prepared_max_entries or try self.ctx.streamCaptureActive()) return null;
+    const compact = projector_key and (isF16Weight(source) or isBf16Weight(source));
+    if (!compact) try ensureF32(source);
+    const bytes = try checkedMul(source.elem_count, if (compact) @sizeOf(u16) else @sizeOf(f32));
+    const entry_limit = if (projector_key) projector_constant_max_entries else policy.prepared_max_entries;
+    const byte_limit = if (projector_key) 1024 * 1024 * 1024 else policy.prepared_max_bytes;
+    if (bytes == 0 or bytes > byte_limit -| self.embedding_gemma2_constant_bytes.load(.acquire) or
+        self.embedding_gemma2_constant_count.load(.acquire) >= entry_limit or try self.ctx.streamCaptureActive()) return null;
     var lease = @import("prepared_cache.zig").acquire(&self.ctx, try @import("prepared_cache.zig").Request.constantSpan(key, bytes), .{ .backend_scratch_bytes = bytes }) catch return null;
     errdefer lease.releaseAfterSdkDeath();
     var buffer = buffer_mod.DeviceBuffer.alloc(&self.ctx, bytes) catch {
@@ -17652,7 +17694,7 @@ fn modelConstantOp(ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT {
     // runs on a cache hit and cannot pin a request's temporary allocation.
     try buffer.copyFromDevice(&self.ctx, source.buffer, bytes);
     try self.ctx.synchronize();
-    snapshot.* = .{ .buffer = buffer, .dtype = .f32, .shape = shape, .elem_count = source.elem_count, .model_constant = true, .model_constant_quota = .none };
+    snapshot.* = .{ .buffer = buffer, .dtype = source.dtype, .shape = shape, .elem_count = source.elem_count, .model_constant = true, .model_constant_quota = .none };
     const result = try borrowModelConstant(self, snapshot);
     if (self.lighton_decode_graph.active) if (self.captured_cache_roots) |roots| roots.selected(self, key, snapshot) catch |err| {
         freeTensor(self, result);
@@ -38031,6 +38073,46 @@ test "embeddinggemma2 CUDA model constants keep independent admission through bo
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Mock.run, .{});
 }
 
+test "CUDA compact projector constants preserve BF16 matrix weights through GEMM" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var guard = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_PROJECTOR_RESIDENCY");
+    defer guard.restore(a);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_PROJECTOR_RESIDENCY", "1", 1));
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    compute.capability_profile = .gemma4;
+    const cb = compute.computeBackend();
+    const bits = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080 };
+    const matrix: tensor_mod.Tensor = .{
+        .data = @constCast(std.mem.sliceAsBytes(&bits)),
+        .dtype = .bf16,
+        .shape = &.{ 2, 2 },
+        .name = "matrix",
+        .allocator = a,
+        .owns_data = false,
+        .owns_shape = false,
+    };
+    const key = "projector.weight.fixture";
+    {
+        const weight = try compute.uploadProjectorMatrix16(&matrix);
+        defer cb.free(weight);
+        const published = (try cb.modelConstant(key, weight)) orelse return error.TestUnexpectedResult;
+        cb.free(published);
+    }
+    const hit = (try cb.modelConstant(key, null)) orelse return error.TestUnexpectedResult;
+    defer cb.free(hit);
+    try std.testing.expectEqual(tensor_mod.DType.bf16, tensorFromCt(hit).dtype);
+    try std.testing.expectEqual(@sizeOf(@TypeOf(bits)), compute.embedding_gemma2_constant_bytes.load(.acquire));
+    const input = try cb.fromFloat32Shape(&.{ 2, 1 }, &.{ 1, 2 });
+    defer cb.free(input);
+    const output = try cb.linearNoBias(input, hit, 1, 2, 2);
+    defer cb.free(output);
+    const values = try cb.toFloat32(output, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 4, 10 }, values);
+}
+
 test "embeddinggemma2 CUDA constant snapshots preserve bits after mutation eviction and warm reuse" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     var compute = try CudaCompute.testing.init(std.testing.allocator);
@@ -38253,7 +38335,7 @@ fn cudaDenseDecoderProjectionIntoOp(ctx: *anyopaque, descriptor: *const ops.kern
     const w = tensorFromCt(inputs[1]);
     if (x.elem_count != try checkedMul(g.rows, g.in_dim) or w.elem_count != try checkedMul(g.out_dim, g.in_dim)) return false;
     if (g.bias and tensorFromCt(inputs[2]).elem_count != g.out_dim) return false;
-    const vendor = cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and (self.strict_f32_weights or g.rows >= 128) and g.in_dim >= 64 and g.out_dim >= 64 and self.cublaslt != null;
+    const vendor = cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and f32VendorRowsEligible(self, g.rows, g.in_dim, g.out_dim) and self.cublaslt != null;
     if (vendor) {
         // No first-use plan discovery in an entered decoder. The encoder
         // normally warmed this same F32 geometry; otherwise remain eager.
@@ -45206,7 +45288,7 @@ const PreparedCudaProjection = struct {
     fn finishF32Profile(self: *CudaCompute, initial: Profile) !?Profile {
         var p = initial;
         const g = p.geometry;
-        if (cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null and (self.strict_f32_weights or g.rows >= 128) and g.width >= 64 and g.columns >= 64) p.family = .vendor_f32 else if (g.bias) p.family = if (g.rows >= 2 and g.width >= 256 and g.columns >= 4) .f32_bias_tiled else .f32_bias else if (cudaF32LinearTiledEnabled() and g.rows <= 16 and g.width >= 512 and (g.columns >= 512 or (self.a4b_runtime != null and isA4bRouterDecodeShape(g.rows, g.width, g.columns))) and self.kernels.linear_f32_tiled != null) p.family = .f32_tiled;
+        if (cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null and f32VendorRowsEligible(self, g.rows, g.width, g.columns)) p.family = .vendor_f32 else if (g.bias) p.family = if (g.rows >= 2 and g.width >= 256 and g.columns >= 4) .f32_bias_tiled else .f32_bias else if (cudaF32LinearTiledEnabled() and g.rows <= 16 and g.width >= 512 and (g.columns >= 512 or (self.a4b_runtime != null and isA4bRouterDecodeShape(g.rows, g.width, g.columns))) and self.kernels.linear_f32_tiled != null) p.family = .f32_tiled;
         if (p.family == .vendor_f32) {
             p.vendor_bytes = cublasLtF32WorkspaceBytes(self);
             p.workspace_bytes = (try std.math.add(usize, p.vendor_bytes, 3)) & ~@as(usize, 3);
@@ -53057,6 +53139,42 @@ fn checkOrdinaryHeaderPreflight(comptime precision: tensor_mod.DType) !void {
     const unchanged = try cb.toFloat32(input, a);
     defer a.free(unchanged);
     try std.testing.expectEqualSlices(f32, &values, unchanged);
+}
+
+test "CUDA wide short-row F32 projection matches scalar and independent reference" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    compute.gemma4_native_plan = .{ .projection = .packed_q4, .geometry = .{ .donor_layers = 24 } };
+    const cb = compute.computeBackend();
+    const width = 1024;
+    const weights = try a.alloc(f32, width * width);
+    defer a.free(weights);
+    for (weights, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 61)) - 30)) / 256;
+    const weight = try cb.fromFloat32Shape(weights, &.{ width, width });
+    defer cb.free(weight);
+    for ([_]usize{ 1, 3, 85 }) |rows| {
+        const values = try a.alloc(f32, rows * width);
+        defer a.free(values);
+        for (values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 37)) - 18)) / 128;
+        const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), width });
+        defer cb.free(input);
+        const output = (try allocUninitF32ShapeOp(&compute, &.{ @intCast(rows), width })).?;
+        defer cb.free(output);
+        try std.testing.expect(try tryCublasLtF32Linear(&compute, tensorFromCt(output).buffer, tensorFromCt(input).buffer, tensorFromCt(weight).buffer, rows, width, width));
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        try compute.kernels.launchLinearF32(&compute.ctx, tensorFromCt(output).buffer, tensorFromCt(input).buffer, tensorFromCt(weight).buffer, rows, width, width);
+        const frozen = try cb.toFloat32(output, a);
+        defer a.free(frozen);
+        for (actual, frozen) |got, expected| try std.testing.expectApproxEqAbs(expected, got, 0.0001);
+        for (0..rows) |row| for ([_]usize{ 0, 17, 511, 1023 }) |column| {
+            var expected: f64 = 0;
+            for (0..width) |k| expected += @as(f64, values[row * width + k]) * @as(f64, weights[column * width + k]);
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), actual[row * width + column], 0.0001);
+        };
+    }
 }
 
 test "CUDA legacy F32 vendor metadata decline precedes math and accepted SDK failure never replays" {

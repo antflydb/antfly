@@ -660,6 +660,12 @@ pub fn prepare(
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
+    if (cuda_profile == .gemma4 and host_weights_owner.architecture == .gpt) {
+        cuda_compute.gemma4_native_plan = @import("../execution/gemma4_native_plan.zig").Plan.resolve(host_weights_owner.architecture.gpt);
+        if (cuda_compute.gemma4_native_plan) |plan| std.log.info("cuda_gemma4_native_plan projections={s} donor_layers={d}", .{
+            @tagName(plan.projection), plan.geometry.donor_layers,
+        });
+    }
     if (cuda_profile == .transformer_seq2seq) {
         const precision = resolveSeq2seqPolicy(host_weights_owner.architecture, cuda_compute.runtime_policy.seq2seq);
         if (precision.encoder_attention == .f16 and host_weights_owner.architecture == .whisper and host_weights_owner.architecture.whisper.max_source_positions > 1500)

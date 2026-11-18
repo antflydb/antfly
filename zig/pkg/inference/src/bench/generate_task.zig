@@ -39,6 +39,8 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         try cb.provisionKvDeviceWriteHook(&storage.?);
         request_pool = pool_id;
     }
+    const has_media = options.generate_image != null or options.generate_audio != null or options.generate_video != null;
+    const projector = if (has_media) try model.ensureProjectorStoreWithControl(cb.execution_control) else null;
     var pipeline = generation.NativeGenerationPipeline{
         .allocator = a,
         .io = init.io,
@@ -53,6 +55,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .return_raw_token_ids = true,
         .model_dir = options.model_dir,
         .gguf_projector_path = model.manifest.gguf_projector_path,
+        .projector_store = projector,
         .graph_cache = if (is_pjrt) &cache else null,
         .compiled_partition_backend = if (is_pjrt) .pjrt else null,
         .compiled_attachment_target = .whole_model,
@@ -72,6 +75,10 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
     const messages = [_]generation.Message{.{ .role = "user", .content = options.generate_text.?, .image_bytes = if (image_bytes != null) &image_inputs else null, .audio_bytes = if (audio_bytes != null) &audio_inputs else null, .video_bytes = video_bytes }};
     const samples = try a.alloc(u64, options.iterations);
     defer a.free(samples);
+    const stage_samples = try a.alloc(?generation.GenerationTimingMs, options.iterations);
+    defer a.free(stage_samples);
+    const cached_stage_samples = try a.alloc(?generation.GenerationTimingMs, if (comparison) options.iterations else 0);
+    defer a.free(cached_stage_samples);
     var reference: ?generation.GenerationResult = null;
     defer if (reference) |*value| value.deinit();
     const cached_samples = try a.alloc(u64, if (comparison) options.iterations else 0);
@@ -79,10 +86,15 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
     var counts: [2]usize = @splat(0);
     var cold: [2]u64 = @splat(0);
     const requests = try std.math.mul(usize, try std.math.add(usize, options.warmup, options.iterations), if (comparison) @as(usize, 2) else 1);
+    const cuda_before = factory.getCudaRuntimeStats(model.session);
     for (0..requests) |i| {
         const mode: usize = if (comparison and (i % 4 == 1 or i % 4 == 2)) 1 else 0;
         if (comparison) pipeline.pjrt_decoder_cache = mode == 1;
         const start = inference.platform.time.awakeNs(init.io);
+        // This benchmark reuses one backend, whereas serving acquires it for
+        // each request. Reset captured temporaries before media/prompt tensors
+        // are created, while keeping immutable model caches and PJRT programs.
+        if (!is_pjrt) try pipeline.cb.beginRequest();
         var result = request: {
             var decode: ?generation.NativeDecodeState = if (request_pool) |pool| generation.NativeDecodeState.initPaged(a, &kv, pool, null) else null;
             defer if (decode) |*state| state.deinit();
@@ -98,7 +110,10 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         if (counts[mode] == 0) cold[mode] = elapsed;
         if (counts[mode] >= options.warmup) {
             const destination = if (mode == 1) cached_samples else samples;
-            destination[counts[mode] - options.warmup] = elapsed;
+            const index = counts[mode] - options.warmup;
+            destination[index] = elapsed;
+            const stages = if (mode == 1) cached_stage_samples else stage_samples;
+            stages[index] = result.timing_ms;
         }
         counts[mode] += 1;
         if (reference) |expected| {
@@ -109,6 +124,8 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
             }
         } else reference = result;
     }
+    const cuda_after = factory.getCudaRuntimeStats(model.session);
+    const cuda_counts = if (cuda_before != null and cuda_after != null) factory.cudaStatsDelta(cuda_after.?, cuda_before.?) else null;
     const held = reference orelse return error.NoGenerationOutput;
     const report = try std.json.Stringify.valueAlloc(a, .{
         .task = "public_generation",
@@ -134,6 +151,9 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .cache_comparison = if (comparison) .{ .order = "ABBA", .same_tokens = true, .baseline_samples_ns = samples, .cached_samples_ns = cached_samples, .cached_cold_request_ns = cold[1] } else null,
         .cold_request_ns = cold[0],
         .samples_ns = samples,
+        .stage_samples_ms = stage_samples,
+        .cuda_request_counters = cuda_counts,
+        .cached_stage_samples_ms = if (comparison) cached_stage_samples else null,
         .warmup = options.warmup,
         .text = held.text,
         .token_ids = held.token_ids,
