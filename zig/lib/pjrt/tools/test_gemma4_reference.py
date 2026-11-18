@@ -5,14 +5,15 @@
 import unittest
 from unittest.mock import patch
 
+import numpy as np
 import torch
-from gemma4_cpu import teacher_forced_inputs
+from gemma4_cpu import decision_checks, teacher_forced_inputs
 from gemma4_reference import (
     load_reference_model,
     official_source_identity,
     reference_weight,
 )
-from transformers import Gemma4Config
+from transformers import Gemma4Config, Gemma4ForCausalLM, Gemma4TextConfig
 from transformers.models.gemma4.modeling_gemma4 import (
     Gemma4AudioAttention,
     Gemma4RMSNorm,
@@ -20,6 +21,50 @@ from transformers.models.gemma4.modeling_gemma4 import (
 
 
 class OfficialReferenceTests(unittest.TestCase):
+    def test_all_step_positions_match_separate_causal_prefixes(self):
+        torch.manual_seed(17)
+        config = Gemma4TextConfig(
+            vocab_size=64,
+            vocab_size_per_layer_input=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            global_head_dim=8,
+            hidden_size_per_layer_input=4,
+            sliding_window=4,
+            num_kv_shared_layers=2,
+            max_position_embeddings=32,
+            pad_token_id=0,
+            layer_types=["sliding_attention", "full_attention"] * 2,
+        )
+        config._attn_implementation = "eager"
+        model = Gemma4ForCausalLM(config).eval().requires_grad_(False)
+        ids = torch.tensor([[3, 4, 5, 6]])
+        with torch.inference_mode():
+            together = model(
+                input_ids=ids, use_cache=False, logits_to_keep=torch.arange(1, 4)
+            ).logits
+            for index, length in enumerate((2, 3, 4)):
+                separate = model(
+                    input_ids=ids[:, :length], use_cache=False, logits_to_keep=1
+                ).logits
+                torch.testing.assert_close(
+                    together[:, index], separate[:, -1], atol=1e-6, rtol=1e-5
+                )
+
+    def test_matching_endpoints_cannot_hide_intermediate_failure(self):
+        report = decision_checks(np.eye(3, dtype=np.float32) * 2, [0, 0, 2])
+        self.assertFalse(report["argmax_matches"])
+        self.assertEqual(report["mismatch_steps"], [2])
+        self.assertEqual(report["reference_argmax_gaps"], [0, 2, 0])
+
+    def test_missing_intermediate_logits_cannot_pass(self):
+        with self.assertRaisesRegex(ValueError, "coverage"):
+            decision_checks(np.zeros((2, 3)), [0, 1, 2])
+
     def test_generated_label_is_excluded_from_teacher_forced_prefix(self):
         media = torch.ones(1, 3, 4)
         original = {

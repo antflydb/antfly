@@ -175,6 +175,23 @@ def teacher_forced_inputs(inputs, tokens, eos_ids):
     return result, step, tokens[step - 1]
 
 
+def decision_checks(logits, tokens):
+    """Keep intermediate failures visible even when both endpoints match."""
+    if logits.ndim != 2 or logits.shape[0] != len(tokens):
+        raise ValueError("Incomplete native decision coverage")
+    expected = np.asarray(tokens, dtype=np.int64)
+    predictions = logits.argmax(axis=-1)
+    matches = predictions == expected
+    gaps = logits.max(axis=-1) - logits[np.arange(len(tokens)), expected]
+    return {
+        "argmax": predictions.tolist(),
+        "native_tokens": tokens,
+        "argmax_matches": bool(matches.all()),
+        "mismatch_steps": (np.flatnonzero(~matches) + 1).tolist(),
+        "reference_argmax_gaps": gaps.tolist(),
+    }
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ("config", "processor", "suite", "gguf", "mmproj", "out"):
@@ -186,14 +203,30 @@ def main():
         type=Path,
         help="Teacher-force a saved native result through its first EOS or final budget token",
     )
+    p.add_argument(
+        "--all-native-steps",
+        action="store_true",
+        help="Check every native decision through EOS; save decision diagnostics without large logit files",
+    )
     a = p.parse_args()
+    if a.all_native_steps and not a.native_tokens:
+        p.error("--all-native-steps requires --native-tokens")
     a.out.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(2)
     config = json.loads(a.config.read_text())
+    if (
+        a.all_native_steps
+        and config["text_config"].get("use_bidirectional_attention") is not None
+    ):
+        raise ValueError("All-step checking requires causal text attention")
     model = load_reference_model(config)
     identity = official_source_identity()
     identity["logit_position"] = (
-        "teacher_forced_last_before_eos" if a.native_tokens else "first_step"
+        "teacher_forced_all_through_eos"
+        if a.all_native_steps
+        else "teacher_forced_last_before_eos"
+        if a.native_tokens
+        else "first_step"
     )
     native_rows = None
     if a.native_tokens:
@@ -287,6 +320,7 @@ def main():
         if "input_features_mask" in inputs:
             inputs["input_features_mask"] = inputs["input_features_mask"].bool()
         expected = None
+        keep = 1
         if native_rows is not None:
             rows = [row for row in native_rows if row["id"] == case["id"]]
             if not rows or any(row["tokens"] != rows[0]["tokens"] for row in rows):
@@ -299,27 +333,39 @@ def main():
             eos_ids = config["eos_token_id"]
             if isinstance(eos_ids, int):
                 eos_ids = [eos_ids]
+            prompt_length = inputs["input_ids"].shape[1]
             inputs, step, expected = teacher_forced_inputs(inputs, tokens, eos_ids)
             meta["teacher_forced_step"] = step
+            if a.all_native_steps:
+                keep = torch.arange(prompt_length - 1, prompt_length + step - 1)
         with torch.inference_mode():
-            output = model(**inputs, use_cache=False, logits_to_keep=1)
-        logits = output.logits[:, -1].float().numpy()
-        if logits.shape != (1, 262144) or not np.isfinite(logits).all():
+            output = model(**inputs, use_cache=False, logits_to_keep=keep)
+        logits = (
+            output.logits.float().numpy()
+            if a.all_native_steps
+            else output.logits[:, -1].float().numpy()
+        )
+        wanted_shape = (1, step, 262144) if a.all_native_steps else (1, 262144)
+        if logits.shape != wanted_shape or not np.isfinite(logits).all():
             raise ValueError("Invalid CPU logits")
-        logits.tofile(a.out / (case["id"] + ".f32"))
+        if not a.all_native_steps:
+            logits.tofile(a.out / (case["id"] + ".f32"))
         info = {
             "id": case["id"],
-            "argmax": int(logits.argmax()),
+            "argmax": int(logits.argmax()) if not a.all_native_steps else None,
             "shape": list(logits.shape),
             "precision": "FP32 CPU from same dequantized QAT GGUF",
             "metadata": meta,
         }
         if expected is not None:
-            info.update(
-                native_token=expected,
-                argmax_matches=int(logits.argmax()) == expected,
-                reference_argmax_gap=float(logits.max() - logits[0, expected]),
-            )
+            if a.all_native_steps:
+                info.update(decision_checks(logits[0], tokens[:step]))
+            else:
+                info.update(
+                    native_token=expected,
+                    argmax_matches=int(logits.argmax()) == expected,
+                    reference_argmax_gap=float(logits.max() - logits[0, expected]),
+                )
             generation_checks.append(info)
         (a.out / (case["id"] + ".json")).write_text(json.dumps(info, indent=2) + "\n")
         print(info, flush=True)
@@ -332,7 +378,13 @@ def main():
         (a.out / "generation-check.json").write_text(
             json.dumps(
                 {
-                    "scope": "teacher-forced final native decision through first EOS or fixed budget; not free-running generation parity",
+                    "scope": "all native greedy decisions under teacher forcing through first EOS or fixed budget"
+                    if a.all_native_steps
+                    else "teacher-forced final native decision through first EOS or fixed budget; not free-running generation parity",
+                    "checked_decisions": sum(
+                        len(row["native_tokens"]) if a.all_native_steps else 1
+                        for row in generation_checks
+                    ),
                     "reference": identity,
                     "passed": passed,
                     "rows": generation_checks,

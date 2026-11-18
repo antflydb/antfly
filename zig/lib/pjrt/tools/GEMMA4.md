@@ -158,6 +158,14 @@ rejects inconsistent repeats, binds the native result by hash, saves
 later decision per case, not every intermediate token or free-running parity.
 Reference-position metadata prevents these vectors from validating prefill.
 
+Add `--all-native-steps` to check every decision through the first EOS or fixed
+budget. This runs the unmodified causal forward with the native prefix and
+selects all prediction positions; it retains decision IDs, disagreement positions
+and reference margins instead of large per-step logit arrays. A regression
+compares this selection with separate official causal prefixes, including shared
+KV layers. This mode rejects bidirectional text attention and exits nonzero if
+any decision differs. Matching first and final decisions is insufficient.
+
 ## Native PLE normalization correction
 
 The comparison exposed a native PLE context-projection discrepancy. The official
@@ -195,6 +203,14 @@ in both arms. `--control branch` restores both old behaviors in the legacy arm
 and enables both corrections in the candidate. These are controls in one binary,
 not a separately built main binary. Every declared fixture is hash-checked before
 execution. The recorded arm environment identifies the resize override.
+
+`--control image-resize` compares the CUDA GGUF image path's bilinear and
+upstream bicubic preprocessing. `ANTFLY_INFERENCE_CUDA_GEMMA4_IMAGE_BICUBIC=0`
+restores the old image resize. This correction applies to standard 16-pixel
+patches; other backends and geometries retain their existing behavior. The
+`branch` control above covers PLE and video only, with the same image policy
+in both arms. Use an image-only suite and corresponding first-step reference
+directory to qualify image preprocessing separately under production defaults.
 
 ## Native video resizing and accuracy profile
 
@@ -273,11 +289,54 @@ budget. `<id>.prompt` contains the exact rendered prompt, with
 `[ANTFLY_REFERENCE_MEDIA]` at the media location. The wrapper checks prompt
 geometry, saves full first-step logits and fixed-budget greedy tokens, and
 records prepared prompt IDs and audio embeddings. Its vision budget is 256–280
-soft tokens, context 8192, F16 KV and flash attention. It does not measure
-performance. Video uses the Transformers oracle. Treat frontend disagreements as investigation results; do not
+soft tokens, context 8192, F16 KV and flash attention. Its default mode does not
+measure performance. Video uses the Transformers oracle. Treat frontend disagreements as investigation results; do not
 switch oracle per case to obtain a passing gate.
 Use libraries built for the host's libc; the retained b12387 binaries required an
 existing compatible runtime loader on this host.
+
+The wrapper also accepts `--measure WARMUPS REPEATS`. This mode uses a greedy
+backend sampler, scalar token readback and synchronized fixed-budget decoding.
+It excludes model load, KV reset, prompt-template rendering and output-text
+decoding. Media file reads, preprocessing and towers remain inside timing.
+Validation uses full-logit CPU argmax and marks its timings unavailable.
+Only the synchronized total is used for latency comparisons; the phase fields
+use submission boundaries and are not independent synchronized GPU timings.
+Use matching modern headers/libraries supporting `llama_process` and extended
+batches; the fresh comparison uses official CUDA release b12521. The comparison
+requires the measured GPU-sampled sequence to equal the full-logit oracle's
+entire fixed-budget sequence.
+
+`compare_gemma4.py` runs three alternating fresh-process rounds over common
+text/image/audio cases, with one warmup and two measured calls per case by
+default. It accepts the benchmark's model/runner/plugin/suite/cache arguments,
+plus `--llama-runner`, `--llama-library`, `--llama-inputs`, repeated `--cpu`
+reference directories and a fresh `--out`. For binaries requiring a newer libc,
+both `--llama-loader` and `--llama-runtime` select an existing compatible runtime.
+Prepare PJRT executables with the exact worker before running it.
+
+This comparison uses the four native accuracy overrides above, checks independent
+first-step logits before timing and reports competitor failures. It verifies
+prepared llama.cpp prompt IDs, complete output budgets and stable greedy tokens
+within/across rounds. It records the llama.cpp timing boundary difference rather
+than claiming identical serving boundaries. Median improvement of at least 5%
+with no p95 regression is the latency-win criterion; first-step accuracy and
+latency wins do not certify whole-generation correctness.
+
+For raw video boundary diagnosis, run the opt-in test
+`gemma4 real video exports decoded RGB parity fixture` with
+`ANTFLY_GEMMA4_VIDEO_PARITY_INPUT` set to the MP4 and
+`ANTFLY_GEMMA4_VIDEO_PARITY_OUTPUT` to an existing directory. The test deliberately
+downloads selected NV12 surfaces and RGB8 frames. Compare them with:
+
+```sh
+python zig/lib/pjrt/tools/gemma4_video_pixels.py --input "$VIDEO" \
+  --capture "$CAPTURE" --out "$CAPTURE/summary.json"
+```
+
+This diagnostic compares timestamps, raw eight-bit SDR decoder surfaces and RGB
+conversion before resize. It records PyAV/FFmpeg versions and hashes. It does
+not widen the model gate or change the production color policy.
 
 The manifest records export-time source hashes; campaign provenance separately
 records the timed preparer and workers. Token IDs are variable program inputs.

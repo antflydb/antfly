@@ -2731,7 +2731,14 @@ fn prepareImageViewAtGeometry(allocator: std.mem.Allocator, store: *ProjectorWei
         cfg.image_mean,
         cfg.image_std,
         1.0 / 255.0,
-        if (store.gguf == null) .torchvision_bicubic else .bilinear,
+        // The upstream Gemma 4 image processor resizes RGB8 with antialiased
+        // bicubic interpolation, just like its video processor. Retain the old
+        // GGUF route for other backends/geometries and explicit rollback.
+        if (store.gguf == null or (store.cb.kind() == .cuda and cfg.patch_size == 16 and !cfg.direct_unified and
+            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_IMAGE_BICUBIC", true)))
+            .torchvision_bicubic
+        else
+            .bilinear,
     );
     return .{ .allocator = allocator, .pixels = pixel_values, .geometry = geometry };
 }

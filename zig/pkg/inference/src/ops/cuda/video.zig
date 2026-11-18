@@ -729,6 +729,61 @@ pub const Preprocessor = struct {
     }
 };
 
+test "gemma4 real video exports decoded RGB parity fixture" {
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    const env = @import("antfly_platform").env;
+    const path = env.getenv("ANTFLY_GEMMA4_VIDEO_PARITY_INPUT") orelse return error.SkipZigTest;
+    const output = env.getenv("ANTFLY_GEMMA4_VIDEO_PARITY_OUTPUT") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const compat = @import("../../io/compat.zig");
+    const bytes = try compat.cwd().readFileAlloc(compat.io(), path, a, .limited(64 * 1024 * 1024));
+    defer a.free(bytes);
+    var compute = try cuda.CudaCompute.initWithKernelJitForProfile(a, .{}, .gemma4);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var preprocess = try Preprocessor.init(a, &compute.ctx);
+    defer preprocess.deinit();
+    const CaptureFrames = struct {
+        compute: *cuda.CudaCompute,
+        cb: *const ops.ComputeBackend,
+        preprocess: *Preprocessor,
+        output: []const u8,
+        count: usize = 0,
+        fn consume(raw: *anyopaque, frame: Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const rgb = try self.preprocess.rgb8(self.compute, frame);
+            defer self.cb.free(rgb);
+            const tensor: *cuda.CudaTensor = @ptrCast(@alignCast(rgb));
+            const values = try std.testing.allocator.alloc(u8, @as(usize, frame.width) * frame.height * 3);
+            defer std.testing.allocator.free(values);
+            try tensor.buffer.copyToHost(&self.compute.ctx, values);
+            const nv12 = try std.testing.allocator.alloc(u8, @as(usize, frame.pitch) * frame.height * 3 / 2);
+            defer std.testing.allocator.free(nv12);
+            const source: @import("buffer.zig").DeviceBuffer = .{ .ptr = frame.device, .len = nv12.len };
+            try source.copyToHost(&self.compute.ctx, nv12);
+            try self.compute.ctx.synchronize();
+            const frame_base = try std.fmt.allocPrint(std.testing.allocator, "{s}/{d}", .{ self.output, self.count });
+            defer std.testing.allocator.free(frame_base);
+            const rgb_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.rgb", .{frame_base});
+            defer std.testing.allocator.free(rgb_path);
+            const nv12_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.nv12", .{frame_base});
+            defer std.testing.allocator.free(nv12_path);
+            const metadata_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.json", .{frame_base});
+            defer std.testing.allocator.free(metadata_path);
+            const meta = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .width = frame.width, .height = frame.height, .pitch = frame.pitch, .matrix = frame.matrix, .full_range = frame.full_range, .high_depth = frame.high_depth, .tone = frame.tone, .timestamp_us = frame.timestamp_us }, .{});
+            defer std.testing.allocator.free(meta);
+            try compat.cwd().writeFile(compat.io(), .{ .sub_path = rgb_path, .data = values });
+            try compat.cwd().writeFile(compat.io(), .{ .sub_path = nv12_path, .data = nv12 });
+            try compat.cwd().writeFile(compat.io(), .{ .sub_path = metadata_path, .data = meta });
+            self.count += 1;
+        }
+    };
+    var capture = CaptureFrames{ .compute = &compute, .cb = &cb, .preprocess = &preprocess, .output = output };
+    const stats = try decodeMp4(a, &compute.ctx, bytes, .{ .context = &capture, .consume = CaptureFrames.consume });
+    try std.testing.expect(capture.count > 0);
+    try std.testing.expectEqual(stats.selected_frames, capture.count);
+}
+
 test "video CUDA scalar clamps preserve bounds without host transfers" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;

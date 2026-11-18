@@ -28,12 +28,19 @@ def main():
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--cpu", type=Path, action="append", required=True)
     p.add_argument(
-        "--control", choices=("ple", "video-resize", "branch"), default="ple"
+        "--control",
+        choices=("ple", "video-resize", "image-resize", "branch"),
+        default="ple",
     )
     p.add_argument("--measure", action="store_true")
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--iterations", type=int, default=3)
     a = p.parse_args()
+    resize_env = {
+        "video-resize": "ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC",
+        "image-resize": "ANTFLY_INFERENCE_CUDA_GEMMA4_IMAGE_BICUBIC",
+        "branch": "ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC",
+    }.get(a.control)
     if not 1 <= a.rounds <= 10 or not 1 <= a.iterations <= 100:
         p.error("Invalid campaign bounds")
     a.out.mkdir(parents=True, exist_ok=False)
@@ -62,6 +69,10 @@ def main():
         case.get("kind") == "video" for case in suite["cases"]
     ):
         raise ValueError("Video resize control needs a video case")
+    if a.control == "image-resize" and not any(
+        case.get("kind") == "image" for case in suite["cases"]
+    ):
+        raise ValueError("Image resize control needs an image case")
     refs, sources, reference_hashes = {}, {}, {}
     for directory in a.cpu:
         identity = json.loads((directory / "reference.json").read_text())
@@ -82,10 +93,10 @@ def main():
         "gpu": gpu(),
         "control": a.control,
         "arm_environment_overrides": {
-            arm: {"ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC": value}
+            arm: {resize_env: value}
             for arm, value in (("legacy", "0"), ("corrected", "1"))
         }
-        if a.control in ("video-resize", "branch")
+        if resize_env
         else {},
         "reference_sources": sources,
         "reference_sha256": reference_hashes,
@@ -113,10 +124,8 @@ def main():
             a.control in ("ple", "branch") and arm == "legacy"
         )
         environment = dict(os.environ)
-        if a.control in ("video-resize", "branch"):
-            environment["ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC"] = (
-                "0" if arm == "legacy" else "1"
-            )
+        if resize_env:
+            environment[resize_env] = "0" if arm == "legacy" else "1"
         config = out / "suite.json"
         config.write_text(json.dumps(selected) + "\n")
         with (out / "worker.log").open("wb") as log:
@@ -222,6 +231,7 @@ def main():
             + {
                 "ple": "legacy versus corrected PLE epsilon",
                 "video-resize": "bilinear versus bicubic video resize",
+                "image-resize": "bilinear versus bicubic image resize",
                 "branch": "legacy PLE epsilon and bilinear video versus corrected PLE epsilon and bicubic video",
             }[a.control]
             + "; direct generation, fixed budgets"

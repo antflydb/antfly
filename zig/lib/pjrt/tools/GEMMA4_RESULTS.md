@@ -1,4 +1,62 @@
-# Gemma 4 E4B QAT: native CUDA versus native PJRT CUDA
+# Gemma 4 E4B QAT: L4 qualification and performance
+
+## Current seven-case comparison
+
+Three alternating fresh-process rounds, one warmup and two measured calls per
+case give six samples per engine/case. All 126 measured calls complete their
+fixed budgets with stable complete sequences; llama.cpp's backend-greedy tokens
+also equal its independent full-logit oracle sequence. Native uses the four
+accuracy overrides in [GEMMA4.md](GEMMA4.md), including the image resize correction.
+PJRT executables were freshly compiled with the current reviewed worker.
+llama.cpp uses official CUDA release b12521 with its asset digest verified.
+
+| Workload | Native ms | BF16 PJRT ms | llama.cpp ms | PJRT/native |
+|---|---:|---:|---:|---:|
+| text_short_256 | 4710.74 | 11544.47 | 3610.69 | 2.45× |
+| page_summary_128 | 2447.11 | 5873.00 | 1885.19 | 2.40× |
+| long2k_summary_64 | 1494.13 | 3112.80 | 1195.43 | 2.08× |
+| image_64 | 1815.36 | 3013.79 | 1042.87 | 1.66× |
+| audio_1s_64 | 1389.78 | 2856.14 | 940.81 | 2.06× |
+| audio_12s_64 | 1501.95 | 2923.46 | 1004.12 | 1.95× |
+| audio_30s_64 | 1664.11 | 2995.80 | 1116.84 | 1.80× |
+
+Native passes the declared latency-win guardrail against this PJRT runner on all
+seven cases, and on none against llama.cpp. It is 25–74% slower than llama.cpp.
+llama.cpp starts with a pre-rendered prompt and excludes output-text decoding;
+native includes both. Both include encoded media preprocessing/towers and
+synchronized fixed-budget token readback, excluding cold load/compile and HTTP.
+These timing-boundary differences are retained in the receipt.
+
+Independent Transformers first-step numerical/argmax gates pass 7/7 for native,
+5/7 and 7/7 respectively for PJRT, and 3/7 and 6/7 for llama.cpp. The latter two
+accuracy failures are retained independently of their performance results.
+The native image resize correction also matches all 64 teacher-forced decisions.
+Its first-step relative L2 increases from 0.01001 to 0.01450 under the accuracy
+profile, remaining within the frozen absolute tolerance. Text/audio sequences
+are identical to the previously checked continuations; together the seven common
+cases match 521/521 decisions through EOS or budget. This does not establish
+video correctness or task quality on a broad corpus.
+
+The [follow-up record](gemma4-l4-followup.json) retains worker/library/source
+hashes, timing samples, memory peaks, per-engine accuracy, generation checks and
+the prior failed decisions. This measures the artifact PJRT runner, not PR
+#1404's exact unified runtime. The all-modality performance goal remains unmet.
+
+The default-image same-binary comparison runs three alternating rounds with
+three measured calls per arm/case. Both first-step absolute gates pass, and the
+median/p95 latency ratios are 1.00033/1.00252. However, relative L2 rises from
+0.00803 to 0.01689, failing the separately declared non-increasing-error
+criterion. The paired report remains failed; the successful 64-decision check
+does not erase that result or establish a qualified production-default change.
+
+A separate 32-token CUDA event diagnostic disables graph replay and compares
+default with accuracy settings. LM-head time rises from 190,621 to 479,667 μs
+over the diagnostic calls, while other recorded decoder categories remain
+close. This identifies exact LM-head computation as a major cost to investigate.
+These instrumented runs are not used as throughput measurements. All 39 Python
+checks, Ruff, Zig formatting and C++ syntax/warning checks pass.
+
+## Historical default-profile comparison
 
 Warm isolated direct generation, encoded media read through synchronized fixed-budget tokens; no HTTP, cold model load, or compilation in latency; memory includes startup and inference. Native Q4_0/F16 KV versus dense BF16/BF16 KV from identical QAT GGUF sources.
 
@@ -234,5 +292,42 @@ The changes are reviewable as accuracy corrections and a qualification harness.
 The broad performance target remains open: default numerical failures, broader
 task-quality/intermediate-generation coverage, and matched current llama.cpp and
 PR #1404 timing are still unresolved. No claim of a current all-modality win over
-llama.cpp is established by this work. PR #1404's head was rechecked and remains
-the reviewed revision.
+llama.cpp is established by that campaign. PR #1404's head matched the reviewed
+revision at that checkpoint; the subsequent review below uses a newer head.
+
+## Intermediate decisions and current-runtime follow-up
+
+The expanded unmodified Transformers gate checks every native prediction through
+the first EOS or fixed budget, instead of only the first and final predictions.
+The previous four-override native profile matches 583/585 decisions. Text and
+all three audio cases pass completely. Two intermediate failures remain:
+
+| Case | Step | Native token | Reference token | Reference logit gap |
+|---|---:|---|---|---:|
+| image_64 | 17 | `rhombus` (211902) | `parallelogram` (152794) | 0.00597191 |
+| video_6s_64 | 61 | `luminous` (79613) | `saturated` (31921) | 0.60105324 |
+
+These failures were hidden by matching endpoint decisions. The gate is retained
+unchanged; 8/8 first-step and endpoint matches did not establish whole-generation
+correctness. A small official-model regression verifies that selecting all
+prediction positions matches separate causal prefixes, including shared KV.
+
+The raw video diagnostic compares all six selected CUDA NVDEC surfaces against
+PyAV at identical timestamps. NV12 bytes match exactly. CUDA RGB8 conversion is
+consistently brighter, with mean absolute differences of 1.14–1.16 out of 255
+and a maximum difference of three. This localizes a real frontend difference
+before resize; it does not prove that this difference alone causes the late
+token mismatch. No color-policy change is promoted from this diagnostic.
+
+The official llama.cpp b12521 CUDA release was downloaded with its published
+asset SHA256 verified. Its first-step results remain 3/7 numerical gates and
+6/7 matching argmaxes against the independent Transformers reference. The short
+audio frontend disagreement remains present. The new timing harness uses GPU
+greedy sampling and separately checks its complete sequence against the
+full-logit llama.cpp oracle; oracle runs are explicitly excluded as timings.
+
+PR #1404 was re-read at `5f75882a96d397a817e745b9268c05b33dded6ca`.
+The newer commits primarily optimize the unified native backend and replay
+lifecycle; they are not all PJRT changes. Its compiler's `scale_before_add`
+handling does not occur in this runner's exported HLO path. The fresh artifact
+runner comparison remains distinct from benchmarking that PR's unified runtime.
