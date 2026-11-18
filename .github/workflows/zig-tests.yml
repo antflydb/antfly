@@ -2233,8 +2233,7 @@ jobs:
       (needs.e2e-base-build.result == 'success' || needs.e2e-full-build.result == 'success') }}
     name: e2e / plan
     needs: [admission, changes, e2e-base-build, e2e-full-build]
-    # Planning only collects Python tests and balances their duration history.
-    runs-on: ubuntu-24.04
+    runs-on: arc-antfly-standard-runtime
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
