@@ -644,7 +644,14 @@ fn canonicalPathAlloc(allocator: std.mem.Allocator, io: Io, path: []const u8) ![
 /// `fcntl` call (liveness, the one-time setup lock) -- never a second,
 /// independently opened fd on the same inode. Paired with
 /// `releaseProcessFd`.
+/// NAME_MAX on every supported filesystem.
+const max_name_bytes = 255;
+
 fn acquireProcessFd(io: Io, region_path: []const u8) RegionError!*FdEntry {
+    // A name past the filesystem limit cannot exist or be created. Refuse it
+    // before `statFile`: Linux's statx wrapper treats ENAMETOOLONG as a
+    // caller bug and panics in safe builds.
+    if (std.fs.path.basename(region_path).len > max_name_bytes or region_path.len >= std.fs.max_path_bytes) return RegionError.RegionUnavailable;
     fd_registry_mutex.lockUncancelable(io);
     defer fd_registry_mutex.unlock(io);
     if (Io.Dir.cwd().statFile(io, region_path, .{})) |st| {
