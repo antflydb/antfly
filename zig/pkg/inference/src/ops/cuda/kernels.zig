@@ -2643,6 +2643,7 @@ pub const KernelModule = struct {
     primitive_broadcast_f32: driver_mod.CUfunction = null,
     layer_norm_backward_f32: driver_mod.CUfunction = null,
     primitive_softmax_f32: driver_mod.CUfunction = null,
+    row_softmax_f32_warp32: driver_mod.CUfunction = null,
     selected_token_logprobs_f32: driver_mod.CUfunction = null,
     primitive_gather_f32: driver_mod.CUfunction = null,
     primitive_gather_bf16_f32: driver_mod.CUfunction = null,
@@ -2825,6 +2826,8 @@ pub const KernelModule = struct {
     rms_channel_source_finish_bf16_values_f32: driver_mod.CUfunction = null,
 
     fn bundledSymbol(comptime field: []const u8) ?[:0]const u8 {
+        // Reuse the existing unmasked F32 row program's historical device ABI.
+        if (std.mem.eql(u8, field, "row_softmax_f32_warp32")) return "termite_embedding_gemma2_training_softmax_f32";
         if (std.mem.eql(u8, field, "e4b_head_prefetch_l2")) return "antfly_gemma4_e4b_head_prefetch_l2";
         if (std.mem.eql(u8, field, "e4b_pair_prefetch_l2")) return "antfly_gemma4_e4b_pair_prefetch_l2";
         if (std.mem.eql(u8, field, "e4b_down_prefetch_l2")) return "antfly_gemma4_e4b_down_prefetch_l2";
@@ -10819,6 +10822,45 @@ pub const KernelModule = struct {
         };
         var params = launch_abi.fieldsFor("LAYER_NORM_BACKWARD", &arguments);
         try launch1d(function, ctx, rows, &params);
+    }
+
+    /// Rectangular, in-place-capable F32 softmax. Short rows retain the pinned
+    /// persistent schedule; wide rows reuse the existing 32-lane score program
+    /// with mask=null and radius=0. Its ABI names both row and column extents
+    /// `sequence`, so full row groups and the live tail are separate launches.
+    /// No square allocation, extra rounding pass, or new device body is needed.
+    /// Returns the actual submission count for the caller's operation counters.
+    pub fn launchRowSoftmaxF32(self: *KernelModule, ctx: *context_mod.CudaContext, output: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, rows: usize, width: usize) !usize {
+        if (rows == 0 or width == 0 or width > 8192) return error.InvalidCudaState;
+        const count = try checkedTensorElements(rows, width);
+        _ = try toU32(count);
+        try checkBytes(output, count);
+        try checkBytes(input, count);
+        if (output.ptr == 0 or input.ptr == 0 or
+            (output.ptr != input.ptr and @import("../kernel_geometry.zig").byteRangesOverlap(output.ptr, count * 4, input.ptr, count * 4))) return error.InvalidCudaState;
+        if (width <= 1024) {
+            try self.launchPersistentRowSoftmaxF32(ctx, .{ output, input, .{} }, try toU32(rows), try toU32(width), false);
+            return 1;
+        }
+        const function = self.row_softmax_f32_warp32 orelse return error.CudaKernelUnavailable;
+        try ctx.makeCurrent();
+        var first: usize = 0;
+        var launches: usize = 0;
+        while (first < rows) {
+            const groups = (rows - first) / width;
+            const live_rows = if (groups == 0) rows - first else groups * width;
+            var pointers = [_]driver_mod.CUdeviceptr{ output.ptr + first * width * 4, input.ptr + first * width * 4, 0 };
+            var batch: u32 = 1;
+            var sequence = try toU32(width);
+            var heads = try toU32(@max(groups, 1));
+            var radius: u32 = 0;
+            var params = launch_abi.addresses(.{ &pointers[0], &pointers[1], &pointers[2], &batch, &sequence, &heads, &radius });
+            try ctx.launchKernel(function, try toU32(if (groups == 0) live_rows else width), heads, 1, 32, 1, 1, 0, ctx.stream, &params, null);
+            ctx.noteKernelLaunch();
+            launches += 1;
+            first += live_rows;
+        }
+        return launches;
     }
 
     pub fn launchPrimitiveSoftmaxF32(
@@ -23383,4 +23425,12 @@ test "source channel RMS concurrent funding includes retained-bank partial and g
     }
     try std.testing.expectEqual(@as(usize, 8192 * 96 + 6144), try Plan.maximumConcurrentBytes(8192));
     try std.testing.expectError(error.Overflow, Plan.maximumConcurrentBytes(std.math.maxInt(usize)));
+}
+
+test "CUDA borrowed quantized metadata row softmax declines overlapping banks before SDK work" {
+    var module: KernelModule = .{};
+    var ctx: context_mod.CudaContext = undefined;
+    try std.testing.expectError(error.InvalidCudaState, module.launchRowSoftmaxF32(&ctx, .{ .ptr = 4096, .len = 12300 }, .{ .ptr = 4100, .len = 12300 }, 3, 1025));
+    try std.testing.expectError(error.InvalidCudaState, module.launchRowSoftmaxF32(&ctx, .{}, .{}, 1, 8193));
+    try std.testing.expectError(error.InvalidCudaState, module.launchRowSoftmaxF32(&ctx, .{}, .{}, 0, 512));
 }

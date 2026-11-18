@@ -30164,9 +30164,10 @@ fn cudaF32TiledAttentionEnabled() bool {
 /// This eager owner declares capture unsupported before acquiring resources.
 fn tryUnmaskedTiledF32Attention(self: *CudaCompute, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize, sequence: usize, heads: usize, dim: usize) !?CT {
     if (self.cublaslt == null or !cudaCublasLtEnabled() or self.ctx.info.compute_major < 8 or
-        self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or self.kernels.gliner25_softmax_f32 == null or
-        batch == 0 or batch > 16 or sequence == 0 or sequence > 1024 or heads == 0 or heads > 64 or (dim != 64 and dim != 128)) return null;
-    const plan = kernel_geometry.UnmaskedAttentionTile.init(batch, sequence, heads, dim, 128, 64 * 1024 * 1024) catch return null;
+        self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+        (if (sequence <= 1024) self.kernels.gliner25_softmax_f32 == null else self.kernels.row_softmax_f32_warp32 == null) or
+        batch == 0 or batch > 16 or sequence == 0 or sequence > 8192 or heads == 0 or heads > 64 or (dim != 64 and dim != 128)) return null;
+    const plan = kernel_geometry.UnmaskedAttentionTile.init(batch, sequence, heads, dim, 512, 64 * 1024 * 1024) catch return null;
     if (sequence >= 512 and plan.tile_rows < 32) return null;
     const q = tensorFromCt(q_ct);
     const k = tensorFromCt(k_ct);
@@ -30202,9 +30203,9 @@ fn tryUnmaskedTiledF32Attention(self: *CudaCompute, q_ct: CT, k_ct: CT, v_ct: CT
             try blas.matmulAttentionStridedTyped(&self.ctx, scores, query, key, workspace, rows, sequence, dim, plan.hidden, plan.hidden, sequence, heads, dim, dim, score_stride, false, true, true, 1.0 / @sqrt(@as(f32, @floatFromInt(dim))), .f32);
             // Reuse the shipped parallel row schedule. The serial primitive
             // underutilizes the device for these wide attention rows.
-            try self.kernels.launchPersistentRowSoftmaxF32(&self.ctx, .{ scores, scores, .{} }, @intCast(heads * rows), @intCast(sequence), false);
+            const softmax_launches = try self.kernels.launchRowSoftmaxF32(&self.ctx, scores, scores, heads * rows, sequence);
             try blas.matmulAttentionStridedTyped(&self.ctx, dst, scores, value, workspace, rows, dim, sequence, sequence, plan.hidden, plan.hidden, heads, score_stride, dim, dim, false, false, true, 1.0, .f32);
-            self.stats.launch_attention += 3;
+            self.stats.launch_attention += 2 + softmax_launches;
         }
     }
     self.stats.f32_tiled_attention_calls += 1;
@@ -60903,7 +60904,7 @@ test "CUDA tiled F32 unmasked attention preserves frozen and F64 outputs with li
     compute.cublaslt.?.attention_plan_cache_enabled = true;
     const cb = compute.computeBackend();
     const Case = struct { batch: usize, sequence: usize, heads: usize, dim: usize };
-    for ([_]Case{ .{ .batch = 2, .sequence = 129, .heads = 2, .dim = 64 }, .{ .batch = 1, .sequence = 513, .heads = 3, .dim = 128 }, .{ .batch = 1, .sequence = 1024, .heads = 2, .dim = 64 } }) |c| {
+    for ([_]Case{ .{ .batch = 2, .sequence = 129, .heads = 2, .dim = 64 }, .{ .batch = 1, .sequence = 513, .heads = 3, .dim = 128 }, .{ .batch = 1, .sequence = 1024, .heads = 2, .dim = 64 }, .{ .batch = 1, .sequence = 2340, .heads = 6, .dim = 64 } }) |c| {
         const hidden = c.heads * c.dim;
         const count = c.batch * c.sequence * hidden;
         const q_data = try a.alloc(f32, count);
@@ -60957,5 +60958,5 @@ test "CUDA tiled F32 unmasked attention preserves frozen and F64 outputs with li
             };
         }
     }
-    try std.testing.expectEqual(@as(usize, 6), compute.stats.f32_tiled_attention_calls);
+    try std.testing.expectEqual(@as(usize, 8), compute.stats.f32_tiled_attention_calls);
 }
