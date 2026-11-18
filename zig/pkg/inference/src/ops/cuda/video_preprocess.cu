@@ -88,6 +88,10 @@ extern "C" __global__ void video_patches(const unsigned char *input, float *outp
     float py=(float(dy)+0.5f)*float(raster_height)/float(out_height)-0.5f;
     float sx, sy;
     coded_position(px, py, width, height, rotation, &sx, &sy);
+    // Half-pixel coordinates can lie outside the raster when upscaling.
+    // Clamp before forming interpolation weights, matching the CPU image path.
+    sx=fminf(float(width)-1.0f,fmaxf(0.0f,sx));
+    sy=fminf(float(height)-1.0f,fmaxf(0.0f,sy));
     unsigned x0=(unsigned)fmaxf(0.0f,floorf(sx)), y0=(unsigned)fmaxf(0.0f,floorf(sy)), x1=min(x0+1,width-1), y1=min(y0+1,height-1);
     float fx=sx-x0, fy=sy-y0;
     float a=rgb(input,pitch,height,x0,y0,c,matrix,full,high,tone), b=rgb(input,pitch,height,x1,y0,c,matrix,full,high,tone);

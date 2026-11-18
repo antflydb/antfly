@@ -31,6 +31,23 @@ extrapolates at negative half-pixel coordinates. The saved scalar reproduction
 matches the failing values exactly. That separate edge-clamp correction is
 qualified in the subsequent check, rather than folded into the RGB study.
 
+## Legacy bilinear edge correction
+
+The CUDA fallback clamps source coordinates before calculating bilinear weights,
+matching CPU image resizing at upscaled raster edges. The existing regression
+previously produced 0.08180144 instead of 0.23284316 for the first upscaled
+sample. It now passes with the original tolerance. The focused CUDA video suite
+reports 65 passes and one optional timing test skipped; decoder parity, HDR,
+rotation, RGB fixtures and PTX source integrity are included. Both RGB kernel
+bodies are byte-for-byte unchanged by this fix, and all six real RGB frames
+still match PyAV exactly. The large generated PTX diff is primarily virtual
+register renumbering; its source change only clamps two coordinates.
+
+Final worker checks are retained in the
+[edge qualification record](gemma4-l4-edge-qualification.json). The interleaved
+competitor comparison above remains the performance evidence; native-only
+follow-up runs are spot checks, not a replacement comparison campaign.
+
 ## Current seven-case comparison
 
 Three alternating fresh-process rounds, one warmup and two measured calls per

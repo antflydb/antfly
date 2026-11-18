@@ -246,8 +246,9 @@ export ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_SWSCALE_RGB=1
 This uses F32 media weights/vision attention, the ordinary PLE gate path and
 exact LM-head multiplication. Apply the same profile to validation and timing;
 campaign provenance records every override. These are explicit qualification
-settings, not new serving defaults. Eight passing first-step gates do not
-establish whole-generation or task-quality parity. The default fast profile
+settings, not new serving defaults. The full profile also matches all 585
+retained native decisions through EOS or budget; this does not establish broad
+task-quality parity. The default fast profile
 still has numerical failures on this corpus.
 
 `ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_SWSCALE_RGB=1` separately opts into the
@@ -265,6 +266,11 @@ FMA contraction and fast math; the tool's existing default is unchanged. Prefix
 the output with `// source-sha256: <SHA256 of input.cu>` and retain a single final
 newline. The source-integrity test requires PTX 7.8 and CUDA 11.8; do not replace
 it with PTX from a newer toolkit unsupported by the deployment driver.
+
+The legacy bilinear fallback clamps half-pixel source coordinates before forming
+interpolation weights. This fixes negative weights at upscaled raster edges and
+matches the CPU image path. Its existing up/downscale regression retains its
+original tolerance; the RGB kernel bodies are unchanged by this correction.
 
 Build and run the focused native CPU regression with a compile-time filter:
 
