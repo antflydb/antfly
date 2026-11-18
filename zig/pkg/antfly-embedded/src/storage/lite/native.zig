@@ -7057,6 +7057,11 @@ pub const NativeFile = struct {
     /// processes those maps later. Owned by `checkpointRedoLog`; cleared
     /// (and freed) by whichever of the two reaches it first.
     redo_fold_retain_pending: ?[]const u64 = null,
+    /// Set by `installCommitForFold` for a purely logical commit: its page
+    /// count, which can cover external value pages it wrote past the
+    /// pre-commit count. The fold raises its own page count to it once its
+    /// transaction is open, as it does for staged pages.
+    redo_fold_page_count_floor: ?u64 = null,
     /// perf/lwa-orphan-pages: page ids `checkpointRedoLog` found owned by
     /// a version its own fold just discovered superseded or deleted,
     /// strictly within the window just folded -- see
@@ -7142,6 +7147,11 @@ pub const NativeFile = struct {
     /// to the writer (lite-writer-authority.md W1), so this file never
     /// begins a transaction.
     forwarding_only: bool = false,
+    /// Bumped whenever this instance adopts state it did not commit itself:
+    /// another instance's or process's header, fold or redo records. Caches
+    /// derived from durable state above this file revalidate against it
+    /// (`adoptionEpoch`).
+    adoption_epoch: antfly_platform.atomic.Value(u64) = .init(0),
     no_sync: bool = false,
     /// When set, durability barriers (`syncIfRequired`) call
     /// `antfly_platform.filesystem.syncData` directly on the raw handle
@@ -7859,6 +7869,22 @@ pub const NativeFile = struct {
     /// shared overlay -- a second opener never replays that content at
     /// all, since the first opener's replay already populated the
     /// structure every later opener on this inode shares.
+    pub fn adoptionEpoch(self: *const NativeFile) u64 {
+        return self.adoption_epoch.load(.acquire);
+    }
+    /// Re-read the on-disk header and adopt its recovered active checkpoint
+    /// (a concurrent fold published past what this handle opened with).
+    fn adoptOnDiskCheckpoint(self: *NativeFile, io: std.Io) !void {
+        var header_bytes: [header_size]u8 = undefined;
+        try readHeaderExactAt(self.file, io, &header_bytes);
+        var fresh_header = try decodeHeader(&header_bytes);
+        const file_size = (try self.file.stat(io)).size;
+        fresh_header.checkpoints = loadCheckpointSlots(self.file, io, fresh_header.page_size, file_size);
+        const recovered = try recoverActiveCheckpoint(self.file, io, fresh_header, file_size, false);
+        fresh_header.active_checkpoint = recovered.index;
+        try self.adoptIndexPublicationHeader(fresh_header);
+    }
+
     fn recoverRedoLog(self: *NativeFile, allocator: Allocator, io: std.Io, test_hook: if (builtin.is_test) ?*const fn (?*anyopaque) void else void, test_ctx: if (builtin.is_test) ?*anyopaque else void) !void {
         var checkpoint = self.activeCheckpoint();
         // perf/lwa-fold-boundary: the real, durable fold boundary this
@@ -7918,14 +7944,7 @@ pub const NativeFile = struct {
             const published = r.readLogState();
             durable_ceiling_offset = publishedDurableCeiling(r, published);
             if (published.checkpoint_sequence > folded_through) {
-                var header_bytes: [header_size]u8 = undefined;
-                try readHeaderExactAt(self.file, io, &header_bytes);
-                var fresh_header = try decodeHeader(&header_bytes);
-                const file_size = (try self.file.stat(io)).size;
-                fresh_header.checkpoints = loadCheckpointSlots(self.file, io, fresh_header.page_size, file_size);
-                const recovered = try recoverActiveCheckpoint(self.file, io, fresh_header, file_size, false);
-                fresh_header.active_checkpoint = recovered.index;
-                try self.adoptIndexPublicationHeader(fresh_header);
+                try self.adoptOnDiskCheckpoint(io);
                 checkpoint = self.activeCheckpoint();
                 folded_through = checkpoint.redo_folded_through;
             }
@@ -7964,6 +7983,19 @@ pub const NativeFile = struct {
         defer if (scan_slot) |s| if (scan_region) |r| {
             r.unpinReader(s);
             r.releaseReaderSlot(s);
+        };
+        // A fold that published between the catch-up above and this pin may
+        // already have zero-filled the log from `folded_through`, and the
+        // pin only defers folds after it. Catch up again under the pin until
+        // the published boundary stops moving.
+        if (scan_region) |r| while (true) {
+            const published = r.readLogState();
+            if (published.checkpoint_sequence <= folded_through) break;
+            try self.adoptOnDiskCheckpoint(io);
+            checkpoint = self.activeCheckpoint();
+            folded_through = checkpoint.redo_folded_through;
+            durable_ceiling_offset = publishedDurableCeiling(r, published);
+            if (scan_slot) |slot| r.pinReader(slot, @max(folded_through, 1));
         };
         if (builtin.is_test) if (test_hook) |hook| hook(test_ctx);
         const MetaCtx = struct {
@@ -8364,10 +8396,11 @@ pub const NativeFile = struct {
         // ids that collide with the ones just flushed. Advance it to
         // cover every flushed page before anything below references or
         // allocates past it.
-        if (staged_pages.len != 0) {
-            var max_staged_page: u64 = 0;
-            for (staged_pages) |p| max_staged_page = @max(max_staged_page, p.page_id);
-            const required = max_staged_page + 1;
+        const page_count_floor = self.redo_fold_page_count_floor;
+        self.redo_fold_page_count_floor = null;
+        if (staged_pages.len != 0 or page_count_floor != null) {
+            var required: u64 = page_count_floor orelse 0;
+            for (staged_pages) |p| required = @max(required, p.page_id + 1);
             if (required > self.header.checkpoints[self.header.active_checkpoint].page_count) {
                 self.header.checkpoints[self.header.active_checkpoint].page_count = required;
             }
@@ -9088,6 +9121,7 @@ pub const NativeFile = struct {
             try inode_lock.withRedoOverlayLock(entry, io, &rctx, ReplayCtx.run);
 
             const outcome = rctx.outcome;
+            if (outcome.valid_count != 0) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
             redo.durable_sequence = outcome.last_sequence orelse redo.durable_sequence;
             redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, outcome.valid_bytes, outcome.last_sequence);
         }
@@ -9401,6 +9435,7 @@ pub const NativeFile = struct {
     /// catalog epoch and unchanged immutable index inputs under a writer lease.
     /// The newest allocator state must accompany the newest primary roots.
     pub fn adoptIndexPublicationHeader(self: *NativeFile, header: Header) !void {
+        if (!std.meta.eql(self.header, header)) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
         if (self.transaction_header != null or self.durable_header != null or self.checkpoint_publication_uncertain or
             self.header.page_size != header.page_size or self.header.indexed_reclamation != header.indexed_reclamation) return error.EnrichmentWaitCanceled;
         if (std.meta.eql(self.header, header)) return;
@@ -9476,6 +9511,16 @@ pub const NativeFile = struct {
     /// tail is left alone for whichever instance still needs it.
     fn refreshIfWriterBaseStale(self: *NativeFile) !void {
         const entry = self.inode_lock_ref.load(.acquire) orelse return;
+        // The inode registry only sees this process's commits. Another
+        // process's durable redo appends are published in the shared region:
+        // a writer that took the lease after one (a maintenance turn's
+        // forwarded write, for one) must replay them into the shared overlay
+        // and adopt their tail first, or it appends over durable records.
+        if (self.redo) |*redo| if (self.regionForInode() catch null) |region| {
+            const published = region.readLogState().durable_sequence;
+            const own = @max(redo.writer.last_sequence orelse 0, inode_lock.committedSequence(entry), entry.self_published_durable_sequence.load(.acquire));
+            if (published > own) try self.refreshCrossProcessRedoOverlay();
+        };
         const latest = inode_lock.committedSequence(entry);
         // perf/lwa-grouped-stall: `base` below (the checkpoint's own
         // `commit_sequence`) and `redo.writer.last_sequence` (this
@@ -10370,6 +10415,7 @@ pub const NativeFile = struct {
     fn publishRedoLogState(self: *NativeFile) void {
         const redo = if (self.redo) |*r| r else return;
         const region = (self.regionForInode() catch return) orelse return;
+        if (self.inode_lock_ref.load(.acquire)) |entry| _ = entry.self_published_durable_sequence.fetchMax(redo.durable_sequence, .acq_rel);
         region.publishLogState(.{
             .checkpoint_sequence = redo.checkpoint_sequence,
             .durable_sequence = redo.durable_sequence,
@@ -13381,6 +13427,15 @@ pub const NativeFile = struct {
     /// enumerating unchanged records. Splits/heights may differ; fall back to
     /// comparing leaf keys and immutable record references in changed paths.
     /// The caller fences page reuse and generation replacement for both roots.
+    /// Whether another process's redo commit after `sequence` changed the
+    /// index catalog's logical content. Such a commit leaves the index
+    /// catalog root (and so the logical index generation) in place until a
+    /// fold moves it. Same-process commits keep their own mirrors current.
+    pub fn indexCatalogChangedAfter(self: *const NativeFile, sequence: u64) bool {
+        const redo = self.redo orelse return false;
+        return redo.shared.replayedSequence(@backingInt(TransactionWrites.Root.index)) > sequence;
+    }
+
     pub fn indexCatalogPrefixUnchanged(self: *NativeFile, latest: *NativeFile, prefix: []const u8) !bool {
         const upper = try prefixUpperAlloc(self.allocator, prefix);
         defer if (upper) |bytes| self.allocator.free(bytes);
@@ -20325,7 +20380,11 @@ pub const NativeFile = struct {
             checkpoint.document_root_page == current.document_root_page and
             checkpoint.catalog_root_page == current.catalog_root_page and
             checkpoint.index_catalog_root_page == current.index_catalog_root_page and
-            checkpoint.namespace_directory_root_page == current.namespace_directory_root_page) return;
+            checkpoint.namespace_directory_root_page == current.namespace_directory_root_page)
+        {
+            self.redo_fold_page_count_floor = checkpoint.page_count;
+            return;
+        }
         const pages = try redo.shared.snapshotAllPagesAlloc(std.heap.page_allocator, self.runtimeIo());
         defer std.heap.page_allocator.free(pages);
         for (pages) |p| {

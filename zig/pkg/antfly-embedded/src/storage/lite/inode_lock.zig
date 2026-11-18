@@ -382,6 +382,9 @@ pub const Entry = struct {
     /// commit's publish racing a newer one. See
     /// `publishCommittedSequence`/`committedSequence` below.
     last_committed_sequence: std.atomic.Value(u64) = .init(0),
+    /// Highest durable redo sequence this process published to the shared
+    /// lock region. A larger published sequence came from another process.
+    self_published_durable_sequence: std.atomic.Value(u64) = .init(0),
     /// Defense in depth, not a lock: the `NativeFile` instance (as
     /// `@intFromPtr`, 0 for none yet) that most recently began a
     /// transaction against this inode *while marked `lease_managed`* --
