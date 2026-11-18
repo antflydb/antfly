@@ -584,6 +584,52 @@ def test_session_cannot_read_staged_rows_into_recreated_table(tmp_path: Path, st
                 session.close()
 
 
+def test_cross_process_overwrites_keep_full_text_deletes(tmp_path: Path) -> None:
+    # Regression: overwrites from several processes, each waiting for
+    # full-text visibility, lost earlier deletes. A writer rewrote a
+    # segment's whole delete bitmap from a stale view: a maintenance commit
+    # forwarded without the writer lease, a refresh that kept a root whose
+    # indexes predated another process's change, or overlay versions older
+    # than another process's fold shadowing the folded tree.
+    path = tmp_path / "overwrites.aflite"
+    processes, writes, keys = 6, 80, 8
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=30.0) as db:
+        db.batch_json({"inserts": {"seed": {"text": "seed"}}, "sync_level": "full_index"})
+    script = """
+import antfly_embedded, sys
+worker, writes, keys = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+with antfly_embedded.open(sys.argv[1], no_sync=True, busy_timeout=30.0) as db:
+    for s in range(writes):
+        db.batch_json({'inserts': {f'k{s % keys}-{worker}': {'text': f'tok{worker}x{s} common'}}, 'sync_level': 'full_index'})
+"""
+    workers = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(path), str(w), str(writes), str(keys)], env=_child_environment()
+        )
+        for w in range(processes)
+    ]
+    try:
+        for worker in workers:
+            assert worker.wait(timeout=600) == 0
+    finally:
+        for worker in workers:
+            if worker.poll() is None:
+                worker.terminate()
+                worker.wait(timeout=5)
+    with antfly_embedded.open(path, no_sync=True, busy_timeout=30.0) as db:
+        db.run_until_idle()
+        wrong = []
+        for w in range(processes):
+            for s in range(writes):
+                result = db.search(
+                    {"full_text_search": {"match": {"field": "text", "text": f"tok{w}x{s}"}}, "limit": 4}
+                )
+                hits = len(result["responses"][0]["hits"]["hits"])
+                if hits != (1 if s >= writes - keys else 0):
+                    wrong.append((w, s, hits))
+        assert wrong == []
+
+
 def test_cross_process_writers_do_not_lose_each_others_rows(tmp_path: Path) -> None:
     path = tmp_path / "writers.aflite"
     with antfly_embedded.create(path, no_sync=True, busy_timeout=10.0) as parent:
