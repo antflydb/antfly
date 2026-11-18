@@ -5304,8 +5304,8 @@ pub const ComputeBackend = struct {
         return self.vtable.scaledDotProductAttention(self.ptr, Q, K, V, mask, attn_bias, batch, seq_len, num_heads, head_dim);
     }
 
-    /// Unmasked, token-major Gemma4 vision attention. Providers without the
-    /// qualified model-specific kernel retain portable unmasked attention.
+    /// Unmasked token-major attention with F32 inputs and probabilities.
+    /// Providers select a qualified native schedule or portable attention.
     pub fn scaledDotProductAttentionUnmaskedF32(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
         if (self.vtable.regions.vision.unmaskedF32) |f| {
             return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);

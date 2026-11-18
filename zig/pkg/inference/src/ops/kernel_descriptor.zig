@@ -361,6 +361,31 @@ pub fn gatedPairedProjection(graph: *const ml.graph.Graph, first: ml.graph.NodeI
     return .{ .head = head, .activation = kind, .output = output };
 }
 
+/// Gate/up activation followed by a bias-free down projection. This is only
+/// geometry; route admission must prove all covered intermediates are private.
+pub const GatedDownProjection = struct {
+    gated: GatedProjection,
+    down: Descriptor,
+    weight: ml.graph.NodeId,
+    output: ml.graph.NodeId,
+};
+
+pub fn gatedDownProjection(graph: *const ml.graph.Graph, first: ml.graph.NodeId, second: ml.graph.NodeId, product: ml.graph.NodeId, output: ml.graph.NodeId) ?GatedDownProjection {
+    var gated = gatedPairedProjection(graph, first, second, product) orelse return null;
+    if (output >= graph.nodeCount()) return null;
+    const node = graph.node(output);
+    if (node.op != .fused_linear_no_bias or node.num_inputs != 2 or node.inputs[0] != product) return null;
+    const down = lower(graph, output) orelse return null;
+    const geometry = switch (down.operation) {
+        .linear => |g| g,
+        else => return null,
+    };
+    const pair = gated.head.linears[0].operation.linear;
+    if (geometry.bias or geometry.rows != pair.rows or geometry.in_dim != pair.out_dim or
+        !down.input_shapes[0].eq(graph.node(product).output_shape) or !gated.head.append(output)) return null;
+    return .{ .gated = gated, .down = down, .weight = node.inputs[1], .output = output };
+}
+
 /// Head-local F32 normalization followed by rotary position encoding. This
 /// describes the original reshape/RMS/reshape/RoPE chain; consumers must prove
 /// its intermediate values are private before choosing a fused schedule.
@@ -908,6 +933,31 @@ test "shared gated projection descriptor distinguishes activation precision and 
     graph.nodeMut(product).output_shape = shape;
     graph.nodeMut(product).inputs[1] = pair;
     try std.testing.expect(gatedPairedProjection(&graph, pair, second, product) == null);
+}
+
+test "shared gated projection descriptor admits unequal down width and rejects malformed geometry" {
+    var graph = ml.graph.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ 3, 32 }));
+    const gate = try builder.parameter("gate", ml.graph.Shape.init(.f32, &.{ 64, 32 }));
+    const up = try builder.parameter("up", ml.graph.Shape.init(.f32, &.{ 64, 32 }));
+    const weight = try builder.parameter("down", ml.graph.Shape.init(.f32, &.{ 16, 64 }));
+    const shape = ml.graph.Shape.init(.f32, &.{ 3, 64 });
+    const pair = try graph.addNode(.{ .op = .{ .fused_linear_no_bias_pair = .{ .rows = 3, .in_dim = 32, .out_dim = 64 } }, .output_shape = shape, .inputs = .{ input, gate, up, ml.graph.null_node }, .num_inputs = 3 });
+    const second = try graph.addNode(.{ .op = .{ .fused_to_float32 = {} }, .output_shape = shape, .inputs = .{ pair, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node }, .num_inputs = 1 });
+    const activated = try builder.silu(pair);
+    const product = try builder.elemMultiply(activated, second);
+    const output = try graph.addNode(.{ .op = .{ .fused_linear_no_bias = .{ .rows = 3, .in_dim = 64, .out_dim = 16 } }, .output_shape = ml.graph.Shape.init(.f32, &.{ 3, 16 }), .inputs = .{ product, weight, ml.graph.null_node, ml.graph.null_node }, .num_inputs = 2 });
+    const program = gatedDownProjection(&graph, pair, second, product, output) orelse return error.MissingGatedDownProjection;
+    try std.testing.expectEqual(@as(u8, 5), program.gated.head.covered_count);
+    try std.testing.expectEqual(@as(u32, 16), program.down.operation.linear.out_dim);
+    try std.testing.expectEqual(weight, program.weight);
+    graph.nodeMut(output).op.fused_linear_no_bias.in_dim = 32;
+    try std.testing.expect(gatedDownProjection(&graph, pair, second, product, output) == null);
+    graph.nodeMut(output).op.fused_linear_no_bias.in_dim = 64;
+    graph.nodeMut(output).inputs[0] = second;
+    try std.testing.expect(gatedDownProjection(&graph, pair, second, product, output) == null);
 }
 
 test "shared independent projection descriptor preserves unequal widths and rejects duplicate sources" {

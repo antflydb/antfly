@@ -1330,7 +1330,7 @@ pub const Pool = struct {
             if (self.region_execution_profile == .unknown and owner.requirements.requires_execution_profile) return error.RegionExecutionProfileChanged;
             if (owner.input_nodes.len > region_binding.max_inputs or owner.requirements.outputs.len > region_binding.max_outputs) return error.UnsupportedPreparedRegionBoundary;
         }
-        var lifetimes = try @import("region_lifetimes.zig").create(self.allocator, graph, reachable, &self.plan, owned.owners);
+        var lifetimes = try @import("region_lifetimes.zig").createWithBindings(self.allocator, graph, reachable, &self.plan, owned.owners, facts);
         defer lifetimes.deinit();
         try @import("region_recolor.zig").applyWithLastUse(&self.plan, lifetimes.first_use, lifetimes.input_last_use);
         try self.rebindRegionKernelSlots();

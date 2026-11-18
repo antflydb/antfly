@@ -36,8 +36,15 @@ pub const Plan = struct {
 };
 
 pub fn create(a: std.mem.Allocator, graph: *const ml.graph.Graph, reachable: []const bool, physical: *const buffers.BufferPlan, owners: []const *const region.Owned) !Plan {
+    return createWithBindings(a, graph, reachable, physical, owners, &.{});
+}
+
+/// Immutable parameter bindings exist before numerical submission, regardless
+/// of where their declarations appear in the graph. Computed/mutable operands
+/// still require their real scheduled producer before entry.
+pub fn createWithBindings(a: std.mem.Allocator, graph: *const ml.graph.Graph, reachable: []const bool, physical: *const buffers.BufferPlan, owners: []const *const region.Owned, facts: []const @import("kernel_route.zig").Binding) !Plan {
     const n = graph.nodeCount();
-    if (reachable.len != n or physical.node_positions.len != n) return error.InvalidRegionOrder;
+    if (reachable.len != n or physical.node_positions.len != n or (facts.len != 0 and facts.len != n)) return error.InvalidRegionOrder;
     const order = try a.alloc(ml.graph.NodeId, n);
     defer a.free(order);
     var live: usize = 0;
@@ -87,7 +94,12 @@ pub fn create(a: std.mem.Allocator, graph: *const ml.graph.Graph, reachable: []c
     for (owners) |owner| {
         const entry = physical.positionForNode(owner.entry_node);
         for (owner.input_nodes) |input| {
-            if (input >= n or !reachable[input] or producers[input] == none or producers[input] >= entry) return error.RegionInputUnavailableAtEntry;
+            if (input >= n or !reachable[input] or producers[input] == none) return error.RegionInputUnavailableAtEntry;
+            if (producers[input] >= entry) {
+                if (graph.node(input).op != .parameter or facts.len != n or facts[input] != .tensor) return error.RegionInputUnavailableAtEntry;
+                const implementation = facts[input].tensor.implementation;
+                if (implementation.context != owner.implementation.context or implementation.table != owner.implementation.table) return error.RegionInputUnavailableAtEntry;
+            }
             input_last[input] = if (input_last[input] == none) entry else @max(input_last[input], entry);
             // Unknown/output sentinel lifetimes stay conservative. An earlier
             // elided consumer no longer authorizes freeing this handle before
@@ -171,4 +183,47 @@ test "frozen region cannot consume an external activation before its producer is
     const outputs = [_]region.Output{.{ .node = output, .logical = shape, .bytes = 16 }};
     const owner = region.Owned{ .context = &marker, .implementation = .{ .context = &marker, .table = &marker }, .key = 1, .policy_key = 2, .covered_nodes = &.{ entry, output }, .input_nodes = &.{ input, late }, .entry_node = entry, .requirements = .{ .outputs = &outputs, .uncovered = .{} }, .vtable = &Fixture.table };
     try std.testing.expectError(error.RegionInputUnavailableAtEntry, create(a, &graph, reachable, &physical, &.{&owner}));
+}
+
+test "frozen region admits late immutable parameters only with exact prebound backend authority" {
+    const a = std.testing.allocator;
+    const partition = @import("../graph/partition.zig");
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{4});
+    const input = try builder.parameter("x", shape);
+    const entry = try builder.neg(input);
+    const late = try builder.parameter("late", shape);
+    const output = try builder.add(entry, late);
+    try graph.markOutput(output);
+    const capabilities = [_]partition.Capability{.{ .backend = .native, .priority = 0, .supports = &partition.supportsAll }};
+    var schedule = try partition.partition(a, &graph, &capabilities);
+    defer schedule.deinit();
+    var physical = try buffers.build(a, &graph, &schedule, .{});
+    defer physical.deinit();
+    const reachable = try interpreter.computeReachable(a, &graph);
+    defer a.free(reachable);
+    var marker: u8 = 0;
+    var other: u8 = 0;
+    const outputs = [_]region.Output{.{ .node = output, .logical = shape, .bytes = 16 }};
+    const owner = region.Owned{ .context = &marker, .implementation = .{ .context = &marker, .table = &marker }, .key = 1, .policy_key = 2, .covered_nodes = &.{ entry, output }, .input_nodes = &.{ input, late }, .entry_node = entry, .requirements = .{ .outputs = &outputs, .uncovered = .{} }, .vtable = &Fixture.table };
+    const facts = try a.alloc(@import("kernel_route.zig").Binding, graph.nodeCount());
+    defer a.free(facts);
+    @memset(facts, .unknown);
+    try std.testing.expectError(error.RegionInputUnavailableAtEntry, create(a, &graph, reachable, &physical, &.{&owner}));
+    facts[late] = .{ .imported_device = .{ .logical = shape, .implementation = owner.implementation } };
+    try std.testing.expectError(error.RegionInputUnavailableAtEntry, createWithBindings(a, &graph, reachable, &physical, &.{&owner}, facts));
+    facts[late] = .{ .tensor = .{ .value = @ptrFromInt(8), .implementation = .{ .context = &other, .table = &marker } } };
+    try std.testing.expectError(error.RegionInputUnavailableAtEntry, createWithBindings(a, &graph, reachable, &physical, &.{&owner}, facts));
+    facts[late].tensor.implementation = owner.implementation;
+    var lifetimes = try createWithBindings(a, &graph, reachable, &physical, &.{&owner}, facts);
+    defer lifetimes.deinit();
+    try std.testing.expectEqual(physical.positionForNode(entry), lifetimes.input_last_use[late]);
+    // Binding authority cannot turn an ordinary computed activation into a
+    // prebound parameter, even if a caller incorrectly supplies a tensor fact.
+    graph.nodeMut(late).op = .{ .neg = {} };
+    graph.nodeMut(late).inputs[0] = input;
+    graph.nodeMut(late).num_inputs = 1;
+    try std.testing.expectError(error.RegionInputUnavailableAtEntry, createWithBindings(a, &graph, reachable, &physical, &.{&owner}, facts));
 }

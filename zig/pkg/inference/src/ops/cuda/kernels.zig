@@ -4075,9 +4075,16 @@ pub const KernelModule = struct {
         ctx.noteKernelLaunch();
     }
 
-    /// Persistent row reduction with a separately rounded dy*probability backward input.
-    /// The legacy device symbol is retained for serialized artifact compatibility.
+    /// Compatibility adapter for training's separately rounded dy*probability input.
     pub fn launchTrainingPersistentSoftmaxF32(self: *const KernelModule, ctx: *context_mod.CudaContext, buffers: [3]buffer_mod.DeviceBuffer, rows: u32, width: u32, backward: bool) !void {
+        return self.launchPersistentRowSoftmaxF32(ctx, buffers, rows, width, backward);
+    }
+
+    /// One warp/subwarp owns each F32 row, with the pinned register extents and
+    /// reduction order. Forward permits exact input/output aliasing: every lane
+    /// loads its row before publication. The third buffer is unused in forward.
+    /// The historical device symbol remains the serialized artifact ABI.
+    pub fn launchPersistentRowSoftmaxF32(self: *const KernelModule, ctx: *context_mod.CudaContext, buffers: [3]buffer_mod.DeviceBuffer, rows: u32, width: u32, backward: bool) !void {
         const function = self.gliner25_softmax_f32 orelse return error.CudaKernelUnavailable;
         if (rows == 0 or width == 0 or width > 1024) return error.InvalidCudaState;
         const count = try std.math.mul(usize, rows, width);
@@ -4102,6 +4109,7 @@ pub const KernelModule = struct {
         const blocks = try std.math.divCeil(u32, rows, batches * warps);
         try ctx.makeCurrent();
         try ctx.launchKernel(function, blocks, 1, 1, lanes, warps, 1, 0, ctx.stream, &params, null);
+        ctx.noteKernelLaunch();
     }
 
     pub const TrainingLayerNormPhase = enum(u32) { forward, input_gradient, parameter_gradients };
