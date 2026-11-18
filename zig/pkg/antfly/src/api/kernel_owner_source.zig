@@ -362,6 +362,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         descriptor: descriptor_contract.Descriptor,
         entry: ?db_types.OrderedApplyReceipt = null,
         claimed: bool = false, // Protected by the owner registry mutex.
+        projection_failure: ?anyerror = null, // Completed result, protected by the registry mutex.
         prepare_graph_indexes: bool = false,
         retry_delay_ms: u32 = 2,
         next_log_ns: u64 = 0,
@@ -646,9 +647,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         // apply-only release that observed started=true before shutdown may
         // still load it while stop waits for attached apply work to drain.
         self.apply_ready_wake = null;
+        var requests = self.apply_control_requests.valueIterator();
+        while (requests.next()) |request| request.*.deinit(self.alloc);
         self.apply_control_requests.deinit(self.alloc);
         self.apply_control_requests = .empty;
-        for (self.apply_control_pending.items) |pending| pending.deinit(self.alloc);
         self.apply_control_pending.deinit(self.alloc);
         self.apply_control_pending = .empty;
     }
@@ -684,8 +686,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (@import("builtin").is_test) if (self.test_apply_control_hooks) |hooks| {
                 if (hooks.before_open) |before_open| before_open(hooks.ptr);
             };
+            var projection_failure: ?anyerror = null;
             const opened = blk: {
-                var lease = self.acquireDescriptorOnce(request.group_id, request.table_name, request.path, request.descriptor, .shared, .resident, .{ .historical_raft_apply = true, .apply_open = request, .prepare_graph_indexes = request.prepare_graph_indexes }) catch |err| {
+                var lease = self.acquireApplyControlOwner(request, &projection_failure) catch |err| {
+                    if (projection_failure != null) break :blk false;
                     switch (err) {
                         error.StorageKernelOwnerTransitionRequired,
                         error.StorageReadTemporarilyUnavailable,
@@ -706,14 +710,20 @@ pub const ProvisionedKernelOwnerSource = struct {
                 lease.deinit();
                 break :blk true;
             };
-            if (opened) {
+            if (opened or projection_failure != null) {
                 lock(&self.mutex);
                 self.apply_control_active = null;
-                self.forgetApplyOpenLocked(request);
+                const publish_failure = projection_failure != null and request.entry != null and
+                    !request.claimed and !self.apply_control_stopping;
+                if (publish_failure) {
+                    request.projection_failure = projection_failure;
+                } else {
+                    self.forgetApplyOpenLocked(request);
+                }
                 const wake = self.apply_ready_wake;
                 if (wake != null) self.apply_ready_wake_inflight += 1;
                 self.mutex.unlock();
-                request.deinit(self.alloc);
+                if (!publish_failure) request.deinit(self.alloc);
                 if (wake) |callback| {
                     callback.notify();
                     lock(&self.mutex);
@@ -742,6 +752,23 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.mutex.unlock();
             io.sleep(.fromMilliseconds(retry_delay_ms), .awake) catch {};
         }
+    }
+
+    fn acquireApplyControlOwner(self: *ProvisionedKernelOwnerSource, request: *ApplyOpen, projection_failure: *?anyerror) !Lease {
+        var physical = self.physical_catalogs.acquire(self.alloc, request.group_id, request.descriptor.indexes_json) catch |err| switch (err) {
+            error.CatalogProjectionBusy => return error.StorageKernelOwnerTransitionRequired,
+            error.OutOfMemory => return err,
+            else => {
+                projection_failure.* = err;
+                return err;
+            },
+        };
+        defer physical.deinit();
+        return self.acquireProjectedDescriptorOnce(request.group_id, request.table_name, request.path, request.descriptor, &physical, .shared, .resident, .{
+            .historical_raft_apply = true,
+            .apply_open = request,
+            .prepare_graph_indexes = request.prepare_graph_indexes,
+        });
     }
 
     pub fn withGroupVisibleRootGeneration(
@@ -4177,16 +4204,25 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer if (physical) |*projection| projection.deinit();
 
         if (!self.mutex.tryLock()) return error.RaftApplyWriterUnavailable;
+        if (!self.canAcquireApplyLocked(group_id, table_name)) {
+            self.mutex.unlock();
+            return error.RaftApplyWriterUnavailable;
+        }
         var claimed_open: ?*ApplyOpen = null;
-        defer if (claimed_open) |request| request.deinit(self.alloc);
+        defer if (claimed_open) |reclaimed| reclaimed.deinit(self.alloc);
+        const key: ApplyOpenKey = .{ .group_id = group_id, .table_name = table_name };
+        var request = self.findApplyOpenLocked(key, entry);
+        if (self.takeApplyProjectionFailureLocked(request)) |failed| {
+            claimed_open = failed;
+            self.mutex.unlock();
+            return failed.projection_failure.?;
+        }
         if (self.tryAcquireWarmApplyLocked(group_id, table_name, raw_descriptor, if (physical) |cut| cut.bytes else null, needs_index_catalog)) |lease| {
-            claimed_open = self.claimApplyOpenLocked(lease.entry, entry);
+            claimed_open = self.claimApplyOpenLocked(lease.entry, request);
             self.mutex.unlock();
             return lease;
         }
-        const key: ApplyOpenKey = .{ .group_id = group_id, .table_name = table_name };
-        const may_queue = !self.quiescing and !self.apply_control_stopping and
-            !self.publicationPendingLocked(group_id, table_name) and self.canQueueApplyOpenLocked(key);
+        const may_queue = self.canQueueApplyOpenLocked(key);
         self.mutex.unlock();
         if (!may_queue) return error.RaftApplyWriterUnavailable;
         // A committed descriptor may carry large schema and index JSON. Clone
@@ -4203,14 +4239,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer if (pending_owned) pending.deinit(self.alloc);
         if (!self.mutex.tryLock()) return error.RaftApplyWriterUnavailable;
         defer self.mutex.unlock();
-        if (self.quiescing or self.apply_control_stopping or
-            self.publicationPendingLocked(group_id, table_name)) return error.RaftApplyWriterUnavailable;
+        if (!self.canAcquireApplyLocked(group_id, table_name)) return error.RaftApplyWriterUnavailable;
+        request = self.findApplyOpenLocked(key, entry);
+        if (self.takeApplyProjectionFailureLocked(request)) |failed| {
+            claimed_open = failed;
+            return failed.projection_failure.?;
+        }
         // The control executor may have admitted the raw cut while we
         // prepared the queue item. Recheck without building a projection.
         if (physical == null)
             physical = self.physical_catalogs.lookup(group_id, raw_descriptor.indexes_json) catch null;
         if (self.tryAcquireWarmApplyLocked(group_id, table_name, raw_descriptor, if (physical) |cut| cut.bytes else null, needs_index_catalog)) |lease| {
-            claimed_open = self.claimApplyOpenLocked(lease.entry, entry);
+            claimed_open = self.claimApplyOpenLocked(lease.entry, request);
             return lease;
         }
         if (!self.canQueueApplyOpenLocked(key)) return error.RaftApplyWriterUnavailable;
@@ -4219,6 +4259,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         pending_owned = false;
         self.apply_control_wake.set(self.apply_control_io.?);
         return error.RaftApplyWriterUnavailable;
+    }
+
+    fn canAcquireApplyLocked(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) bool {
+        return !self.quiescing and !self.apply_control_stopping and
+            !self.publicationPendingLocked(group_id, table_name);
     }
 
     fn canQueueApplyOpenLocked(self: *ProvisionedKernelOwnerSource, key: ApplyOpenKey) bool {
@@ -4233,14 +4278,23 @@ pub const ProvisionedKernelOwnerSource = struct {
             _ = self.apply_control_requests.remove(request.key());
     }
 
-    fn claimApplyOpenLocked(self: *ProvisionedKernelOwnerSource, owner: *Entry, entry: ?db_types.OrderedApplyReceipt) ?*ApplyOpen {
+    fn findApplyOpenLocked(self: *ProvisionedKernelOwnerSource, key: ApplyOpenKey, entry: ?db_types.OrderedApplyReceipt) ?*ApplyOpen {
         const receipt = entry orelse return null;
-        const key: ApplyOpenKey = .{ .group_id = owner.group_id, .table_name = owner.table_name };
         const request = self.apply_control_requests.get(key) orelse return null;
         const queued = request.entry orelse return null;
-        if (queued.term != receipt.term or queued.index != receipt.index) return null;
+        return if (queued.term == receipt.term and queued.index == receipt.index) request else null;
+    }
 
-        _ = self.apply_control_requests.remove(key);
+    fn takeApplyProjectionFailureLocked(self: *ProvisionedKernelOwnerSource, matching: ?*ApplyOpen) ?*ApplyOpen {
+        const request = matching orelse return null;
+        if (request.projection_failure == null) return null;
+        _ = self.apply_control_requests.remove(request.key());
+        return request;
+    }
+
+    fn claimApplyOpenLocked(self: *ProvisionedKernelOwnerSource, owner: *Entry, matching: ?*ApplyOpen) ?*ApplyOpen {
+        const request = matching orelse return null;
+        _ = self.apply_control_requests.remove(request.key());
         request.claimed = true;
         if (owner.apply_handoff_until_ns.load(.acquire) == 0)
             owner.apply_handoff_until_ns.store(platform_time.monotonicNs() +| apply_handoff_timeout_ns, .release);
@@ -4261,8 +4315,6 @@ pub const ProvisionedKernelOwnerSource = struct {
         projected: ?[]const u8,
         needs_index_catalog: bool,
     ) ?Lease {
-        if (self.quiescing or self.apply_control_stopping or
-            self.publicationPendingLocked(group_id, table_name)) return null;
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (needs_index_catalog and !entry.graph_replay_indexes_prepared) continue;
@@ -4298,6 +4350,26 @@ pub const ProvisionedKernelOwnerSource = struct {
         var physical = self.physical_catalogs.acquire(self.alloc, group_id, raw_descriptor.indexes_json) catch |err|
             return if (err == error.CatalogProjectionBusy) error.StorageKernelOwnerTransitionRequired else err;
         defer physical.deinit();
+        return self.acquireProjectedDescriptorOnce(group_id, table_name, path, raw_descriptor, &physical, admission, residency, controls);
+    }
+
+    fn applyHandoffProtectedLocked(self: *const ProvisionedKernelOwnerSource, entry: *const Entry, controls: ReadControls) bool {
+        if (controls.historical_raft_apply or self.apply_control_stopping) return false;
+        const handoff_until = entry.apply_handoff_until_ns.load(.acquire);
+        return handoff_until != 0 and platform_time.monotonicNs() < handoff_until;
+    }
+
+    fn acquireProjectedDescriptorOnce(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        path: []const u8,
+        raw_descriptor: descriptor_contract.Descriptor,
+        physical: *const @import("owner_catalog_projection.zig").Cache.Lease,
+        admission: LeaseAdmission,
+        residency: Residency,
+        controls: ReadControls,
+    ) !Lease {
         var descriptor = raw_descriptor;
         descriptor.indexes_json = physical.bytes;
 
@@ -4355,6 +4427,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             }
             if (entry.closing) return error.StorageKernelOwnerTransitionRequired;
             if (entry.retired or entry.generation != descriptor.lsm_root_generation or !entry.identity.eql(descriptor.identity) or !restore_matches) {
+                if (!entry.retired and self.applyHandoffProtectedLocked(entry, controls))
+                    return error.StorageReadTemporarilyUnavailable;
                 entry.retired = true;
                 if (entry.active_users == 0) {
                     stale_index = index;
@@ -4377,9 +4451,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             {
                 // Compatible acquisitions take the shared path below.
                 // Protect only the replacement of the prepared owner.
-                const handoff_until = entry.apply_handoff_until_ns.load(.acquire);
-                if (!controls.historical_raft_apply and !self.apply_control_stopping and handoff_until != 0 and
-                    platform_time.monotonicNs() < handoff_until)
+                if (self.applyHandoffProtectedLocked(entry, controls))
                     return error.StorageReadTemporarilyUnavailable;
                 // Catalog definition changes do not necessarily publish a new
                 // physical root generation. An API lease is not the only DB
@@ -4414,7 +4486,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 if (entry.apply_projection) |*previous| previous.deinit();
                 entry.apply_projection = pin;
             }
-            self.physical_catalogs.retainAdmitted(self.alloc, &physical);
+            self.physical_catalogs.retainAdmitted(self.alloc, physical);
             _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
             return .{ .source = self, .entry = entry, .exclusive = exclusive };
         }
@@ -4530,7 +4602,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .exclusive_active = exclusive,
         };
         self.entries.appendAssumeCapacity(entry);
-        self.physical_catalogs.retainAdmitted(self.alloc, &physical);
+        self.physical_catalogs.retainAdmitted(self.alloc, physical);
         _ = self.owner_cache_misses.fetchAdd(1, .monotonic);
         return .{ .source = self, .entry = entry, .exclusive = exclusive };
     }
@@ -7211,6 +7283,9 @@ test "committed owner apply never opens or closes storage under the raft apply l
         try io.sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.acquireDescriptorOnce(1, "docs", path, first, .shared, .resident, .{}));
+    var replacement = first;
+    replacement.lsm_root_generation ^= 1;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.acquireDescriptorOnce(1, "docs", path, replacement, .shared, .resident, .{}));
     source.physical_catalogs.forget(1);
     try std.testing.expect((try source.physical_catalogs.lookup(1, first.indexes_json)) == null);
     // With the shared cache locked, the committed entry can only use its pin.
@@ -7410,6 +7485,56 @@ test "committed owner apply consumes an independently opened owner before delaye
     Source.lock(&source.mutex);
     defer source.mutex.unlock();
     try std.testing.expectEqual(@as(u64, 0), source.entries.items[0].apply_handoff_until_ns.load(.acquire));
+}
+
+test "committed owner apply reports permanent projection failures for the exact entry" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Source = ProvisionedKernelOwnerSource;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    var source = Source.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    try source.startApplyControl(io);
+
+    const invalid: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .indexes_json = "[\"_index_alias_epoch\"]",
+    };
+    const batch: db_types.BatchRequest = .{ .writes = &.{.{ .key = "doc:a", .value = "{}" }} };
+    const key: Source.ApplyOpenKey = .{ .group_id = 1, .table_name = "docs" };
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        Source.lock(&source.mutex);
+        const queued = source.apply_control_requests.contains(key);
+        source.mutex.unlock();
+        if (queued) break;
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", invalid, batch, 2, 1));
+        if (platform_time.monotonicNs() >= deadline) return error.TestColdOwnerDidNotQueue;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    while (true) {
+        const ready = blk: {
+            Source.lock(&source.mutex);
+            defer source.mutex.unlock();
+            const request = source.apply_control_requests.get(key) orelse break :blk false;
+            if (request.projection_failure == null) break :blk false;
+            try std.testing.expect(source.apply_control_active == null);
+            try std.testing.expectEqual(@as(usize, 0), source.apply_control_pending.items.len);
+            break :blk true;
+        };
+        if (ready) break;
+        if (platform_time.monotonicNs() >= deadline) return error.TestProjectionFailureDidNotComplete;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", invalid, batch, 2, 2));
+    try std.testing.expectError(error.InvalidTableIndexMetadata, applyCommittedForTest(&source, alloc, 1, "docs", invalid, batch, 2, 1));
+    var valid = invalid;
+    valid.indexes_json = "{}";
+    try applyCommittedForTest(&source, alloc, 1, "docs", valid, batch, 2, 2);
 }
 
 test "owner shutdown joins recovery close while raft progress remains available" {
