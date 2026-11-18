@@ -1014,8 +1014,19 @@ def test_previous_reader_opens_plain_database_and_rejects_new_features(tmp_path)
         hashlib.sha256(fixture.read_bytes()).hexdigest()
         == "d0a509a1ddf87feaf017032b1f9762bc89fd67c6568760a6f867bd23baf95d48"
     )
+    # A current physical format the pinned reader predates refuses every
+    # file outright (no migration: Antfly is unreleased). Catalog fencing is
+    # then unreachable for Lite files; the previous reader must still fail
+    # at the header, before loading anything. Current creation is the only
+    # writer for that case, since it cannot open the older fixture either.
+    probe = tmp_path / "format-probe.aflite"
+    antfly_embedded.create_with_options(probe, options).close()
+    shared_format = probe.read_bytes()[:8] == b"AFLITE\x03P"
     for path in (plain, identity, pending):
-        shutil.copyfile(fixture, path)
+        if shared_format:
+            shutil.copyfile(fixture, path)
+        else:
+            antfly_embedded.create_with_options(path, options).close()
     with _open_graph_test(plain, options) as db:
         db.create_table("plain_named", {})
         db.create_table("dropped_named", {})
@@ -1043,6 +1054,24 @@ def test_previous_reader_opens_plain_database_and_rejects_new_features(tmp_path)
         db.add_index(dict(graph, name="new", replaces="old"))
         assert db.pending_work_stats()["replacements"]
         assert db.capabilities()["minimum_reader_version"] == 2
+    if not shared_format:
+        script = r"""
+import ctypes, sys
+lib = ctypes.CDLL(sys.argv[1])
+lib.antfly_lite_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+lib.antfly_lite_open.restype = ctypes.c_int
+lib.antfly_last_error_detail.restype = ctypes.c_char_p
+for path in sys.argv[2:]:
+    handle = ctypes.c_void_p()
+    code = lib.antfly_lite_open(path.encode(), ctypes.byref(handle))
+    detail = lib.antfly_last_error_detail()
+    assert code != 0 and not handle.value, (path, code, detail)
+    assert detail == b"InvalidNativeMagic", (path, code, detail)
+"""
+        subprocess.run(
+            [sys.executable, "-c", script, previous, str(plain), str(identity), str(pending)], check=True, timeout=60
+        )
+        return
     for path in (plain, identity, pending):
         with path.open("rb") as file:
             assert file.read(8) == b"AFLITE\x03P", "catalog fencing requires a compatible physical format"
