@@ -130,7 +130,9 @@ producer/source. Replaying that exact candidate is rejected inside the same
 guarded write that would publish it. Transient responses and newer successful
 publications preserve the cycle record. The authority still needs to drive this
 outcome from an actual cross-shard validation decision and retain inspectable
-candidate history under the configured policy.
+candidate history under the configured policy. Co-located capacity and
+authority readiness failures are recorded as retryable ordered outcomes, so
+the apply watermark advances and immutable uploads remain available.
 
 Generated output must first enter private candidate storage, outside the current
 accepted artifact namespace. A candidate binds source revisions, producer recipe,

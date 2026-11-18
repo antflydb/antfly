@@ -28248,10 +28248,8 @@ pub const DB = struct {
         errdefer txn.abort();
         try @import("artifact_publication.zig").stageRejection(&txn, command, entry.index, reason);
         std.log.debug("artifact publication rejected mode={s} producer={s} index={d} reason={s}", .{ @tagName(command.mode), command.producer_name, entry.index, @tagName(reason) });
-        // Baseline readiness is temporary: keep the immutable upload so the
-        // same logical publication can finalize after reconciliation. A
-        // terminal upload record here would strand its retry forever.
-        if (reason != .baseline_pending) try completeArtifactUpload(&txn, opts.artifact_upload_finalize, entry);
+        // Retryable outcomes retain the immutable upload for a later apply.
+        if (!reason.preservesUpload()) try completeArtifactUpload(&txn, opts.artifact_upload_finalize, entry);
         var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         const marker = orderedApplyReceiptWrite(entry, &marker_buf);
         try txn.put(marker.key, marker.value);
@@ -28767,6 +28765,8 @@ pub const DB = struct {
         var guard: Guard = .{ .db = self, .replication_payload = replication_payload, .command = command, .sequence = sequence, .prepared = prepared_value, .coverage = prepared_value.coverage, .chunk_fence = prepared_value.chunk_fence, .chunk_vector_fence = prepared_value.chunk_vector_fence, .asset_upstream_fences = prepared_value.asset_upstream_fences, .position = .{ .raft = .{ .term = entry.term, .index = entry.index } }, .proof = prepared_proof orelse return error.ArtifactCatalogCorrupt, .document_references = if (prepared_document_refs) |*value| value else return error.ArtifactCatalogCorrupt, .upload = opts.artifact_upload_finalize };
         _ = self.core.store.putBatchWithPromotionsReplayAndBuiltWrite(batch_ctx.io, writes.items, deletes.items, &.{}, .{ .sequence = sequence, .payload = replay }, null, .{ .ptr = &guard, .validate = Guard.validate }) catch |err| switch (err) {
             error.GraphCycle => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .graph_cycle, &apply_held),
+            error.GraphConstraintCapacity => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .graph_constraint_capacity, &apply_held),
+            error.GraphConstraintBusy, error.GraphConstraintNotReady => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .graph_constraint_pending, &apply_held),
             error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_source, &apply_held),
             error.ArtifactCoverageBaselinePending, error.ArtifactPublicationPending => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .baseline_pending, &apply_held),
             else => return err,

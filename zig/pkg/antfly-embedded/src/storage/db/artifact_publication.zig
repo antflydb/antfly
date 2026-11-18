@@ -513,7 +513,23 @@ pub const Command = struct {
 };
 
 pub const Receipt = struct { publication_digest: Digest, sequence: u64 };
-pub const Rejection = enum(u8) { stale_source = 1, stale_catalog = 2, sealed_source = 3, invalid_output = 4, baseline_pending = 5, graph_cycle = 6 };
+pub const Rejection = enum(u8) {
+    stale_source = 1,
+    stale_catalog = 2,
+    sealed_source = 3,
+    invalid_output = 4,
+    baseline_pending = 5,
+    graph_cycle = 6,
+    graph_constraint_capacity = 7,
+    graph_constraint_pending = 8,
+
+    pub fn preservesUpload(self: Rejection) bool {
+        return switch (self) {
+            .baseline_pending, .graph_constraint_capacity, .graph_constraint_pending => true,
+            else => false,
+        };
+    }
+};
 pub const Rejected = struct { publication_digest: Digest, applied_index: u64, reason: Rejection };
 const receipt_prefix = "\x00\x00__artifact_publication__:receipt:";
 const receipt_bytes = 4 + 32 + 32 + 8 + 8 + Position.encoded_len + 32 + 32;
@@ -1797,7 +1813,14 @@ test "ordered artifact inventory publication coverage is point bounded idempoten
     var graph = changed;
     graph.producer_kind = .graph;
     graph.publication_digest = graph.digest();
+    try stageRejection(&txn, graph, 14, .graph_constraint_capacity);
+    const capacity = (try rejected(&txn, graph)).?;
+    try std.testing.expectEqual(.graph_constraint_capacity, capacity.reason);
+    try std.testing.expect(capacity.reason.preservesUpload());
+    try requireUnrejectedGraphCandidate(&txn, graph);
     try stageRejection(&txn, graph, 15, .graph_cycle);
+    try stageRejection(&txn, graph, 16, .graph_constraint_pending);
+    try std.testing.expectEqual(.graph_cycle, (try rejected(&txn, graph)).?.reason);
     try std.testing.expectError(error.GraphCycle, requireUnrejectedGraphCandidate(&txn, graph));
     graph.publication_digest = @splat(92);
     try requireUnrejectedGraphCandidate(&txn, graph);
