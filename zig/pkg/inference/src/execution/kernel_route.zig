@@ -50,6 +50,10 @@ pub const Binding = union(enum) {
         /// publication independent of this private, non-donatable input header.
         borrowable_host: bool = false,
     },
+    /// Mutable device ingress copied into this variant's assigned input bank.
+    /// This is a storage recipe, independent of the caller's current address.
+    /// It grants no host-ingress proof or immutable source/payload credit.
+    imported_device: struct { logical: ml.graph.Shape, implementation: Implementation },
     /// Actual resident metadata obtained without allocation, transfer or GPU
     /// submission. Plane facts include canonical storage identity/version.
     resident: struct { logical: ml.graph.Shape, planes: []const storage.Plane, implementation: Implementation },

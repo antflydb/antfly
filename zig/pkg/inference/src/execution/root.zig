@@ -20,6 +20,7 @@ pub const ModelProgram = @import("program.zig").ModelProgram;
 pub const capture = @import("capture.zig");
 pub const model_frontend = @import("model_frontend.zig");
 pub const captured_forward = @import("captured_forward.zig");
+pub const prefill_frontend = @import("prefill_frontend.zig");
 pub const Binding = @import("program.zig").Binding;
 pub const Executable = @import("executable.zig").Executable;
 pub const prepare = @import("executable.zig").prepare;

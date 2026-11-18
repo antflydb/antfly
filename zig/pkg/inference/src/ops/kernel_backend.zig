@@ -92,6 +92,9 @@ pub const VTable = struct {
     copyPhysicalInput: ?*const fn (ctx: *anyopaque, destination: CT, source: CT) anyerror!void = null,
     createPhysicalReplay: ?*const fn (ctx: *anyopaque) anyerror!?physical_storage.Replay = null,
     physicalReplayTensorSupported: ?*const fn (ctx: *anyopaque, tensor: CT) bool = null,
+    /// Prove an immutable binding's actual retained physical root and layout.
+    /// This grants replay lifetime only, never complete-payload/quota credit.
+    physicalReplayImmutableSupported: ?*const fn (ctx: *anyopaque, tensor: CT, logical: @import("ml").graph.Shape) anyerror!bool = null,
     physicalReplayKernelSupported: ?*const fn (ctx: *anyopaque, descriptor: *const kernel_descriptor.Descriptor) bool = null,
     /// Static backend legality. A true result still requires tensor/layout
     /// binding validation before dispatch; it is not a replacement proof.

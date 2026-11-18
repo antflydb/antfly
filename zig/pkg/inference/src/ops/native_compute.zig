@@ -52944,6 +52944,7 @@ fn assignedKernelWorkspaceOp(_: *anyopaque, descriptor: *const ops.kernel_descri
     if (descriptor.operation == .dense_attention_rows) {
         const rows = descriptor.operation.dense_attention_rows;
         if (!rows.valid(descriptor)) return error.InvalidAttentionShape;
+        if (rows.num_kv_heads != 0) return .{};
         if (rows.kind == .cross) return .{ .host_byte_size = try std.math.mul(usize, try std.math.mul(usize, rows.query_rows, rows.key_rows), 4) };
         const plan = try linalg.FlashCausalWorkspace.init(rows.query_rows, rows.key_rows, rows.head_dim);
         return .{ .host_byte_size = try std.math.mul(usize, plan.floats, 4) };
@@ -52965,11 +52966,11 @@ fn assignedKernelGeometrySupported(descriptor: *const ops.kernel_descriptor.Desc
     return switch (descriptor.operation) {
         .paged_attention => |geometry| geometry.valid(descriptor),
         .dense_attention_prefix => |geometry| geometry.valid(descriptor),
-        .dense_attention_rows => |geometry| geometry.valid(descriptor),
+        .dense_attention_rows => |geometry| geometry.num_kv_heads == 0 and geometry.valid(descriptor),
         // Reduced DOT weights remain on the existing converting compatibility
         // path until their source staging has an exact assigned-workspace route.
         .dot => descriptor.input_shapes[0].dtype == .f32 and descriptor.input_shapes[1].dtype == .f32,
-        .transpose, .broadcast => false,
+        .transpose, .broadcast, .add_mul_scalar => false,
         .slice => |slice| check: {
             if (descriptor.input_shapes[0].eq(descriptor.output_shape)) {
                 var identity = true;
@@ -53054,6 +53055,7 @@ fn validateAssignedPagedAttention(geometry: ops.kernel_descriptor.PagedAttention
 }
 
 fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
+    if (request.descriptor.operation == .dense_attention_rows and request.descriptor.operation.dense_attention_rows.num_kv_heads != 0) return false;
     return runAssignedKernelImpl(false, ctx, request, null);
 }
 
@@ -53209,7 +53211,7 @@ fn runAssignedKernelImpl(comptime authored: bool, ctx: *anyopaque, request: ops.
             try actual.manager.writeLayerKvSuffix(actual.context.kv_cache.?.sequence_id, geometry.layer_index, actual.context.total_sequence_len, 1, dense_inputs[1], dense_inputs[2]);
             try gqaPagedAttentionDirectInto(actual.pool, actual.blocks, geometry.layer_index, dense_inputs[0], null, actual.context, geometry.num_heads, geometry.num_kv_heads, geometry.head_dim, null, output);
         },
-        .transpose, .broadcast => unreachable,
+        .transpose, .broadcast, .add_mul_scalar => unreachable,
         .concat => |geometry| try concatDenseInto(dense_inputs[0], dense_inputs[1], output, geometry),
         .slice => |slice| try sliceDenseInto(dense_inputs[0], output, try slice.plan(descriptor.input_shapes[0], descriptor.output_shape)),
         .gather => |gather| {
@@ -56025,7 +56027,7 @@ const NativeSourceRoute = struct {
                 break :blk buf.view_strides == null and buf.source_tensor == null and buf.quantized_storage == null and
                     (buf.declared_dtype == null or buf.declared_dtype == .f32) and buf.data.len == shape.numElements().?;
             },
-            .unknown => false,
+            .unknown, .imported_device => false,
         };
     }
     fn planesDense(logical: Shape, planes: []const @import("../execution/storage_ownership.zig").Plane, expected: Shape) bool {

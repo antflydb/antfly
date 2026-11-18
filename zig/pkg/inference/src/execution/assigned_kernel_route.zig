@@ -97,6 +97,7 @@ fn planesDense(backend: ops.ComputeBackend, logical: ml.graph.Shape, planes: []c
 pub fn bindingDense(backend: ops.ComputeBackend, binding: route.Binding, expected: ml.graph.Shape) bool {
     return switch (binding) {
         .imported_host => |host| host.target == backend.kind() and shapeEqual(host.logical, expected),
+        .imported_device => |device| backend.kind() == .cuda and device.implementation.context == backend.ptr and device.implementation.table == @as(*const anyopaque, @ptrCast(backend.vtable)) and expected.dtype == .f32 and shapeEqual(device.logical, expected),
         .planned => |planned| planesDense(backend, planned.logical, planned.planes, expected),
         .resident => |resident| resident.implementation.context == backend.ptr and resident.implementation.table == @as(*const anyopaque, @ptrCast(backend.vtable)) and planesDense(backend, resident.logical, resident.planes, expected),
         .tensor => |known| actualDense(backend, known, expected),

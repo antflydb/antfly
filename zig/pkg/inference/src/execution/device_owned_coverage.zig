@@ -57,6 +57,22 @@ fn allocation(pool: *const physical.Pool, id: buffers.AllocationId, size: usize,
 fn ingress(pool: *const physical.Pool, node: ml.graph.NodeId, logical: ml.graph.Shape, target: ops.ComputeBackend) bool {
     const selected = if (pool.selection) |*value| value else return false;
     const fact = selected.inputs.find(node) orelse return false;
+    if (fact == .imported_device) {
+        const device = fact.imported_device;
+        if (target.kind() != .cuda or device.implementation.context != target.ptr or device.implementation.table != @as(*const anyopaque, @ptrCast(target.vtable)) or !device.logical.eq(logical) or logical.dtype != .f32) return false;
+        var found = false;
+        for (pool.device_input_plans) |plan| if (plan.node == node) {
+            if (found or plan.backend_index >= pool.backends.len or plan.epoch != selected.epoch or !plan.shape.eq(logical)) return false;
+            const backend = pool.backends[plan.backend_index];
+            if (backend.ptr != target.ptr or backend.vtable != target.vtable or services(backend) == null) return false;
+            const size = bytes(logical) orelse return false;
+            if (!allocation(pool, plan.allocation, size, .input_binding, false)) return false;
+            const functions = backend.vtable.kernels orelse return false;
+            if (functions.copyPhysicalInput == null or functions.physicalTensorView == null) return false;
+            found = true;
+        };
+        return found;
+    }
     if (fact != .imported_host or !fact.imported_host.owned_ingress or fact.imported_host.target != target.kind() or !fact.imported_host.logical.eq(logical)) return false;
     var found = false;
     for (pool.host_input_plans) |plan| if (plan.node == node) {
@@ -154,7 +170,7 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
             .runtime_input => {
                 if (node.op != .parameter or slot.roles.graph_output) return .{ .compatibility = .input_representation };
                 if (selected.inputs.find(@intCast(id))) |binding| {
-                    if (binding != .imported_host or !ingress(pool, @intCast(id), slot.desc.shape, target)) return .{ .compatibility = .input_representation };
+                    if ((binding != .imported_host and binding != .imported_device) or !ingress(pool, @intCast(id), slot.desc.shape, target)) return .{ .compatibility = .input_representation };
                 } else {
                     const immutable = pool.immutable_bindings orelse return .{ .compatibility = .input_representation };
                     const binding = immutable.find(@intCast(id)) orelse return .{ .compatibility = .input_representation };

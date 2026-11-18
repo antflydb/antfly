@@ -30,6 +30,44 @@ const Frame = struct {
     backend: ops.ComputeBackend,
     executable: ?executable.Executable = null,
     busy: bool = false,
+    // One retained original model binding per executable frame. Repeated
+    // invocations reuse these exact packed/mirrored handles; neither tracing
+    // nor request submission manufactures a replacement representation.
+    weights: std.ArrayList(interpreter.RuntimeInput) = .empty,
+    weight_bindings: std.ArrayList(@import("kernel_route.zig").InputBinding) = .empty,
+
+    fn bindWeights(self: *Frame, allocator: std.mem.Allocator, program: *const @import("program.zig").ModelProgram) !void {
+        const functions = self.backend.vtable.kernels orelse return;
+        const retain = functions.retainImmutableTensor orelse return;
+        for (program.bindings) |binding| {
+            if (binding.kind != .weight or binding.node_id == @import("ml").graph.null_node) continue;
+            const borrowed = try self.backend.getWeight(binding.name);
+            defer self.backend.free(borrowed);
+            // getWeight may return lookup-map metadata. Retain the physical
+            // source root before storing any handle across requests/rehashes.
+            const value = (try retain(self.backend.ptr, borrowed)) orelse {
+                // Streaming/custom providers retain their original lookup path;
+                // neither cloning payload nor a partial immutable map is safe.
+                self.releaseWeights(allocator);
+                self.weights = .empty;
+                self.weight_bindings = .empty;
+                return;
+            };
+            self.weights.append(allocator, .{ .node_id = binding.node_id, .value = value, .source_backend = &self.backend }) catch |err| {
+                self.backend.free(value);
+                return err;
+            };
+            try self.weight_bindings.append(allocator, .{ .node_id = binding.node_id, .value = .{ .tensor = .{
+                .value = value,
+                .implementation = .{ .context = self.backend.ptr, .table = self.backend.vtable },
+            } } });
+        }
+    }
+    fn releaseWeights(self: *Frame, allocator: std.mem.Allocator) void {
+        for (self.weights.items) |input| self.backend.free(input.value);
+        self.weights.deinit(allocator);
+        self.weight_bindings.deinit(allocator);
+    }
 };
 
 const Entry = struct {
@@ -65,6 +103,7 @@ const Entry = struct {
             const frame = self.frames.items[index];
             std.debug.assert(!frame.busy);
             if (frame.executable) |*value| value.deinit();
+            frame.releaseWeights(self.allocator);
             frame.backend.deinit();
             self.allocator.destroy(frame);
         }
@@ -80,6 +119,27 @@ const Entry = struct {
         defer allocator.free(shape);
         if (shape.len > 8) return error.UnsupportedShape;
         const dtype = try backend.tensorDType(weight);
+        // A packed primary is a storage plane of a floating-point operand.
+        // Ask the canonical provider's existing descriptor; do not read back,
+        // unpack, clone, or infer a format from a checkpoint/model name.
+        const Semantic = struct {
+            dimensions: []const i64,
+            quantized: bool = false,
+            fn visit(raw: *anyopaque, report: @import("storage_ownership.zig").Report) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (report == .plane and report.plane.role == .primary and report.plane.descriptor.quant_format != null) {
+                    const logical = report.plane.descriptor.shape;
+                    if (std.mem.eql(i64, self.dimensions, logical.dims[0..logical.rank()])) self.quantized = true;
+                }
+            }
+        };
+        var semantic = Semantic{ .dimensions = shape };
+        if (dtype == .u8 or dtype == .i8) if (backend.vtable.kernels) |functions| {
+            if (functions.accepts(backend.vtable)) if (functions.storageOwnership) |query| {
+                _ = try query(backend.ptr, weight, .{ .context = &semantic, .visit = Semantic.visit });
+            };
+        };
+        if (semantic.quantized) return @import("ml").graph.Shape.init(.f32, shape);
         return @import("ml").graph.Shape.init(switch (dtype) {
             inline else => |tag| @field(@import("ml").graph.DType, @tagName(tag)),
         }, shape);
@@ -101,9 +161,10 @@ const Entry = struct {
     fn create(allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, key: Key) !*Entry {
         const frame = try allocator.create(Frame);
         errdefer allocator.destroy(frame);
-        frame.backend = try provider.create(provider.context, allocator);
+        frame.* = .{ .backend = try provider.create(provider.context, allocator) };
         errdefer frame.backend.deinit();
-        var program = try capture.trace(allocator, forward, inputs, .{ .context = @constCast(&frame.backend), .resolve = weightShape, .values = weightValues });
+        errdefer frame.releaseWeights(allocator);
+        var program = try capture.trace(allocator, forward, inputs, .{ .context = &frame.backend, .resolve = weightShape, .values = weightValues });
         errdefer program.deinit();
         const entry = try allocator.create(Entry);
         errdefer allocator.destroy(entry);
@@ -128,6 +189,11 @@ const Entry = struct {
                 entry.resident = try @import("../graph/pjrt_executor.zig").createExecutorWithOptions(allocator, &entry.program.graph, &part, &frame.backend, &frame.backend, client, .{ .resident_capacity = forward.resident_capacity, .resident_initial = forward.resident_initial, .resident_visibility = visibility, .precision = forward.precision, .mutable_parameters = entry.program.mutable_parameters }, if (context.pjrt_parameter_store) |store| @ptrCast(@alignCast(store)) else null);
             } else return error.PjrtNotEnabled;
         } else {
+            if (provider.compiled_context == null) {
+                try frame.bindWeights(allocator, &entry.program);
+                options.immutable_input_bindings = frame.weight_bindings.items;
+                options.input_bindings = frame.weights.items;
+            }
             frame.executable = try executable.prepareWithOptions(allocator, &entry.program, &frame.backend, if (provider.compiled_context != null) .compiled_required else .compiled_preferred, options);
         }
         frame.busy = false;
@@ -161,10 +227,16 @@ const Entry = struct {
         }
         const frame = try self.allocator.create(Frame);
         errdefer self.allocator.destroy(frame);
-        frame.backend = try self.provider.create(self.provider.context, self.allocator);
+        frame.* = .{ .backend = try self.provider.create(self.provider.context, self.allocator) };
         errdefer frame.backend.deinit();
+        errdefer frame.releaseWeights(self.allocator);
         var options = executable.PrepareOptions{ .compiled = self.provider.compiled_context, .compiled_source = if (self.provider.compiled_context != null) source else null };
         if (options.compiled) |*context| context.cb = &frame.backend;
+        if (self.provider.compiled_context == null) {
+            try frame.bindWeights(self.allocator, &self.program);
+            options.immutable_input_bindings = frame.weight_bindings.items;
+            options.input_bindings = frame.weights.items;
+        }
         frame.executable = if (self.resident != null) null else try executable.prepareWithOptions(self.allocator, &self.program, &frame.backend, if (self.provider.compiled_context != null) .compiled_required else .compiled_preferred, options);
         frame.busy = true;
         platform.sync.lockYielding(&self.mutex);
@@ -286,8 +358,9 @@ pub const Cache = struct {
     pub fn runResident(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, state: *@import("../graph/pjrt_decoder_state.zig").State, allocator: std.mem.Allocator, control: ?Control) ![]Tensor {
         if (comptime !@import("build_options").enable_pjrt) return error.PjrtNotEnabled;
         if (forward.resident_capacity == 0) return error.NotResidentDecoder;
+        for (inputs) |input| if (input.resident != null) return error.ResidentInputNotSupported;
         if (control) |active| try active.check();
-        for (inputs) |input| _ = try capture.inputShape(input.tensor);
+        for (inputs) |input| _ = try input.shape();
         if (forward.validate) |validate| try validate(forward.context, inputs);
         const entry = try self.acquire(model_allocator, provider, forward, inputs, control);
         defer entry.release();
@@ -325,20 +398,35 @@ pub const Cache = struct {
         return outputs;
     }
 
-    pub fn run(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, allocator: std.mem.Allocator, control: ?Control) ![]Tensor {
+    pub fn runDevice(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, allocator: std.mem.Allocator, control: ?Control) !DeviceResult {
+        return self.runDeviceWithReadbacks(model_allocator, provider, forward, inputs, allocator, control, .forbidden);
+    }
+
+    fn runDeviceWithReadbacks(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, allocator: std.mem.Allocator, control: ?Control, readbacks: @FieldType(interpreter.ExecuteOptions, "activation_readbacks")) !DeviceResult {
         if (control) |active| try active.check();
-        for (inputs) |input| _ = try capture.inputShape(input.tensor);
+        for (inputs) |input| {
+            _ = try input.shape();
+            if (input.resident) |source| {
+                if (try source.backend.tensorDType(source.value) != input.tensor.dtype) return error.InvalidInputShape;
+                const shape = try source.backend.tensorShape(source.value, allocator);
+                defer allocator.free(shape);
+                if (!std.mem.eql(i64, shape, input.tensor.shape)) return error.InvalidInputShape;
+            }
+        }
         if (forward.validate) |validate| try validate(forward.context, inputs);
         const entry = try self.acquire(model_allocator, provider, forward, inputs, control);
-        defer entry.release();
+        errdefer entry.release();
         const frame = try entry.acquireFrame();
-        defer entry.returnFrame(frame);
+        errdefer entry.returnFrame(frame);
         const frame_executable = if (frame.executable) |*value| value else return error.ResidentDecoderRequiresState;
         frame.backend.execution_control = control;
-        defer frame.backend.execution_control = null;
+        errdefer frame.backend.execution_control = null;
         var runtime_inputs: std.ArrayList(interpreter.RuntimeInput) = .empty;
         defer runtime_inputs.deinit(allocator);
-        defer for (runtime_inputs.items) |input| frame.backend.free(input.value);
+        // Borrow retained immutable bindings; only request imports below are
+        // released at invocation exit. The frame survives all device results.
+        try runtime_inputs.appendSlice(allocator, frame.weights.items);
+        defer for (runtime_inputs.items[frame.weights.items.len..]) |input| frame.backend.free(input.value);
         for (inputs) |input| {
             var node: ?@import("ml").graph.NodeId = null;
             for (entry.program.bindings) |binding| {
@@ -349,15 +437,63 @@ pub const Cache = struct {
             }
             const id = node orelse return error.MissingProgramInput;
             if (id == @import("ml").graph.null_node) continue;
-            const value = try provider.import(provider.context, &frame.backend, &input.tensor, allocator);
+            const value = if (input.resident != null)
+                try input.value(&frame.backend)
+            else
+                try provider.import(provider.context, &frame.backend, &input.tensor, allocator);
             runtime_inputs.append(allocator, .{ .node_id = id, .value = value }) catch |err| {
                 frame.backend.free(value);
                 return err;
             };
         }
-        var result = try frame_executable.run(allocator, .{ .runtime_inputs = runtime_inputs.items, .execution_control = control, .output_placement = .producer, .strict_integer_constants = true });
-        defer result.deinit(&frame_executable.runtime);
+        var routes: ?*@import("prepared_routes.zig").PreparedRoutes = null;
+        defer if (routes) |selected| selected.release();
+        if (comptime !@import("build_options").enable_wasm) if (forward.device_inputs == .assigned and provider.compiled_context == null and frame.backend.kind() == .cuda) {
+            var facts: std.ArrayList(@import("kernel_route.zig").InputBinding) = .empty;
+            defer facts.deinit(allocator);
+            for (runtime_inputs.items[frame.weights.items.len..]) |input| {
+                const shape = entry.program.graph.node(input.node_id).output_shape;
+                if (shape.dtype != .f32) continue;
+                try facts.append(allocator, .{ .node_id = input.node_id, .value = .{ .imported_device = .{
+                    .logical = shape,
+                    .implementation = .{ .context = frame.backend.ptr, .table = frame.backend.vtable },
+                } } });
+            }
+            if (facts.items.len != 0) {
+                if (frame_executable.runtime.physical_pool) |pool| routes = try pool.prepareRoutes(facts.items);
+            }
+        };
+        var result = try frame_executable.run(allocator, .{ .runtime_inputs = runtime_inputs.items, .prepared_routes = routes, .execution_control = control, .output_placement = .producer, .strict_integer_constants = true, .activation_readbacks = readbacks });
+        errdefer result.deinit(&frame_executable.runtime);
         if (control) |active| try active.check();
+        return .{ .entry = entry, .frame = frame, .result = result };
+    }
+
+    /// The result pins its cache entry AND busy mutable frame until all device
+    /// consumers have published their own values. No backend pointer into an
+    /// evicted frame can escape this synchronous lease.
+    pub const DeviceResult = struct {
+        entry: *Entry,
+        frame: *Frame,
+        result: executable.runtime_module.Result,
+        pub fn backend(self: *const DeviceResult, index: usize) *const ops.ComputeBackend {
+            return self.result.backendFor(&self.frame.executable.?.runtime, index);
+        }
+        pub fn deinit(self: *DeviceResult) void {
+            self.result.deinit(&self.frame.executable.?.runtime);
+            self.frame.backend.execution_control = null;
+            self.entry.returnFrame(self.frame);
+            self.entry.release();
+            self.* = undefined;
+        }
+    };
+
+    pub fn run(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, allocator: std.mem.Allocator, control: ?Control) ![]Tensor {
+        var held = try self.runDeviceWithReadbacks(model_allocator, provider, forward, inputs, allocator, control, .allowed);
+        defer held.deinit();
+        const entry = held.entry;
+        const frame_executable = &held.frame.executable.?;
+        const result = &held.result;
         const outputs = try allocator.alloc(Tensor, result.outputs.len);
         var count: usize = 0;
         errdefer {
@@ -447,6 +583,14 @@ const TestProvider = struct {
             const expected: []const f32 = if (iteration == 0) &.{ 2, -4, 6, -8, 10, -12 } else &.{ -14, -14, -14, -14, -14, -14 };
             try std.testing.expectEqualSlices(f32, expected, outputs[0].asFloat32());
             try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, outputs[0].shape);
+            if (client == null) {
+                const entry = cache.entries.entries.items[0];
+                try std.testing.expectEqual(@as(usize, 1), entry.frames.items.len);
+                const frame = entry.frames.items[0];
+                try std.testing.expectEqual(@as(usize, 1), frame.weights.items.len);
+                try std.testing.expect(frame.weight_bindings.items[0].value.tensor.value == frame.weights.items[0].value);
+                try std.testing.expect(frame.weights.items[0].source_backend == &frame.backend);
+            }
         }
         try std.testing.expectEqual(@as(u64, 1), cache.entries.stats.builds);
         var foreign = provider;
@@ -500,7 +644,7 @@ test "captured forward cache reuses immutable programs with independent CPU fram
 
 test "captured forward cache executes through real PJRT and shares compiled operands across frames" {
     if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
-    var client = @import("pjrt").pjrt.Client.initFromEnv(std.testing.allocator) catch |err| switch (err) {
+    var client = testPjrtClient(std.testing.allocator) catch |err| switch (err) {
         error.PjrtPluginNotFound => return error.SkipZigTest,
         else => return err,
     };
@@ -526,7 +670,7 @@ const TestRotary = struct {
 test "captured forward PJRT rotary preserves both pair layouts partial rotation and offsets" {
     if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var client = @import("pjrt").pjrt.Client.initFromEnv(a) catch |err| switch (err) {
+    var client = testPjrtClient(a) catch |err| switch (err) {
         error.PjrtPluginNotFound => return error.SkipZigTest,
         else => return err,
     };
@@ -605,7 +749,7 @@ test "captured forward CPU pooling excludes nonfinite padding and normalizes tru
 
 test "captured forward PJRT pooling excludes nonfinite padding and normalizes truncated rows" {
     if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
-    var client = @import("pjrt").pjrt.Client.initFromEnv(std.testing.allocator) catch |err| switch (err) {
+    var client = testPjrtClient(std.testing.allocator) catch |err| switch (err) {
         error.PjrtPluginNotFound => return error.SkipZigTest,
         else => return err,
     };
@@ -654,17 +798,18 @@ test "captured forward BF16 rotary preserves coefficient product and partial-lay
     };
 }
 
+fn testPjrtClient(a: std.mem.Allocator) !@import("pjrt").pjrt.Client {
+    const Client = @import("pjrt").pjrt.Client;
+    // Standalone CUDA qualification needs an explicit, small pool; the
+    // native CUDA backend is deliberately unnecessary for these tests.
+    const policy: Client.MemoryPolicy = if (platform.env.getenv("ANTFLY_PJRT_TEST_CUDA_DEVICE_BYTES")) |bytes|
+        .{ .cuda = .{ .capacity_bytes = 256 * 1024 * 1024, .device_bytes = try std.fmt.parseInt(usize, bytes, 10) } }
+    else
+        .cpu;
+    return Client.initFromEnvWithMemoryPolicy(a, policy);
+}
+
 const TestTemporal = struct {
-    fn client(a: std.mem.Allocator) !@import("pjrt").pjrt.Client {
-        const Client = @import("pjrt").pjrt.Client;
-        // Standalone CUDA qualification needs an explicit, small pool; the
-        // native CUDA backend is deliberately unnecessary for these tests.
-        const policy: Client.MemoryPolicy = if (platform.env.getenv("ANTFLY_PJRT_TEST_CUDA_DEVICE_BYTES")) |bytes|
-            .{ .cuda = .{ .capacity_bytes = 256 * 1024 * 1024, .device_bytes = try std.fmt.parseInt(usize, bytes, 10) } }
-        else
-            .cpu;
-        return Client.initFromEnvWithMemoryPolicy(a, policy);
-    }
     const params = ops.Gemma4AudioLocalAttentionParams{ .rows = 5, .hidden = 4, .heads = 2, .head_dim = 2, .chunk = 2, .context_left = 3, .context = 4, .k_scale = 0.7, .logit_cap = 50, .invalid_value = -1e9, .exclude_farthest_key = true };
     const rel = [_]f32{ 0.1, -0.2, 0.3, 0.4, -0.3, 0.2, -0.1, 0.1, 0.2, -0.4, 0.3, 0.1 };
     const scales = [_]f32{ 0.7, 0.9 };
@@ -710,7 +855,7 @@ const TestTemporal = struct {
 test "captured temporal PJRT local relative attention and causal convolution preserve masks and runtime values" {
     if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var client = try TestTemporal.client(a);
+    var client = try testPjrtClient(a);
     defer client.deinit();
     var source = TestProvider{ .weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } };
     defer source.weights.deinitOwned();
@@ -742,7 +887,7 @@ test "captured temporal PJRT local relative attention and causal convolution pre
 test "captured temporal PJRT independent reductions publish BF16 values after F32 probabilities" {
     if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var client = try TestTemporal.client(a);
+    var client = try testPjrtClient(a);
     defer client.deinit();
     var source = TestProvider{ .weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } };
     defer source.weights.deinitOwned();
@@ -912,4 +1057,137 @@ test "model program cold requests coalesce builds and share one immutable entry"
     }
     try std.testing.expectEqual(@as(usize, 1), source.creates.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 1), cache.specializationCount());
+}
+
+test "device program cache keeps current inputs and pins output frames across eviction" {
+    const a = std.testing.allocator;
+    var source = TestProvider{ .weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } };
+    defer source.weights.deinitOwned();
+    var origin = try TestProvider.create(&source, a);
+    defer origin.deinit();
+    const Stage = struct {
+        fn run(_: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const capture.Input) ![]capture.Output {
+            const value = try inputs[0].value(cb);
+            defer cb.free(value);
+            const out = (try cb.multiplyScalar(value, 3)) orelse return error.UnsupportedPrimitiveOp;
+            errdefer cb.free(out);
+            const outputs = try allocator.alloc(capture.Output, 1);
+            outputs[0] = .{ .name = "scaled", .value = out };
+            return outputs;
+        }
+    };
+    const provider = Provider{ .context = &source, .create = TestProvider.create, .import = TestProvider.import };
+    const forward = capture.Forward{ .context = &source, .fingerprint = 0x646576696365, .output_names = &.{"scaled"}, .run = Stage.run };
+    var cache = Cache{};
+    var cache_open = true;
+    defer if (cache_open) cache.deinit(a);
+    const shape = [_]i64{ 2, 3 };
+    for (0..2) |iteration| {
+        const values: [6]f32 = @splat(@as(f32, @floatFromInt(iteration + 1)));
+        const value = try origin.fromFloat32Shape(&values, &.{ 2, 3 });
+        defer origin.free(value);
+        const inputs = [_]capture.Input{.{ .tensor = .{ .name = "input", .data = &.{}, .dtype = .f32, .shape = &shape, .allocator = a, .owns_data = false, .owns_shape = false }, .resident = .{ .backend = &origin, .value = value } }};
+        var held = try cache.runDevice(a, provider, forward, &inputs, a, null);
+        defer held.deinit();
+        try std.testing.expectEqual(@as(usize, 1), cache.specializationCount());
+        if (iteration == 1) {
+            cache.deinit(a);
+            cache_open = false;
+        }
+        const actual = try held.backend(0).toFloat32(held.result.outputs[0], a);
+        defer a.free(actual);
+        for (actual) |got| try std.testing.expectEqual(3 * values[0], got);
+    }
+}
+
+test "functional global GQA executes a final query over its complete donor extent" {
+    const a = std.testing.allocator;
+    var source = TestProvider{ .weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } };
+    defer source.weights.deinitOwned();
+    const Stage = struct {
+        fn run(_: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const capture.Input) ![]capture.Output {
+            const q = try inputs[0].value(cb);
+            defer cb.free(q);
+            const k = try inputs[1].value(cb);
+            defer cb.free(k);
+            const v = try inputs[2].value(cb);
+            defer cb.free(v);
+            const out = try cb.gqaPagedAttention(q, k, v, null, .{ .total_sequence_len = 3, .query_sequence_len = 1, .kv_sequence_len = 3 }, 1, 1, 1, 2);
+            errdefer cb.free(out);
+            const outputs = try allocator.alloc(capture.Output, 1);
+            outputs[0] = .{ .name = "attention", .value = out };
+            return outputs;
+        }
+    };
+    var q = try Tensor.initFloat32(a, "q", &.{ 1, 2 }, &.{ 0, 0 });
+    defer q.deinit();
+    var k = try Tensor.initFloat32(a, "k", &.{ 3, 2 }, &.{ 0, 0, 0, 0, 0, 0 });
+    defer k.deinit();
+    var v = try Tensor.initFloat32(a, "v", &.{ 3, 2 }, &.{ 0, 2, 4, 6, 8, 10 });
+    defer v.deinit();
+    const inputs = [_]capture.Input{ .{ .tensor = q }, .{ .tensor = k }, .{ .tensor = v } };
+    var cache = Cache{};
+    defer cache.deinit(a);
+    const outputs = try cache.run(a, .{ .context = &source, .create = TestProvider.create, .import = TestProvider.import }, .{ .context = &source, .fingerprint = 0x6771616c617374, .output_names = &.{"attention"}, .run = Stage.run }, &inputs, a, null);
+    defer a.free(outputs);
+    defer for (outputs) |*output| output.deinit();
+    for (outputs[0].asFloat32(), [_]f32{ 4, 6 }) |got, expected| try std.testing.expectApproxEqAbs(expected, got, 0.000001);
+}
+
+const TestScalarAffine = struct {
+    fn forward(_: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const capture.Input) ![]capture.Output {
+        const x = try inputs[0].value(cb);
+        defer cb.free(x);
+        const y = try cb.fromFloat32Shape(&.{ 0.5, 4, -1.5, 1.75 }, &.{4});
+        defer cb.free(y);
+        const scale = try cb.fromFloat32Shape(&.{0.25}, &.{1});
+        defer cb.free(scale);
+        const branch = (try cb.residualAddScale(x, y, scale)) orelse blk: {
+            const scaled = try cb.multiply(x, scale);
+            defer cb.free(scaled);
+            break :blk try cb.add(scaled, y);
+        };
+        errdefer cb.free(branch);
+        const sum = try cb.add(x, y);
+        defer cb.free(sum);
+        const scaled_sum = try cb.multiply(sum, scale);
+        errdefer cb.free(scaled_sum);
+        const outputs = try allocator.alloc(capture.Output, 2);
+        outputs[0] = .{ .name = "scaled_branch", .value = branch };
+        outputs[1] = .{ .name = "scaled_sum", .value = scaled_sum };
+        return outputs;
+    }
+    fn qualify(client: ?*anyopaque) !void {
+        const a = std.testing.allocator;
+        var source = TestProvider{ .weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } };
+        defer source.weights.deinitOwned();
+        const provider = Provider{ .context = &source, .create = TestProvider.create, .import = TestProvider.import, .compiled_context = if (client) |actual| .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = actual } else null };
+        var cache = Cache{};
+        defer cache.deinit(a);
+        var input = try Tensor.initFloat32(a, "x", &.{4}, &.{ 1, -2, 3.5, 0.25 });
+        defer input.deinit();
+        for ([_]@import("precision.zig").Policy{ .f32, .bf16 }) |precision| {
+            var selected = provider;
+            if (selected.compiled_context) |*context| context.pjrt_precision = precision;
+            const outputs = try cache.run(a, selected, .{ .context = &source, .fingerprint = 0x616666696e65, .output_names = &.{ "scaled_branch", "scaled_sum" }, .run = forward, .precision = precision }, &.{.{ .tensor = input }}, a, null);
+            defer a.free(outputs);
+            defer for (outputs) |*output| output.deinit();
+            try std.testing.expectEqualSlices(f32, &.{ 0.75, 3.5, -0.625, 1.8125 }, outputs[0].asFloat32());
+            try std.testing.expectEqualSlices(f32, &.{ 0.375, 0.5, 0.5, 0.5 }, outputs[1].asFloat32());
+        }
+    }
+};
+
+test "scalar affine captured programs preserve both formulas in F32 and BF16" {
+    try TestScalarAffine.qualify(null);
+}
+
+test "scalar affine real PJRT preserves native scaled branch arithmetic" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    var client = testPjrtClient(std.testing.allocator) catch |err| switch (err) {
+        error.PjrtPluginNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer client.deinit();
+    try TestScalarAffine.qualify(@ptrCast(&client));
 }

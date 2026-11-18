@@ -33,6 +33,14 @@ pub const Scope = struct {
     pub fn context(self: *Scope) contracts.ForwardKvReuse {
         return .{ .ptr = self, .resolve_fn = resolve };
     }
+    pub fn retainDonor(self: *Scope, layer: usize) !contracts.ForwardKvReuse.Pair {
+        if (layer >= self.entries.len) return error.InvalidForwardKvLayer;
+        const entry = self.entries[layer] orelse return error.MissingForwardKvDonor;
+        const key = (try self.backend.retainImmutableTensor(entry.held.key, self.allocator)) orelse return error.ForwardKvRetentionUnsupported;
+        errdefer self.release(key);
+        const value = (try self.backend.retainImmutableTensor(entry.held.value, self.allocator)) orelse return error.ForwardKvRetentionUnsupported;
+        return .{ .key = key, .value = value };
+    }
     fn resolve(raw: *anyopaque, layer: usize, read_only: bool, key: ops.CT, value: ops.CT) !contracts.ForwardKvReuse.Pair {
         const self: *Scope = @ptrCast(@alignCast(raw));
         if (layer >= self.entries.len) return error.InvalidForwardKvLayer;
@@ -80,4 +88,29 @@ test "forward KV reuse preserves causal donor values after original tensors reti
     try std.testing.expectError(error.MissingForwardKvDonor, cb.gqaPagedAttention(q, q, q, null, context, 1, 1, 1, 2));
     context.mode = .paged_decode;
     try std.testing.expectError(error.InvalidForwardKvMode, cb.gqaPagedAttention(q, q, q, null, context, 1, 1, 1, 2));
+}
+
+test "functional prefill KV publication retains donor lifetimes" {
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var scope = try Scope.init(a, &cb, 1, null);
+    var scope_open = true;
+    defer if (scope_open) scope.deinit();
+    const values = [_]f32{ 1.0003, 2.0007, -3.001, 4.001 };
+    const value = try cb.fromFloat32Shape(&values, &.{ 2, 2 });
+    defer cb.free(value);
+    _ = try Scope.resolve(&scope, 0, false, value, value);
+    const held = try scope.retainDonor(0);
+    defer cb.free(held.key);
+    defer cb.free(held.value);
+    scope.deinit();
+    scope_open = false;
+    const actual = try cb.toFloat32(held.key, a);
+    defer a.free(actual);
+    for (values, actual) |original, got| try std.testing.expectEqual(original, got);
 }

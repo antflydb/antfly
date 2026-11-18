@@ -12,10 +12,49 @@ const program = @import("program.zig");
 
 pub const Input = struct {
     tensor: tensor.Tensor,
+    /// Descriptor-only host metadata for a tensor already held by a backend.
+    /// The source and value are borrowed only through synchronous submission.
+    resident: ?struct { backend: *const ops.ComputeBackend, value: ops.CT } = null,
+
     /// Host control/visibility metadata that determines graph structure. Its
     /// bytes participate in specialization; ordinary activation/ID values do not.
     specialize: bool = false,
     state: bool = false,
+
+    pub fn shape(self: Input) !ml.graph.Shape {
+        if (self.resident == null) return inputShape(self.tensor);
+        if (self.specialize or self.tensor.data.len != 0 or self.tensor.shape.len > ml.graph.shape.max_rank) return error.InvalidInputShape;
+        const result = ml.graph.Shape.init(switch (self.tensor.dtype) {
+            inline else => |dtype| @field(ml.graph.DType, @tagName(dtype)),
+        }, self.tensor.shape);
+        _ = result.numElements() orelse return error.InvalidInputShape;
+        return result;
+    }
+
+    pub fn value(self: Input, cb: *const ops.ComputeBackend) !ops.CT {
+        if (self.resident) |held| {
+            if (cb.kind() == .graph) return tracing.TracingCompute.namedRuntimeInput(cb, self.tensor.name, try self.shape());
+            if (try cb.copyTensorFromBackend(held.backend, held.value)) |copied| return copied;
+            // Native operands already have host storage. Borrow that storage
+            // for the ordinary typed upload, never a device readback fallback.
+            if (held.backend.kind() == .native and self.tensor.dtype == .f32) {
+                const values = (try held.backend.hostFloat32Read(held.value)) orelse return error.UnsupportedProgramTransport;
+                return self.fromHostF32(cb, values);
+            }
+            return error.UnsupportedProgramTransport;
+        }
+        if (self.tensor.dtype == .f32) return self.fromHostF32(cb, self.tensor.asFloat32());
+        return (try cb.fromConstantBytes(self.tensor.data, switch (self.tensor.dtype) {
+            inline else => |dtype| @field(ml.graph.DType, @tagName(dtype)),
+        }, self.tensor.shape)) orelse error.UnsupportedProgramTransport;
+    }
+
+    fn fromHostF32(self: Input, cb: *const ops.ComputeBackend, values: []const f32) !ops.CT {
+        var dims: [8]i32 = undefined;
+        if (self.tensor.shape.len > dims.len) return error.InvalidInputShape;
+        for (self.tensor.shape, 0..) |dim, index| dims[index] = std.math.cast(i32, dim) orelse return error.InvalidInputShape;
+        return cb.fromFloat32Shape(values, dims[0..self.tensor.shape.len]);
+    }
 };
 
 pub const Output = struct {
@@ -32,6 +71,12 @@ pub const Forward = struct {
     /// Checkpoint/configuration and arithmetic-contract identity. The cache
     /// belongs to its loaded model, never a process-global checkpoint name.
     fingerprint: u64,
+    /// Authored native schedules retain their original projection calls and
+    /// packed weight operands; only unreachable nodes are removed.
+    optimization: enum { general, authored_schedule } = .general,
+    /// Assigned CUDA inputs trade a device copy for stable reusable banks.
+    /// Callers opt in only after qualifying their workload's replay benefit.
+    device_inputs: enum { direct, assigned } = .direct,
     resident_capacity: usize = 0,
     resident_initial: bool = false,
     precision: @import("precision.zig").Policy = .f32,
@@ -68,12 +113,13 @@ pub fn inputShape(input: tensor.Tensor) !ml.graph.Shape {
 pub fn specializationKey(forward: Forward, inputs: []const Input) ![32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(std.mem.asBytes(&forward.fingerprint));
+    hash.update(&.{ @intFromEnum(forward.optimization), @intFromEnum(forward.device_inputs) });
     hash.update(std.mem.asBytes(&forward.resident_capacity));
     hash.update(&.{@intFromBool(forward.resident_initial)});
     hash.update(&.{@backingInt(forward.precision)});
     hash.update(&.{@backingInt(forward.residual_storage)});
     for (inputs) |input| {
-        const shape = try inputShape(input.tensor);
+        const shape = try input.shape();
         const name_len = input.tensor.name.len;
         hash.update(std.mem.asBytes(&name_len));
         hash.update(input.tensor.name);
@@ -85,7 +131,7 @@ pub fn specializationKey(forward: Forward, inputs: []const Input) ![32]u8 {
 }
 
 pub fn trace(allocator: std.mem.Allocator, forward: Forward, inputs: []const Input, weights: tracing.WeightShapeResolver) !program.ModelProgram {
-    for (inputs) |input| _ = try inputShape(input.tensor);
+    for (inputs) |input| _ = try input.shape();
     if (forward.validate) |validate| try validate(forward.context, inputs);
     if (forward.author) |author| return author(forward.context, allocator, inputs);
     var tracer = tracing.TracingCompute.initWithWeightResolver(allocator, weights);
@@ -97,8 +143,11 @@ pub fn trace(allocator: std.mem.Allocator, forward: Forward, inputs: []const Inp
     var bindings: std.ArrayList(program.Binding) = .empty;
     defer bindings.deinit(allocator);
     for (inputs) |input| {
-        const shape = try inputShape(input.tensor);
-        const node = try tracer.bindRuntimeInput(input.tensor.name, shape, input.tensor.data);
+        const shape = try input.shape();
+        const node = if (input.resident != null)
+            try tracer.bindRuntimeInputShape(input.tensor.name, shape)
+        else
+            try tracer.bindRuntimeInput(input.tensor.name, shape, input.tensor.data);
         try bindings.append(allocator, .{ .name = input.tensor.name, .node_id = node, .kind = if (input.state) .state_input else .input });
     }
     const backend = tracer.backend();
@@ -128,7 +177,7 @@ pub fn trace(allocator: std.mem.Allocator, forward: Forward, inputs: []const Inp
         };
         if (!external) try bindings.append(allocator, .{ .name = graph.parameterName(graph.node(node)), .node_id = node, .kind = .weight });
     }
-    return program.ModelProgram.init(allocator, graph, bindings.items);
+    return program.ModelProgram.initWithPipeline(allocator, graph, bindings.items, if (forward.optimization == .authored_schedule) ml.graph.passes.pipeline.Pipeline.cleanup else ml.graph.passes.pipeline.Pipeline.default);
 }
 
 const TestForward = struct {

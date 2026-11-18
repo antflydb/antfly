@@ -440,6 +440,8 @@ pub const AttentionAttrs = struct {
     batch: u32,
     seq_len: u32,
     kv_seq_len: u32 = 0,
+    /// K/V are complete explicit operands, independent of request cache state.
+    functional_kv: bool = false,
     num_heads: u32,
     num_kv_heads: u32 = 0,
     head_dim: u32,
@@ -881,7 +883,9 @@ pub const OpCode = union(enum) {
     fused_concat: ConcatFusedAttrs,
     fused_elem_add: void,
     fused_elem_multiply: void,
-    fused_add_mul_scalar: void,
+    /// False: (a + b) * scalar. True: a * scalar + b. These are distinct
+    /// arithmetic contracts even when a backend supplies a fused launcher.
+    fused_add_mul_scalar: struct { scale_before_add: bool = false },
     fused_boundary_training_attention_v1: BoundaryTrainingAttentionAttrs,
     fused_boundary_training_attention_backward_v1: BoundaryTrainingAttentionAttrs,
     fused_sdpa: AttentionAttrs,

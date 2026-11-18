@@ -528,12 +528,14 @@ pub fn compilePartitionWithOptions(
                 node_map[nid] = try b.multiply(x, y);
             },
 
-            .fused_add_mul_scalar => {
+            .fused_add_mul_scalar => |attrs| {
                 const x = try getHloId(node_map, ins[0]);
                 const y = try getHloId(node_map, ins[1]);
                 const scalar = try getHloId(node_map, ins[2]);
-                const sum = try b.add(x, y);
-                node_map[nid] = try b.multiply(sum, scalar);
+                node_map[nid] = if (attrs.scale_before_add)
+                    try b.add(try b.multiply(x, scalar), y)
+                else
+                    try b.multiply(try b.add(x, y), scalar);
             },
 
             .fused_embedding_lookup => {

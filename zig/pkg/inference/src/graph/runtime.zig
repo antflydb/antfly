@@ -586,6 +586,27 @@ pub const Runtime = struct {
                     planned_options.runtime_inputs = merged;
                     planned_options.host_inputs = null;
                 }
+                if (frame) |active| if (active.pool.device_input_plans.len != 0) {
+                    const existing = planned_options.runtime_inputs orelse return error.MissingProgramInput;
+                    const bound = try active.bindDeviceInputs(existing);
+                    // Replace only private invocation metadata. Caller inputs
+                    // and retained immutable bindings are never overwritten.
+                    const merged = if (allocated_inputs) |owned| owned else if (existing.len <= input_storage.len) input_storage[0..existing.len] else blk: {
+                        allocated_inputs = try allocator.alloc(interpreter.RuntimeInput, existing.len);
+                        break :blk allocated_inputs.?;
+                    };
+                    if (merged.ptr != existing.ptr) @memcpy(merged, existing);
+                    for (bound) |input| {
+                        var found = false;
+                        for (merged) |*current| if (current.node_id == input.node_id) {
+                            current.* = input;
+                            found = true;
+                            break;
+                        };
+                        if (!found) return error.MissingProgramInput;
+                    }
+                    planned_options.runtime_inputs = merged;
+                };
                 const replay_inputs = if (frame) |active| try active.bindReplayInputs(&planned_options) else null;
                 defer if (replay_inputs != null) frame.?.releaseReplayInputs();
                 if (replay_inputs) |inputs| planned_options.runtime_inputs = inputs;

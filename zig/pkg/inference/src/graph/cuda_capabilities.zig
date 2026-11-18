@@ -55,6 +55,13 @@ pub fn supports(op: ml.graph.OpCode) bool {
         .fused_log_softmax,
         .fused_linear,
         .fused_linear_no_bias,
+        .fused_linear_no_bias_pair,
+        .fused_to_float32,
+        .fused_rope,
+        .fused_gqa_causal_attention,
+        .fused_elem_add,
+        .fused_elem_multiply,
+        .fused_add_mul_scalar,
         .fused_gelu,
         .fused_gelu_exact,
         .fused_relu,
@@ -133,10 +140,11 @@ pub fn decide(query: partition.CapabilityQuery) partition.CapabilityDecision {
         .neg, .sqrt, .rsqrt, .exp, .log, .sin, .cos, .tanh, .erf, .abs, .fused_gelu, .fused_gelu_exact, .fused_relu, .fused_silu => {
             if (node.num_inputs != 1 or !sameShape(node.output_shape, query.graph.node(node.inputs[0]).output_shape)) return reject(.unsupported_op);
         },
-        .add, .sub, .mul, .div => {
+        .add, .sub, .mul, .div, .fused_elem_add, .fused_elem_multiply => {
             if (node.num_inputs != 2) return reject(.unsupported_op);
             const lhs = query.graph.node(node.inputs[0]).output_shape;
             const rhs = query.graph.node(node.inputs[1]).output_shape;
+            if ((query.op == .fused_elem_add or query.op == .fused_elem_multiply) and !sameShape(lhs, rhs) and lhs.numElements() != 1 and rhs.numElements() != 1) return reject(.unsupported_op);
             const rank = @max(lhs.rank(), rhs.rank());
             if (node.output_shape.rank() != rank) return reject(.unsupported_op);
             for (0..rank) |axis| {
@@ -190,6 +198,29 @@ pub fn decide(query: partition.CapabilityQuery) partition.CapabilityDecision {
             if (node.output_shape.rank() != 2 or node.output_shape.dim(0) != attrs.rows or node.output_shape.dim(1) != attrs.out_dim) return reject(.unsupported_op);
             if (lhs.numElements().? != @as(u64, attrs.rows) * attrs.in_dim or rhs.rank() != 2 or rhs.dim(0) != attrs.out_dim or rhs.dim(1) != attrs.in_dim) return reject(.unsupported_op);
             if (node.num_inputs == 3 and query.graph.node(node.inputs[2]).output_shape.numElements().? != attrs.out_dim) return reject(.unsupported_op);
+        },
+        .fused_linear_no_bias_pair => |attrs| {
+            if (node.num_inputs != 3 or attrs.num_projections != 0 or attrs.rows == 0 or attrs.in_dim == 0 or attrs.out_dim == 0 or
+                node.output_shape.rank() != 2 or node.output_shape.dim(0) != attrs.rows or node.output_shape.dim(1) != attrs.out_dim or
+                query.graph.node(node.inputs[0]).output_shape.numElements().? != @as(u64, attrs.rows) * attrs.in_dim) return reject(.unsupported_op);
+            for (node.getInputs()[1..]) |id| {
+                const shape = query.graph.node(id).output_shape;
+                if (shape.rank() != 2 or shape.dim(0) != attrs.out_dim or shape.dim(1) != attrs.in_dim) return reject(.unsupported_op);
+            }
+        },
+        .fused_to_float32 => {
+            if (node.num_inputs != 1 or query.graph.node(node.inputs[0]).op != .fused_linear_no_bias_pair or !sameShape(node.output_shape, query.graph.node(node.inputs[0]).output_shape)) return reject(.unsupported_op);
+        },
+        .fused_add_mul_scalar => {
+            if (node.num_inputs != 3 or !sameShape(node.output_shape, query.graph.node(node.inputs[0]).output_shape) or
+                !sameShape(node.output_shape, query.graph.node(node.inputs[1]).output_shape) or query.graph.node(node.inputs[2]).output_shape.numElements() != 1) return reject(.unsupported_op);
+        },
+        .fused_rope => {
+            if (@import("../ops/kernel_descriptor.zig").lower(query.graph, query.node_id) == null) return reject(.unsupported_op);
+        },
+        .fused_gqa_causal_attention => {
+            const descriptor = @import("../ops/kernel_descriptor.zig").lower(query.graph, query.node_id) orelse return reject(.unsupported_op);
+            if (descriptor.operation.dense_attention_rows.head_dim > 512) return reject(.unsupported_op);
         },
         .reduce_sum, .reduce_max, .reduce_mean => {
             const descriptor = @import("../ops/kernel_descriptor.zig").lower(query.graph, query.node_id) orelse return reject(.unsupported_op);
@@ -340,4 +371,26 @@ test "CUDA graph legality admits exact transposed LHS matrix layouts without adm
         graph.nodeMut(rhs).output_shape.dtype = .bf16;
         try std.testing.expect(!decide(query).can_execute);
     }
+}
+
+test "CUDA graph legality keeps functional grouped prefixes and scalar residuals resident" {
+    const a = std.testing.allocator;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const q = try builder.parameter("q", ml.graph.Shape.init(.f32, &.{ 1, 8 }));
+    const k = try builder.parameter("k", ml.graph.Shape.init(.f32, &.{ 3, 4 }));
+    const v = try builder.parameter("v", ml.graph.Shape.init(.f32, &.{ 3, 4 }));
+    const attention = try graph.addNode(.{ .op = .{ .fused_gqa_causal_attention = .{ .batch = 1, .seq_len = 1, .kv_seq_len = 3, .functional_kv = true, .num_heads = 2, .num_kv_heads = 1, .head_dim = 4 } }, .output_shape = graph.node(q).output_shape, .inputs = .{ q, k, v, ml.graph.null_node }, .num_inputs = 3 });
+    var query = partition.CapabilityQuery{ .graph = &graph, .node_id = attention, .op = graph.node(attention).op };
+    try std.testing.expect(decide(query).can_execute);
+    graph.nodeMut(attention).op.fused_gqa_causal_attention.functional_kv = false;
+    query.op = graph.node(attention).op;
+    try std.testing.expect(!decide(query).can_execute);
+    const scalar = try builder.parameter("scale", ml.graph.Shape.init(.f32, &.{1}));
+    const residual = try graph.addNode(.{ .op = .{ .fused_add_mul_scalar = .{} }, .output_shape = graph.node(q).output_shape, .inputs = .{ q, q, scalar, ml.graph.null_node }, .num_inputs = 3 });
+    query = .{ .graph = &graph, .node_id = residual, .op = graph.node(residual).op };
+    try std.testing.expect(decide(query).can_execute);
+    graph.nodeMut(scalar).output_shape = ml.graph.Shape.init(.f32, &.{8});
+    try std.testing.expect(!decide(query).can_execute);
 }

@@ -434,11 +434,16 @@ fn executeCommandNode(
             const rhs = valueFor(values, inputs[1]) orelse return error.MissingValue;
             break :blk try cb.multiply(lhs, rhs);
         },
-        .fused_add_mul_scalar => blk: {
+        .fused_add_mul_scalar => |attrs| blk: {
             const lhs = valueFor(values, inputs[0]) orelse return error.MissingValue;
             const rhs = valueFor(values, inputs[1]) orelse return error.MissingValue;
             const scalar = valueFor(values, inputs[2]) orelse return error.MissingValue;
-            if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| break :blk fused;
+            if (attrs.scale_before_add) {
+                if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| break :blk fused;
+                const scaled = try cb.multiply(lhs, scalar);
+                defer cb.free(scaled);
+                break :blk try cb.add(scaled, rhs);
+            }
             const sum = try cb.add(lhs, rhs);
             errdefer cb.free(sum);
             const scaled = try cb.multiply(sum, scalar);

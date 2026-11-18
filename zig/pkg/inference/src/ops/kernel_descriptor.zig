@@ -195,13 +195,20 @@ pub const DenseAttentionRows = struct {
     key_rows: u32,
     num_heads: u32,
     head_dim: u32,
+    /// Zero retains the authored equal-head contract. Explicit KV heads name
+    /// a functional grouped-query program with an exact static key extent.
+    num_kv_heads: u32 = 0,
+    sliding_window: u32 = 0,
     pub fn valid(self: @This(), descriptor: *const Descriptor) bool {
         if (self.query_rows == 0 or self.key_rows == 0 or self.num_heads == 0 or self.head_dim == 0 or descriptor.input_count != 3) return false;
-        if (self.kind == .causal and self.query_rows != self.key_rows) return false;
+        if (self.num_kv_heads == 0) {
+            if (self.sliding_window != 0 or (self.kind == .causal and self.query_rows != self.key_rows)) return false;
+        } else if (self.kind != .causal or self.num_heads % self.num_kv_heads != 0 or self.query_rows > self.key_rows) return false;
         const width = std.math.mul(i64, self.num_heads, self.head_dim) catch return false;
         if (descriptor.output_shape.dtype != .f32 or descriptor.output_shape.rank() != 2 or descriptor.output_shape.dims[0] != self.query_rows or descriptor.output_shape.dims[1] != width) return false;
+        const key_width = std.math.mul(i64, if (self.num_kv_heads == 0) self.num_heads else self.num_kv_heads, self.head_dim) catch return false;
         for (descriptor.input_shapes[0..3], 0..) |shape, i| {
-            if (shape.dtype != .f32 or shape.rank() != 2 or shape.dims[0] != (if (i == 0) self.query_rows else self.key_rows) or shape.dims[1] != width) return false;
+            if (shape.dtype != .f32 or shape.rank() != 2 or shape.dims[0] != (if (i == 0) self.query_rows else self.key_rows) or shape.dims[1] != (if (i == 0) width else key_width)) return false;
             const count = shape.numElements() orelse return false;
             _ = std.math.mul(usize, std.math.cast(usize, count) orelse return false, 4) catch return false;
         }
@@ -209,7 +216,7 @@ pub const DenseAttentionRows = struct {
     }
 };
 
-pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, linear: Linear, norm: Norm, softmax: Softmax, rope: Rope, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather, paged_attention: PagedAttention, dense_attention_prefix: DenseAttentionPrefix, dense_attention_rows: DenseAttentionRows };
+pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, add_mul_scalar: struct { scale_before_add: bool = false }, linear: Linear, norm: Norm, softmax: Softmax, rope: Rope, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather, paged_attention: PagedAttention, dense_attention_prefix: DenseAttentionPrefix, dense_attention_rows: DenseAttentionRows };
 
 /// Value-only semantics for original independent, fused-pair, and grouped QKV
 /// projection heads. It never owns a CT, prepared slot, or execution policy.
@@ -313,6 +320,23 @@ pub fn groupedProjectionHeadWithSelection(graph: *const ml.graph.Graph, linear_i
     return result;
 }
 
+/// Original paired producer with both output identities, including embedded
+/// decoder stages. This is a structural description, never permission to split
+/// its tuned joint schedule into two independent projections.
+pub fn pairedProjection(graph: *const ml.graph.Graph, first: ml.graph.NodeId, second_id: ml.graph.NodeId) ?ProjectionHead {
+    if (first >= graph.nodeCount() or second_id >= graph.nodeCount()) return null;
+    const pair = graph.node(first);
+    const second = graph.node(second_id);
+    if (pair.op != .fused_linear_no_bias_pair or pair.getInputs().len != 3 or second.op != .fused_to_float32 or second.getInputs().len != 1 or second.inputs[0] != first) return null;
+    const attrs = pair.op.fused_linear_no_bias_pair;
+    var head = ProjectionHead{ .form = .pair, .count = 2, .input = pair.inputs[0], .entry = first };
+    if (!head.source(graph, 0, pair.inputs[1], first, attrs.rows, attrs.in_dim, attrs.out_dim, true) or
+        !head.source(graph, 1, pair.inputs[2], second_id, attrs.rows, attrs.in_dim, attrs.out_dim, true) or !head.append(first) or !head.append(second_id)) return null;
+    for (head.linears[0..2]) |linear| if (linear.output_shape.dtype != .f32 or linear.input_shapes[0].dtype != .f32 or linear.input_shapes[1].dtype != .f32) return null;
+    if (head.weights[0] == head.weights[1]) return null;
+    return head;
+}
+
 /// Complete parameter-fed projection head only. Mixed graphs keep their
 /// original executor and schedule; no reachability/placement is guessed here.
 pub fn projectionHead(graph: *const ml.graph.Graph) ?ProjectionHead {
@@ -320,16 +344,7 @@ pub fn projectionHead(graph: *const ml.graph.Graph) ?ProjectionHead {
     if (outputs.len != 2 and outputs.len != 3) return null;
     var result: ?ProjectionHead = null;
     if (outputs.len == 2) {
-        const pair_id = outputs[0];
-        const pair = graph.node(pair_id);
-        const second = graph.node(outputs[1]);
-        if (pair.op == .fused_linear_no_bias_pair and pair.getInputs().len == 3 and second.op == .fused_to_float32 and second.getInputs().len == 1 and second.inputs[0] == pair_id) {
-            const attrs = pair.op.fused_linear_no_bias_pair;
-            var head = ProjectionHead{ .form = .pair, .count = 2, .input = pair.inputs[0], .entry = pair_id };
-            if (!head.source(graph, 0, pair.inputs[1], outputs[0], attrs.rows, attrs.in_dim, attrs.out_dim, true) or
-                !head.source(graph, 1, pair.inputs[2], outputs[1], attrs.rows, attrs.in_dim, attrs.out_dim, true) or !head.append(pair_id) or !head.append(outputs[1])) return null;
-            result = head;
-        }
+        result = pairedProjection(graph, outputs[0], outputs[1]);
     } else {
         const first = graph.node(outputs[0]);
         if (first.op == .slice and first.getInputs().len == 1) {
@@ -509,6 +524,7 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
         .sub => .{ .binary = .subtract },
         .mul, .fused_elem_multiply => .{ .binary = .multiply },
         .div => .{ .binary = .divide },
+        .fused_add_mul_scalar => |attrs| .{ .add_mul_scalar = .{ .scale_before_add = attrs.scale_before_add } },
         .fused_linear, .fused_linear_no_bias => |attrs| blk: {
             if (attrs.rows == 0 or attrs.in_dim == 0 or attrs.out_dim == 0 or (node.op == .fused_linear and attrs.num_projections != 0) or shape.rank() != 2 or shape.dim(0) != attrs.rows or shape.dim(1) != attrs.out_dim) return null;
             kernel_geometry.validateProjectionGroups(&attrs.projection_out_dims, attrs.num_projections, attrs.out_dim) catch return null;
@@ -537,6 +553,10 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
                 else => .mean,
             }, .geometry = geometry } };
         },
+        .fused_gqa_causal_attention => |attrs| blk: {
+            if (!attrs.functional_kv or attrs.batch != 1 or node.num_inputs != 3) return null;
+            break :blk .{ .dense_attention_rows = .{ .kind = .causal, .query_rows = attrs.seq_len, .key_rows = if (attrs.kv_seq_len == 0) attrs.seq_len else attrs.kv_seq_len, .num_heads = attrs.num_heads, .num_kv_heads = attrs.num_kv_heads, .head_dim = attrs.head_dim, .sliding_window = attrs.sliding_window orelse 0 } };
+        },
         .fused_rope => |attrs| .{ .rope = Rope.init(shape.dims[0..shape.rank()], @intCast(count), attrs.seq_len, attrs.head_dim, if (attrs.rope_dim == 0) attrs.head_dim else attrs.rope_dim, attrs.theta, attrs.freq_scale, attrs.position_offset, attrs.consecutive_pairs) catch return null },
         .fused_layer_norm, .fused_rms_norm => |attrs| blk: {
             if (shape.rank() == 0 or attrs.dim == 0 or attrs.dim != shape.dim(shape.rank() - 1)) return null;
@@ -549,7 +569,7 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
         else => .{ .unary = unary(node.op) orelse return null },
     };
     const inputs: u8 = switch (operation) {
-        .paged_attention, .dense_attention_prefix, .dense_attention_rows => 3,
+        .paged_attention, .dense_attention_prefix, .dense_attention_rows, .add_mul_scalar => 3,
         .unary => 1,
         .binary, .dot, .concat, .gather => 2,
         .softmax, .rope, .reduction, .transpose, .broadcast, .slice => 1,
@@ -572,6 +592,8 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
         if ((operation == .unary or operation == .softmax or operation == .rope) and input_count != count) return null;
         result.input_shapes[index] = input_shape;
     }
+    if (operation == .add_mul_scalar and (result.input_count != 3 or !shape.eq(result.input_shapes[0]) or !shape.eq(result.input_shapes[1]) or result.input_shapes[2].numElements() != 1)) return null;
+    if (operation == .dense_attention_rows and !operation.dense_attention_rows.valid(&result)) return null;
     if (operation == .linear) {
         const linear = operation.linear;
         if (result.input_shapes[0].numElements().? != @as(u64, linear.rows) * linear.in_dim or result.input_shapes[1].numElements().? != @as(u64, linear.out_dim) * linear.in_dim or (linear.bias and result.input_shapes[2].numElements().? != linear.out_dim)) return null;
@@ -736,4 +758,30 @@ test "dense prefix cold legality rejects F32 byte extents overflowing address sp
         .output_shape = ml.graph.Shape.init(.f32, &.{ 1, width }),
     };
     try std.testing.expect(!descriptor.operation.dense_attention_prefix.valid(&descriptor));
+}
+
+test "functional grouped attention descriptor preserves query offsets KV widths and windows" {
+    const a = std.testing.allocator;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const query = try builder.parameter("q", ml.graph.Shape.init(.f32, &.{ 1, 8 }));
+    const key = try builder.parameter("k", ml.graph.Shape.init(.f32, &.{ 3, 4 }));
+    const value = try builder.parameter("v", ml.graph.Shape.init(.f32, &.{ 3, 4 }));
+    const attention = try graph.addNode(.{ .op = .{ .fused_gqa_causal_attention = .{ .batch = 1, .seq_len = 1, .kv_seq_len = 3, .functional_kv = true, .num_heads = 2, .num_kv_heads = 1, .head_dim = 4, .sliding_window = 2 } }, .output_shape = ml.graph.Shape.init(.f32, &.{ 1, 8 }), .inputs = .{ query, key, value, ml.graph.null_node }, .num_inputs = 3 });
+    const descriptor = lower(&graph, attention) orelse return error.MissingPreparedKernelRoute;
+    // A request-backed operation must never acquire this functional route.
+    graph.nodeMut(attention).op.fused_gqa_causal_attention.functional_kv = false;
+    try std.testing.expect(lower(&graph, attention) == null);
+    graph.nodeMut(attention).op.fused_gqa_causal_attention.functional_kv = true;
+    try std.testing.expectEqual(@as(u32, 1), descriptor.operation.dense_attention_rows.query_rows);
+    try std.testing.expectEqual(@as(u32, 3), descriptor.operation.dense_attention_rows.key_rows);
+    try std.testing.expectEqual(@as(u32, 1), descriptor.operation.dense_attention_rows.num_kv_heads);
+    try std.testing.expectEqual(@as(u32, 2), descriptor.operation.dense_attention_rows.sliding_window);
+    var malformed = descriptor;
+    malformed.input_shapes[1] = ml.graph.Shape.init(.f32, &.{ 3, 8 });
+    try std.testing.expect(!malformed.operation.dense_attention_rows.valid(&malformed));
+    malformed = descriptor;
+    malformed.operation.dense_attention_rows.num_kv_heads = 3;
+    try std.testing.expect(!malformed.operation.dense_attention_rows.valid(&malformed));
 }

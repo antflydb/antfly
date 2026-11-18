@@ -2586,6 +2586,9 @@ pub const KernelModule = struct {
     attention_match_repeat: bool = false,
     attention_match_repeat_launches: usize = 0,
     gqa_prefill_profile: GqaPrefillProfile = .automatic,
+    /// Admitted by a model adapter; all physical/storage/target checks remain
+    /// in the shared Flash selector, including explicit rollback profiles.
+    grouped_f16_flash_prefill: bool = false,
     // Resolved once at module load: the score-prework decision runs per layer
     // per decoded token and getenv is a linear scan of environ.
     gqa_score_prework_mode: GeneratedGqaScorePreworkMode = .automatic,
@@ -3899,6 +3902,7 @@ pub const KernelModule = struct {
             self.attention_match_repeat = false;
             self.attention_match_repeat_launches = 0;
             self.gqa_prefill_profile = .automatic;
+            self.grouped_f16_flash_prefill = false;
             self.qwen3vl_automatic_prefill = false;
             self.lighton_automatic_prefill = false;
             self.gqa_score_prework_mode = .automatic;
@@ -9596,7 +9600,7 @@ pub const KernelModule = struct {
         const flash_prefill_launch = selectGqaFlashPrefillLaunch(
             self.gqa_prefill_profile,
             flash_prefill_eligibility,
-            flash_prefill_function != null and (r.num_kv_heads != 2 or self.gqa_prefill_profile != .automatic),
+            flash_prefill_function != null and (r.num_kv_heads != 2 or self.gqa_prefill_profile != .automatic or self.grouped_f16_flash_prefill),
         );
         const f16_prefill_launch = selectGqaF16PrefillLaunch(
             self.gqa_prefill_profile,

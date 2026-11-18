@@ -63,7 +63,7 @@ pub const Selection = struct {
             if (!slot.roles.runtime_input and slot.kind != .runtime_input) return error.InvalidKernelInputBinding;
             switch (input.value) {
                 .tensor, .planned => return error.InvalidRuntimeKernelFact,
-                .resident, .imported_host, .unknown => {},
+                .resident, .imported_host, .imported_device, .unknown => {},
             }
         }
         const inputs = try facts.ImmutableBindings.createSource(allocator, runtime);
@@ -214,7 +214,7 @@ pub const Selection = struct {
     const RetainedInput = struct { value: route.Binding, witnessed: bool };
     fn retainedInput(self: *const Selection, pool: *const physical.Pool, node: NodeId) RetainedInput {
         if (self.inputs.find(node)) |value| return .{ .value = value, .witnessed = switch (value) {
-            .resident, .imported_host => true,
+            .resident, .imported_host, .imported_device => true,
             else => false,
         } };
         if (pool.immutable_bindings) |immutable| if (immutable.find(node)) |value| return .{ .value = value, .witnessed = false };
@@ -389,6 +389,10 @@ pub const Selection = struct {
                 const host = binding_value.imported_host;
                 if (host.target != backend.kind() or !host.logical.eq(source_slot.desc.shape)) break :imported null;
                 break :imported try densePlane(host.logical, backend, .primary, self.epoch);
+            } else if (binding_value == .imported_device) imported: {
+                const device = binding_value.imported_device;
+                if (backend.kind() != .cuda or device.implementation.context != backend.ptr or device.implementation.table != @as(*const anyopaque, @ptrCast(backend.vtable)) or !device.logical.eq(source_slot.desc.shape) or device.logical.dtype != .f32) break :imported null;
+                break :imported try densePlane(device.logical, backend, .primary, self.epoch);
             } else try @import("dense_alias.zig").primary(binding_value, backend, source_slot.desc.shape);
             const primary = candidate orelse continue;
             const alias = @import("dense_alias.zig").reshapePlane(primary, source_slot.desc.shape, output_slot.desc.shape, backend.kind(), source) orelse continue;
@@ -410,6 +414,7 @@ pub const Selection = struct {
         return switch (a) {
             .unknown => true,
             .imported_host => |value| std.meta.eql(value, b.imported_host),
+            .imported_device => |value| std.meta.eql(value, b.imported_device),
             .tensor => |value| value.value == b.tensor.value and std.meta.eql(value.implementation, b.tensor.implementation),
             .planned => |value| std.meta.eql(value.logical, b.planned.logical) and equalPlanes(value.planes, b.planned.planes),
             .resident => |value| std.meta.eql(value.logical, b.resident.logical) and std.meta.eql(value.implementation, b.resident.implementation) and equalPlanes(value.planes, b.resident.planes),

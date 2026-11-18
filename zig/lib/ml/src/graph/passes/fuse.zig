@@ -540,7 +540,7 @@ fn fuseAddMulScalar(allocator: std.mem.Allocator, work: *Graph, reachable: []con
             continue;
 
         const fused_id = try work.addNode(.{
-            .op = .{ .fused_add_mul_scalar = {} },
+            .op = .{ .fused_add_mul_scalar = .{} },
             .output_shape = n.output_shape,
             .inputs = .{ matched.add_lhs, matched.add_rhs, matched.scalar, null_node },
             .num_inputs = 3,
@@ -3685,7 +3685,7 @@ test "fuse detects add multiplied by scalar" {
     try std.testing.expectEqual(@as(u32, 1), result.num_rewrites);
     const out_id = result.graph.outputs.items[0];
     try std.testing.expectEqual(@as(usize, 3), result.graph.node(out_id).num_inputs);
-    try std.testing.expectEqualDeep(OpCode{ .fused_add_mul_scalar = {} }, result.graph.node(out_id).op);
+    try std.testing.expectEqualDeep(OpCode{ .fused_add_mul_scalar = .{} }, result.graph.node(out_id).op);
 }
 
 test "fuse skips add multiplied by non-scalar tensor" {

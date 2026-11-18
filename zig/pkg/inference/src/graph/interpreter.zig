@@ -2853,8 +2853,13 @@ pub fn executeNode(
             });
         },
 
-        .fused_add_mul_scalar => {
-            if (try cb.addMultiplyScalarTensor(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]))) |fused| return fused;
+        .fused_add_mul_scalar => |attrs| {
+            if (attrs.scale_before_add) {
+                if (try cb.addMultiplyScalarTensor(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]))) |fused| return fused;
+                const scaled = try cb.multiply(V.get(ins[0]), V.get(ins[2]));
+                defer cb.free(scaled);
+                return cb.add(scaled, V.get(ins[1]));
+            }
             const sum = try cb.add(V.get(ins[0]), V.get(ins[1]));
             errdefer cb.free(sum);
             const scaled = try cb.multiply(sum, V.get(ins[2]));
@@ -2969,8 +2974,10 @@ pub fn executeNode(
         .fused_gqa_causal_attention => |attrs| {
             // If an attention context is provided, route through
             // gqaPagedAttention with auto-incremented layer_index.
-            if (state.options.attention != null or (attrs.sliding_window orelse 0) != 0) {
-                var attn = state.options.attention orelse contracts.AttentionContext{ .total_sequence_len = attrs.seq_len, .query_sequence_len = attrs.seq_len, .kv_sequence_len = if (attrs.kv_seq_len != 0) attrs.kv_seq_len else attrs.seq_len };
+            const key_rows = if (attrs.kv_seq_len == 0) attrs.seq_len else attrs.kv_seq_len;
+            const request_attention = if (attrs.functional_kv) null else state.options.attention;
+            if (request_attention != null or (attrs.sliding_window orelse 0) != 0 or key_rows != attrs.seq_len) {
+                var attn = request_attention orelse contracts.AttentionContext{ .total_sequence_len = key_rows, .query_sequence_len = attrs.seq_len, .kv_sequence_len = key_rows };
                 attn.layer_index = if (attrs.layer_index == std.math.maxInt(u32))
                     state.attention_layer
                 else
@@ -8903,4 +8910,40 @@ fn checkPrunedRuntimeBindings(allocator: std.mem.Allocator) !void {
 test "runtime input remapping prunes removed bindings and preserves owners atomically" {
     try checkPrunedRuntimeBindings(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPrunedRuntimeBindings, .{});
+}
+
+test "scalar affine graph forms preserve scaled branch versus scaled sum" {
+    const a = std.testing.allocator;
+    const ml_graph = @import("ml").graph;
+    var graph = ml_graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml_graph.Builder.init(&graph);
+    const lhs = try builder.parameter("lhs", Shape.init(.f32, &.{4}));
+    const rhs = try builder.parameter("rhs", Shape.init(.f32, &.{4}));
+    const scalar = try builder.parameter("scale", Shape.init(.f32, &.{1}));
+    try graph.markOutput(try builder.addMulScalar(lhs, rhs, scalar));
+    try graph.markOutput(try builder.scaledAdd(lhs, rhs, scalar));
+    for ([_]@import("../backends/backends.zig").BackendType{ .native, .metal }) |kind| {
+        if (kind == .metal) {
+            if (comptime !@import("build_options").enable_metal) continue;
+            if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) continue;
+        }
+        var context = try @import("../backends/compute_context.zig").BackendContext.init(a, kind, null);
+        defer context.deinit(a);
+        const cb = context.computeBackend();
+        const x = try cb.fromFloat32Shape(&.{ 1, -2, 3.5, 0.25 }, &.{4});
+        defer cb.free(x);
+        const y = try cb.fromFloat32Shape(&.{ 0.5, 4, -1.5, 1.75 }, &.{4});
+        defer cb.free(y);
+        const scale = try cb.fromFloat32Shape(&.{0.25}, &.{1});
+        defer cb.free(scale);
+        const inputs = [_]RuntimeInput{ .{ .node_id = lhs, .value = x }, .{ .node_id = rhs, .value = y }, .{ .node_id = scalar, .value = scale } };
+        var result = try execute(a, &graph, &cb, .{ .runtime_inputs = &inputs });
+        defer result.deinit(&cb);
+        for (result.outputs, [_][4]f32{ .{ 0.375, 0.5, 0.5, 0.5 }, .{ 0.75, 3.5, -0.625, 1.8125 } }) |value, expected| {
+            const actual = try cb.toFloat32(value, a);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(f32, &expected, actual);
+        }
+    }
 }

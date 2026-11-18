@@ -150,13 +150,13 @@ pub const ImmutableBindings = struct {
                 @memcpy(planes, input.planes);
                 break :copied .{ .resident = .{ .logical = input.logical, .planes = planes, .implementation = input.implementation } };
             },
-            .imported_host, .unknown => value,
+            .imported_host, .imported_device, .unknown => value,
         };
     }
     fn releaseBindingWithCleanup(value: *route.Binding, cleanup: @import("cleanup_context.zig").Context) void {
         switch (value.*) {
             .tensor => |input| backend(input.implementation).freeWithCleanup(input.value, cleanup),
-            .planned, .resident, .imported_host, .unknown => {},
+            .planned, .resident, .imported_host, .imported_device, .unknown => {},
         }
         value.* = .unknown;
     }

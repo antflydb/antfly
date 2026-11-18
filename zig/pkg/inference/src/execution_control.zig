@@ -198,6 +198,16 @@ pub const InferenceExecutionControl = struct {
         return result;
     }
 
+    /// A graph replay has no per-node checkpoints. Runtime ownership metadata
+    /// and IO alone do not require them, but every observable request hook and
+    /// every supervision requirement must retain the ordinary checked path.
+    pub fn permitsCheckpointFreeReplay(self: InferenceExecutionControl) bool {
+        return self.native_call_policy == .in_process and
+            self.deadline_ns == null and self.cancellation == null and
+            self.progress == null and self.check_fn == null and
+            self.hard_cancellation == null;
+    }
+
     pub fn check(self: InferenceExecutionControl) !void {
         if (self.check_fn) |check_fn| try CheckBoundary.call("check_fn", self.check_dispatch, check_fn, .{self.ptr});
         if (self.cancellation) |token| {
@@ -1038,4 +1048,29 @@ test "uninterruptible admission preflight validates without arming a monitor" {
         try std.testing.expectEqual(@as(usize, 1), hooks.arms);
     }
     try std.testing.expectEqual(hooks.arms, hooks.disarms);
+}
+
+test "checkpoint free replay admits passive embedded controls and preserves request hooks" {
+    const Callback = struct {
+        fn cancelled(_: ?*anyopaque) bool {
+            return false;
+        }
+        fn check(_: ?*anyopaque) !void {}
+        fn update(_: ?*anyopaque, _: Progress) void {}
+    };
+    const passive = InferenceExecutionControl{ .native_call_policy = .in_process, .io = std.testing.io };
+    try std.testing.expect(passive.permitsCheckpointFreeReplay());
+    try std.testing.expect(!(InferenceExecutionControl{}).permitsCheckpointFreeReplay());
+    var controlled = passive;
+    controlled.deadline_ns = std.math.maxInt(u64);
+    try std.testing.expect(!controlled.permitsCheckpointFreeReplay());
+    controlled = passive;
+    controlled.cancellation = .{ .is_cancelled_fn = Callback.cancelled };
+    try std.testing.expect(!controlled.permitsCheckpointFreeReplay());
+    controlled = passive;
+    controlled.progress = .{ .update_fn = Callback.update };
+    try std.testing.expect(!controlled.permitsCheckpointFreeReplay());
+    controlled = passive;
+    controlled.check_fn = Callback.check;
+    try std.testing.expect(!controlled.permitsCheckpointFreeReplay());
 }

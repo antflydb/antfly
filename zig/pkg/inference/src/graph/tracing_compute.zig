@@ -179,6 +179,27 @@ pub const TracingCompute = struct {
         return node;
     }
 
+    /// Device-backed authored stages bind an explicit name rather than
+    /// manufacturing a host copy merely to identify a runtime parameter.
+    pub fn bindRuntimeInputShape(self: *TracingCompute, name: []const u8, shape: Shape) !NodeId {
+        for (self.runtime_inputs.items) |input| if (std.mem.eql(u8, self.graph.parameterName(self.graph.node(input.node)), name)) return error.DuplicateProgramInput;
+        try self.runtime_inputs.ensureUnusedCapacity(self.allocator, 1);
+        var builder = Builder.init(&self.graph);
+        const node = try builder.parameter(name, shape);
+        self.runtime_inputs.appendAssumeCapacity(.{ .bytes = &.{}, .shape = shape, .node = node });
+        return node;
+    }
+    pub fn namedRuntimeInput(cb: *const ops.ComputeBackend, name: []const u8, shape: Shape) !CT {
+        if (cb.kind() != .graph) return error.UnsupportedProgramTransport;
+        const self = fromCtx(cb.ptr);
+        for (self.runtime_inputs.items) |input| {
+            if (!std.mem.eql(u8, self.graph.parameterName(self.graph.node(input.node)), name)) continue;
+            if (!input.shape.eq(shape)) return error.InvalidInputShape;
+            return self.makeHandle(input.node);
+        }
+        return error.MissingProgramInput;
+    }
+
     fn runtimeInput(self: *TracingCompute, bytes: []const u8, dtype: DType, shape: Shape) !?NodeId {
         if (bytes.len == 0) return null;
         for (self.runtime_inputs.items) |input| {
@@ -926,7 +947,7 @@ pub const TracingCompute = struct {
         const id = switch (request) {
             .add => |op| try builder.elemAdd(nodeIdFromCT(op.lhs), nodeIdFromCT(op.rhs)),
             .scale => |op| try builder.elemMultiply(nodeIdFromCT(op.input), nodeIdFromCT(op.scalar)),
-            .add_scale => |op| try builder.addMulScalar(nodeIdFromCT(op.lhs), nodeIdFromCT(op.rhs), nodeIdFromCT(op.scalar)),
+            .add_scale => |op| try builder.scaledAdd(nodeIdFromCT(op.lhs), nodeIdFromCT(op.rhs), nodeIdFromCT(op.scalar)),
         };
         return if (tc.residual_storage == .f32) tc.makeHandleExact(id) else tc.makeHandle(id);
     }
@@ -948,7 +969,7 @@ pub const TracingCompute = struct {
     fn addMultiplyScalarTensorOp(ctx: *anyopaque, a: CT, b: CT, scalar: CT) anyerror!?CT {
         var tc = fromCtx(ctx);
         var bld = Builder.init(tc.getGraphMut());
-        const id = try bld.addMulScalar(nodeIdFromCT(a), nodeIdFromCT(b), nodeIdFromCT(scalar));
+        const id = try bld.scaledAdd(nodeIdFromCT(a), nodeIdFromCT(b), nodeIdFromCT(scalar));
         return tc.makeHandle(id);
     }
 
@@ -1201,6 +1222,7 @@ pub const TracingCompute = struct {
                 .batch = @intCast(batch),
                 .seq_len = @intCast(attention.query_sequence_len),
                 .kv_seq_len = @intCast(attention.kv_sequence_len),
+                .functional_kv = attention.mode == .dense_causal and attention.kv_cache == null,
                 .num_heads = @intCast(num_heads),
                 .num_kv_heads = @intCast(num_kv_heads),
                 .head_dim = @intCast(head_dim),
@@ -2168,7 +2190,7 @@ test "model program F32 residual preserves small BF16 branch updates" {
     const backend = compute.computeBackend();
     var result = try @import("interpreter.zig").execute(a, tracer.getGraph(), &backend, .{});
     defer result.deinit(&backend);
-    const expected = [_]f32{ 1, 1.015625, 2.03125, 2.033203125, 1.0009765625, 1.0009765625 };
+    const expected = [_]f32{ 1, 1.015625, 2.03125, 2.0322265625, 1.0009765625, 1.0009765625 };
     for (result.outputs, expected) |output, value| {
         const values = try backend.toFloat32(output, a);
         defer a.free(values);

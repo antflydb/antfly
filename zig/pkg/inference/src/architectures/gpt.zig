@@ -1390,7 +1390,20 @@ pub fn forwardLastLogitsLastRowTensorFromEmbeddingsWithLayer0Overrides(
     if (output == .last) std.log.info("cuda_multimodal_shared_kv_prefill rows={d} donor_layers={d}", .{
         seq_len, config.num_hidden_layers - config.num_kv_shared_layers,
     });
-    const hidden_result = try forwardFinalHiddenWithSharedKvOutput(
+    const captured = if (comptime build_options.enable_cuda) captured: {
+        if (output != .last or !layer0DecoderOverridesEmpty(overrides)) break :captured null;
+        try validateDecoderForwardCleanup(cb, overrides.cleanup, decode_context);
+        break :captured @import("../ops/cuda/cuda_compute.zig").CudaCompute.tryCapturedPrefill(cb, allocator, config, hidden_input, ple_vectors, decode_context.?) catch |err| {
+            cb.free(hidden_input);
+            return err;
+        };
+    } else null;
+    const hidden_result = if (captured) |value| blk: {
+        // This public GPT entry consumes its embedding, while the shared
+        // program borrows it just like the prepared decoder entry.
+        cb.free(hidden_input);
+        break :blk HiddenTensorResult{ .hidden = value, .total_rows = 1 };
+    } else try forwardFinalHiddenWithSharedKvOutput(
         cb,
         allocator,
         config,
@@ -2908,12 +2921,13 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0OverridesAndTrace(
     );
 }
 
-const SharedKvPrefillOutput = enum { all, last, kv_only };
+pub const SharedKvPrefillOutput = enum { all, last, kv_only };
 
 fn sharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
     const geometry = @import("../execution/gemma4_native_plan.zig").Geometry.resolve(config) orelse return null;
-    if (dc.attention_mode != .paged_prefill or dc.query_sequence_len <= 1 or
-        dc.query_sequence_len > dc.total_sequence_len or dc.kv_cache == null or
+    const functional = dc.attention_mode == .full_recompute and dc.forward_kv_reuse != null and dc.kv_cache == null;
+    if ((!functional and (dc.attention_mode != .paged_prefill or dc.kv_cache == null)) or dc.query_sequence_len <= 1 or
+        dc.query_sequence_len > dc.total_sequence_len or
         dc.kv_batch != null or dc.selection_query_capture != null or
         dc.mrope_positions != null or dc.qwen3vl_visual_mask != null or
         dc.qwen3vl_deepstack_embeddings != null) return null;
@@ -3093,7 +3107,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     return forwardFinalHiddenWithSharedKvOutput(cb, allocator, config, hidden_input, overrides, batch, seq_len, decode_context, ple_vectors, pre_norm_out, trace_sink, .all);
 }
 
-fn forwardFinalHiddenWithSharedKvOutput(
+pub fn forwardFinalHiddenWithSharedKvOutput(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     config: Config,

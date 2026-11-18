@@ -14306,7 +14306,7 @@ fn tryExecuteMetalCommand(
         .fused_tanh_act => try executeRuntimeFusedUnary(cb, values, inputs, .tanh_act),
         .fused_elem_add, .add => try executeRuntimeAdd(graph, cb, values, inputs, n.output_shape, output_hint),
         .fused_elem_multiply, .mul => try executeRuntimeBinary(graph, cb, values, node_id, inputs, n.output_shape, .multiply, output_hint),
-        .fused_add_mul_scalar => try executeRuntimeAddMulScalar(cb, values, inputs),
+        .fused_add_mul_scalar => |attrs| try executeRuntimeAddMulScalar(cb, values, inputs, attrs.scale_before_add),
         .sub => try executeRuntimeBinary(graph, cb, values, node_id, inputs, n.output_shape, .subtract, output_hint),
         .div => try executeRuntimeBinary(graph, cb, values, node_id, inputs, n.output_shape, .divide, output_hint),
         .less_than => try executeRuntimeBinary(graph, cb, values, node_id, inputs, n.output_shape, .less_than, null),
@@ -14908,11 +14908,17 @@ fn executeRuntimeAddMulScalar(
     cb: *const ComputeBackend,
     values: []?CT,
     inputs: []const NodeId,
+    scale_before_add: bool,
 ) !?CT {
     const lhs = valueFor(values, inputs[0]) orelse return null;
     const rhs = valueFor(values, inputs[1]) orelse return null;
     const scalar = valueFor(values, inputs[2]) orelse return null;
-    if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| return fused;
+    if (scale_before_add) {
+        if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| return fused;
+        const scaled = try cb.multiply(lhs, scalar);
+        defer cb.free(scaled);
+        return cb.add(scaled, rhs);
+    }
     const sum = try cb.add(lhs, rhs);
     errdefer cb.free(sum);
     const scaled = try cb.multiply(sum, scalar);

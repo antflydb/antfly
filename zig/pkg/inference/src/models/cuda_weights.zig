@@ -662,9 +662,19 @@ pub fn prepare(
     try cuda_compute.requireProfile(cuda_profile);
     if (cuda_profile == .gemma4 and host_weights_owner.architecture == .gpt) {
         cuda_compute.gemma4_native_plan = @import("../execution/gemma4_native_plan.zig").Plan.resolve(host_weights_owner.architecture.gpt);
-        if (cuda_compute.gemma4_native_plan) |plan| std.log.info("cuda_gemma4_native_plan projections={s} donor_layers={d}", .{
-            @tagName(plan.projection), plan.geometry.donor_layers,
-        });
+        if (cuda_compute.gemma4_native_plan) |*plan| {
+            cuda_compute.kernels.grouped_f16_flash_prefill = plan.flash_prefill;
+            // GB10 has controlled text/image/audio/video parity and timing.
+            // SM89 keeps explicit experimental admission until measured there;
+            // other targets retain their original attention schedule.
+            const qualified_warp = cuda_compute.ctx.info.compute_major == 12 and cuda_compute.ctx.info.compute_minor == 1;
+            const requested_sm89 = cuda_compute.ctx.info.compute_major == 8 and cuda_compute.ctx.info.compute_minor == 9 and platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_F16_WARP_DECODE");
+            plan.warp_decode = plan.warp_decode and (qualified_warp or requested_sm89);
+            if (plan.warp_decode) cuda_compute.kernels.e4b_f16_warp_split_enabled = true;
+            std.log.info("cuda_gemma4_native_plan projections={s} donor_layers={d} flash_prefill={} capture_prefill={}", .{
+                @tagName(plan.projection), plan.geometry.donor_layers, plan.flash_prefill, plan.capture_prefill,
+            });
+        }
     }
     if (cuda_profile == .transformer_seq2seq) {
         const precision = resolveSeq2seqPolicy(host_weights_owner.architecture, cuda_compute.runtime_policy.seq2seq);

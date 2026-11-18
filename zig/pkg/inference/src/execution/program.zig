@@ -63,6 +63,10 @@ pub const ModelProgram = struct {
     /// Borrows source graph/bindings; the returned program owns its graph and
     /// names. Node IDs in returned bindings always refer to the optimized IR.
     pub fn init(allocator: std.mem.Allocator, graph: *const ml.graph.Graph, bindings: []const Binding) !ModelProgram {
+        return initWithPipeline(allocator, graph, bindings, ml.graph.passes.pipeline.Pipeline.default);
+    }
+
+    pub fn initWithPipeline(allocator: std.mem.Allocator, graph: *const ml.graph.Graph, bindings: []const Binding, pipeline: ml.graph.passes.pipeline.Pipeline) !ModelProgram {
         var name_bytes: usize = 0;
         for (bindings) |binding| {
             if (binding.node_id >= graph.nodeCount()) return error.InvalidProgramBinding;
@@ -74,7 +78,7 @@ pub const ModelProgram = struct {
             }
             name_bytes = try std.math.add(usize, name_bytes, binding.name.len);
         }
-        var optimized = try ml.graph.passes.pipeline.Pipeline.default.run(allocator, graph);
+        var optimized = try pipeline.run(allocator, graph);
         errdefer optimized.deinit();
         const mapped_bindings = try allocator.alloc(Binding, bindings.len);
         errdefer allocator.free(mapped_bindings);

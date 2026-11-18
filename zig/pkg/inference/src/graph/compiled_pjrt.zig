@@ -1396,8 +1396,15 @@ test "PJRT whole-model availability rejects host-fallback plans even with artifa
     });
     try graph.markOutput(selected);
 
+    const Restricted = struct {
+        fn supports(op: ml_graph.OpCode) bool {
+            return op != .where_select and partition_mod.supportsPjrt(op);
+        }
+    };
+    // Exercise an explicitly restricted provider rather than assuming an
+    // operation remains unsupported as the real PJRT implementation grows.
     const capabilities = [_]partition_mod.Capability{
-        .{ .backend = .pjrt, .priority = 10, .supports = &partition_mod.supportsPjrt },
+        .{ .backend = .pjrt, .priority = 10, .supports = &Restricted.supports },
         .{ .backend = .native, .priority = 1, .supports = &partition_mod.supportsAll },
     };
     const plan = try partition_mod.partition(allocator, &graph, &capabilities);

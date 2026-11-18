@@ -5032,6 +5032,13 @@ fn forwardFinalHiddenTensorDirect(
     phase: BlockTimingPhase,
     ple_vectors: ?ops.CT,
 ) !?DirectHiddenResult {
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda and phase == .prefill and configured_layer_count == gpt_config.num_hidden_layers and seq_len == decode_context.query_sequence_len and !gatedFamilyCompareRequested()) {
+            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.tryCapturedPrefill(cb, allocator, gpt_config, hidden_input, ple_vectors, decode_context)) |captured| {
+                return .{ .hidden = captured, .total_rows = 1 };
+            }
+        }
+    }
     if (try forwardFinalHiddenTensorGemmaDirect(
         cb,
         allocator,

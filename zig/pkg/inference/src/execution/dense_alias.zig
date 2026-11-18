@@ -88,7 +88,7 @@ pub fn primary(binding: route.Binding, target: ops.ComputeBackend, expected: ml.
             const plane = result.value orelse break :blk null;
             break :blk if (plane.descriptor.shape.eq(expected)) plane else null;
         },
-        .imported_host, .unknown => null,
+        .imported_host, .imported_device, .unknown => null,
     };
 }
 fn planes(logical: ml.graph.Shape, input: []const ownership.Plane, expected: ml.graph.Shape) ?ownership.Plane {

@@ -3006,8 +3006,9 @@ pub const ComputeBackend = struct {
         /// Backends may fuse Gemma4 QAT PLE gate projection with its activation/slice multiply.
         linearNoBiasActivationSliceLastDim: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, source: CT, rows: usize, in_dim: usize, out_dim: usize, start: usize, activation: DecoderRuntimeActivationKind) anyerror!?CT = null,
 
-        /// Y = (A + B) * scalar[0]. Backends may fuse residual add and a
-        /// device-resident scalar multiply used by per-layer output scales.
+        /// Y = A * scalar[0] + B. The scalar scales the branch A before
+        /// residual addition; it must not scale the residual B. Historical API
+        /// name retained for existing callers and tuned native implementations.
         addMultiplyScalarTensor: ?*const fn (ctx: *anyopaque, a: CT, b: CT, scalar: CT) anyerror!?CT = null,
 
         /// Y = A * scale_a + B * scale_b. Backends may fuse small PLE/residual

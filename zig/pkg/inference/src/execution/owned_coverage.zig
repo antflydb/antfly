@@ -121,7 +121,7 @@ fn inputKnown(pool: *const physical.Pool, node: ml.graph.NodeId, binding: route.
             const coverage = query(value.implementation.context, value.value, .{ .context = &observed, .visit = Collector.emit }) catch break :check false;
             break :check coverage == .complete and observed.valid and observed.count == 1;
         },
-        .unknown, .planned => false,
+        .unknown, .planned, .imported_device => false,
     };
 }
 fn literalIndex(pool: *const physical.Pool, slot: buffers.LogicalSlot) ?usize {
