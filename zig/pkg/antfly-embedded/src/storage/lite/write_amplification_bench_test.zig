@@ -2344,6 +2344,15 @@ test "lite write amplification: mixed text+sparse write engages both inline fast
     // update (doc-0's very first write touches both), so this stays at
     // the single-index ceiling, not double it.
     try expectAtMost(mixed.durableCommitsPerWrite(), 1.25, "mixed text+sparse durable commits/write (workers on)");
+
+    // The sparse index's large catalog values fold through the direct
+    // large-batch path; their chain pages must be counted, or retiring an
+    // overwritten value fails every later fold.
+    const guard = api.enterHandle(fixture.handle, .read) orelse return error.TestUnexpectedResult;
+    defer guard.leave();
+    const root = guard.handle.parent_handle orelse guard.handle;
+    const status = try root.owned_lite_backend.?.native_docstore.?.reclamationStatus();
+    try std.testing.expectEqual(@as(u64, 0), status.allocator_work.redo_checkpoint_failures);
 }
 
 // lite-single-commit-write-path.md §3.3c: the relational write surface --

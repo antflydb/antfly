@@ -12770,6 +12770,17 @@ pub const NativeFile = struct {
                 self.flushing_transaction = false;
             }
             try self.putCatalogBatchForRoot(root, mutations, options);
+            // The staged path's catalog chain walk in `flushTransactionWrites`
+            // never sees this batch. A redo fold folds external values whose
+            // chain pages a diverting commit wrote outside the ledger; the
+            // records above retained only each chain's root.
+            if (self.redo != null) if (writes.pages.ledger) |state| {
+                const checkpoint = self.activeCheckpoint();
+                for (mutations) |m| {
+                    if (m.is_delete or m.external_value_root_page == 0) continue;
+                    try self.retainUnretainedValueChainPages(state, checkpoint, m.external_value_root_page, m.external_value_len, null);
+                }
+            };
             try writes.pages.flush();
             return;
         }
