@@ -1635,6 +1635,7 @@ pub const ApiHttpServerConfig = struct {
     /// Node-local personal connection owner; never populated by distributed configuration.
     chatgpt: ?*@import("antfly_local_sources").chatgpt_manager.Manager = null,
     pgwire: ?common_config.Config.PgwireConfig = null,
+    pgwire_spool_store: ?@import("../serverless/artifacts/store.zig").ArtifactStore = null,
     restore_validation: ?@import("restore_catalog.zig").ValidationPort = null,
     auth_enabled: bool = false,
     experimental: bool = false,

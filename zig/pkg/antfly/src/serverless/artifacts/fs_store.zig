@@ -131,6 +131,18 @@ pub const FsStore = struct {
     /// Qualify an owned spool root. Reopening the same payload and its native
     /// fencing inventory preserves identity. A fresh root receives a new one.
     pub fn spoolArtifactStore(self: *FsStore, cancellation: CancellationToken) !artifact_store.ArtifactStore {
+        return self.openSpoolArtifactStore(null, cancellation);
+    }
+
+    /// A provisioned shared mount owns the payload and the fencing inventory
+    /// together. Require its expected incarnation so an empty or replaced mount
+    /// cannot enroll slots or publish stale attempts under the prior identity.
+    pub fn sharedSpoolArtifactStore(self: *FsStore, expected: [32]u8, cancellation: CancellationToken) !artifact_store.ArtifactStore {
+        if (std.mem.allEqual(u8, &expected, 0)) return error.PgSpoolStorageUnsupported;
+        return self.openSpoolArtifactStore(expected, cancellation);
+    }
+
+    fn openSpoolArtifactStore(self: *FsStore, expected: ?[32]u8, cancellation: CancellationToken) !artifact_store.ArtifactStore {
         const expected_inventory = try std.fs.path.join(self.alloc, &.{ self.root_dir, ".upload-inventory" });
         defer self.alloc.free(expected_inventory);
         if (!std.mem.eql(u8, expected_inventory, self.inventory_root)) return error.PgSpoolStorageUnsupported;
@@ -161,6 +173,7 @@ pub const FsStore = struct {
             if (!std.meta.eql(checksum, encoded[36..68].*) or std.mem.allEqual(u8, &id, 0)) return error.ArtifactUploadFenceCorrupt;
         } else |err| switch (err) {
             error.FileNotFound => {
+                if (expected != null) return error.PgSpoolStorageUnsupported;
                 while (true) {
                     try cancellation.check();
                     io.random(&id);
@@ -174,9 +187,13 @@ pub const FsStore = struct {
             },
             else => return err,
         }
+        if (expected) |incarnation| {
+            if (!std.meta.eql(id, incarnation)) return error.PgSpoolStorageUnsupported;
+        }
         try cancellation.check();
         var store = self.artifactStore();
         store.namespace_identity = id;
+        store.shared_across_owners = expected != null;
         return store;
     }
 

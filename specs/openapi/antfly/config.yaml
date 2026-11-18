@@ -356,6 +356,19 @@ components:
           minLength: 1
           maxLength: 63
           description: Enables logical replication for the named Antfly publication on installations with retained history and qualified spool storage.
+        replication_spool:
+          type: object
+          additionalProperties: false
+          description: Dedicated shared filesystem spool with durable cross-owner locks. Provision the mounted directory with antfly storage provision-pgwire-spool and configure its returned namespace on each participating data node.
+          required: [directory, namespace]
+          properties:
+            directory:
+              type: string
+              description: Absolute path to the provisioned shared mount.
+            namespace:
+              type: string
+              pattern: "^[0-9A-Fa-f]{64}$"
+              description: Hexadecimal incarnation returned by spool provisioning.
     Config:
       type: object
       properties:

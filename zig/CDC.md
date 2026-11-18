@@ -1,6 +1,6 @@
 # CDC
 
-This document describes the Postgres replication-source / CDC subsystem in
+This document describes inbound PostgreSQL CDC and outbound logical replication in
 `antfly-zig`.
 
 It is intentionally narrower than query-time `foreign_sources`.
@@ -13,6 +13,44 @@ authenticated commit hooks, and managed archive publication is described in
 [Lake ingestion, change capture, and publication](../docs/plans/lake-ingestion-and-publication.md).
 It builds on this subsystem's canonical apply, metadata ownership, and durable
 checkpoint contracts; it does not imply those additional source APIs exist today.
+
+## Outbound PostgreSQL logical replication
+
+A native data node can serve a configured Antfly publication over pgwire. The
+slot binds to that publication at creation. It retains whole committed
+transactions in `pgoutput` format and advances retention after durable client
+feedback. This deployment path currently serves one native history root and
+requires slot creation with `NOEXPORT_SNAPSHOT`.
+
+Provision a dedicated mounted directory for the slot spool. Every data node
+serving the publication or reclaiming its spool must see the same files and
+fencing inventory. The filesystem must provide cross-node advisory locking,
+atomic rename, and durable file and directory synchronization. Keep the volume
+mounted at the configured path while these nodes are active.
+
+```sh
+antfly storage provision-pgwire-spool /srv/antfly/pgwire-spool
+```
+
+Use the returned namespace in each participating data node's config.
+
+```json
+{
+  "pgwire": {
+    "enabled": true,
+    "replication_publication": "changes",
+    "replication_spool": {
+      "directory": "/srv/antfly/pgwire-spool",
+      "namespace": "<64 hexadecimal digits returned by provisioning>"
+    }
+  }
+}
+```
+
+Keep the namespace and the fencing inventory with the spool volume. At startup,
+a missing or different spool incarnation prevents the node from serving that
+configuration. A replacement spool requires resynchronizing consumers that were
+bound to the original incarnation.
 
 ## Metadata substrate
 

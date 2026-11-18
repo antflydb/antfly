@@ -6108,6 +6108,8 @@ pub const DataServer = struct {
     owned_incoming_graph_route_io: ?lsm_storage_io.IoStorage = null,
     owned_incoming_graph_route_store: ?antfly.storage_backend_erased.Store = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
+    pgwire_spool_files: ?@import("../serverless/artifacts/fs_store.zig").FsStore = null,
+    pgwire_spool_store: ?@import("../serverless/artifacts/store.zig").ArtifactStore = null,
     h1_disconnect_probe: ?httpx.H1DisconnectProbe = null,
     data_request_lifecycle_hook: ?DataRequestLifecycleHook = null,
     hot_standby_cfg: DataServerHotStandbyConfig = .{},
@@ -7212,6 +7214,19 @@ pub const DataServer = struct {
     pub fn initApiServer(self: *DataServer) !void {
         if (self.http_server != null) return;
         var api_server_cfg = self.api_server_cfg;
+        if (api_server_cfg.pgwire) |wire| if (wire.replication_spool) |spool| {
+            if (api_server_cfg.pgwire_spool_store != null) return error.PgSpoolStorageUnsupported;
+            self.pgwire_spool_files = try @import("../serverless/artifacts/fs_store.zig").FsStore.initExisting(self.alloc, spool.directory);
+            api_server_cfg.pgwire_spool_store = (&self.pgwire_spool_files.?).sharedSpoolArtifactStore(spool.namespace, .{}) catch |err| {
+                self.pgwire_spool_files.?.deinit();
+                self.pgwire_spool_files = null;
+                return err;
+            };
+        };
+        errdefer if (self.pgwire_spool_files) |*files| {
+            files.deinit();
+            self.pgwire_spool_files = null;
+        };
         if (self.remote_metadata != null) api_server_cfg.configureRemoteCatalogPublicationAuthority();
         if (self.data_request_lifecycle_hook != null) {
             if (api_server_cfg.query_result_lifecycle_hook != null)
@@ -7484,6 +7499,7 @@ pub const DataServer = struct {
         // Graph queries issued through the provisioned source and auxiliary
         // API helpers share one fenced directory. This prevents duplicate L1s
         // from diverging and gives both paths the configured durable L2.
+        self.pgwire_spool_store = api_server_cfg.pgwire_spool_store;
         self.http_server.?.bindIncomingGraphRoutes(self.read_source.source());
         antfly.public_api.kernel_bridge.setAntflyProvider(&self.http_server.?, self.read_source.antfly_provider);
         const ttl_port: server_coordinated_ttl.Port = .{ .ptr = self, .expire_fn = expireRelationalRows };
@@ -10161,6 +10177,9 @@ pub const DataServer = struct {
         self.http_observer_lease = null;
         if (self.http_server) |*http_server| http_server.deinit();
         self.http_server = null;
+        self.pgwire_spool_store = null;
+        if (self.pgwire_spool_files) |*files| files.deinit();
+        self.pgwire_spool_files = null;
         _ = self.read_source.withAntflyProvider(null);
         _ = self.write_source.withAntflyProvider(null);
         if (self.data_raft_apply) |apply_sm| {
@@ -24410,7 +24429,7 @@ pub const DataServer = struct {
         const now = self.dataRaftRealtimeNs() / std.time.ns_per_s;
         const page = try remote.scanChangefeedMaintenance(self.alloc, .{ .now = now, .after = self.changefeed_maintenance_after }, request);
         const SpoolRegistry = @import("../metadata/pg_spool_artifacts.zig").Registry;
-        const spool: ?SpoolRegistry = if (self.api_server_cfg.document_artifact_store) |store| blk: {
+        const spool: ?SpoolRegistry = if (self.pgwire_spool_store orelse self.api_server_cfg.document_artifact_store) |store| blk: {
             const candidate: SpoolRegistry = .{ .store = store, .io = io };
             candidate.requireAvailable(self.api_server_cfg.deployment_mode != .standalone, request) catch |err| switch (err) {
                 error.PgSpoolStorageUnsupported => break :blk null,

@@ -20,6 +20,40 @@ const adapter = @import("metadata/pg_spool_artifacts.zig");
 const slot = @import("metadata/pg_slot.zig");
 const artifacts = @import("serverless/artifacts/store.zig");
 const FsStore = @import("serverless/artifacts/fs_store.zig").FsStore;
+test "pg spool artifact shared mount requires provisioned incarnation and shares its retirement fence" {
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const path = try temp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var primary = try FsStore.init(a, path);
+    defer primary.deinit();
+    try std.testing.expectError(error.PgSpoolStorageUnsupported, primary.sharedSpoolArtifactStore(@splat(1), .{}));
+    const local = try primary.spoolArtifactStore(.{});
+    const namespace = local.namespace_identity.?;
+    try std.testing.expect(!local.shared_across_owners);
+    var wrong_namespace = namespace;
+    wrong_namespace[0] ^= 1;
+    try std.testing.expectError(error.PgSpoolStorageUnsupported, primary.sharedSpoolArtifactStore(wrong_namespace, .{}));
+    var successor = try FsStore.initExisting(a, path);
+    defer successor.deinit();
+    var producer = try primary.sharedSpoolArtifactStore(namespace, .{});
+    var collector = try successor.sharedSpoolArtifactStore(namespace, .{});
+    try (adapter.Registry{ .store = producer, .io = std.testing.io }).requireAvailable(true, @import("antfly_local_sources").api_operation.RequestContext{});
+    try (adapter.Registry{ .store = collector, .io = std.testing.io }).requireAvailable(true, @import("antfly_local_sources").api_operation.RequestContext{});
+    var scope: artifacts.UploadScope = .{ .domain = @splat(3), .attempt = @splat(5) };
+    std.mem.writeInt(u64, scope.attempt[0..8], 1, .big);
+    var payload = try producer.putScoped(scope, "already visible", .{});
+    defer payload.deinit(a);
+    var read = try collector.stat(payload.artifact_id);
+    defer read.deinit(a);
+    try std.testing.expectEqual(payload.byte_len, read.byte_len);
+    try collector.retireScopedUploads(scope.domain, 1, .{});
+    try std.testing.expectError(error.ArtifactUploadAttemptRetired, producer.putScoped(scope, "delayed publication", .{}));
+    try std.Io.Dir.cwd().deleteTree(std.testing.io, primary.inventory_root);
+    try std.testing.expectError(error.PgSpoolStorageUnsupported, successor.sharedSpoolArtifactStore(namespace, .{}));
+}
+
 test "pg spool artifact adapter persists verified pages closure and exact replay across reopen" {
     const a = std.testing.allocator;
     var temp = std.testing.tmpDir(.{});

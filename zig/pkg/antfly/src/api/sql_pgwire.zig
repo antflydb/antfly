@@ -314,7 +314,7 @@ pub const CatalogReplicationPublication = struct {
         const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, response, .{ .allocate = .alloc_always });
         const cut = try resolved.requirePublicationCut(request);
         if (!std.meta.eql(publicationDatabaseKey(cut), database)) return error.ChangefeedResynchronizationRequired;
-        const current = resolvePublicationMembers(self.server, a, identity, context, targets, resolved, cut) catch |err| switch (err) {
+        const current = resolvePublicationMembers(self.server, a, identity, context, targets, resolved, cut, members.items) catch |err| switch (err) {
             error.TableNotFound => return error.ChangefeedResynchronizationRequired,
             else => return err,
         };
@@ -1054,7 +1054,7 @@ pub const CatalogReplicationFactory = struct {
         var key_buffer: [256]u8 = undefined;
         _ = try publication_metadata.key(&key_buffer, 1, @splat(1), publication);
         const shared = api.cfg.deployment_mode != .standalone;
-        const store = if (api.cfg.document_artifact_store) |configured_store| configured_store else blk: {
+        const store = if (api.cfg.pgwire_spool_store orelse api.cfg.document_artifact_store) |configured_store| configured_store else blk: {
             if (shared) return error.PgSpoolStorageUnsupported;
             const files = if (api.document_artifact_files) |*value| value else return error.PgSpoolStorageUnsupported;
             break :blk try files.spoolArtifactStore(.{});
@@ -2025,7 +2025,8 @@ fn executePublication(
         if (command.if_exists) return .{ .command_tag = tag };
         return error.PgPublicationNotFound;
     }
-    const members = if (command.action == .drop) null else try resolvePublicationMembers(server, a, identity, context, targets, resolved_catalog, cut);
+    const previous_members = if (old) |record| record.members orelse &.{} else &.{};
+    const members = if (command.action == .drop) null else try resolvePublicationMembers(server, a, identity, context, targets, resolved_catalog, cut, previous_members);
     const revision = if (old) |record| record.revision else 0;
     try authority.credential.validate();
     try port.mutate(port.ptr, a, .{
@@ -2044,6 +2045,29 @@ fn publicationMemberLess(_: void, lhs: publication_metadata.Member, rhs: publica
     return lhs.table.table_id < rhs.table.table_id;
 }
 
+/// Relation ids are 32-bit wire aliases in one publication. Keep the
+/// persisted alias when the same table survives a publication revision.
+fn assignPublicationOids(members: []publication_metadata.Member, previous: []const publication_metadata.Member) void {
+    var candidate: u32 = 16384;
+    for (members) |*member| {
+        for (previous) |prior| {
+            if (member.table.table_id == prior.table.table_id) {
+                member.oid = prior.oid;
+                break;
+            }
+        } else {
+            // The previous set is bounded and candidate only advances.
+            while (true) : (candidate += 1) {
+                for (previous) |prior| {
+                    if (prior.oid == candidate) break;
+                } else break;
+            }
+            member.oid = candidate;
+            candidate += 1;
+        }
+    }
+}
+
 fn resolvePublicationMembers(
     server: *http.ApiHttpServer,
     a: std.mem.Allocator,
@@ -2052,6 +2076,7 @@ fn resolvePublicationMembers(
     targets: []const @import("antfly_local_sources").system_catalog_domain.Target,
     resolved_catalog: @import("antfly_local_sources").system_catalog_domain.ResolvedMany,
     cut: @import("antfly_local_sources").system_catalog_domain.PublicationCatalogCut,
+    previous: []const publication_metadata.Member,
 ) ![]const publication_metadata.Member {
     const names = try a.alloc([]const u8, targets.len);
     for (targets, names) |target, *name| name.* = try target.resourceNameAlloc(a);
@@ -2086,12 +2111,13 @@ fn resolvePublicationMembers(
             .permission_name = name,
             .namespace = try a.dupe(u8, target.namespace),
             .name = try a.dupe(u8, target.table),
-            .oid = std.math.cast(u32, table.table_id) orelse return error.ChangefeedCapabilityUnsupported,
+            .oid = 0,
             .identity = if (keys.len != 0) .default else .full,
             .key_columns = keys,
         };
     }
     std.mem.sort(publication_metadata.Member, members, {}, publicationMemberLess);
+    assignPublicationOids(members, previous);
     try publication_metadata.validateMembers(members);
     return members;
 }
@@ -2123,6 +2149,8 @@ const Job = struct {
                         error.PgReplicationSyntax => diagnostic.set("42601", "Invalid publication statement", null, false),
                         error.PgPublicationAlreadyExists => diagnostic.set("42710", "Publication already exists", null, false),
                         error.PgPublicationNotFound => diagnostic.set("42704", "Publication does not exist", null, false),
+                        error.PgPublicationConflict => diagnostic.set("40001", "Publication changed concurrently", null, true),
+                        error.ChangefeedCapabilityUnsupported, error.UnsupportedReplicationMode => diagnostic.set("0A000", "Publication requires supported native relational tables and replication authority", null, false),
                         else => diagnostic.set(safe.code, execution.diagnosticMessage(err, &message_buffer), null, safe.retryable),
                     }
                 }
@@ -2152,7 +2180,10 @@ const Job = struct {
             var identity: ?http.AuthenticatedIdentity = try self.credential.identity(server.alloc);
             defer identity.?.deinit(server.alloc);
             var authority: Authority = .{ .credential = self.credential, .identity = &identity, .request = self.request };
-            self.result = try executePublication(server, self.alloc, &authority, parsed.command);
+            self.result = executePublication(server, self.alloc, &authority, parsed.command) catch |err| {
+                std.log.debug("pgwire publication command failed action={s} err={s}", .{ @tagName(parsed.command.action), @errorName(err) });
+                return err;
+            };
             return;
         }
         var lease = self.adapter.server.sqlPlanCache().acquire(self.adapter.server.sqlPlanCacheIo(), .{
@@ -3617,7 +3648,7 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
             const schema =
                 \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer","nullable":false}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"pk","columns":["id"],"primary":true,"timing":"immediate"}]}
             ;
-            const table: domain.ResolvedTable = .{ .table_id = 71, .name = "physical", .query_definition = .{ .table_id = 71, .schema_json = schema, .read_schema_json = "", .indexes_json = "{}" } };
+            const table: domain.ResolvedTable = .{ .table_id = 0x1234_0000_0047, .name = "physical", .query_definition = .{ .table_id = 0x1234_0000_0047, .schema_json = schema, .read_schema_json = "", .indexes_json = "{}" } };
             const has_members = input.targets.len != 0;
             if (has_members) try std.testing.expectEqualStrings("docs", input.targets[0].table);
             const cut: domain.ResolvedMany = .{
@@ -3721,6 +3752,8 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
     const replaced = try executePublication(server, alloc, &authority, .{ .action = .replace_members, .name = create.name, .tables = create.tables });
     try std.testing.expectEqualStrings("ALTER PUBLICATION", replaced.command_tag);
     const after = try live.resolve(live.ptr, alloc, database, &.{"feed"}, .{});
+    try std.testing.expectEqual(@as(u32, 16384), before.members[0].oid);
+    try std.testing.expectEqual(before.members[0].oid, after.members[0].oid);
     try std.testing.expect(!std.meta.eql((try before.binding()).identity(), (try after.binding()).identity()));
     const slots = try CatalogReplicationSlots.open(server, resolver.identity, alloc, "default", .{});
     try std.testing.expectEqual(database, slots.database);
