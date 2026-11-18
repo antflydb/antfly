@@ -36,6 +36,27 @@ pub fn digest(bytes: []const u8) [64]u8 {
     return std.fmt.bytesToHex(hash, .lower);
 }
 
+pub fn packAdmission(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    const parts = try split(alloc, encoded);
+    defer parts.deinit(alloc);
+    const inputs = parts.inputs orelse return alloc.dupe(u8, encoded);
+    if (inputs.len < 64 * 1024) return alloc.dupe(u8, encoded);
+    var compressed: std.Io.Writer.Allocating = .init(alloc);
+    defer compressed.deinit();
+    const history = try alloc.alloc(u8, std.compress.flate.max_window_len);
+    defer alloc.free(history);
+    var compressor = try std.compress.flate.Compress.init(&compressed.writer, history, .zlib, .default);
+    try compressor.writer.writeAll(inputs);
+    try compressor.finish();
+    const base64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(compressed.written().len));
+    defer alloc.free(base64);
+    _ = std.base64.standard.Encoder.encode(base64, compressed.written());
+    var tree = try std.json.parseFromSlice(std.json.Value, alloc, parts.record, .{});
+    defer tree.deinit();
+    try tree.value.object.put(tree.arena.allocator(), "cluster_binding_deflate", .{ .string = base64 });
+    return std.json.Stringify.valueAlloc(alloc, tree.value, .{});
+}
+
 pub fn split(alloc: std.mem.Allocator, encoded: []const u8) !Split {
     var tree = std.json.parseFromSlice(std.json.Value, alloc, encoded, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
@@ -45,6 +66,22 @@ pub fn split(alloc: std.mem.Allocator, encoded: []const u8) !Split {
     if (tree.value != .object) return .{ .record = try alloc.dupe(u8, encoded) };
     const v = tree.value.object.get("format_version") orelse return .{ .record = try alloc.dupe(u8, encoded) };
     if (v != .integer or v.integer != version) return .{ .record = try alloc.dupe(u8, encoded) };
+    if (tree.value.object.get("cluster_binding_deflate")) |compressed_input| {
+        if (compressed_input != .string or tree.value.object.get("cluster_binding") != null) return error.CorruptRestoreJobStore;
+        const compressed = try alloc.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(compressed_input.string));
+        defer alloc.free(compressed);
+        try std.base64.standard.Decoder.decode(compressed, compressed_input.string);
+        var reader = std.Io.Reader.fixed(compressed);
+        const history = try alloc.alloc(u8, std.compress.flate.max_window_len);
+        defer alloc.free(history);
+        var decoder = std.compress.flate.Decompress.init(&reader, .zlib, history);
+        const bytes = try decoder.reader.allocRemaining(alloc, .limited(max_bytes));
+        errdefer alloc.free(bytes);
+        const expected = tree.value.object.get("cluster_binding_sha256") orelse return error.CorruptRestoreJobStore;
+        if (expected != .string or !std.mem.eql(u8, expected.string, &digest(bytes))) return error.CorruptRestoreJobStore;
+        _ = tree.value.object.orderedRemove("cluster_binding_deflate");
+        return .{ .record = try std.json.Stringify.valueAlloc(alloc, tree.value, .{}), .inputs = bytes };
+    }
     const binding = tree.value.object.get("cluster_binding") orelse .null;
     if (binding == .null) return .{ .record = try alloc.dupe(u8, encoded) };
     const bytes = try std.json.Stringify.valueAlloc(alloc, binding, .{ .emit_null_optional_fields = false });
@@ -98,6 +135,17 @@ test "restore runtime store persists checkpoints and requeues interrupted work a
     try std.testing.expect(std.mem.indexOf(u8, parts.record, "AQ==") == null);
     try validateReference(a, parts.record, parts.record);
     try std.testing.expectError(error.CorruptRestoreJobStore, validateReference(a, parts.record, null));
+    const padding = try a.alloc(u8, 4 * 1024 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'a');
+    const large = try std.json.Stringify.valueAlloc(a, .{ .format_version = version, .cluster_binding = .{ .recovery_manifests_json = padding } }, .{});
+    defer a.free(large);
+    const compressed_input = try packAdmission(a, large);
+    defer a.free(compressed_input);
+    try std.testing.expect(compressed_input.len < 64 * 1024);
+    const unpacked = try split(a, compressed_input);
+    defer unpacked.deinit(a);
+    try std.testing.expect(unpacked.inputs.?.len > padding.len);
     const full = try hydrate(a, parts.record, parts.inputs);
     defer a.free(full);
     try std.testing.expect(std.mem.indexOf(u8, full, "AQ==") != null);

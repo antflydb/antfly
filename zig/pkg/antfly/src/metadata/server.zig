@@ -932,7 +932,7 @@ fn metadataRestoreJobGet(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const
     if (svc.localMetadataLeadershipTerm() == null) return error.NotLeader;
     try svc.ensureLinearizableRead();
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    return try store.getRestoreJobValue(alloc, svc.metadata_group_id, key);
+    return try store.getRestoreJobRecord(alloc, svc.metadata_group_id, key);
 }
 
 fn metadataRestoreJobLoad(ptr: *anyopaque, alloc: std.mem.Allocator) ![]restore_jobs.ReplicatedPersistence.OwnedRow {

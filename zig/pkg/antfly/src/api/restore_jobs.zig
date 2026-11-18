@@ -1225,6 +1225,8 @@ pub const Store = struct {
             if (owned_key) |key| self.alloc.free(key);
         };
         if (self.replicated) |replicated| {
+            const proposal = try immutable_inputs.packAdmission(alloc, encoded);
+            defer alloc.free(proposal);
             const key = try jobKey(alloc, job_id);
             defer alloc.free(key);
             try self.reservePersistenceLocked(job_id, encoded.len);
@@ -1233,9 +1235,9 @@ pub const Store = struct {
                 self.fencePersistenceLocked(job_id);
                 if (submitted) |observed| observed.* = true;
                 const committed = (if (req.generation_plan_json orelse req.rewrite_plan_json) |plan|
-                    replicated.createWithStaging(alloc, key, encoded, plan, self.replicated_leadership_term)
+                    replicated.createWithStaging(alloc, key, proposal, plan, self.replicated_leadership_term)
                 else
-                    replicated.create(alloc, key, encoded, self.replicated_leadership_term)) catch |err| switch (err) {
+                    replicated.create(alloc, key, proposal, self.replicated_leadership_term)) catch |err| switch (err) {
                     error.TableTopologyProtocolUpgradeRequired,
                     error.MetadataTopologyCommandTooLarge,
                     error.RestoreJobRecordTooLarge,
@@ -1577,9 +1579,33 @@ pub const Store = struct {
         defer alloc.free(key);
         const fresh = try replicated.get(alloc, key);
         defer if (fresh) |value| alloc.free(value);
+        var fresh_inputs: ?[]u8 = null;
+        defer if (fresh_inputs) |bytes| alloc.free(bytes);
+        var input_key: ?[]u8 = null;
+        defer if (input_key) |bytes| alloc.free(bytes);
+        if (fresh) |value| {
+            const Header = struct { cluster_binding_sha256: ?[]const u8 = null };
+            var header = std.json.parseFromSlice(Header, alloc, value, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.CorruptRestoreJobStore,
+            };
+            defer header.deinit();
+            if (header.value.cluster_binding_sha256 != null) {
+                self.lock();
+                const known_inputs = self.inputs.contains(job_id);
+                self.mutex.unlock();
+                if (!known_inputs) {
+                    input_key = try std.fmt.allocPrint(alloc, "{s}{s}", .{ key, immutable_inputs.suffix });
+                    fresh_inputs = (try replicated.get(alloc, input_key.?)) orelse return error.CorruptRestoreJobStore;
+                    const full = try immutable_inputs.hydrate(alloc, value, fresh_inputs);
+                    alloc.free(full);
+                }
+            }
+        }
         self.lock();
         defer self.mutex.unlock();
         if (!self.refreshObservationMatchesLocked(job_id, observation)) return;
+        if (fresh_inputs) |bytes| _ = try self.captureInputRowLocked(input_key.?, bytes);
         if (fresh) |value| {
             var parsed = std.json.parseFromSlice(JobState, alloc, value, .{ .ignore_unknown_fields = true }) catch return error.CorruptRestoreJobStore;
             defer parsed.deinit();
@@ -2269,8 +2295,8 @@ pub const Store = struct {
             self.alloc.free(removed.value);
             _ = self.job_revisions.remove(job_id);
             self.markStoreMutationLocked();
-            self.removeHistoryLocked(job_id);
         }
+        self.removeHistoryLocked(job_id);
         if (map_key) |value| {
             if (self.idempotency.fetchRemove(value)) |removed| self.alloc.free(removed.key);
         }
