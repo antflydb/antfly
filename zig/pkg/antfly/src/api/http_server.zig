@@ -13867,9 +13867,8 @@ pub const ApiHttpServer = struct {
     }
 
     fn authorizePublishedRestoreDestinations(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, principal: []const u8) !void {
-        var snapshot = (try self.source.adminSnapshot()) orelse return error.MetadataCapabilityUnavailable;
-        defer self.source.freeAdminSnapshot(&snapshot);
-        const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        const table = (try self.source.tableRecord(alloc, table_name)) orelse return error.TableNotFound;
+        defer metadata_table_manager.freeTable(alloc, table);
         try self.authorizeRestoreDefinitionDestinations(alloc, table.name, table.replication_sources_json, table.indexes_json, principal);
     }
 
@@ -21986,10 +21985,10 @@ pub const ApiHttpServer = struct {
                 continue;
             }
 
-            const exists = self.tableExists(table_name) catch |err| return metadataAccessFailure(err);
-            const started = restoreTableAttempted(active_table_index, durability_pending_table_ranges, published_table_ranges, @intCast(i));
-            const published = restore_jobs.containsTableIndex(published_table_ranges, @intCast(i));
-            if (!started and !published and std.mem.eql(u8, restore_mode, "skip_if_exists") and exists) {
+            if (std.mem.eql(u8, restore_mode, "skip_if_exists") and
+                !restoreTableAttempted(active_table_index, durability_pending_table_ranges, published_table_ranges, @intCast(i)) and
+                (self.tableExists(table_name) catch |err| return metadataAccessFailure(err)))
+            {
                 statuses[i].status = "skipped";
                 continue;
             }
@@ -22010,19 +22009,11 @@ pub const ApiHttpServer = struct {
             // because it now exists; wait for the already-published replica
             // restore intent to drain instead.
             if (restore_jobs.containsTableIndex(published_table_ranges, @intCast(i))) {
-                (if (req.admitted_child_pins != null)
-                    self.authorizePublishedRestoreDestinations(op_alloc, table_name, destination_authorization_principal)
-                else
-                    self.authorizeClusterRestoreManifestDestinations(
-                        op_alloc,
-                        location,
-                        table_backup_id,
-                        artifact_backup_id,
-                        destination_authorization_principal,
-                    )) catch |err| switch (err) {
+                self.authorizePublishedRestoreDestinations(op_alloc, table_name, destination_authorization_principal) catch |err| switch (err) {
                     error.RestoreDestinationReauthorizationRequired,
                     error.StoredDestinationAuthorizationRevoked,
                     => return error.RestoreDestinationReauthorizationRequired,
+                    error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                     else => return error.InvalidRequest,
                 };
                 if (!self.cfg.deployment_mode.isStandalone()) {

@@ -2583,9 +2583,18 @@ fn validRestoreDigest(value: []const u8) bool {
 }
 
 pub fn containsTableIndex(ranges: []const TableIndexRange, needle: u16) bool {
-    for (ranges) |range| {
-        if (needle < range[0]) return false;
-        if (needle <= range[1]) return true;
+    var lower: usize = 0;
+    var upper = ranges.len;
+    while (lower < upper) {
+        const middle = lower + (upper - lower) / 2;
+        const range = ranges[middle];
+        if (needle < range[0]) {
+            upper = middle;
+        } else if (needle > range[1]) {
+            lower = middle + 1;
+        } else {
+            return true;
+        }
     }
     return false;
 }
