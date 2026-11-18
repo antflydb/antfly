@@ -6728,7 +6728,7 @@ pub const CudaCompute = struct {
             try self.embedding_gemma2_resize.clearWithCleanup(&self.ctx, current);
             try self.clearEmbeddingGemma2ConstantsWithCleanup(false, current);
             try self.embedding_gemma2_global_scratch.clear(&self.ctx);
-            if (self.capability_profile == .gemma4) try self.clearGemma4ProjectorWeights(false);
+            if (self.capability_profile == .gemma4) try self.clearGemma4ProjectorWeightsWithCleanup(false, current);
             if (self.capability_profile == .lightonocr3 or self.capability_profile == .florence2) {
                 // Idle allocations must retire under the policy that admitted
                 // them before their reservation moves to another controller.
@@ -7955,15 +7955,20 @@ pub const CudaCompute = struct {
     pub fn retainGemma4ProjectorWeight(self: *CudaCompute, key: []const u8, value: CT) void {
         if (!self.gemma4_projector_cache_enabled or key.len > 384 or
             self.gemma4_projector_weights.contains(key) or
+            self.ctx.prepared_cache_funding != null or self.managed_derived_weight_publication or
+            self.shared_operation_owner != null or self.run_budget != null or
             self.resident_training_cache or self.execution_scope != null or
             self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
             cudaEffectiveTempSlotPeriod(self) != 0) return;
         const source = tensorFromCt(value);
         if (!source.owned_by_tensor or !source.owns_buffer or source.buffer.borrowed or
             source.resident_parent != null or source.resident_references.load(.acquire) != 1 or
+            source.storage_retirement != null or source.physical_lease != null or source.physical_storage_base or
+            source.foreign_payload_owner != null or source.foreign_clone_owner != null or source.foreign_header_allocator != null or
             source.model_constant or source.quant_type != null or
             source.tc_quant != null or source.bf16_mirror.ptr != 0 or source.q8_1_mirror.ptr != 0 or
             (source.dtype != .f32 and source.dtype != .f16 and source.dtype != .bf16)) return;
+        for (source.auxiliary_leases) |lease| if (lease != null) return;
         const bytes = std.math.mul(usize, source.elem_count, source.dtype.byteSize()) catch return;
         const ceiling = 1024 * 1024 * 1024;
         if (bytes == 0 or bytes != source.buffer.len or bytes != source.buffer.allocation_bytes or
@@ -7983,6 +7988,9 @@ pub const CudaCompute = struct {
         self.ctx.synchronize() catch return;
         source.model_constant = true;
         source.gemma4_projector_constant = true;
+        // This compatibility producer owns an independently acquired raw
+        // weight lease. Managed callers use the prepared constant publisher;
+        // they must never acquire raw quota inside an execution boundary.
         source.model_constant_quota = CacheQuota.fromRawAdmission(lease);
         _ = source.resident_references.fetchAdd(1, .acq_rel);
         self.gemma4_projector_weight_bytes += bytes;
@@ -8003,12 +8011,22 @@ pub const CudaCompute = struct {
     }
 
     fn clearGemma4ProjectorWeights(self: *CudaCompute, context_destroyed: bool) !void {
+        return self.clearGemma4ProjectorWeightsWithCleanup(context_destroyed, .{ .outside_execution = true });
+    }
+
+    fn validateProjectorConstantCleanup(self: *const CudaCompute, current: CacheCleanup) !void {
+        var it = self.gemma4_projector_weights.valueIterator();
+        while (it.next()) |root| try root.*.model_constant_quota.validateCleanup(current);
+    }
+
+    fn clearGemma4ProjectorWeightsWithCleanup(self: *CudaCompute, context_destroyed: bool, current: CacheCleanup) !void {
+        try self.validateProjectorConstantCleanup(current);
         if (self.gemma4_projector_weights.capacity() == 0) return;
         if (!context_destroyed and self.gemma4_projector_weights.count() != 0) try self.ctx.synchronize();
         var it = self.gemma4_projector_weights.iterator();
         while (it.next()) |entry| {
             if (context_destroyed) entry.value_ptr.*.buffer = .{};
-            freeTensor(self, entry.value_ptr.*);
+            freeTensorWithCleanup(self, entry.value_ptr.*, current);
             self.allocator.free(entry.key_ptr.*);
         }
         self.gemma4_projector_weights.deinit(self.allocator);
@@ -8730,6 +8748,7 @@ pub const CudaCompute = struct {
         try self.embedding_gemma2_resize.validateCleanup(current);
         try self.embedding_gemma2_execution.validateCleanup(current);
         try self.validateConstantCleanup(current);
+        try self.validateProjectorConstantCleanup(current);
         try self.ctx.video_cache_budget.validateCleanup(current);
         try self.ocr_retained_cache_quota.validateCleanup(current);
         try self.auxiliaryCache(.rotary_positions_u32).quota.validateCleanup(current);
@@ -8794,7 +8813,7 @@ pub const CudaCompute = struct {
             self.embedding_gemma2_execution.clearWithCleanup(self.allocator, &self.ctx, current) catch break :failed true;
             self.clearEmbeddingGemma2ConstantsWithCleanup(false, current) catch break :failed true;
             self.embedding_gemma2_global_scratch.clear(&self.ctx) catch break :failed true;
-            self.clearGemma4ProjectorWeights(false) catch break :failed true;
+            self.clearGemma4ProjectorWeightsWithCleanup(false, current) catch break :failed true;
             break :failed false;
         };
         // releaseResources may transfer a live primary to the allocation ledger.
@@ -9436,7 +9455,11 @@ pub const CudaCompute = struct {
         if (cb.kind() != .cuda or cb.execution_owner != 0) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const explicit_mode = platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY") != null;
-        if (!self.gemma4_e4b_sm89_qualified or (explicit_mode and !cudaDecodeGraphReplayEnabled()) or
+        // An explicitly selected native execution plan uses the same bounded
+        // paged-KV replay contract on other qualified CUDA architectures.
+        // Keep automatic promotion scoped to the existing physical evidence.
+        const planned_replay = explicit_mode and self.gemma4_dense_qualified and self.gemma4_native_plan != null;
+        if ((!self.gemma4_e4b_sm89_qualified and !planned_replay) or (explicit_mode and !cudaDecodeGraphReplayEnabled()) or
             (!explicit_mode and (!allow_default or
                 !cuda_artifact.hasBf16WmmaCodeFor(self.ctx.info.compute_major, self.ctx.info.compute_minor) or
                 !self.capture_gates.persistent_replay or !self.capture_gates.device_scalars or
@@ -10485,7 +10508,6 @@ pub const CudaCompute = struct {
             .elem_count = count,
             .quant_type = storage.tensor_type,
             .owns_buffer = false,
-            .owns_shape = false,
             .owned_by_tensor = false,
         });
         self.gemma4_ple_host = mapped;
@@ -13144,9 +13166,17 @@ fn noteModelConstantRetirement(self: *CudaCompute, tensor: *const CudaTensor) vo
 }
 
 fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor, current: @import("../../execution/cleanup_context.zig").Context) void {
+    // The zero-copy projector producer predates prepared cache publication.
+    // Its explicit producer tag, not absence of an epoch, selects its legacy
+    // callback contract. Prepared quota is rejected by that contract. Actual
+    // boundary-aware callers always retain their current cleanup checks.
+    const legacy_projector = cuda_tensor.gemma4_projector_constant and
+        current.boundary == null and !current.outside_execution;
     if (cuda_tensor.cache_retirement_slot) |slot| {
         slot.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
-    } else if (cuda_tensor.model_constant) cuda_tensor.model_constant_quota.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+    } else if (cuda_tensor.model_constant) {
+        if (legacy_projector) cuda_tensor.model_constant_quota.validateLegacyRaw() catch platform.inference_process_supervisor.restartWorker() else cuda_tensor.model_constant_quota.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+    }
     if (cuda_tensor.physical_storage_base) {
         freePhysicalRootChecked(self, cuda_tensor) catch platform.inference_process_supervisor.restartWorker();
         return;
@@ -13173,7 +13203,7 @@ fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor, current: 
         } else {
             _ = cuda_tensor.buffer.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
             noteModelConstantRetirement(self, cuda_tensor);
-            cuda_tensor.model_constant_quota.releaseAfterSdkDeath(current) catch platform.inference_process_supervisor.restartWorker();
+            if (legacy_projector) cuda_tensor.model_constant_quota.releaseLegacyRawAfterSdkDeath() catch platform.inference_process_supervisor.restartWorker() else cuda_tensor.model_constant_quota.releaseAfterSdkDeath(current) catch platform.inference_process_supervisor.restartWorker();
         }
     } else if (cuda_tensor.owns_buffer) releaseDeviceBuffer(self, &cuda_tensor.buffer);
     if (cuda_tensor.owns_shape) self.allocator.free(cuda_tensor.shape);
@@ -18864,7 +18894,7 @@ fn debugProfileCheckpoint(ctx: *anyopaque, label: []const u8, layer: usize) void
 
 fn debugCudaGraphReplayRequested(ctx: *anyopaque) bool {
     const self: *const CudaCompute = @ptrCast(@alignCast(ctx));
-    return self.gemma4_e4b_sm89_qualified and self.gemma4_request_replay_capacity != null and
+    return self.gemma4_request_replay_capacity != null and
         cudaRequestDecodeGraphReplayMode(self) != .off;
 }
 
@@ -20830,11 +20860,12 @@ fn audioBatchLayoutsEnabledOp(ctx: *anyopaque) bool {
 fn audioLogMelEnabledOp(ctx: *anyopaque) bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     return (self.capability_profile == .embedding_gemma2 and self.embedding_gemma2_policy.audio_frontend_fused) or
-        (self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_AUDIO_LOGMEL_FUSED", true));
+        (self.gemma4_dense_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_AUDIO_LOGMEL_FUSED", self.gemma4_e4b_sm89_qualified));
 }
 fn audioLogMelOp(ctx: *anyopaque, pcm: CT, plan: CT, mask: CT, frames: usize, hop: usize, floor: f32) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (!audioLogMelEnabledOp(ctx)) return null;
+    if (frames == 0 or hop == 0 or !std.math.isFinite(floor) or floor <= 0) return error.InvalidTensorShape;
     const x = tensorFromCt(pcm);
     const p = tensorFromCt(plan);
     const m = tensorFromCt(mask);
@@ -62004,6 +62035,11 @@ test "Gemma4 CUDA projector cache preserves compact dtype and independent admiss
         const bytes = 4 * dtype.byteSize();
         try std.testing.expectEqual(bytes, controller.snapshot().backend_weight_bytes);
         try std.testing.expectEqual(@as(usize, 1), compute.gemma4_projector_weight_count);
+        // A managed cleanup without its prepared raw carrier must fail before
+        // removing keys or changing the independent reservation.
+        try std.testing.expectError(error.CacheRetirementCleanupAuthorityRequired, compute.clearGemma4ProjectorWeightsWithCleanup(false, .{}));
+        try std.testing.expectEqual(@as(usize, 1), compute.gemma4_projector_weights.count());
+        try std.testing.expectEqual(bytes, controller.snapshot().backend_weight_bytes);
         const borrowed = (try compute.borrowGemma4ProjectorWeight("fixture")).?;
         var borrowed_owned = true;
         defer if (borrowed_owned) cb.free(borrowed);
@@ -62025,6 +62061,15 @@ test "Gemma4 CUDA projector cache preserves compact dtype and independent admiss
     }
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_weight_bytes);
     try std.testing.expectEqual(@as(usize, 0), compute.gemma4_projector_weight_bytes);
+    // A managed publication cannot silently fall back to raw admission. The
+    // original request tensor remains usable when optional retention declines.
+    const managed = try cb.fromFloat32Shape(&values, &.{4});
+    defer cb.free(managed);
+    compute.managed_derived_weight_publication = true;
+    compute.retainGemma4ProjectorWeight("managed", managed);
+    try std.testing.expect(try compute.borrowGemma4ProjectorWeight("managed") == null);
+    try std.testing.expectEqual(@as(usize, 0), replacement.snapshot().backend_weight_bytes);
+    compute.managed_derived_weight_publication = false;
     try compute.configureEmbeddingGemma2Admission(.{ .controller = &controller, .limits = .{ .backend_limit_bytes = 1 }, .check_live_memory = false });
     const denied = try cb.fromFloat32Shape(&values, &.{4});
     defer cb.free(denied);
@@ -62219,6 +62264,17 @@ test "Gemma4 CUDA adaptive replay binds reserved page tables and resets request 
     _ = unsetenv("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY");
     compute.gemma4_e4b_sm89_qualified = false;
     try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, false)) == null);
+    // Explicit native plans on other architectures need the same request-wide
+    // capacity; otherwise every page crossing invalidates the captured graph.
+    compute.gemma4_dense_qualified = true;
+    compute.gemma4_native_plan = .{ .projection = .bf16_donors, .geometry = .{ .donor_layers = 24 } };
+    try std.testing.expectEqual(@as(?usize, 144), try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, false));
+    try std.testing.expect(cb.debugCudaGraphReplayRequested());
+    try beginRequest(&compute);
+    _ = setenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY", "off", 1);
+    try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, false)) == null);
+    _ = unsetenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY");
+    try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, true)) == null);
 }
 
 test "Gemma4 CUDA explicit auto replay falls back outside qualified capacity" {
