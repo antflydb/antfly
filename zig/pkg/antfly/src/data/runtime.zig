@@ -5831,6 +5831,8 @@ pub const DataServer = struct {
     /// Context-source host (#1634): replicated dependency commands, cross-group
     /// notice delivery, routed reads, and table topology for every owner.
     context_host: ?antfly.public_api.context_host.Host = null,
+    /// Some table declared context sources since this process started.
+    context_sources_seen: bool = false,
     context_maintenance_running: std.atomic.Value(bool) = .init(false),
     context_maintenance_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
     status_source: antfly.public_api.http_server.StatusSource,
@@ -6826,6 +6828,15 @@ pub const DataServer = struct {
         const runtime = self.backend_runtime orelse return;
         if (runtime.durable_jobs.executesInline() or self.background_jobs_shutdown.load(.acquire)) return;
         if (self.context_host == null) return;
+        // Skip the per-group sweep entirely while no table has ever declared
+        // context sources (checked against a cached catalog digest at most
+        // once a second). Once any has, keep sweeping so removals still
+        // refresh each group's topology.
+        if (!self.context_sources_seen) {
+            const any = self.context_host.?.anyContextSources(self.alloc, platform_time.monotonicNs(), std.time.ns_per_s) catch true;
+            if (!any) return;
+            self.context_sources_seen = true;
+        }
         if (self.context_maintenance_running.swap(true, .acq_rel)) return;
         var scheduled = false;
         defer if (!scheduled) self.context_maintenance_running.store(false, .release);
@@ -6891,7 +6902,7 @@ pub const DataServer = struct {
                 try contextPropose(server, a, job.group_id, job.table, command, false);
             }
             if (status.deliveries.len != 0) {
-                const host = &(server.context_host orelse return);
+                const host = if (server.context_host) |*value| value else return;
                 var acks = std.ArrayListUnmanaged([]const u8).empty;
                 for (status.deliveries) |d| {
                     const request = try std.json.Stringify.valueAlloc(a, .{ .dependent = d.dependent, .notice = d.notice }, .{});
@@ -10048,6 +10059,7 @@ pub const DataServer = struct {
             @panic("data server provider shutdown barrier failed");
         };
         if (self.hot_standby_admin_server) |*server| server.deinit();
+        if (self.context_host) |*host| host.deinit();
         if (self.hot_standby_promoted_primary) |*primary| primary.close();
         if (self.hot_standby_standby_replication_http_executor) |*executor| executor.deinit();
         // Safe only now: every replication round has been quiesced above, so

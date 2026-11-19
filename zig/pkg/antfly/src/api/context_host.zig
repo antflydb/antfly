@@ -92,10 +92,16 @@ pub const CollectEnrichments = struct {
 pub fn topologyJsonAlloc(alloc: Allocator, tables: []const TableInfo, collect: CollectEnrichments, table_name: []const u8) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
+    return topologyFromDeclaredAlloc(alloc, tables, try declarationsAlloc(arena.allocator(), tables, collect), table_name);
+}
+
+/// `topologyJsonAlloc` from already collected declarations.
+pub fn topologyFromDeclaredAlloc(alloc: Allocator, tables: []const TableInfo, declared: []const ctx.DeclaredEnrichment, table_name: []const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
     const a = arena.allocator();
     const own = findByName(tables, table_name) orelse return error.ContextSourceTableUnavailable;
     const own_identity = try identityAlloc(a, own.table_id);
-    const declared = try declarationsAlloc(a, tables, collect);
     const inbound = try ctx.inboundDeclarationsAlloc(a, declared, own_identity);
     const wire = try a.alloc(notices.DeclaredConfig, inbound.len);
     for (inbound, wire) |d, *w| w.* = .{ .dependent_table_id = d.table_id, .artifact = d.name, .stored_json = d.context_sources_json };
@@ -216,6 +222,88 @@ pub const max_scan_rows: u32 = 100_000;
 
 pub const Host = struct {
     primitives: Primitives,
+    cache: DeclarationCache = .{},
+
+    /// Every table's enrichment declarations, recomputed only when some
+    /// table's identity or index definitions change (keyed by a digest of
+    /// them), so idle maintenance does not re-parse the catalog per group.
+    const DeclarationCache = struct {
+        mutex: std.atomic.Mutex = .unlocked,
+        digest: [32]u8 = @splat(0),
+        valid: bool = false,
+        arena: ?std.heap.ArenaAllocator = null,
+        declared: []const ctx.DeclaredEnrichment = &.{},
+        any_context_sources: bool = false,
+        checked_at_ns: u64 = 0,
+
+        fn lock(self: *DeclarationCache) void {
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        }
+
+        /// Refresh from `tables` if they changed. Caller holds the lock.
+        fn refreshLocked(self: *DeclarationCache, alloc: Allocator, tables: []const TableInfo, collect: CollectEnrichments) !void {
+            var h = std.crypto.hash.sha2.Sha256.init(.{});
+            for (tables) |t| {
+                var id: [8]u8 = undefined;
+                std.mem.writeInt(u64, &id, t.table_id, .little);
+                h.update(&id);
+                var len: [8]u8 = undefined;
+                std.mem.writeInt(u64, &len, t.indexes_json.len, .little);
+                h.update(&len);
+                h.update(t.indexes_json);
+            }
+            var digest: [32]u8 = undefined;
+            h.final(&digest);
+            if (self.valid and std.mem.eql(u8, &digest, &self.digest)) return;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            errdefer arena.deinit();
+            const owned = arena.allocator();
+            // Parsed declarations may alias the caller's catalog buffers:
+            // copy every string into the cache's own arena.
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const parsed = try declarationsAlloc(scratch.allocator(), tables, collect);
+            const declared = try owned.alloc(ctx.DeclaredEnrichment, parsed.len);
+            for (parsed, declared) |d, *o| o.* = .{
+                .table_id = try owned.dupe(u8, d.table_id),
+                .name = try owned.dupe(u8, d.name),
+                .source_artifact = try owned.dupe(u8, d.source_artifact),
+                .context_sources_json = try owned.dupe(u8, d.context_sources_json),
+            };
+            var any = false;
+            for (declared) |d| if (d.context_sources_json.len != 0) {
+                any = true;
+            };
+            if (self.arena) |*old| old.deinit();
+            self.arena = arena;
+            self.declared = declared;
+            self.any_context_sources = any;
+            self.digest = digest;
+            self.valid = true;
+        }
+    };
+
+    pub fn deinit(self: *Host) void {
+        if (self.cache.arena) |*arena| arena.deinit();
+        self.cache = .{};
+    }
+
+    /// Whether any table declares context sources. Re-reads the catalog at
+    /// most once per `max_age_ns`; callers use it to skip idle maintenance.
+    pub fn anyContextSources(self: *Host, alloc: Allocator, now_ns: u64, max_age_ns: u64) !bool {
+        self.cache.lock();
+        defer self.cache.mutex.unlock();
+        if (self.cache.valid and now_ns -| self.cache.checked_at_ns < max_age_ns) return self.cache.any_context_sources;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const p = self.primitives;
+        try self.cache.refreshLocked(cache_allocator, try p.tables_fn(p.ptr, arena.allocator()), p.collect);
+        self.cache.checked_at_ns = now_ns;
+        return self.cache.any_context_sources;
+    }
+
+    /// The cache outlives every request; it never borrows a caller's.
+    const cache_allocator = std.heap.page_allocator;
 
     /// One context operation for the owner of `group_id`/`table_name`.
     pub fn call(self: *Host, alloc: Allocator, op_raw: u32, group_id: u64, table_name: []const u8, request: []const u8) ![]u8 {
@@ -297,7 +385,10 @@ pub const Host = struct {
             },
             .topology => {
                 const tables = try p.tables_fn(p.ptr, a);
-                return topologyJsonAlloc(alloc, tables, p.collect, table_name);
+                self.cache.lock();
+                defer self.cache.mutex.unlock();
+                try self.cache.refreshLocked(cache_allocator, tables, p.collect);
+                return topologyFromDeclaredAlloc(alloc, tables, self.cache.declared, table_name);
             },
         }
     }
@@ -550,4 +641,73 @@ test "context host delivers notices to every group of the dependent table" {
     defer alloc.free(leader);
     try std.testing.expectEqualStrings("1", leader);
     try std.testing.expectError(error.ContextDependentUnavailable, host.call(alloc, @backingInt(host_json.Op.deliver), 10, "orgs", "{\"dependent\":\"srv:404\",\"notice\":\"n\"}"));
+}
+
+var test_collect_calls: usize = 0;
+
+fn countingTestCollect(a: Allocator, indexes_json: []const u8) anyerror![]const db_types.EnrichmentConfig {
+    test_collect_calls += 1;
+    return testCollect(a, indexes_json);
+}
+
+test "context host caches catalog declarations until the catalog changes" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        docs_indexes: []const u8 = "{}",
+        fn tables(ptr: *anyopaque, a: Allocator) anyerror![]const TableInfo {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const out = try a.alloc(TableInfo, 2);
+            out[0] = .{ .table_id = 7, .name = "orgs", .indexes_json = "{}" };
+            out[1] = .{ .table_id = 9, .name = "docs", .indexes_json = try a.dupe(u8, self.docs_indexes) };
+            return out;
+        }
+        fn propose(_: *anyopaque, _: Allocator, _: u64, _: []const u8, _: command_mod.Command, _: bool) anyerror!void {}
+        fn isLeader(_: *anyopaque, _: u64) bool {
+            return true;
+        }
+        fn groups(_: *anyopaque, a: Allocator, _: []const u8) anyerror![]const u64 {
+            return a.dupe(u64, &.{1});
+        }
+        fn groupForKey(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror!u64 {
+            return 1;
+        }
+        fn reads(_: *anyopaque) table_reads.TableReadSource {
+            unreachable;
+        }
+        fn parseQuery(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror!db_types.SearchRequest {
+            return error.UnsupportedQueryRequest;
+        }
+    };
+    var fake = Fake{};
+    var host = Host{ .primitives = .{ .ptr = &fake, .propose_fn = Fake.propose, .is_leader_fn = Fake.isLeader, .groups_fn = Fake.groups, .group_for_key_fn = Fake.groupForKey, .tables_fn = Fake.tables, .reads_fn = Fake.reads, .collect = .{ .collect_fn = countingTestCollect }, .parse_query_fn = Fake.parseQuery } };
+    defer host.deinit();
+    test_collect_calls = 0;
+    // No context sources anywhere: idle maintenance can skip the sweep.
+    try std.testing.expect(!try host.anyContextSources(alloc, 1, std.time.ns_per_s));
+    const parsed_once = test_collect_calls;
+    for (0..3) |_| {
+        const out = try host.call(alloc, @backingInt(host_json.Op.topology), 1, "orgs", "");
+        defer alloc.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"inbound\":[]") != null);
+    }
+    // Unchanged catalog: no re-parse for repeated topology requests.
+    try std.testing.expectEqual(parsed_once, test_collect_calls);
+
+    // docs now reads orgs: the catalog changed, so declarations refresh.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tables = [_]TableInfo{
+        .{ .table_id = 7, .name = "orgs", .indexes_json = "{}" },
+        .{ .table_id = 9, .name = "docs", .indexes_json = "{}" },
+    };
+    const stored = try admitAlloc(a, &tables, .{ .collect_fn = testCollect }, "docs", "brief", try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"org":{"document":{"table":"orgs","key_from":"/org"},"fields":["name"]}}
+    , .{}), null, null);
+    fake.docs_indexes = try std.fmt.allocPrint(a, "{{\"enrichments\":[{{\"name\":\"brief\",\"context_sources_json\":{f}}}]}}", .{std.json.fmt(stored, .{})});
+    const out = try host.call(alloc, @backingInt(host_json.Op.topology), 1, "orgs", "");
+    defer alloc.free(out);
+    try std.testing.expect(test_collect_calls > parsed_once);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"dependent_table_id\":\"srv:9\"") != null);
+    try std.testing.expect(try host.anyContextSources(alloc, 1 + 2 * std.time.ns_per_s, std.time.ns_per_s));
 }
