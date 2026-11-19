@@ -18,6 +18,7 @@ const std = @import("std");
 const local = @import("antfly_local_sources");
 const catalog = local.sql_catalog;
 const ast = local.sql_ast;
+const RelationOid = local.sql_compiler.PostgresCatalogRelation;
 const Element = local.sql_array_value.ElementType;
 
 const pg_type_name = "pg_type";
@@ -27,6 +28,8 @@ const pg_namespace_storage = "\x00pg_catalog.pg_namespace";
 const pg_auth_members_storage = "\x00pg_catalog.pg_auth_members";
 const pg_publication_storage = "\x00pg_catalog.pg_publication";
 const pg_replication_slots_storage = "\x00pg_catalog.pg_replication_slots";
+const pg_class_storage = "\x00pg_catalog.pg_class";
+const pg_description_storage = "\x00pg_catalog.pg_description";
 const pg_enum_storage = "\x00pg_catalog.pg_enum";
 const pg_roles_storage = "\x00pg_catalog.pg_roles";
 pub const Role = struct {
@@ -41,12 +44,14 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
     const enums = std.mem.eql(u8, name.table, "pg_enum");
     const slots = std.mem.eql(u8, name.table, "pg_replication_slots");
     const publications = std.mem.eql(u8, name.table, "pg_publication");
-    if (!roles and !members and !namespaces and !enums and !slots and !publications and !std.mem.eql(u8, name.table, pg_type_name)) return null;
+    const descriptions = std.mem.eql(u8, name.table, "pg_description");
+    const classes = std.mem.eql(u8, name.table, "pg_class");
+    if (!classes and !descriptions and !roles and !members and !namespaces and !enums and !slots and !publications and !std.mem.eql(u8, name.table, pg_type_name)) return null;
     if (name.namespace) |namespace| if (!std.mem.eql(u8, namespace, "pg_catalog")) return null;
     if (name.database) |qualified| if (!std.mem.eql(u8, qualified, database)) return error.Forbidden;
     if (action != .read) return error.SqlReadOnlyTransaction;
     if (namespaces) return .{
-        .id = 2615,
+        .id = @backingInt(RelationOid.pg_namespace),
         .physical_name = pg_namespace_storage,
         .schema_version = 1,
         .scope = .{ .database = database, .namespace = "pg_catalog", .name = "pg_namespace", .revision = 1 },
@@ -56,7 +61,7 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
         },
     };
     if (publications) return .{
-        .id = 6104,
+        .id = @backingInt(RelationOid.pg_publication),
         .physical_name = pg_publication_storage,
         .schema_version = 1,
         .scope = .{ .database = database, .namespace = "pg_catalog", .name = "pg_publication", .revision = 1 },
@@ -73,7 +78,7 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
         },
     };
     if (slots) return .{
-        .id = 12001,
+        .id = @backingInt(RelationOid.pg_replication_slots),
         .physical_name = pg_replication_slots_storage,
         .schema_version = 1,
         .scope = .{ .database = database, .namespace = "pg_catalog", .name = "pg_replication_slots", .revision = 1 },
@@ -96,8 +101,32 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
             .{ .name = "conflicting", .path = "conflicting", .type = .boolean, .nullable = false },
         },
     };
+    if (classes) return .{
+        .id = @backingInt(RelationOid.pg_class),
+        .physical_name = pg_class_storage,
+        .schema_version = 1,
+        .scope = .{ .database = database, .namespace = "pg_catalog", .name = "pg_class", .revision = 1 },
+        .columns = &.{
+            .{ .name = "oid", .path = "oid", .type = .integer, .nullable = false },
+            .{ .name = "relname", .path = "relname", .type = .string, .nullable = false },
+            .{ .name = "relnamespace", .path = "relnamespace", .type = .integer, .nullable = false },
+            .{ .name = "relkind", .path = "relkind", .type = .string, .nullable = false },
+        },
+    };
+    if (descriptions) return .{
+        .id = @backingInt(RelationOid.pg_description),
+        .physical_name = pg_description_storage,
+        .schema_version = 1,
+        .scope = .{ .database = database, .namespace = "pg_catalog", .name = "pg_description", .revision = 1 },
+        .columns = &.{
+            .{ .name = "objoid", .path = "objoid", .type = .integer, .nullable = false },
+            .{ .name = "classoid", .path = "classoid", .type = .integer, .nullable = false },
+            .{ .name = "objsubid", .path = "objsubid", .type = .integer, .element_type = .int32, .nullable = false },
+            .{ .name = "description", .path = "description", .type = .string, .nullable = false },
+        },
+    };
     if (enums) return .{
-        .id = 3501,
+        .id = @backingInt(RelationOid.pg_enum),
         .physical_name = pg_enum_storage,
         .schema_version = 1,
         .scope = .{ .database = database, .namespace = "pg_catalog", .name = "pg_enum", .revision = 1 },
@@ -109,7 +138,7 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
         },
     };
     if (members) return .{
-        .id = 1261,
+        .id = @backingInt(RelationOid.pg_auth_members),
         .physical_name = pg_auth_members_storage,
         .schema_version = 1,
         .scope = .{ .database = database, .namespace = "pg_catalog", .name = "pg_auth_members", .revision = 1 },
@@ -123,7 +152,7 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
         },
     };
     if (roles) return .{
-        .id = 12000,
+        .id = @backingInt(RelationOid.pg_roles),
         .physical_name = pg_roles_storage,
         .schema_version = 1,
         .scope = .{ .database = database, .namespace = "pg_catalog", .name = "pg_roles", .revision = 1 },
@@ -139,7 +168,7 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
         },
     };
     return .{
-        .id = 1247, // PostgreSQL's pg_type relation OID.
+        .id = @backingInt(RelationOid.pg_type), // PostgreSQL's pg_type relation OID.
         .physical_name = pg_type_storage,
         .schema_version = 1,
         .scope = .{ .database = database, .namespace = "pg_catalog", .name = pg_type_name, .revision = 1 },
@@ -161,7 +190,80 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
 }
 
 pub fn owns(table: catalog.Table) bool {
-    return std.mem.eql(u8, table.physical_name, pg_type_storage) or isRoles(table) or isEmpty(table) or isNamespaces(table) or isReplicationSlots(table) or isPublications(table);
+    return std.mem.eql(u8, table.physical_name, pg_type_storage) or isRoles(table) or isEmpty(table) or isNamespaces(table) or isReplicationSlots(table) or isPublications(table) or isClasses(table);
+}
+
+pub fn isClasses(table: catalog.Table) bool {
+    return std.mem.eql(u8, table.physical_name, pg_class_storage);
+}
+
+pub const Class = struct {
+    oid: u32,
+    name: []const u8,
+    namespace: u32,
+    kind: []const u8 = "r",
+
+    pub fn matches(self: Class, conditions: []const catalog.Condition) !bool {
+        for (conditions) |condition| {
+            const field = std.meta.stringToEnum(enum { oid, relname, relnamespace, relkind }, condition.column) orelse return error.InvalidSqlBackendResponse;
+            const value: std.json.Value = switch (field) {
+                .oid => .{ .integer = self.oid },
+                .relname => .{ .string = self.name },
+                .relnamespace => .{ .integer = self.namespace },
+                .relkind => .{ .string = self.kind },
+            };
+            if (!try conditionMatches(value, condition)) return false;
+        }
+        return true;
+    }
+
+    fn page(a: std.mem.Allocator, items: []const Class, start: usize, limit: u32) !catalog.Page {
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+        const end = @min(items.len, start +| limit);
+        const rows = try alloc.alloc(catalog.Row, end - start);
+        for (items[start..end], rows) |item, *output| {
+            var attrs: std.json.ObjectMap = .empty;
+            try attrs.put(alloc, "oid", .{ .integer = item.oid });
+            try attrs.put(alloc, "relname", .{ .string = try alloc.dupe(u8, item.name) });
+            try attrs.put(alloc, "relnamespace", .{ .integer = item.namespace });
+            try attrs.put(alloc, "relkind", .{ .string = try alloc.dupe(u8, item.kind) });
+            output.* = .{ .id = try std.fmt.allocPrint(alloc, "{d:0>10}", .{item.oid}), .version = 1, .value = .{ .object = attrs } };
+        }
+        return .{ .rows = rows, .owned_arena = arena, .after = if (end < items.len) try std.fmt.allocPrint(alloc, "{d}", .{end}) else null };
+    }
+};
+
+pub fn scanClasses(a: std.mem.Allocator, request: catalog.Scan, items: []const Class) !catalog.Page {
+    if (request.search != null) return error.UnsupportedSqlShape;
+    return Class.page(a, items, try startOf(request.after, items.len), request.limit);
+}
+
+pub fn openClasses(request: catalog.Scan, arena: std.heap.ArenaAllocator, items: []const Class) !catalog.Cursor {
+    var owned = arena;
+    errdefer owned.deinit();
+    if (request.search != null) return error.UnsupportedSqlShape;
+    const start = try startOf(request.after, items.len);
+    const Classes = struct {
+        arena: std.heap.ArenaAllocator,
+        items: []const Class,
+        index: usize,
+        fn next(raw: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const result = try Class.page(alloc, self.items, self.index, limit);
+            self.index += result.rows.len;
+            return result;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var resources = self.arena;
+            resources.deinit();
+        }
+    };
+    const state = try owned.allocator().create(Classes);
+    state.* = .{ .arena = owned, .items = items, .index = start };
+    return .{ .ptr = state, .next = Classes.next, .close = Classes.close, .estimated_rows = items.len - start };
 }
 
 pub fn isPublications(table: catalog.Table) bool {
@@ -362,9 +464,11 @@ pub fn openNamespaces(a: std.mem.Allocator, request: catalog.Scan, items: []cons
 }
 
 /// Antfly's PostgreSQL catalog exposes built-in types and the session's
-/// effective role. It has no enum type declarations or separate role grants.
+/// effective role. SQL enum declarations, comments and separate role grants
+/// are absent from this catalog.
 pub fn isEmpty(table: catalog.Table) bool {
-    return std.mem.eql(u8, table.physical_name, pg_auth_members_storage) or std.mem.eql(u8, table.physical_name, pg_enum_storage);
+    return std.mem.eql(u8, table.physical_name, pg_auth_members_storage) or std.mem.eql(u8, table.physical_name, pg_enum_storage) or
+        std.mem.eql(u8, table.physical_name, pg_description_storage);
 }
 
 pub fn openEmpty(context: *anyopaque) catalog.Cursor {
@@ -587,6 +691,31 @@ test "pgwire pg_roles describes only the supplied authenticated role" {
     var exhausted = try cursor.next(cursor.ptr, a, 1);
     defer exhausted.deinit();
     try std.testing.expectEqual(@as(usize, 0), exhausted.rows.len);
+}
+
+test "pgwire pg_class exposes the regclass identity and paginates the captured rows" {
+    const a = std.testing.allocator;
+    const relation = (try resolve(.{ .table = "pg_class" }, .read, "default")).?;
+    try std.testing.expect(isClasses(relation));
+    try std.testing.expectEqual(@as(u64, @backingInt(RelationOid.pg_class)), relation.id);
+    try std.testing.expect(isEmpty((try resolve(.{ .table = "pg_description" }, .read, "default")).?));
+    var storage = std.heap.ArenaAllocator.init(a);
+    const items = storage.allocator().dupe(Class, &.{
+        .{ .oid = @backingInt(RelationOid.pg_class), .name = "pg_class", .namespace = builtin_namespace.oid },
+        .{ .oid = 18000, .name = "events", .namespace = 2200 },
+    }) catch |err| {
+        storage.deinit();
+        return err;
+    };
+    const cursor = try openClasses(.{ .fields = &.{}, .limit = 1 }, storage, items);
+    defer cursor.close(cursor.ptr);
+    const first = try cursor.next(cursor.ptr, a, 1);
+    defer first.deinit();
+    const second = try cursor.next(cursor.ptr, a, 1);
+    defer second.deinit();
+    try std.testing.expectEqualStrings("pg_class", first.rows[0].value.object.get("relname").?.string);
+    try std.testing.expectEqual(@as(i64, 2200), second.rows[0].value.object.get("relnamespace").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), (try cursor.next(cursor.ptr, a, 1)).rows.len);
 }
 
 test "pgwire pg_publication projects explicit publications and handles predicates" {

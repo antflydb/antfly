@@ -283,6 +283,25 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
         sql("CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT)")
         if export_snapshot:
             sql("ALTER TABLE smoke REPLICA IDENTITY FULL")
+        names = subprocess.check_output(
+            [
+                psql,
+                *connection,
+                "-XAt",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                "SELECT n.nspname, c.relname, c.relkind, d.description "
+                "FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                "LEFT JOIN pg_catalog.pg_description d ON c.oid = d.objoid "
+                "AND d.classoid = 'pg_catalog.pg_class'::regclass AND d.objsubid = 0 "
+                "WHERE n.nspname = 'public' AND c.relname = 'smoke'",
+            ],
+            text=True,
+            env=env,
+            timeout=40,
+        ).splitlines()
+        assert names == ["public|smoke|r|"]
         assert catalog_publication() == []
         sql("CREATE PUBLICATION changes FOR TABLE smoke")
         assert catalog_publication() == ["f|t|t|t|f"]

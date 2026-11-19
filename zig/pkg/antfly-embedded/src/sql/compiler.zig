@@ -45,6 +45,19 @@ pub const PostgresInputProcedure = enum {
     jsonb_in,
 };
 
+/// Relation identities exposed by the PostgreSQL compatibility catalog.
+pub const PostgresCatalogRelation = enum(u32) {
+    pg_class = 1259,
+    pg_description = 2609,
+    pg_type = 1247,
+    pg_namespace = 2615,
+    pg_publication = 6104,
+    pg_enum = 3501,
+    pg_auth_members = 1261,
+    pg_roles = 12000,
+    pg_replication_slots = 12001,
+};
+
 pub const Error = std.mem.Allocator.Error || error{
     InvalidSqlSyntax,
     UnsupportedSqlShape,
@@ -282,6 +295,16 @@ test "compiler treats TIMESTAMPTZ quoted literals as typed datetime casts" {
     try std.testing.expect(expression.* == .cast);
     try std.testing.expectEqual(ast.ColumnType.datetime, expression.cast.type);
     try std.testing.expectEqualStrings("2025-01-01T01:30:00+01:30", expression.cast.operand.literal.string);
+}
+
+test "compiler resolves PostgreSQL catalog relation regclass literals" {
+    var compiled = try compile(std.testing.allocator, "INSERT INTO identifiers (oid) VALUES ('PG_CLASS'::regclass), (CAST('pg_catalog.pg_description' AS pg_catalog.regclass)), (NULL::regclass)", .{});
+    defer compiled.deinit();
+    const values = compiled.statement.insert.rows;
+    try std.testing.expectEqual(@as(i64, 1259), values[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 2609), values[1][0].integer);
+    try std.testing.expectEqual(ast.ColumnType.integer, compiled.statement.insert.expressions[2][0].?.cast.type);
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, compile(std.testing.allocator, "SELECT 'public.pg_class'::regclass", .{}));
 }
 
 test "compiler resolves built-in input procedure regproc literals" {
@@ -2037,6 +2060,20 @@ const Parser = struct {
                 if (std.ascii.eqlIgnoreCase(symbol, @tagName(procedure))) return self.scalarNode(.{ .literal = .{ .string = @tagName(procedure) } });
             }
             return self.fail(error.SqlInvalidTextRepresentation, "unknown built-in input procedure");
+        }
+        self.pos = start;
+        const class_qualified = self.ddlWord("pg_catalog");
+        if ((!class_qualified or self.take(.dot)) and self.ddlWord("regclass")) {
+            if (operand.* != .literal) return self.fail(error.UnsupportedSqlShape, "expected a literal catalog relation name");
+            if (operand.literal == .null) return self.scalarNode(.{ .cast = .{ .operand = operand, .type = .integer } });
+            if (operand.literal != .string) return self.fail(error.UnsupportedSqlShape, "expected a literal catalog relation name");
+            const spelling = operand.literal.string;
+            const prefix = "pg_catalog.";
+            const symbol = if (std.ascii.startsWithIgnoreCase(spelling, prefix)) spelling[prefix.len..] else spelling;
+            inline for (std.meta.tags(PostgresCatalogRelation)) |catalog_relation| {
+                if (std.ascii.eqlIgnoreCase(symbol, @tagName(catalog_relation))) return self.scalarNode(.{ .literal = .{ .integer = @backingInt(catalog_relation) } });
+            }
+            return self.fail(error.SqlInvalidTextRepresentation, "unknown PostgreSQL catalog relation");
         }
         self.pos = start;
         const kind = try self.castType();

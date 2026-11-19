@@ -2958,6 +2958,11 @@ const GuardedCatalog = struct {
         if (system.isEmpty(table)) return .{ .rows = &.{} };
         if (system.isReplicationSlots(table)) return self.replicationSlotPage(alloc, request);
         if (system.isPublications(table)) return self.publicationPage(alloc, request);
+        if (system.isClasses(table)) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            return system.scanClasses(alloc, request, try self.catalogClasses(arena.allocator(), request.conditions));
+        }
         if (system.isNamespaces(table)) {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
@@ -3111,6 +3116,14 @@ const GuardedCatalog = struct {
         if (system.isEmpty(table)) return system.openEmpty(self);
         if (system.isReplicationSlots(table)) return system.openSingleRow(alloc, try self.replicationSlotPage(alloc, request));
         if (system.isPublications(table)) return system.openSingleRow(alloc, try self.publicationPage(alloc, request));
+        if (system.isClasses(table)) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            const items = self.catalogClasses(arena.allocator(), request.conditions) catch |err| {
+                arena.deinit();
+                return err;
+            };
+            return system.openClasses(request, arena, items);
+        }
         if (system.isNamespaces(table)) {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
@@ -3191,6 +3204,73 @@ const GuardedCatalog = struct {
         }
         capture.schema_search_path = try effective.toOwnedSlice(alloc);
         return capture;
+    }
+
+    fn catalogClasses(self: *GuardedCatalog, a: std.mem.Allocator, conditions: []const catalog.Condition) ![]const system.Class {
+        const domain = @import("antfly_local_sources").system_catalog_domain;
+        const Relation = compiler.PostgresCatalogRelation;
+        var result: std.ArrayList(system.Class) = .empty;
+        inline for (std.meta.tags(Relation)) |tag| {
+            const item: system.Class = .{
+                .oid = @backingInt(tag),
+                .name = @tagName(tag),
+                .namespace = system.builtin_namespace.oid,
+                .kind = switch (tag) {
+                    .pg_roles, .pg_replication_slots => "v",
+                    else => "r",
+                },
+            };
+            if (try item.matches(conditions)) try result.append(a, item);
+        }
+        const server = self.authority.server orelse return result.items;
+        if (server.source.vtable.system_catalog == null) return result.items;
+        const database = self.authority.request.database orelse domain.default_database_name;
+        const context = try self.authority.context();
+        const identity = self.authority.identity.* orelse return error.Forbidden;
+        var revision: ?u64 = null;
+        var visited: usize = 0;
+        for (try self.catalogNamespaces(a, &.{})) |namespace| {
+            if (namespace.oid == system.builtin_namespace.oid) continue;
+            var list: domain.TableList = .{ .database = database, .namespace = namespace.name, .limit = 128, .revision = revision };
+            while (true) {
+                try context.ensureActive();
+                var page_arena = std.heap.ArenaAllocator.init(server.alloc);
+                defer page_arena.deinit();
+                const scratch = page_arena.allocator();
+                const bytes = try server.source.systemCatalog(scratch, context, .{ .list_tables = list });
+                const page = try std.json.parseFromSliceLeaky(@import("../system_catalog/projection.zig").TableListing, scratch, bytes, .{});
+                if (revision) |expected| if (expected != page.revision) return error.CatalogGenerationChanged;
+                revision = page.revision;
+                list.revision = revision;
+                list.legacy_membership = page.legacy_membership;
+                for (page.entries) |entry| {
+                    visited += 1;
+                    if (visited > 4096) return error.SqlProgramLimitExceeded;
+                    const key = try (domain.Target{ .database = database, .namespace = namespace.name, .table = entry.name }).resourceNameAlloc(scratch);
+                    if (!try http.tablePermissionCurrentlyAllowed(identity, key, .read)) continue;
+                    const digest = publication_control.hash(.{ .domain = "antfly:pg-class-oid:v1", .table = entry.table.table_id });
+                    const item: system.Class = .{ .oid = 16384 + std.mem.readInt(u32, digest[0..4], .big) % (std.math.maxInt(u32) - 16384), .name = entry.name, .namespace = namespace.oid };
+                    if (try item.matches(conditions)) {
+                        var retained = item;
+                        retained.name = try a.dupe(u8, item.name);
+                        try result.append(a, retained);
+                    }
+                }
+                const next = page.next_after orelse break;
+                if (list.after) |prior| if (std.mem.eql(u8, prior, next) and list.after_table_id == page.next_table_id) return error.InvalidSqlBackendResponse;
+                list.after = try a.dupe(u8, next);
+                list.after_table_id = page.next_table_id;
+            }
+        }
+        std.mem.sort(system.Class, result.items, {}, struct {
+            fn less(_: void, lhs: system.Class, rhs: system.Class) bool {
+                return lhs.oid < rhs.oid;
+            }
+        }.less);
+        for (result.items, 0..) |item, index| {
+            if (index > 0 and item.oid == result.items[index - 1].oid) return error.InvalidSqlBackendResponse;
+        }
+        return result.items;
     }
 
     fn catalogNamespaces(self: *GuardedCatalog, a: std.mem.Allocator, conditions: []const catalog.Condition) ![]const system.Namespace {
