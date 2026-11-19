@@ -1612,6 +1612,9 @@ pub const ExternalStreamDestination = struct {
         previous_checkpoint: ?[]const u8,
         checkpoint: []const u8,
         changes: []const foreign_mod.ReplicationChange,
+        /// The entire qualified snapshot at the prepared provider cut.
+        /// An empty slice commits a cut with zero visible rows.
+        snapshot_rows: ?[]const std.json.Value = null,
         deadline_ns: ?u64,
     };
 };

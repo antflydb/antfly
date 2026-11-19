@@ -193,7 +193,26 @@ pub const StreamOwner = struct {
         if (options.catalog_table_id != request.table.table_id or options.catalog_generation != request.table.object_storage_generation) return error.CatalogGenerationChanged;
         const source = try std.fmt.allocPrint(a, "postgres:{d}:{d}", .{ request.table.table_id, request.cutover.source_ordinal });
         const epoch = try std.fmt.allocPrint(a, "{d}", .{request.cutover.cutover_authority_id});
-        const batch = try postgresBatch(a, source, epoch, request.previous_checkpoint, request.checkpoint, identity.key_columns, request.changes);
+        const batch = if (request.snapshot_rows) |rows| blk: {
+            if (request.previous_checkpoint != null or request.changes.len != 0 or
+                !std.mem.eql(u8, request.checkpoint, request.cutover.prepared_checkpoint)) return error.InvalidReplicationCheckpoint;
+            if (rows.len > max_group_changes) return error.LakeWriteTooLarge;
+            const changes = try a.alloc(Batch.Change, rows.len);
+            for (rows, changes) |row, *change| change.* = .{ .op = .upsert, .row = row };
+            const snapshot: Batch = .{
+                .batch_id = try a.dupe(u8, &catalog.types.digestHex(request.checkpoint)),
+                .source = source,
+                .epoch = epoch,
+                .checkpoint = request.checkpoint,
+                .key_fields = identity.key_columns,
+                .changes = changes,
+            };
+            try snapshot.validate(max_group_changes);
+            break :blk snapshot;
+        } else blk: {
+            const previous = request.previous_checkpoint orelse return error.InvalidReplicationCheckpoint;
+            break :blk try postgresBatch(a, source, epoch, previous, request.checkpoint, identity.key_columns, request.changes);
+        };
         const outcome = try applyBatch(a, bound.binding, options, context, batch);
         return if (outcome.committed) .committed else .accepted;
     }
@@ -1062,18 +1081,31 @@ test "external lake filesystem WAL applies the managed PostgreSQL stream owner p
     const row = try std.json.parseFromSliceLeaky(V, a, "{\"id\":1}", .{});
     var request: StreamOwner.Port.Request = .{
         .table = .{ .table_id = 9, .name = "events", .schema_json = schema, .object_storage_generation = 4 },
-        .cutover = .{ .table_id = 9, .source_ordinal = 2, .source_kind = "postgres", .cutover_authority_id = 12 },
-        .previous_checkpoint = null,
+        .cutover = .{ .table_id = 9, .source_ordinal = 2, .source_kind = "postgres", .cutover_authority_id = 12, .prepared_checkpoint = "cut" },
+        .previous_checkpoint = "cut",
         .checkpoint = &checkpoint,
         .changes = &.{.{ .op = .insert, .checkpoint = &checkpoint, .row = row }},
         .deadline_ns = null,
     };
+    var unbootstrapped = request;
+    unbootstrapped.previous_checkpoint = null;
+    try std.testing.expectError(error.InvalidReplicationCheckpoint, port.apply(port.ptr, alloc, unbootstrapped));
+    var snapshot = request;
+    snapshot.changes = &.{};
+    snapshot.snapshot_rows = &.{};
+    snapshot.previous_checkpoint = null;
+    try std.testing.expectError(error.InvalidReplicationCheckpoint, port.apply(port.ptr, alloc, snapshot));
+    snapshot.checkpoint = "cut";
+    const initial_row = try std.json.parseFromSliceLeaky(V, a, "{\"id\":2}", .{});
+    snapshot.snapshot_rows = &.{initial_row};
+    try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, snapshot));
     try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, request));
     try std.testing.expect(fixture.checks > 1);
     try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, request));
+    try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, snapshot));
     request.table.object_storage_generation += 1;
     try std.testing.expectError(error.CatalogGenerationChanged, port.apply(port.ptr, alloc, request));
     fixture.authority += 1;
     try std.testing.expectError(error.ReplicationCutoverAuthorityLost, port.apply(port.ptr, alloc, request));
-    try std.testing.expectEqual(@as(u64, 1), try watermark(a, bound.binding, options, .{}));
+    try std.testing.expectEqual(@as(u64, 2), try watermark(a, bound.binding, options, .{}));
 }
