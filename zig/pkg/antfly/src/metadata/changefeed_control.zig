@@ -1038,6 +1038,7 @@ fn initialCursor(state: State, cut: Digest) Digest {
 pub const SlotStart = struct {
     consistent_lsn: u64,
     cursor: Digest,
+    snapshot: ?SlotSnapshot = null,
 };
 
 /// Recover the original start after an ambiguous seal. The caller must supply
@@ -1059,7 +1060,11 @@ pub fn recoverSlotStart(state: State, original: Write, now: u64) !SlotStart {
         !equal(state.cut, seal.cut) or !equal(slot.database, configuration.database) or
         !std.mem.eql(u8, slot.name, configuration.name) or slot.byte_limit != configuration.byte_limit or
         slot.consistent_lsn != configuration.consistent_lsn or !configuration.matchesBinding(slot.binding)) return error.ChangefeedConflict;
-    return .{ .consistent_lsn = slot.consistent_lsn, .cursor = initialCursor(state, state.cut) };
+    return .{
+        .consistent_lsn = slot.consistent_lsn,
+        .cursor = initialCursor(state, state.cut),
+        .snapshot = if (definition.start == .snapshot_then_changes) try SlotSnapshot.capture(state, configuration.database, original.owner, now) else null,
+    };
 }
 
 /// The name identifies the exact durable slot cut. Import must also recheck
@@ -2033,6 +2038,11 @@ test "changefeed slot snapshot name binds pins and initial LSN across metadata r
     const enrollment = state;
     state = try step(a, state, .{ .seal = .{ .cut = @splat(7), .slot = config } });
     const snapshot = try SlotSnapshot.capture(state, database, definition.owner, 101);
+    const original: Write = .{ .id = id, .authority = state.authority, .owner = definition.owner, .authorization = definition.authorization, .expected_revision = enrollment.revision, .expected_epoch = enrollment.epoch, .mutation = .{ .seal = .{ .cut = state.cut, .slot = config } } };
+    const recovered = try recoverSlotStart(state, original, 101);
+    try std.testing.expectEqual(config.consistent_lsn, recovered.consistent_lsn);
+    try std.testing.expectEqualDeep(snapshot, recovered.snapshot.?);
+
     const name = snapshot.name();
     var reopened = try parse(a, try encode(a, state));
     defer reopened.deinit();

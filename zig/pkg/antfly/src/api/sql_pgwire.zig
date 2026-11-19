@@ -962,17 +962,15 @@ pub const SlotCommands = struct {
         command: wire.replication_commands.Create,
         write: control.Write,
         now: u64,
-        snapshot_name: ?[]const u8,
         context: operation.RequestContext,
     ) !wire.Result {
         if (command.temporary) return error.UnsupportedReplicationOption;
         if (write.mutation != .seal) return error.InvalidChangefeed;
         const configuration = write.mutation.seal.slot orelse return error.InvalidChangefeed;
         if (!std.mem.eql(u8, command.slot, configuration.name)) return error.InvalidChangefeed;
-        if ((command.snapshot == .export_snapshot) != (snapshot_name != null)) return error.InvalidChangefeed;
-        if (snapshot_name) |name| {
-            if (name.len == 0 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidChangefeed;
-        }
+        if (command.snapshot == .use_snapshot) return error.UnsupportedReplicationOption;
+        const snapshot_name = if (command.snapshot == .export_snapshot) try alloc.alloc(u8, control.SlotSnapshot.name_size) else null;
+        errdefer if (snapshot_name) |bytes| alloc.free(bytes);
         const point = try wire.replication_commands.formatLsn(alloc, @fromBackingInt(configuration.consistent_lsn));
         errdefer alloc.free(point);
         const values = try alloc.dupe(std.json.Value, &.{
@@ -986,7 +984,11 @@ pub const SlotCommands = struct {
         errdefer alloc.free(rows);
         // Allocate the wire result before committing so allocation failure has
         // a definite outcome. The result borrows the command and caller arena.
-        _ = try metadata.sealSlot(alloc, write, now, context);
+        const sealed = try metadata.sealSlot(alloc, write, now, context);
+        if (sealed.consistent_lsn != configuration.consistent_lsn or (sealed.snapshot != null) != (snapshot_name != null))
+            return error.MetadataMutationOutcomeUnknown;
+        if (snapshot_name) |bytes| @memcpy(bytes, &sealed.snapshot.?.name());
+
         return .{
             .columns = &.{
                 .{ .name = "slot_name", .type = .string },
@@ -1063,9 +1065,11 @@ pub const CatalogSlotEnrollment = struct {
     };
 
     pub fn create(slots: CatalogReplicationSlots, a: std.mem.Allocator, names: []const []const u8, command: wire.replication_commands.Create, request: wire.Request, context: operation.RequestContext) !wire.Result {
-        if (command.snapshot != .nothing or command.temporary) return error.UnsupportedReplicationOption;
+        if (command.snapshot == .use_snapshot or command.temporary) return error.UnsupportedReplicationOption;
         if (!control.pg_slot.validName(command.slot)) return error.InvalidReplicationSlotName;
         const source = slots.server.cfg.native_history_roots orelse return error.ChangefeedCapabilityUnsupported;
+        const export_snapshot = command.snapshot == .export_snapshot;
+        if (export_snapshot and source.bootstrap_pages == null) return error.ChangefeedCapabilityUnsupported;
         const port = slots.server.source.changefeeds orelse return error.ChangefeedCapabilityUnsupported;
         const maintenance = CatalogReplicationSlots.maintenanceContext(context);
         var arena = std.heap.ArenaAllocator.init(a);
@@ -1084,6 +1088,7 @@ pub const CatalogSlotEnrollment = struct {
             .authorization = binding.identity(),
             .tables = tables,
             .projection = .rows,
+            .start = if (export_snapshot) .snapshot_then_changes else .now,
         };
         var captured = try source.capture(scratch, definition, maintenance);
         defer captured.deinit();
@@ -1114,8 +1119,8 @@ pub const CatalogSlotEnrollment = struct {
             try policy.authorizeRoot(current, root.namespace, maintenance);
             var write: control.Write = .{ .id = id, .authority = authority, .owner = owner, .authorization = definition.authorization, .expected_revision = state.revision, .expected_epoch = state.epoch, .mutation = undefined };
             if (state.phase == .empty) {
-                write.mutation = .{ .create = .{ .id = id, .definition = definition, .now = now, .expires_at = now +| 3600 } };
-            } else if (state.phase == .enrolling and now < state.expires_at) {
+                write.mutation = .{ .create = .{ .id = id, .definition = definition, .now = now, .expires_at = now +| 3600, .bootstrap_expires_at = if (export_snapshot) now +| control.max_bootstrap_seconds else 0 } };
+            } else if (state.phase == .enrolling and !state.expiryDue(now)) {
                 if (state.roots.len == 0) {
                     write.mutation = .{ .plan_roots = try captured.initialPlans(work) };
                 } else {
@@ -1126,9 +1131,13 @@ pub const CatalogSlotEnrollment = struct {
                         continue;
                     }
                     try policy.validateRoot(state, root.namespace, root.fence, root.table_name, maintenance);
-                    const cut = control.hash(.{ .domain = "antfly:pg-slot-enrollment:v1", .authority = authority, .definition = definition.identity(), .root = root.namespace, .consumer_epoch = enrolled.consumer_epoch, .start = enrolled.start });
+                    const continuation = control.hash(.{ .domain = "antfly:pg-slot-enrollment:v1", .authority = authority, .definition = definition.identity(), .root = root.namespace, .consumer_epoch = enrolled.consumer_epoch, .start = enrolled.start });
+                    const cut = if (enrolled.snapshot) |pin|
+                        control.hash(.{ .domain = "antfly:pg-slot-snapshot-enrollment:v1", .continuation = continuation, .pin = pin })
+                    else
+                        continuation;
                     write.mutation = .{ .seal = .{ .cut = cut, .slot = .{ .database = slots.database, .name = command.slot, .binding = binding } } };
-                    return SlotCommands.create(port, a, command, write, now, null, maintenance);
+                    return SlotCommands.create(port, a, command, write, now, maintenance);
                 }
             } else return error.ChangefeedConflict;
             try port.mutate(work, write, maintenance);
@@ -4028,8 +4037,22 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
         bootstrap = try (publication_control.Mutation{ .enroll = .{ .namespace = namespace, .ownership_epoch = 1, .grant_sequence = 2, .consumer_epoch = 1, .start = 10, .snapshot = .{ .id = bootstrap.consumerId(), .digest = @splat(4), .expires_at = now + 300 } } }).apply(alloc, bootstrap, .{ .incarnation = incarnation, .sequence = 3 });
         var pinned = configuration;
         pinned.binding = try after.binding();
-        fixture.slot_state = try (publication_control.Mutation{ .seal = .{ .cut = @splat(7), .slot = pinned } }).apply(alloc, bootstrap, .{ .incarnation = incarnation, .sequence = 4 });
-        const token = try publication_control.SlotSnapshot.capture(fixture.slot_state, database, snapshot_definition.owner, now);
+        fixture.slot_state = bootstrap;
+        const writes = fixture.writes;
+        defer fixture.writes = writes;
+        const exported = try SlotCommands.create(server.source.changefeeds.?, alloc, .{ .slot = pinned.name, .snapshot = .export_snapshot }, .{
+            .id = id,
+            .authority = incarnation,
+            .owner = snapshot_definition.owner,
+            .authorization = snapshot_definition.authorization,
+            .expected_epoch = bootstrap.epoch,
+            .expected_revision = bootstrap.revision,
+            .mutation = .{ .seal = .{ .cut = @splat(7), .slot = pinned } },
+        }, now, CatalogReplicationSlots.maintenanceContext(.{}));
+        try std.testing.expectEqualStrings("CREATE_REPLICATION_SLOT", exported.command_tag);
+        try std.testing.expectEqualStrings("0/1", exported.rows[0][1].string);
+        const token = try publication_control.SlotSnapshot.parse(exported.rows[0][2].string);
+        try token.verify(fixture.slot_state, database, snapshot_definition.owner, now);
         var qualified = try slots.qualifySnapshot(alloc, token, .{});
         defer qualified.deinit();
         try std.testing.expectEqual(@as(u64, 10), qualified.value.roots[0].start);
