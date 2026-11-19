@@ -90,6 +90,9 @@ pub const AllocatorWork = struct {
     /// (`NativeFile.redoCheckpointPendingError`), has a persistently
     /// failing checkpoint on its hands, not a one-off.
     redo_checkpoint_failures: u64 = 0,
+    /// Redo-log folds this process published (the checkpoint's
+    /// `redo_folded_through` advanced). Monotonic, like the failures.
+    redo_checkpoint_folds: u64 = 0,
 
     pub fn absorb(self: *AllocatorWork, source: *AllocatorWork) void {
         if (self == source) return;

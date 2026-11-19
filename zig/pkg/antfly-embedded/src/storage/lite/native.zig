@@ -8360,6 +8360,12 @@ pub const NativeFile = struct {
     }
 
     pub fn checkpointRedoLogWithDurability(self: *NativeFile, durable: bool) anyerror!void {
+        const folded_before = self.activeCheckpoint().redo_folded_through;
+        try self.checkpointRedoLogWithDurabilityImpl(durable);
+        if (self.activeCheckpoint().redo_folded_through != folded_before) self.allocator_work.redo_checkpoint_folds +|= 1;
+    }
+
+    fn checkpointRedoLogWithDurabilityImpl(self: *NativeFile, durable: bool) anyerror!void {
         if (comptime builtin.is_test) if (self.test_fail_checkpoint_redo_log) |err| {
             self.test_fail_checkpoint_redo_log = null;
             return err;
@@ -21897,10 +21903,22 @@ fn recoverCrashedWriterDataFile(io: std.Io, path: []const u8) !void {
     _ = try recoverActiveCheckpoint(file, io, header, file_size, true);
 }
 
-const FairLockRecoveryCtx = struct { io: std.Io, path: []const u8 };
+const FairLockRecoveryCtx = struct {
+    allocator: Allocator,
+    io: std.Io,
+    wait_io: std.Io,
+    path: []const u8,
+    deadline_ns: i96,
+    /// The authoritative sidecar lock, taken before recovery may truncate
+    /// the data file; kept as the caller's lease once the turn is won.
+    lease: ?PathWriterLock = null,
+};
 
 fn fairLockRecoverDeadWriter(ctx_ptr: ?*anyopaque) anyerror!void {
-    const ctx: *const FairLockRecoveryCtx = @ptrCast(@alignCast(ctx_ptr.?));
+    const ctx: *FairLockRecoveryCtx = @ptrCast(@alignCast(ctx_ptr.?));
+    // A writer admitted by the sidecar flock alone (no region slot) may be
+    // writing right now; recovery must exclude it before touching the file.
+    if (ctx.lease == null) ctx.lease = try plainWriterLockUntil(ctx.allocator, ctx.io, ctx.wait_io, ctx.path, ctx.deadline_ns);
     try recoverCrashedWriterDataFile(ctx.io, ctx.path);
 }
 
@@ -21927,7 +21945,8 @@ pub fn fairWriterLockWithIo(allocator: Allocator, io: std.Io, wait_io: std.Io, p
     // attempt forever. `recovery_ctx` must outlive this call (it does:
     // both live in this function's own frame, and `acquireWriterFairBounded`
     // never retains the pointer past its own return).
-    var recovery_ctx = FairLockRecoveryCtx{ .io = io, .path = path };
+    var recovery_ctx = FairLockRecoveryCtx{ .allocator = allocator, .io = io, .wait_io = wait_io, .path = path, .deadline_ns = deadline_ns };
+    errdefer if (recovery_ctx.lease) |*held| held.close();
     const contended = region.acquireWriterFairBounded(wait_io, pid, .{ .nanoseconds = deadline_ns }, .{ .ctx = &recovery_ctx, .run = fairLockRecoverDeadWriter }) catch |err| switch (err) {
         error.Timeout => return error.FileBusy,
         error.Canceled => return error.Canceled,
@@ -21937,8 +21956,9 @@ pub fn fairWriterLockWithIo(allocator: Allocator, io: std.Io, wait_io: std.Io, p
 
     // Our turn, per the region's own ticket: take the real (still
     // authoritative) sidecar lock exactly as the pre-region
-    // ticket-won path always did.
-    var lease = try plainWriterLockUntil(allocator, io, wait_io, path, deadline_ns);
+    // ticket-won path always did, unless recovery already holds it.
+    var lease = recovery_ctx.lease orelse try plainWriterLockUntil(allocator, io, wait_io, path, deadline_ns);
+    recovery_ctx.lease = null;
     // Without this, a `create` failure just below would return holding
     // the sidecar flock forever: `lease` is a local the caller never
     // sees, so only this function can close it on that path.
@@ -24751,6 +24771,44 @@ const FairLockProbe = struct {
         }
     }
 };
+
+test "lite fair writer lock recovers a dead writer only under the sidecar lock" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "fair-recovery-order.aflite");
+    defer a.free(path);
+    var pool = std.Io.Threaded.init(a, .{ .concurrent_limit = .limited(4) });
+    defer pool.deinit();
+    const io = pool.io();
+    {
+        var file = try NativeFile.createWithIo(a, io, path, .{ .no_sync = true });
+        defer file.close();
+        try file.putDocument("doc", "committed");
+    }
+    // Bytes past the active checkpoint, which recovery truncates.
+    {
+        const data = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+        defer data.close(io);
+        const size = (try data.stat(io)).size;
+        var page: [4096]u8 = @splat(0xab);
+        try data.writePositionalAll(io, &page, size);
+    }
+    const before = (try std.Io.Dir.cwd().statFile(io, path, .{})).size;
+    var region = try shared_lock_region.Region.open(std.heap.page_allocator, io, path);
+    defer region.close();
+    region.markDeadWriterForTest(@as(u32, @bitCast(std.c.getpid())) +% 1);
+    // A writer admitted by the sidecar flock alone holds the file.
+    var flock_only = try plainWriterLockUntil(a, io, io, path, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
+    try std.testing.expectError(error.FileBusy, fairWriterLockWithIo(a, io, io, path, std.Io.Clock.awake.now(io).nanoseconds + 200 * std.time.ns_per_ms));
+    // Recovery never ran: the file is untouched and the dead holder stands.
+    try std.testing.expectEqual(before, (try std.Io.Dir.cwd().statFile(io, path, .{})).size);
+    try std.testing.expect(region.writerHolderDead());
+    flock_only.close();
+    var lease = try fairWriterLockWithIo(a, io, io, path, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
+    lease.close();
+    try std.testing.expect(!region.writerHolderDead());
+}
 
 test "lite fair writer lock grants contended writers in arrival order" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(16) });
