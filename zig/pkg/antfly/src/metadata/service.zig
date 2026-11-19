@@ -8966,6 +8966,8 @@ pub const MetadataHttpService = struct {
     embedding_activity_cache: EmbeddingActivityCache = .{},
     catalog_projection_reader: catalog_projection_reader.CatalogProjectionReader = .{},
     cdc_write_source_override: ?api_table_writes.TableWriteSource = null,
+    // Installed before start and borrowed until the CDC jobs drain.
+    cdc_lake_owner: ?CdcLakeOptions = null,
     local_group_status_provider: ?LocalGroupStatusProvider = null,
     local_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     routed_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
@@ -9166,6 +9168,44 @@ pub const MetadataHttpService = struct {
     pub fn setLifecycleReconcileHook(self: *MetadataHttpService, hook: ?LifecycleReconcileHook) void {
         self.lifecycle_reconcile_hook = hook;
         self.lifecycle_reconcile_requested.store(true, .release);
+    }
+
+    const CdcLakeRequest = metadata_replication_backfill.ExternalStreamDestination.Request;
+    const CdcLakeOptions = struct {
+        ptr: *anyopaque,
+        resolve: *const fn (*anyopaque, std.mem.Allocator, CdcLakeRequest) anyerror!@import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions,
+    };
+
+    pub fn installCdcLakeOwner(self: *MetadataHttpService, owner: CdcLakeOptions) void {
+        self.cdc_lake_owner = owner;
+    }
+
+    pub fn drainCdcJobs(self: *MetadataHttpService) void {
+        shutdownCdcRuntimeJobs(self);
+    }
+
+    fn resolveCdcLakeOwner(raw: *anyopaque, a: std.mem.Allocator, request: CdcLakeRequest) !@import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions {
+        const self: *MetadataHttpService = @ptrCast(@alignCast(raw));
+        const owner = self.cdc_lake_owner orelse return error.UnsupportedReplicationRoute;
+        return owner.resolve(owner.ptr, a, request);
+    }
+
+    fn checkCdcLakeOwner(raw: *anyopaque, request: CdcLakeRequest) !void {
+        const self: *MetadataHttpService = @ptrCast(@alignCast(raw));
+        try ensureCdcWorkPermit(self);
+        try self.ensureLinearizableReadWithContext(.{ .deadline_ns = request.deadline_ns });
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const table = (try store.getTable(self.alloc, self.metadata_group_id, request.table.table_id)) orelse return error.CatalogGenerationChanged;
+        defer metadata_table_manager.freeTable(self.alloc, table);
+        if (table.object_storage_generation != request.table.object_storage_generation or
+            !std.mem.eql(u8, table.schema_json, request.table.schema_json) or
+            !std.mem.eql(u8, table.replication_sources_json, request.table.replication_sources_json)) return error.CatalogGenerationChanged;
+        const current = (try store.getReplicationSourceStatus(self.alloc, self.metadata_group_id, table.table_id, request.cutover.source_ordinal)) orelse return error.ReplicationCutoverAuthorityLost;
+        defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, current);
+        if (!replicationCutoverAuthorityMatches(current, request.cutover)) return error.ReplicationCutoverAuthorityLost;
+        const definition = try @import("source_control.zig").definitionDigest(self.alloc, table.replication_sources_json, request.cutover.source_ordinal);
+        if (!try store.legacyReplicationSourceIntakeAllowed(self.alloc, self.metadata_group_id, table.table_id, request.cutover.source_ordinal, definition)) return error.SourcePendingWork;
+        try ensureCdcWorkPermit(self);
     }
 
     pub fn setCdcWriteSource(self: *MetadataHttpService, source: ?api_table_writes.TableWriteSource) void {
@@ -11791,6 +11831,7 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         snapshot: *MetadataStatus,
     ) void {
+        snapshot.managed_iceberg_sources = self.cdc_lake_owner != null and self.replica_root_dir != null;
         snapshot.runtime_status_protocol_activated_version = self.runtimeStatusProtocolActivationVersion();
         snapshot.dense_native_storage_protocol_activated_version =
             self.denseNativeStorageProtocolActivationVersion();
@@ -11902,6 +11943,7 @@ pub const MetadataHttpService = struct {
         });
         current_status.metadata_epoch = self.lifecycle_signal.currentEpoch();
         current_status.metrics = self.metrics();
+        current_status.managed_iceberg_sources = self.cdc_lake_owner != null and self.replica_root_dir != null;
         return current_status;
     }
 
@@ -13746,6 +13788,12 @@ pub const MetadataHttpService = struct {
         );
         _ = hosted_write_source.withDestinationAuthorization(self.destination_authorizer);
         const write_source = self.cdc_write_source_override orelse hosted_write_source.source();
+        var lake_owner: @import("../serverless/lake_ingestion.zig").StreamOwner = .{
+            .ptr = self,
+            .resolve = resolveCdcLakeOwner,
+            .check = checkCdcLakeOwner,
+        };
+        const lake_destination = if (self.cdc_lake_owner != null) lake_owner.port() else null;
         var cursors = loadCdcCursors(self);
         defer storeCdcCursors(self, cursors);
 
@@ -13754,6 +13802,7 @@ pub const MetadataHttpService = struct {
             .io = runtime.io() orelse std.Options.debug_io,
             .registry = &self.cdc_backfill_registry,
             .write_source = write_source,
+            .external_destination = lake_destination,
             .secret_store = self.secret_store,
             .work_permit = cdcWorkPermit(self),
             .destination_authorizer = self.destination_authorizer,
@@ -13783,6 +13832,7 @@ pub const MetadataHttpService = struct {
             .io = runtime.io() orelse std.Options.debug_io,
             .registry = &self.cdc_backfill_registry,
             .write_source = write_source,
+            .external_destination = lake_destination,
             .secret_store = self.secret_store,
             .work_permit = cdcWorkPermit(self),
             .destination_authorizer = self.destination_authorizer,
@@ -17990,7 +18040,8 @@ fn tableLifecycleMatches(
     return switch (expected) {
         .present => {
             const record = table orelse return false;
-            return tableRangesReady(snapshot, record.table_id);
+            // External object tables commit their definition without native placement.
+            return record.storage.engine == .object or tableRangesReady(snapshot, record.table_id);
         },
         .absent => table == null,
     };

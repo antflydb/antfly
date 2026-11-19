@@ -2357,29 +2357,88 @@ def test_standalone_postgres_cdc_snapshot_completes_with_embeddings_index(
     )
 
 
-@pytest.mark.parametrize("extra_rows", [0, 16_384], ids=["single-row", "multi-file"])
-def test_standalone_postgres_bootstraps_and_streams_to_writable_iceberg(
-    pg_cdc_source, tmp_path, extra_rows
+@pytest.mark.parametrize(
+    "deployment, extra_rows",
+    [("standalone", 0), ("standalone", 16_384), ("distributed", 0)],
+    ids=["standalone-single-row", "standalone-multi-file", "distributed-single-row"],
+)
+def test_postgres_bootstraps_and_streams_to_writable_iceberg(
+    pg_cdc_source, tmp_path, deployment, extra_rows, request
 ):
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
-    config = tmp_path / "antfly.json"
-    config.write_text(
-        json.dumps(
-            {
-                "deployment_mode": "standalone",
+    if deployment == "standalone":
+        config = tmp_path / "antfly.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "deployment_mode": "standalone",
+                    "storage": {
+                        "engine": "local",
+                        "local": {"base_dir": str(tmp_path / "native")},
+                    },
+                }
+            )
+        )
+        server = StandaloneAntflyServer(binary, "127.0.0.1", 0, config_path=config)
+    else:
+        from test_secrets import TableObjectStorage
+
+        artifacts = TableObjectStorage()
+        request.addfinalizer(artifacts.close)
+        config = {
+            "deployment_mode": "distributed",
+            "storage": {
+                "engine": "local",
+                "artifacts": {"connection": "cdc-artifacts", "bucket": "antfly"},
+            },
+            "connections": {
+                "cdc-artifacts": {
+                    "kind": "external_io",
+                    "capabilities": ["storage.primary"],
+                    "external_io": {
+                        "protocol": "s3",
+                        "endpoint": artifacts.endpoint,
+                        "use_ssl": False,
+                        "addressing_style": "path",
+                        "region": "us-east-1",
+                        "buckets": ["antfly"],
+                        "credentials": {
+                            "source": "static",
+                            "access_key_id": "fixture",
+                            "secret_access_key": "fixture",
+                        },
+                    },
+                }
+            },
+        }
+
+        def node_config(role):
+            return {
+                **config,
                 "storage": {
-                    "engine": "local",
-                    "local": {"base_dir": str(tmp_path / "native")},
+                    **config["storage"],
+                    "local": {"base_dir": str(tmp_path / role)},
                 },
             }
+
+        server = StatefulAntflyServer(
+            binary,
+            "127.0.0.1",
+            0,
+            metadata_config=node_config("metadata"),
+            data_config=node_config("data"),
         )
-    )
-    server = StandaloneAntflyServer(binary, "127.0.0.1", 0, config_path=config)
     table = "/tables/cdc_iceberg"
     provider = pg_cdc_source["table_name"]
 
     def call(method, path, body=None):
-        reply = requests.request(method, server.api_url + path, json=body, timeout=15)
+        try:
+            reply = requests.request(
+                method, server.api_url + path, json=body, timeout=40
+            )
+        except requests.RequestException as error:
+            pytest.fail(f"{method} {path} {error}\n{server.debug_logs()}")
+
         assert reply.ok, (
             f"{method} {path} {reply.status_code} {reply.text}\n{server.debug_logs()}"
         )
@@ -2464,6 +2523,7 @@ def test_standalone_postgres_bootstraps_and_streams_to_writable_iceberg(
             },
         )
         attached = call("GET", table + "/sources/managed")
+        assert attached["cdc_supported"], attached
         call(
             "POST",
             table + "/sources/managed",

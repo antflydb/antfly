@@ -49,6 +49,7 @@ pub const TableTopologyProtocolStatus = struct {
 
 pub const MetadataStatus = struct {
     metadata_group_id: u64,
+    managed_iceberg_sources: bool = false,
     /// Zero means the peer predates the causal reallocation barrier.
     reallocation_barrier_protocol_version: u16 = 0,
     /// Zero means the peer cannot decode atomic table-topology transitions.

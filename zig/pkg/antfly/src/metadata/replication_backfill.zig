@@ -402,7 +402,8 @@ pub const SnapshotBackfillRunner = struct {
         defer if (external) |*binding| binding.deinit(self.alloc);
         const lake_owner = if (external) |binding| blk: {
             if (binding.binding.format != .iceberg or binding.binding.write_policy != .iceberg_writer or
-                parsed.routes.len != 0 or parsed.on_update_json != null or parsed.on_delete_json != null) return error.UnsupportedReplicationRoute;
+                binding.binding.row_identity == null) return error.UnsupportedReplicationRoute;
+            try parsed.validateLakeDestination();
             const owner = self.external_destination orelse return error.UnsupportedReplicationRoute;
             const observed = owner.bootstrap_committed orelse return error.UnsupportedReplicationRoute;
             parsed.require_exact_cutover = true;
@@ -1909,7 +1910,8 @@ pub const StreamingReplicationRunner = struct {
         const destination = if (binding) |external| blk: {
             if (external.binding.format != .iceberg or external.binding.write_policy != .iceberg_writer) return error.UnsupportedReplicationRoute;
             try external.binding.validateSupported();
-            if (external.binding.row_identity == null or parsed.routes.len != 0 or parsed.on_update_json != null or parsed.on_delete_json != null) return error.UnsupportedReplicationRoute;
+            if (external.binding.row_identity == null) return error.UnsupportedReplicationRoute;
+            try parsed.validateLakeDestination();
             break :blk self.external_destination orelse return error.UnsupportedReplicationRoute;
         } else null;
 
@@ -2379,6 +2381,11 @@ const ParsedReplicationSourceConfig = struct {
     delete_document_on_delete: bool = false,
     has_routes: bool = false,
 
+    fn validateLakeDestination(self: ParsedReplicationSourceConfig) !void {
+        if (self.routes.len != 0 or self.on_update_json != null or self.on_delete_json != null)
+            return error.UnsupportedReplicationRoute;
+    }
+
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.type_name);
         alloc.free(self.dsn);
@@ -2412,6 +2419,15 @@ const ParsedReplicationRouteConfig = struct {
         self.* = undefined;
     }
 };
+
+/// Writable Iceberg owns one PostgreSQL cut and checkpoint per table.
+pub fn validateLakeSourceDefinition(a: Allocator, table_name: []const u8, encoded: []const u8, count: usize, authorizer: stored_destination_authorization.Authorizer) !void {
+    if (count > 1) return error.UnsupportedReplicationRoute;
+    if (count == 0) return;
+    var parsed = try parseReplicationSourceConfig(a, table_name, encoded, 0, authorizer);
+    defer parsed.deinit(a);
+    try parsed.validateLakeDestination();
+}
 
 fn parseReplicationSourceConfig(
     alloc: Allocator,

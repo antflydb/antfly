@@ -1264,6 +1264,7 @@ class StatefulAntflyServer:
         *,
         auth_enabled: bool = False,
         data_config: dict | None = None,
+        metadata_config: dict | None = None,
     ):
         self.binary = binary
         self.host = host
@@ -1283,6 +1284,12 @@ class StatefulAntflyServer:
             )
             setup.callback(self.tempdir.cleanup)
             self.root = Path(self.tempdir.name)
+            self.metadata_config_path = None
+            if metadata_config is not None:
+                self.metadata_config_path = self.root / "metadata-config.json"
+                self.metadata_config_path.write_text(
+                    json.dumps(metadata_config), encoding="utf-8"
+                )
             self.data_config_path = None
             if data_config is not None:
                 self.data_config_path = self.root / "data-config.json"
@@ -1325,6 +1332,8 @@ class StatefulAntflyServer:
             admin_port=self.metadata_admin_port,
             root=self.root,
         )
+        if self.metadata_config_path is not None:
+            metadata_command.extend(["--config", str(self.metadata_config_path)])
         self.metadata_proc = self.port_reservations.handoff_to(
             (self.metadata_port, self.metadata_admin_port),
             lambda: subprocess.Popen(
@@ -1400,21 +1409,20 @@ class StatefulAntflyServer:
         data_out = _read_log_tail(self.data_log_path)
         return f"[metadata]\n{metadata_out}\n[data]\n{data_out}"
 
-    def _stop_processes(self) -> None:
-        if self.data_proc is not None and self.data_proc.poll() is None:
-            self.data_proc.send_signal(signal.SIGTERM)
+    def _stop_processes(self, *, crash: bool = False) -> None:
+        for proc in (self.data_proc, self.metadata_proc):
+            if proc is None or proc.poll() is not None:
+                continue
+            if crash:
+                proc.kill()
+                proc.wait(timeout=10)
+                continue
+            proc.send_signal(signal.SIGTERM)
             try:
-                self.data_proc.wait(timeout=10)
+                proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                self.data_proc.kill()
-                self.data_proc.wait()
-        if self.metadata_proc is not None and self.metadata_proc.poll() is None:
-            self.metadata_proc.send_signal(signal.SIGTERM)
-            try:
-                self.metadata_proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.metadata_proc.kill()
-                self.metadata_proc.wait()
+                proc.kill()
+                proc.wait()
         self.data_proc = None
         self.metadata_proc = None
 
@@ -1426,8 +1434,8 @@ class StatefulAntflyServer:
         self.data_log_file = self.data_log_path.open("a")
         self._start_processes(truncate_logs=False)
 
-    def pause(self) -> None:
-        self._stop_processes()
+    def pause(self, *, crash: bool = False) -> None:
+        self._stop_processes(crash=crash)
         self.port_reservations.ensure_reserved(
             self.metadata_port,
             self.metadata_admin_port,

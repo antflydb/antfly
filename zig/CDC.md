@@ -259,9 +259,12 @@ hash, so extracting the contract does not change durable queue identities.
 
 PostgreSQL poll results expose complete committed transactions. All rows in
 one transaction share an opaque source checkpoint. Native destinations admit
-the transaction through their canonical write path. Standalone writable
-Iceberg destinations admit it through the lake ingress and resolve the
-catalog commit before advancing the durable source checkpoint. A retry uses the
+the transaction through their canonical write path. Writable Iceberg
+destinations admit it through the lake ingress and resolve the catalog commit
+before advancing the durable source checkpoint. On a distributed cluster, the
+metadata leader uses the configured shared S3 or GCS artifact lane for that
+ingress. Configure the same artifact store on metadata and serving nodes.
+Each writable Iceberg table owns one PostgreSQL source cut and checkpoint. A retry uses the
 same source epoch, transaction identity, and checkpoint. Unsupported mutation
 messages, including inbound TRUNCATE, stop progress before the checkpoint.
 
@@ -270,6 +273,8 @@ the public changefeed API and eligible relational tables through pgoutput.
 Writable Iceberg reports its ingress and catalog commit capability. External
 read-only Iceberg attachments report committed snapshots as their change
 authority. Index publication is a separate milestone across these contracts.
+The managed-source status reports the durable published generation and its
+base snapshot alongside pending or failed index generations.
 See [destination integration](https://github.com/antflydb/antfly/issues/1698)
 and [committed history and changefeeds](https://github.com/antflydb/antfly/issues/1639).
 

@@ -148,6 +148,11 @@ pub const MetadataServer = struct {
     restore_supervisor_owner_id: u64 = 0,
     restore_supervisor_stop: std.atomic.Value(bool) = .init(false),
 
+    fn resolveCdcLakeOptions(raw: *anyopaque, a: std.mem.Allocator, request: @import("replication_backfill.zig").ExternalStreamDestination.Request) !@import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions {
+        const api: *public_api_kernel.ApiHttpServer = @ptrCast(@alignCast(raw));
+        return api.lakeStreamOwnerOptions(.{ .allocator = a, .table = request.table, .request = .{ .deadline_ns = request.deadline_ns } });
+    }
+
     pub fn init(
         alloc: std.mem.Allocator,
         cfg: MetadataServerConfig,
@@ -413,6 +418,11 @@ pub const MetadataServer = struct {
                 return err;
             };
             owned_public_http_server = public_http_server;
+            if (api_server_cfg.node_config) |node| {
+                const storage = node.storage.artifacts;
+                if (storage.connection != null and storage.bucket != null)
+                    svc.installCdcLakeOwner(.{ .ptr = public_http_server, .resolve = resolveCdcLakeOptions });
+            }
             try public_http_server.attachReplicatedRestoreJobStore(metadataRestoreJobPersistence(svc));
             public_http_server.bindIncomingGraphRoutes(public_read_source.source());
 
@@ -480,6 +490,7 @@ pub const MetadataServer = struct {
 
     pub fn deinitWithDeadline(self: *MetadataServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
         self.stopRestoreSupervisor();
+        self.svc.drainCdcJobs();
         if (self.transition_ops_registration) |*registration| registration.deinit();
         self.transition_ops_registration = null;
         if (self.owned_admin_listener) |listener| {
