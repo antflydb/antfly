@@ -28,7 +28,10 @@ from port_reservations import find_free_port
 
 
 @pytest.mark.e2e_resource("antfly_process")
-def test_pg_recvlogical_resume_after_restart(tmp_path):
+@pytest.mark.parametrize(
+    "export_snapshot", [False, True], ids=["stream-only", "exported-snapshot"]
+)
+def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
     binary = harness.resolve_binary_path(
         os.environ.get("ANTFLY_BIN", str(harness.DEFAULT_ANTFLY_BIN))
     )
@@ -66,9 +69,9 @@ def test_pg_recvlogical_resume_after_restart(tmp_path):
             timeout=40,
         )
 
-    def slot(*action):
+    def slot(*action, name="smoke_slot"):
         subprocess.run(
-            [client, *connection, "--slot=smoke_slot", *action],
+            [client, *connection, f"--slot={name}", *action],
             env=env,
             check=True,
             timeout=40,
@@ -125,7 +128,65 @@ def test_pg_recvlogical_resume_after_restart(tmp_path):
     try:
         sql("CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT)")
         sql("CREATE PUBLICATION changes FOR TABLE smoke")
-        slot("--create-slot", "--plugin=pgoutput")
+        if export_snapshot:
+            slot("--create-slot", "--plugin=pgoutput", name="history_setup")
+            sql("INSERT INTO smoke (id, content) VALUES (6, 'snapshot-before-cut')")
+            exporter_connection = [
+                *connection[:-1],
+                "dbname=default replication=database",
+            ]
+            exported = subprocess.check_output(
+                [
+                    psql,
+                    *exporter_connection,
+                    "-XAt",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-c",
+                    "CREATE_REPLICATION_SLOT smoke_slot LOGICAL pgoutput EXPORT_SNAPSHOT",
+                ],
+                env=env,
+                text=True,
+                timeout=40,
+            )
+            name, point, snapshot, plugin = exported.strip().split("|")
+            assert name == "smoke_slot"
+            assert point and point != "0/0"
+            assert snapshot.startswith("antfly_v1_")
+            assert plugin == "pgoutput"
+            sql("UPDATE smoke SET content = 'snapshot-after-cut' WHERE id = 6")
+            copied = subprocess.run(
+                [
+                    psql,
+                    *connection,
+                    "-XAt",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-v",
+                    "VERBOSITY=verbose",
+                    "-c",
+                    "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+                    "-c",
+                    f"SET TRANSACTION SNAPSHOT '{snapshot}'",
+                    "-c",
+                    "SELECT content FROM smoke",
+                    "-c",
+                    "COMMIT",
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=40,
+            )
+            assert copied.returncode == 0, copied.stdout + copied.stderr
+            assert copied.stdout.splitlines() == [
+                "BEGIN",
+                "SET",
+                "snapshot-before-cut",
+                "COMMIT",
+            ]
+        else:
+            slot("--create-slot", "--plugin=pgoutput")
         first = tmp_path / "first.bin"
         with stream(first) as reader:
             sql("INSERT INTO smoke (id, content) VALUES (7, 'retained-stream-smoke')")
@@ -135,6 +196,10 @@ def test_pg_recvlogical_resume_after_restart(tmp_path):
                     break
                 time.sleep(0.2)
             assert first.exists() and b"retained-stream-smoke" in first.read_bytes()
+            if export_snapshot:
+                assert b"snapshot-after-cut" in first.read_bytes()
+                assert b"snapshot-before-cut" not in first.read_bytes()
+
             # Give the client time to flush and report the complete frame.
             time.sleep(12)
 
@@ -146,5 +211,10 @@ def test_pg_recvlogical_resume_after_restart(tmp_path):
             assert resumed.is_file()
         assert resumed.read_bytes() == b""
         slot("--drop-slot")
+        if export_snapshot:
+            slot("--drop-slot", name="history_setup")
+    except Exception:
+        print(server.debug_logs())
+        raise
     finally:
         server.stop()

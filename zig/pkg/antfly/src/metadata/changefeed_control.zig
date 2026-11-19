@@ -24,6 +24,7 @@ pub const Namespace = [24]u8;
 pub const protocol_version: u16 = 109;
 pub const verified_bootstrap_protocol_version: u16 = 111;
 pub const qualified_bootstrap_protocol_version: u16 = 112;
+pub const slot_snapshot_start_protocol_version: u16 = 113;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
@@ -469,6 +470,7 @@ pub const Mutation = union(enum) {
     // Retained for replay of entries admitted before certified cutover.
     finish_bootstrap: struct { proof: Digest },
     finish_verified_bootstrap: struct { proof: Digest },
+    start_exported_slot: struct { name: SlotSnapshot, now: u64, requested_lsn: u64 },
     release_snapshot: struct { namespace: Namespace, snapshot_id: Id, proof: Digest },
     renew: struct { now: u64, expires_at: u64 },
     expire: u64,
@@ -483,6 +485,7 @@ pub const Mutation = union(enum) {
             .settled => |result| if (result.effect == .rejected and result.effect.rejected == 8) return qualified_bootstrap_protocol_version,
             else => {},
         };
+        if (self == .start_exported_slot) return slot_snapshot_start_protocol_version;
         return if (self == .finish_verified_bootstrap) verified_bootstrap_protocol_version else protocol_version;
     }
 
@@ -530,6 +533,7 @@ pub const Mutation = union(enum) {
             .reclaimed => |value| if (!nz(value.namespace) or value.consumer_epoch == 0 or value.next < value.previous) return error.InvalidChangefeed,
             .finish_bootstrap => |value| if (!nz(value.proof)) return error.InvalidChangefeed,
             .finish_verified_bootstrap => |value| if (!nz(value.proof)) return error.InvalidChangefeed,
+            .start_exported_slot => |value| if (!nz(value.name.feed) or !nz(value.name.proof) or value.now == 0) return error.InvalidChangefeed,
             .release_snapshot => |value| if (!nz(value.namespace) or !nz(value.snapshot_id) or !nz(value.proof)) return error.InvalidChangefeed,
             .renew => |value| try lease(value.now, value.expires_at),
             .expire => |value| if (value == 0) return error.InvalidChangefeed,
@@ -874,6 +878,20 @@ pub const Mutation = union(enum) {
             },
             .finish_verified_bootstrap => |completion| {
                 if (!equal(completion.proof, try state.bootstrapCompletionProof())) return error.ChangefeedConflict;
+                next.phase = .streaming;
+            },
+            .start_exported_slot => |start| {
+                const slot = state.slot orelse return error.ReplicationSlotNotFound;
+                try start.name.verify(state, slot.database, state.definition.?.owner, start.now);
+                _ = try slot.restartAt(start.requested_lsn);
+                const roots = try a.dupe(Root, state.roots);
+                // START explicitly adopts the exported cut. It does not
+                // allocate or acknowledge a native delivery or a WAL entry.
+                for (roots) |*root| {
+                    root.snapshot_delivered = .{ .page = 1, .done = true };
+                    root.snapshot_acknowledged = root.snapshot_delivered;
+                }
+                next.roots = roots;
                 next.phase = .streaming;
             },
             .release_snapshot => |release| {
@@ -2055,6 +2073,18 @@ test "changefeed slot snapshot name binds pins and initial LSN across metadata r
     altered_config.consistent_lsn += 1;
     const different_lsn = try step(a, enrollment, .{ .seal = .{ .cut = @splat(7), .slot = altered_config } });
     try std.testing.expectError(error.InvalidReplicationSnapshot, imported.verify(different_lsn, database, definition.owner, 101));
+    const start: Mutation = .{ .start_exported_slot = .{ .name = imported, .now = 101, .requested_lsn = config.consistent_lsn } };
+    try std.testing.expectEqual(slot_snapshot_start_protocol_version, start.requiredProtocol());
+    var invalid_start = start;
+    invalid_start.start_exported_slot.requested_lsn += 1;
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, invalid_start));
+    const streaming = try step(a, state, start);
+    try std.testing.expectEqual(Phase.streaming, streaming.phase);
+    try std.testing.expectEqualDeep(state.slot.?, streaming.slot.?);
+    try std.testing.expectEqual(state.acknowledged_cursor, streaming.acknowledged_cursor);
+    try std.testing.expect(streaming.roots[0].snapshot_acknowledged.done);
+    try std.testing.expect(streaming.needsMaintenance(101));
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, imported.verify(streaming, database, definition.owner, 101));
     const issued = testDelivery(state, &.{.{ .namespace = namespace, .position = .{ .sequence = 10 }, .snapshot = .{ .page = 1, .done = true } }});
     state = try step(a, state, .{ .issue = issued });
     try std.testing.expectError(error.ChangefeedResynchronizationRequired, imported.verify(state, database, definition.owner, 101));

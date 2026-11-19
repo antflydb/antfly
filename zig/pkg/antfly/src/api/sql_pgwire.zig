@@ -485,9 +485,18 @@ pub const CatalogReplicationSlots = struct {
         return page;
     }
 
+    fn normalizeSnapshotSchema(page: *@import("history_page_operations.zig").pages.BootstrapPage) !void {
+        const sources = @import("antfly_local_sources");
+        const a = page.arena.allocator();
+        const parsed = try sources.schema_mod.parseValidatedTableSchema(a, page.schema);
+        const schema = try sources.schema_mod.deriveRuntimeTableSchema(a, parsed);
+        page.schema = try sources.storage_schema.serializeSchema(a, schema);
+    }
+
     pub fn readExportedSnapshotRows(self: CatalogReplicationSlots, a: std.mem.Allocator, name: []const u8, namespace: control.Namespace, after: u32, rows: u32, bytes: u32, context: operation.RequestContext) !@import("../pgwire/values.zig").HistoricalSnapshot {
         var raw = try self.readExportedSnapshot(a, name, namespace, after, rows, bytes, context);
         defer raw.deinit();
+        try normalizeSnapshotSchema(&raw);
         return @import("../pgwire/values.zig").HistoricalSnapshot.decode(a, raw);
     }
 
@@ -496,6 +505,7 @@ pub const CatalogReplicationSlots = struct {
         const offset = if (after) |cursor| std.fmt.parseUnsigned(u32, cursor, 10) catch return error.HistoryCheckpointConflict else 0;
         var raw = try self.readExportedSnapshot(a, name, namespace, offset, rows, bytes, context);
         defer raw.deinit();
+        try normalizeSnapshotSchema(&raw);
         return @import("../pgwire/values.zig").historicalCatalogPage(a, raw, table);
     }
 
@@ -822,6 +832,13 @@ pub const CatalogRetainedStream = struct {
         const names = try owned.alloc([]const u8, binding_value.publications.len);
         for (binding_value.publications, names) |name, *copy| copy.* = try owned.dupe(u8, name);
         const expected: control.pg_slot.Binding = .{ .publications = names, .projection = binding_value.projection };
+        if (state.value.phase == .bootstrap) {
+            try publication.authorize(slots.identity, scratch.allocator(), state.value, expected);
+            try config.validate();
+            try registry.qualify(state.value, config.require_shared, context);
+            const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_s;
+            try SlotCommands.startExported(service.*, scratch.allocator(), state.value, @backingInt(start.position), now, CatalogReplicationSlots.maintenanceContext(context));
+        }
         var actor: control.Id = undefined;
         while (true) {
             try request_value.check();
@@ -954,6 +971,22 @@ pub const SlotCommands = struct {
                 continue;
             };
         }
+    }
+
+    fn startExported(metadata: Metadata, a: std.mem.Allocator, state: control.State, requested: u64, now: u64, context: operation.RequestContext) !void {
+        const slot = state.slot orelse return error.ReplicationSlotNotFound;
+        const definition = state.definition orelse return error.ChangefeedConflict;
+        const name = try control.SlotSnapshot.capture(state, slot.database, definition.owner, now);
+        _ = try slot.restartAt(requested);
+        try metadata.mutate(a, .{
+            .id = state.id,
+            .authority = state.authority,
+            .owner = definition.owner,
+            .authorization = definition.authorization,
+            .expected_revision = state.revision,
+            .expected_epoch = state.epoch,
+            .mutation = .{ .start_exported_slot = .{ .name = name, .now = now, .requested_lsn = requested } },
+        }, context);
     }
 
     pub fn create(
@@ -2795,9 +2828,12 @@ const GuardedCatalog = struct {
             return error.UnsupportedSqlShape;
         const authority = self.authority;
         const server = authority.server orelse return error.ChangefeedCapabilityUnsupported;
-        const context = try authority.context();
+        const context = try @import("../pgwire/retained_stream.zig").metadataContext(authority.request);
         const slots = try CatalogReplicationSlots.open(server, .{ .context = authority.credential, .read = Adapter.replicationIdentity }, alloc, authority.request.database orelse "default", context);
-        return slots.readExportedSnapshotCatalogPage(alloc, &snapshot.token.name(), snapshot.namespace, table, request.after, @min(request.limit, 256), 4 * 1024 * 1024, context);
+        return slots.readExportedSnapshotCatalogPage(alloc, &snapshot.token.name(), snapshot.namespace, table, request.after, @min(request.limit, 256), 4 * 1024 * 1024, context) catch |err| {
+            std.log.warn("exported snapshot page unavailable err={s}", .{@errorName(err)});
+            return err;
+        };
     }
 
     const PinnedCursor = struct {
@@ -4085,6 +4121,11 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
         try std.testing.expect(!Authority.allowsWrite(&bound_authority, "physical"));
         try std.testing.expectError(error.HistoryCheckpointConflict, slots.readExportedSnapshotCatalogPage(alloc, &token.name(), namespace, sql_table, "bad", 1, 4096, .{}));
         try std.testing.expectError(error.ChangefeedCapabilityUnsupported, slots.readExportedSnapshotCatalogPage(alloc, &token.name(), namespace, sql_table, null, 1, 4096, .{}));
+        try std.testing.expectError(error.ChangefeedConflict, SlotCommands.startExported(server.source.changefeeds.?, alloc, fixture.slot_state, 2, now, CatalogReplicationSlots.maintenanceContext(.{})));
+        try SlotCommands.startExported(server.source.changefeeds.?, alloc, fixture.slot_state, 1, now, CatalogReplicationSlots.maintenanceContext(.{}));
+        try std.testing.expectEqual(publication_control.Phase.streaming, fixture.slot_state.phase);
+        try std.testing.expectEqual(@as(u64, 1), fixture.slot_state.slot.?.confirmed_lsn);
+        try std.testing.expect(fixture.slot_state.roots[0].snapshot_acknowledged.done);
     }
     {
         var tmp = std.testing.tmpDir(.{});

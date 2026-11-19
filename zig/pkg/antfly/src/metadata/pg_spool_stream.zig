@@ -30,7 +30,7 @@ fn same(a: anytype, b: @TypeOf(a)) bool {
 pub const Config = struct {
     lease_seconds: u64 = slot_control.max_session_seconds,
     require_shared: bool = true,
-    fn validate(self: Config) !void {
+    pub fn validate(self: Config) !void {
         if (self.lease_seconds == 0 or self.lease_seconds > slot_control.max_session_seconds) return error.InvalidChangefeed;
     }
 };
