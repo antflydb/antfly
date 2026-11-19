@@ -453,6 +453,26 @@ pub const Certificate = struct {
         const manifest_digest = self.manifest.digest();
         for (self.resolutions, self.manifest.participants) |resolution, participant| try resolution.validateBound(manifest_digest, self.manifest.commit_version, participant);
     }
+
+    /// Project a validated certificate onto the feed's sorted root vector.
+    /// Out-of-scope participants and positive no-effect outcomes both leave
+    /// no pending frame for the subscriber.
+    pub fn projectEffects(self: Certificate, selected: []const Namespace, effects: []?Effects) !void {
+        if (selected.len == 0 or selected.len > max_participants or effects.len != selected.len) return error.InvalidTxnRecord;
+        try self.validate();
+        var resolution_index: usize = 0;
+        for (selected, effects, 0..) |namespace, *effect, i| {
+            if (!nonzero(namespace) or (i != 0 and std.mem.order(u8, &selected[i - 1], &namespace) != .lt)) return error.InvalidTxnRecord;
+            while (resolution_index < self.resolutions.len and std.mem.order(u8, &self.resolutions[resolution_index].namespace, &namespace) == .lt) : (resolution_index += 1) {}
+            effect.* = null;
+            if (resolution_index < self.resolutions.len and same(self.resolutions[resolution_index].namespace, namespace)) {
+                effect.* = switch (self.resolutions[resolution_index].outcome) {
+                    .effects => |value| value,
+                    .no_effect => null,
+                };
+            }
+        }
+    }
     pub fn digest(self: Certificate) Digest {
         var sha = std.crypto.hash.sha2.Sha256.init(.{});
         sha.update("antfly:transaction-completion-certificate:v1");
@@ -499,6 +519,18 @@ test "transaction completion requires exact frozen members including positive ze
     };
     const certificate: Certificate = .{ .manifest = manifest, .resolutions = &resolutions };
     try certificate.validate();
+    var projected: [3]?Effects = undefined;
+    try certificate.projectEffects(&.{ members[0].namespace, @splat(2), members[1].namespace }, &projected);
+    try std.testing.expectEqualDeep(resolutions[0].outcome.effects, projected[0].?);
+    try std.testing.expectEqual(null, projected[1]);
+    try std.testing.expectEqual(null, projected[2]);
+    var hidden: [2]?Effects = undefined;
+    try certificate.projectEffects(&.{ @splat(2), members[1].namespace }, &hidden);
+    try std.testing.expectEqualDeep([2]?Effects{ null, null }, hidden);
+    try std.testing.expectError(error.InvalidTxnRecord, certificate.projectEffects(&.{ members[0].namespace, members[0].namespace }, &hidden));
+    var incomplete = certificate;
+    incomplete.resolutions = resolutions[0..1];
+    try std.testing.expectError(error.InvalidTxnRecord, incomplete.projectEffects(&.{ @splat(2), members[1].namespace }, &hidden));
     try resolutions[0].validate(manifest);
     var foreign = resolutions[0];
     foreign.namespace = @splat(20);

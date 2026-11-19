@@ -432,10 +432,21 @@ pub const FrameCompletion = struct {
     commit_version: u64,
 };
 
+pub const CompletionProjection = struct {
+    roots: []const frame.Namespace,
+    effects: []?completion.Effects,
+};
+
 /// Qualify the exact frame against its retained all-participant certificate
 /// under the same read transaction that supplied the authenticated descriptor.
 /// The caller decides which effects belong to the subscription.
 pub fn readFrameCompletion(a: A, txn: anytype, root_generation: u64, header: frame.Header, descriptor: frame.Descriptor) !?FrameCompletion {
+    return readProjectedFrameCompletion(a, txn, root_generation, header, descriptor, null);
+}
+
+/// Return selected effects only after proving that the local frame is bound
+/// to the retained certificate in this read transaction.
+pub fn readProjectedFrameCompletion(a: A, txn: anytype, root_generation: u64, header: frame.Header, descriptor: frame.Descriptor, projection: ?CompletionProjection) !?FrameCompletion {
     if (header.transaction_scope != .coordinated or !std.mem.eql(u8, &header.namespace, &descriptor.namespace) or
         header.sequence != descriptor.sequence) return error.InvalidHistoryAdmission;
     const raw = (try optional(txn, &completionCertificateKey(header.transaction_id))) orelse {
@@ -466,6 +477,7 @@ pub fn readFrameCompletion(a: A, txn: anytype, root_generation: u64, header: fra
         if (effects.sequence != header.sequence or
             !std.mem.eql(u8, &effects.frame_digest, &frame.digest(descriptor.raw)) or
             !std.mem.eql(u8, &resolution.source_position, &header.source_position)) return error.HistoryCorrupt;
+        if (projection) |selected| try certificate.projectEffects(selected.roots, selected.effects);
         return .{ .certificate_digest = publication.digest, .commit_version = manifest.commit_version };
     }
     return error.HistoryCorrupt;
@@ -951,6 +963,10 @@ test "native history consumer control coordinated frame completion distinguishes
     const header: frame.Header = .{ .namespace = @splat(1), .sequence = 7, .transaction_id = @splat(2), .transaction_scope = .coordinated };
     var descriptor: frame.Descriptor = .{ .raw = "", .namespace = header.namespace, .sequence = header.sequence, .total = 0, .count = 0, .events = 0 };
     try std.testing.expectEqual(null, try readFrameCompletion(std.testing.allocator, &store, 1, header, descriptor));
+    var effects = [_]?completion.Effects{.{ .sequence = 11, .frame_digest = @splat(3) }};
+    const projection: CompletionProjection = .{ .roots = &.{header.namespace}, .effects = &effects };
+    try std.testing.expectEqual(null, try readProjectedFrameCompletion(std.testing.allocator, &store, 1, header, descriptor, projection));
+    try std.testing.expectEqual(@as(u64, 11), effects[0].?.sequence);
     store.retained_only = true;
     try std.testing.expectError(error.HistoryCorrupt, readFrameCompletion(std.testing.allocator, &store, 1, header, descriptor));
     descriptor.sequence += 1;
