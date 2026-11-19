@@ -13,11 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Private continuation for ROOT-LOCAL projected transactions. A partial frame
+//! Private continuation for projected transactions. A partial frame
 //! remembers whether a preceding page exposed any authorized row. This permits
 //! a later empty page to complete a relevant transaction without manufacturing
-//! completion markers for entirely hidden transactions. Coordinated transaction
-//! completion requires a separate qualified participant/outcome contract.
+//! completion markers for entirely hidden transactions. A coordinated delivery
+//! retains its certificate and visibility between completed participant frames.
 const std = @import("std");
 const control = @import("changefeed_control.zig");
 const A = std.mem.Allocator;
@@ -26,6 +26,87 @@ const base64 = std.base64.url_safe_no_pad;
 const fixed_bytes = 4 + 32 + 32 + 2;
 const max_raw_bytes = fixed_bytes + (control.max_roots + 7) / 8 + 32;
 pub const max_text_bytes = base64.Encoder.calcSize(max_raw_bytes);
+pub const Coordinated = struct {
+    transaction: Digest,
+    certificate: Digest,
+    visible: bool,
+
+    const prefix = "CFV2_";
+    const bytes = 32 * 5 + 1;
+
+    pub fn encode(self: Coordinated, a: A, scope: Digest, roots: []const control.Root) ![]u8 {
+        if (std.mem.allEqual(u8, &scope, 0) or std.mem.allEqual(u8, &self.transaction, 0) or std.mem.allEqual(u8, &self.certificate, 0)) return error.InvalidChangefeed;
+        var raw: [bytes]u8 = undefined;
+        raw[0..32].* = scope;
+        raw[32..64].* = try positions(roots);
+        raw[64..96].* = self.transaction;
+        raw[96..128].* = self.certificate;
+        raw[128] = @intFromBool(self.visible);
+        raw[129..161].* = digest(raw[0..129]);
+        const out = try a.alloc(u8, prefix.len + base64.Encoder.calcSize(bytes));
+        @memcpy(out[0..prefix.len], prefix);
+        _ = base64.Encoder.encode(out[prefix.len..], &raw);
+        return out;
+    }
+
+    pub fn decode(scope: Digest, roots: []const control.Root, text: []const u8) !?Coordinated {
+        if (!std.mem.startsWith(u8, text, prefix)) return null;
+        const encoded = text[prefix.len..];
+        if (encoded.len != base64.Encoder.calcSize(bytes)) return error.ChangefeedResynchronizationRequired;
+        var raw: [bytes]u8 = undefined;
+        base64.Decoder.decode(&raw, encoded) catch return error.ChangefeedResynchronizationRequired;
+        var canonical: [base64.Encoder.calcSize(bytes)]u8 = undefined;
+        if (!std.mem.eql(u8, encoded, base64.Encoder.encode(&canonical, &raw)) or
+            !std.mem.eql(u8, raw[0..32], &scope) or !std.mem.eql(u8, raw[32..64], &(try positions(roots))) or
+            !std.mem.eql(u8, raw[129..161], &digest(raw[0..129])) or raw[128] > 1 or
+            std.mem.allEqual(u8, raw[64..96], 0) or std.mem.allEqual(u8, raw[96..128], 0)) return error.ChangefeedResynchronizationRequired;
+        return .{ .transaction = raw[64..96].*, .certificate = raw[96..128].*, .visible = raw[128] == 1 };
+    }
+};
+
+/// A coordinated transaction starts only when every subscribed effect is at
+/// its root's head. This avoids holding a visible transaction open behind an
+/// unrelated predecessor. A partially consumed frame still needs completion.
+pub fn requireCoordinatedHead(roots: []const control.Root, effects: anytype, selected: usize, sequence: u64, resuming: bool) !void {
+    if (effects.len != roots.len or selected >= roots.len or effects[selected] == null or effects[selected].?.sequence != sequence)
+        return error.ChangefeedResynchronizationRequired;
+    for (roots, effects, 0..) |root, effect, index| {
+        if (!resuming and index != selected and root.delivered.event != 0) return error.ReadUnavailable;
+        if (effect) |expected| {
+            if (expected.sequence == 0) return error.ChangefeedResynchronizationRequired;
+            if (root.delivered.sequence < expected.sequence - 1) return error.ReadUnavailable;
+        } else if (root.delivered.event != 0 and index != selected) return error.ReadUnavailable;
+    }
+}
+
+test "coordinated projection retains visibility across finished root frames" {
+    const a = std.testing.allocator;
+    var roots = [_]control.Root{ testRoot(1, 0), testRoot(2, 0), testRoot(3, 0) };
+    const Effect = struct { sequence: u64 };
+    const effects = [_]?Effect{ .{ .sequence = 8 }, .{ .sequence = 9 }, null };
+    try std.testing.expectError(error.ReadUnavailable, requireCoordinatedHead(&roots, &effects, 0, 8, false));
+    roots[1].delivered.sequence = 8;
+    try requireCoordinatedHead(&roots, &effects, 0, 8, false);
+    try std.testing.expect(!otherCoordinatedEffectsConsumed(&roots, &effects, 0));
+    roots[0].delivered.sequence = 8;
+    const active: Coordinated = .{ .transaction = @splat(2), .certificate = @splat(3), .visible = true };
+    const encoded = try active.encode(a, @splat(1), &roots);
+    defer a.free(encoded);
+    try std.testing.expect(control.validProviderContext(encoded));
+    try std.testing.expectEqualDeep(active, (try Coordinated.decode(@splat(1), &roots, encoded)).?);
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, Coordinated.decode(@splat(4), &roots, encoded));
+    try requireCoordinatedHead(&roots, &effects, 1, 9, true);
+    try std.testing.expect(otherCoordinatedEffectsConsumed(&roots, &effects, 1));
+    roots[1].delivered.event = 1;
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, Coordinated.decode(@splat(1), &roots, encoded));
+}
+
+pub fn otherCoordinatedEffectsConsumed(roots: []const control.Root, effects: anytype, selected: usize) bool {
+    for (roots, effects, 0..) |root, effect, index| {
+        if (index != selected and effect != null and root.delivered.sequence < effect.?.sequence) return false;
+    }
+    return true;
+}
 fn digest(raw: []const u8) Digest {
     var out: Digest = undefined;
     std.crypto.hash.sha2.Sha256.hash(raw, &out, .{});

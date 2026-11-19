@@ -105,7 +105,9 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
         pub fn authorize(self: *Self, state: control.State, request: anytype) !void {
             try self.policy.authorize(state, request);
             _ = try self.root.validateScope(state);
-            if (state.definition.?.tables.len != 1 or state.roots.len != 1 or !equal(state.roots[0].namespace, self.root.namespace)) return error.ChangefeedCapabilityUnsupported;
+            _ = try state.rootIndex(self.root.namespace);
+            if (state.roots.len == 1 and state.definition.?.tables.len != 1) return error.ChangefeedCapabilityUnsupported;
+            if (state.roots.len != 1 and (state.phase == .bootstrap or !@hasDecl(Root, "readProjectedWithContext"))) return error.ChangefeedCapabilityUnsupported;
             if (self.raw_bytes_limit == 0 or self.raw_bytes_limit > page_types.max_source_bytes) return error.InvalidChangefeed;
         }
         pub fn nowSeconds(self: *Self, request: anytype) !u64 {
@@ -211,12 +213,15 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
             const roots = try state.rootsAt(a, before);
             if (state.phase == .bootstrap) return self.renderSnapshot(a, state, roots[0], original, limits, request);
             const context = try state.contextAt(before);
-            const seen = try continuation.decode(a, scope(state), roots, context);
+            const index = try state.rootIndex(self.root.namespace);
+            const coordinated = try continuation.Coordinated.decode(scope(state), roots, context);
+            const seen = if (coordinated == null) try continuation.decode(a, scope(state), roots, context) else try a.alloc(bool, roots.len);
+            if (coordinated != null) @memset(seen, false);
             if (original) |receipt| if (receipt.advances.len == 0) {
                 if (!std.mem.eql(u8, receipt.provider_context, context)) return error.ChangefeedResynchronizationRequired;
                 return heartbeat(a, state, before, context, limits);
             };
-            const start = roots[0].delivered;
+            const start = roots[index].delivered;
             var raw_events = limits.events;
             var target: ?control.Position = null;
             if (original) |receipt| {
@@ -231,10 +236,15 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
                 }
                 if (raw_events > 1024) return error.ChangefeedResynchronizationRequired;
             }
-            var page = try self.root.readWithContext(a, state, before, try self.nowSeconds(request), raw_events, self.raw_bytes_limit, request);
+            const now = try self.nowSeconds(request);
+            var page = if (@hasDecl(Root, "readProjectedWithContext") and roots.len > 1)
+                try self.root.readProjectedWithContext(a, state, before, now, raw_events, self.raw_bytes_limit, request)
+            else
+                try self.root.readWithContext(a, state, before, now, raw_events, self.raw_bytes_limit, request);
             defer page.deinit();
             const header = page.header orelse {
                 if (original != null) return error.ChangefeedResynchronizationRequired;
+                if (coordinated != null) return error.ReadUnavailable;
                 return heartbeat(a, state, before, context, limits);
             };
             const completion = switch (header.transaction_scope) {
@@ -247,7 +257,15 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
             else
                 control.hash(.{ .domain = "antfly:feed-transaction:v1", .scope = scope(state), .namespace = header.namespace, .transaction = header.transaction_id, .sequence = header.sequence });
             const transaction_id = try hex(a, transaction_identity);
-            const table_id = try std.fmt.allocPrint(a, "{d}", .{state.definition.?.tables[0].table_id});
+            const distributed = completion != null and roots.len > 1;
+            if (coordinated) |active| {
+                if (!distributed or !equal(active.transaction, transaction_identity) or !equal(active.certificate, completion.?.certificate_digest))
+                    return error.ReadUnavailable;
+            }
+            if (distributed) try continuation.requireCoordinatedHead(roots, page.completion_effects, index, header.sequence, coordinated != null);
+            const other_effects_consumed = !distributed or continuation.otherCoordinatedEffectsConsumed(roots, page.completion_effects, index);
+            const table = try self.root.validateScope(state);
+            const table_id = try std.fmt.allocPrint(a, "{d}", .{table.table_id});
             var events: std.ArrayList(RawJson) = .empty;
             var event_bytes: u64 = 0;
             var consumed: u32 = 0;
@@ -255,13 +273,13 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
                 .rows => .rows,
                 .keys_and_versions => .keys_and_versions,
             };
-            for (page.events, 0..) |raw, index| {
+            for (page.events, 0..) |raw, ordinal_in_page| {
                 try request.ensureActive();
                 const document = try page_types.documentId(a, raw.key);
                 const images = try self.policy.images(a, state, header, document, try parseImage(a, raw.before), try parseImage(a, raw.after), request);
-                const effect = try projection.project(a, state.definition.?.tables[0], projected, images.before, images.after);
+                const effect = try projection.project(a, table, projected, images.before, images.after);
                 if (effect) |value| {
-                    const ordinal = page.first_ordinal + @as(u32, @intCast(index));
+                    const ordinal = page.first_ordinal + @as(u32, @intCast(ordinal_in_page));
                     const event: Event = .{
                         .event_id = try hex(a, control.hash(.{ .domain = "antfly:feed-event:v1", .scope = scope(state), .namespace = header.namespace, .sequence = header.sequence, .ordinal = ordinal })),
                         .transaction_id = transaction_id,
@@ -273,7 +291,7 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
                         .after = if (value.after) |v| .{ .a = a, .value = v } else null,
                     };
                     const bytes = try size(a, event);
-                    const complete = page.first_ordinal + consumed + 1 == page.frame_events;
+                    const complete = other_effects_consumed and page.first_ordinal + consumed + 1 == page.frame_events;
                     const envelope_bytes = try size(a, Envelope{ .events = &.{}, .transaction = .{ .transaction_id = transaction_id, .complete = complete } });
                     const total = envelope_bytes + event_bytes + bytes + events.items.len;
                     if (total > limits.bytes or events.items.len >= limits.events) {
@@ -288,11 +306,15 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
             const complete = page.first_ordinal + consumed == page.frame_events;
             const next: control.Position = if (complete) .{ .sequence = header.sequence } else .{ .sequence = start.sequence, .event = page.first_ordinal + consumed };
             if (target) |expected| if (next.order(expected) != .eq) return error.ChangefeedResynchronizationRequired;
-            const relevant = seen[0] or events.items.len != 0;
-            seen[0] = relevant and !complete;
-            roots[0].delivered = next;
-            const next_context = try continuation.encode(a, scope(state), roots, seen);
-            const envelope: Envelope = .{ .events = events.items, .transaction = if (relevant) .{ .transaction_id = transaction_id, .complete = complete } else null };
+            const relevant = (if (coordinated) |active| active.visible else seen[index]) or events.items.len != 0;
+            const transaction_complete = complete and other_effects_consumed;
+            roots[index].delivered = next;
+            seen[index] = relevant and !complete and !distributed;
+            const next_context = if (distributed and !transaction_complete)
+                try (continuation.Coordinated{ .transaction = transaction_identity, .certificate = completion.?.certificate_digest, .visible = relevant }).encode(a, scope(state), roots)
+            else
+                try continuation.encode(a, scope(state), roots, seen);
+            const envelope: Envelope = .{ .events = events.items, .transaction = if (relevant) .{ .transaction_id = transaction_id, .complete = transaction_complete } else null };
             if (try size(a, envelope) > limits.bytes) return error.ChangefeedBackpressure;
             const advances = try a.dupe(control.Advance, &.{.{ .namespace = self.root.namespace, .position = next }});
             const position_proof = control.hash(.{ .domain = "antfly:native-document-page:v1", .scope = scope(state), .header = header, .start = start, .next = next, .before_context = context, .after_context = next_context });

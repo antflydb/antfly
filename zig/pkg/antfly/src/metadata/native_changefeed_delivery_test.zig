@@ -289,3 +289,92 @@ pub fn bootstrap() !void {
     try std.testing.expect(acknowledged.value.roots[0].snapshot_acknowledged.done);
     _ = try acknowledged.value.bootstrapCompletionProof();
 }
+
+pub fn coordinated() !void {
+    const a = std.testing.allocator;
+    const Page = local.table_write_source.history_page.Page;
+    const record: Table = .{ .table_id = 7, .name = "docs", .schema_json = "{}" };
+    const table: control.Table = .{
+        .table_id = 7,
+        .binding = control.tableBinding(record),
+        .policy_revision = 1,
+        .contract = .native_document,
+        .predicates = &.{.{ .field = "tenant", .value = .{ .string = "A" } }},
+    };
+    const first_ns = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 7 } ++ @as([16]u8, @splat(1));
+    const second_ns = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 7 } ++ @as([16]u8, @splat(2));
+    const Root = struct {
+        namespace: control.Namespace,
+        pub fn validateScope(_: *@This(), state: control.State) !control.Table {
+            try state.validate();
+            return state.definition.?.tables[0];
+        }
+        pub fn readWithContext(_: *@This(), _: A, _: control.State, _: control.Digest, _: u64, _: u32, _: u32, _: Request) !Page {
+            return error.TestExpectedProjectedRead;
+        }
+        pub fn readProjectedWithContext(self: *@This(), alloc: A, _: control.State, _: control.Digest, _: u64, _: u32, _: u32, _: Request) !Page {
+            const visible = std.mem.eql(u8, &self.namespace, &first_ns);
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            errdefer arena.deinit();
+            const scratch = arena.allocator();
+            const key = try @import("antfly_local_sources").storage_internal_keys.documentKeyAlloc(scratch, if (visible) "visible" else "hidden");
+            const events = try scratch.dupe(@typeInfo(@FieldType(Page, "events")).pointer.child, &.{.{ .key = key, .before = null, .after = if (visible) "{\"tenant\":\"A\"}" else "{\"tenant\":\"B\"}" }});
+            return .{
+                .arena = arena,
+                .header = .{ .namespace = self.namespace, .sequence = 1, .transaction_id = @splat(5), .transaction_scope = .coordinated },
+                .completion = .{ .certificate_digest = @splat(6), .commit_version = 7 },
+                .completion_effects = &.{ .{ .sequence = 1, .frame_digest = @splat(8) }, .{ .sequence = 1, .frame_digest = @splat(9) } },
+                .events = events,
+                .frame_events = 1,
+                .next = .{ .sequence = 1 },
+                .observed_latest = 1,
+                .caught_up = true,
+            };
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const meta_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/coordinated-meta", .{tmp.sub_path});
+    defer a.free(meta_path);
+    var store = try Store.init(a, .{ .root_dir = meta_path });
+    defer store.deinit();
+    try store.applyStandaloneCommand(group, .{ .upsert_table = record });
+    var svc: Service = .{ .store = &store };
+    const definition: control.Definition = .{ .owner = @splat(1), .authorization = @splat(2), .projection = .rows, .tables = &.{table} };
+    try svc.mutate(a, .{ .create = .{ .id = @splat(4), .definition = definition, .now = 100, .expires_at = 1000 } });
+    try svc.mutate(a, .{ .plan_roots = &.{ .{ .namespace = first_ns, .ownership_epoch = 1 }, .{ .namespace = second_ns, .ownership_epoch = 1 } } });
+    inline for (.{ first_ns, second_ns }) |namespace| {
+        var state = try svc.load(a);
+        defer state.deinit();
+        const root = state.value.roots[try state.value.rootIndex(namespace)];
+        try svc.mutate(a, .{ .enroll = .{ .namespace = namespace, .ownership_epoch = 1, .grant_sequence = root.grant_sequence, .consumer_epoch = 1, .start = 0 } });
+    }
+    try svc.mutate(a, .{ .seal = .{ .cut = @splat(7) } });
+    var state = try svc.load(a);
+    defer state.deinit();
+    var policy: Policy = .{};
+    var root: Root = .{ .namespace = first_ns };
+    var renderer: provider.ProviderFor(Root, Policy) = .{ .root = &root, .policy = &policy };
+    const id = state.value.id;
+    var first = try coordinator.pull(&svc, &renderer, a, id, state.value.latest_cursor, .{}, Request{});
+    defer first.deinit();
+    var initial = try body(a, first.body);
+    defer initial.deinit();
+    const transaction = initial.value.object.get("transaction").?.object;
+    try std.testing.expect(!transaction.get("complete").?.bool);
+    try std.testing.expectEqual(@as(usize, 1), initial.value.object.get("events").?.array.items.len);
+
+    root.namespace = second_ns;
+    var last = try coordinator.pull(&svc, &renderer, a, id, first.cursor, .{}, Request{});
+    defer last.deinit();
+    var completed = try body(a, last.body);
+    defer completed.deinit();
+    const ending = completed.value.object.get("transaction").?.object;
+    try std.testing.expect(ending.get("complete").?.bool);
+    try std.testing.expectEqualStrings(transaction.get("transaction_id").?.string, ending.get("transaction_id").?.string);
+    try std.testing.expectEqual(@as(usize, 0), completed.value.object.get("events").?.array.items.len);
+    var replay = try coordinator.pull(&svc, &renderer, a, id, first.cursor, .{}, Request{});
+    defer replay.deinit();
+    try std.testing.expect(replay.replayed);
+    try std.testing.expectEqualStrings(last.body, replay.body);
+}

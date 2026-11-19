@@ -45280,6 +45280,7 @@ fn implementationTests() type {
         test "native history consumer control document provider preserves authorized historical replay" {
             try @import("../metadata/native_changefeed_delivery_test.zig").run();
             try @import("../metadata/native_changefeed_delivery_test.zig").bootstrap();
+            try @import("../metadata/native_changefeed_delivery_test.zig").coordinated();
         }
 
         test "native history consumer control adapter recovers metadata and root after lost progress replies" {
