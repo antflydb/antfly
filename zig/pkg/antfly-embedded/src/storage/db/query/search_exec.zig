@@ -10418,9 +10418,14 @@ const IndexedPredicateEvaluator = struct {
     const RangeEvidence = struct {
         covered: roaring.RoaringBitmap,
         matches: roaring.RoaringBitmap,
+        complete: bool = true,
+
+        fn init(alloc: Allocator) RangeEvidence {
+            return .{ .covered = roaring.RoaringBitmap.init(alloc), .matches = roaring.RoaringBitmap.init(alloc) };
+        }
     };
 
-    fn collectRangeEvidence(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, physical: ?*const roaring.RoaringBitmap) !RangeEvidence {
+    fn collectRangeEvidence(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, physical: ?*const roaring.RoaringBitmap, capture_coverage: bool) !RangeEvidence {
         const field = query.numeric_range.field;
         const filter = (try search_mod.searchQueryToFilterArena(self.scratch, query)).withControl(self.control);
         var covered_docs = roaring.RoaringBitmap.init(self.alloc);
@@ -10430,6 +10435,7 @@ const IndexedPredicateEvaluator = struct {
         var physical_it = if (physical) |rows| rows.iterator() else null;
         var next = if (physical_it) |*iter| iter.next() else null;
         var offset: u32 = 0;
+        var complete = true;
         for (self.snapshot.segments, 0..) |segment, index| {
             try self.control.check();
             const base = offset;
@@ -10443,11 +10449,31 @@ const IndexedPredicateEvaluator = struct {
                 error.InvalidSegment, error.CrcMismatch => null,
                 else => return err,
             };
-            const coverage = if (entry.liveDocCount() != 0 and witness == .populated)
-                try entry.typedDocValuesCoverageWithValidation(field, .{ .execution_deadline_ns = self.control.deadline_ns, .cancellation = self.control.cancellation })
-            else
-                null;
-            const exact = if (coverage) |value| value.status == .covered and value.value_type == .numeric_val else false;
+            const exact = exact: {
+                if (entry.liveDocCount() == 0 or witness != .populated) break :exact false;
+                if (physical != null) {
+                    switch (entry.cachedTypedDocValuesCoverage(field)) {
+                        .initialized => |value| break :exact value.status == .covered and value.value_type == .numeric_val,
+                        .missing => break :exact false,
+                        .uninitialized => {},
+                    }
+                    break :exact entry.hasDenseNumericNavigation(field, self.control) catch |err| switch (err) {
+                        error.InvalidSegment, error.InvalidData, error.CrcMismatch, error.StorageReadTemporarilyUnavailable => false,
+                        else => return err,
+                    };
+                }
+                const value = (entry.typedDocValuesCoverageWithValidation(field, .{
+                    .execution_deadline_ns = self.control.deadline_ns,
+                    .cancellation = self.control.cancellation,
+                }) catch |err| switch (err) {
+                    error.StorageReadTemporarilyUnavailable => {
+                        complete = false;
+                        break :exact false;
+                    },
+                    else => return err,
+                }) orelse break :exact false;
+                break :exact value.status == .covered and value.value_type == .numeric_val;
+            };
             var pending = roaring.RoaringBitmap.init(self.alloc);
             defer pending.deinit();
             if (physical_it) |*iter| {
@@ -10471,6 +10497,7 @@ const IndexedPredicateEvaluator = struct {
                 try self.control.check();
                 try matched_docs.add(base + doc);
             }
+            if (!capture_coverage) continue;
             if (physical != null) {
                 if (entry.shared.deleted) |deleted| pending.andNotWith(&deleted);
                 var candidates = pending.iterator();
@@ -10510,30 +10537,33 @@ const IndexedPredicateEvaluator = struct {
         }
         var ordinal_only = self;
         ordinal_only.skip_unmapped = true;
-        var covered = try ordinal_only.resolveOrdinals(&covered_docs);
+        var covered = if (capture_coverage) try ordinal_only.resolveOrdinals(&covered_docs) else roaring.RoaringBitmap.init(self.alloc);
         errdefer covered.deinit();
-        return .{ .covered = covered, .matches = try ordinal_only.resolveOrdinals(&matched_docs) };
+        return .{ .covered = covered, .matches = try ordinal_only.resolveOrdinals(&matched_docs), .complete = complete };
     }
 
     fn rangeEvidence(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap, path: []const u8) !RangeEvidence {
-        if (self.key_domain != null) return self.collectRangeEvidence(query, null);
+        if (self.key_domain != null) return self.collectRangeEvidence(query, null, true);
         const cache = &self.snapshot.graph_predicates;
         const coverage_key = try std.fmt.allocPrint(self.scratch, "range-field:{s}:{s}", .{ self.presence_cache_prefix orelse self.cache_prefix, query.numeric_range.field });
         const match_key = try std.fmt.allocPrint(self.scratch, "range-match:{d}:{s}:{s}", .{ self.cache_prefix.len, self.cache_prefix, path });
-        if (try cache.getScoped(self.alloc, coverage_key, self.control, scope)) |owned| {
-            var covered = owned;
-            if (covered.cardinality() == 0) return .{ .covered = covered, .matches = roaring.RoaringBitmap.init(self.alloc) };
-            errdefer covered.deinit();
-            if (try cache.getScoped(self.alloc, match_key, self.control, scope)) |matches| return .{ .covered = covered, .matches = matches };
-            covered.deinit();
+        var cached_coverage = try cache.getScoped(self.alloc, coverage_key, self.control, scope);
+        defer if (cached_coverage) |*rows| rows.deinit();
+        if (cached_coverage) |covered| {
+            if (covered.cardinality() == 0) return RangeEvidence.init(self.alloc);
+            if (try cache.getScoped(self.alloc, match_key, self.control, scope)) |matches| {
+                cached_coverage = null;
+                return .{ .covered = covered, .matches = matches };
+            }
         }
 
-        const narrow = scope.cardinality() *| 32 <= self.snapshot.filterPhysicalDocCount();
-        if (narrow and self.snapshot.graphOrdinalScanCost() <= scope.cardinality() *| 8) {
+        const narrow = scope.cardinality() <= 8 or scope.cardinality() *| 32 <= self.snapshot.filterPhysicalDocCount();
+        if (narrow) {
+            if (self.snapshot.graphOrdinalScanCost() > scope.cardinality() *| 8) return RangeEvidence.init(self.alloc);
             if (self.probe_input != null) {
                 var physical = try self.collectPhysicalProbeScope(scope);
                 defer physical.deinit();
-                return self.collectRangeEvidence(query, &physical);
+                return self.collectRangeEvidence(query, &physical, true);
             }
             if (self.executor.resolve_doc_set_doc_ids) |resolve| {
                 var temporary = std.heap.ArenaAllocator.init(self.alloc);
@@ -10556,20 +10586,35 @@ const IndexedPredicateEvaluator = struct {
                 candidate.scratch = a;
                 var physical = try candidate.collectPhysicalProbeScope(scope);
                 defer physical.deinit();
-                return candidate.collectRangeEvidence(query, &physical);
+                return candidate.collectRangeEvidence(query, &physical, true);
             }
+            return RangeEvidence.init(self.alloc);
         }
         const flight = try cache.lockFlight(match_key, self.control);
         defer flight.unlock();
-        if (try cache.getScoped(self.alloc, match_key, self.control, scope)) |owned| {
-            var matches = owned;
-            errdefer matches.deinit();
-            if (try cache.getScoped(self.alloc, coverage_key, self.control, scope)) |covered| return .{ .covered = covered, .matches = matches };
-            matches.deinit();
+        if (cached_coverage == null) cached_coverage = try cache.getScoped(self.alloc, coverage_key, self.control, scope);
+        if (cached_coverage) |covered| {
+            if (covered.cardinality() == 0) return RangeEvidence.init(self.alloc);
+            if (try cache.getScoped(self.alloc, match_key, self.control, scope)) |matches| {
+                cached_coverage = null;
+                return .{ .covered = covered, .matches = matches };
+            }
         }
-        var evidence = try self.collectRangeEvidence(query, null);
-        cache.put(self.snapshot.alloc, coverage_key, &evidence.covered);
-        cache.put(self.snapshot.alloc, match_key, &evidence.matches);
+        var evidence = try self.collectRangeEvidence(query, null, cached_coverage == null);
+        if (evidence.complete) {
+            if (cached_coverage) |covered| {
+                evidence.covered.deinit();
+                evidence.covered = covered;
+                cached_coverage = null;
+            } else cache.put(self.snapshot.alloc, coverage_key, &evidence.covered);
+            cache.put(self.snapshot.alloc, match_key, &evidence.matches);
+        } else if (cached_coverage != null) {
+            // The cached coverage may include a temporarily unavailable
+            // segment. Treat this attempt as residual-only.
+            evidence.covered.deinit();
+            evidence.matches.deinit();
+            return RangeEvidence.init(self.alloc);
+        }
         evidence.covered.andWith(scope);
         evidence.matches.andWith(scope);
         return evidence;
@@ -10580,6 +10625,9 @@ const IndexedPredicateEvaluator = struct {
         const stored = (range.stored_standard_range orelse return error.UnsupportedQueryRequest).*;
         const schema = self.schema orelse return self.executeStoredRange(stored, scope);
         if (!self.reconcile_primary_ranges or range.exact_bounds == null or !runtime_schema_mod.hasNumericRangeCoverageMapping(schema, range.field)) {
+            return self.executeStoredRange(stored, scope);
+        }
+        if (self.key_domain != null and (scope.cardinality() <= 128 or scope.cardinality() *| 32 <= self.snapshot.filterPhysicalDocCount())) {
             return self.executeStoredRange(stored, scope);
         }
         var evidence = try self.rangeEvidence(query, scope, path);
@@ -11411,13 +11459,33 @@ test "optional numeric range keeps typed evidence in mixed segment generations" 
         .scratch = scratch,
         .cache_prefix = "",
     };
-    var evidence = try evaluator.collectRangeEvidence(query, null);
+    for (evaluator.snapshot.segments) |segment| {
+        if ((try segment.reader.numericRangeCoverage("rank")) != .populated) continue;
+        for (segment.shared.typed_doc_values_coverage) |*column| {
+            if (!std.mem.eql(u8, column.field, "rank")) continue;
+            try std.testing.expect(column.initialization_mutex.tryLock());
+            defer std.Io.Threaded.mutexUnlock(&column.initialization_mutex);
+            var busy = try evaluator.collectRangeEvidence(query, null, true);
+            defer busy.covered.deinit();
+            defer busy.matches.deinit();
+            try std.testing.expect(!busy.complete);
+            try std.testing.expectEqual(@as(usize, 0), busy.covered.cardinality());
+        }
+    }
+
+    var evidence = try evaluator.collectRangeEvidence(query, null, true);
     defer evidence.covered.deinit();
     defer evidence.matches.deinit();
     try std.testing.expectEqual(@as(usize, 1), evidence.covered.cardinality());
     try std.testing.expectEqual(@as(usize, 1), evidence.matches.cardinality());
     try std.testing.expect(evidence.covered.contains(5));
     try std.testing.expect(evidence.matches.contains(5));
+
+    var matches_only = try evaluator.collectRangeEvidence(query, null, false);
+    defer matches_only.covered.deinit();
+    defer matches_only.matches.deinit();
+    try std.testing.expectEqual(@as(usize, 0), matches_only.covered.cardinality());
+    try std.testing.expect(matches_only.matches.contains(5));
 }
 
 test "optional numeric range frontier memo coalesces small extensions" {
