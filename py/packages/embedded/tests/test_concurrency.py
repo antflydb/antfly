@@ -584,6 +584,33 @@ def test_session_cannot_read_staged_rows_into_recreated_table(tmp_path: Path, st
                 session.close()
 
 
+def test_runtime_full_text_index_keeps_overwrites_through_background_merges(tmp_path: Path) -> None:
+    # Large values on a runtime-added index make the maintenance snapshot
+    # merge segments while this connection keeps indexing inline. Neither may
+    # publish over the other's index state: every live version stays
+    # searchable and no overwritten one comes back.
+    path = tmp_path / "merges.aflite"
+    writes, keys = 300, 128
+
+    def text(sequence: int) -> str:
+        return (f"tokx{sequence} common" + " filler alpha beta" * 60)[:1024]
+
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=30.0) as db:
+        assert db.delete_index("full_text_index_v0")
+        db.add_index({"name": "matched_text", "type": "full_text", "config_json": {"field": "text"}})
+        for sequence in range(writes):
+            db.batch_json({"inserts": {f"k{sequence % keys}": {"text": text(sequence)}}, "sync_level": "full_index"})
+    with antfly_embedded.open(path, no_sync=True, busy_timeout=30.0) as db:
+        wrong = []
+        for sequence in range(writes):
+            found = db.search({"full_text_search": {"match": {"field": "text", "text": f"tokx{sequence}"}}, "limit": 4})
+            hits = [hit["_id"] for hit in found["responses"][0]["hits"]["hits"]]
+            expected = [f"k{sequence % keys}"] if sequence >= writes - keys else []
+            if hits != expected:
+                wrong.append((sequence, hits))
+        assert wrong == []
+
+
 def test_cross_process_overwrites_keep_full_text_deletes(tmp_path: Path) -> None:
     # Regression: overwrites from several processes, each waiting for
     # full-text visibility, lost earlier deletes. A writer rewrote a

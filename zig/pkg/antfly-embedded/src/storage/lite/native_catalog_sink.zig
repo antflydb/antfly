@@ -248,6 +248,14 @@ pub const Sink = struct {
     /// SAME eventual group-commit instead of each leading its own.
     fn submitDeferred(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation) anyerror!native_catalog_backend.Pending {
         const self: *Sink = @ptrCast(@alignCast(ptr));
+        // A maintenance snapshot's index content must not ride along: a
+        // later group can carry the serving store's own index commits, built
+        // from state that does not include this one. Commit it now, under the
+        // writer admission that fences stale snapshot publications.
+        if (self.store.forwardedWriter() != null) {
+            try submit(ptr, scope, mutations, false);
+            return .{ .ptr = undefined, .waitFn = completedWait };
+        }
         const ctx = try self.allocator.create(DeferredApplyCtx);
         errdefer self.allocator.destroy(ctx);
         const owned_scope = try self.allocator.dupe(u8, scope);
@@ -273,6 +281,8 @@ pub const Sink = struct {
         });
         return .{ .ptr = ctx, .waitFn = DeferredApplyCtx.wait };
     }
+
+    fn completedWait(_: *anyopaque) anyerror!void {}
 
     fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
         const self: *Sink = @ptrCast(@alignCast(ptr));

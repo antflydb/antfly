@@ -13483,6 +13483,14 @@ pub const NativeFile = struct {
     /// index catalog's logical content. Such a commit leaves the index
     /// catalog root (and so the logical index generation) in place until a
     /// fold moves it. Same-process commits keep their own mirrors current.
+    /// Highest sequence of any index-catalog version this inode's overlay
+    /// holds, this process's own commits included (unlike
+    /// `indexCatalogChangedAfter`, which sees only other processes').
+    pub fn indexCatalogLatestSequence(self: *const NativeFile) u64 {
+        const redo = self.redo orelse return 0;
+        return redo.shared.latestSequence(@backingInt(TransactionWrites.Root.index));
+    }
+
     pub fn indexCatalogChangedAfter(self: *const NativeFile, sequence: u64) bool {
         const redo = self.redo orelse return false;
         return redo.shared.replayedSequence(@backingInt(TransactionWrites.Root.index)) > sequence;
