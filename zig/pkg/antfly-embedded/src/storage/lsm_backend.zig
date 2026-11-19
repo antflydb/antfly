@@ -1660,6 +1660,7 @@ pub const Backend = struct {
     root_writer_lock: ?storage_io.NativePathLock = null,
     wal_operation_lock_file: ?storage_io.NativePathLockFile = null,
     storage_owner: ?*storage_io.NativeStorage = null,
+    native_storage_owner_transferred: bool = false,
     storage: ?storage_io.Storage = null,
     manifest_backing: ?[]u8 = null,
     recovered_manifest: ?@import("lsm_backend/manifest_replay.zig").RecoveryState = null,
@@ -2808,6 +2809,16 @@ pub const Backend = struct {
     pub fn acquireNativeStorageLease(self: *Backend) !?storage_io.NativeStorage.Lease {
         const owner = self.storage_owner orelse return null;
         return try owner.acquireLease();
+    }
+
+    /// Move destruction responsibility to a successor while the LSM still
+    /// borrows the runtime during its shutdown. The successor must outlive
+    /// shutdown and close the transferred owner with the page allocator.
+    pub fn transferNativeStorageOwnership(self: *Backend) ?*storage_io.NativeStorage {
+        const owner = self.storage_owner orelse return null;
+        std.debug.assert(!self.native_storage_owner_transferred);
+        self.native_storage_owner_transferred = true;
+        return owner;
     }
 
     pub fn maintenanceDebtHint(self: *const Backend) u64 {
