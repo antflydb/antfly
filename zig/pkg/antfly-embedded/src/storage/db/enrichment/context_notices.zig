@@ -53,6 +53,10 @@ const store = @import("context_dependency_store.zig");
 pub const Digest = ctx.Digest;
 pub const shadow_kind: u8 = 0x5f;
 pub const outbox_family: u8 = 0x04;
+/// Outbox entries by stable identity, then outbox key (staging order):
+/// `prefix ++ identity ++ outbox_key` -> "". An acknowledgement retires the
+/// earliest pending entry with its identity by one seek, on every replica.
+pub const outbox_index_family: u8 = 0x05;
 pub const notice_format: u32 = 1;
 pub const default_fanout_page: usize = 512;
 
@@ -252,6 +256,50 @@ pub const Notice = struct {
     /// Pivot carriers already expanded into distance blocks (continuations).
     expanded: bool = false,
 };
+
+/// Replicated identity of an outbox notice: its encoding with the
+/// replica-local derived sequence zeroed. Replicas stage the same notices in
+/// the same order, so equal identities pair up occurrence by occurrence.
+pub fn stableIdentity(alloc: Allocator, raw: []const u8) !Digest {
+    var out: Digest = undefined;
+    var decoded = decodeNoticeAlloc(alloc, raw) catch {
+        std.crypto.hash.sha2.Sha256.hash(raw, &out, .{});
+        return out;
+    };
+    defer decoded.deinit();
+    var notice = decoded.notice;
+    notice.sequence = 0;
+    const encoded = try encodeNoticeAlloc(alloc, notice);
+    defer alloc.free(encoded);
+    std.crypto.hash.sha2.Sha256.hash(encoded, &out, .{});
+    return out;
+}
+
+pub const outbox_index_key_len = 4 + 32 + 16;
+
+pub fn outboxIndexKey(identity: Digest, outbox_key: []const u8) [outbox_index_key_len]u8 {
+    var out: [outbox_index_key_len]u8 = undefined;
+    @memcpy(out[0..4], &store.familyPrefix(outbox_index_family));
+    @memcpy(out[4..36], &identity);
+    @memcpy(out[36..], outbox_key[0..16]);
+    return out;
+}
+
+/// Stage one outbox entry and its identity index entry. Every outbox write
+/// goes through here.
+pub fn planPutOutbox(alloc: Allocator, plan: *store.Plan, outbox_key: [16]u8, value: []const u8) !void {
+    const identity = try stableIdentity(alloc, value);
+    const index = outboxIndexKey(identity, &outbox_key);
+    try plan.put(&outbox_key, value);
+    try plan.put(&index, "");
+}
+
+/// Index keys of outbox entries being deleted (keys with their values).
+pub fn outboxIndexKeysAlloc(alloc: Allocator, keys: []const []const u8, values: []const []const u8) ![][outbox_index_key_len]u8 {
+    const out = try alloc.alloc([outbox_index_key_len]u8, keys.len);
+    for (keys, values, out) |k, v, *o| o.* = outboxIndexKey(try stableIdentity(alloc, v), k);
+    return out;
+}
 
 pub fn encodeNoticeAlloc(alloc: Allocator, n: Notice) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
@@ -490,9 +538,8 @@ fn stageMany(alloc: Allocator, plan: *store.Plan, binding: SpecBinding, own_tabl
         .refresh = binding.refresh,
         .sequence = sequence,
     });
-    errdefer alloc.free(value);
-    const okey = outboxKey(sequence, result.next_ordinal);
-    try plan.putOwned(try alloc.dupe(u8, &okey), value);
+    defer alloc.free(value);
+    try planPutOutbox(alloc, plan, outboxKey(sequence, result.next_ordinal), value);
     result.next_ordinal += 1;
     result.notices += 1;
 }
@@ -513,9 +560,8 @@ fn stageRows(alloc: Allocator, plan: *store.Plan, binding: SpecBinding, own_tabl
         .refresh = binding.refresh,
         .sequence = sequence,
     });
-    errdefer alloc.free(value);
-    const okey = outboxKey(sequence, result.next_ordinal);
-    try plan.putOwned(try alloc.dupe(u8, &okey), value);
+    defer alloc.free(value);
+    try planPutOutbox(alloc, plan, outboxKey(sequence, result.next_ordinal), value);
     result.next_ordinal += 1;
     result.notices += 1;
 }

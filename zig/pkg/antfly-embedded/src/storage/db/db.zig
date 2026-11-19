@@ -239,6 +239,8 @@ fn copyContextSplitState(alloc: Allocator, source: *docstore_mod.DocStore, dest:
     if (writes.items.len != 0) try dest.putBatch(writes.items, &.{});
     const outbox = context_dependency_store.familyPrefix(@import("enrichment/context_notices.zig").outbox_family);
     try deleteKeysWithPrefixFromStore(alloc, dest, &outbox);
+    const outbox_index = context_dependency_store.familyPrefix(@import("enrichment/context_notices.zig").outbox_index_family);
+    try deleteKeysWithPrefixFromStore(alloc, dest, &outbox_index);
 }
 
 fn contextNowMs() u64 {
@@ -10536,9 +10538,8 @@ pub const DB = struct {
                             .sequence = sequence,
                         });
                         defer a.free(value);
-                        const key = notices.outboxKey(sequence, ordinal);
+                        try notices.planPutOutbox(a, plan, notices.outboxKey(sequence, ordinal), value);
                         ordinal += 1;
-                        try plan.put(&key, value);
                     }
                 }
             }

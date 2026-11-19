@@ -167,8 +167,10 @@ fn unhexAlloc(a: Allocator, hex: []const u8) ![]u8 {
     return out;
 }
 
+/// Acknowledgement for a delivered notice: its replicated identity, not its
+/// bytes (which carry a replica-local sequence).
 pub fn ackDigestHexAlloc(a: Allocator, notice: []const u8) ![]u8 {
-    return hexAlloc(a, &valueDigest(notice));
+    return hexAlloc(a, &(try @import("context_notices.zig").stableIdentity(a, notice)));
 }
 
 fn valueDigest(value: []const u8) Digest {
@@ -316,20 +318,31 @@ pub fn applyTxn(alloc: Allocator, txn: anytype, command: Command) !Outcome {
     }
     for (command.puts) |p| try txn.put(try unhexAlloc(a, p.key), try unhexAlloc(a, p.value));
     if (command.acks.len != 0) {
-        const prefix = store.familyPrefix(outbox_family);
+        // Each acknowledgement retires the earliest pending outbox entry with
+        // that identity (replicas stage identical notices in the same order),
+        // found through the identity index: work is bounded by the page.
+        const notices_mod = @import("context_notices.zig");
+        var counts = std.StringArrayHashMapUnmanaged(usize).empty;
+        for (command.acks) |hex| {
+            const entry = try counts.getOrPut(a, hex);
+            if (!entry.found_existing) entry.value_ptr.* = 0;
+            entry.value_ptr.* += 1;
+        }
         var doomed = std.ArrayListUnmanaged([]u8).empty;
-        {
+        var it = counts.iterator();
+        while (it.next()) |entry| {
+            const identity_bytes = try unhexAlloc(a, entry.key_ptr.*);
+            const prefix = try std.mem.concat(a, u8, &.{ &store.familyPrefix(notices_mod.outbox_index_family), identity_bytes });
+            var remaining = entry.value_ptr.*;
             var cursor = try txn.openCursor();
             defer cursor.close();
-            var entry = try cursor.seekAtOrAfter(&prefix);
-            while (entry) |e| {
-                if (!std.mem.startsWith(u8, e.key, &prefix)) break;
-                const hex = try hexAlloc(a, &valueDigest(e.value));
-                for (command.acks) |ack| if (std.mem.eql(u8, ack, hex)) {
-                    try doomed.append(a, try a.dupe(u8, e.key));
-                    break;
-                };
-                entry = try cursor.next();
+            var row = try cursor.seekAtOrAfter(prefix);
+            while (row) |r| {
+                if (remaining == 0 or !std.mem.startsWith(u8, r.key, prefix) or r.key.len != notices_mod.outbox_index_key_len) break;
+                try doomed.append(a, try a.dupe(u8, r.key));
+                try doomed.append(a, try a.dupe(u8, r.key[prefix.len..]));
+                remaining -= 1;
+                row = try cursor.next();
             }
         }
         for (doomed.items) |key| txn.delete(key) catch |err| {
@@ -502,4 +515,52 @@ test "context dependency commands carry hex rebuilds on plans only" {
     // Inbox appends never journal; rebuilds must be hex.
     try std.testing.expectError(error.InvalidContextDependencyCommand, (Command{ .inbox = &.{"n"}, .rebuilds = rebuilds }).validate());
     try std.testing.expectError(error.InvalidContextDependencyCommand, (Command{ .deletes = &.{"aa"}, .rebuilds = &.{.{ .artifact = "zz", .doc_key = "00" }} }).validate());
+}
+
+test "outbox acknowledgements use replicated identity, one occurrence each" {
+    const alloc = testing.allocator;
+    const notices_mod = @import("context_notices.zig");
+    var leader = store.MemoryStore{ .alloc = alloc };
+    defer leader.deinit();
+    var follower = store.MemoryStore{ .alloc = alloc };
+    defer follower.deinit();
+    const notice: notices_mod.Notice = .{ .dependent_table_id = "srv:2", .artifact = "brief", .source_name = "peers", .source_table_id = "srv:1", .key = "org:acme", .spec = @splat(1), .tuple = @splat(2), .change = .member_changed, .refresh = .{}, .sequence = 0 };
+    // Replicas stage the same two (identical) notices in the same order but
+    // with different local sequences.
+    var leader_values: [2][]u8 = undefined;
+    for ([_]*store.MemoryStore{ &leader, &follower }, [_]u64{ 10, 9000 }) |s, base| {
+        var plan = store.Plan.init(alloc);
+        defer plan.deinit();
+        for (0..2) |i| {
+            var n = notice;
+            n.sequence = base + i;
+            const value = try notices_mod.encodeNoticeAlloc(alloc, n);
+            try notices_mod.planPutOutbox(alloc, &plan, notices_mod.outboxKey(n.sequence, 0), value);
+            if (s == &leader) leader_values[i] = value else alloc.free(value);
+        }
+        try s.apply(&plan);
+    }
+    defer for (leader_values) |v| alloc.free(v);
+    const outbox = store.familyPrefix(notices_mod.outbox_family);
+    const index = store.familyPrefix(notices_mod.outbox_index_family);
+    // The leader delivered its first entry: one ack retires exactly one
+    // occurrence on every replica, whatever its local sequence.
+    const ack = try ackDigestHexAlloc(alloc, leader_values[0]);
+    defer alloc.free(ack);
+    for ([_]*store.MemoryStore{ &leader, &follower }) |s| {
+        var txn = MemTxn{ .s = s };
+        try testing.expectEqual(Outcome.applied, try applyTxn(alloc, &txn, .{ .acks = &.{ack} }));
+        try testing.expectEqual(@as(usize, 1), s.countPrefix(&outbox));
+        try testing.expectEqual(@as(usize, 1), s.countPrefix(&index));
+    }
+    // The earliest occurrence went first: the leader keeps its second entry.
+    try testing.expect(memGet(&leader, &notices_mod.outboxKey(11, 0)) != null);
+    try testing.expect(memGet(&follower, &notices_mod.outboxKey(9001, 0)) != null);
+    // The second ack drains both.
+    for ([_]*store.MemoryStore{ &leader, &follower }) |s| {
+        var txn = MemTxn{ .s = s };
+        _ = try applyTxn(alloc, &txn, .{ .acks = &.{ack} });
+        try testing.expectEqual(@as(usize, 0), s.countPrefix(&outbox));
+        try testing.expectEqual(@as(usize, 0), s.countPrefix(&index));
+    }
 }

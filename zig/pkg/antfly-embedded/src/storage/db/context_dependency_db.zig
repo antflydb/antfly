@@ -689,8 +689,7 @@ pub fn applyNoticesConsuming(
                     } else {
                         var h = std.hash.Wyhash.init(i);
                         h.update(cont);
-                        const key = notices.outboxKey(decoded.notice.sequence, @truncate(h.final() | 0x8000_0000));
-                        try plan.put(&key, cont);
+                        try notices.planPutOutbox(a, plan, notices.outboxKey(decoded.notice.sequence, @truncate(h.final() | 0x8000_0000)), cont);
                     }
                 }
             }
@@ -756,9 +755,17 @@ pub fn dependentOf(alloc: Allocator, raw: []const u8) ![]u8 {
     return alloc.dupe(u8, decoded.notice.dependent_table_id);
 }
 
-pub fn deleteOutboxKeys(primary: *docstore_mod.DocStore, keys: []const []const u8) !void {
+/// Delete delivered outbox entries (with their values) and their identity
+/// index entries.
+pub fn deleteOutboxEntries(alloc: Allocator, primary: *docstore_mod.DocStore, keys: []const []const u8, values: []const []const u8) !void {
     if (keys.len == 0) return;
-    try primary.putBatch(&.{}, keys);
+    const index = try notices.outboxIndexKeysAlloc(alloc, keys, values);
+    defer alloc.free(index);
+    const all = try alloc.alloc([]const u8, keys.len * 2);
+    defer alloc.free(all);
+    for (keys, 0..) |k, i| all[i] = k;
+    for (index, 0..) |*k, i| all[keys.len + i] = k;
+    try primary.putBatch(&.{}, all);
 }
 
 /// Acknowledge delivered outbox entries. Replicated owners propose content
@@ -766,7 +773,7 @@ pub fn deleteOutboxKeys(primary: *docstore_mod.DocStore, keys: []const []const u
 /// their local keys); `values` are the delivered notice bytes.
 pub fn ackOutbox(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, keys: []const []const u8, values: []const []const u8) !void {
     if (keys.len == 0) return;
-    const replication = manager.context_replication orelse return deleteOutboxKeys(primary, keys);
+    const replication = manager.context_replication orelse return deleteOutboxEntries(alloc, primary, keys, values);
     if (!replication.isOwner()) return error.ContextDependencyNotOwner;
     // Deferred: the host acknowledges after it delivered.
     if (active_collector != null) return;
