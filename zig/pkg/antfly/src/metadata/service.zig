@@ -13829,7 +13829,7 @@ test "metadata table topology protocol fences namespace writers and restored dec
     try std.testing.expect(tableTopologyProtocolCompatible(predecessor, 42, 7, incarnation, version));
 }
 
-test "metadata table topology protocol checks the command's required version and exact replica" {
+test "metadata service table topology protocol checks the command's required version and exact replica" {
     const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     var status = MetadataStatus{
         .metadata_group_id = 42,
@@ -13837,6 +13837,13 @@ test "metadata table topology protocol checks the command's required version and
         .metadata_raft_local_node_id = 7,
         .metrics = .{},
     };
+    const pinned_restore_version = metadata_topology_protocol.pinned_restore_job_version;
+    status.table_topology_protocol_version = pinned_restore_version - 1;
+    try std.testing.expect(!tableTopologyProtocolCompatible(status, 42, 7, incarnation, pinned_restore_version));
+    try std.testing.expect(tableTopologyProtocolCompatible(status, 42, 7, incarnation, metadata_topology_protocol.restore_job_admission_version));
+    status.table_topology_protocol_version = pinned_restore_version;
+    try std.testing.expect(tableTopologyProtocolCompatible(status, 42, 7, incarnation, pinned_restore_version));
+    status.table_topology_protocol_version = 0;
     try std.testing.expect(!tableTopologyProtocolCompatible(
         status,
         42,
@@ -18404,6 +18411,7 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
         hasher.update(std.mem.asBytes(&range.restore_native_manifest_size_bytes));
         hashProjectedProvisioningBytes(&hasher, range.restore_native_manifest_sha256);
         hasher.update(&range.completed_restore_fingerprint);
+        hasher.update(&range.restore_admission_fingerprint);
     }
 
     const placements = try service.listProjectedPlacementIntents(alloc);

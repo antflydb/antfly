@@ -210,6 +210,45 @@ pub fn buildPlan(arena: std.mem.Allocator, id: staging.Id, cohort_digest: stagin
     return .{ .plan = plan, .skipped = skipped.items };
 }
 
+test "restore staging driver shares stable identities and existing destination modes preserves legacy canonical plan digests" {
+    const a = std.testing.allocator;
+    const legacy = std.mem.trim(u8, @embedFile("testdata/legacy_restore_range.json"), "\n");
+    const decoded = try std.json.parseFromSlice(metadata.RangeRecord, a, legacy, .{});
+    defer decoded.deinit();
+    var output = try std.Io.Writer.Allocating.initCapacity(a, 4096);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+    try @import("antfly_local_sources").storage_db_relational_integrity_json.write(decoded.value, &json);
+    try std.testing.expectEqualStrings(legacy, output.written());
+    var range = decoded.value;
+    const plan: staging.Plan = .{ .id = @splat(1), .cohort_digest = @splat(2), .targets = &.{.{ .source_table_id = 9, .table = .{ .table_id = 19, .name = "docs", .schema_json = "{}" }, .ranges = &.{range} }} };
+    const old_bytes = try std.json.Stringify.valueAlloc(a, plan, .{});
+    defer a.free(old_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, old_bytes, legacy) != null);
+    const restored = try std.json.parseFromSlice(staging.Plan, a, old_bytes, .{});
+    defer restored.deinit();
+    try std.testing.expectEqual(try plan.digest(a), try restored.value.digest(a));
+    range.restore_admission_fingerprint = @splat(7);
+    output.clearRetainingCapacity();
+    json = .{ .writer = &output.writer, .options = .{} };
+    try @import("antfly_local_sources").storage_db_relational_integrity_json.write(range, &json);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "restore_admission_fingerprint") != null);
+    var updated = plan;
+    var target = plan.targets[0];
+    target.ranges = &.{range};
+    updated.targets = &.{target};
+    const job_json = try std.json.Stringify.valueAlloc(a, staging.Job{ .plan = updated, .plan_digest = try updated.digest(a), .state = .importing }, .{});
+    defer a.free(job_json);
+    const groups = try staging.admissionReaderGroups(a, .{ .tables = &.{}, .ranges = &.{}, .jobs_json = &.{job_json} });
+    defer a.free(groups);
+    try std.testing.expectEqualSlices(u64, &.{701}, groups);
+    const legacy_job = try std.json.Stringify.valueAlloc(a, staging.Job{ .plan = plan, .plan_digest = try plan.digest(a), .state = .importing }, .{});
+    defer a.free(legacy_job);
+    const legacy_groups = try staging.admissionReaderGroups(a, .{ .tables = &.{}, .ranges = &.{}, .jobs_json = &.{legacy_job} });
+    defer a.free(legacy_groups);
+    try std.testing.expectEqual(@as(usize, 0), legacy_groups.len);
+}
+
 test "restore staging driver shares stable identities and existing destination modes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

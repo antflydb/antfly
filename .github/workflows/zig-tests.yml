@@ -2240,6 +2240,11 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
+          sparse-checkout: |
+            py/packages/embedded
+            scripts/ci
+            zig/e2e/antfly
+            zig/scripts
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
       - name: Restore common E2E duration history
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
