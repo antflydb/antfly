@@ -1334,6 +1334,11 @@ pub const WriterLane = struct {
         // `local_wait_deadline` still governs that case exactly as before.
         const unconditional_wait = connection.admission_deadline_ns == null and connection.options.busy_timeout_ms == 0;
         var backoff_ns: i96 = poll_initial_ns;
+        // A foreign maintenance turn this checkout queued on and retained for
+        // its next refresh (`Owner.waitRetainMaintenanceTurn`). Every exit
+        // from this function leaves the gate unlocked.
+        var turn_retained = false;
+        defer if (turn_retained) connection.owner.releaseMaintenanceTurn();
         self.mutex.lockUncancelable(io);
         while (true) {
             // A same-process synthetic reader (`pinForLocalRead`) is
@@ -1396,7 +1401,10 @@ pub const WriterLane = struct {
                 // parked lifetime.
                 connection.gate.mutex.lockUncancelable(io);
                 var lease: ?native.PathWriterLock = parked;
-                const root = connection.refresh(&lease, intent, true) catch |err| {
+                const refreshed = connection.refresh(&lease, intent, true);
+                if (turn_retained) connection.owner.releaseMaintenanceTurnAssumeLocked();
+                turn_retained = false;
+                const root = refreshed catch |err| {
                     connection.gate.mutex.unlock(io);
                     if (lease) |*held| held.close();
                     self.mutex.lockUncancelable(io);
@@ -1404,7 +1412,8 @@ pub const WriterLane = struct {
                     self.mutex.unlock(io);
                     self.signalReleased(io);
                     if (err == error.MaintenanceTurnBusy) {
-                        try waitForMaintenanceTurn(io, local_wait_deadline, unconditional_wait, &backoff_ns);
+                        turn_retained = try connection.owner.waitRetainMaintenanceTurn(local_wait_deadline, unconditional_wait);
+                        if (!turn_retained) try waitForMaintenanceTurn(io, local_wait_deadline, unconditional_wait, &backoff_ns);
                         self.mutex.lockUncancelable(io);
                         continue;
                     }
@@ -1441,7 +1450,10 @@ pub const WriterLane = struct {
                     self.signalReleased(io);
                     return err;
                 };
-                const root = connection.refresh(&lease, intent, true) catch |err| {
+                const refreshed = connection.refresh(&lease, intent, true);
+                if (turn_retained) connection.owner.releaseMaintenanceTurnAssumeLocked();
+                turn_retained = false;
+                const root = refreshed catch |err| {
                     if (lease) |*held| held.close();
                     connection.gate.mutex.unlock(io);
                     self.mutex.lockUncancelable(io);
@@ -1449,7 +1461,8 @@ pub const WriterLane = struct {
                     self.mutex.unlock(io);
                     self.signalReleased(io);
                     if (err == error.MaintenanceTurnBusy) {
-                        try waitForMaintenanceTurn(io, local_wait_deadline, unconditional_wait, &backoff_ns);
+                        turn_retained = try connection.owner.waitRetainMaintenanceTurn(local_wait_deadline, unconditional_wait);
+                        if (!turn_retained) try waitForMaintenanceTurn(io, local_wait_deadline, unconditional_wait, &backoff_ns);
                         self.mutex.lockUncancelable(io);
                         continue;
                     }
@@ -3617,12 +3630,16 @@ pub const Owner = struct {
         try store.file.inheritAllocatorVerification(&maintenance.file);
     }
 
-    fn acquireMaintenanceTurnGuard(self: *Owner) !?std.Io.File {
+    fn maintenanceTurnGuardPath(self: *Owner) ![]u8 {
         var digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(self.path, &digest, .{});
         const name = try std.fmt.allocPrint(alloc, ".aflite-maintenance-{s}.lock", .{std.fmt.bytesToHex(digest, .lower)});
         defer alloc.free(name);
-        const path = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(self.path) orelse ".", name });
+        return std.fs.path.join(alloc, &.{ std.fs.path.dirname(self.path) orelse ".", name });
+    }
+
+    fn acquireMaintenanceTurnGuard(self: *Owner) !?std.Io.File {
+        const path = try self.maintenanceTurnGuardPath();
         defer alloc.free(path);
         // Keep the coordination inode in place across turns and closes: unlink
         // could give concurrent owners different locks. Process death releases
@@ -3638,11 +3655,58 @@ pub const Owner = struct {
         };
     }
 
+    /// For a refresh that needs the maintenance turn another process holds.
+    /// That turn needs the writer lease to finish, so the caller holds
+    /// neither the lease nor the gate here: it queues on the turn itself
+    /// (bounded by `deadline_ns`) and retains it, so the turn cannot pass
+    /// to the next background pass in between. The caller releases it
+    /// (`releaseMaintenanceTurnAssumeLocked`) once its refresh is done.
+    /// Returns false, retaining nothing, when the wait cannot start now;
+    /// the caller then backs off as before.
+    fn waitRetainMaintenanceTurn(self: *Owner, deadline_ns: i96, unconditional: bool) !bool {
+        const io = h.handleLockIo();
+        {
+            self.gate.mutex.lockUncancelable(io);
+            defer self.gate.mutex.unlock(io);
+            if (self.maintenance_turn_references != 0) {
+                self.maintenance_turn_references += 1;
+                return true;
+            }
+        }
+        const path = try self.maintenanceTurnGuardPath();
+        defer alloc.free(path);
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false });
+        const locked = if (unconditional) blk: {
+            file.lock(self.path_lock_io.io(), .exclusive) catch |err| {
+                file.close(io);
+                return err;
+            };
+            break :blk file;
+        } else @import("../storage/lite/path_lock_wait.zig").lockUntil(file, self.path_lock_io.io(), .exclusive, deadline_ns) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => return false,
+            else => return err,
+        };
+        self.gate.mutex.lockUncancelable(io);
+        defer self.gate.mutex.unlock(io);
+        if (self.maintenance_turn_references == 0) {
+            self.maintenance_turn_lease = locked;
+        } else locked.close(io);
+        self.maintenance_turn_references += 1;
+        return true;
+    }
+
     fn retainMaintenanceTurnAssumeLocked(self: *Owner) !bool {
         if (self.maintenance_turn_references == 0)
             self.maintenance_turn_lease = (try self.acquireMaintenanceTurnGuard()) orelse return false;
         self.maintenance_turn_references += 1;
         return true;
+    }
+
+    fn releaseMaintenanceTurn(self: *Owner) void {
+        const io = h.handleLockIo();
+        self.gate.mutex.lockUncancelable(io);
+        defer self.gate.mutex.unlock(io);
+        self.releaseMaintenanceTurnAssumeLocked();
     }
 
     fn releaseMaintenanceTurnAssumeLocked(self: *Owner) void {
@@ -5032,16 +5096,27 @@ pub const Connection = struct {
         }
         const io = h.handleLockIo();
         const deadline = self.admissionDeadline();
+        const unconditional = self.admission_deadline_ns == null and self.options.busy_timeout_ms == 0;
         var backoff_ns: i96 = 100 * std.time.ns_per_us;
         while (true) {
             if (lease.*) |*held| held.close();
             lease.* = null;
             self.gate.mutex.unlock(io);
-            const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
-            const slept = remaining > 0 and (if (io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake)) |_| true else |_| false);
+            const retained = self.owner.waitRetainMaintenanceTurn(deadline, unconditional) catch |err| {
+                self.gate.mutex.lockUncancelable(io);
+                return if (err == error.FileBusy) error.FileBusy else err;
+            };
+            if (!retained) {
+                const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+                const slept = remaining > 0 and (if (io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake)) |_| true else |_| false);
+                if (!slept) {
+                    self.gate.mutex.lockUncancelable(io);
+                    return error.FileBusy;
+                }
+                backoff_ns = @min(backoff_ns * 2, 5 * std.time.ns_per_ms);
+            }
             self.gate.mutex.lockUncancelable(io);
-            if (!slept) return error.FileBusy;
-            backoff_ns = @min(backoff_ns * 2, 5 * std.time.ns_per_ms);
+            defer if (retained) self.owner.releaseMaintenanceTurnAssumeLocked();
             lease.* = try self.acquirePathLeaseAssumeLocked(skip_lane_wait);
             return self.owner.refreshOrTurnBusy() catch |err| switch (err) {
                 error.MaintenanceTurnBusy => continue,
