@@ -23,6 +23,9 @@ const A = std.mem.Allocator;
 const header_size = 56;
 const digest_size = 32;
 pub const max_bytes = header_size + control.max_bootstrap_bytes + digest_size;
+pub fn prefixSize(_: pages.BootstrapRequest) usize {
+    return header_size + digest_size;
+}
 
 pub const OrderedRead = struct {
     request: pages.BootstrapRequest,

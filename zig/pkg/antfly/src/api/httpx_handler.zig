@@ -577,7 +577,7 @@ test "history control ingress mounted route rejects unsigned migration traffic" 
     defer a.free(base);
     const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "history-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
     defer a.free(token);
-    for ([_][]const u8{ "control-v1", "page-v1", "grant-v1", "resolution-v1", "publication-v1" }) |leaf| {
+    for ([_][]const u8{ "control-v1", "page-v1", "bootstrap-page-v1", "grant-v1", "resolution-v1", "publication-v1" }) |leaf| {
         const url = try std.fmt.allocPrint(a, "{s}/internal/v1/groups/17/tables/docs/history/{s}", .{ base, leaf });
         defer a.free(url);
         var unsigned = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &.{.{ "content-type", "application/json" }}, 20);
@@ -1940,6 +1940,9 @@ pub const AntflyApiHandler = struct {
         if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
             try server.postWithBodyLimit(table_prefix ++ routes.history_page_suffix, @import("history_page_operations.zig").max_request_bytes, httpx.Handler.bind(self, internalHistoryPage));
         } else try server.post(table_prefix ++ routes.history_page_suffix, httpx.Handler.bind(self, internalHistoryPage));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_bootstrap_page_suffix, @import("history_page_operations.zig").max_request_bytes, httpx.Handler.bind(self, internalHistoryBootstrapPage));
+        } else try server.post(table_prefix ++ routes.history_bootstrap_page_suffix, httpx.Handler.bind(self, internalHistoryBootstrapPage));
         if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
             try server.postWithBodyLimit(table_prefix ++ routes.history_grant_suffix, @import("history_grant_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryGrant));
         } else try server.post(table_prefix ++ routes.history_grant_suffix, httpx.Handler.bind(self, internalHistoryGrant));
@@ -4161,6 +4164,14 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalHistoryPage(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalHistoryPageFor(ctx, false);
+    }
+
+    fn internalHistoryBootstrapPage(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalHistoryPageFor(ctx, true);
+    }
+
+    fn internalHistoryPageFor(self: *AntflyApiHandler, ctx: *httpx.Context, comptime bootstrap: bool) !httpx.Response {
         const operations = @import("history_page_operations.zig");
         const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
         var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
@@ -4170,7 +4181,11 @@ pub const AntflyApiHandler = struct {
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return historyPageFailure(ctx, error.InvalidHistoryPageRequest);
         if (body.len > operations.max_request_bytes) return textResponse(ctx, 413, "history page request exceeds byte limit");
-        const encoded = operations.execute(self.api_server.cfg.native_history_page, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyPageFailure(ctx, err);
+        const context = operationContext(ctx, null);
+        const encoded = (if (bootstrap)
+            operations.Bootstrap.execute(self.api_server.cfg.native_history_bootstrap_page, ctx.allocator, params.group_id, params.table_name, body, context)
+        else
+            operations.execute(self.api_server.cfg.native_history_page, ctx.allocator, params.group_id, params.table_name, body, context)) catch |err| return historyPageFailure(ctx, err);
         errdefer ctx.allocator.free(encoded);
         try ctx.setHeader("Content-Type", "application/octet-stream");
         try ctx.setHeader("Cache-Control", "no-store");

@@ -21,7 +21,7 @@ pub const sql_max_request_body_bytes: usize = 4 << 20;
 /// before buffering so a SQL request cannot consume the much larger batch cap.
 pub fn publicPostBodyLimit(path: []const u8) ?usize {
     if (isInternalSourcePlanPath(path)) return 2 * 1024 * 1024;
-    if (isInternalHistoryControlPath(path) or isInternalHistoryPagePath(path) or isInternalHistoryGrantPath(path) or isInternalHistoryResolutionPath(path) or isInternalHistoryPublicationPath(path) or isInternalHistoryOwnerPath(path) or isInternalHistoryDecisionPath(path)) return 4096;
+    if (isInternalHistoryControlPath(path) or isInternalHistoryPagePath(path) or isInternalHistoryBootstrapPagePath(path) or isInternalHistoryGrantPath(path) or isInternalHistoryResolutionPath(path) or isInternalHistoryPublicationPath(path) or isInternalHistoryOwnerPath(path) or isInternalHistoryDecisionPath(path)) return 4096;
     if (isInternalDocumentReadPath(path)) return @import("antfly_public_limits").max_document_read_body_bytes;
     if (isPrivacyFindingsPath(path)) return @import("antfly_public_limits").max_privacy_findings_body_bytes;
     if (privacyMutationBodyLimit(path)) |limit| return limit;
@@ -87,6 +87,9 @@ pub fn isInternalHistoryControlPath(path: []const u8) bool {
 }
 pub fn isInternalHistoryPagePath(path: []const u8) bool {
     return isInternalHistoryPath(path, "page-v1");
+}
+pub fn isInternalHistoryBootstrapPagePath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "bootstrap-page-v1");
 }
 pub fn isInternalHistoryResolutionPath(path: []const u8) bool {
     return isInternalHistoryPath(path, "resolution-v1");
@@ -257,6 +260,7 @@ pub const Routes = struct {
     pub const source_plan_chunk_suffix = "/source-plan/chunk-v1";
     pub const history_control_suffix = "/history/control-v1";
     pub const history_page_suffix = "/history/page-v1";
+    pub const history_bootstrap_page_suffix = "/history/bootstrap-page-v1";
     pub const history_grant_suffix = "/history/grant-v1";
     pub const history_resolution_suffix = "/history/resolution-v1";
     pub const history_decision_suffix = "/history/decision-v1";

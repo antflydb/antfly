@@ -65,6 +65,7 @@ pub const Source = struct {
     catalog: catalog_api.CatalogSource,
     controls: @import("history_control_operations.zig").Port,
     pages: @import("history_page_operations.zig").Port,
+    bootstrap_pages: ?@import("history_page_operations.zig").Bootstrap.Port = null,
     grants: @import("history_grant_operations.zig").Port,
     /// Authorization must precede capture. Returned locators borrow the owned
     /// generation, so they remain valid even after the publisher retires it.

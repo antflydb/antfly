@@ -59,20 +59,46 @@ pub const ErrorResponse = struct {
         } };
     }
 };
-pub const Port = struct {
-    ptr: *anyopaque,
-    read_fn: *const fn (*anyopaque, std.mem.Allocator, metadata.CatalogRouteFence, []const u8, Request, operation.RequestContext) anyerror!pages.Page,
-    boundary_dispatch: Boundary.Dispatch = Boundary.local_dispatch,
-    pub const VTable = struct { read: @FieldType(Port, "read_fn") };
-    const Boundary = local.runtime_callback_abi.Boundary(VTable);
-    pub fn read(self: Port, a: std.mem.Allocator, fence: metadata.CatalogRouteFence, table: []const u8, input: Request, context: operation.RequestContext) !pages.Page {
-        return Boundary.call("read", self.boundary_dispatch, self.read_fn, .{ self.ptr, a, fence, table, input, context });
+pub const Port = PagePort(Request, pages.Page);
+
+pub const Bootstrap = struct {
+    pub const wire = source.history_bootstrap_wire;
+    pub const Request = struct {
+        version: u8,
+        request: pages.BootstrapRequest,
+        pub fn validate(self: @This(), namespace: [24]u8) !void {
+            if (self.version != 1 or !std.mem.eql(u8, &namespace, &self.request.reference.namespace)) return error.InvalidHistoryPageRequest;
+            try self.request.validate();
+        }
+    };
+    pub const Port = PagePort(Bootstrap.Request, pages.BootstrapPage);
+
+    pub fn execute(port: ?Bootstrap.Port, a: std.mem.Allocator, group: u64, table: []const u8, body: []const u8, context: operation.RequestContext) ![]u8 {
+        return executePage(Bootstrap.Request, Bootstrap.wire, port, a, group, table, body, context);
     }
 };
 
+fn PagePort(comptime Input: type, comptime Page: type) type {
+    return struct {
+        ptr: *anyopaque,
+        read_fn: *const fn (*anyopaque, std.mem.Allocator, metadata.CatalogRouteFence, []const u8, Input, operation.RequestContext) anyerror!Page,
+        boundary_dispatch: Boundary.Dispatch = Boundary.local_dispatch,
+        const Self = @This();
+        pub const VTable = struct { read: @FieldType(Self, "read_fn") };
+        const Boundary = local.runtime_callback_abi.Boundary(VTable);
+        pub fn read(self: Self, a: std.mem.Allocator, fence: metadata.CatalogRouteFence, table: []const u8, input: Input, context: operation.RequestContext) !Page {
+            return Boundary.call("read", self.boundary_dispatch, self.read_fn, .{ self.ptr, a, fence, table, input, context });
+        }
+    };
+}
+
 pub fn decode(a: std.mem.Allocator, body: []const u8, namespace: [24]u8) !Request {
+    return decodePage(Request, a, body, namespace);
+}
+
+fn decodePage(comptime Input: type, a: std.mem.Allocator, body: []const u8, namespace: [24]u8) !Input {
     if (body.len > max_request_bytes) return error.InvalidHistoryPageRequest;
-    var parsed = std.json.parseFromSlice(Request, a, body, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidHistoryPageRequest;
+    var parsed = std.json.parseFromSlice(Input, a, body, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidHistoryPageRequest;
     defer parsed.deinit();
     try parsed.value.validate(namespace);
     return parsed.value;
@@ -81,6 +107,10 @@ pub fn decode(a: std.mem.Allocator, body: []const u8, namespace: [24]u8) !Reques
 /// The caller owns returned HPG1 bytes. No result escapes after cancellation,
 /// and encoding validates all page metadata against the original request.
 pub fn execute(port: ?Port, a: std.mem.Allocator, group: u64, table: []const u8, body: []const u8, context: operation.RequestContext) ![]u8 {
+    return executePage(Request, wire, port, a, group, table, body, context);
+}
+
+fn executePage(comptime Input: type, comptime Codec: type, port: anytype, a: std.mem.Allocator, group: u64, table: []const u8, body: []const u8, context: operation.RequestContext) ![]u8 {
     try context.ensureActive();
     if (group == 0 or table.len == 0 or table.len > 1024 or context.catalog_route_fence_json.len == 0 or context.catalog_route_fence_json.len > 16384) return error.InvalidCatalogRouteFence;
     var parsed = std.json.parseFromSlice(metadata.CatalogRouteFence, a, context.catalog_route_fence_json, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidCatalogRouteFence;
@@ -95,12 +125,12 @@ pub fn execute(port: ?Port, a: std.mem.Allocator, group: u64, table: []const u8,
     std.mem.writeInt(u64, namespace[0..8], fence.route.identity_namespace.table_id, .big);
     std.mem.writeInt(u64, namespace[8..16], fence.route.identity_namespace.shard_id, .big);
     std.mem.writeInt(u64, namespace[16..24], fence.route.identity_namespace.range_id, .big);
-    const input = try decode(a, body, namespace);
+    const input = try decodePage(Input, a, body, namespace);
     const target = port orelse return error.ChangefeedCapabilityUnsupported;
     var page = try target.read(a, fence, table, input, context);
     defer page.deinit();
     try context.ensureActive();
-    const encoded = try wire.encode(a, page, input.request);
+    const encoded = try Codec.encode(a, page, input.request);
     errdefer a.free(encoded);
     try context.ensureActive();
     return encoded;
@@ -165,4 +195,34 @@ test "history page ingress rejects scope mismatches forged pages and late cancel
     try std.testing.expectEqual(@as(u16, 409), ErrorResponse.fromError(error.TopologyChanged).status());
     try std.testing.expectEqual(.resynchronization_required, ErrorResponse.fromError(error.HistoryConsumerConflict).code);
     try std.testing.expectEqual(.page_budget_exceeded, ErrorResponse.fromError(error.HistoryTooLarge).code);
+}
+
+test "history page ingress bootstrap binds the pin and row position" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn read(_: *anyopaque, alloc: std.mem.Allocator, _: metadata.CatalogRouteFence, _: []const u8, input: Bootstrap.Request, _: operation.RequestContext) !pages.BootstrapPage {
+            return .{ .arena = .init(alloc), .schema = "{}", .rows = &.{}, .next_row = input.request.after_rows, .done = true };
+        }
+    };
+    var token: u8 = 0;
+    const port: Bootstrap.Port = .{ .ptr = &token, .read_fn = Fixture.read };
+    const fence: metadata.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
+    const encoded_fence = try std.json.Stringify.valueAlloc(a, fence, .{});
+    defer a.free(encoded_fence);
+    const context: operation.RequestContext = .{ .catalog_route_fence_json = encoded_fence };
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 17, .big);
+    std.mem.writeInt(u64, namespace[16..24], 19, .big);
+    var input: Bootstrap.Request = .{ .version = 1, .request = .{ .reference = .{ .namespace = namespace, .authority = @splat(1), .definition = @splat(2), .consumer = @splat(3), .epoch = 1, .grant = 1 }, .digest = @splat(4), .now_seconds = 100, .after_rows = 12 } };
+    const body = try std.json.Stringify.valueAlloc(a, input, .{});
+    defer a.free(body);
+    const encoded = try Bootstrap.execute(port, a, 17, "docs", body, context);
+    defer a.free(encoded);
+    var page = try Bootstrap.wire.decode(a, encoded, input.request);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(u32, 12), page.next_row);
+    try std.testing.expect(page.done);
+    input.request.digest[0] ^= 1;
+    try std.testing.expectError(error.HistoryCorrupt, Bootstrap.wire.decode(a, encoded, input.request));
 }

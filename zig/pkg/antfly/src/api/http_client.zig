@@ -3045,7 +3045,25 @@ pub const ApiHttpClient = struct {
         fence: route_metadata_api.CatalogRouteFence,
         context: @import("antfly_local_sources").api_operation.RequestContext,
     ) !@import("history_page_operations.zig").pages.Page {
+        return self.fetchGroupHistoryPageFor(base_uri, group_id, table_name, input, fence, context, false);
+    }
+
+    pub fn fetchGroupHistoryBootstrapPage(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        input: @import("history_page_operations.zig").Bootstrap.Request,
+        fence: route_metadata_api.CatalogRouteFence,
+        context: @import("antfly_local_sources").api_operation.RequestContext,
+    ) !@import("history_page_operations.zig").pages.BootstrapPage {
+        return self.fetchGroupHistoryPageFor(base_uri, group_id, table_name, input, fence, context, true);
+    }
+
+    fn fetchGroupHistoryPageFor(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, input: anytype, fence: route_metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext, comptime bootstrap: bool) !(if (bootstrap) @import("history_page_operations.zig").pages.BootstrapPage else @import("history_page_operations.zig").pages.Page) {
         const contract = @import("history_page_operations.zig");
+        const codec = if (bootstrap) contract.Bootstrap.wire else contract.wire;
+        const suffix = if (bootstrap) routes.Routes.history_bootstrap_page_suffix else routes.Routes.history_page_suffix;
         try context.ensureActive();
         if (self.internal_service == null) return error.Unauthorized;
         try fence.validate();
@@ -3057,7 +3075,7 @@ pub const ApiHttpClient = struct {
         try input.validate(namespace);
         const table = try percentEncodePathComponent(self.alloc, table_name);
         defer self.alloc.free(table);
-        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, table, routes.Routes.history_page_suffix });
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, table, suffix });
         defer self.alloc.free(path);
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
@@ -3075,7 +3093,7 @@ pub const ApiHttpClient = struct {
         var response = self.executeRequest(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .headers = &.{
             .{ .name = route_metadata_api.catalog_route_fence_header, .value = encoded_fence },
             .{ .name = route_metadata_api.catalog_route_deadline_ms_header, .value = budget },
-        }, .timeout_ms = timeout, .cancellation = &cancellation, .max_response_bytes = contract.wire.prefixSize(input.request) + @as(usize, input.request.max_bytes) }) catch |err| return switch (err) {
+        }, .timeout_ms = timeout, .cancellation = &cancellation, .max_response_bytes = codec.prefixSize(input.request) + @as(usize, input.request.max_bytes) }) catch |err| return switch (err) {
             error.OutOfMemory, error.Canceled, error.Cancelled, error.DeadlineExceeded => err,
             else => error.ReadUnavailable,
         };
@@ -3103,7 +3121,7 @@ pub const ApiHttpClient = struct {
         if (!std.mem.eql(u8, ack, route_metadata_api.catalog_route_fence_ack_value) or response.header(internal_batch_forwarding.outcome_header) != null) return error.InvalidRemoteResponse;
         const content_type = response.header("Content-Type") orelse response.content_type orelse return error.InvalidRemoteResponse;
         if (!std.ascii.eqlIgnoreCase(content_type, "application/octet-stream")) return error.InvalidRemoteResponse;
-        var page = try contract.wire.decode(self.alloc, response.body, input.request);
+        var page = try codec.decode(self.alloc, response.body, input.request);
         errdefer page.deinit();
         try context.ensureActive();
         return page;

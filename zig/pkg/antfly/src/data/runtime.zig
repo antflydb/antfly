@@ -7316,6 +7316,7 @@ pub const DataServer = struct {
         api_server_cfg.native_source_checkpoint_observe = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = sourceCheckpointObserveOperation } else null;
         api_server_cfg.native_source_plan_chunk = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = sourcePlanChunkOperation } else null;
         api_server_cfg.native_history_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = historyControlOperation } else null;
+        api_server_cfg.native_history_bootstrap_page = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyBootstrapPageOperation } else null;
         api_server_cfg.native_history_page = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyPageOperation } else null;
         api_server_cfg.native_history_grant = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyGrantOperation } else null;
         api_server_cfg.native_history_resolution = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyResolutionOperation } else null;
@@ -13704,7 +13705,7 @@ pub const DataServer = struct {
     /// Request-scoped feed-root transport. HTTP ingress continues to use the
     /// local-only callback so a forwarded request cannot bounce between peers.
     pub fn historyRootsSource(self: *DataServer) @import("../api/history_roots.zig").Source {
-        return .{ .catalog = self.write_source.catalog, .controls = self.historyControlPort(), .pages = self.historyPagePort(), .grants = self.historyGrantPort() };
+        return .{ .catalog = self.write_source.catalog, .controls = self.historyControlPort(), .pages = self.historyPagePort(), .bootstrap_pages = self.historyBootstrapPagePort(), .grants = self.historyGrantPort() };
     }
 
     pub fn historyControlPort(self: *DataServer) @import("../api/history_control_operations.zig").Port {
@@ -13713,6 +13714,10 @@ pub const DataServer = struct {
 
     pub fn historyPagePort(self: *DataServer) @import("../api/history_page_operations.zig").Port {
         return .{ .ptr = self, .read_fn = historyPageRoutedOperation };
+    }
+
+    pub fn historyBootstrapPagePort(self: *DataServer) @import("../api/history_page_operations.zig").Bootstrap.Port {
+        return .{ .ptr = self, .read_fn = historyBootstrapPageRoutedOperation };
     }
 
     pub fn historyResolutionPort(self: *DataServer) @import("../api/history_resolution_operations.zig").Port {
@@ -13727,11 +13732,12 @@ pub const DataServer = struct {
         return .{ .ptr = self, .read_fn = historyPublicationRoutedOperation };
     }
 
-    const HistoryOperation = enum { control, page, grant, resolution, publication, owner, decision, source_plan_control, source_plan_observe, source_plan_chunk, source_checkpoint_observe, source_scope_observe, source_producer_closure_observe, source_producer_control, legacy_terminal_control, legacy_inventory_observe, source_scope_control, source_retirement_control };
+    const HistoryOperation = enum { control, page, bootstrap_page, grant, resolution, publication, owner, decision, source_plan_control, source_plan_observe, source_plan_chunk, source_checkpoint_observe, source_scope_observe, source_producer_closure_observe, source_producer_control, legacy_terminal_control, legacy_inventory_observe, source_scope_control, source_retirement_control };
     fn historyRequestType(comptime kind: HistoryOperation) type {
         return switch (kind) {
             .control => @import("../api/history_control_operations.zig").wire.Request,
             .page => @import("../api/history_page_operations.zig").Request,
+            .bootstrap_page => @import("../api/history_page_operations.zig").Bootstrap.Request,
             .grant => @import("../api/history_grant_operations.zig").Request,
             .resolution => @import("../api/history_resolution_operations.zig").Request,
             .decision => @import("../api/history_decision_operations.zig").Request,
@@ -13754,6 +13760,7 @@ pub const DataServer = struct {
         return switch (kind) {
             .control => @import("../api/history_control_operations.zig").wire.Response,
             .page => @import("../api/history_page_operations.zig").pages.Page,
+            .bootstrap_page => @import("../api/history_page_operations.zig").pages.BootstrapPage,
             .grant => @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantObservation,
             .resolution => @import("../api/history_resolution_operations.zig").wire.Reply,
             .decision => @import("../api/history_decision_operations.zig").Reply,
@@ -13779,6 +13786,10 @@ pub const DataServer = struct {
     fn historyPageRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.page), context: antfly.public_api.operation.RequestContext) !historyResultType(.page) {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         return self.historyRoutedOperation(alloc, fence, table, .page, input, context);
+    }
+    fn historyBootstrapPageRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.bootstrap_page), context: antfly.public_api.operation.RequestContext) !historyResultType(.bootstrap_page) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(alloc, fence, table, .bootstrap_page, input, context);
     }
     fn historyPublicationRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.publication), context: antfly.public_api.operation.RequestContext) !historyResultType(.publication) {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
@@ -13840,6 +13851,7 @@ pub const DataServer = struct {
         if (observed.local) return switch (kind) {
             .control => historyControlOperation(self, alloc, fence, table, input, context),
             .page => historyPageOperation(self, alloc, fence, table, input, context),
+            .bootstrap_page => historyBootstrapPageOperation(self, alloc, fence, table, input, context),
             .grant => historyGrantOperation(self, alloc, fence, table, input, context),
             .resolution => historyResolutionOperation(self, alloc, fence, table, input, context),
             .decision => historyDecisionOperation(self, alloc, fence, table, input, context),
@@ -13870,13 +13882,14 @@ pub const DataServer = struct {
         var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(context.cancellation);
         var lane = try self.acquireDataRaftForwardLaneUntil(group, clock.deadline_ns.?, .{ .discovery = .cached, .cancellation = &cancellation });
         defer lane.release();
-        var executor = antfly.common.http.IoHttpExecutor.init(alloc, lane.io(), .{ .max_response_bytes = if (kind == .page) @import("../api/history_page_operations.zig").wire.prefixSize(input.request) + @as(usize, input.request.max_bytes) else if (kind == .decision) @import("../api/history_decision_operations.zig").max_reply_bytes else if (kind == .source_retirement_control) RetirementHttp.max_reply_bytes else if (kind == .source_scope_control) ScopeControlHttp.max_reply_bytes else if (kind == .legacy_inventory_observe) LegacyInventoryHttp.max_reply_bytes else if (kind == .legacy_terminal_control) LegacyTerminalHttp.max_reply_bytes else if (kind == .source_producer_control) ProducerControlHttp.max_reply_bytes else if (kind == .source_producer_closure_observe) ProducerRead.max_observation_bytes else if (kind == .source_scope_observe) ScopeRead.max_bytes else if (kind == .source_plan_chunk) SourcePlanHttp.max_bytes else @import("../api/history_control_operations.zig").wire.max_bytes });
+        var executor = antfly.common.http.IoHttpExecutor.init(alloc, lane.io(), .{ .max_response_bytes = if (kind == .page) @import("../api/history_page_operations.zig").wire.prefixSize(input.request) + @as(usize, input.request.max_bytes) else if (kind == .bootstrap_page) @import("../api/history_page_operations.zig").Bootstrap.wire.prefixSize(input.request) + @as(usize, input.request.max_bytes) else if (kind == .decision) @import("../api/history_decision_operations.zig").max_reply_bytes else if (kind == .source_retirement_control) RetirementHttp.max_reply_bytes else if (kind == .source_scope_control) ScopeControlHttp.max_reply_bytes else if (kind == .legacy_inventory_observe) LegacyInventoryHttp.max_reply_bytes else if (kind == .legacy_terminal_control) LegacyTerminalHttp.max_reply_bytes else if (kind == .source_producer_control) ProducerControlHttp.max_reply_bytes else if (kind == .source_producer_closure_observe) ProducerRead.max_observation_bytes else if (kind == .source_scope_observe) ScopeRead.max_bytes else if (kind == .source_plan_chunk) SourcePlanHttp.max_bytes else @import("../api/history_control_operations.zig").wire.max_bytes });
         defer executor.deinit();
         var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
         _ = client.withInternalServiceAuth(self.api_server_cfg.internal_service_secret, self.api_server_cfg.internal_service_issuer);
         return switch (kind) {
             .control => client.fetchGroupHistoryControl(uri, group, table, input, fence, context),
             .page => client.fetchGroupHistoryPage(uri, group, table, input, fence, context),
+            .bootstrap_page => client.fetchGroupHistoryBootstrapPage(uri, group, table, input, fence, context),
             .grant => client.fetchGroupHistoryGrant(uri, group, table, input, fence, context),
             .resolution => client.fetchGroupHistoryResolution(uri, group, table, input, fence, context),
             .decision => client.fetchGroupHistoryDecision(uri, group, table, input, fence, context),
@@ -13945,6 +13958,10 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         return self.historyLocalRead(alloc, fence, table, .page, input, context);
     }
+    fn historyBootstrapPageOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.bootstrap_page), context: antfly.public_api.operation.RequestContext) !historyResultType(.bootstrap_page) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyLocalRead(alloc, fence, table, .bootstrap_page, input, context);
+    }
 
     /// Retry only transient read admission. Each attempt revalidates the same
     /// route and identity with a fresh ReadIndex, within one original budget.
@@ -13969,6 +13986,7 @@ pub const DataServer = struct {
             try context.ensureActive();
             var result = (switch (kind) {
                 .page => owner.orderedHistoryPageRouted(alloc, fence, table, input.request),
+                .bootstrap_page => owner.orderedHistoryBootstrapPageRouted(alloc, fence, table, input.request),
                 .grant => owner.orderedHistoryGrantRouted(alloc, fence, table, input.identity),
                 .resolution => owner.orderedHistoryResolutionRouted(alloc, fence, table, input.binding()),
                 .decision => owner.orderedHistoryDecisionRouted(alloc, fence, table, input.binding()),
@@ -13982,7 +14000,7 @@ pub const DataServer = struct {
                 },
                 else => return err,
             };
-            errdefer if (kind == .page or kind == .decision) result.deinit();
+            errdefer if (kind == .page or kind == .bootstrap_page or kind == .decision) result.deinit();
             try context.ensureActive();
             return result;
         }
@@ -45027,7 +45045,7 @@ fn consumerTests() type {
                 };
                 const api_server = try a.create(antfly.public_api.kernel_bridge.ApiHttpServer);
                 defer a.destroy(api_server);
-                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .internal_service_accept_legacy_unauthenticated = true, .routed_raft_batch_writer = server.routedRaftBatchWriter(), .native_source_plan_control = .{ .ptr = server, .execute_fn = DataServer.sourcePlanControlOperation }, .native_source_plan_observe = .{ .ptr = server, .read_fn = DataServer.sourcePlanObserveOperation }, .native_source_scope_control = .{ .ptr = server, .execute_fn = DataServer.sourceScopeControlOperation }, .native_source_retirement_control = .{ .ptr = server, .execute_fn = DataServer.sourceRetirementControlOperation }, .native_source_scope_observe = .{ .ptr = server, .read_fn = DataServer.sourceScopeObserveOperation }, .native_source_producer_closure_observe = .{ .ptr = server, .read_fn = DataServer.sourceProducerClosureObserveOperation }, .native_source_producer_control = .{ .ptr = server, .execute_fn = DataServer.sourceProducerControlOperation }, .native_legacy_terminal = .{ .ptr = server, .execute_fn = DataServer.legacyTerminalOperation }, .native_legacy_inventory = .{ .ptr = server, .read_fn = DataServer.legacyInventoryOperation }, .native_source_checkpoint_observe = .{ .ptr = server, .read_fn = DataServer.sourceCheckpointObserveOperation }, .native_source_plan_chunk = .{ .ptr = server, .read_fn = DataServer.sourcePlanChunkOperation }, .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_decision = .{ .ptr = server, .read_fn = DataServer.historyDecisionOperation }, .native_history_owner = .{ .ptr = server, .read_fn = DataServer.historyOwnerOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
+                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .internal_service_accept_legacy_unauthenticated = true, .routed_raft_batch_writer = server.routedRaftBatchWriter(), .native_source_plan_control = .{ .ptr = server, .execute_fn = DataServer.sourcePlanControlOperation }, .native_source_plan_observe = .{ .ptr = server, .read_fn = DataServer.sourcePlanObserveOperation }, .native_source_scope_control = .{ .ptr = server, .execute_fn = DataServer.sourceScopeControlOperation }, .native_source_retirement_control = .{ .ptr = server, .execute_fn = DataServer.sourceRetirementControlOperation }, .native_source_scope_observe = .{ .ptr = server, .read_fn = DataServer.sourceScopeObserveOperation }, .native_source_producer_closure_observe = .{ .ptr = server, .read_fn = DataServer.sourceProducerClosureObserveOperation }, .native_source_producer_control = .{ .ptr = server, .execute_fn = DataServer.sourceProducerControlOperation }, .native_legacy_terminal = .{ .ptr = server, .execute_fn = DataServer.legacyTerminalOperation }, .native_legacy_inventory = .{ .ptr = server, .read_fn = DataServer.legacyInventoryOperation }, .native_source_checkpoint_observe = .{ .ptr = server, .read_fn = DataServer.sourceCheckpointObserveOperation }, .native_source_plan_chunk = .{ .ptr = server, .read_fn = DataServer.sourcePlanChunkOperation }, .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_bootstrap_page = .{ .ptr = server, .read_fn = DataServer.historyBootstrapPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_decision = .{ .ptr = server, .read_fn = DataServer.historyDecisionOperation }, .native_history_owner = .{ .ptr = server, .read_fn = DataServer.historyOwnerOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
                 defer api_server.deinit();
                 var handler = try antfly.public_api.kernel_bridge.createHandler(api_server);
                 defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
@@ -45108,6 +45126,9 @@ fn consumerTests() type {
                 small_page_input.request.max_bytes = 1;
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 try std.testing.expectError(error.HistoryTooLarge, origin.historyPagePort().read(a, route.fence().?, "docs", small_page_input, .{}));
+                const missing_snapshot: page_contract.Bootstrap.Request = .{ .version = 1, .request = .{ .reference = ref, .digest = @splat(77), .now_seconds = 100 } };
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                try std.testing.expectError(error.HistoryResynchronizationRequired, origin.historyBootstrapPagePort().read(a, route.fence().?, "docs", missing_snapshot, .{}));
                 var remote_input: ingress.wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .inspect = ref } };
                 const submit_body = try std.json.Stringify.valueAlloc(a, remote_input, .{});
                 defer a.free(submit_body);

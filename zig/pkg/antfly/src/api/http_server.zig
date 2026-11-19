@@ -1726,6 +1726,7 @@ pub const ApiHttpServerConfig = struct {
     native_source_checkpoint_observe: ?@import("source_checkpoint_operations.zig").Port = null,
     native_source_plan_chunk: ?@import("source_plan_operations.zig").ChunkPort = null,
     native_history_control: ?@import("history_control_operations.zig").Port = null,
+    native_history_bootstrap_page: ?@import("history_page_operations.zig").Bootstrap.Port = null,
     native_history_page: ?@import("history_page_operations.zig").Port = null,
     native_history_grant: ?@import("history_grant_operations.zig").Port = null,
     native_history_resolution: ?@import("history_resolution_operations.zig").Port = null,
