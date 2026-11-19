@@ -1,5 +1,18 @@
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Fresh fixed-budget native/PJRT/llama.cpp comparison on common fixtures."""
 
 import argparse
@@ -50,6 +63,66 @@ def check_rows(rows, cases, repeats):
             raise ValueError("Nondeterministic greedy measurements")
 
 
+def check_decisions(rows, references):
+    """Reuse official CPU decisions only while their complete prefixes match."""
+    actual_ids = {row["id"] for row in rows}
+    if actual_ids != set(references):
+        raise ValueError("Decision reference coverage differs")
+    for row in rows:
+        expected = references[row["id"]]
+        if len(row["tokens"]) < len(expected):
+            raise ValueError("Incomplete decision prefix: " + row["id"])
+        for step, (actual, reference) in enumerate(zip(row["tokens"], expected)):
+            if actual != reference:
+                raise ValueError(
+                    f"Transformer decision differs: {row['id']}/{step}: {actual} != {reference}"
+                )
+
+
+def check_cpu_pins(qualification, models, identities, vectors):
+    truth = qualification["source_truth"]
+    expected_models = qualification["native_reference_profile"][
+        "validation_provenance"
+    ]["models"]
+    if models != expected_models:
+        raise ValueError("CPU reference model source differs")
+    if any(identity != truth["identity"] for identity in identities):
+        raise ValueError("CPU forward identity differs")
+    if any(truth["vectors"].get(name) != value for name, value in vectors.items()):
+        raise ValueError("CPU reference vector identity differs")
+
+
+def check_native_activity(
+    report, required, media_required=(), cases=(), kind_required=()
+):
+    by_kind = {}
+    for requirement in kind_required:
+        kind, separator, name = requirement.partition("=")
+        if not separator or kind not in {"text", "image", "audio", "video"} or not name:
+            raise ValueError("Expected kind=counter native activity requirement")
+        if not any(case.get("kind", "text") == kind for case in cases):
+            raise ValueError("Required native activity kind has no cases: " + kind)
+        by_kind.setdefault(kind, set()).add(name)
+    for name in (
+        set(required)
+        | set(media_required)
+        | {n for names in by_kind.values() for n in names}
+    ):
+        count = report.get("cuda", {}).get(name)
+        if type(count) is not int or count <= 0:
+            raise ValueError("Inactive native optimization: " + name)
+    kinds = {case["id"]: case.get("kind", "text") for case in cases}
+    for row in report.get("rows", []):
+        kind = kinds.get(row["id"])
+        names = set(media_required) if kind and kind != "text" else set()
+        for name in names | by_kind.get(kind, set()):
+            count = row.get(name)
+            if type(count) is not int or count <= 0:
+                raise ValueError(
+                    "Inactive measured media optimization: " + row["id"] + "/" + name
+                )
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in (
@@ -73,6 +146,18 @@ def main():
     p.add_argument("--llama-loader", type=Path)
     p.add_argument("--llama-runtime", type=Path)
     p.add_argument("--cpu", type=Path, action="append", required=True)
+    p.add_argument("--native-env-file", type=Path)
+    p.add_argument("--native-baseline", type=Path)
+    p.add_argument("--native-decisions-reference", type=Path)
+    p.add_argument("--cpu-qualification", type=Path)
+    p.add_argument("--require-native-stat", action="append", default=[])
+    p.add_argument("--require-native-media-stat", action="append", default=[])
+    p.add_argument(
+        "--require-native-kind-stat",
+        action="append",
+        default=[],
+        metavar="KIND=COUNTER",
+    )
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--iterations", type=int, default=2)
     a = p.parse_args()
@@ -80,6 +165,35 @@ def main():
         p.error("Invalid campaign bounds")
     if bool(a.llama_loader) != bool(a.llama_runtime):
         p.error("Specify both compatible loader and runtime")
+    native_environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith("ANTFLY_INFERENCE_")
+    }
+    native_environment.update(REFERENCE_ENV)
+    if a.native_env_file:
+        overrides = json.loads(a.native_env_file.read_text())
+        if not isinstance(overrides, dict) or any(
+            not isinstance(key, str)
+            or not key.startswith("ANTFLY_INFERENCE_")
+            or not isinstance(value, str)
+            for key, value in overrides.items()
+        ):
+            p.error("Native environment must map ANTFLY_INFERENCE_ keys to strings")
+        native_environment.update(overrides)
+    decision_references = None
+    if a.native_decisions_reference:
+        reference = json.loads(a.native_decisions_reference.read_text())
+        positions = reference["all_native_decisions"]["rows"]
+        decision_references = {row["id"]: row["argmax"] for row in positions}
+        if len(decision_references) != len(positions) or any(
+            not values
+            or any(
+                type(value) is not int or not 0 <= value < 262144 for value in values
+            )
+            for values in decision_references.values()
+        ):
+            p.error("Invalid independent decision reference")
     a.out.mkdir(parents=True, exist_ok=False)
     suite = json.loads(a.suite.read_text())
     manifest = json.loads(a.manifest.read_text())
@@ -113,6 +227,7 @@ def main():
         raise ValueError("No common cases")
     suite = {**suite, "cases": cases}
     refs = {}
+    reference_hashes = {}
     identities = []
     for directory in a.cpu:
         identity = json.loads((directory / "reference.json").read_text())
@@ -126,13 +241,55 @@ def main():
             if path.stem in refs:
                 raise ValueError("Duplicate CPU reference")
             refs[path.stem] = np.fromfile(path, dtype="<f4")
+            reference_hashes[path.stem] = digest(path)
     if not set(selected_ids) <= set(refs):
         raise ValueError("Missing CPU references")
+    if a.cpu_qualification:
+        check_cpu_pins(
+            json.loads(a.cpu_qualification.read_text()),
+            {
+                key: manifest["preparation"][key + "_sha256"]
+                for key in ("gguf", "mmproj")
+            },
+            identities,
+            {name: reference_hashes[name] for name in selected_ids},
+        )
     orders = [
         ("native", "pjrt", "llama"),
         ("llama", "pjrt", "native"),
         ("pjrt", "native", "llama"),
     ]
+    if a.native_baseline:
+        orders = [
+            ("native", "pjrt", "baseline", "llama"),
+            ("pjrt", "llama", "native", "baseline"),
+            ("llama", "baseline", "pjrt", "native"),
+            ("baseline", "native", "llama", "pjrt"),
+        ]
+    runtime_directories = [
+        Path(directory)
+        for directory in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+        if directory
+    ]
+    if a.llama_runtime:
+        runtime_directories.append(a.llama_runtime)
+    runtime_files = {
+        path.resolve()
+        for directory in runtime_directories
+        for pattern in (
+            "ld-linux*.so*",
+            "libc.so*",
+            "libm.so*",
+            "libstdc++.so*",
+            "libgcc_s.so*",
+            "libgomp.so*",
+            "libcublas.so*",
+            "libcublasLt.so*",
+            "libcudart.so*",
+        )
+        for path in directory.glob(pattern)
+        if path.is_file()
+    }
     receipt = {
         "gpu": gpu(),
         "rounds": a.rounds,
@@ -140,7 +297,44 @@ def main():
         "warmups": 1,
         "common_case_ids": selected_ids,
         "orders": orders,
-        "native_environment": REFERENCE_ENV,
+        "native_environment": native_environment,
+        "cpu_vector_sha256": {name: reference_hashes[name] for name in selected_ids},
+        "cpu_qualification_sha256": digest(a.cpu_qualification)
+        if a.cpu_qualification
+        else None,
+        "native_baseline": (
+            {"sha256": digest(a.native_baseline), "environment": REFERENCE_ENV}
+            if a.native_baseline
+            else None
+        ),
+        "ambient_runtime_environment": {
+            key: value
+            for key, value in sorted(os.environ.items())
+            if key.startswith("ANTFLY_CUDA_ENABLE_")
+            or key
+            in (
+                "CUDA_VISIBLE_DEVICES",
+                "LD_LIBRARY_PATH",
+                "LD_PRELOAD",
+                "NVIDIA_TF32_OVERRIDE",
+                "ANTFLY_CUDA_QMATMUL_VARIANT",
+                "TERMITE_GEMMA4_AUDIO_HOST_OPS",
+                "TERMITE_DISABLE_PLE",
+                "TERMITE_DISABLE_SHARED_KV",
+                "TERMITE_DISABLE_SLIDING_ATTENTION",
+                "TERMITE_DENSE_DECODE_EVAL_STRIDE",
+                "TERMITE_GEMMA4_DISABLE_LAYER_OUTPUT_SCALE",
+                "TERMITE_GEMMA4_DISABLE_RMSNORM_ADD_FUSION",
+            )
+        },
+        "required_native_stats": a.require_native_stat,
+        "required_native_media_stats": a.require_native_media_stat,
+        "required_native_kind_stats": a.require_native_kind_stat,
+        "native_decisions_reference_sha256": (
+            digest(a.native_decisions_reference)
+            if a.native_decisions_reference
+            else None
+        ),
         "files": {
             name: digest(getattr(a, name))
             for name in (
@@ -158,6 +352,9 @@ def main():
         },
         "llama_libraries": {
             str(path.name): digest(path) for path in a.llama_library.glob("*.so")
+        },
+        "configured_runtime_libraries_sha256": {
+            str(path): digest(path) for path in sorted(runtime_files)
         },
         "llama_inputs": {
             str(path.name): digest(path)
@@ -202,7 +399,7 @@ def main():
         if not memory["valid"]:
             raise ValueError("Invalid memory sampling")
 
-    def native(directory, validation=False):
+    def native(directory, validation=False, baseline=False):
         directory.mkdir()
         config = native_suite(
             suite,
@@ -212,12 +409,23 @@ def main():
             validation,
         )
         (directory / "suite.json").write_text(json.dumps(config))
-        env = {**os.environ, **REFERENCE_ENV}
+        env = (
+            {
+                **{
+                    key: value
+                    for key, value in os.environ.items()
+                    if not key.startswith("ANTFLY_INFERENCE_")
+                },
+                **REFERENCE_ENV,
+            }
+            if baseline
+            else {**os.environ, **native_environment}
+        )
         child(
             [
                 str(x.resolve())
                 for x in (
-                    a.native,
+                    a.native_baseline if baseline else a.native,
                     a.gguf,
                     a.tokenizer,
                     a.template,
@@ -229,7 +437,16 @@ def main():
             env,
             directory,
         )
-        return json.loads((directory / "result.json").read_text())["rows"]
+        report = json.loads((directory / "result.json").read_text())
+        if not baseline:
+            check_native_activity(
+                report,
+                a.require_native_stat,
+                a.require_native_media_stat,
+                cases,
+                a.require_native_kind_stat,
+            )
+        return report["rows"]
 
     def llama(directory, validation=False):
         directory.mkdir()
@@ -290,10 +507,13 @@ def main():
         return rows
 
     native(a.out / "validation-native", True)
+    if a.native_baseline:
+        native(a.out / "validation-baseline", True, baseline=True)
     llama_oracle = llama(a.out / "validation-llama", True)
     pjrt(a.out / "validation-pjrt", True)
     checks = {}
-    for engine in ("native", "llama", "pjrt"):
+    engines = ("native", "llama", "pjrt") + (("baseline",) if a.native_baseline else ())
+    for engine in engines:
         base = a.out / ("validation-" + engine)
         if engine == "llama":
             base /= "run"
@@ -317,15 +537,23 @@ def main():
             raise ValueError("llama/reference prepared tokens differ: " + case["id"])
     (a.out / "validation.json").write_text(json.dumps(checks, indent=2) + "\n")
     if not all(
-        x["logit_tolerance_pass"] and x["argmax_matches"] for x in checks["native"]
+        x["logit_tolerance_pass"] and x["argmax_matches"]
+        for engine in ("native", "baseline")
+        if engine in checks
+        for x in checks[engine]
     ):
         raise ValueError("Native accuracy gate failed before timing")
-    all_rows = {name: [] for name in ("native", "pjrt", "llama")}
+    all_rows = {name: [] for name in engines}
+    runners = {"native": native, "pjrt": pjrt, "llama": llama}
+    if a.native_baseline:
+        runners["baseline"] = lambda directory: native(directory, baseline=True)
     for index in range(a.rounds):
         for engine in orders[index % len(orders)]:
             directory = a.out / f"r{index}-{engine}"
-            rows = {"native": native, "pjrt": pjrt, "llama": llama}[engine](directory)
+            rows = runners[engine](directory)
             check_rows(rows, cases, a.iterations)
+            if engine in ("native", "baseline") and decision_references is not None:
+                check_decisions(rows, decision_references)
             if engine == "llama":
                 canonical = {r["id"]: r["tokens"] for r in llama_oracle}
                 if any(r["tokens"] != canonical[r["id"]] for r in rows):
@@ -359,12 +587,14 @@ def main():
                 "p95_ms": tails,
                 "native_speedup": {
                     engine: medians[engine] / medians["native"]
-                    for engine in ("pjrt", "llama")
+                    for engine in engines
+                    if engine != "native"
                 },
                 "native_latency_win": {
                     engine: medians["native"] <= 0.95 * medians[engine]
                     and tails["native"] <= tails[engine]
-                    for engine in ("pjrt", "llama")
+                    for engine in engines
+                    if engine != "native"
                 },
             }
         )
@@ -374,6 +604,15 @@ def main():
                 "measurement_valid": True,
                 "acceptance": receipt,
                 "accuracy": checks,
+                "native_decisions": (
+                    {
+                        "scope": "official Transformer prefixes through first EOS or fixed budget; every measured native row checked",
+                        "unique_positions": sum(map(len, decision_references.values())),
+                        "passed": True,
+                    }
+                    if decision_references is not None
+                    else None
+                ),
                 "results": summary,
             },
             indent=2,

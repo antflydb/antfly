@@ -1,5 +1,129 @@
 # Gemma 4 E4B QAT: L4 qualification and performance
 
+## L4 speed follow-up in progress
+
+The [speed qualification record](gemma4-l4-speed-qualification.json) retains
+the new opt-in experiments separately from the previous comparison below.
+No all-modality llama.cpp speed win or PR readiness is claimed yet.
+
+The rebuilt worker `79468d00046d0ced3714150cd215c1301d94ed218c56fb96e85f60de9e88fae9`
+passes 8/8 numerical/argmax gates and all 585 official decisions with both the
+unfused PLE control and the corrected exact PLE fusion. All 262,144 first-step
+logit bits match between those profiles on every case. The fusion retains the
+qualified BF16 mirror path for prefill; its measured counters confirm that both
+paths execute. This establishes correctness, without a demonstrated fusion
+latency improvement. Production defaults remain at 5/8 numerical gates and
+8/8 first-token argmax matches on both the previous and rebuilt worker.
+
+A fresh four-arm campaign completed one of four planned rounds, with two
+measured calls per case and engine. It was stopped to investigate the remaining
+llama.cpp deficit. The completed round is retained as a performance screen;
+the campaign's `measurement_valid` is false and it does not establish qualified
+latency wins. No compiler or competing GPU job ran during these measurements.
+
+| Workload | Candidate ms | Original qualified baseline ms | llama.cpp ms | BF16 PJRT ms |
+|---|---:|---:|---:|---:|
+| text_short_256 | 3678.43 | 4723.62 | 3611.98 | 11378.86 |
+| page_summary_128 | 1911.85 | 2443.55 | 1883.94 | 5833.04 |
+| long2k_summary_64 | 1197.78 | 1494.35 | 1197.09 | 3073.33 |
+| image_64 | 1123.13 | 1813.21 | 1045.18 | 2987.07 |
+| audio_1s_64 | 984.06 | 1385.61 | 943.40 | 2894.22 |
+| audio_12s_64 | 1021.09 | 1491.60 | 1004.33 | 2897.76 |
+| audio_30s_64 | 1124.79 | 1667.03 | 1120.04 | 2999.19 |
+| video_6s_64 | 1160.34 | 1630.09 | 1275.96 | 3096.66 |
+
+In that screen, candidate median latency is about 20–38% lower than the original
+qualified baseline, and the measured PJRT artifact is about 2.6–3.2 times slower.
+The candidate remains 0.1–7.5% slower than llama.cpp on seven cases; video latency
+is about 9% lower. Every measured native candidate and baseline sequence matches
+the 585 saved official decision prefixes. This PJRT comparison uses the artifact
+runner, not PR #1404's exact unified runtime. The declared latency guardrail
+still requires at least a 5% median improvement with no p95 regression in a
+completed comparison.
+
+The rebuilt lossless-projector worker
+`8b7291c97ecb474dbb9af416c74f09f9a3c6b5845c4cf9db74dc17efabba9a21`
+converts 232 BF16 projector matrices whose values are exactly representable in
+FP16, retaining the residual precision path for the other 15 BF16 matrices.
+The conversion predicate passes an exhaustive 65,536-encoding test. With
+`ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_LOSSLESS_F16=1`, this worker passes all
+8/8 numerical/argmax gates and 585/585 official decisions. This preserves weight
+values exactly; FP16 activation arithmetic still requires the model gates.
+The 1-second audio cosine is 0.99990478 against the unchanged 0.9999 minimum.
+Every measured media request records both FP16 and residual calls: image
+112/1, each audio case 120/14, and video 672/6. Audio also records three resident
+layout calls per request.
+
+A completed one-round, two-call comparison of this worker gives the following
+medians. It passes native numerical gates and all saved decision prefixes, but
+one round remains a preliminary screen, not multi-round latency qualification.
+The private llama.cpp compatibility runtime was restored from verified Debian
+packages and the same official CUDA 12.8 runtime asset; runtime library hashes
+are now recorded alongside the engine hashes.
+
+| Workload | Candidate ms | llama.cpp ms | BF16 PJRT ms |
+|---|---:|---:|---:|
+| text_short_256 | 3644.67 | 3596.76 | 11796.95 |
+| page_summary_128 | 1893.59 | 1869.69 | 5979.67 |
+| long2k_summary_64 | 1185.20 | 1190.51 | 3174.05 |
+| image_64 | 1068.59 | 1038.34 | 3088.61 |
+| audio_1s_64 | 976.55 | 936.64 | 2914.55 |
+| audio_12s_64 | 1014.85 | 995.79 | 2984.74 |
+| audio_30s_64 | 1108.11 | 1109.46 | 3063.47 |
+| video_6s_64 | 1102.30 | 1265.81 | 3149.78 |
+
+Five cases remain 1.3–4.3% slower than llama.cpp. Long text and 30-second audio
+are near parity; video latency is about 13% lower. Native is 2.7–3.2 times faster
+than this PJRT artifact. The provisional profile now selects the qualified
+lossless-projector settings; it does not establish an all-modality speed win.
+
+The existing raw BF16 tensor-core route for prefill below 64 rows fails the
+1-second audio numerical gate (cosine 0.99987249, relative L2 0.02033754) and
+changes short-text decision 205. It is rejected. Integer tensor-core GEMV and
+warp-per-output prototypes preserve the checked output bits but are slower.
+These failures do not change the frozen tolerances.
+
+Persistent BF16 prefill mirrors, F16 vision attention and the Q8 activation
+head pass all eight first-step numerical/argmax gates and all 585 saved official
+Transformers decisions. The other six-profile settings remain in force,
+including disabled PLE gate fusion and F32 projector storage. The worst cosine
+is 0.99992213 with the unchanged 0.9999 threshold. Persistent prefill mirrors
+cost 7,890,534,400 additional GPU bytes; sampled process GPU usage reaches about
+16.45 GB on the L4. Decode retains the quantized weights. This result covers
+the retained fixtures and context budget, not general task quality or concurrency.
+
+Three-term residual BF16 projector products also pass 8/8 and 585/585 with the
+projector cache disabled. An initial cached experiment exercised that correction
+only during weight creation: borrowed cache views lost the projector tag. Its
+warmed timings cannot qualify the residual path. The source now preserves the
+tag and records residual calls per request, with a gate rejecting zero activity
+on any measured media request. The rebuilt cached path passes 8/8 and 585/585
+with either two or three residual terms. Every measured image/video request
+records 113/678 residual calls; audio records 134 residual and three resident
+layout calls per request. Those CUDA layouts eliminate the subsampler's host
+normalization and flattening round trips.
+
+The [provisional speed profile](gemma4-l4-speed-profile.json) selects two terms,
+RMS/Q8 mirror reuse and 32-token attention chunks. It passes the unchanged
+numerical and decision gates. Its native-only timings remain diagnostic, and
+the all-modality llama.cpp goal is still open. The combined prefill tuner and
+gate/up fusion passes first-step gates but changes page-summary decision 101;
+it is rejected. Raw-Q4 prefill and the online split-K dispatch diagnostic also
+remain unpromoted because of substantial latency regressions; the latter never
+entered its intended kernel on this model.
+
+The head changes preserve F32 reduction order and Q6 unpacked integer values.
+The differential harness passes 32 checks including real head weights,
+vocabulary tails, multiple rows and suppression, plus four complete-vocabulary
+Q8 logit bit comparisons. Kernel timings are diagnostic and do not establish
+end-to-end performance. PLE fusion and near-threshold compact-media variants
+that previously failed decision or numerical checks remain rejected; the exact
+PLE correction above is a separately qualified implementation. SM89 and fatbin
+head/PLE differential checks pass. Both the original and regenerated portable
+PTX fail loading with CUDA error 222 on this host: its driver API is 13.0 while
+the generating toolkit is 13.2. Portable PTX execution is not claimed; the L4
+checks use SM89 machine code. Tolerances are unchanged.
+
 ## Opt-in eight-case correctness follow-up
 
 The six-override accuracy profile in [GEMMA4.md](GEMMA4.md) passes all 8/8

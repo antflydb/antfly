@@ -16565,7 +16565,10 @@ extern "C" __global__ void termite_linear_q4_0_activation_slice_last_dim_q8_1_f3
     unsigned int lane = tid & 31u;
     unsigned int warp = tid >> 5;
     unsigned int row_blocks = in_dim / 32u;
-    __shared__ float warp_partial[4][4];
+    // The qualified E4B singleton launch uses eight warps, matching the
+    // unfused Q4 projection's reduction order. Four-warp callers retain
+    // their existing arithmetic and launch geometry.
+    __shared__ float warp_partial[4][8];
     float acc[4];
     bool full_tile = col_tile + 3u < out_dim;
     #pragma unroll
@@ -16606,7 +16609,7 @@ extern "C" __global__ void termite_linear_q4_0_activation_slice_last_dim_q8_1_f3
     #pragma unroll
     for (unsigned int c = 0; c < 4u; ++c) {
         float sum = termite_warp_reduce_sum(acc[c]);
-        if (lane == 0u && warp < 4u) warp_partial[c][warp] = sum;
+        if (lane == 0u && warp < 8u) warp_partial[c][warp] = sum;
     }
     __syncthreads();
     if (tid == 0u) {
@@ -16616,7 +16619,7 @@ extern "C" __global__ void termite_linear_q4_0_activation_slice_last_dim_q8_1_f3
             if (full_tile || col < out_dim) {
                 float y = 0.0f;
                 #pragma unroll
-                for (unsigned int w = 0; w < 4u; ++w) y += warp_partial[c][w];
+                for (unsigned int w = 0; w < (blockDim.x >> 5); ++w) y += warp_partial[c][w];
                 dst[row * out_dim + col] =
                     termite_decoder_activation_f32(y, activation) *
                     source[row * source_cols + source_start + col];
@@ -16885,15 +16888,23 @@ __device__ __forceinline__ int termite_pack_q6k_i8x4(const unsigned char* bp, un
     return termite_pack_i8x4(values);
 }
 
-__device__ __forceinline__ int termite_pack_q6k_i8x4_sub(const unsigned char* bp, unsigned int sub, unsigned int sub_offset) {
-    signed char values[4];
-    unsigned int base_value_index = sub * 16u + sub_offset;
-    #pragma unroll
-    for (unsigned int i = 0u; i < 4u; ++i) {
-        values[i] = (signed char)termite_q6k_quant_i32(bp, base_value_index + i);
-    }
-    return termite_pack_i8x4(values);
+// Q6_K blocks have an even 210-byte stride. Two aligned 16-bit loads
+// handle either 32-bit alignment without misaligned word reads. Unpack all
+// four bytes together, then sign-extend each six-bit value independently.
+__device__ __forceinline__ unsigned termite_load_q6_u32_2aligned(const unsigned char* p) {
+    const unsigned short* h = (const unsigned short*)p;
+    return unsigned(h[0]) | (unsigned(h[1]) << 16);
 }
+
+__device__ __forceinline__ int termite_pack_q6k_i8x4_sub(const unsigned char* bp, unsigned sub, unsigned offset) {
+    unsigned half = sub >> 3, group = (sub & 7) >> 1, lbase = (sub & 1) * 16 + offset;
+    unsigned lo = termite_load_q6_u32_2aligned(bp + half * 64 + (group & 1) * 32 + lbase);
+    unsigned hi = termite_load_q6_u32_2aligned(bp + 128 + half * 32 + lbase);
+    unsigned q = ((lo >> ((group >> 1) * 4)) & 0x0f0f0f0fu) | (((hi >> (group * 2)) & 0x03030303u) << 4);
+    unsigned sign = (~q) & 0x20202020u;
+    return int((q ^ 0x20202020u) | (sign << 1) | (sign << 2));
+}
+
 
 __device__ float termite_q4k_value_broadcast_scale(const unsigned char* bp, unsigned int value_index, unsigned int lane) {
     unsigned int sub = value_index / 32u;
@@ -20971,77 +20982,106 @@ extern "C" __global__ void termite_linear_q6_k_argmax_rows_stage1_tile8(
     }
 }
 
+// Keep the existing FP32 accumulation tree while moving its eight input
+// stripes into per-lane registers. Each warp owns two vocabulary columns;
+// only the final eight winners require a block-wide barrier.
+__device__ __forceinline__ float antfly_q6_f32_half(unsigned short h) {
+    float x;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(x) : "h"(h));
+    return x;
+}
+
+__device__ __forceinline__ float antfly_q6_f32_value(const unsigned char* bp, unsigned i) {
+    unsigned sub = i / 16, half = sub / 8, group = (sub % 8) / 2, lane = i & 31;
+    unsigned lo = bp[half * 64 + (group & 1) * 32 + lane];
+    unsigned hi = bp[128 + half * 32 + lane];
+    int q = int(((lo >> ((group / 2) * 4)) & 15) | (((hi >> (group * 2)) & 3) << 4)) - 32;
+    unsigned short dh = unsigned(bp[208]) | (unsigned(bp[209]) << 8);
+    float scale = antfly_q6_f32_half(dh) * float((signed char)bp[192 + sub]);
+    return scale * float(q);
+}
+
 extern "C" __global__ void termite_linear_q6_k_argmax_rows_stage1_tile16(
     float* partial_values,
-    unsigned int* partial_indices,
+    unsigned* partial_indices,
     const float* input,
     const unsigned char* weight,
     const int* suppress_token_ids,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim,
-    unsigned int suppress_count
+    unsigned rows,
+    unsigned in_dim,
+    unsigned out_dim,
+    unsigned suppress_count
 ) {
-    const unsigned int cols = 16u;
-    unsigned int col_tiles = (out_dim + cols - 1u) / cols;
-    unsigned int global_tile = blockIdx.x;
-    unsigned int row = col_tiles == 0u ? 0u : global_tile / col_tiles;
-    unsigned int tile = col_tiles == 0u ? 0u : global_tile - row * col_tiles;
-    unsigned int col_tile = tile * cols;
-    unsigned int tid = threadIdx.x;
-    unsigned int row_blocks = in_dim / 256u;
-    __shared__ float partial[16][256];
-    float acc[16];
+    unsigned tiles = (out_dim + 15) / 16, row = blockIdx.x / tiles, tile = blockIdx.x % tiles;
+    unsigned lane = threadIdx.x & 31, warp = threadIdx.x >> 5, blocks = in_dim / 256;
+    float acc[2][8];
     #pragma unroll
-    for (unsigned int c = 0; c < 16u; ++c) acc[c] = 0.0f;
-
-    if (row < rows) {
-        for (unsigned int block = 0; block < row_blocks; ++block) {
-            float x = input[row * in_dim + block * 256u + tid];
-            #pragma unroll
-            for (unsigned int c = 0; c < 16u; ++c) {
-                unsigned int col = col_tile + c;
-                if (col < out_dim) {
-                    const unsigned char* bp = weight + (col * row_blocks + block) * 210u;
-                    acc[c] += x * termite_q6k_value(bp, tid);
-                }
-            }
-        }
-    }
-    #pragma unroll
-    for (unsigned int c = 0; c < 16u; ++c) partial[c][tid] = acc[c];
-    __syncthreads();
-    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            #pragma unroll
-            for (unsigned int c = 0; c < 16u; ++c) partial[c][tid] += partial[c][tid + stride];
-        }
-        __syncthreads();
-    }
-    if (tid == 0u) {
-        float best_value = -3.402823466e+38f;
-        unsigned int best_index = 0xffffffffu;
+    for (unsigned c = 0; c < 2; ++c) {
         #pragma unroll
-        for (unsigned int c = 0; c < 16u; ++c) {
-            unsigned int col = col_tile + c;
-            if (row >= rows || col >= out_dim) continue;
-            bool suppressed = false;
-            for (unsigned int j = 0; j < suppress_count; ++j) {
-                int token_id = suppress_token_ids[j];
-                if (token_id >= 0 && (unsigned int)token_id == col) {
-                    suppressed = true;
-                    break;
+        for (unsigned p = 0; p < 8; ++p) acc[c][p] = 0;
+    }
+    if (row < rows) for (unsigned b = 0; b < blocks; ++b) {
+        #pragma unroll
+        for (unsigned c = 0; c < 2; ++c) {
+            unsigned col = tile * 16 + warp * 2 + c;
+            if (col < out_dim) {
+                const unsigned char* bp = weight + (col * blocks + b) * 210;
+                #pragma unroll
+                for (unsigned p = 0; p < 8; ++p) {
+                    unsigned k = lane + p * 32;
+                    acc[c][p] = fmaf(input[row * in_dim + b * 256 + k], antfly_q6_f32_value(bp, k), acc[c][p]);
                 }
             }
-            if (suppressed) continue;
-            float value = partial[c][0];
-            if (value > best_value || (value == best_value && col < best_index)) {
-                best_value = value;
-                best_index = col;
+        }
+    }
+    float best = -3.402823466e+38f;
+    unsigned best_i = 0xffffffffu;
+    #pragma unroll
+    for (unsigned c = 0; c < 2; ++c) {
+        // Preserve the old shared-memory reduction's 128/64/32 tree exactly.
+        acc[c][0] += acc[c][4];
+        acc[c][1] += acc[c][5];
+        acc[c][2] += acc[c][6];
+        acc[c][3] += acc[c][7];
+        acc[c][0] += acc[c][2];
+        acc[c][1] += acc[c][3];
+        acc[c][0] += acc[c][1];
+        float v = acc[c][0];
+        #pragma unroll
+        for (unsigned delta = 16; delta > 0; delta >>= 1) v += __shfl_down_sync(0xffffffffu, v, delta);
+        unsigned col = tile * 16 + warp * 2 + c;
+        bool suppressed = false;
+        for (unsigned j = 0; j < suppress_count; ++j) {
+            if (suppress_token_ids[j] >= 0 && unsigned(suppress_token_ids[j]) == col) suppressed = true;
+        }
+        if (row < rows && col < out_dim && !suppressed && (v > best || (v == best && col < best_i))) {
+            best = v;
+            best_i = col;
+        }
+    }
+    __shared__ float scores[8];
+    __shared__ unsigned ids[8];
+    if (lane == 0) {
+        scores[warp] = best;
+        ids[warp] = best_i;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        best = lane < 8 ? scores[lane] : -3.402823466e+38f;
+        best_i = lane < 8 ? ids[lane] : 0xffffffffu;
+        #pragma unroll
+        for (unsigned delta = 16; delta > 0; delta >>= 1) {
+            float v = __shfl_down_sync(0xffffffffu, best, delta);
+            unsigned id = __shfl_down_sync(0xffffffffu, best_i, delta);
+            if (id != 0xffffffffu && (v > best || (v == best && id < best_i))) {
+                best = v;
+                best_i = id;
             }
         }
-        partial_values[global_tile] = best_value;
-        partial_indices[global_tile] = best_index;
+        if (lane == 0) {
+            partial_values[blockIdx.x] = best;
+            partial_indices[blockIdx.x] = best_i;
+        }
     }
 }
 

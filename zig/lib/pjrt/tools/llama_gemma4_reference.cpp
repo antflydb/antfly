@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Oracle and fixed-budget benchmark over unmodified llama.cpp / libmtmd APIs.
 #include "llama.h"
 #include "mtmd-helper.h"
@@ -16,6 +29,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef ANTFLY_REFERENCE_PYAV_VIDEO
+#include "llama_gemma4_pyav.h"
+#endif
 
 static void require(bool ok, const char * message) {
     if (!ok) throw std::runtime_error(message);
@@ -93,12 +109,25 @@ int main(int argc, char ** argv) {
                 return std::isalnum(v) || v == '_' || v == '-';
             }), "Invalid case identifier");
             require(std::none_of(cases.begin(), cases.end(), [&](const Case & prior) { return prior.id == c.id; }), "Duplicate case");
-            require(c.kind == "text" || c.kind == "image" || c.kind == "audio", "Oracle supports text, image and audio inputs");
+            require(c.kind == "text" || c.kind == "image" || c.kind == "audio" || c.kind == "video", "Unsupported media kind");
             require(c.budget > 0 && c.budget <= 8192 && c.expected + size_t(c.budget) <= 8192, "Invalid context/output budget");
             c.prompt = read_text(base / (c.id + ".prompt"));
             cases.push_back(std::move(c));
         }
         require(!cases.empty(), "Empty suite");
+        // Match the official processor's 70 soft tokens per video frame. Image
+        // requests retain their separate 280-token projector configuration.
+        mtmd_context * video_media = nullptr;
+        if (std::any_of(cases.begin(), cases.end(), [](const Case & c) { return c.kind == "video"; })) {
+#ifdef ANTFLY_REFERENCE_PYAV_VIDEO
+            reference_pyav_init();
+#endif
+            auto video_params = vp;
+            video_params.image_min_tokens = 70;
+            video_params.image_max_tokens = 70;
+            video_media = mtmd_init_from_file(argv[2], model, video_params);
+            require(video_media != nullptr, "Video projector initialization failed");
+        }
         auto run = [&](const Case & c, bool capture) {
             llama_memory_clear(llama_get_memory(ctx), true);
             if (sampler) llama_sampler_reset(sampler);
@@ -107,19 +136,56 @@ int main(int argc, char ** argv) {
             const auto started = std::chrono::steady_clock::now();
             std::vector<const mtmd_bitmap *> bitmaps;
             mtmd_helper_bitmap_wrapper bitmap{};
-            if (c.kind != "text") {
+            auto * request_media = c.kind == "video" ? video_media : media;
+            std::string prompt = c.prompt;
+            if (c.kind == "video") {
+                auto params = mtmd_helper_video_init_params_default();
+                params.fps_target = 1.0f;
+                params.timestamp_interval_ms = 0;
+                params.no_soundtrack = true;
+#ifdef ANTFLY_REFERENCE_PYAV_VIDEO
+                params.decoder = &reference_pyav_decoder;
+#endif
+                bitmap.video_ctx = mtmd_helper_video_init(request_media, c.path.c_str(), params);
+                require(bitmap.video_ctx != nullptr, "Video decoding unavailable");
+                const auto info = mtmd_helper_video_get_info(bitmap.video_ctx);
+                require(info.fps == 1.0f, "Expected one-Hz video sampling");
+                std::string frames;
+                for (;;) {
+                    mtmd_bitmap * frame = nullptr;
+                    char * text = nullptr;
+                    const auto status = mtmd_helper_video_read_next(bitmap.video_ctx, &frame, &text);
+                    if (status == -1) break;
+                    require(status == 0 && bool(frame) != bool(text), "Video decode failed");
+                    // The generic helper's prose timestamps differ from Gemma's
+                    // template. Use the same one-Hz timestamps as Transformers.
+                    if (text) { std::free(text); continue; }
+                    require(bitmaps.size() < 60, "Video exceeds qualification scope");
+                    char timestamp[32];
+                    std::snprintf(timestamp, sizeof(timestamp), "%s00:%02zu [ANTFLY_REFERENCE_MEDIA]",
+                                  bitmaps.empty() ? "" : " ", bitmaps.size());
+                    frames += timestamp;
+                    bitmaps.push_back(frame);
+                }
+                require(!bitmaps.empty(), "Empty video");
+                const std::string marker = "[ANTFLY_REFERENCE_MEDIA]";
+                const auto offset = prompt.find(marker);
+                require(offset != std::string::npos && prompt.find(marker, offset + marker.size()) == std::string::npos,
+                        "Expected one video marker");
+                prompt.replace(offset, marker.size(), frames + " ");
+            } else if (c.kind != "text") {
                 auto opt = mtmd_helper_init_opt_default();
                 bitmap = mtmd_helper_bitmap_init_from_file(media, c.path.c_str(), false, opt);
                 require(bitmap.bitmap != nullptr, "Media decoding failed");
                 bitmaps.push_back(bitmap.bitmap);
             }
-            mtmd_input_text input{c.prompt.data(), c.prompt.size(), false, true};
+            mtmd_input_text input{prompt.data(), prompt.size(), false, true};
             auto * chunks = mtmd_input_chunks_init();
-            require(mtmd_tokenize(media, chunks, &input, bitmaps.data(), bitmaps.size()) == 0, "Media tokenization failed");
+            require(mtmd_tokenize(request_media, chunks, &input, bitmaps.data(), bitmaps.size()) == 0, "Media tokenization failed");
             const auto count = mtmd_helper_get_n_tokens(chunks);
             require(count == c.expected, "Reference/native prompt geometry differs");
             llama_pos pos = 0;
-            require(mtmd_helper_eval_chunks(media, ctx, chunks, 0, 0, 512, true, &pos) == 0, "Reference prefill failed");
+            require(mtmd_helper_eval_chunks(request_media, ctx, chunks, 0, 0, 512, true, &pos) == 0, "Reference prefill failed");
             const auto prefilled = std::chrono::steady_clock::now();
             std::vector<llama_token> tokens;
             tokens.reserve(c.budget);
@@ -127,6 +193,9 @@ int main(int argc, char ** argv) {
             // Validation alone downloads full logits and features. Measurement
             // obtains one backend-sampled token per step, as a serving client would.
             if (capture) {
+#ifdef ANTFLY_REFERENCE_PYAV_VIDEO
+                if (c.kind == "video") reference_pyav_capture(out / (c.id + ".frames.json"));
+#endif
                 require(logits != nullptr, "No logits");
                 std::ofstream logit_file(out / (c.id + ".f32"), std::ios::binary);
                 logit_file.write(reinterpret_cast<const char *>(logits), n_vocab * sizeof(float));
@@ -182,6 +251,7 @@ int main(int argc, char ** argv) {
             const double elapsed = std::chrono::duration<double, std::milli>(finished - started).count();
             mtmd_input_chunks_free(chunks);
             if (bitmap.bitmap) mtmd_bitmap_free(bitmap.bitmap);
+            if (c.kind == "video") for (const auto * frame : bitmaps) mtmd_bitmap_free(const_cast<mtmd_bitmap *>(frame));
             if (bitmap.video_ctx) mtmd_helper_video_free(bitmap.video_ctx);
             if (capture) {
                 std::ofstream file(out / (c.id + ".tokens"));
@@ -196,6 +266,11 @@ int main(int argc, char ** argv) {
         if (measure) for (const auto & c : cases) (void)run(c, false);
         std::ofstream report(out / "result.json");
         report << std::setprecision(12) << "{\"backend\":\"llama.cpp CUDA\",\"sampling\":\"" << (measure ? "backend greedy" : "CPU argmax full logits")
+#ifdef ANTFLY_REFERENCE_PYAV_VIDEO
+               << "\",\"video_decoder\":\"PyAV via unmodified libmtmd custom-decoder API"
+#else
+               << "\",\"video_decoder\":\"libmtmd ffmpeg helper"
+#endif
                << "\",\"measurement\":" << (measure ? "true" : "false") << ",\"warmups\":" << warmups << ",\"repeats\":" << repeats
                << ",\"scope\":\"pre-rendered prompt; encoded media read, tokenization, towers, prefill, fixed-budget decode and synchronized token readback; excludes load, KV reset, template rendering, output text decoding and cleanup\",\"rows\":[";
         bool first = true;
@@ -216,6 +291,7 @@ int main(int argc, char ** argv) {
         }
         report << "]}\n";
         require(bool(report), "Report output failed");
+        if (video_media) mtmd_free(video_media);
         mtmd_free(media); llama_batch_ext_free(step_batch); llama_free(ctx);
         if (sampler) llama_sampler_free(sampler);
         llama_model_free(model); llama_backend_free();

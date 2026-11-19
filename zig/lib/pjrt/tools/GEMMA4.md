@@ -305,7 +305,7 @@ KV buffers on the GPU; it does not recompute the full prefix per decode step.
 ## Optional llama.cpp oracle
 
 `llama_gemma4_reference.cpp` uses the unmodified llama/libmtmd C APIs. Build it
-against matching llama.cpp headers and libraries (the review used b12387):
+against matching llama.cpp headers and libraries (the current comparison uses b12521):
 
 ```sh
 c++ -std=c++17 -O2 -I"$LLAMA_HEADERS" zig/lib/pjrt/tools/llama_gemma4_reference.cpp \
@@ -315,16 +315,28 @@ GGML_BACKEND_PATH="$LLAMA_LIB" ./llama-gemma4-reference \
 ```
 
 Each input-directory `cases.tsv` row contains whitespace-separated case ID,
-kind (`text`, `image`, `audio`), absolute media path (`-` for text), expected prompt tokens and output-token
+kind (`text`, `image`, `audio`, `video`), absolute media path (`-` for text), expected prompt tokens and output-token
 budget. `<id>.prompt` contains the exact rendered prompt, with
 `[ANTFLY_REFERENCE_MEDIA]` at the media location. The wrapper checks prompt
 geometry, saves full first-step logits and fixed-budget greedy tokens, and
 records prepared prompt IDs and audio embeddings. Its vision budget is 256–280
 soft tokens, context 8192, F16 KV and flash attention. Its default mode does not
-measure performance. Video uses the Transformers oracle. Treat frontend disagreements as investigation results; do not
+measure performance. Transformers remains the independent correctness oracle for every modality. Treat frontend disagreements as investigation results; do not
 switch oracle per case to obtain a passing gate.
 Use libraries built for the host's libc; the retained b12387 binaries required an
 existing compatible runtime loader on this host.
+
+Video uses libmtmd's unmodified custom-decoder API and a separate projector
+context with a 70-soft-token frame budget. It samples at one Hz, omits the
+soundtrack and renders Gemma's `00:00` timestamps. Prepared token IDs are checked
+against Transformers, including all frame slots. The supported qualification
+scope is clips shorter than one minute at their original dimensions.
+The default decoder requires ffmpeg/ffprobe. On hosts with PyAV instead, add
+`-DANTFLY_REFERENCE_PYAV_VIDEO $(python3-config --includes)` and
+`$(python3-config --embed --ldflags)` to the build command, and expose PyAV via
+`PYTHONPATH`. Interpreter/import startup is outside timing; encoded-file opening,
+sequential decoding, skipped frames and RGB conversion remain inside it.
+Validation saves `<id>.frames.json` with the selected source timestamps.
 
 The wrapper also accepts `--measure WARMUPS REPEATS`. This mode uses a greedy
 backend sampler, scalar token readback and synchronized fixed-budget decoding.
@@ -339,12 +351,19 @@ requires the measured GPU-sampled sequence to equal the full-logit oracle's
 entire fixed-budget sequence.
 
 `compare_gemma4.py` runs three alternating fresh-process rounds over common
-text/image/audio cases, with one warmup and two measured calls per case by
+text/image/audio/video cases, with one warmup and two measured calls per case by
 default. It accepts the benchmark's model/runner/plugin/suite/cache arguments,
 plus `--llama-runner`, `--llama-library`, `--llama-inputs`, repeated `--cpu`
 reference directories and a fresh `--out`. For binaries requiring a newer libc,
 both `--llama-loader` and `--llama-runtime` select an existing compatible runtime.
 Prepare PJRT executables with the exact worker before running it.
+
+Add `--native-baseline PATH --rounds 4` to include a preserved native worker in
+four rotated rounds. The baseline uses the six reference overrides with other
+`ANTFLY_INFERENCE_` overrides removed. Both native binaries must pass the CPU
+numerical gates; when decision references are supplied, every measured baseline
+sequence must match them too. Baseline hashes, environments and speed ratios
+are retained with the competitor results.
 
 This comparison uses the six native accuracy overrides above, checks independent
 first-step logits before timing and reports competitor failures. It verifies
@@ -353,6 +372,45 @@ within/across rounds. It records the llama.cpp timing boundary difference rather
 than claiming identical serving boundaries. Median improvement of at least 5%
 with no p95 regression is the latency-win criterion; first-step accuracy and
 latency wins do not certify whole-generation correctness.
+
+To evaluate another opt-in native profile, pass `--native-env-file profile.json`,
+a JSON map of `ANTFLY_INFERENCE_` names to string values. The receipt records the
+effective overrides; the six accuracy defaults remain the default comparison.
+`--native-decisions-reference gemma4-l4-rgb-qualification.json` requires every
+measured native sequence to match all 585 saved official CPU decisions through
+the first EOS or budget. Post-EOS fixed-budget suffixes are outside that oracle.
+`--cpu-qualification gemma4-l4-qualification.json` additionally pins the eight
+CPU vector hashes, official forward identities and model hashes to the original
+independent qualification. Every comparison receipt records CPU vector hashes.
+Require optimization counters with repeated `--require-native-stat NAME`,
+`--require-native-media-stat NAME` (each measured media request), or
+`--require-native-kind-stat audio=NAME` (each measured request of that kind).
+Warmup-only activity cannot qualify a measured media optimization.
+
+The provisional L4 speed profile is `gemma4-l4-speed-profile.json`. Its current
+worker passes the eight numerical/argmax gates and 585 official decisions, but
+the all-modality llama.cpp latency target remains open. It enables exact E4B
+PLE fusion, persistent BF16 prefill mirrors, resident audio layouts and the
+lossless projector-weight conversion. The latter changes activation precision,
+so exact weight storage alone does not qualify it. Require
+`gemma4_projector_f16_weight_count` globally and `gemma4_projector_f16_calls`
+alongside `gemma4_projector_residual_calls` on every measured media request.
+Also require `audio=gemma4_audio_resident_layout_calls` and the exact PLE fusion
+and prefill-fallback counters. The speed qualification record retains the
+worker/source hashes, all gates, rejected variants and preliminary timings.
+
+The projector conversion predicate can be tested independently with:
+
+```sh
+zig test zig/pkg/inference/src/ops/cuda/projector_precision.zig \
+  --cache-dir .zig-cache/native --global-cache-dir .zig-cache/global
+```
+
+This exhaustively compares all 65,536 BF16 encodings with a finite FP16 round
+trip. Numerical gates remain cosine >=0.9999, relative L2 <=0.02 and exact
+argmax; promotion additionally requires all saved token decisions. Comparison
+receipts include configured compatibility/CUDA runtime library hashes and the
+library search environment as well as engine hashes.
 
 For raw video boundary diagnosis, run the opt-in test
 `gemma4 real video exports decoded RGB parity fixture` with

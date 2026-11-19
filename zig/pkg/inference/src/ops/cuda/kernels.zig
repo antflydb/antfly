@@ -15536,7 +15536,10 @@ pub const KernelModule = struct {
         source_cols: usize,
         source_start: usize,
         activation: u8,
+        exact_e4b_reduction: bool,
     ) driver_mod.Error!void {
+        if (exact_e4b_reduction and (ctx.info.compute_major != 8 or ctx.info.compute_minor != 9 or
+            rows != 1 or in_dim != 2560 or out_dim != 256)) return error.InvalidCudaState;
         const function = self.linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4 orelse return error.CudaKernelUnavailable;
         if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
         if (source_start > source_cols or out_dim > source_cols - source_start) return error.InvalidCudaState;
@@ -15570,7 +15573,8 @@ pub const KernelModule = struct {
             @ptrCast(&source_start_u32),
             @ptrCast(&activation_u32),
         };
-        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads_w4, &params);
+        const threads = if (exact_e4b_reduction) q4_0_tiled_threads else q4_0_tiled_threads_w4;
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, threads, &params);
     }
 
     pub fn launchLinearQ4KF32(

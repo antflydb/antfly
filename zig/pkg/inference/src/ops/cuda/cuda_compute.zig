@@ -79,6 +79,8 @@ pub const CudaTensor = struct {
     // both the direct allocation and its retained shared-admission lease.
     model_constant: bool = false,
     gemma4_projector_constant: bool = false,
+    gemma4_projector_weight: bool = false,
+    gemma4_projector_f16_weight: bool = false,
     model_constant_lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null,
 
     buffer: buffer_mod.DeviceBuffer,
@@ -1518,6 +1520,13 @@ pub const RuntimeStats = struct {
     bf16_scalar_linear_calls: usize = 0,
     bf16_scalar_qkv_calls: usize = 0,
     f16_cublaslt_linear_calls: usize = 0,
+    gemma4_projector_residual_calls: usize = 0,
+    gemma4_audio_resident_layout_calls: usize = 0,
+    cublaslt_workspace_bytes: usize = 0,
+    gemma4_ple_exact_fusion_calls: usize = 0,
+    gemma4_ple_prefill_mirror_fallbacks: usize = 0,
+    gemma4_projector_f16_weight_count: usize = 0,
+    gemma4_projector_f16_calls: usize = 0,
     f16_cublaslt_qkv_calls: usize = 0,
     f16_cublaslt_activation_staging_calls: usize = 0,
     f16_cublaslt_fallbacks: usize = 0,
@@ -6146,6 +6155,7 @@ pub const CudaCompute = struct {
 
     pub fn snapshotStats(self: *const CudaCompute) RuntimeStats {
         var stats = self.stats;
+        stats.cublaslt_workspace_bytes = self.cublaslt_workspace_scratch.buffer.len;
         stats.kernel_launches = self.ctx.stats.kernel_launches;
         stats.stream_syncs = self.ctx.stats.stream_syncs;
         for (self.temp_buffers.buffers.items) |buffer| {
@@ -7286,10 +7296,26 @@ pub const CudaCompute = struct {
         defer scan.deinit();
         try copyFromHostTracked(self, device, tensor.data);
         try synchronizeAndDrainDeferredDeviceFrees(self);
-        // Projector weights remain mapped for lazy lookup, but this completed
-        // upload no longer needs their clean host pages resident as a duplicate.
+        var stored_dtype = tensor.dtype;
+        const lossless_f16 = self.gemma4_e4b_sm89_qualified and !self.resident_training_cache and
+            tensor.dtype == .bf16 and
+            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_LOSSLESS_F16", false) and
+            @import("projector_precision.zig").bf16TensorFitsF16(tensor.data);
+        if (lossless_f16) {
+            var widened = try allocDeviceBuffer(self, try checkedMul(count, @sizeOf(f32)));
+            defer releaseDeviceBuffer(self, &widened);
+            try self.scalar_clamp_kernel.widen16Bit(&self.ctx, device.ptr, widened.ptr, count, true);
+            try self.kernels.launchF32ToF16(&self.ctx, device, widened, count);
+            try synchronizeAndDrainDeferredDeviceFrees(self);
+            stored_dtype = .f16;
+            self.stats.gemma4_projector_f16_weight_count += 1;
+        }
+        // All source reads, including exact-conversion eligibility, are done.
         c_file.MmapRegion.adviseBytesDontNeed(scan.bytes);
-        return createTensorWithDType(self, device, shape, count, tensor.dtype);
+        const result = try createTensorWithDType(self, device, shape, count, stored_dtype);
+        tensorFromCt(result).gemma4_projector_weight = true;
+        tensorFromCt(result).gemma4_projector_f16_weight = lossless_f16;
+        return result;
     }
 
     /// Upload compact F16/BF16 weights and widen exactly on device. The caller owns
@@ -12472,6 +12498,64 @@ fn tryCublasLtF16Linear(
     return true;
 }
 
+// Retain the activation's rounding residual when multiplying immutable
+// 16-bit projector weights. Each tensor-core product accumulates into F32.
+// Three BF16 terms recover approximately the original activation precision;
+// the two-term option is an explicit performance ablation. Decoder weights
+// retain their existing dispatch and training never enters this path.
+fn tryCublasLtProjectorResidualLinear(
+    self: *CudaCompute,
+    dst: buffer_mod.DeviceBuffer,
+    input: *const CudaTensor,
+    weight: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    bf16: bool,
+) !bool {
+    const high = if (bf16)
+        try stageBf16ActivationForCublasLt(self, input, rows, in_dim) orelse return false
+    else
+        try stageF16ActivationForCublasLt(self, input, rows, in_dim) orelse return false;
+    const blas = &(self.cublaslt orelse return false);
+    const terms = if (bf16) platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL_TERMS") orelse 3 else 2;
+    if (terms != 2 and terms != 3) return error.InvalidShape;
+    const count = try checkedMul(rows, in_dim);
+    var residual = try allocDeviceBuffer(self, try checkedMul(count, 4));
+    defer releaseDeviceBuffer(self, &residual);
+    var rounded = try allocDeviceBuffer(self, try checkedMul(count, 4));
+    defer releaseDeviceBuffer(self, &rounded);
+    var low = try allocDeviceBuffer(self, try checkedMul(count, 2));
+    defer releaseDeviceBuffer(self, &low);
+    var correction = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, out_dim), 4));
+    defer releaseDeviceBuffer(self, &correction);
+    try self.scalar_clamp_kernel.widen16Bit(&self.ctx, high.ptr, rounded.ptr, count, bf16);
+    try self.kernels.launchElementwiseF32(&self.ctx, residual, input.buffer, rounded, count, .subtract);
+    const workspace = cublasLtWorkspace(self);
+    if (bf16) {
+        blas.matmulBf16WeightF32Out(&self.ctx, dst, high, weight, workspace, rows, in_dim, out_dim) catch return false;
+    } else {
+        blas.matmulF16WeightF32Out(&self.ctx, dst, high, weight, workspace, rows, in_dim, out_dim) catch return false;
+    }
+    for (1..terms) |term| {
+        if (bf16) {
+            try self.kernels.launchF32ToBf16(&self.ctx, low, residual, count);
+            blas.matmulBf16WeightF32Out(&self.ctx, correction, low, weight, workspace, rows, in_dim, out_dim) catch return false;
+        } else {
+            try self.kernels.launchF32ToF16(&self.ctx, low, residual, count);
+            blas.matmulF16WeightF32Out(&self.ctx, correction, low, weight, workspace, rows, in_dim, out_dim) catch return false;
+        }
+        try self.kernels.launchElementwiseF32(&self.ctx, dst, dst, correction, rows * out_dim, .add);
+        if (term + 1 < terms) {
+            try self.scalar_clamp_kernel.widen16Bit(&self.ctx, low.ptr, rounded.ptr, count, bf16);
+            try self.kernels.launchElementwiseF32(&self.ctx, residual, residual, rounded, count, .subtract);
+        }
+    }
+    if (bf16) self.stats.bf16_cublaslt_linear_calls += terms else self.stats.f16_cublaslt_linear_calls += terms;
+    self.stats.gemma4_projector_residual_calls += 1;
+    return true;
+}
+
 fn tryCublasLtBf16LinearPair(
     self: *CudaCompute,
     dst_a: buffer_mod.DeviceBuffer,
@@ -14182,6 +14266,8 @@ fn borrowModelConstant(self: *CudaCompute, parent: *CudaTensor) !CT {
     const tensor = tensorFromCt(result);
     tensor.owns_buffer = false;
     tensor.resident_parent = parent;
+    tensor.gemma4_projector_weight = parent.gemma4_projector_weight;
+    tensor.gemma4_projector_f16_weight = parent.gemma4_projector_f16_weight;
     parent.resident_references += 1;
     return result;
 }
@@ -16665,7 +16751,13 @@ fn audioFlattenOp(ctx: *anyopaque, input: CT, time: usize, freq: usize, channels
 }
 fn audioFrontendOp(ctx: *anyopaque, input: CT, auxiliary: ?CT, params: ops.AudioFrontendParams) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    if (self.capability_profile != .embedding_gemma2) return null;
+    // Gemma4's NCHW subsampler uses the same channel norm and flatten
+    // contracts. Keep those intermediates on device for the qualified L4
+    // model, retaining the host fallback as an explicit rollback.
+    const gemma4_layout = self.capability_profile == .gemma4 and self.gemma4_e4b_sm89_qualified and
+        params.batch == 1 and (params.mode == 3 or params.mode == 4) and
+        platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_AUDIO_RESIDENT_LAYOUTS", false);
+    if (self.capability_profile != .embedding_gemma2 and !gemma4_layout) return null;
     const n = try params.counts();
     const x = tensorFromCt(input);
     try ensureF32(x);
@@ -16678,6 +16770,7 @@ fn audioFrontendOp(ctx: *anyopaque, input: CT, auxiliary: ?CT, params: ops.Audio
     errdefer releaseDeviceBuffer(self, &output);
     errdefer self.ctx.synchronize() catch {};
     try (try self.embeddingGemma2Module()).launchAudioFrontend(&self.ctx, output, x.buffer, if (aux) |t| t.buffer else .{}, params);
+    if (gemma4_layout) self.stats.gemma4_audio_resident_layout_calls += 1;
     return createTensor(self, output, shape, n.output);
 }
 
@@ -20645,11 +20738,22 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
         // The QAT checkpoint stores this projection in F16 already. Decode
         // widens each weight exactly while retaining F32 inputs, accumulation,
         // and the original reduction order. Only prefill rounds activations.
-        if (self.gemma4_e4b_sm89_qualified and rows == 1 and in_dim == 2560 and out_dim == 10752) {
+        if (!primitive_training and self.gemma4_e4b_sm89_qualified and weight_tensor.gemma4_projector_weight and
+            !weight_tensor.gemma4_projector_f16_weight and
+            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL", false))
+        {
+            if (try tryCublasLtProjectorResidualLinear(self, device, input_tensor, weight_tensor.buffer, rows, in_dim, out_dim, false)) {
+                self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
+            } else {
+                try self.kernels.launchLinearF16WeightF32Tiled(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                self.stats.f16_scalar_linear_calls += 1;
+            }
+        } else if (self.gemma4_e4b_sm89_qualified and rows == 1 and in_dim == 2560 and out_dim == 10752) {
             try self.kernels.launchLinearF16WeightF32Tiled(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
             self.stats.f16_scalar_linear_calls += 1;
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
         } else if (try tryCublasLtF16Linear(self, device, input_tensor, weight_tensor.buffer, rows, in_dim, out_dim)) {
+            if (weight_tensor.gemma4_projector_f16_weight) self.stats.gemma4_projector_f16_calls += 1;
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
         } else {
             self.stats.f16_cublaslt_fallbacks += 1;
@@ -20900,7 +21004,16 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
             else => return error.UnsupportedTensorType,
         }
     } else if (isBf16Weight(weight_tensor)) {
-        if (try tryCublasLtBf16Linear(self, device, input_tensor, weight_tensor.buffer, rows, in_dim, out_dim)) {
+        if (!primitive_training and self.gemma4_e4b_sm89_qualified and weight_tensor.gemma4_projector_weight and
+            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL", false))
+        {
+            if (try tryCublasLtProjectorResidualLinear(self, device, input_tensor, weight_tensor.buffer, rows, in_dim, out_dim, true)) {
+                self.dispatch_stats.note(self.allocator, .linear_no_bias, .bf16, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
+            } else {
+                try self.kernels.launchLinearBf16WeightF32Tiled(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                self.stats.bf16_scalar_linear_calls += 1;
+            }
+        } else if (try tryCublasLtBf16Linear(self, device, input_tensor, weight_tensor.buffer, rows, in_dim, out_dim)) {
             // cuBLASLt counters are updated by the helper.
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .bf16, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
         } else {
@@ -24519,6 +24632,15 @@ fn linearNoBiasActivationSliceLastDim(
     if (source_rows != rows or start > source_cols or out_dim > source_cols - start) return null;
     try ensureCount(source_tensor, try checkedMul(source_rows, source_cols));
 
+    // Preserve the qualified E4B hybrid prefill's BF16 GEMM. Singleton
+    // decode instead uses the exact eight-warp fused projection below.
+    if (self.gemma4_e4b_sm89_qualified and rows > 1 and
+        weightBf16MirrorForRows(self, weight_tensor, rows) != null)
+    {
+        self.stats.gemma4_ple_prefill_mirror_fallbacks += 1;
+        return null;
+    }
+
     // With an admitted hybrid BF16 mirror, this E2B prefill candidate evaluates
     // two existing semantic operations in place of the fused Q8_1+Q4_0 PLE
     // kernel: returning null asks the architecture fallback to run
@@ -24564,6 +24686,8 @@ fn linearNoBiasActivationSliceLastDim(
         };
         defer prepared.deinit(self);
         const q8_input = prepared.buffer;
+        const exact_e4b_reduction = self.gemma4_e4b_sm89_qualified and
+            rows == 1 and in_dim == 2560 and out_dim == 256;
         self.kernels.launchLinearQ4_0ActivationSliceLastDimQ8_1Tile4F32(
             &self.ctx,
             device,
@@ -24576,11 +24700,13 @@ fn linearNoBiasActivationSliceLastDim(
             source_cols,
             start,
             @backingInt(activation),
+            exact_e4b_reduction,
         ) catch |err| switch (err) {
             error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
             else => return err,
         };
         used_q8_1_dp4a = true;
+        if (exact_e4b_reduction) self.stats.gemma4_ple_exact_fusion_calls += 1;
     }
 
     if (!used_q8_1_dp4a) self.kernels.launchLinearQ4_0ActivationSliceLastDimTile4F32(
@@ -39617,6 +39743,8 @@ test "Gemma4 CUDA projector cache preserves compact dtype and independent admiss
         var borrowed_owned = true;
         defer if (borrowed_owned) cb.free(borrowed);
         try std.testing.expectEqual(dtype, tensorFromCt(borrowed).dtype);
+        try std.testing.expect(tensorFromCt(weight).gemma4_projector_weight);
+        try std.testing.expect(tensorFromCt(borrowed).gemma4_projector_weight);
         try std.testing.expectEqual(tensorFromCt(weight).buffer.ptr, tensorFromCt(borrowed).buffer.ptr);
         try std.testing.expect(try compute.borrowGemma4ProjectorWeight("different-owner") == null);
         // Replacing admission removes cache ownership but leaves live aliases
