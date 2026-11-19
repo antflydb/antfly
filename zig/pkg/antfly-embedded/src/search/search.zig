@@ -275,6 +275,7 @@ pub const MultiPhraseQuery = struct {
 
 pub const NumericRangeQuery = struct {
     field: []const u8,
+    exact_bounds: ?query_mod.RangeFilter.ExactBounds = null,
     min: ?f64 = null,
     max: ?f64 = null,
     inclusive_min: bool = true,
@@ -1400,6 +1401,7 @@ fn executeNumericRange(
         .field = rq.field,
         .min_val = rq.min,
         .max_val = rq.max,
+        .exact_bounds = rq.exact_bounds,
         .inclusive_min = rq.inclusive_min,
         .inclusive_max = rq.inclusive_max,
     } }, request, rq.boost);
@@ -5723,6 +5725,7 @@ pub fn searchQueryToFilterWithPreparation(alloc: Allocator, sq: SearchQuery, pre
             .field = rq.field,
             .min_val = rq.min,
             .max_val = rq.max,
+            .exact_bounds = rq.exact_bounds,
             .inclusive_min = rq.inclusive_min,
             .inclusive_max = rq.inclusive_max,
         } },
@@ -5874,6 +5877,7 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
                 .field = rq.field,
                 .min_val = rq.min,
                 .max_val = rq.max,
+                .exact_bounds = rq.exact_bounds,
                 .inclusive_min = rq.inclusive_min,
                 .inclusive_max = rq.inclusive_max,
             } },

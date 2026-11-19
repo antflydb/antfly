@@ -1375,11 +1375,21 @@ fn writeTextSegmentWithScratch(
     }
     var numeric_coverage: std.StringHashMapUnmanaged(usize) = .empty;
     defer numeric_coverage.deinit(alloc);
-    for (docs) |doc| {
-        for (doc.complete_numeric_fields) |name| {
-            const count = try numeric_coverage.getOrPutValue(alloc, name, 0);
-            count.value_ptr.* += 1;
+    var start: usize = 0;
+    while (start < docs.len) {
+        const complete = docs[start].complete_numeric_fields;
+        // Ordinary rows share the schema's complete field list. Count a run
+        // once instead of hashing every declared field for every row.
+        var end = start + 1;
+        while (end < docs.len) : (end += 1) {
+            const next = docs[end].complete_numeric_fields;
+            if (next.ptr != complete.ptr or next.len != complete.len) break;
         }
+        for (complete) |name| {
+            const count = try numeric_coverage.getOrPutValue(alloc, name, 0);
+            count.value_ptr.* += end - start;
+        }
+        start = end;
     }
     var witnesses: std.ArrayListUnmanaged(segment_mod.NumericRangeWitness) = .empty;
     defer witnesses.deinit(alloc);

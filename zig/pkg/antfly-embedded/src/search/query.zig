@@ -79,6 +79,7 @@ pub const Filter = union(enum) {
             .wildcard => |*f| f.control = control,
             .regexp => |*f| f.control = control,
             .term_range => |*f| f.control = control,
+            .range => |*f| f.control = control,
             else => {},
         }
         return result;
@@ -1682,14 +1683,22 @@ pub const GeoShapeFilter = struct {
 /// Numeric range filter: matches documents with f64 typed doc values in a range.
 /// Default: [min, max) — inclusive min, exclusive max.
 pub const RangeFilter = struct {
+    pub const ExactBounds = struct {
+        min: ?typed_dv.NumericValue,
+        max: ?typed_dv.NumericValue,
+    };
+
     field: []const u8,
     min_val: ?f64 = null,
     max_val: ?f64 = null,
+    exact_bounds: ?ExactBounds = null,
     inclusive_min: bool = true,
     inclusive_max: bool = false,
     boost: f32 = 1.0,
+    control: ExecutionControl = .{},
 
     pub fn execute(self: RangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        try self.control.check();
         var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return roaring.RoaringBitmap.init(alloc);
         defer reader.deinit();
 
@@ -1702,21 +1711,36 @@ pub const RangeFilter = struct {
         }
         var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
         defer cursor.deinit();
-        while (try cursor.next()) |entry| {
+        var visited: usize = 0;
+        while (try cursor.next()) |entry| : (visited += 1) {
+            if ((visited & 1023) == 0) try self.control.check();
             if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
             const doc_id = entry.doc_id;
-            const numeric_value: ?f64 = switch (entry.value) {
-                .f64_val => |value| value,
-                .i64_val => |value| @floatFromInt(value),
-                .u64_val => |value| @floatFromInt(value),
-                .numeric_val => |value| typed_dv.numericValueAsF64(value),
-                else => null,
+            const value: typed_dv.NumericValue = switch (entry.value) {
+                inline .f64_val, .i64_val, .u64_val => |number, tag| @unionInit(typed_dv.NumericValue, @tagName(tag), number),
+                .numeric_val => |number| number,
+                else => continue,
             };
-            const value = numeric_value orelse continue;
-            if (self.matches(value)) try result.add(@intCast(doc_id));
+            const in_range = if (self.exact_bounds) |bounds|
+                self.matchesExact(value, bounds)
+            else
+                self.matches(typed_dv.numericValueAsF64(value));
+            if (in_range) try result.add(@intCast(doc_id));
         }
 
         return result;
+    }
+
+    fn matchesExact(self: RangeFilter, value: typed_dv.NumericValue, bounds: ExactBounds) bool {
+        if (bounds.min) |min| {
+            const order = typed_dv.compareNumericValues(value, min);
+            if (order == .lt or (order == .eq and !self.inclusive_min)) return false;
+        }
+        if (bounds.max) |max| {
+            const order = typed_dv.compareNumericValues(value, max);
+            if (order == .gt or (order == .eq and !self.inclusive_max)) return false;
+        }
+        return true;
     }
 
     fn matches(self: RangeFilter, value: f64) bool {

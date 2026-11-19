@@ -156310,9 +156310,10 @@ test "db optional numeric range filters lexical and dense candidates on fresh an
             .{ .field = "size", .value = 99, .bucket = 9 },
             .{ .field = "retention_years", .value = 99, .bucket = null },
         }) |case| {
+            const authorization = "{\"term\":{\"tenant\":\"archive\"}}";
             const filter = try std.fmt.allocPrint(scratch,
-                \\{{"bool":{{"must":[{{"term":{{"tenant":"archive"}}}},{{"numeric_range":{{"field":"{s}","min":{d},"max":{d},"inclusive_max":true}}}}]}}}}
-            , .{ case.field, case.value, case.value });
+                \\{{"conjuncts":[{{"numeric_range":{{"field":"{s}","min":{d},"max":{d},"inclusive_max":true}}}},{s}]}}
+            , .{ case.field, case.value, case.value, authorization });
             const expected: u64 = if (case.bucket != null) 16 else 0;
             var lexical = try db.search(a, .{
                 .index_name = text_index,
@@ -156321,6 +156322,7 @@ test "db optional numeric range filters lexical and dense candidates on fresh an
                 .profile = true,
                 .full_text = .{ .match = .{ .field = "body", .text = "harbor beacon" } },
                 .filter_query_json = filter,
+                .authorization_filter_query_json = authorization,
             });
             defer lexical.deinit();
             var dense = try db.searchDenseProfiled(a, .{
@@ -156329,6 +156331,7 @@ test "db optional numeric range filters lexical and dense candidates on fresh an
                 .limit = 16,
                 .include_stored = false,
                 .filter_query_json = filter,
+                .authorization_filter_query_json = authorization,
             }, .{ .vector = &.{ 1, 0 }, .k = 16 });
             defer dense.result.deinit();
             errdefer std.debug.print(
@@ -156338,6 +156341,7 @@ test "db optional numeric range filters lexical and dense candidates on fresh an
             try std.testing.expectEqual(expected, dense.profile.native_filter_candidate_count);
             if (expected != 0) {
                 try std.testing.expectEqual(expected, lexical.sort_profile.?.candidate_count);
+                try std.testing.expectEqual(@as(u32, 1), lexical.sort_profile.?.text_ranking_passes);
                 try std.testing.expectEqualStrings("exact_native_filter", dense.profile.search_route);
             } else {
                 try std.testing.expectEqualStrings("native_filter", lexical.sort_profile.?.candidate_source);

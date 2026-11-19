@@ -966,6 +966,8 @@ pub const TextProjectionBatchBuilder = struct {
     selected_field: ?[]const u8 = null,
     store_source_columns: bool = false,
     text_docs: std.ArrayListUnmanaged(introducer_mod.TextDocument) = .empty,
+    numeric_projection_lookup: std.StringHashMapUnmanaged(?f64) = .empty,
+    numeric_coverage_fields: ?[]const []const u8 = null,
 
     pub fn init(
         arena: Allocator,
@@ -1039,9 +1041,13 @@ pub const TextProjectionBatchBuilder = struct {
         if (!retain_empty and extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0 and !extractedHasTypedFields(extracted)) return;
 
         const order = if (!has_selected_field) try mappedIndexSortProjection(self.arena, extraction_root, self.schema, extracted.typed_fields) else IndexSortProjection{};
+        const complete_numeric_fields = if (has_selected_field)
+            &.{}
+        else
+            try self.completeNumericFields(extraction_root, extracted.typed_fields orelse &.{});
         try self.text_docs.append(self.arena, .{
             .index_sort_values = order.values,
-            .complete_numeric_fields = if (has_selected_field) &.{} else try completeNumericFields(self.arena, extraction_root, self.schema, extracted.typed_fields orelse &.{}),
+            .complete_numeric_fields = complete_numeric_fields,
             .index_sort_projection_valid = order.valid and !has_selected_field,
             .id = doc.key,
             .stored_data = if (self.store_source_columns) "" else doc.stored_data,
@@ -1059,6 +1065,48 @@ pub const TextProjectionBatchBuilder = struct {
             .typed_fields = if (has_selected_field) &.{} else extracted.typed_fields orelse if (doc.typed_source == null) &.{} else null,
             .typed_source = if (has_selected_field) null else if (extracted.typed_fields == null) doc.typed_source else null,
         });
+    }
+
+    fn completeNumericFields(
+        self: *TextProjectionBatchBuilder,
+        root: std.json.Value,
+        projected: []const introducer_mod.TypedFieldValue,
+    ) ![]const []const u8 {
+        const schema = self.schema orelse return &.{};
+        if (root != .object) return &.{};
+        const alloc = self.arena;
+        const fields = self.numeric_coverage_fields orelse init: {
+            var eligible: std.ArrayList([]const u8) = .empty;
+            for (schema.exact_fields) |field| {
+                if (runtime_schema.supportsNumericRangeCoverage(field)) try eligible.append(alloc, field.field);
+            }
+            const names = try eligible.toOwnedSlice(alloc);
+            self.numeric_coverage_fields = names;
+            break :init names;
+        };
+        if (fields.len == 0) return fields;
+
+        const by_field = &self.numeric_projection_lookup;
+        by_field.clearRetainingCapacity();
+        for (projected) |typed| {
+            const slot = try by_field.getOrPut(alloc, typed.field_name);
+            slot.value_ptr.* = if (slot.found_existing or typed.conflicted or typed.value != .numeric_val)
+                null
+            else
+                typed_dv.numericValueAsF64(typed.value.numeric_val);
+        }
+
+        var complete: ?std.ArrayList([]const u8) = null;
+        for (fields, 0..) |field, i| {
+            if (!numericSourceMatchesProjection(root, field, by_field.get(field))) {
+                if (complete == null) {
+                    complete = .empty;
+                    try complete.?.appendSlice(alloc, fields[0..i]);
+                }
+            } else if (complete) |*subset| try subset.append(alloc, field);
+        }
+        if (complete) |*subset| return subset.toOwnedSlice(alloc);
+        return fields;
     }
 
     /// Borrow only under a retained column lease. Otherwise promote source
@@ -3113,34 +3161,16 @@ fn mappedTypedDocValueFieldAlloc(
     };
 }
 
-fn completeNumericFields(
-    alloc: Allocator,
-    root: std.json.Value,
-    maybe_schema: ?runtime_schema.TableSchema,
-    projected: []const introducer_mod.TypedFieldValue,
-) ![]const []const u8 {
-    const schema = maybe_schema orelse return &.{};
-    if (root != .object) return &.{};
-    var complete: std.ArrayList([]const u8) = .empty;
-    for (schema.exact_fields) |field| {
-        if (!runtime_schema.supportsNumericRangeCoverage(field)) continue;
-
-        const raw = numericCoverageSourceValue(root, field.source_field) orelse continue;
-        const expected: ?f64 = switch (raw) {
-            .null => null,
-            .integer => |number| @floatFromInt(number),
-            .float => |number| if (std.math.isFinite(number)) number else continue,
-            else => continue,
-        };
-        var emitted: ?f64 = null;
-        const valid = for (projected) |typed| {
-            if (!std.mem.eql(u8, typed.field_name, field.field)) continue;
-            if (typed.conflicted or typed.value != .numeric_val or emitted != null) break false;
-            emitted = typed_dv.numericValueAsF64(typed.value.numeric_val);
-        } else emitted == expected;
-        if (valid) try complete.append(alloc, field.field);
-    }
-    return complete.toOwnedSlice(alloc);
+fn numericSourceMatchesProjection(root: std.json.Value, field: []const u8, observed: ??f64) bool {
+    const raw = numericCoverageSourceValue(root, field) orelse return false;
+    const expected: ?f64 = switch (raw) {
+        .null => null,
+        .integer => |number| @floatFromInt(number),
+        .float => |number| if (std.math.isFinite(number)) number else return false,
+        else => return false,
+    };
+    const emitted = observed orelse return expected == null;
+    return emitted != null and emitted == expected;
 }
 
 /// A literal dotted key can alias the typed column, and a multivalued

@@ -9502,7 +9502,7 @@ pub fn graphIndexedPredicateAlloc(a: Allocator, req: types.SearchRequest, execut
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, json, .{});
     if (patternFilterValueHasRole(parsed)) return error.UnsupportedQueryRequest;
     const search_query = try patternFilterValueToSearchQuery(scratch, parsed, entry.text_analysis, entry.runtime_schema);
-    if (!try searchQueryCanUseSnapshot(snapshot, search_query, entry.text_analysis, entry.runtime_schema, false)) return error.UnsupportedQueryRequest;
+    if (!try searchQueryCanUseSnapshotWithControl(snapshot, search_query, entry.text_analysis, entry.runtime_schema, false, control)) return error.UnsupportedQueryRequest;
     const filter = try search_mod.searchQueryToFilterArena(scratch, search_query);
     var docs = try snapshot.executeFilterBitmap(a, filter.withControl(control));
     defer docs.deinit();
@@ -9606,12 +9606,13 @@ fn collectSearchQueryResolvedDocSetAlloc(
 
     if (bench_profile) snapshot_ns = platform_time.monotonicNs() - snapshot_start_ns;
     const capability_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    if (!(try searchQueryCanUseSnapshot(
+    if (!(try searchQueryCanUseSnapshotWithControl(
         snapshot,
         search_query,
         text_entry.text_analysis,
         text_entry.runtime_schema,
         allow_analyzed_terms,
+        control,
     ))) return null;
     if (bench_profile) capability_ns = platform_time.monotonicNs() - capability_start_ns;
 
@@ -9685,12 +9686,13 @@ fn collectStructuredFilterTextDocNumsAlloc(
 
     const snapshot = text_entry.persistent.acquireSnapshot();
     defer snapshot.release();
-    if (!(try searchQueryCanUseSnapshot(
+    if (!(try searchQueryCanUseSnapshotWithControl(
         snapshot,
         search_query,
         text_entry.text_analysis,
         text_entry.runtime_schema,
         false,
+        .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
     ))) return null;
 
     const filter = search_mod.searchQueryToFilterArena(arena_alloc, search_query) catch return null;
@@ -9781,12 +9783,13 @@ fn collectStructuredFilterDocIdsAlloc(
 
     const snapshot = text_entry.persistent.acquireSnapshot();
     defer snapshot.release();
-    if (!(try searchQueryCanUseSnapshot(
+    if (!(try searchQueryCanUseSnapshotWithControl(
         snapshot,
         search_query,
         text_entry.text_analysis,
         text_entry.runtime_schema,
         false,
+        .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
     ))) return null;
     const k: u32 = @intCast(@min(snapshot.liveDocCount(), @as(u64, std.math.maxInt(u32))));
     var result = try search_mod.execute(alloc, snapshot, .{
@@ -9820,6 +9823,18 @@ fn searchQueryCanUseSnapshot(
     runtime_schema: ?runtime_schema_mod.TableSchema,
     allow_analyzed_terms: bool,
 ) !bool {
+    return searchQueryCanUseSnapshotWithControl(snapshot, query, text_analysis, runtime_schema, allow_analyzed_terms, .{});
+}
+
+fn searchQueryCanUseSnapshotWithControl(
+    snapshot: *const index_mod.IndexSnapshot,
+    query: search_mod.SearchQuery,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+    allow_analyzed_terms: bool,
+    control: query_mod.ExecutionControl,
+) !bool {
+    try control.check();
     return switch (query) {
         .match_none,
         .match_all,
@@ -9836,9 +9851,9 @@ fn searchQueryCanUseSnapshot(
             try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
             (snapshot.liveDocCount() == 0 or try snapshot.hasInvertedField(item.field)),
         .fuzzy => |item| try snapshot.hasInvertedField(item.field),
-        .numeric_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .numeric),
-        .date_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .datetime),
-        .bool_field => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .boolean),
+        .numeric_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .numeric, item.exact_bounds == null, control),
+        .date_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .datetime, false, control),
+        .bool_field => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .boolean, false, control),
         .geo_distance => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
         .geo_bbox => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
         .term_range => |item| (try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
@@ -9851,13 +9866,13 @@ fn searchQueryCanUseSnapshot(
         .regexp => |item| try snapshot.hasInvertedField(item.field),
         .bool_query => |item| {
             for (item.must) |child| {
-                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms))) return false;
+                if (!(try searchQueryCanUseSnapshotWithControl(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms, control))) return false;
             }
             for (item.should) |child| {
-                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms))) return false;
+                if (!(try searchQueryCanUseSnapshotWithControl(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms, control))) return false;
             }
             for (item.must_not) |child| {
-                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms))) return false;
+                if (!(try searchQueryCanUseSnapshotWithControl(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms, control))) return false;
             }
             return true;
         },
@@ -9869,6 +9884,8 @@ fn searchQueryCanUseMappedDocValues(
     field: []const u8,
     runtime_schema: ?runtime_schema_mod.TableSchema,
     expected_type: runtime_schema_mod.AntflyType,
+    permits_missing_values: bool,
+    control: query_mod.ExecutionControl,
 ) !bool {
     const schema = runtime_schema orelse return false;
     const mapping = runtime_schema_mod.resolveDeclaredFieldType(schema, field) orelse blk: {
@@ -9881,13 +9898,18 @@ fn searchQueryCanUseMappedDocValues(
     };
     if (mapping.field_type != expected_type) return false;
     if (!runtime_schema_mod.mappingHasNativeDocValues(mapping)) return false;
-    const allow_sparse_numeric = expected_type == .numeric and
+    // Standard ranges can compare stored nonnumeric scalars as text, including
+    // explicit null. An absence witness cannot establish that behavior.
+    const allow_sparse_numeric = permits_missing_values and
         runtime_schema_mod.hasNumericRangeCoverageMapping(schema, field);
     const coverage = try snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
         snapshot,
         field,
         mapping,
-        null,
+        if (control.deadline_ns != null or control.cancellation != null)
+            .{ .execution_deadline_ns = control.deadline_ns, .cancellation = control.cancellation }
+        else
+            null,
         allow_sparse_numeric,
     );
     return coverage.status == .covered;
@@ -11410,6 +11432,10 @@ fn parseStandardRangeObject(
     return switch (mapping.field_type) {
         .numeric => .{ .numeric_range = .{
             .field = field,
+            .exact_bounds = .{
+                .min = if (lower) |bound| try exactNumericRangeBound(bound.value) else null,
+                .max = if (upper) |bound| try exactNumericRangeBound(bound.value) else null,
+            },
             .min = if (lower) |bound| try jsonOptionalF64Strict(bound.value) else null,
             .max = if (upper) |bound| try jsonOptionalF64Strict(bound.value) else null,
             .inclusive_min = if (lower) |bound| bound.inclusive else true,
@@ -11429,6 +11455,16 @@ fn parseStandardRangeObject(
             .inclusive_min = if (lower) |bound| bound.inclusive else true,
             .inclusive_max = if (upper) |bound| bound.inclusive else false,
         } },
+        else => error.InvalidArgument,
+    };
+}
+
+fn exactNumericRangeBound(value: std.json.Value) !typed_dv.NumericValue {
+    return switch (value) {
+        .integer => |number| .{ .i64_val = number },
+        .float => |number| if (std.math.isFinite(number)) .{ .f64_val = number } else error.InvalidArgument,
+        // The residual predicate also handles wide integer bounds as temporal
+        // values. Keep those on the residual path.
         else => error.InvalidArgument,
     };
 }
@@ -14085,6 +14121,7 @@ pub fn searchTextQuery(
                 .window_len = out.hits.len,
                 .total_ns = execute_ns + hits_ns + postprocess_ns,
             });
+            out.sort_profile.?.text_ranking_passes = candidate_iterations;
         }
         if (effective_req.include_stored and !chunk_backed) {
             const source_profile = try loadMissingProjectedTextHitDocuments(alloc, effective_req, executor, out.hits);
@@ -18333,6 +18370,7 @@ fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
     var expected_value_type: ?typed_dv.ValueType = null;
     for (snapshot.segments, 0..) |*physical, segment_index| {
         if (physical.liveDocCount() == 0) continue;
+        if (validation) |active| active.checkActive() catch |err| return if (err == error.Canceled) error.Cancelled else err;
         var segment_lease = snapshot.leaseSegment(segment_index) catch |err| switch (err) {
             error.Canceled => return error.Cancelled,
             else => return err,
@@ -38599,5 +38637,58 @@ test "optional numeric range coverage survives compaction and rejects unproven i
     var legacy_writer = try index_mod.IndexWriter.init(a);
     defer legacy_writer.deinit();
     try legacy_writer.addSegment(mixed);
-    try std.testing.expect(!try searchQueryCanUseSnapshot(legacy_writer.snapshot(), rank, .{}, schema, false));
+    try std.testing.expect(try searchQueryCanUseSnapshot(legacy_writer.snapshot(), rank, .{}, schema, false));
+
+    const unknown = try segment_mod.mergeSegments(a, &.{ populated, conflicted });
+    defer a.free(unknown);
+    var unknown_writer = try index_mod.IndexWriter.init(a);
+    defer unknown_writer.deinit();
+    try unknown_writer.addSegment(unknown);
+    try std.testing.expect(!try searchQueryCanUseSnapshot(unknown_writer.snapshot(), rank, .{}, schema, false));
+    try std.testing.expect(try searchQueryCanUseSnapshot(unknown_writer.snapshot(), size, .{}, schema, false));
+
+    const collision_name = "\x00__antfly_numeric_range_coverage";
+    const colliding_schema: runtime_schema_mod.TableSchema = .{
+        .exact_fields = &.{.{ .field = collision_name, .source_field = collision_name, .mapping = numeric }},
+    };
+    const collision = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{
+        .{ .key = "reserved-name", .value = "{\"\\u0000__antfly_numeric_range_coverage\":6}" },
+    }, .{}, colliding_schema)).?;
+    defer a.free(collision);
+    const collision_merged = try segment_mod.mergeSegments(a, &.{ collision, collision });
+    defer a.free(collision_merged);
+    var collision_reader = try segment_mod.SegmentReader.init(a, collision_merged);
+    defer collision_reader.deinit();
+    try std.testing.expectEqual(segment_mod.NumericRangeCoverage.populated, (try collision_reader.numericRangeCoverage(collision_name)).?);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const raw_range = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"range":{"rank":{"gt":9007199254740992}}}
+    , .{});
+    const standard = try patternFilterValueToSearchQuery(arena.allocator(), raw_range, .{}, schema);
+    try std.testing.expect(!try searchQueryCanUseSnapshot(legacy_writer.snapshot(), standard, .{}, schema, false));
+    try std.testing.expectEqual(@as(i64, 9007199254740992), standard.numeric_range.exact_bounds.?.min.?.i64_val);
+
+    const large_integers = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{
+        .{ .key = "lower", .value = "{\"rank\":9007199254740992}" },
+        .{ .key = "higher", .value = "{\"rank\":9007199254740993}" },
+    }, .{}, schema)).?;
+    defer a.free(large_integers);
+    var large_writer = try index_mod.IndexWriter.init(a);
+    defer large_writer.deinit();
+    try large_writer.addSegment(large_integers);
+    try std.testing.expectError(error.Timeout, searchQueryCanUseSnapshotWithControl(
+        large_writer.snapshot(),
+        standard,
+        .{},
+        schema,
+        false,
+        .{ .deadline_ns = 0 },
+    ));
+    try std.testing.expect(try searchQueryCanUseSnapshot(large_writer.snapshot(), standard, .{}, schema, false));
+    const exact_filter = try search_mod.searchQueryToFilterArena(arena.allocator(), standard);
+    const exact_matches = try large_writer.snapshot().executeFilter(a, exact_filter);
+    defer a.free(exact_matches);
+    try std.testing.expectEqualSlices(u32, &.{1}, exact_matches);
 }

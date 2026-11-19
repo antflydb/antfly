@@ -108,6 +108,24 @@ pub const NumericRangeWitness = struct {
     coverage: NumericRangeCoverage,
 };
 
+const NumericRangeWitnessIterator = struct {
+    remaining: []const u8 = &.{},
+    previous: []const u8 = "",
+
+    fn next(self: *NumericRangeWitnessIterator) !?NumericRangeWitness {
+        if (self.remaining.len == 0) return null;
+        if (self.remaining.len < 3) return error.InvalidSegment;
+        const length = std.mem.readInt(u16, self.remaining[0..2], .big);
+        const coverage = std.enums.fromInt(NumericRangeCoverage, self.remaining[2]) orelse return error.InvalidSegment;
+        if (length > self.remaining.len - 3) return error.InvalidSegment;
+        const name = self.remaining[3..][0..length];
+        if (!std.mem.lessThan(u8, self.previous, name)) return error.InvalidSegment;
+        self.remaining = self.remaining[3 + @as(usize, length) ..];
+        self.previous = name;
+        return .{ .field = name, .coverage = coverage };
+    }
+};
+
 fn encodeNumericRangeWitnesses(alloc: Allocator, witnesses: []NumericRangeWitness) ![]u8 {
     std.mem.sort(NumericRangeWitness, witnesses, {}, struct {
         fn lessThan(_: void, lhs: NumericRangeWitness, rhs: NumericRangeWitness) bool {
@@ -368,7 +386,9 @@ pub const SegmentWriter = struct {
 
     pub fn addNumericRangeWitnesses(self: *SegmentWriter, witnesses: []NumericRangeWitness) !void {
         if (witnesses.len == 0) return;
-        const field_idx = try self.addField(numeric_range_coverage_field);
+        const field_idx: u16 = for (self.fields.items, 0..) |field, i| {
+            if (std.mem.eql(u8, field.name, numeric_range_coverage_field)) break @intCast(i);
+        } else try self.addField(numeric_range_coverage_field);
         const bytes = try encodeNumericRangeWitnesses(self.alloc, witnesses);
         errdefer self.alloc.free(bytes);
         try self.addSectionOwned(field_idx, numeric_range_coverage_section, bytes);
@@ -2199,28 +2219,26 @@ pub const SegmentReader = struct {
         return try decodeIndexSortMetadataAlloc(alloc, section);
     }
 
+    fn numericRangeWitnesses(self: *const SegmentReader) !NumericRangeWitnessIterator {
+        const bytes = (try self.getSection(numeric_range_coverage_field, numeric_range_coverage_section)) orelse return .{};
+        if (bytes.len == 0 or bytes[0] != 1) return .{};
+        return .{ .remaining = bytes[1..] };
+    }
+
     /// A producer witness for an exact, source-backed numeric field.
     pub fn numericRangeCoverage(self: *const SegmentReader, field: []const u8) !?NumericRangeCoverage {
-        const bytes = (try self.getSection(numeric_range_coverage_field, numeric_range_coverage_section)) orelse return null;
-        if (bytes.len == 0 or bytes[0] != 1) return null;
-        var pos: usize = 1;
-        var previous: []const u8 = "";
+        var witnesses = try self.numericRangeWitnesses();
         var found: ?NumericRangeCoverage = null;
-        while (pos < bytes.len) {
-            if (bytes.len - pos < 3) return error.InvalidSegment;
-            const length = std.mem.readInt(u16, bytes[pos..][0..2], .big);
-            const coverage = std.enums.fromInt(NumericRangeCoverage, bytes[pos + 2]) orelse return error.InvalidSegment;
-            pos += 3;
-            if (length > bytes.len - pos) return error.InvalidSegment;
-            const name = bytes[pos..][0..length];
-            pos += length;
-            if (!std.mem.lessThan(u8, previous, name)) return error.InvalidSegment;
-            previous = name;
-            if (std.mem.eql(u8, name, field)) found = coverage;
+        while (try witnesses.next()) |witness| {
+            if (std.mem.eql(u8, witness.field, field)) found = witness.coverage;
         }
         const coverage = found orelse return null;
-        if (self.hasSection(field, .typed_doc_values) != (coverage == .populated)) return error.InvalidSegment;
+        if (!self.numericRangeWitnessConsistent(field, coverage)) return error.InvalidSegment;
         return coverage;
+    }
+
+    fn numericRangeWitnessConsistent(self: *const SegmentReader, field: []const u8, coverage: NumericRangeCoverage) bool {
+        return self.hasSection(field, .typed_doc_values) == (coverage == .populated);
     }
 
     pub fn provesNullIndexSortField(self: *const SegmentReader, name: []const u8) !bool {
@@ -3782,7 +3800,6 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
             if (std.mem.eql(u8, f.name, doc_ordinals_field)) continue;
             if (std.mem.eql(u8, f.name, index_sort_field)) continue;
             if (std.mem.eql(u8, f.name, doc_key_range_field)) continue;
-            if (std.mem.eql(u8, f.name, numeric_range_coverage_field)) continue;
             try field_set.put(alloc, f.name, {});
         }
     }
@@ -3795,6 +3812,8 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
 
     // For each field, append merged sections directly into the sink and retain
     // only compact section-index metadata.
+    var coverage = try MergeNumericRangeCoverage.init(alloc, inputs);
+    defer coverage.deinit(alloc);
     var witnesses: std.ArrayListUnmanaged(NumericRangeWitness) = .empty;
     defer witnesses.deinit(alloc);
     var field_iter = field_set.keyIterator();
@@ -3874,8 +3893,8 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
             try built_field.sections.append(alloc, .{ .section_type = .typed_doc_values, .offset = typed_start, .length = sink.len() - typed_start, .checksum = try sink.crc32Range(typed_start, sink.len() - typed_start) });
         }
 
-        if (try mergedNumericRangeCoverage(alloc, field_name, inputs, wrote_typed_values)) |coverage| {
-            try witnesses.append(alloc, .{ .field = field_name, .coverage = coverage });
+        if (try coverage.forField(alloc, field_name, inputs, wrote_typed_values)) |witness| {
+            try witnesses.append(alloc, .{ .field = field_name, .coverage = witness });
         }
 
         const source_start = sink.len();
@@ -3955,7 +3974,6 @@ fn writeSortedMergedSegmentToSink(
             if (std.mem.eql(u8, f.name, doc_ordinals_field)) continue;
             if (std.mem.eql(u8, f.name, index_sort_field)) continue;
             if (std.mem.eql(u8, f.name, doc_key_range_field)) continue;
-            if (std.mem.eql(u8, f.name, numeric_range_coverage_field)) continue;
             try field_set.put(alloc, f.name, {});
         }
     }
@@ -3966,6 +3984,8 @@ fn writeSortedMergedSegmentToSink(
         built_fields.deinit(alloc);
     }
 
+    var coverage = try MergeNumericRangeCoverage.init(alloc, inputs);
+    defer coverage.deinit(alloc);
     var witnesses: std.ArrayListUnmanaged(NumericRangeWitness) = .empty;
     defer witnesses.deinit(alloc);
     var field_iter = field_set.keyIterator();
@@ -4012,8 +4032,8 @@ fn writeSortedMergedSegmentToSink(
             try built_field.sections.append(alloc, .{ .section_type = .typed_doc_values, .offset = typed_start, .length = sink.len() - typed_start, .checksum = try sink.crc32Range(typed_start, sink.len() - typed_start) });
         }
 
-        if (try mergedNumericRangeCoverage(alloc, field_name, inputs, wrote_typed_values)) |coverage| {
-            try witnesses.append(alloc, .{ .field = field_name, .coverage = coverage });
+        if (try coverage.forField(alloc, field_name, inputs, wrote_typed_values)) |witness| {
+            try witnesses.append(alloc, .{ .field = field_name, .coverage = witness });
         }
 
         const source_start = sink.len();
@@ -5657,31 +5677,81 @@ fn hasLiveTypedField(inputs: []const MergeInput, name: ?[]const u8) bool {
     return false;
 }
 
-fn mergedNumericRangeCoverage(
-    alloc: Allocator,
-    field: []const u8,
-    inputs: []const MergeInput,
-    wrote_typed_values: bool,
-) !?NumericRangeCoverage {
-    var witnessed = false;
-    for (inputs) |input| {
-        if (!inputHasLiveDocs(input)) continue;
-        const coverage = input.reader.numericRangeCoverage(field) catch |err| switch (err) {
-            error.InvalidSegment, error.CrcMismatch => return null,
-            else => return err,
-        } orelse return null;
-        // A merge with no output can mean incompatible types or that every
-        // value was deleted. Only carry the witness in the second case.
-        if (coverage == .populated and !wrote_typed_values) {
+const MergeNumericRangeCoverage = struct {
+    const FieldMap = std.StringHashMapUnmanaged(NumericRangeCoverage);
+    by_input: []FieldMap,
+    fields: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn init(alloc: Allocator, inputs: []const MergeInput) !MergeNumericRangeCoverage {
+        const maps = try alloc.alloc(FieldMap, inputs.len);
+        @memset(maps, .empty);
+        var out: MergeNumericRangeCoverage = .{ .by_input = maps };
+        errdefer out.deinit(alloc);
+        for (inputs, maps) |input, *map| {
+            if (!inputHasLiveDocs(input)) continue;
+            var records = input.reader.numericRangeWitnesses() catch |err| switch (err) {
+                error.CrcMismatch, error.InvalidSegment => continue,
+                else => return err,
+            };
+            while (records.next() catch {
+                map.clearRetainingCapacity();
+                break;
+            }) |witness| {
+                if (input.reader.numericRangeWitnessConsistent(witness.field, witness.coverage)) {
+                    try map.put(alloc, witness.field, witness.coverage);
+                }
+            }
+            var names = map.keyIterator();
+            while (names.next()) |name| try out.fields.put(alloc, name.*, {});
+        }
+        return out;
+    }
+
+    fn deinit(self: *MergeNumericRangeCoverage, alloc: Allocator) void {
+        for (self.by_input) |*map| map.deinit(alloc);
+        alloc.free(self.by_input);
+        self.fields.deinit(alloc);
+    }
+
+    fn forField(
+        self: MergeNumericRangeCoverage,
+        alloc: Allocator,
+        field: []const u8,
+        inputs: []const MergeInput,
+        wrote_typed_values: bool,
+    ) !?NumericRangeCoverage {
+        if (!self.fields.contains(field)) return null;
+        for (inputs, self.by_input) |input, map| {
+            if (!inputHasLiveDocs(input)) continue;
+            if (map.get(field)) |proof| {
+                if (proof == .empty or wrote_typed_values) continue;
+            }
             var typed = (try input.reader.typedDocValuesScoped(alloc, field)) orelse return null;
             defer typed.deinit();
             if (!typedDocValuesValueTypeIsNumeric(typed.value_type)) return null;
+            if (map.contains(field)) continue;
+
+            // An older column can independently prove complete coverage if
+            // its validated typed IDs cover every surviving document.
+            var last: ?u32 = null;
+            var live: u32 = 0;
+            for (0..typed.num_chunks) |chunk| {
+                const ids = typed.readValidatedChunkDocIds(@intCast(chunk)) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return null,
+                };
+                defer alloc.free(ids);
+                for (ids) |id| {
+                    if (id >= input.reader.doc_count or (last != null and id <= last.?)) return null;
+                    last = id;
+                    if (!input.isDeleted(id)) live += 1;
+                }
+            }
+            if (live != input.reader.doc_count - input.deletedBefore(input.reader.doc_count)) return null;
         }
-        witnessed = true;
+        return if (wrote_typed_values) .populated else .empty;
     }
-    if (!witnessed) return null;
-    return if (wrote_typed_values) .populated else .empty;
-}
+};
 
 fn appendMergedNumericRangeWitnesses(
     alloc: Allocator,
@@ -5692,6 +5762,11 @@ fn appendMergedNumericRangeWitnesses(
     if (witnesses.len == 0) return;
     const bytes = try encodeNumericRangeWitnesses(alloc, witnesses);
     defer alloc.free(bytes);
+    for (fields.items) |*existing| {
+        if (std.mem.eql(u8, existing.name, numeric_range_coverage_field)) {
+            return appendBuiltSection(alloc, sink, existing, numeric_range_coverage_section, bytes);
+        }
+    }
     var field = BuiltField{ .name = numeric_range_coverage_field };
     errdefer field.deinit(alloc);
     try appendBuiltSection(alloc, sink, &field, numeric_range_coverage_section, bytes);
