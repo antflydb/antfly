@@ -244,6 +244,7 @@ pub const View = struct {
     schema_search_path: ?[]const []const u8 = null,
     snapshot_lsn: ?u64 = null,
     transaction_xid: ?u64 = null,
+    transaction_timestamp_ns: ?u64 = null,
 
     pub fn capture(backing: std.mem.Allocator, owner: Owner, scope: Scope, overlay: []const OverlayEntry) !View {
         var arena = std.heap.ArenaAllocator.init(backing);
@@ -603,6 +604,19 @@ test "SQL current_setting evaluates from one authorized pinned view" {
     try std.testing.expectEqualStrings("18446744073709551615", xid_result.output.rows[0][1].string);
     try std.testing.expectError(error.SqlNumericOutOfRange, compiler.compile(std.testing.allocator, "SELECT '18446744073709551616'::xid8", .{}));
     with_capture.setting_capture.?.transaction_xid = null;
+
+    var timestamp = try compiler.compile(std.testing.allocator, "SELECT CURRENT_TIMESTAMP, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(0)", .{});
+    defer timestamp.deinit();
+    try std.testing.expect(timestamp.uses_transaction_timestamp);
+    with_capture.setting_capture.?.transaction_timestamp_ns = 1_999_500_500;
+    var timestamp_result = try runtime.execute(std.testing.allocator, with_capture, &timestamp, &.{}, .{});
+    defer timestamp_result.deinit();
+    const times = timestamp_result.output.rows[0];
+    try std.testing.expectEqualStrings("1970-01-01T00:00:01.999501000Z", times[0].string);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:02.000000000Z", times[1].string);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:02.000000000Z", times[2].string);
+    try std.testing.expectError(error.SqlInvalidParameterValue, compiler.compile(std.testing.allocator, "SELECT CURRENT_TIMESTAMP(7)", .{}));
+    with_capture.setting_capture.?.transaction_timestamp_ns = null;
 
     var schemas = try compiler.compile(std.testing.allocator, "SELECT current_schemas(false)[1], pg_catalog.current_schemas(true)[1], current_schemas(true)[3], current_schemas(NULL) IS NULL", .{});
     defer schemas.deinit();

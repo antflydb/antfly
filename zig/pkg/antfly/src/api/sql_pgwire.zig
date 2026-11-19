@@ -3217,6 +3217,14 @@ const GuardedCatalog = struct {
     fn settingCapture(self: *GuardedCatalog, alloc: std.mem.Allocator, adapter: *execution.Adapter, compiled: *const compiler.Compiled) !@FieldType(catalog.Backend, "setting_capture") {
         if (!compiled.uses_current_setting) return null;
         var capture = adapter.settingCapture().?;
+        if (compiled.uses_transaction_timestamp) {
+            capture.transaction_timestamp_ns = if (self.authority.request.session_id) |encoded| timestamp: {
+                const transaction = try @import("distributed_txn.zig").parseTxnIdHex(encoded);
+                const server = self.authority.server orelse return error.NoActiveSqlTransaction;
+                const info = server.txn_sessions.getInfo(transaction) orelse return error.NoActiveSqlTransaction;
+                break :timestamp info.begin_timestamp;
+            } else @import("antfly_platform").time.realtimeNs();
+        }
         if (compiled.uses_transaction_xid) if (self.authority.request.session_id) |encoded| {
             const transaction = try @import("distributed_txn.zig").parseTxnIdHex(encoded);
             const digest = publication_control.hash(.{ .domain = "antfly:pg-sql-transaction-id:v1", .transaction = transaction });

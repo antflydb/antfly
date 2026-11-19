@@ -422,6 +422,10 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                     "-c",
                     "SELECT pg_catalog.pg_current_xact_id()",
                     "-c",
+                    "SELECT CURRENT_TIMESTAMP",
+                    "-c",
+                    "SELECT CURRENT_TIMESTAMP",
+                    "-c",
                     "SELECT content FROM smoke",
                     "-c",
                     "COMMIT",
@@ -434,6 +438,8 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             assert copied.returncode == 0, copied.stdout + copied.stderr
             copied_lines = copied.stdout.splitlines()
             xid = int(copied_lines[4])
+            timestamp = copied_lines[6]
+            assert timestamp and timestamp == copied_lines[7]
             assert 3 <= xid <= (1 << 63) - 1
             assert copied_lines == [
                 "BEGIN",
@@ -442,6 +448,8 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                 point,
                 str(xid),
                 str(xid),
+                timestamp,
+                timestamp,
                 "snapshot-before-cut",
                 "COMMIT",
             ]

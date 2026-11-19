@@ -1012,6 +1012,7 @@ pub const Backend = struct {
         schema_search_path: ?[]const []const u8 = null,
         snapshot_lsn: ?u64 = null,
         transaction_xid: ?u64 = null,
+        transaction_timestamp_ns: ?u64 = null,
     } = null,
     /// Authorized, immutable settings captured for this exact statement.
     /// Providers must never populate this from pgwire-local string settings.
@@ -1057,6 +1058,7 @@ pub const Backend = struct {
         if (capture.schema_search_path) |names| try view.setSchemaSearchPath(names);
         view.snapshot_lsn = capture.snapshot_lsn;
         view.transaction_xid = capture.transaction_xid;
+        view.transaction_timestamp_ns = capture.transaction_timestamp_ns;
         return view;
     }
 

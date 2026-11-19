@@ -87,6 +87,7 @@ pub const Compiled = struct {
     uses_current_schemas: bool = false,
     uses_snapshot_lsn: bool = false,
     uses_transaction_xid: bool = false,
+    uses_transaction_timestamp: bool = false,
 
     pub fn deinit(self: *Compiled) void {
         self.arena.deinit();
@@ -166,7 +167,7 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
     const statement = try parser.statement();
     _ = parser.take(.semicolon);
     if (parser.pos != tokens.items.len) return parser.fail(error.UnsupportedSqlShape, "unexpected trailing SQL; only one supported statement is allowed");
-    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting, .uses_current_schemas = parser.uses_current_schemas, .uses_snapshot_lsn = parser.uses_snapshot_lsn, .uses_transaction_xid = parser.uses_transaction_xid };
+    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting, .uses_current_schemas = parser.uses_current_schemas, .uses_snapshot_lsn = parser.uses_snapshot_lsn, .uses_transaction_xid = parser.uses_transaction_xid, .uses_transaction_timestamp = parser.uses_transaction_timestamp };
 }
 
 fn lexicalError(kind: lexer.LexErrorKind) Error {
@@ -336,6 +337,7 @@ const Parser = struct {
     uses_current_schemas: bool = false,
     uses_snapshot_lsn: bool = false,
     uses_transaction_xid: bool = false,
+    uses_transaction_timestamp: bool = false,
     relation_depth: usize = 0,
 
     fn fail(self: *Parser, err: Error, message: []const u8) Error {
@@ -620,6 +622,18 @@ const Parser = struct {
             const negative = self.take(.minus);
             if (!negative) try self.expect(.plus);
             left = try self.scalarNode(.{ .unary = .{ .op = if (negative) .negative else .positive, .operand = try self.scalar(depth + 1, 7) } });
+        } else if (self.ddlWord("current_timestamp")) {
+            self.uses_current_setting = true;
+            self.uses_transaction_timestamp = true;
+            const precision: i64 = if (self.take(.lparen)) precision: {
+                const parsed = try self.value();
+                if (parsed != .integer or parsed.integer < 0 or parsed.integer > 6)
+                    return self.fail(error.SqlInvalidParameterValue, "CURRENT_TIMESTAMP precision must be 0..6");
+                try self.expect(.rparen);
+                break :precision parsed.integer;
+            } else 6;
+            const argument = try self.scalarNode(.{ .literal = .{ .integer = precision } });
+            left = try self.scalarNode(.{ .call = .{ .name = "$current_timestamp", .args = try self.alloc.dupe(*const ast.Scalar, &.{argument}) } });
         } else if ((self.peek(.identifier) and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lparen) or self.qualifiedCatalogFunction()) {
             if (self.qualifiedCatalogFunction()) self.pos += 2;
             const function = self.tokens[self.pos];
@@ -2657,7 +2671,7 @@ const Parser = struct {
             },
             .cast => |part| try self.persistentExpression(part.operand, generated),
             .call => |part| {
-                if (std.mem.eql(u8, part.name, "current_schemas") or std.mem.eql(u8, part.name, "pg_current_wal_lsn") or std.mem.eql(u8, part.name, "pg_current_xact_id")) return self.fail(error.UnsupportedSqlShape, "schema expressions cannot capture session state");
+                if (std.mem.eql(u8, part.name, "current_schemas") or std.mem.eql(u8, part.name, "pg_current_wal_lsn") or std.mem.eql(u8, part.name, "pg_current_xact_id") or std.mem.eql(u8, part.name, "$current_timestamp")) return self.fail(error.UnsupportedSqlShape, "schema expressions cannot capture session state");
                 if (part.subquery != null or part.star or part.distinct or part.filter != null or part.window != null or part.within_group != null)
                     return self.fail(error.UnsupportedSqlShape, "subqueries, aggregates and windows are not allowed in schema expressions");
                 for (part.args) |arg| try self.persistentExpression(arg, generated);
