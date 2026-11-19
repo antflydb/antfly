@@ -29681,6 +29681,11 @@ pub const DB = struct {
     /// exact output digest), so dependency state lands with the artifact.
     fn promoteContextIntentsTxn(self: *DB, alloc: Allocator, txn: anytype, command: anytype) !void {
         if (!self.core.index_manager.hasAssetContextSources()) return;
+        // Only context-bound enrichment outputs carry an execution identity
+        // (their rendered context). Their dependency state must land with
+        // them: an intent superseded by a newer source change (or missing)
+        // means the output was built from stale context and must not publish.
+        const context_bound = command.producer_kind == .enrichment and command.execution_identity != null;
         for (command.mutations) |effect| {
             const value = effect.value orelse continue;
             var ref = (artifact_ids.decodeArtifactRefAlloc(alloc, effect.key) catch null) orelse continue;
@@ -29691,7 +29696,8 @@ pub const DB = struct {
             var reader = context_dependency_store.TxnReader(@TypeOf(txn.*)){ .txn = txn };
             var plan = context_dependency_store.Plan.init(alloc);
             defer plan.deinit();
-            _ = try context_dependency_store.planPromoteIntent(alloc, reader.reader(), &plan, ref.document_id, ref.name, output_digest);
+            const promoted = try context_dependency_store.planPromoteIntent(alloc, reader.reader(), &plan, ref.document_id, ref.name, output_digest);
+            if (context_bound and !promoted) return error.EnrichmentSourceChanged;
             try context_dependency_store.applyPlanToTxn(txn, &plan);
         }
     }
@@ -157754,4 +157760,32 @@ test "db read-only reopen restores context topology without writing it" {
     try std.testing.expect(readonly.core.index_manager.hasContextDependents());
     // Installing on a read-only handle is in-memory only.
     try readonly.setContextDependencyHost("lite:1", &inbound, null, null);
+}
+
+test "db ordered context-bound publication requires its promoted dependency intent" {
+    const alloc = std.testing.allocator;
+    const publication = @import("artifact_publication.zig");
+    var tmp = try TestDirectory.init("context-promotion-required");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const declaration = try contextSourcesTestDeclarationAlloc(alloc,
+        \\{"peers":{"query":{"filter_query":{"field":"org","term":{"$source":"/org"}}},"fields":["title"],"max_documents":10}}
+    );
+    defer alloc.free(declaration);
+    try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .context_sources_json = declaration });
+    const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "summary");
+    defer alloc.free(output_key);
+    const source = publication.Source{ .document_key = "doc:a", .content_digest = @splat(1), .timestamp = 1, .input_position = null };
+    const effect = publication.Mutation{ .family = .document_artifact, .key = output_key, .value = "built from stale context", .source_index = 0 };
+    var command: publication.Command = .{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .enrichment, .producer_name = "summary", .producer_generation = 1, .producer_artifact_name = "summary", .sources = (&source)[0..1], .mutations = (&effect)[0..1], .publication_digest = @splat(0) };
+    var txn = try db.core.store.beginWriteTxn();
+    defer txn.abort();
+    // Context-bound output with no intent for these bytes (superseded or
+    // never recorded): the publication must not commit.
+    command.execution_identity = @splat(3);
+    try std.testing.expectError(error.EnrichmentSourceChanged, db.promoteContextIntentsTxn(alloc, &txn, command));
+    // Outputs that are not context-bound keep the old, optional promotion.
+    command.execution_identity = null;
+    try db.promoteContextIntentsTxn(alloc, &txn, command);
 }
