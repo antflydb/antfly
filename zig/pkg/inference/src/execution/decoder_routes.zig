@@ -34,6 +34,17 @@ pub fn metalPreparedEmbeddingChunkRows(config: gpt_mod.Config, admitted_rows: us
     return @min(@as(usize, 512), if (admitted_rows == 0) 512 else admitted_rows);
 }
 
+/// Prepared media can use the same resident decoder and KV policy as tokens.
+/// Keep qualification scoped until every additional geometry is measured.
+pub fn supportsPreparedMediaRuntime(config: gpt_mod.Config, dtype: runtime.kv.pool.KvDType) bool {
+    return dtype == .f16 and config.sharedKvPrefillDonorLayers() != null;
+}
+
+/// Profitability/promotion is separate from the provider's legal input forms.
+pub fn prefersPreparedMediaRuntime(config: gpt_mod.Config, dtype: runtime.kv.pool.KvDType) bool {
+    return supportsPreparedMediaRuntime(config, dtype) and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_PREPARED_MEDIA_RUNTIME", true);
+}
+
 pub fn retainsPreparedPromptInputs(backend: runtime.kv.pool.BackendKind, config: gpt_mod.Config) bool {
     return (backend == .cuda or backend == .metal) and config.sharedKvPrefillDonorLayers() != null;
 }
@@ -326,7 +337,7 @@ pub fn metalPreparedPrefillHiddenCaptureEnabled() bool {
 }
 
 test "Metal shared KV prefill keeps admitted chunks and isolates unsupported adapters" {
-    const config = gpt_mod.Config{ .family = .gemma, .hidden_size = 2560, .num_hidden_layers = 42, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 512, .num_kv_shared_layers = 18, .sliding_window = 512, .sliding_window_pattern = 6, .ple_hidden_size = 256 };
+    const config = gpt_mod.Config{ .family = .gemma, .position_encoding = .rope, .hidden_size = 2560, .num_hidden_layers = 42, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 512, .num_kv_shared_layers = 18, .sliding_window = 512, .sliding_window_pattern = 6, .ple_hidden_size = 256 };
     try std.testing.expectEqual(@as(?usize, 512), metalPreparedEmbeddingChunkRows(config, 0));
     try std.testing.expectEqual(@as(?usize, 512), metalPreparedEmbeddingChunkRows(config, 8192));
     try std.testing.expectEqual(@as(?usize, 1), metalPreparedEmbeddingChunkRows(config, 1));
@@ -334,7 +345,12 @@ test "Metal shared KV prefill keeps admitted chunks and isolates unsupported ada
     try std.testing.expect(retainsPreparedPromptInputs(.metal, config));
     try std.testing.expect(retainsPreparedPromptInputs(.cuda, config));
     try std.testing.expect(!retainsPreparedPromptInputs(.native, config));
+    try std.testing.expect(supportsPreparedMediaRuntime(config, .f16));
+    for ([_]runtime.kv.pool.KvDType{ .f32, .bf16, .int8, .fp8, .int4 }) |dtype| try std.testing.expect(!supportsPreparedMediaRuntime(config, dtype));
     var unsupported = config;
+    unsupported.position_encoding = .absolute;
+    try std.testing.expect(!supportsPreparedMediaRuntime(unsupported, .f16));
+    unsupported = config;
     unsupported.gemma4_mtp_assistant = true;
     try std.testing.expect(metalPreparedEmbeddingChunkRows(unsupported, 512) == null);
     unsupported = config;

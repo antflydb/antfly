@@ -2141,15 +2141,7 @@ pub fn forwardSampledTokenFamily(
     };
 }
 
-pub const PrefillPreparedTail = struct {
-    final_hidden: ops.CT,
-    final_norm_slot: usize,
-    final_lm_head_slot: usize,
-    hidden_size: usize,
-    vocab_size: usize,
-    norm_eps: f32,
-    greedy_token_id: ?i64 = null,
-};
+pub const PrefillPreparedTail = decoder_gated_runtime.PrefillPreparedTail;
 
 pub fn forwardPrefillLastPreparedTailFamily(
     cb: *const ops.ComputeBackend,
@@ -2159,10 +2151,11 @@ pub fn forwardPrefillLastPreparedTailFamily(
     input_ids: []const i64,
     seq_len: usize,
     decode_context: *const anyopaque,
-    prefer_greedy_token: bool,
+    options: decoder_gated_runtime.PrefillTailOptions,
 ) !?PrefillPreparedTail {
+    // Preserve the existing qualified family gate for token and row inputs.
     return switch (gpt_config.family) {
-        .llama, .mistral, .qwen2, .gemma => if (try decoder_gated_runtime.forwardPrefillLastPreparedTail(
+        .llama, .mistral, .qwen2, .gemma => decoder_gated_runtime.forwardPrefillLastPreparedTail(
             cb,
             allocator,
             gpt_config,
@@ -2170,16 +2163,8 @@ pub fn forwardPrefillLastPreparedTailFamily(
             input_ids,
             seq_len,
             @ptrCast(@alignCast(decode_context)),
-            .{ .prefer_greedy_token = prefer_greedy_token },
-        )) |tail| .{
-            .final_hidden = tail.final_hidden,
-            .final_norm_slot = tail.final_norm_slot,
-            .final_lm_head_slot = tail.final_lm_head_slot,
-            .hidden_size = tail.hidden_size,
-            .vocab_size = tail.vocab_size,
-            .norm_eps = tail.norm_eps,
-            .greedy_token_id = tail.greedy_token_id,
-        } else null,
+            options,
+        ),
         else => null,
     };
 }

@@ -719,7 +719,7 @@ pub const RunAdmission = struct {
                 try @import("../ops/cuda/libraries.zig").Bf16GemmProgram.maximumTemporaryBytes(source_patch_rows, patch_limits.max_width, patch_limits.max_columns);
             const vendor_phase = @max(@max(audio_source_workspace, vision_source_workspace), @max(split_workspace, classic_workspace));
             const logical_metadata = 2 * @sizeOf(u32); // exact mask-bank device tail
-            const whole_ple = @import("../ops/cuda/embedding_gemma2_execution.zig").encoderPleBytes(tokens, 512, 24) catch return error.ResourceLimitExceeded;
+            const whole_ple = @import("embedding_gemma2_cuda.zig").encoderPleBytes(tokens, 512, 24) catch return error.ResourceLimitExceeded;
             return try addBytes(try addBytes(try addBytes(try addBytes(arena, states), staging), try addBytes(attention, fixed)), try addBytes(try addBytes(vendor_phase, logical_metadata), whole_ple));
         }
         // Attention and FFN phases are sequential, so reserve the larger peak
@@ -6412,8 +6412,8 @@ test "EmbeddingGemma2 CUDA admission follows the bounded resident arena" {
     // Pre-media source packs have their own actual logical row geometry.
     const b8 = try admission.profiledWorkspace(.{ .batch = 8, .sequence = 8192, .input_bytes = 8 * 8192 * 24, .preprocessing_complete = true });
     const b32 = try admission.profiledWorkspace(.{ .batch = 32, .sequence = 8192, .input_bytes = 32 * 8192 * 24, .preprocessing_complete = true });
-    try std.testing.expect(b8 - try @import("../ops/cuda/embedding_gemma2_execution.zig").encoderPleBytes(8 * 8192, 512, 24) < 2 * 1024 * 1024 * 1024);
-    try std.testing.expect(b32 - try @import("../ops/cuda/embedding_gemma2_execution.zig").encoderPleBytes(32 * 8192, 512, 24) < 6 * 1024 * 1024 * 1024);
+    try std.testing.expect(b8 - try @import("embedding_gemma2_cuda.zig").encoderPleBytes(8 * 8192, 512, 24) < 2 * 1024 * 1024 * 1024);
+    try std.testing.expect(b32 - try @import("embedding_gemma2_cuda.zig").encoderPleBytes(32 * 8192, 512, 24) < 6 * 1024 * 1024 * 1024);
     try std.testing.expect(b32 > b8);
     // Preserve every old mandatory component and add exactly the retained
     // whole-PLE bank; no prior activation/workspace floor is used as credit.
@@ -10443,7 +10443,7 @@ test "owned execution cohort construction unwinds every allocation failure witho
 test "official CUDA encoder admission bounds actual split programs for every declared source class" {
     // Pure typed schedule/layout calls only. No Context/driver/module/model is
     // initialized, and no GPU or allocation timing is part of this contract.
-    const Attention = @import("../ops/cuda/embedding_gemma2.zig");
+    const Attention = @import("../ops/cuda/encoder_multimodal.zig");
     const envelopes = [_]usize{ 1, 64, 65, 127, 128, 177, 178, 256, 270, 320, 447, 448, 449, 510, 511, 512, 513, 577, 8192 };
     const logical_lengths = [_]usize{ 1, 16, 63, 64, 65, 127, 128, 129, 177, 178, 255, 256, 257, 270, 319, 320, 383, 384, 385, 447, 448, 449, 510, 511, 512, 513, 577, 1024, 4096, 8192 };
     for ([_]usize{ 1, 4, 8 }) |batch| for (envelopes) |envelope| {

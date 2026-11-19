@@ -1847,14 +1847,11 @@ fn shouldAutoUseMetalWholeModelGenerate(
     prompt_cache_requested: bool,
     speculation_requested: bool,
     has_multimodal_input: bool,
+    prepared_media_supported: bool,
     selection: GenerateBackendSelection,
 ) bool {
     if (!build_options.enable_metal) return false;
-    // The whole-model executor prefills from token ids into its own KV
-    // storage. Image and audio prompts are prefilled from projected
-    // embeddings on the eager decode state instead, so the executor would
-    // start decoding with an empty cache and fail its position check.
-    if (has_multimodal_input) return false;
+    if (has_multimodal_input and !prepared_media_supported) return false;
     // An eligible cache request must stay on the eager paged-KV route. Silently
     // auto-selecting whole-model compiled execution would ignore an explicit
     // prompt_cache_key and make the opt-in cache appear enabled but inert.
@@ -17600,6 +17597,11 @@ pub const Node = struct {
         };
         if (selected_kv and (backend_kind != .metal or !gpt_config.usesGemma4Channels() or gpt_config.usesMoe() or gpt_config.gemma4_mtp_assistant or !gpt_config.supportsSplitSwaGlobalKvRing()))
             return ctx.status(400).json(.{ .@"error" = "UNSUPPORTED_KV_CACHE_POLICY", .message = "select_v1 requires the qualified Gemma4 Metal hybrid-attention route" });
+        const kv_dtype = if (config.cache_dtype) |name|
+            runtime.kv.pool.parseKvDType(name) orelse
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid cache_dtype value" })
+        else
+            session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
         const auto_metal_whole_model = !selected_kv and shouldAutoUseMetalWholeModelGenerate(
             model.session.backend(),
             graph_mod.metal_executor.supportsSession(model.session),
@@ -17607,6 +17609,7 @@ pub const Node = struct {
             config.prompt_cache_enabled,
             config.speculation_requested,
             generateMessagesHaveMedia(effective_messages),
+            @import("../execution/decoder_routes.zig").prefersPreparedMediaRuntime(gpt_config, kv_dtype),
             backend_selection,
         );
         const effective_compiled_partition_backend: ?ops.BackendKind = if (auto_metal_whole_model)
@@ -17621,11 +17624,6 @@ pub const Node = struct {
             .whole_model
         else
             backend_selection.compiled_attachment_target;
-        const kv_dtype = if (config.cache_dtype) |name|
-            runtime.kv.pool.parseKvDType(name) orelse
-                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid cache_dtype value" })
-        else
-            session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
         const target_kv_capacity_policy = generation.generationKvCapacityPolicyForRoute(
             if (build_options.enable_metal and
                 model.session.backend() == .metal and
@@ -18416,10 +18414,14 @@ pub const Node = struct {
         // than waiting for the entire prompt to finish. The shared model/backend
         // and scheduler-batched ordinary generation keep their existing control.
         if (native_transfer != null) cb.execution_control = execution_control;
-        const pool_config = if (native_transfer != null)
+        var pool_config = if (native_transfer != null)
             generation.attentionMatchCheckpointPoolConfig(kv_dtype, gpt_config)
         else
             generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
+
+        // The compiled runtime owns numerical KV. Outer request storage only
+        // coordinates logical positions and must not allocate a second mirror.
+        if (effective_compiled_partition_backend == .metal and effective_compiled_attachment_target == .whole_model) pool_config.store_cpu_bytes = false;
 
         var prompt_cache: ?*runtime.kv.prompt_cache.PromptPrefixCache = null;
         var active_kv_manager: *runtime.kv.manager.KvManager = &kv_manager;
@@ -38741,14 +38743,15 @@ test "generate backend selection keeps compiled mode explicit" {
     try std.testing.expect(auto_compiled.graph_mode_requested);
 
     const auto_default = try parseGenerateBackendSelection(null, null, null);
-    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, false, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, false, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, false, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, true, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, true, false, auto_default));
-    // Image and audio prompts stay on the eager route (see the function).
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, true, auto_default));
+    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, false, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, false, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, false, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, true, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, true, false, false, auto_default));
+    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, true, true, auto_default));
+    // Unqualified media still requires its existing route.
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, true, false, auto_default));
     try validatePromptCacheExecutionMode(true, auto_default);
 
     const explicit_compiled = try parseGenerateBackendSelection(null, "compiled", null);
@@ -38761,7 +38764,7 @@ test "generate backend selection keeps compiled mode explicit" {
     if (build_options.enable_metal) {
         const metal_eager = try parseGenerateBackendSelection(.metal, "eager", null);
         try std.testing.expect(metal_eager.eager_mode_requested);
-        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, false, metal_eager));
+        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, false, false, metal_eager));
     } else {
         try std.testing.expectError(
             error.BackendUnavailable,

@@ -1878,7 +1878,7 @@ class RuntimeCacheTest(unittest.TestCase):
                     self.own("zig/pkg/inference/src/graph/kernel_source_owner.zig")
                 )
                 if backend == "cuda":
-                    native_templates.append(self.own("zig/pkg/inference/src/ops/cuda/embedding_gemma2.zig"))
+                    native_templates.append(self.own("zig/pkg/inference/src/ops/cuda/encoder_multimodal.zig"))
                     native_templates.extend(self.own("zig/pkg/inference/" + name) for name in (
                         "src/graph/cuda_execution_contract.zig",
                         "src/ops/cuda/lighton_device_policy.zig",

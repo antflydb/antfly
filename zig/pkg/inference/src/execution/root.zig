@@ -161,3 +161,8 @@ test {
 test {
     _ = @import("cleanup_owner.zig");
 }
+
+test {
+    _ = @import("resident_rows.zig");
+    _ = @import("decoder_routes.zig");
+}

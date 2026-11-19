@@ -52,56 +52,7 @@ pub const EmbeddingRows = struct {
     /// A logical F32 dtype alone can also describe packed/opaque model storage,
     /// which copyRows2D cannot necessarily consume. No callback or kind-tag copy
     /// substitutes for this complete plain-row metadata proof.
-    fn sourceNamespace(backend: *const ComputeBackend, source: ops.CT, rows: usize, width: usize) !?@import("../execution/storage_ownership.zig").Identity {
-        const functions = backend.vtable.kernels orelse return null;
-        if (!functions.accepts(backend.vtable)) return null;
-        const inspect = functions.storageOwnership orelse return null;
-        const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32));
-        const Proof = struct {
-            bytes: usize,
-            primary: usize = 0,
-            namespace: ?@import("../execution/storage_ownership.zig").Identity = null,
-            valid: bool = true,
-            fn visit(raw: *anyopaque, report: @import("../execution/storage_ownership.zig").Report) !void {
-                const self: *@This() = @ptrCast(@alignCast(raw));
-                const plane = switch (report) {
-                    .plane => |plane| plane,
-                    .backing => return,
-                };
-                if (plane.role != .primary) return;
-                self.primary += 1;
-                self.namespace = plane.backing;
-                const descriptor = plane.descriptor;
-                if (descriptor.shape.dtype != .f32 or descriptor.quant_format != null or descriptor.attention_kv_format != null or descriptor.attention_storage != null or plane.backing == null or plane.logical_bytes != self.bytes or plane.readable_bytes < self.bytes) {
-                    self.valid = false;
-                    return;
-                }
-                switch (descriptor.storage) {
-                    .host_f32, .host_dense, .metal_buffer, .cuda_buffer, .metadata_view => {},
-                    else => {
-                        self.valid = false;
-                        return;
-                    },
-                }
-                const elements = descriptor.shape.numElements() orelse {
-                    self.valid = false;
-                    return;
-                };
-                if (elements < 0 or std.math.cast(usize, elements) != self.bytes / @sizeOf(f32)) {
-                    self.valid = false;
-                    return;
-                }
-                const dense = @import("../graph/backend_contracts.zig").TensorStrides.dense(descriptor.shape);
-                if (!std.mem.eql(i64, dense.asSlice(), descriptor.strides.asSlice())) self.valid = false;
-            }
-        };
-        var proof = Proof{ .bytes = bytes };
-        const coverage = inspect(backend.ptr, source, .{ .context = &proof, .visit = Proof.visit }) catch |err| switch (err) {
-            error.UnsupportedShape, error.UnsupportedTensorType => return null,
-            else => return err,
-        };
-        return if (coverage == .complete and proof.valid and proof.primary == 1) proof.namespace else null;
-    }
+    const sourceNamespace = @import("resident_rows.zig").namespace;
 
     pub fn supportsSource(backend: *const ComputeBackend, source: ops.CT, rows: usize, width: usize) !bool {
         return (try sourceNamespace(backend, source, rows, width)) != null;
@@ -716,7 +667,13 @@ pub const Runtime = struct {
         const route: decoder_storage.Route = if (context.compiled_partition_backend == .metal and context.cb.kind() == .metal and self.state.isPaged() and context.kv_dtype != null) .metal_whole_model else .standard;
         const policy = decoder_storage.routeCapacityPolicy(route, context.gpt_config.*, request.route.storage, context.kv_dtype orelse .f16, request.sampled_ring_qualified);
         const bounded = policy == .split_swa_ring;
-        const rows = decoder_routes.wholeModelExecutionPrefillChunkSize(context.compiled_partition_backend, request.configured_chunk_rows, request.scheduler_chunk_rows, request.query_tokens, bounded);
+        // Reuse the admitted native schedule default instead of substituting the
+        // generic 256-row fallback when a tuned prepared family uses 512 rows.
+        const configured_rows = if (request.configured_chunk_rows != 0) request.configured_chunk_rows else if (context.compiled_partition_backend == .metal)
+            decoder_routes.metalPreparedEmbeddingChunkRows(context.gpt_config.*, 0) orelse 0
+        else
+            0;
+        const rows = decoder_routes.wholeModelExecutionPrefillChunkSize(context.compiled_partition_backend, configured_rows, request.scheduler_chunk_rows, request.query_tokens, bounded);
         const speculative = @min(@as(usize, @intCast(request.speculative_k)), @as(usize, runtime.tier.memory.generation_max_speculative_k)) + 1;
         self.state.configureKvMaxInflightTokens(@max(rows, speculative), bounded);
         return .{ .chunk_rows = rows, .bounded_swa = bounded };
@@ -960,6 +917,7 @@ pub const Runtime = struct {
 
     pub const CompiledChunk = struct {
         token_ids: []const i64,
+        prepared_rows: ?@import("resident_rows.zig").Rows = null,
         total_sequence_length: usize,
         output: enum { kv_only, last_logits, greedy_token },
     };
@@ -969,7 +927,7 @@ pub const Runtime = struct {
     /// under the caller's existing execution/provider capability. An error
     /// after the runtime call propagates; no eager/serial replay is attempted.
     pub fn runCompiledChunk(self: *Runtime, request: CompiledChunk) !Output {
-        return self.runCompiledChunkWith(request, graph_mod.execution.graphForwardCompiledModelOutput);
+        return self.runCompiledChunkWith(request, graph_mod.execution.graphForwardCompiledModelOutputWithInputs);
     }
 
     fn runCompiledChunkWith(self: *Runtime, request: CompiledChunk, comptime forward_fn: anytype) !Output {
@@ -993,7 +951,7 @@ pub const Runtime = struct {
         var inherited = if (supplied_cleanup == null and cleanup_operation != null) try cleanup_operation.?.retainCleanupEpoch() else null;
         defer if (inherited) |*epoch| epoch.release();
         const cleanup = @import("cleanup_context.zig").Context{ .boundary = supplied_cleanup orelse if (inherited) |*epoch| epoch else null, .operation = cleanup_operation };
-        var output = (try forward_fn(&self.forward.context, cache, request.token_ids, 1, request.total_sequence_length, &context)) orelse return error.MissingCompiledModelRuntime;
+        var output = (try forward_fn(&self.forward.context, cache, request.token_ids, 1, request.total_sequence_length, &context, .{ .prepared_rows = request.prepared_rows, .kv_only = request.output == .kv_only })) orelse return error.MissingCompiledModelRuntime;
         defer output.deinitWithCleanup(allocator, cleanup);
         return switch (request.output) {
             .kv_only => .{},
@@ -1092,6 +1050,15 @@ pub const Runtime = struct {
         const embeddings = if (request.ensure_device_resident) try cb.ensureDeviceResidentOwned(original) else original;
         var owned = true;
         errdefer if (owned) cb.free(embeddings);
+        const compiled_rows = request.route == .prepared_last_row and self.forward.context.compiled_partition_backend == .metal and
+            self.forward.context.compiled_attachment_target == .whole_model and self.forward.graph_cache != null;
+        if (compiled_rows) {
+            if (request.capture_hidden or request.attention_mask != null or request.positions != null or request.visual_mask != null or request.deepstack_embeddings != null or request.token_ids.len != request.sequence_length) return error.UnsupportedPreparedRows;
+            const rows = @min(@as(usize, 512), if (request.chunk_rows == 0) @as(usize, 512) else request.chunk_rows);
+            owned = false;
+            defer cb.free(embeddings);
+            return self.runEmbeddingChunks(embeddings, request, rows);
+        }
         if (request.route == .prepared_last_row and !request.capture_hidden and request.attention_mask == null and
             request.positions == null and request.visual_mask == null and request.deepstack_embeddings == null and
             self.state.isPaged())
@@ -1131,6 +1098,8 @@ pub const Runtime = struct {
         const a = self.forward.context.allocator;
         const config = self.forward.context.gpt_config.*;
         if (request.token_ids.len != request.sequence_length or rows == 0) return error.InvalidPreparedPrompt;
+        const compiled = self.forward.context.compiled_partition_backend == .metal and
+            self.forward.context.compiled_attachment_target == .whole_model and self.forward.graph_cache != null;
         var state = BorrowedDecodeStateRuntime.init(self.state);
         // Disabling the arithmetic optimization cannot waive the admitted
         // physical row bound or the retained full-prompt input reservation.
@@ -1140,14 +1109,25 @@ pub const Runtime = struct {
             if (cb.execution_control) |active| try active.check();
             const count = @min(rows, request.sequence_length - start);
             const end = start + count;
-            var decode = state.makeDecodeContext(end, count);
-            if (decode.kv_position_offset != 0 or decode.attention_mode == .full_recompute) return error.UnsupportedShape;
-            decode.kv_sequence_len = end;
-            try self.forward.context.bindDecoderCleanup(&decode);
             const part = try cb.sliceRows2D(a, embeddings, start, count, config.hidden_size);
             var owns_part = true;
             defer if (owns_part) cb.free(part);
             const ids = request.token_ids[start..end];
+            if (compiled) {
+                const result = try self.runCompiledChunkWithOwnedLane(.{
+                    .token_ids = ids,
+                    .prepared_rows = .{ .source = cb, .tensor = part, .rows = count, .width = config.hidden_size },
+                    .total_sequence_length = end,
+                    .output = if (end == request.sequence_length) .last_logits else .kv_only,
+                }, self.forward.graph_cache.?, graph_mod.execution.graphForwardCompiledModelOutputWithInputs);
+                if (end == request.sequence_length) return result;
+                start = end;
+                continue;
+            }
+            var decode = state.makeDecodeContext(end, count);
+            if (decode.kv_position_offset != 0 or decode.attention_mode == .full_recompute) return error.UnsupportedShape;
+            decode.kv_sequence_len = end;
+            try self.forward.context.bindDecoderCleanup(&decode);
             if (end == request.sequence_length) {
                 var numerical = Forward{ .forward = self.forward };
                 owns_part = false;
@@ -1704,7 +1684,7 @@ fn checkNativeCompiledChunkCore(cb: ComputeBackend, _: ComputeBackend) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             return gpt_arch.getTracedWeight(std.testing.allocator, &self.backend, self.config, name);
         }
-        fn forward(ctx: *const graph_mod.execution.Context, _: *graph_mod.cache.GraphCache, tokens: []const i64, batch: usize, sequence: usize, decode: *const gpt_arch.DecodeContext) !?graph_mod.model_runtime.ModelOutput {
+        fn forward(ctx: *const graph_mod.execution.Context, _: *graph_mod.cache.GraphCache, tokens: []const i64, batch: usize, sequence: usize, decode: *const gpt_arch.DecodeContext, _: graph_mod.execution.CompiledPrefillOptions) !?graph_mod.model_runtime.ModelOutput {
             const self: *@This() = @ptrCast(@alignCast(ctx.weights.?.ptr));
             self.calls += 1;
             try std.testing.expect(@import("allocation_registry.zig").enabled());
@@ -1807,7 +1787,7 @@ fn checkMetalCompiledChunk(cb: ComputeBackend, native_reference: ComputeBackend)
         fn get(_: *anyopaque, _: []const u8) anyerror!ops.CT {
             return error.UnexpectedCompiledPrefillWeightOverride;
         }
-        fn forward(ctx: *const graph_mod.execution.Context, cache_arg: *graph_mod.cache.GraphCache, tokens: []const i64, batch: usize, sequence: usize, decode: *const gpt_arch.DecodeContext) !?graph_mod.model_runtime.ModelOutput {
+        fn forward(ctx: *const graph_mod.execution.Context, cache_arg: *graph_mod.cache.GraphCache, tokens: []const i64, batch: usize, sequence: usize, decode: *const gpt_arch.DecodeContext, _: graph_mod.execution.CompiledPrefillOptions) !?graph_mod.model_runtime.ModelOutput {
             const self: *@This() = @ptrCast(@alignCast(ctx.weights.?.ptr));
             self.calls += 1;
             var result = (try graph_mod.execution.graphForwardCompiledModelOutput(ctx, cache_arg, tokens, batch, sequence, decode)) orelse return error.MissingCompiledModelRuntime;

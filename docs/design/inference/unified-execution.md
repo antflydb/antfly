@@ -53,6 +53,36 @@ analysis and immutable weights during shape specialization.
   cache behavior and fallback. Nested transfer audits cannot weaken an outer
   strict policy. Planner-only assertions do not establish execution parity.
 
+## Model binding and retained native execution
+
+Model configuration, checkpoint names and model layer composition belong to
+architecture and backend adapters. `backends/embedding_gemma2_cuda.zig` binds EG2
+configuration and statically composes existing CUDA operations. The operation
+bindings in `ops/cuda/encoder_multimodal.zig` contain no model configuration or
+checkpoint imports. Historical device exports remain artifact ABI compatibility
+names; new host APIs use operation names.
+
+`ops/cuda/retained_execution_cache.zig` owns reusable buffers, capture, completion
+and retirement. Its compile-time recipe supplies admission geometry, complete
+capture identity and compatibility checks. The model adapter compares the entire
+configuration, numerical policy and resolved route before reusing a graph. This
+separation introduces no runtime kernel interpreter or virtual dispatch.
+
+Prepared media rows enter the existing `ModelRuntime` prefill request as a
+borrowed `execution/resident_rows.zig` value. Geometry, physical readability and
+provider identity are checked before state reset or KV mutation. Separate wrapper
+objects require an explicit live operation capability proving the same provider.
+The synchronous call does not retain borrowed rows. Token lookup and prepared
+rows then use the same qualified Metal transformer and tail schedules, chunking,
+KV ring policy and output intent. Intermediate chunks can publish KV only.
+Automatic media selection is limited to the qualified F16 profile; explicit
+modes and unsupported precision retain their existing selection rules.
+
+These changes reuse `ModelProgram`, `Executable`, candidate admission and physical
+buffer planning. They do not make the portable whole-model Tile prototype a
+production replacement for native tuned programs. Numerical sharing and schedule
+qualification remain separate from moving model ownership.
+
 ## Kernel ownership and validation
 
 `ops/kernel_descriptor.zig` describes operation semantics and requirements;

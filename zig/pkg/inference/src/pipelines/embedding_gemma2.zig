@@ -5185,7 +5185,7 @@ test "embeddinggemma2 CUDA video inspected admission fits constrained scratch an
 
 test "embeddinggemma2 NVDEC cache admission policy is linked on portable hosts" {
     _ = @import("../ops/cuda/video_cache_budget.zig");
-    _ = @import("../ops/cuda/embedding_gemma2_execution.zig");
+    _ = @import("../backends/embedding_gemma2_cuda.zig");
     _ = @import("../ops/cuda/embedding_gemma2_policy.zig");
     _ = @import("../ops/cuda/embedding_gemma2_resize.zig");
 }
@@ -6511,7 +6511,7 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
             const decoder = compute.ctx.video_decoder_cache orelse return error.MissingActualVideoDecoder;
             try std.testing.expect(compute.ctx.video_cache_budget.quota == .prepared);
             const sequence = try std.math.mul(usize, grid_x, grid_y);
-            const rows_limit = @import("../ops/cuda/embedding_gemma2_execution.zig").graph_rows_limit;
+            const rows_limit = @import("../backends/embedding_gemma2_cuda.zig").graph_rows_limit;
             var result = @This(){ .decoder = @intFromPtr(decoder), .full_row_eligible = sequence != 0 and 4 <= rows_limit / sequence, .batching_graph = compute.embedding_gemma2_policy.image_batch and compute.embedding_gemma2_policy.graph_replay, .native_supported = compute.embedding_gemma2_policy.native_vision and @import("../ops/cuda/artifact.zig").hasBf16WmmaCodeFor(compute.ctx.info.compute_major, compute.ctx.info.compute_minor), .native_launches = compute.embedding_gemma2_native_vision_launches, .fused_launches = if (compute.embedding_gemma2) |*module| module.stats().fused_vision_launches else 0, .replays = compute.embedding_gemma2_vision_graph_replays };
             for (compute.embedding_gemma2_execution.arenas) |arena| if (arena.kind == .vision and arena.quota == .prepared and arena.grid_x == grid_x and arena.grid_y == grid_y and arena.sequence == sequence) {
                 if (arena.batch == 4) {

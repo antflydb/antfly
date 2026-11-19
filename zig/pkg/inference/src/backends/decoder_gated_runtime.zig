@@ -6550,6 +6550,9 @@ pub const PrefillPreparedTail = struct {
 
 pub const PrefillTailOptions = struct {
     prefer_greedy_token: bool = false,
+    /// Borrowed scaled rows from the same prepared provider. Token IDs retain
+    /// their PLE semantics; every later transformer/tail stage is shared.
+    input_embeddings: ?ops.CT = null,
     /// A native-program miss must decline before any decoder/KV execution.
     execution: enum { compatible, captured_native } = .compatible,
 };
@@ -6568,6 +6571,7 @@ pub fn forwardPrefillLastPreparedTail(
     if (input_ids.len == 0 or decode_context.query_sequence_len != input_ids.len) return null;
     if (decode_context.attention_mode != .paged_prefill) return null;
     if (options.execution == .captured_native) {
+        if (options.input_embeddings != null) return null;
         if (comptime !build_options.enable_cuda) return null;
         if (configured_layer_count != gpt_config.num_hidden_layers or seq_len != decode_context.query_sequence_len or gatedFamilyCompareRequested()) return null;
         if (!@import("../ops/cuda/cuda_compute.zig").CudaCompute.capturedPrefillRequested(cb)) return null;
@@ -6576,7 +6580,9 @@ pub fn forwardPrefillLastPreparedTail(
     timing_stats.prefill_query_tokens += input_ids.len;
 
     var started_at = monotonicNowNs();
-    const hidden = try decoder_rms_runtime.embedTokens(cb, allocator, gpt_config, input_ids);
+    const hidden = options.input_embeddings orelse try decoder_rms_runtime.embedTokens(cb, allocator, gpt_config, input_ids);
+    var owns_input_hidden = options.input_embeddings == null;
+    defer if (owns_input_hidden) cb.free(hidden);
     var finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.prefill_embed_nanos += finished_at - started_at;
 
@@ -6657,7 +6663,6 @@ pub fn forwardPrefillLastPreparedTail(
     );
     if (direct_hidden_result == null) {
         cancelDecoderRuntimeFrame(cb, &ple_frame_active);
-        cb.free(hidden);
         return null;
     }
     var decoder_frame_active = if (direct_hidden_result) |direct_hidden|
@@ -6687,7 +6692,13 @@ pub fn forwardPrefillLastPreparedTail(
     if (finished_at > started_at) timing_stats.prefill_block_nanos += finished_at - started_at;
     // The embedded rows were borrowed by the block stack (the direct paths
     // copy them into their own hidden buffers); release them here.
-    if (final_hidden != hidden) cb.free(hidden);
+    if (final_hidden == hidden) {
+        if (!owns_input_hidden) return error.PreparedPrefillAliasedBorrow;
+        owns_input_hidden = false;
+    } else if (owns_input_hidden) {
+        cb.free(hidden);
+        owns_input_hidden = false;
+    }
     var owns_final_hidden = true;
     errdefer if (owns_final_hidden) cb.free(final_hidden);
     if (direct_hidden_result != null and compare_hidden_input != null) {

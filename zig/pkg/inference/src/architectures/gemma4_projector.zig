@@ -10828,7 +10828,7 @@ test "embedding video cache recipe shares actual140geometry and exact selected-f
 }
 
 test "video cold qualification preserves original row limit and independent wide aspect full partial eligibility" {
-    const Cache = @import("../ops/cuda/embedding_gemma2_execution.zig");
+    const Cache = @import("../backends/embedding_gemma2_cuda.zig");
     const Vision = @import("../ops/cuda/embedding_gemma2_vision.zig");
     const original = embeddingGemma2VideoGeometryFull(160, 96);
     try std.testing.expectEqual(@as(usize, 45), original.grid_x);

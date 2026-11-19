@@ -13,6 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// Operation-level CUDA bindings for encoder attention, normalization and media
+/// programs. Model configuration and weight binding belong in backend adapters.
+/// Device export names remain stable to preserve packaged artifact compatibility.
 const std = @import("std");
 const artifact = @import("artifact.zig");
 const driver = @import("driver.zig");

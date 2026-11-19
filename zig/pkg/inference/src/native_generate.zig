@@ -562,16 +562,23 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         print("\n", .{});
     }
 
-    // Explicit compiled partition backends always use graph mode; otherwise
-    // keep eager as the default and preserve TERMITE_GRAPH_MODE as the
-    // compatibility opt-in when --mode is omitted.
+    // Qualified prepared native execution shares the same pipeline for text and
+    // media. Explicit modes and diagnostic live execution keep their policies.
     const compiled_mode_requested = if (opts.mode) |mode| mode == .compiled else false;
+    const automatic_prepared_runtime = build_options.enable_metal and model.session.backend() == .metal and
+        opts.mode == null and opts.compiled_target == null and
+        platform.env.getenv("TERMITE_METAL_DUMP_GENERATE_LOGITS_F32") == null and
+        platform.env.getenv("TERMITE_METAL_TEACHER_FORCE_TOKEN_IDS") == null and
+        @import("execution/decoder_routes.zig").prefersPreparedMediaRuntime(gpt_config, if (opts.cache_dtype) |name| runtime.kv.pool.parseKvDType(name) orelse .f32 else session_factory.recommendedKvDTypeForSession(model.session, .metal)) and graph_mod.metal_executor.supportsSession(model.session) and !forcePrefillHostLogits() and
+        !config.prompt_cache_enabled and !config.speculation_requested and effective_draft_model == null and
+        (opts.backend == .auto or opts.backend == .metal);
     const explicit_partition_backend = blk: {
         const requested = native_backend_choice.compiledPartitionBackendForMode(
             opts.backend,
             compiled_mode_requested,
         );
         if (requested) |backend| break :blk backend;
+        if (automatic_prepared_runtime) break :blk ops.BackendKind.metal;
         if (compiled_mode_requested and opts.backend == .auto and build_options.enable_metal and model.session.backend() == .metal) {
             break :blk ops.BackendKind.metal;
         }
@@ -579,11 +586,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     };
     try native_backend_choice.validateRequiredCompiledBackend(&session_manager, explicit_partition_backend);
     const compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = opts.compiled_target orelse blk: {
-        if (explicit_partition_backend == .pjrt or (compiled_mode_requested and explicit_partition_backend == .metal)) break :blk .whole_model;
+        if (automatic_prepared_runtime or explicit_partition_backend == .pjrt or (compiled_mode_requested and explicit_partition_backend == .metal)) break :blk .whole_model;
         break :blk .partitioned;
     };
     const graph_mode = native_backend_choice.forcesGraphMode(opts.backend) or
-        compiled_mode_requested or graphModeEnabled();
+        automatic_prepared_runtime or compiled_mode_requested or graphModeEnabled();
     if (graph_mode and generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config)) {
         return error.DeepSeekV4CompressedGraphModeNotSupported;
     }
@@ -791,7 +798,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     // route, not an admission bypass. Reuse the effective KV dtype, capacity
     // policy, scheduler lease, and selected prefill geometry above.
     debugGenerateSetup("live whole-model executor probe begin", .{});
-    const live_whole_model_executed = tryRunLiveWholeModelExecutorGenerate(
+    const live_whole_model_executed = if (automatic_prepared_runtime) false else tryRunLiveWholeModelExecutorGenerate(
         allocator,
         io,
         &opts,
@@ -905,7 +912,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     defer if (draft_cb) |*backend| backend.deinit();
 
     var kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, kvSlidingTrimForced());
-    if (explicit_partition_backend == .pjrt) kv_pool_config.store_cpu_bytes = false;
+    if (explicit_partition_backend == .pjrt or (explicit_partition_backend == .metal and compiled_attachment_target == .whole_model)) kv_pool_config.store_cpu_bytes = false;
     const pool_id = try kv_manager.addPool(kv_pool_config);
     var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
     defer kv_storage.deinit();

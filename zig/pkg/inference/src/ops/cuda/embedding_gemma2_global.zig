@@ -19,7 +19,7 @@ const std = @import("std");
 const Context = @import("context.zig").CudaContext;
 const Buffer = @import("buffer.zig").DeviceBuffer;
 const Blas = @import("cublaslt.zig").CublasLt;
-const Encoder = @import("embedding_gemma2.zig");
+const Encoder = @import("encoder_multimodal.zig");
 const Control = @import("../../execution_control.zig").InferenceExecutionControl;
 const memory = @import("../../runtime/tier/memory.zig");
 
@@ -231,7 +231,7 @@ test "global MQA failed growth and reused address invalidate captured workspace"
     defer scratch.clear(&ctx) catch unreachable;
     const old = (try scratch.acquire(&ctx, 512)).?;
     const old_generation = scratch.generation;
-    var graph = @import("embedding_gemma2_execution.zig").Arena{};
+    var graph = @import("../../backends/embedding_gemma2_cuda.zig").Arena{};
     graph.setAttentionWorkspaces(0, old.ptr, old_generation, 0);
     // Ordinary reuse must preserve the key for a live allocation.
     _ = (try scratch.acquire(&ctx, 256)).?;

@@ -848,6 +848,24 @@ pub fn graphForwardCompiledModelOutput(
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
 ) !?model_runtime.ModelOutput {
+    return graphForwardCompiledModelOutputWithInputs(pipeline, cache, input_ids, batch, seq_len, decode_context, .{});
+}
+
+pub const CompiledPrefillOptions = struct {
+    prepared_rows: ?@import("../execution/resident_rows.zig").Rows = null,
+    kv_only: bool = false,
+};
+
+pub fn graphForwardCompiledModelOutputWithInputs(
+    pipeline: *const Context,
+    cache: *cache_mod.GraphCache,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    options: CompiledPrefillOptions,
+) !?model_runtime.ModelOutput {
+    if (options.prepared_rows != null and (batch != 1 or decode_context.attention_mode != .paged_prefill)) return error.UnsupportedPreparedRows;
     const backend = pipeline.compiled_partition_backend orelse return null;
     if (pipeline.compiled_attachment_target != .whole_model) return null;
     const backend_def = compiledBackendDefinition(backend) orelse return null;
@@ -855,6 +873,7 @@ pub fn graphForwardCompiledModelOutput(
     // Graph-backed targets expose owned host logits through their graph hook.
     // Resident targets retain the common candidate's single commit boundary.
     if (backend_def.resolve_model_runtime == null) {
+        if (options.prepared_rows != null) return null;
         const logits = try graphForwardCompiledModelLast(pipeline, cache, input_ids, batch, seq_len, decode_context) orelse return null;
         return .{ .logits = logits };
     }
@@ -864,6 +883,10 @@ pub fn graphForwardCompiledModelOutput(
     defer cleanup.deinit();
     const attach_context = compiledBackendAttachContext(pipeline, backend, attention_mode);
     var request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
+    if (request == .prefill) {
+        request.prefill.prepared_rows = options.prepared_rows;
+        request.prefill.kv_only = options.kv_only;
+    }
     switch (request) {
         inline else => |*value| {
             value.backend_operation = pipeline.cb.operationToken();

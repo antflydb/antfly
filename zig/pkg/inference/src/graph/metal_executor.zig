@@ -2210,6 +2210,7 @@ const runtime_vtable = model_runtime.ModelRuntime.VTable{
     .operation_backend = operationBackend,
     .accepts_operation_backend = acceptsOperationBackend,
     .capabilities = runtimeCapabilities,
+    .supports_forward_request = runtimeSupportsForwardRequest,
     .prepare = runtimePrepare,
     .prefill = runtimePrefill,
     .decode = runtimeDecode,
@@ -2399,15 +2400,25 @@ fn createRuntime(definition: *session_decoder.Definition, allocator: std.mem.All
     return .{ .ptr = try RuntimeContext.init(allocator, definition), .vtable = &runtime_vtable };
 }
 
+fn runtimeSupportsForwardRequest(raw: *anyopaque, request: model_runtime.ForwardRequest, _: model_runtime.ForwardOperation) bool {
+    const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(raw));
+    if (request == .prefill) if (request.prefill.prepared_rows) |rows| {
+        const config = runtime_ctx.definition.configuration.value;
+        if (!@import("../execution/decoder_routes.zig").supportsPreparedMediaRuntime(config, runtime_ctx.kv_storage.storage.config.dtype) or request.prefill.force_host_logits) return false;
+        rows.validateFor(&runtime_ctx.cb, request.prefill.query_seq_len, config.hidden_size, request.prefill.backend_operation) catch return false;
+    };
+    return true;
+}
+
 fn runtimeCapabilities(ctx: *anyopaque) model_runtime.RuntimeCapabilities {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
-    _ = runtime_ctx;
     // Decode context assembly and hot-path token bookkeeping are executor-owned
     // now, but KV mutation/storage still depends on the host-backed block
     // manager and paged cache metadata. Keep this at runtime_owned_host_cache
     // until that metadata and mutation policy move fully behind the backend.
     return .{
         .supports_decode = true,
+        .supports_prepared_rows = @import("../execution/decoder_routes.zig").supportsPreparedMediaRuntime(runtime_ctx.definition.configuration.value, runtime_ctx.kv_storage.storage.config.dtype),
         .supports_sample_decode = true,
         .supports_greedy_decode = true,
         .state_ownership = .runtime_owned_host_cache,
@@ -2573,6 +2584,10 @@ fn runtimePrefill(
     if (request.input_ids.len == 0 or request.query_seq_len == 0) return error.EmptyPrompt;
     if (request.input_ids.len != request.query_seq_len) return error.UnsupportedShape;
     if (request.query_seq_len > request.seq_len) return error.UnsupportedShape;
+    if (request.prepared_rows) |rows| {
+        if (!@import("../execution/decoder_routes.zig").supportsPreparedMediaRuntime(runtime_ctx.definition.configuration.value, runtime_ctx.kv_storage.storage.config.dtype) or request.force_host_logits) return error.UnsupportedPreparedRows;
+        try rows.validateFor(&runtime_ctx.cb, request.query_seq_len, runtime_ctx.definition.configuration.value.hidden_size, request.backend_operation);
+    }
     try runtime_ctx.configureKvPolicy(request.max_inflight_tokens, request.allow_swa_ring);
 
     timing_stats.prefill_calls += 1;
@@ -2599,7 +2614,7 @@ fn runtimePrefill(
     if (decoderRuntimePrefillTraceRequested()) {
         std.debug.print("prefill-trace: runtimePrefill qlen={d} seq={d} ready={}\n", .{ request.query_seq_len, request.seq_len, decoder_runtime_ready });
     }
-    if (decoder_runtime_ready and request.query_seq_len == 1) {
+    if (decoder_runtime_ready and request.query_seq_len == 1 and request.prepared_rows == null) {
         try request.check();
         const token_id = request.input_ids[request.input_ids.len - 1];
         const direct_started_at = monotonicNowNs();
@@ -2618,7 +2633,16 @@ fn runtimePrefill(
         const timing_before = runtime_ctx.cb.directFamilyTimingSnapshot();
         const direct_started_at = monotonicNowNs();
         const config = runtime_ctx.definition.configuration.value;
-        if (request.kv_only and !request.force_host_logits and !request.prefer_greedy_token and
+        if (request.prepared_rows) |rows| {
+            if (request.kv_only) {
+                var hidden_rows = (try decoder_gated_runtime.forwardFinalHiddenRowsFromEmbeddings(&runtime_ctx.cb, allocator, config, configured_layer_count, rows.tensor, request.input_ids, request.seq_len, &decode_context, if (request.query_seq_len > 1 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_SHARED_KV_PREFILL", true)) .kv_only else .all)) orelse return error.PreparedRowsExecutionUnavailable;
+                hidden_rows.deinit(&runtime_ctx.cb);
+                recordPrefillFamilyTiming(&runtime_ctx.cb, direct_started_at, timing_before, true);
+                runtime_ctx.noteDecoderRuntimeStateFromCurrentView();
+                return .{};
+            }
+        }
+        if (request.prepared_rows == null and request.kv_only and !request.force_host_logits and !request.prefer_greedy_token and
             request.query_seq_len > 1 and config.sharedKvPrefillDonorLayers() != null and
             platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_SHARED_KV_PREFILL", true))
         {
@@ -2630,16 +2654,17 @@ fn runtimePrefill(
                 return .{};
             }
         }
-        if (try metal_runtime.forwardPrefillLastPreparedTailFamily(
+        const prepared_tail = try metal_runtime.forwardPrefillLastPreparedTailFamily(
             &runtime_ctx.cb,
             allocator,
-            runtime_ctx.definition.configuration.value,
+            config,
             configured_layer_count,
             request.input_ids,
             request.seq_len,
             &decode_context,
-            request.prefer_greedy_token,
-        )) |tail| {
+            .{ .prefer_greedy_token = request.prefer_greedy_token, .input_embeddings = if (request.prepared_rows) |rows| rows.tensor else null },
+        );
+        if (prepared_tail) |tail| {
             recordPrefillFamilyTiming(&runtime_ctx.cb, direct_started_at, timing_before, true);
             runtime_ctx.noteDecoderRuntimeStateFromCurrentView();
             return .{ .prepared_tail = .{
@@ -2658,6 +2683,7 @@ fn runtimePrefill(
         }
         recordPrefillFamilyTiming(&runtime_ctx.cb, direct_started_at, timing_before, false);
     }
+    if (request.prepared_rows != null) return error.PreparedRowsExecutionUnavailable;
     try request.check();
     const fallback_started_at = monotonicNowNs();
     const logits = try forwardLastLogits(

@@ -18,6 +18,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
     var cb = try factory.getComputeBackend(model.session, a);
     defer cb.deinit();
     cb.execution_control = .{ .native_call_policy = .in_process, .io = init.io };
+    const resident_metal = cb.kind() == .metal and inference.execution.decoder_routes.prefersPreparedMediaRuntime(config, factory.recommendedKvDTypeForSession(model.session, .metal));
     var cache = inference.graph.cache.GraphCache.init(a);
     defer cache.deinitWithBackend(&cb);
     var kv = inference.runtime.kv.manager.KvManager.init(a);
@@ -33,7 +34,8 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
             else => return error.GenerationBackendSelectionMismatch,
         };
         const dtype = factory.recommendedKvDTypeForSession(model.session, kind);
-        const pool_config = generation.kvPoolConfig(kind, dtype, config, false);
+        var pool_config = generation.kvPoolConfig(kind, dtype, config, false);
+        if (resident_metal) pool_config.store_cpu_bytes = false;
         const pool_id = try kv.addPool(generation.requestKvManagerPoolConfig(pool_config));
         storage = try inference.runtime.kv.storage_runtime.KvStorageRuntime.init(a, pool_config);
         try cb.provisionKvDeviceWriteHook(&storage.?);
@@ -57,8 +59,8 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .model_dir = options.model_dir,
         .gguf_projector_path = model.manifest.gguf_projector_path,
         .projector_store = projector,
-        .graph_cache = if (is_pjrt) &cache else null,
-        .compiled_partition_backend = if (is_pjrt) .pjrt else null,
+        .graph_cache = if (is_pjrt or resident_metal) &cache else null,
+        .compiled_partition_backend = if (is_pjrt) .pjrt else if (resident_metal) .metal else null,
         .compiled_attachment_target = .whole_model,
         .pjrt_client = client,
         .pjrt_media_bucket_rows = options.pjrt.media_bucket_rows,

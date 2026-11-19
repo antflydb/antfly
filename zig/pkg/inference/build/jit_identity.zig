@@ -163,7 +163,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/ops/cuda/row_selection_stats_f32.ptx",
         "src/ops/cuda/generated/tile_whisper_logits.cu",
         "src/ops/cuda/encoder_decoder_fusions.zig",
-        "src/ops/cuda/embedding_gemma2.zig",
+        "src/ops/cuda/encoder_multimodal.zig",
         "src/ops/cuda/lighton_recurrent.ptx",
         "src/ops/cuda/lighton_attention.ptx",
         "src/ops/cuda/lighton_activation.ptx",

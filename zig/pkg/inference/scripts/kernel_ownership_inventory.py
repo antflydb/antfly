@@ -55,9 +55,44 @@ def source_regions(data):
     return regions
 
 
+def verify_shared_dependencies(root):
+    """Keep numerical descriptions and retained storage independent of models."""
+    root = root.resolve()
+    core = root / "zig/lib/tile/src"
+    cache = root / "zig/pkg/inference/src/ops/cuda/retained_execution_cache.zig"
+    bindings = cache.with_name("encoder_multimodal.zig")
+    imports = re.compile(r'@import\(\s*"([^"\n]+)"\s*\)')
+    checked = []
+    for source in sorted(core.rglob("*.zig")) + [f for f in (cache, bindings) if f.is_file()]:
+        # Imports inside line comments are documentation, not dependencies.
+        text = re.sub(r"//[^\n]*", "", source.read_text())
+        tile = source.is_relative_to(core)
+        for name in imports.findall(text):
+            if not name.endswith(".zig"):
+                allowed = {"std", "builtin"} if tile else {"std", "builtin", "build_options", "antfly_platform", "antfly_tile"}
+                if name not in allowed:
+                    raise ValueError("shared numerical/storage owner imports application module: " + name)
+                continue
+            target = (source.parent / name).resolve()
+            if tile:
+                if not target.is_relative_to(core):
+                    raise ValueError("Tile core import escapes shared package: " + name)
+            else:
+                package = root / "zig/pkg/inference/src"
+                allowed = [package / directory for directory in ("ops/cuda", "execution", "runtime")]
+                contracts = {package / "ops/kernel_geometry.zig", package / "graph/backend_contracts.zig"}
+                if source == bindings:
+                    contracts.add(package / "ops/ops.zig")
+                if target not in contracts and not any(target.is_relative_to(directory) for directory in allowed):
+                    raise ValueError("retained CUDA cache imports model/backend adapter: " + name)
+        checked.append({"source": str(source.relative_to(root)), **fingerprint(source.read_bytes())})
+    return checked
+
+
 def verify(root, inventory):
     if inventory["schema"] != 1:
         raise ValueError("unknown inventory schema")
+    dependencies = verify_shared_dependencies(root)
     package = (root / "zig/pkg/inference").resolve()
     def path(name):
         result = (package / name).resolve()
@@ -137,7 +172,7 @@ def verify(root, inventory):
                 name = str(child.relative_to(package))
                 if name not in outputs and not any(row["output"] == name for row in leaves):
                     leaves.append({"output": name, "classification": "canonical_native_include", **fingerprint(child.read_bytes())})
-    return {**inventory, "verification": {"regions_and_files": len(verified), "standalone_cuda_inputs": standalone, "shared_program_sources": [shared_sources[name] for name in sorted(shared_sources)], "canonical_native": canonical + sorted(leaves, key=lambda row: row["output"]), "retention": "Canonical surrounds and include leaves are authored implementation, not dead-code candidates. Compatibility exports remain ABI adapters; lexical single-reference counts do not establish liveness."}}
+    return {**inventory, "verification": {"shared_dependency_boundaries": dependencies, "regions_and_files": len(verified), "standalone_cuda_inputs": standalone, "shared_program_sources": [shared_sources[name] for name in sorted(shared_sources)], "canonical_native": canonical + sorted(leaves, key=lambda row: row["output"]), "retention": "Canonical surrounds and include leaves are authored implementation, not dead-code candidates. Compatibility exports remain ABI adapters; lexical single-reference counts do not establish liveness."}}
 
 
 def main():

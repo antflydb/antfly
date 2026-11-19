@@ -3799,7 +3799,7 @@ pub const NativeGenerationPipeline = struct {
                 enableCudaPrefillFirstToken() and enableCudaPrefillGreedyToken(),
             ))
         else if (prepared_multimodal_prompt) |*prepared|
-            try self.executePreparedMultimodalPrefill(prepared, seq_len, decode_state, capture_mtp_prefill_hidden, config.prefill_chunk_size)
+            try self.executePreparedMultimodalPrefill(prepared, seq_len, decode_state, capture_mtp_prefill_hidden, config)
         else
             try self.executePrefill(prefill_ids, seq_len, cached_prompt_tokens, decode_state, config, allow_prefill_greedy_token, capture_mtp_prefill_hidden);
         if (native_work_enabled) {
@@ -4863,24 +4863,7 @@ pub const NativeGenerationPipeline = struct {
         };
         errdefer work_complete = false;
         var prompt_runtime = self.prefillRuntime(decode_state, null);
-        const request = decoder_prefill.PromptRequest{
-            .route = decoderRouteRequest(config),
-            .prompt_tokens = seq_len,
-            .query_tokens = prompt_ids.len,
-            .prefilled_tokens = prefilled_tokens,
-            .allow_resident_greedy = allow_resident_greedy_token,
-            .capture_hidden = capture_last_hidden,
-            .selected_kv = config.kv_cache_mode == .select_v1,
-            .checkpoint = self.checkpoint_prepare != null or self.checkpoint_resume != null,
-            .has_draft = self.draft_cb != null,
-            .has_prompt_cache = self.prompt_cache != null,
-            .scheduler_peers = if (self.scheduler) |scheduler| scheduler.shouldCoordinateCurrentRequests() else false,
-            .execution_serialized = self.execution_lock != null,
-            .configured_chunk_rows = config.prefill_chunk_size,
-            .scheduler_chunk_rows = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
-            .speculative_k = config.speculative_k,
-            .sampled_ring_qualified = exact_hybrid_sampled_ring_qualification_override,
-        };
+        const request = self.promptRequest(config, seq_len, prompt_ids.len, prefilled_tokens, allow_resident_greedy_token, capture_last_hidden);
         const prompt_plan = try prompt_runtime.planPrompt(request);
         const exact_prefill_probe = prompt_plan.exact_repeat_probe;
         var exact_prefill_calls: usize = 0;
@@ -5170,19 +5153,47 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
+    fn promptRequest(self: *NativeGenerationPipeline, config: GenerationConfig, seq_len: usize, query_tokens: usize, prefilled_tokens: usize, allow_resident_greedy_token: bool, capture_last_hidden: bool) decoder_prefill.PromptRequest {
+        return .{
+            .route = decoderRouteRequest(config),
+            .prompt_tokens = seq_len,
+            .query_tokens = query_tokens,
+            .prefilled_tokens = prefilled_tokens,
+            .allow_resident_greedy = allow_resident_greedy_token,
+            .capture_hidden = capture_last_hidden,
+            .selected_kv = config.kv_cache_mode == .select_v1,
+            .checkpoint = self.checkpoint_prepare != null or self.checkpoint_resume != null,
+            .has_draft = self.draft_cb != null,
+            .has_prompt_cache = self.prompt_cache != null,
+            .scheduler_peers = if (self.scheduler) |scheduler| scheduler.shouldCoordinateCurrentRequests() else false,
+            .execution_serialized = self.execution_lock != null,
+            .configured_chunk_rows = config.prefill_chunk_size,
+            .scheduler_chunk_rows = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
+            .speculative_k = config.speculative_k,
+            .sampled_ring_qualified = exact_hybrid_sampled_ring_qualification_override,
+        };
+    }
+
     fn executePreparedMultimodalPrefill(
         self: *NativeGenerationPipeline,
         prepared: *gemma3_mm.PreparedPrompt,
         seq_len: usize,
         decode_state: *NativeDecodeState,
         capture_last_hidden: bool,
-        admitted_chunk_rows: usize,
+        config: GenerationConfig,
     ) !PrefillOutput {
         var numerical = self.prefillRuntime(decode_state, directPrefillExecutionMutex(true, false, false, self.execution_lock));
         var direct_prefill_turn_acquired = false;
         defer if (direct_prefill_turn_acquired) {
             self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
         };
+        const compiled_media = self.compiled_partition_backend == .metal and self.compiled_attachment_target == .whole_model and self.graph_cache != null;
+        var admitted_chunk_rows = config.prefill_chunk_size;
+        if (compiled_media) {
+            if (prepared.attn_or_mask != null or capture_last_hidden) return error.UnsupportedPreparedRows;
+            const plan = try numerical.prepareCompiledPrompt(self.promptRequest(config, seq_len, seq_len, 0, false, capture_last_hidden));
+            admitted_chunk_rows = @min(plan.chunk_rows, 512);
+        }
         try numerical.resetRecurrentPrompt();
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| {
@@ -5193,17 +5204,17 @@ pub const NativeGenerationPipeline = struct {
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| {
                 if (self.io == null) {
-                    try numerical.prepareWholePrompt(seq_len);
+                    if (!compiled_media) try numerical.prepareWholePrompt(seq_len);
                 } else {
                     try scheduler.awaitTurnControlled(lease, .prefill, self.io.?, self.execution_control);
                     direct_prefill_turn_acquired = true;
-                    try numerical.prepareWholePrompt(seq_len);
+                    if (!compiled_media) try numerical.prepareWholePrompt(seq_len);
                 }
             } else {
-                try numerical.prepareWholePrompt(seq_len);
+                if (!compiled_media) try numerical.prepareWholePrompt(seq_len);
             }
         } else {
-            try numerical.prepareWholePrompt(seq_len);
+            if (!compiled_media) try numerical.prepareWholePrompt(seq_len);
         }
 
         if (prepared.input_embeddings == null) return error.InvalidPreparedPrompt;

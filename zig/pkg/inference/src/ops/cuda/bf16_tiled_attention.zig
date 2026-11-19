@@ -20,7 +20,7 @@ const std = @import("std");
 const Context = @import("context.zig").CudaContext;
 const Buffer = @import("buffer.zig").DeviceBuffer;
 const Blas = @import("cublaslt.zig").CublasLt;
-const Module = @import("embedding_gemma2.zig").Module;
+const Module = @import("encoder_multimodal.zig").Module;
 const SourceRows = @import("../kernel_geometry.zig").SourceGemmRows;
 
 pub const tile_rows: usize = 1024;

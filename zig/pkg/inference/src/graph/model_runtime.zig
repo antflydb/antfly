@@ -113,6 +113,7 @@ pub const ModelRuntime = struct {
     pub fn supportsForwardRequest(self: *const ModelRuntime, request: ForwardRequest, operation: ForwardOperation) bool {
         switch (request) {
             .prefill => |prefill_request| {
+                if (prefill_request.prepared_rows != null and !self.capabilities().supports_prepared_rows) return false;
                 if (prefill_request.query_seq_len == 0 or prefill_request.input_ids.len != prefill_request.query_seq_len or prefill_request.query_seq_len > prefill_request.seq_len) return false;
             },
             .decode => {
@@ -212,6 +213,7 @@ pub const ModelRuntime = struct {
         request: PrefillRequest,
     ) !ModelOutput {
         try request.check();
+        if (request.prepared_rows != null and !self.capabilities().supports_prepared_rows) return error.UnsupportedPreparedRows;
         var hard_cancellation = if (request.execution_control) |control|
             try control.enterUninterruptible(self.capabilities().interruption)
         else
@@ -360,6 +362,7 @@ pub const ForwardOperation = enum { logits, greedy };
 
 pub const RuntimeCapabilities = struct {
     supports_decode: bool = false,
+    supports_prepared_rows: bool = false,
     supports_sample_decode: bool = false,
     supports_greedy_decode: bool = false,
     state_ownership: RuntimeStateOwnership = .host_assisted_inputs,
@@ -683,6 +686,9 @@ pub const PrefillRequest = struct {
     backend_operation: ?@import("../execution/backend_operation.zig").Borrowed = null,
     execution_control: ?InferenceExecutionControl = null,
     input_ids: []const i64,
+    /// Synchronous device-row borrow, already scaled by the model adapter.
+    /// IDs still carry PLE/position semantics. Providers explicitly opt in.
+    prepared_rows: ?@import("../execution/resident_rows.zig").Rows = null,
     seq_len: usize,
     query_seq_len: usize,
     attention_mode: cache_mod.AttentionMode,
@@ -699,6 +705,10 @@ pub const PrefillRequest = struct {
     prefer_greedy_token: bool = false,
 
     pub fn check(self: PrefillRequest) !void {
+        if (self.prepared_rows) |rows| {
+            if (self.input_ids.len != self.query_seq_len or self.query_seq_len > self.seq_len) return error.InvalidPreparedRows;
+            try rows.validateGeometry(self.query_seq_len, rows.width);
+        }
         if (self.execution_control) |control| try control.check();
     }
 };
@@ -1681,4 +1691,26 @@ test "model runtime preserves explicit KV-only prefill intent without logits" {
     defer output.deinit(std.testing.allocator);
     try std.testing.expect(output.logits == null and output.device_logits == null and output.prepared_tail == null);
     try std.testing.expectEqual(@as(usize, 1), calls);
+}
+
+test "prepared row input requires explicit provider capability before execution" {
+    const Probe = struct {
+        fn prefill(raw: *anyopaque, _: std.mem.Allocator, _: PrefillRequest) !ModelOutput {
+            const calls: *usize = @ptrCast(@alignCast(raw));
+            calls.* += 1;
+            return error.UnexpectedPreparedPrefill;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var calls: usize = 0;
+    var instance = ModelRuntime{ .ptr = &calls, .vtable = &.{ .prefill = Probe.prefill, .deinit = Probe.close } };
+    defer instance.deinit();
+    var source: ops.ComputeBackend = undefined;
+    const request = PrefillRequest{ .input_ids = &.{ 1, 2 }, .seq_len = 2, .query_seq_len = 2, .attention_mode = .paged_prefill, .prepared_rows = .{ .source = &source, .tensor = @ptrFromInt(16), .rows = 2, .width = 8 } };
+    try std.testing.expect(!instance.supportsForwardRequest(.{ .prefill = request }, .logits));
+    try std.testing.expectError(error.UnsupportedPreparedRows, instance.prefill(std.testing.allocator, request));
+    try std.testing.expectEqual(@as(usize, 0), calls);
+    var invalid = request;
+    invalid.prepared_rows.?.rows = 3;
+    try std.testing.expectError(error.InvalidPreparedRows, invalid.check());
 }

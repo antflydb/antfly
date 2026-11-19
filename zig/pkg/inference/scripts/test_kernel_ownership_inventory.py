@@ -35,12 +35,44 @@ class OwnershipInventoryTest(unittest.TestCase):
         (self.package / "program.cu").write_text('#include "leaf.cuh"\n// tile-codegen:begin projection.0 family (do not edit; run: test)\nabc\n// tile-codegen:end projection.0 family\n')
         self.inventory = {"schema": 1, "native_regions": [{"output": "program.cu", "owner": "tile_region", "family_region": "projection.0", **ownership.fingerprint(b"abc\n")} ]}
 
+    def test_shared_tile_dependencies_stay_inside_standard_library_package(self):
+        core = self.root / "zig/lib/tile/src"
+        core.mkdir(parents=True)
+        source = core / "operation.zig"
+        source.write_text('const std = @import("std"); const layout = @import("layout.zig");\n')
+        self.assertEqual(len(ownership.verify_shared_dependencies(self.root)), 1)
+        source.write_text('const model = @import("../../../pkg/inference/src/models/gpt.zig");\n')
+        with self.assertRaisesRegex(ValueError, "Tile core import escapes"):
+            ownership.verify(self.root, self.inventory)
+        source.write_text('const model = @import("inference_internal");\n')
+        with self.assertRaisesRegex(ValueError, "imports application module"):
+            ownership.verify(self.root, self.inventory)
+
+    def test_retained_cache_requires_recipe_instead_of_model_import(self):
+        cache = self.package / "src/ops/cuda/retained_execution_cache.zig"
+        cache.parent.mkdir(parents=True)
+        cache.write_text('const context = @import("context.zig"); const layout = @import("../kernel_geometry.zig"); const cleanup = @import("../../execution/cleanup_context.zig");\n')
+        self.assertEqual(len(ownership.verify_shared_dependencies(self.root)), 1)
+        for name in ("../../models/gpt.zig", "../../backends/embedding_gemma2_cuda.zig", "../../pipelines/generation.zig"):
+            cache.write_text('const model = @import("' + name + '");\n')
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "cache imports model/backend adapter"):
+                ownership.verify(self.root, self.inventory)
+
     def test_consumes_regions_and_retains_template_include(self):
         report = ownership.verify(self.root, self.inventory)
         self.assertEqual(report["verification"]["regions_and_files"], 1)
         canonical = report["verification"]["canonical_native"]
         self.assertEqual([row["classification"] for row in canonical], ["canonical_native_surrounds", "canonical_native_include"])
         self.assertEqual(canonical[1]["output"], "leaf.cuh")
+
+    def test_operation_bindings_accept_descriptors_but_reject_model_binding(self):
+        source = self.package / "src/ops/cuda/encoder_multimodal.zig"
+        source.parent.mkdir(parents=True)
+        source.write_text('const params = @import("../ops.zig"); const context = @import("context.zig");\n')
+        self.assertEqual(len(ownership.verify_shared_dependencies(self.root)), 1)
+        source.write_text('const config = @import("../../models/embedding_gemma2.zig");\n')
+        with self.assertRaisesRegex(ValueError, "imports model/backend adapter"):
+            ownership.verify_shared_dependencies(self.root)
 
     def test_shared_program_owner_is_a_verified_build_input(self):
         self.inventory["tile_source_inputs"] = ["leaf.cuh"]

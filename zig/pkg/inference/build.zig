@@ -1248,7 +1248,7 @@ pub fn build(b: *std.Build) void {
     global_attention_bench.root_module.linkSystemLibrary("pthread", .{});
     b.step("build-embeddinggemma2-global-bench", "Build isolated global MQA schedule benchmark").dependOn(&b.addInstallArtifact(global_attention_bench, .{}).step);
 
-    const global_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/test_embeddinggemma2_global.zig"), .target = target, .optimize = optimize }), .filters = &.{ "global MQA", "encoder replay invalidates", "embeddinggemma2 CUDA arithmetic", "embeddinggemma2 CUDA optimized identities" } });
+    const global_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/test_embeddinggemma2_global.zig"), .target = target, .optimize = optimize }), .filters = &.{ "global MQA", "encoder replay invalidates", "embeddinggemma2 execution cache", "embeddinggemma2 graph", "arena cold chronology", "CUDA retained cache purposes", "encoder logical", "encoder retained", "encoder whole PLE", "source vision fixed", "CUDA encoder graph refresh", "retained CUDA execution", "embeddinggemma2 CUDA arithmetic", "embeddinggemma2 CUDA optimized identities" } });
     var global_test_imports = global_attention_bench.root_module.import_table.iterator();
     while (global_test_imports.next()) |entry| global_tests.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
     global_tests.root_module.link_libc = true;

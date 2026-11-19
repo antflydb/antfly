@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const cuda_compute = @import("../ops/cuda/cuda_compute.zig");
-const eg2_module = @import("../ops/cuda/embedding_gemma2.zig");
+const eg2_module = @import("../ops/cuda/encoder_multimodal.zig");
 const buffer_mod = @import("../ops/cuda/buffer.zig");
 
 const CudaCompute = cuda_compute.CudaCompute;
@@ -170,7 +170,7 @@ pub const ResidentObjective = struct {
 
 pub fn run(compute: *CudaCompute, request: Request) !Result {
     try request.validate();
-    const module = try compute.embeddingGemma2Module();
+    const module = try compute.encoderMultimodalModule();
     const rows: usize = @as(usize, request.query_count) + request.candidate_count;
     const full_elements = try mul(rows, 768);
     const largest_width: usize = request.dimensions[request.dimensions.len - 1];
