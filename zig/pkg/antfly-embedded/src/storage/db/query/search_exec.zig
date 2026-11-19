@@ -9466,6 +9466,42 @@ const GraphOrdinalBatch = struct {
     }
 };
 
+pub const IndexedClauseCache = struct { memory: *IndexedClauseMembership, alloc: Allocator, budget: ?*WorkBudget };
+
+pub const IndexedClauseMembership = struct {
+    entries: std.StringHashMapUnmanaged(roaring.RoaringBitmap) = .empty,
+    bytes: usize = 0,
+    const max_bytes = 4 * 1024 * 1024;
+
+    pub fn deinit(self: *@This(), alloc: Allocator, budget: ?*WorkBudget) void {
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            entry.value_ptr.deinit();
+        }
+        self.entries.deinit(alloc);
+        if (budget) |work| work.releaseStateBytes(self.bytes);
+    }
+
+    fn put(self: *@This(), alloc: Allocator, budget: ?*WorkBudget, key: []const u8, rows: *const roaring.RoaringBitmap) void {
+        const bytes = key.len +| rows.cloneStorageBound() +| (3 * @sizeOf(roaring.RoaringBitmap));
+        if (bytes > max_bytes - self.bytes or self.entries.contains(key)) return;
+        if (budget) |work| {
+            if (bytes > work.max_retained_state_bytes -| work.retained_state_bytes) return;
+            work.retainStateBytes(bytes) catch return;
+        }
+        var retained = false;
+        defer if (!retained) if (budget) |work| work.releaseStateBytes(bytes);
+        const owned = alloc.dupe(u8, key) catch return;
+        defer if (!retained) alloc.free(owned);
+        var bitmap = rows.cloneExact(alloc) catch return;
+        defer if (!retained) bitmap.deinit();
+        self.entries.put(alloc, owned, bitmap) catch return;
+        self.bytes += bytes;
+        retained = true;
+    }
+};
+
 const IndexedPredicateEvaluator = struct {
     snapshot: *index_mod.IndexSnapshot,
     analysis: introducer_mod.TextAnalysisConfig,
@@ -9477,6 +9513,10 @@ const IndexedPredicateEvaluator = struct {
     budget: ?*WorkBudget = null,
     cache_prefix: []const u8,
     frontier: ?std.AutoHashMapUnmanaged(doc_set.DocOrdinal, []const u8) = null,
+    missing_rows: ?*roaring.RoaringBitmap = null,
+    local_cache: ?LocalCache = null,
+
+    const LocalCache = IndexedClauseCache;
 
     fn indexed(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery) !bool {
         return searchQueryCanUseSnapshotWithControl(self.snapshot, query, self.analysis, self.schema, false, self.control);
@@ -9492,6 +9532,9 @@ const IndexedPredicateEvaluator = struct {
     fn executeIndexedClause(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: ?*const roaring.RoaringBitmap, path: []const u8) !roaring.RoaringBitmap {
         if (scope) |domain| if (domain.cardinality() == 0) return roaring.RoaringBitmap.init(self.alloc);
         const key = try std.fmt.allocPrint(self.scratch, "clause:{d}:{s}:{s}", .{ self.cache_prefix.len, self.cache_prefix, path });
+        if (self.local_cache) |local| {
+            if (local.memory.entries.getPtr(key)) |rows| return self.copyMembership(rows, scope);
+        }
         const cache = &self.snapshot.graph_predicates;
         if (try cache.getScoped(self.alloc, key, self.control, scope)) |rows| return rows;
         const flight = try cache.lockFlight(key, self.control);
@@ -9499,11 +9542,22 @@ const IndexedPredicateEvaluator = struct {
         if (try cache.getScoped(self.alloc, key, self.control, scope)) |rows| return rows;
         var all = try self.executeIndexed(query);
         cache.put(self.snapshot.alloc, key, &all);
-        const domain = scope orelse return all;
+        if (self.local_cache) |local| local.memory.put(local.alloc, local.budget, key, &all);
+        if (scope == null) return all;
         defer all.deinit();
-        var rows = try domain.clone(self.alloc);
-        rows.andWith(&all);
-        return rows;
+        return self.copyMembership(&all, scope);
+    }
+
+    fn copyMembership(self: IndexedPredicateEvaluator, source: *const roaring.RoaringBitmap, scope: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        const domain = scope orelse return source.cloneExact(self.alloc);
+        var result = roaring.RoaringBitmap.init(self.alloc);
+        errdefer result.deinit();
+        var ids = domain.iterator();
+        while (ids.next()) |id| {
+            try self.control.check();
+            if (source.contains(id)) try result.add(id);
+        }
+        return result;
     }
 
     fn initialScope(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery) !roaring.RoaringBitmap {
@@ -9513,8 +9567,27 @@ const IndexedPredicateEvaluator = struct {
                 if (try self.indexed(child)) try required.append(self.scratch, child);
             }
             if (required.items.len != 0) return self.executeIndexedClause(.{ .bool_query = .{ .must = required.items } }, null, "/g0");
+            const minimum = requiredShould(query.bool_query);
+            if (try self.indexedShouldGate(query.bool_query.should, minimum)) |gate|
+                return self.executeIndexedClause(gate, null, "/t0");
         }
         return self.executeIndexedClause(.{ .match_all = {} }, null, "/universe");
+    }
+
+    fn requiredShould(boolean: search_mod.BoolQuery) u32 {
+        return if (boolean.should.len != 0 and boolean.must.len == 0 and !boolean.pure_should_optional)
+            @max(@as(u32, 1), boolean.min_should)
+        else
+            boolean.min_should;
+    }
+
+    fn indexedShouldGate(self: IndexedPredicateEvaluator, clauses: []const search_mod.SearchQuery, required: u32) !?search_mod.SearchQuery {
+        if (required == 0) return null;
+        var native: std.ArrayListUnmanaged(search_mod.SearchQuery) = .empty;
+        for (clauses) |clause| if (try self.indexed(clause)) try native.append(self.scratch, clause);
+        const residual = clauses.len - native.items.len;
+        if (required <= residual) return null;
+        return .{ .bool_query = .{ .should = native.items, .min_should = required - @as(u32, @intCast(residual)) } };
     }
 
     const Clause = struct {
@@ -9564,16 +9637,19 @@ const IndexedPredicateEvaluator = struct {
             if (result == null) result = try scope.clone(self.alloc);
             result.?.andNotWith(&excluded);
         }
+        const required_should = requiredShould(boolean);
+        const gate = try self.indexedShouldGate(boolean.should, required_should);
+        if (gate) |indexed_gate| {
+            const narrowed = try self.executeIndexedClause(indexed_gate, if (result) |*rows| rows else scope, try self.clausePath(path, 't', 0));
+            if (result) |*rows| rows.deinit();
+            result = narrowed;
+        }
         for (residual_must.items) |clause| {
             const next = try self.execute(clause.query, if (result) |*rows| rows else scope, clause.path);
             if (result) |*rows| rows.deinit();
             result = next;
         }
-        const required_should = if (boolean.should.len != 0 and boolean.must.len == 0 and !boolean.pure_should_optional)
-            @max(@as(u32, 1), boolean.min_should)
-        else
-            boolean.min_should;
-        if (required_should != 0) {
+        if (required_should != 0 and (gate == null or gate.?.bool_query.should.len != boolean.should.len)) {
             const matched = try self.executeShould(boolean.should, required_should, if (result) |*rows| rows else scope, path);
             if (result) |*rows| rows.deinit();
             result = matched;
@@ -9688,10 +9764,14 @@ const IndexedPredicateEvaluator = struct {
             var frontier_keys: [64][]const u8 = undefined;
             var ordinals: [64]doc_set.DocOrdinal = undefined;
             var count: usize = 0;
-            while (count < ordinals.len) : (count += 1) {
+            while (count < ordinals.len) {
                 const ordinal = docs.next() orelse break;
+                if (self.missing_rows) |missing| {
+                    if (missing.contains(ordinal)) continue;
+                }
                 ordinals[count] = ordinal;
                 if (self.frontier) |frontier| frontier_keys[count] = frontier.get(ordinal) orelse return error.InvalidData;
+                count += 1;
             }
             if (count == 0) break;
             if (self.budget) |budget| try budget.consumeAnchors(count);
@@ -9708,7 +9788,11 @@ const IndexedPredicateEvaluator = struct {
             if (stored.len != count) return error.InvalidData;
             for (keys, ordinals[0..count], stored) |key, ordinal, raw| {
                 try self.control.check();
-                const value = raw orelse return error.StorageReadTemporarilyUnavailable;
+                const value = raw orelse {
+                    const missing = self.missing_rows orelse return error.StorageReadTemporarilyUnavailable;
+                    try missing.add(ordinal);
+                    continue;
+                };
                 if (try predicate.matchesStored(scratch, key, value)) try matches.add(ordinal);
             }
         }
@@ -9772,6 +9856,7 @@ pub fn graphIndexedPredicateAlloc(
     frontier: ?GraphPredicateFrontier,
     budget: *WorkBudget,
     frontier_scoped: *bool,
+    local_cache: ?IndexedClauseCache,
 ) !doc_set.ResolvedDocSet {
     const control = query_mod.ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
     try control.check();
@@ -9810,6 +9895,7 @@ pub fn graphIndexedPredicateAlloc(
         .scratch = scratch,
         .budget = budget,
         .cache_prefix = key,
+        .local_cache = local_cache,
     };
     const fully_indexed = try matcher.indexed(search_query);
     // Only immutable index membership can be cached on the text snapshot.
@@ -9899,6 +9985,8 @@ fn collectMixedStructuredFilterAlloc(
         deletions.update(std.mem.asBytes(&revision));
     }
     const cache_prefix = try std.fmt.allocPrint(scratch, "{d}:{d}:{d}:{d}:{s}", .{ entry.instance_id, entry.projection_revision, executor.identity_read_generation orelse 0, deletions.final(), filter_json });
+    var missing_rows = roaring.RoaringBitmap.init(alloc);
+    defer missing_rows.deinit();
     const matcher = IndexedPredicateEvaluator{
         .snapshot = snapshot,
         .analysis = entry.text_analysis,
@@ -9909,17 +9997,14 @@ fn collectMixedStructuredFilterAlloc(
         .scratch = scratch,
         .budget = req.graph_work_budget,
         .cache_prefix = cache_prefix,
+        .missing_rows = &missing_rows,
     };
     var domain = try matcher.initialScope(query);
     defer domain.deinit();
-    if (req.authorization_filter_query_json.len != 0) {
-        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, req.authorization_filter_query_json, .{});
-        const auth = try patternFilterValueToSearchQuery(scratch, parsed, entry.text_analysis, entry.runtime_schema);
-        if (!(try matcher.indexed(auth))) return error.UnsupportedQueryRequest;
-        var allowed = try matcher.executeIndexed(auth);
-        defer allowed.deinit();
-        domain.andWith(&allowed);
-    }
+    const candidate = doc_set.ResolvedDocSet{ .ordinal_bitmap = domain };
+    var visible = try executor.live_filter_doc_set.?(executor.ctx, alloc, &candidate, executor.identity_read_generation);
+    defer visible.deinit(alloc);
+    try restrictMixedFilterScope(matcher, &domain, &visible, true);
     if (resolvedDocFilterFromRequest(req)) |prior| {
         try restrictMixedFilterScope(matcher, &domain, &prior.include, true);
         try restrictMixedFilterScope(matcher, &domain, &prior.exclude, false);
@@ -9932,19 +10017,27 @@ fn collectMixedStructuredFilterAlloc(
         const exclude = doc_set.ResolvedDocSet{ .doc_keys = req.exclude_doc_ids };
         try restrictMixedFilterScope(matcher, &domain, &exclude, false);
     }
-    const candidate = doc_set.ResolvedDocSet{ .ordinal_bitmap = domain };
-    var visible = try executor.live_filter_doc_set.?(executor.ctx, alloc, &candidate, executor.identity_read_generation);
-    defer visible.deinit(alloc);
-    try restrictMixedFilterScope(matcher, &domain, &visible, true);
     if (req.filter_prefix.len != 0 or req.native_key_predicate != null) {
-        var authorized = try authorizedMixedKeyScope(matcher, req, &domain);
+        var authorized = try authorizedMixedKeyScope(matcher, req, &domain, null);
         defer authorized.deinit();
         domain.andWith(&authorized);
     }
-    return .{ .ordinal_bitmap = try matcher.execute(query, &domain, "") };
+    if (req.authorization_filter_query_json.len != 0) {
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, req.authorization_filter_query_json, .{});
+        const auth = try patternFilterValueToSearchQuery(scratch, parsed, entry.text_analysis, entry.runtime_schema);
+        var policy_matcher = matcher;
+        policy_matcher.cache_prefix = try std.fmt.allocPrint(scratch, "authorization:{d}:{s}:{s}", .{ cache_prefix.len, cache_prefix, req.authorization_filter_query_json });
+        var allowed = try policy_matcher.execute(auth, &domain, "");
+        defer allowed.deinit();
+        domain.andWith(&allowed);
+        domain.andNotWith(&missing_rows);
+    }
+    var result = try matcher.execute(query, &domain, "");
+    result.andNotWith(&missing_rows);
+    return .{ .ordinal_bitmap = result };
 }
 
-fn authorizedMixedKeyScope(matcher: IndexedPredicateEvaluator, req: types.SearchRequest, domain: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+fn authorizedMixedKeyScope(matcher: IndexedPredicateEvaluator, req: types.SearchRequest, domain: *const roaring.RoaringBitmap, wanted: ?*const std.StringHashMapUnmanaged(void)) !roaring.RoaringBitmap {
     const resolve = matcher.executor.resolve_doc_set_doc_ids orelse return error.UnsupportedQueryRequest;
     const key_filter = if (req.native_key_predicate) |*filter| filter.receiver() else null;
     var allowed = roaring.RoaringBitmap.init(matcher.alloc);
@@ -9971,7 +10064,7 @@ fn authorizedMixedKeyScope(matcher: IndexedPredicateEvaluator, req: types.Search
             }
         }
         for (keys, ordinals[0..count], key_allowed[0..count]) |key, ordinal, keep| {
-            if (keep and std.mem.startsWith(u8, key, req.filter_prefix)) try allowed.add(ordinal);
+            if (keep and std.mem.startsWith(u8, key, req.filter_prefix) and (wanted == null or wanted.?.contains(key))) try allowed.add(ordinal);
         }
     }
     return allowed;
@@ -9989,7 +10082,15 @@ fn restrictMixedFilterScope(matcher: IndexedPredicateEvaluator, domain: *roaring
         const resolve = matcher.executor.resolve_doc_ids_to_doc_set orelse return error.UnsupportedQueryRequest;
         var resolved = try resolve(matcher.executor.ctx, matcher.alloc, set.doc_keys, matcher.executor.identity_read_generation);
         defer resolved.deinit(matcher.alloc);
-        if (resolved == .doc_keys) return error.UnsupportedQueryRequest;
+        if (resolved == .doc_keys) {
+            var wanted: std.StringHashMapUnmanaged(void) = .empty;
+            defer wanted.deinit(matcher.alloc);
+            for (resolved.doc_keys) |key| try wanted.put(matcher.alloc, key, {});
+            var matched = try authorizedMixedKeyScope(matcher, .{}, domain, &wanted);
+            defer matched.deinit();
+            if (keep_matches) domain.andWith(&matched) else domain.andNotWith(&matched);
+            return;
+        }
         return restrictMixedFilterScope(matcher, domain, &resolved, keep_matches);
     }
     if (set.* == .ordinal_bitmap) {

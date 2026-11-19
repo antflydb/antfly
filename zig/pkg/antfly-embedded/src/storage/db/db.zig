@@ -49245,10 +49245,10 @@ pub const DB = struct {
     /// Stored-document matching cannot reproduce an index's analyzer. Preserve
     /// any pre-resolved row authorization when intersecting the new predicate.
     fn graphRequestWithIndexedFilterAlloc(self: *DB, req: types.SearchRequest) !AlgebraicDocFilterRequest {
-        return self.graphRequestWithIndexedFilterForKeysAlloc(req, null);
+        return self.graphRequestWithIndexedFilterForKeysAlloc(req, null, null);
     }
 
-    fn graphRequestWithIndexedFilterForKeysAlloc(self: *DB, req: types.SearchRequest, keys: ?[]const []const u8) !AlgebraicDocFilterRequest {
+    fn graphRequestWithIndexedFilterForKeysAlloc(self: *DB, req: types.SearchRequest, keys: ?[]const []const u8, clause_cache: ?db_query_search.IndexedClauseCache) !AlgebraicDocFilterRequest {
         var needs_index = false;
         for ([_][]const u8{ req.filter_query_json, req.exclusion_query_json }) |json| {
             if (json.len == 0) continue;
@@ -49264,7 +49264,7 @@ pub const DB = struct {
         memory.tracked = .{ .backing = self.alloc, .budget = req.graph_work_budget orelse &memory.local_budget };
         var native = AlgebraicDocFilterRequest{ .req = req, .graph_memory = memory, .graph_memory_alloc = self.alloc };
         errdefer native.deinit();
-        self.prepareGraphIndexedFilter(&native, req, keys) catch |err| return if (err == error.OutOfMemory and memory.tracked.denied) error.GraphWorkBudgetExceeded else err;
+        self.prepareGraphIndexedFilter(&native, req, keys, clause_cache) catch |err| return if (err == error.OutOfMemory and memory.tracked.denied) error.GraphWorkBudgetExceeded else err;
         return native;
     }
 
@@ -49328,7 +49328,7 @@ pub const DB = struct {
         return .{ .ordinal_bitmap = bitmap };
     }
 
-    fn prepareGraphIndexedFilter(self: *DB, native: *AlgebraicDocFilterRequest, req: types.SearchRequest, keys: ?[]const []const u8) !void {
+    fn prepareGraphIndexedFilter(self: *DB, native: *AlgebraicDocFilterRequest, req: types.SearchRequest, keys: ?[]const []const u8, clause_cache: ?db_query_search.IndexedClauseCache) !void {
         const a = native.graph_memory.?.tracked.allocator();
         const filter = try a.create(doc_set.ResolvedDocFilter);
         filter.* = .{};
@@ -49346,7 +49346,7 @@ pub const DB = struct {
         const budget = native.graph_memory.?.tracked.budget.?;
         var residual_exclusion = false;
         if (req.exclusion_query_json.len > 0) {
-            filter.exclude = db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json, null, budget, &native.frontier_scoped) catch |err| switch (err) {
+            filter.exclude = db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json, null, budget, &native.frontier_scoped, clause_cache) catch |err| switch (err) {
                 error.GraphResidualFrontierRequired => pending: {
                     residual_exclusion = true;
                     break :pending .none;
@@ -49354,8 +49354,8 @@ pub const DB = struct {
                 else => return err,
             };
         }
-        if (req.filter_query_json.len > 0) filter.include = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.filter_query_json, frontier, budget, &native.frontier_scoped);
-        if (residual_exclusion) filter.exclude = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json, frontier, budget, &native.frontier_scoped);
+        if (req.filter_query_json.len > 0) filter.include = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.filter_query_json, frontier, budget, &native.frontier_scoped, clause_cache);
+        if (residual_exclusion) filter.exclude = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json, frontier, budget, &native.frontier_scoped, clause_cache);
         if (req.resolved_doc_filter) |raw| {
             const prior: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(raw));
             var prior_include = if (prior.include == .doc_keys) try self.graphPriorKeyOrdinalsAlloc(a, prior.include.doc_keys, req.identity_read_generation) else null;
@@ -49382,7 +49382,7 @@ pub const DB = struct {
         original_req: types.SearchRequest,
         keys: []const []const u8,
     ) !GraphKeyAdmission {
-        var indexed_filter = try self.graphRequestWithIndexedFilterForKeysAlloc(original_req, keys);
+        var indexed_filter = try self.graphRequestWithIndexedFilterForKeysAlloc(original_req, keys, null);
         defer indexed_filter.deinit();
         const req = indexed_filter.req;
         const ordinals = try self.lookupLiveDocOrdinalsNoLock(
@@ -49514,6 +49514,7 @@ pub const DB = struct {
         indexed_node_filter: ?AlgebraicDocFilterRequest = null,
         indexed_request_filter: ?AlgebraicDocFilterRequest = null,
         decisions: std.StringHashMapUnmanaged(bool) = .empty,
+        clause_membership: db_query_search.IndexedClauseMembership = .{},
 
         fn init(
             db: *DB,
@@ -49539,6 +49540,7 @@ pub const DB = struct {
             var it = self.decisions.keyIterator();
             while (it.next()) |key| self.alloc.free(key.*);
             self.decisions.deinit(self.alloc);
+            self.clause_membership.deinit(self.alloc, self.req.graph_work_budget);
             self.prepared_filters.deinit();
             if (self.indexed_node_filter) |*filter| filter.deinit();
             if (self.indexed_request_filter) |*filter| filter.deinit();
@@ -49587,10 +49589,11 @@ pub const DB = struct {
             }
 
             if (missing_keys.items.len > 0) {
+                const clause_cache: db_query_search.IndexedClauseCache = .{ .memory = &self.clause_membership, .alloc = self.alloc, .budget = self.req.graph_work_budget };
                 var scoped_request: ?AlgebraicDocFilterRequest = null;
                 defer if (scoped_request) |*entry| entry.deinit();
                 if (self.indexed_request_filter == null) {
-                    const prepared = try self.db.graphRequestWithIndexedFilterForKeysAlloc(self.req, missing_keys.items);
+                    const prepared = try self.db.graphRequestWithIndexedFilterForKeysAlloc(self.req, missing_keys.items, clause_cache);
                     if (prepared.frontier_scoped) scoped_request = prepared else self.indexed_request_filter = prepared;
                 }
                 const request_filter = if (scoped_request) |*entry| entry else &self.indexed_request_filter.?;
@@ -49618,7 +49621,7 @@ pub const DB = struct {
                             filter_req.filter_query_json = filter_query_json;
                             filter_req.exclusion_query_json = "";
                             filter_req.resolved_doc_filter = null;
-                            const prepared = try self.db.graphRequestWithIndexedFilterForKeysAlloc(filter_req, query_keys.items);
+                            const prepared = try self.db.graphRequestWithIndexedFilterForKeysAlloc(filter_req, query_keys.items, clause_cache);
                             if (prepared.frontier_scoped) scoped_node = prepared else self.indexed_node_filter = prepared;
                         }
                         const node_filter = if (scoped_node) |*entry| entry else &self.indexed_node_filter.?;
@@ -156385,26 +156388,45 @@ test "db optional numeric range filters lexical and dense candidates on fresh an
         const text_index = if (evolved) blk: {
             try db.batch(.{ .writes = &writes, .sync_level = .full_index });
             try db.setSchemaJson(a, schema);
-            // Public schema evolution publishes a replacement text generation.
-            try db.addIndex(.{ .name = "ft_v2", .kind = .full_text, .config_json = "{}" });
-            break :blk "ft_v2";
+            // Publish the new schema's text projection through the managed
+            // generation builder, including untouched rows of the old epoch.
+            const cfg: types.IndexConfig = .{ .name = "full_text_index_v2", .kind = .full_text, .config_json = "{}" };
+            const repair_id = (try db.admitManagedFullTextIndex(cfg)) orelse return error.TestUnexpectedResult;
+            var published = false;
+            for (0..32) |_| {
+                const step = try db.advanceIndexRepairIntent(a, repair_id, repair_completion_test_options);
+                if (step.repaired) {
+                    published = true;
+                    break;
+                }
+                if (!try db.hasPendingIndexRepairIntents(a) and !db.core.index_manager.repairUnavailable(cfg.name)) {
+                    published = true;
+                    break;
+                }
+                try std.testing.expect(!step.terminal);
+            }
+            try std.testing.expect(published);
+            break :blk cfg.name;
         } else "ft";
+        var updated: std.ArrayList(types.BatchWrite) = .empty;
         for (&writes, 0..) |*write, i| {
             const bucket = (i / 4) % 10;
-            const fields = if (bucket == 9)
+            if (evolved and bucket == 9) continue;
+            const fields = if (bucket == 8)
                 ",\"size\":99"
             else
                 try std.fmt.allocPrint(scratch, ",\"retention_years\":{d}", .{5 + bucket});
             write.value = try std.fmt.allocPrint(scratch, "{s}{s}}}", .{ write.value[0 .. write.value.len - 1], fields });
+            try updated.append(scratch, write.*);
         }
         var offset: usize = 0;
-        while (offset < writes.len) : (offset += 128) {
-            try db.batch(.{ .writes = writes[offset..][0..128], .sync_level = .full_index });
+        while (offset < updated.items.len) : (offset += 128) {
+            try db.batch(.{ .writes = updated.items[offset..][0..@min(128, updated.items.len - offset)], .sync_level = .full_index });
         }
 
         for ([_]struct { field: []const u8, value: u32, bucket: ?usize }{
             .{ .field = "retention_years", .value = 6, .bucket = 1 },
-            .{ .field = "size", .value = 99, .bucket = 9 },
+            .{ .field = "size", .value = 99, .bucket = 8 },
             .{ .field = "retention_years", .value = 99, .bucket = null },
         }) |case| {
             const authorization = "{\"term\":{\"tenant\":\"archive\"}}";
@@ -156551,6 +156573,39 @@ test "optional numeric range graph admission preserves legacy indexed predicates
         }
     }
 
+    const match_mast = "{\"match\":{\"field\":\"body\",\"text\":\"mast\"}}";
+    const selective_should = "{\"bool\":{\"must\":[" ++ range ++ "],\"should\":[" ++ match_mast ++ "],\"minimum_should_match\":1}}";
+    var policy_result = try db.search(a, .{
+        .index_name = "ft",
+        .limit = 3,
+        .include_stored = false,
+        .full_text = .{ .match = .{ .field = "body", .text = "beacon" } },
+        .filter_query_json = conjunction,
+        .authorization_filter_query_json = range,
+        .filter_doc_ids = &.{ "missing", "b" },
+        .exclude_doc_ids = &.{"also-missing"},
+    });
+    defer policy_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), policy_result.hits.len);
+    try std.testing.expectEqualStrings("b", policy_result.hits[0].id);
+
+    var wide: std.ArrayList(u8) = .empty;
+    defer wide.deinit(a);
+    try wide.appendSlice(a, "{\"disjuncts\":[");
+    for (0..17) |_| try wide.appendSlice(a, "{\"match\":{\"field\":\"body\",\"text\":\"unmatched\"}},");
+    try wide.appendSlice(a, range ++ "]}");
+    var wide_gate = DB.GraphNodeAdmissionCache.init(&db, a, .{ .index_name = "ft", .filter_query_json = wide.items }, "ft", .{});
+    defer wide_gate.deinit();
+    const wide_one = try wide_gate.iface().filterKeysAlloc(a, &.{"b"}, false);
+    defer a.free(wide_one);
+    try std.testing.expect(wide_one[0]);
+    try std.testing.expectEqual(@as(usize, 17), wide_gate.clause_membership.entries.count());
+    const misses = snapshot.graph_predicates.misses;
+    const wide_two = try wide_gate.iface().filterKeysAlloc(a, &.{"c"}, false);
+    defer a.free(wide_two);
+    try std.testing.expect(wide_two[0]);
+    try std.testing.expectEqual(misses + 1, snapshot.graph_predicates.misses);
+
     var budget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(.{ .max_scanned_anchors = 1 });
     var admission = DB.GraphNodeAdmissionCache.init(&db, a, .{
         .index_name = "ft",
@@ -156592,6 +156647,21 @@ test "optional numeric range graph admission preserves legacy indexed predicates
     }, &.{"a"});
     defer a.free(decided);
     try std.testing.expectEqualSlices(bool, &.{true}, decided);
+
+    var ordinary = try db.search(a, .{
+        .index_name = "ft",
+        .limit = 3,
+        .include_stored = false,
+        .full_text = .{ .match = .{ .field = "body", .text = "beacon" } },
+        .filter_query_json = conjunction,
+    });
+    defer ordinary.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ordinary.hits.len);
+    try std.testing.expectEqualStrings("b", ordinary.hits[0].id);
+
+    const should_pruned = try db.filterGraphKeysAlloc(a, .{ .index_name = "ft", .filter_query_json = selective_should }, &.{ "a", "c" });
+    defer a.free(should_pruned);
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, should_pruned);
 
     const bounded = try db.filterGraphKeysAlloc(a, .{ .index_name = "ft", .filter_query_json = conjunction }, &.{"b"});
     defer a.free(bounded);
