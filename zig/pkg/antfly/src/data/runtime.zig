@@ -46070,6 +46070,30 @@ fn consumerTests() type {
                     }
                 };
                 try HostedAdmission.run(a, base, catalog, try origin.distributedReadExecutor(), root, secret);
+                const PageInput = @import("../api/history_page_operations.zig").Request;
+                var qualified_input: PageInput = .{
+                    .version = 1,
+                    .request = .{ .reference = ref, .after = .{}, .now_seconds = 100, .include_completion = true },
+                };
+                var found_completion = false;
+                for (0..64) |_| {
+                    var qualified_page = origin.historyPagePort().read(a, route.fence().?, "docs", qualified_input, .{}) catch |err| {
+                        std.debug.print("coordinated frame proof read after sequence {d} failed: {s}\n", .{ qualified_input.request.after.sequence, @errorName(err) });
+                        return err;
+                    };
+                    defer qualified_page.deinit();
+                    const header = qualified_page.header orelse break;
+                    if (std.mem.eql(u8, &header.transaction_id, &@as([16]u8, @splat(115)))) {
+                        try std.testing.expectEqual(.coordinated, header.transaction_scope);
+                        const completion = qualified_page.completion orelse return error.TestUnexpectedResult;
+                        try std.testing.expectEqual(@as(u64, 3001), completion.commit_version);
+                        found_completion = true;
+                        break;
+                    }
+                    qualified_input.request.after = qualified_page.next;
+                }
+                try std.testing.expect(found_completion);
+
                 try SourcePlanHttpFixture.run(a, server, origin, try origin.distributedReadExecutor(), base, secret, route.fence().?, current_owner);
             }
             const rejected = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 99 } });
