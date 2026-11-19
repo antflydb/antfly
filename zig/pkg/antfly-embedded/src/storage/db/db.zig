@@ -3236,6 +3236,9 @@ pub const DB = struct {
     context_notice_dispatcher: ?context_dependency_db.Dispatcher = null,
     /// Set when a replicated inbox append applied; cleared once drained.
     context_inbox_pending: std.atomic.Value(bool) = .init(false),
+    /// Durable rebuild intents may await journaling (always assumed after
+    /// open, until a drain finds none).
+    context_rebuild_intents_pending: std.atomic.Value(bool) = .init(true),
     /// Distributed hosts: reader over the host's routed read source.
     context_remote_reader: ?*@import("context_source_db_reader.zig").RemoteReader = null,
     context_topology_source: ?@import("context_host_json.zig").Topology = null,
@@ -10450,6 +10453,11 @@ pub const DB = struct {
             self.setContextReplication(config.replication);
             try self.reloadContextTopology();
             self.core.index_manager.context_drain = .{ .ptr = self, .drain_fn = drainContextHook };
+            // Recover rebuilds whose plan committed before a crash. A failure
+            // keeps the intents; the next applied command retries.
+            if (!openModeRequiresReadOnlyBackends(self.open_mode)) self.drainContextRebuildIntents() catch |err| {
+                std.log.warn("context rebuild intent recovery deferred: {s}", .{@errorName(err)});
+            };
             return;
         }
         try self.setContextDependencyHost(config.table_id, config.inbound, reader, config.dispatcher);
@@ -10659,6 +10667,57 @@ pub const DB = struct {
         const invalidated = summary.invalidated;
         try self.journalContextRebuilds(&summary);
         return invalidated;
+    }
+
+    /// Journal every durable rebuild intent, then delete the intents. A crash
+    /// after journaling but before deletion only repeats a rebuild; a crash
+    /// or failure before journaling leaves the intents for the next drain.
+    fn drainContextRebuildIntents(self: *DB) !void {
+        const command_mod = @import("enrichment/context_dependency_command.zig");
+        self.context_rebuild_intents_pending.store(true, .release);
+        while (true) {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const Collect = struct {
+                a: Allocator,
+                keys: std.ArrayListUnmanaged([]const u8) = .empty,
+                values: std.ArrayListUnmanaged([]const u8) = .empty,
+                fn visit(p: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
+                    const c: *@This() = @ptrCast(@alignCast(p));
+                    try c.keys.append(c.a, try c.a.dupe(u8, key));
+                    try c.values.append(c.a, try c.a.dupe(u8, value));
+                    return c.keys.items.len < 1024;
+                }
+            };
+            var collect = Collect{ .a = a };
+            {
+                var reader = try context_dependency_db.StoreReader.init(self.core.store);
+                defer reader.deinit();
+                const prefix = context_dependency_store.familyPrefix(command_mod.rebuild_family);
+                try reader.reader().scanPrefix(a, &prefix, .{ .ptr = &collect, .visit_fn = Collect.visit });
+            }
+            if (collect.keys.items.len == 0) break;
+            var refs = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef).empty;
+            errdefer {
+                for (refs.items) |ref| enrichment_types.freeGeneratedRef(self.alloc, ref);
+                refs.deinit(self.alloc);
+            }
+            for (collect.values.items) |value| {
+                const decoded = try command_mod.decodeRebuildIntentAlloc(a, value);
+                const ref = try enrichment_types.cloneGeneratedRef(self.alloc, .{ .kind = .asset, .index_name = decoded.artifact, .artifact_name = decoded.artifact, .doc_key = decoded.doc_key });
+                refs.append(self.alloc, ref) catch |err| {
+                    enrichment_types.freeGeneratedRef(self.alloc, ref);
+                    return err;
+                };
+            }
+            var summary = context_dependency_db.ApplySummary{ .rebuild_refs = try refs.toOwnedSlice(self.alloc) };
+            defer summary.deinit(self.alloc);
+            try self.journalContextRebuilds(&summary);
+            try self.core.store.putBatch(&.{}, collect.keys.items);
+            if (collect.keys.items.len < 1024) break;
+        }
+        self.context_rebuild_intents_pending.store(false, .release);
     }
 
     fn journalContextRebuilds(self: *DB, summary: *context_dependency_db.ApplySummary) !void {
@@ -28691,30 +28750,13 @@ pub const DB = struct {
     fn afterContextDependencyApplied(self: *DB, command: @import("enrichment/context_dependency_command.zig").Command) !void {
         // Delivered notices are processed by the group leader's drain.
         if (command.isInbox()) self.signalContextInbox();
-        if (command.rebuilds.len != 0) {
-            // Journal rebuilds only now that the invalidation they follow
-            // has landed, so they observe the stale dependency state.
-            const command_mod = @import("enrichment/context_dependency_command.zig");
-            var arena = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena.deinit();
-            const a = arena.allocator();
-            var refs = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef).empty;
-            errdefer {
-                for (refs.items) |ref| enrichment_types.freeGeneratedRef(self.alloc, ref);
-                refs.deinit(self.alloc);
-            }
-            for (command.rebuilds) |rebuild| {
-                const decoded = try command_mod.decodeRebuildAlloc(a, rebuild);
-                const ref = try enrichment_types.cloneGeneratedRef(self.alloc, .{ .kind = .asset, .index_name = decoded.artifact, .artifact_name = decoded.artifact, .doc_key = decoded.doc_key });
-                refs.append(self.alloc, ref) catch |err| {
-                    enrichment_types.freeGeneratedRef(self.alloc, ref);
-                    return err;
-                };
-            }
-            var summary = context_dependency_db.ApplySummary{ .rebuild_refs = try refs.toOwnedSlice(self.alloc) };
-            defer summary.deinit(self.alloc);
-            try self.journalContextRebuilds(&summary);
-        }
+        // The plan's rebuild intents committed with its receipt. Journal
+        // them now (and any left by a crash or a failed earlier append).
+        // The entry already committed, so a journaling failure must not fail
+        // the apply: the intents stay durable and the next apply retries.
+        if (command.rebuilds.len != 0 or self.context_rebuild_intents_pending.load(.acquire)) self.drainContextRebuildIntents() catch |err| {
+            std.log.warn("context rebuild journaling deferred: {s}", .{@errorName(err)});
+        };
         var host_hex: [context_dependency_host_key.len * 2]u8 = undefined;
         _ = std.fmt.bufPrint(&host_hex, "{x}", .{context_dependency_host_key}) catch unreachable;
         for (command.puts) |p| if (std.mem.eql(u8, p.key, &host_hex)) {
@@ -157904,4 +157946,41 @@ test "db replicated inbox apply splits high fan-out notices across bounded comma
         if (try contextSourcesTestFreshness(&leader, alloc, doc) == .stale) stale += 1;
     }
     try std.testing.expectEqual(@as(usize, 60), stale);
+}
+
+test "db context rebuild intents commit with the plan and survive a crash before journaling" {
+    const alloc = std.testing.allocator;
+    const command_mod = @import("enrichment/context_dependency_command.zig");
+    var tmp = try TestDirectory.init("context-rebuild-intents");
+    defer tmp.cleanup();
+    const Ref = struct { artifact_name: []const u8, doc_key: []const u8 };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const rebuilds = try command_mod.rebuildsAlloc(arena.allocator(), @as([]const Ref, &.{ .{ .artifact_name = "summary", .doc_key = "doc:a" }, .{ .artifact_name = "summary", .doc_key = "doc:b" } }));
+    const intent = try command_mod.rebuildIntentKeyAlloc(alloc, rebuilds[0]);
+    defer alloc.free(intent);
+    {
+        var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        // The plan applies (with its intents) and the process "crashes"
+        // before the post-commit journaling runs.
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        const outcome = try command_mod.applyTxn(alloc, &txn, .{ .deletes = &.{"00"}, .rebuilds = rebuilds });
+        try std.testing.expectEqual(command_mod.Outcome.applied, outcome);
+        try txn.commit();
+    }
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const stored = (try db.core.getStoreValue(alloc, intent)).?;
+    alloc.free(stored);
+    const before = db.core.nextDerivedSequence();
+    try db.drainContextRebuildIntents();
+    // Recovered: both rebuilds journaled once, intents retired.
+    try std.testing.expect(db.core.nextDerivedSequence() > before);
+    try std.testing.expect((try db.core.getStoreValue(alloc, intent)) == null);
+    try std.testing.expect(!db.context_rebuild_intents_pending.load(.acquire));
+    const after = db.core.nextDerivedSequence();
+    try db.drainContextRebuildIntents();
+    try std.testing.expectEqual(after, db.core.nextDerivedSequence());
 }

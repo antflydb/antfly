@@ -44,6 +44,10 @@ pub const Digest = [Sha256.digest_length]u8;
 const outbox_family: u8 = 0x04;
 /// Inbox of delivered notices (dependent side), keyed by notice digest.
 pub const inbox_family: u8 = 0x07;
+/// Rebuilds a plan decided on, written in the same transaction as the plan
+/// and its apply receipt. Each replica journals and then deletes them, so a
+/// crash between commit and journaling cannot lose a rebuild.
+pub const rebuild_family: u8 = 0x0a;
 /// Digest of the last applied plan command (identical on every replica).
 pub const last_applied_key = store.familyPrefix(0x08);
 
@@ -332,9 +336,34 @@ pub fn applyTxn(alloc: Allocator, txn: anytype, command: Command) !Outcome {
             if (@as(anyerror, err) != error.NotFound) return err;
         };
     }
+    for (command.rebuilds) |rebuild| {
+        const key = try rebuildIntentKeyAlloc(a, rebuild);
+        const value = try std.json.Stringify.valueAlloc(a, rebuild, .{});
+        try txn.put(key, value);
+    }
     const d = command.digest();
     try txn.put(&last_applied_key, &d);
     return .applied;
+}
+
+/// Durable rebuild intent key for one (artifact, document) rebuild.
+pub fn rebuildIntentKeyAlloc(alloc: Allocator, rebuild: Command.Rebuild) ![]u8 {
+    var h = Sha256.init(.{});
+    field(&h, rebuild.artifact);
+    field(&h, rebuild.doc_key);
+    var d: Digest = undefined;
+    h.final(&d);
+    const prefix = store.familyPrefix(rebuild_family);
+    return std.mem.concat(alloc, u8, &.{ &prefix, &d });
+}
+
+/// Decode a stored rebuild intent (JSON of `Command.Rebuild`, hex fields).
+pub fn decodeRebuildIntentAlloc(alloc: Allocator, value: []const u8) !struct { artifact: []u8, doc_key: []u8 } {
+    const parsed = try std.json.parseFromSlice(Command.Rebuild, alloc, value, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    const artifact = try unhexAlloc(alloc, parsed.value.artifact);
+    errdefer alloc.free(artifact);
+    return .{ .artifact = artifact, .doc_key = try unhexAlloc(alloc, parsed.value.doc_key) };
 }
 
 /// Whether `command` was the last plan applied (read after the proposal
