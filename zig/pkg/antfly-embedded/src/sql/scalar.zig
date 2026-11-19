@@ -2403,6 +2403,20 @@ test "SQL PostgreSQL array search transforms unwind every allocation failure" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
+test "SQL pg_is_in_recovery evaluates as a boolean on Antfly" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "pg_is_in_recovery() OR pg_catalog.PG_IS_IN_RECOVERY()", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    const result = try program.evaluate(a, &.{}, &.{}, .{});
+    try std.testing.expect(!result.sql_null and !result.value.bool);
+
+    var invalid = try @import("compiler.zig").compileScalar(a, "pg_is_in_recovery(true)", .{});
+    defer invalid.deinit();
+    try std.testing.expectError(error.SqlUndefinedFunction, bind(a, invalid.expression, &.{}, &.{}, .{}));
+}
+
 test "SQL array subscripts select typed cells using PostgreSQL bounds" {
     const a = std.testing.allocator;
     var compiled = try @import("compiler.zig").compileScalar(a,
@@ -2815,6 +2829,10 @@ const Binder = struct {
                     if (call.args.len == 0) return error.InvalidSqlParameters;
                     for (call.args) |arg| _ = try self.infer(arg, depth + 1);
                     break :blk .{ .kind = .integer, .nullable = false };
+                }
+                if (std.mem.eql(u8, call.name, "pg_is_in_recovery")) {
+                    if (call.args.len != 0) return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = .boolean, .element_type = .boolean, .nullable = false };
                 }
                 if (std.mem.eql(u8, call.name, "version") or scopeField(call.name) != null) {
                     if (call.args.len != 0) return error.SqlUndefinedFunction;
@@ -3312,6 +3330,10 @@ const Binder = struct {
                 }
                 if (std.mem.eql(u8, call.name, "version"))
                     break :blk .{ .literal = .{ .string = postgres_version_banner } };
+                // Antfly's distributed storage recovery is independent of
+                // PostgreSQL physical standby mode, which pgwire never enters.
+                if (std.mem.eql(u8, call.name, "pg_is_in_recovery"))
+                    break :blk .{ .literal = .{ .bool = false } };
                 if (scopeField(call.name)) |field| {
                     if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };
                     const view = self.settings orelse return error.SettingCatalogUnavailable;

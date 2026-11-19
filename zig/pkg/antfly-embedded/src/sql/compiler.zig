@@ -488,15 +488,18 @@ const Parser = struct {
         }
     }
 
-    fn qualifiedCurrentSchemas(self: *const Parser) bool {
+    fn qualifiedCatalogFunction(self: *const Parser) bool {
         if (self.pos + 3 >= self.tokens.len) return false;
         const schema = self.tokens[self.pos];
         const function = self.tokens[self.pos + 2];
-        return schema.kind == .identifier and
-            (if (schema.owned) std.mem.eql(u8, schema.text, "pg_catalog") else std.ascii.eqlIgnoreCase(schema.text, "pg_catalog")) and
-            self.tokens[self.pos + 1].kind == .dot and function.kind == .identifier and
-            (if (function.owned) std.mem.eql(u8, function.text, "current_schemas") else std.ascii.eqlIgnoreCase(function.text, "current_schemas")) and
-            self.tokens[self.pos + 3].kind == .lparen;
+        if (schema.kind != .identifier or self.tokens[self.pos + 1].kind != .dot or
+            function.kind != .identifier or self.tokens[self.pos + 3].kind != .lparen) return false;
+        const matches = struct {
+            fn name(t: token.Token, expected: []const u8) bool {
+                return if (t.owned) std.mem.eql(u8, t.text, expected) else std.ascii.eqlIgnoreCase(t.text, expected);
+            }
+        }.name;
+        return matches(schema, "pg_catalog") and (matches(function, "current_schemas") or matches(function, "pg_is_in_recovery"));
     }
 
     fn scalar(self: *Parser, depth: usize, minimum: u8) Error!*const ast.Scalar {
@@ -586,8 +589,8 @@ const Parser = struct {
             const negative = self.take(.minus);
             if (!negative) try self.expect(.plus);
             left = try self.scalarNode(.{ .unary = .{ .op = if (negative) .negative else .positive, .operand = try self.scalar(depth + 1, 7) } });
-        } else if ((self.peek(.identifier) and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lparen) or self.qualifiedCurrentSchemas()) {
-            if (self.qualifiedCurrentSchemas()) self.pos += 2;
+        } else if ((self.peek(.identifier) and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lparen) or self.qualifiedCatalogFunction()) {
+            if (self.qualifiedCatalogFunction()) self.pos += 2;
             const function = self.tokens[self.pos];
             self.pos += 2;
             const name_value = try self.alloc.dupe(u8, function.text);
