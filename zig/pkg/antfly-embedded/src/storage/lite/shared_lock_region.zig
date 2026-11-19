@@ -529,8 +529,15 @@ const fcntlUnlock = antfly_platform.sync.fcntlUnlock;
 /// never come close, and the alternative (an unbounded wait) is exactly
 /// what this whole design exists to avoid everywhere else.
 fn fcntlLockBlocking(io: Io, fd: std.posix.fd_t, offset: i64, lock_type: i16) !void {
-    const deadline = Io.Clock.now(.awake, io).addDuration(.fromSeconds(30));
-    return antfly_platform.sync.fcntlLockBounded(io, fd, offset, lock_type, deadline);
+    return fcntlLockUntil(io, fd, offset, lock_type, null);
+}
+
+/// `fcntlLockBlocking`, bounded by the caller's `deadline` when it is
+/// sooner than the 30 s budget.
+fn fcntlLockUntil(io: Io, fd: std.posix.fd_t, offset: i64, lock_type: i16, deadline: ?Io.Timestamp) !void {
+    const budget = Io.Clock.now(.awake, io).addDuration(.fromSeconds(30));
+    const until = if (deadline) |d| (if (d.compare(.lt, budget)) d else budget) else budget;
+    return antfly_platform.sync.fcntlLockBounded(io, fd, offset, lock_type, until);
 }
 
 /// A fixed byte offset, far beyond any real region's actual size, used
@@ -591,6 +598,9 @@ const FdEntry = struct {
     /// `Region.close` at the same time its real lock is released, so a
     /// later same-process claim can reuse it.
     claimed_slots: std.ArrayListUnmanaged(u32) = .empty,
+    /// Serializes this process's region setup on this inode
+    /// (`openSizedUntil`); the fcntl setup byte alone does not.
+    setup_mutex: Io.Mutex = .init,
 };
 
 // `Io.Mutex`, matching `inode_lock.zig`'s own registry mutex -- never a
@@ -785,6 +795,9 @@ pub const Region = struct {
     test_after_claim_death_probe: ?*const fn (*Region) void = null,
     /// Test support: runs between a ticketless claim and its queue recheck.
     test_after_ticketless_claim: ?*const fn (*Region) void = null,
+    /// Test support: runs in `minimumPinnedSequence` between a reader
+    /// slot's death probe and its cleanup.
+    test_after_reader_dead_probe: ?*const fn (*Region) void = null,
     /// This handle's own reference into `fd_registry` -- this process's
     /// *shared* `FdEntry` for the region's inode (see
     /// `acquireProcessFd`'s own doc comment). Its `fd` is reused for
@@ -1139,6 +1152,17 @@ pub const Region = struct {
     /// rebuilding out from under a still-running writer or reader would
     /// silently break its exclusion/pin guarantees.
     pub fn openSized(allocator: std.mem.Allocator, io: Io, db_path: []const u8, max_readers: u32) !Region {
+        return openSizedUntil(allocator, io, db_path, max_readers, null);
+    }
+
+    /// `open`, with the one-time setup lock bounded by `deadline` instead of
+    /// its own 30 s budget: a writer admission must not outwait its own
+    /// busy timeout setting up the region it queues on.
+    pub fn openUntil(allocator: std.mem.Allocator, io: Io, db_path: []const u8, deadline: Io.Timestamp) !Region {
+        return openSizedUntil(allocator, io, db_path, default_max_readers, deadline);
+    }
+
+    fn openSizedUntil(allocator: std.mem.Allocator, io: Io, db_path: []const u8, max_readers: u32, deadline: ?Io.Timestamp) !Region {
         // Canonicalize before deriving the sidecar name from it: two
         // different relative or symlinked spellings of the same data
         // file -- even from two entirely separate processes, each
@@ -1179,8 +1203,16 @@ pub const Region = struct {
         // `flock`; see `setup_lock_offset`'s own doc comment for why)
         // serializing create/validate/rebuild against every other
         // process's own `openSized` call on this same region. Released
-        // explicitly below, before this handle claims its liveness slot.
-        try fcntlLockBlocking(io, raw_fd, setup_lock_offset, std.c.F.WRLCK);
+        // explicitly below, once this handle has claimed its liveness slot,
+        // so another process's rebuild (`ensureNoLivePeer`) sees it live.
+        //
+        // The byte is an fcntl lock, which this process's threads all
+        // share: the per-fd setup mutex serializes them as well, or two
+        // could both sample a fresh file and one truncate a region the
+        // other already mapped.
+        fd_entry.setup_mutex.lockUncancelable(io);
+        defer fd_entry.setup_mutex.unlock(io);
+        try fcntlLockUntil(io, raw_fd, setup_lock_offset, std.c.F.WRLCK, deadline);
         errdefer fcntlUnlock(raw_fd, setup_lock_offset);
 
         const size = (try setup_file.stat(io)).size;
@@ -1267,11 +1299,10 @@ pub const Region = struct {
         const map_len: usize = @intCast(final_header.region_bytes);
         const final_max_readers = final_header.max_readers;
 
-        fcntlUnlock(raw_fd, setup_lock_offset);
-
         const mapping = std.posix.mmap(null, map_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, raw_fd, 0) catch return RegionError.RegionUnavailable;
         errdefer std.posix.munmap(mapping);
         const claimed = try claimLivenessSlot(io, fd_entry, mapping, final_max_readers);
+        fcntlUnlock(raw_fd, setup_lock_offset);
         return .{ .mapping = mapping, .fd_entry = fd_entry, .own_liveness_slot = claimed.slot, .own_liveness_generation = claimed.generation, .io = io };
     }
 
@@ -2094,11 +2125,10 @@ pub const Region = struct {
     /// `claimReaderSlotWait` for a caller that would rather block for a
     /// bounded time than fail immediately.
     pub fn claimReaderSlot(self: *Region, pid: u32) ReaderError!u32 {
+        const mine = packHolderGen(pid, self.own_liveness_slot, self.own_liveness_generation);
         for (self.readerSlots(), 0..) |*slot, i| {
-            if (slot.owner.cmpxchgStrong(0, pid, .acquire, .monotonic) == null) {
-                slot.generation = packHolderGen(pid, self.own_liveness_slot, self.own_liveness_generation);
-                slot.pinned_sequence.store(0, .monotonic);
-                slot.metadata_pinned_sequence.store(0, .monotonic);
+            if (casReaderSlotWord(slot, 0, mine)) {
+                claimedReaderSlot(slot, pid);
                 return @intCast(i);
             }
         }
@@ -2106,18 +2136,49 @@ pub const Region = struct {
         // good as free -- the liveness probe only runs here, in the
         // already-rare exhaustion path, not on the fast claim above.
         for (self.readerSlots(), 0..) |*slot, i| {
-            const owner = slot.owner.load(.acquire);
-            if (owner == 0) continue;
-            const existing = slot.generation;
-            if (!self.isReferenceDead(holderLivenessSlot(existing), holderClaimGeneration(existing))) continue;
-            if (slot.owner.cmpxchgStrong(owner, pid, .acquire, .monotonic) == null) {
-                slot.generation = packHolderGen(pid, self.own_liveness_slot, self.own_liveness_generation);
-                slot.pinned_sequence.store(0, .monotonic);
-                slot.metadata_pinned_sequence.store(0, .monotonic);
+            const existing = readerSlotWord(slot);
+            if (existing == 0 or !self.readerWordDead(existing)) continue;
+            // Takeover is the one transition off this exact dead word: a
+            // concurrent cleanup or takeover of the same word fails its own
+            // compare-and-swap.
+            if (casReaderSlotWord(slot, existing, mine)) {
+                claimedReaderSlot(slot, pid);
                 return @intCast(i);
             }
         }
         return ReaderError.ReadersExhausted;
+    }
+
+    /// The slot word is the ownership: `packHolderGen` of its claimant,
+    /// zero when free, or `reader_slot_cleaning` plus the cleaner's own
+    /// identity while a dead claimant's pins are cleared. Every transition
+    /// is a compare-and-swap from the exact word observed, so cleanup and
+    /// takeover of one dead claim cannot both win, and neither can touch a
+    /// newer claim of the same slot.
+    const reader_slot_cleaning: u128 = @as(u128, 1) << 127;
+
+    fn readerSlotWord(slot: *const ReaderSlot) u128 {
+        return @atomicLoad(u128, &slot.generation, .acquire);
+    }
+
+    fn casReaderSlotWord(slot: *ReaderSlot, expected: u128, new: u128) bool {
+        return @cmpxchgStrong(u128, &slot.generation, expected, new, .acq_rel, .monotonic) == null;
+    }
+
+    fn claimedReaderSlot(slot: *ReaderSlot, pid: u32) void {
+        slot.pinned_sequence.store(0, .monotonic);
+        slot.metadata_pinned_sequence.store(0, .monotonic);
+        slot.owner.store(pid, .release);
+    }
+
+    /// A claim (or an in-progress cleanup) whose process has died.
+    fn readerWordDead(self: *const Region, word: u128) bool {
+        return self.isReferenceDead(holderLivenessSlot(word), holderClaimGeneration(word));
+    }
+
+    /// A word that pins: claimed, not being cleaned, owner alive.
+    fn readerWordLive(self: *const Region, word: u128) bool {
+        return word != 0 and word & reader_slot_cleaning == 0 and !self.readerWordDead(word);
     }
 
     /// `claimReaderSlot`, but on exhaustion parks on the real cross-
@@ -2188,8 +2249,8 @@ pub const Region = struct {
         const slot = &self.readerSlots()[slot_index];
         slot.pinned_sequence.store(0, .monotonic);
         slot.metadata_pinned_sequence.store(0, .monotonic);
-        slot.generation = 0;
         slot.owner.store(0, .release);
+        @atomicStore(u128, &slot.generation, 0, .release);
         const hdr = self.header();
         _ = hdr.reader_slot_released.fetchAdd(1, .release);
         futexWakeShared(&hdr.reader_slot_released.raw);
@@ -2203,10 +2264,7 @@ pub const Region = struct {
     /// migration step -- that needs to ask about one specific slot
     /// without running a full frontier scan).
     pub fn isReaderSlotLive(self: *const Region, slot_index: u32) bool {
-        const slot = &self.readerSlots()[slot_index];
-        const owner = slot.owner.load(.acquire);
-        if (owner == 0) return false;
-        return !self.isReferenceDead(holderLivenessSlot(slot.generation), holderClaimGeneration(slot.generation));
+        return self.readerWordLive(readerSlotWord(&self.readerSlots()[slot_index]));
     }
 
     /// §8.3's writer-side reuse-frontier scan, replacing
@@ -2235,11 +2293,11 @@ pub const Region = struct {
     pub fn minimumUncoveredPinnedSequence(self: *Region, own_pid: u32, overlay_floor: ?u64) ?u64 {
         var min: ?u64 = null;
         for (self.readerSlots()) |*slot| {
-            if (slot.owner.load(.acquire) == 0) continue;
-            if (self.isReferenceDead(holderLivenessSlot(slot.generation), holderClaimGeneration(slot.generation))) continue;
+            const word = readerSlotWord(slot);
+            if (!self.readerWordLive(word)) continue;
             const seq = slot.pinned_sequence.load(.acquire);
             if (seq == 0) continue;
-            if (holderPid(slot.generation) == own_pid) if (overlay_floor) |floor| if (floor <= seq) continue;
+            if (holderPid(word) == own_pid) if (overlay_floor) |floor| if (floor <= seq) continue;
             if (min == null or seq < min.?) min = seq;
         }
         return min;
@@ -2248,22 +2306,28 @@ pub const Region = struct {
     pub fn minimumPinnedSequence(self: *Region) ?u64 {
         var min: ?u64 = null;
         for (self.readerSlots()) |*slot| {
-            const owner = slot.owner.load(.acquire);
-            if (owner == 0) continue;
+            const word = readerSlotWord(slot);
+            if (word == 0 or word & reader_slot_cleaning != 0) continue;
             // §8.4: a dead reader's never-cleared pin cannot block
             // reclamation forever. Probing costs a syscall per occupied
             // slot, same as the writer side's `writerHolderDead` -- paid
             // only here, in the writer's own reuse-frontier scan (which
             // already costs more than a warm write's own acquire/release
             // ever does), never on a reader's own pin/unpin path.
-            if (self.isReferenceDead(holderLivenessSlot(slot.generation), holderClaimGeneration(slot.generation))) {
-                slot.pinned_sequence.store(0, .monotonic);
-                slot.metadata_pinned_sequence.store(0, .monotonic);
-                slot.generation = 0;
-                slot.owner.store(0, .release);
-                const hdr = self.header();
-                _ = hdr.reader_slot_released.fetchAdd(1, .release);
-                futexWakeShared(&hdr.reader_slot_released.raw);
+            if (self.readerWordDead(word)) {
+                if (comptime builtin.is_test) if (self.test_after_reader_dead_probe) |hook| hook(self);
+                // Own the dead claim first, so a takeover cannot slip in
+                // between clearing its pins and freeing the slot.
+                const cleaning = reader_slot_cleaning | packHolderGen(antfly_platform.process.currentId() orelse 0, self.own_liveness_slot, self.own_liveness_generation);
+                if (casReaderSlotWord(slot, word, cleaning)) {
+                    slot.pinned_sequence.store(0, .monotonic);
+                    slot.metadata_pinned_sequence.store(0, .monotonic);
+                    slot.owner.store(0, .release);
+                    @atomicStore(u128, &slot.generation, 0, .release);
+                    const hdr = self.header();
+                    _ = hdr.reader_slot_released.fetchAdd(1, .release);
+                    futexWakeShared(&hdr.reader_slot_released.raw);
+                }
                 continue;
             }
             const seq = slot.pinned_sequence.load(.acquire);
@@ -2287,9 +2351,7 @@ pub const Region = struct {
     pub fn minimumMetadataPinnedSequence(self: *Region) ?u64 {
         var min: ?u64 = null;
         for (self.readerSlots()) |*slot| {
-            const owner = slot.owner.load(.acquire);
-            if (owner == 0) continue;
-            if (self.isReferenceDead(holderLivenessSlot(slot.generation), holderClaimGeneration(slot.generation))) continue;
+            if (!self.readerWordLive(readerSlotWord(slot))) continue;
             const seq = slot.metadata_pinned_sequence.load(.acquire);
             if (seq == 0) continue;
             if (min == null or seq < min.?) min = seq;
@@ -2313,14 +2375,45 @@ pub const Region = struct {
     /// and/or reclaims log space), never on any other path: no new
     /// syscalls, just atomic stores into the already-mapped region,
     /// exactly like every other steady-state write this file makes.
+    ///
+    /// Caller holds writer authority (the path-writer lease), so it is the
+    /// only publisher. An odd generation found here means a publisher died
+    /// mid-publish; this one repairs it by publishing a complete tuple. A
+    /// tuple older than the published one (a lower durable or checkpoint
+    /// sequence) is dropped: the watermark never moves backwards.
     pub fn publishLogState(self: *Region, state: LogState) void {
         const hdr = self.header();
-        _ = hdr.log_generation.fetchAdd(1, .release);
+        const generation = hdr.log_generation.load(.acquire);
+        if (generation & 1 == 0 and (state.durable_sequence < hdr.log_durable_sequence.load(.monotonic) or
+            state.checkpoint_sequence < hdr.log_checkpoint_sequence.load(.monotonic))) return;
+        const publishing = generation | 1;
+        hdr.log_generation.store(publishing, .release);
         hdr.log_checkpoint_sequence.store(state.checkpoint_sequence, .monotonic);
         hdr.log_durable_sequence.store(state.durable_sequence, .monotonic);
         hdr.log_durable_offset.store(state.durable_offset, .monotonic);
-        _ = hdr.log_generation.fetchAdd(1, .release);
+        hdr.log_generation.store(publishing +% 1, .release);
     }
+
+    /// Test support: a region whose log publication was never made (one
+    /// reinitialized after every process exited).
+    pub fn resetLogStateForTest(self: *Region) void {
+        const hdr = self.header();
+        const publishing = hdr.log_generation.load(.acquire) | 1;
+        hdr.log_generation.store(publishing, .release);
+        hdr.log_checkpoint_sequence.store(0, .monotonic);
+        hdr.log_durable_sequence.store(0, .monotonic);
+        hdr.log_durable_offset.store(0, .monotonic);
+        hdr.log_generation.store(publishing +% 1, .release);
+    }
+
+    /// Test support: a publisher that died with the generation odd.
+    pub fn tearLogStateForTest(self: *Region) void {
+        _ = self.header().log_generation.fetchOr(1, .release);
+    }
+
+    /// Spins `readLogState` tolerates on an odd generation that never
+    /// moves: a publisher that died mid-publish.
+    const log_state_stuck_spins: u32 = 1 << 16;
 
     /// Reads the triple `publishLogState` last published, retrying (no
     /// syscall, no blocking -- a plain spin) whenever the seqlock proves
@@ -2329,11 +2422,28 @@ pub const Region = struct {
     /// more than a handful of times even under real contention; VOPR-safe
     /// by construction (no `std.Io`, no real time, nothing but atomic
     /// loads).
+    ///
+    /// A generation stuck odd (its publisher died) reads as no publication
+    /// at all, the same stale-but-safe state as a freshly initialized
+    /// region, rather than spinning forever; the next lease holder's
+    /// publish repairs it.
     pub fn readLogState(self: *const Region) LogState {
         const hdr = self.header();
+        var stuck: u32 = 0;
+        var last_odd: u32 = 0;
         while (true) {
             const before = hdr.log_generation.load(.acquire);
-            if (before & 1 != 0) continue;
+            if (before & 1 != 0) {
+                if (before != last_odd) {
+                    last_odd = before;
+                    stuck = 0;
+                } else {
+                    stuck += 1;
+                    if (stuck >= log_state_stuck_spins) return .{ .checkpoint_sequence = 0, .durable_sequence = 0, .durable_offset = 0 };
+                }
+                std.atomic.spinLoopHint();
+                continue;
+            }
             const state: LogState = .{
                 .checkpoint_sequence = hdr.log_checkpoint_sequence.load(.monotonic),
                 .durable_sequence = hdr.log_durable_sequence.load(.monotonic),
@@ -4206,6 +4316,88 @@ test "shared lock region: a ticketless claim yields to a ticket published before
     region.finishTurn(Publish.ticket.?);
     region.releaseWriter();
     try std.testing.expectEqual(@as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))), hdr.writer_ticket_head.load(.monotonic));
+}
+
+test "shared lock region: dead-reader cleanup cannot erase a pin taken over in between" {
+    var fixture = try TicketFixture.init("region-reader-takeover.aflite");
+    defer fixture.deinit();
+    const region = &fixture.region;
+    const pid: u32 = @bitCast(std.c.getpid());
+    // Fill every slot with a dead claim (an exited reader's).
+    const dead = packHolderGen(pid +% 1, region.own_liveness_slot, region.own_liveness_generation +% 1);
+    for (region.readerSlots()) |*slot| {
+        @atomicStore(u128, &slot.generation, dead, .release);
+        slot.owner.store(pid +% 1, .release);
+        slot.pinned_sequence.store(5, .release);
+    }
+    // While the writer's frontier scan has found slot 0's claim dead, a new
+    // reader takes that slot over and pins it.
+    const Takeover = struct {
+        var slot: ?u32 = null;
+        fn run(r: *Region) void {
+            if (slot != null) return;
+            slot = r.claimReaderSlot(@bitCast(std.c.getpid())) catch unreachable;
+            r.pinReader(slot.?, 42);
+        }
+    };
+    region.test_after_reader_dead_probe = Takeover.run;
+    _ = region.minimumPinnedSequence();
+    region.test_after_reader_dead_probe = null;
+    const taken = Takeover.slot.?;
+    try std.testing.expect(region.isReaderSlotLive(taken));
+    try std.testing.expectEqual(@as(u64, 42), region.readerSlots()[taken].pinned_sequence.load(.acquire));
+    try std.testing.expectEqual(@as(?u64, 42), region.minimumPinnedSequence());
+    region.releaseReaderSlot(taken);
+}
+
+test "shared lock region: the log watermark never moves backwards and a torn publication recovers" {
+    var fixture = try TicketFixture.init("region-log-state.aflite");
+    defer fixture.deinit();
+    const region = &fixture.region;
+    region.publishLogState(.{ .checkpoint_sequence = 7, .durable_sequence = 42, .durable_offset = 4096 });
+    // A stale publisher (a scan that finished behind the writer).
+    region.publishLogState(.{ .checkpoint_sequence = 7, .durable_sequence = 41, .durable_offset = 2048 });
+    try std.testing.expectEqual(@as(u64, 42), region.readLogState().durable_sequence);
+    // A publisher died with the generation odd: reads stop spinning and
+    // see no publication, and the next lease holder's publish repairs it.
+    region.tearLogStateForTest();
+    try std.testing.expectEqual(@as(u64, 0), region.readLogState().durable_sequence);
+    region.publishLogState(.{ .checkpoint_sequence = 8, .durable_sequence = 43, .durable_offset = 128 });
+    const repaired = region.readLogState();
+    try std.testing.expectEqual(@as(u64, 43), repaired.durable_sequence);
+    try std.testing.expectEqual(@as(u64, 128), repaired.durable_offset);
+}
+
+test "shared lock region: concurrent same-process opens of a fresh region share one mapping" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &buf);
+    const path = try std.fmt.allocPrint(a, "{s}/region-concurrent-open.aflite", .{buf[0..dir_len]});
+    defer a.free(path);
+    const Opener = struct {
+        fn run(p: []const u8, out: *?Region, failed: *bool) void {
+            out.* = Region.open(std.heap.page_allocator, std.testing.io, p) catch {
+                failed.* = true;
+                return;
+            };
+        }
+    };
+    var regions: [6]?Region = @splat(null);
+    var failed: [6]bool = @splat(false);
+    var threads: [6]std.Thread = undefined;
+    for (&threads, 0..) |*thread, i| thread.* = try std.Thread.spawn(.{}, Opener.run, .{ path, &regions[i], &failed[i] });
+    for (threads) |thread| thread.join();
+    defer for (&regions) |*r| if (r.*) |*region| region.close();
+    for (failed) |f| try std.testing.expect(!f);
+    // A ticket claimed through one handle is visible through every other:
+    // no opener truncated and rebuilt a region another had mapped.
+    const first = &regions[0].?;
+    const ticket = first.tryClaimTicket(first.header().writer_ticket_tail.load(.monotonic), @bitCast(std.c.getpid())).?;
+    for (&regions) |*r| try std.testing.expectEqual(ticket +% 1, @as(u32, @truncate(r.*.?.header().writer_ticket_tail.load(.acquire))));
+    first.finishTurn(ticket);
 }
 
 test "shared lock region: the queue keeps admitting contended writers across the 32-bit head wrap" {
