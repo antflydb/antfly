@@ -3448,6 +3448,28 @@ test "SQL joins use one coordinated cut and preserve typed outer nulls across pa
     try std.testing.expectError(error.SqlStatementSnapshotRequired, execute(std.testing.allocator, backend.iface(), &compiled, &.{}, .{}));
 }
 
+test "SQL Boolean array positions preserve correlated subquery windows and absent NULLs" {
+    const a = std.testing.allocator;
+    var backend: TestBackend = .{ .row_count = 3 };
+    var compiled = try compiler.compile(a,
+        \\SELECT r._id,
+        \\       CAST(array_position(ARRAY(SELECT b._id FROM things b WHERE b._id = r._id), '1') AS BOOL),
+        \\       CAST(array_position(ARRAY(SELECT b._id FROM things b ORDER BY b._id LIMIT 1 OFFSET 1), '1') AS BOOL)
+        \\FROM things r ORDER BY r._id
+    , .{});
+    defer compiled.deinit();
+    var description = try @import("describe.zig").describe(a, backend.coordinated(), &compiled, &.{});
+    defer description.deinit();
+    try std.testing.expectEqual(@as(usize, 3), description.binding.columns.len);
+    var result = try execute(a, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+    try std.testing.expect(result.output.sql_nulls.?[0][1]);
+    try std.testing.expectEqual(std.json.Value{ .bool = true }, result.output.rows[1][1]);
+    try std.testing.expect(result.output.sql_nulls.?[2][1]);
+    for (result.output.rows) |row| try std.testing.expectEqual(std.json.Value{ .bool = true }, row[2]);
+}
+
 test "SQL CTE aliases feed hash joins and grouped projection without stringifying rows" {
     var backend: TestBackend = .{ .row_count = 4 };
     var compiled = try compiler.compile(std.testing.allocator, "WITH q(k) AS (SELECT _id FROM things WHERE _id != '3') SELECT a.k, count(*) AS n FROM q AS a JOIN q AS b ON a.k = b.k GROUP BY a.k ORDER BY a.k DESC", .{});

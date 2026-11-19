@@ -23,6 +23,7 @@ const Element = local.sql_array_value.ElementType;
 const pg_type_name = "pg_type";
 const pg_type_storage = "\x00pg_catalog.pg_type";
 const pg_catalog_oid = 11;
+const pg_auth_members_storage = "\x00pg_catalog.pg_auth_members";
 const pg_roles_storage = "\x00pg_catalog.pg_roles";
 pub const Role = struct {
     name: []const u8,
@@ -31,10 +32,25 @@ pub const Role = struct {
 
 pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?catalog.Table {
     const roles = std.mem.eql(u8, name.table, "pg_roles");
-    if (!roles and !std.mem.eql(u8, name.table, pg_type_name)) return null;
+    const members = std.mem.eql(u8, name.table, "pg_auth_members");
+    if (!roles and !members and !std.mem.eql(u8, name.table, pg_type_name)) return null;
     if (name.namespace) |namespace| if (!std.mem.eql(u8, namespace, "pg_catalog")) return null;
     if (name.database) |qualified| if (!std.mem.eql(u8, qualified, database)) return error.Forbidden;
     if (action != .read) return error.SqlReadOnlyTransaction;
+    if (members) return .{
+        .id = 1261,
+        .physical_name = pg_auth_members_storage,
+        .schema_version = 1,
+        .scope = .{ .database = database, .namespace = "pg_catalog", .name = "pg_auth_members", .revision = 1 },
+        .columns = &.{
+            .{ .name = "roleid", .path = "roleid", .type = .integer, .nullable = false },
+            .{ .name = "member", .path = "member", .type = .integer, .nullable = false },
+            .{ .name = "grantor", .path = "grantor", .type = .integer, .nullable = false },
+            .{ .name = "admin_option", .path = "admin_option", .type = .boolean, .nullable = false },
+            .{ .name = "inherit_option", .path = "inherit_option", .type = .boolean, .nullable = false },
+            .{ .name = "set_option", .path = "set_option", .type = .boolean, .nullable = false },
+        },
+    };
     if (roles) return .{
         .id = 12000,
         .physical_name = pg_roles_storage,
@@ -74,7 +90,23 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
 }
 
 pub fn owns(table: catalog.Table) bool {
-    return std.mem.eql(u8, table.physical_name, pg_type_storage) or isRoles(table);
+    return std.mem.eql(u8, table.physical_name, pg_type_storage) or isRoles(table) or isMemberships(table);
+}
+
+pub fn isMemberships(table: catalog.Table) bool {
+    return std.mem.eql(u8, table.physical_name, pg_auth_members_storage);
+}
+
+/// The session role projects effective Antfly grants. There are no
+/// independently assumable PostgreSQL roles in the projected catalog.
+pub fn openMemberships(context: *anyopaque) catalog.Cursor {
+    const Empty = struct {
+        fn next(_: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
+            return .{ .rows = &.{} };
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    return .{ .ptr = context, .next = Empty.next, .close = Empty.close, .estimated_rows = 0 };
 }
 
 pub fn isRoles(table: catalog.Table) bool {

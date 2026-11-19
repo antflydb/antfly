@@ -128,6 +128,28 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
         },
     )
     try:
+        memberships = (
+            "ARRAY(SELECT b.rolname FROM pg_catalog.pg_auth_members m "
+            "JOIN pg_catalog.pg_roles b ON (m.roleid = b.oid) WHERE m.member = r.oid)"
+        )
+        role_query = (
+            "SELECT oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, "
+            "rolcanlogin, rolreplication FROM pg_roles "
+            "WHERE pg_has_role('admin', oid, 'member')"
+        )
+        membership_query = (
+            "SELECT r.rolcanlogin, r.rolreplication, "
+            + ", ".join(
+                f"CAST(array_position({memberships}, '{role}') AS BOOL) IS TRUE"
+                for role in (
+                    "rds_superuser",
+                    "rdsadmin",
+                    "rdsrepladmin",
+                    "rds_replication",
+                )
+            )
+            + " FROM pg_roles r WHERE r.rolname = current_user"
+        )
         discovery = subprocess.check_output(
             [
                 psql,
@@ -142,9 +164,11 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                 "-c",
                 "SELECT oid, typname, typelem, typarray FROM pg_catalog.pg_type WHERE oid IN (23, 1007) ORDER BY oid",
                 "-c",
-                "SELECT oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolreplication FROM pg_roles WHERE pg_has_role('admin', oid, 'member')",
+                role_query,
                 "-c",
                 "SELECT pg_has_role('other', oid, 'member') FROM pg_catalog.pg_roles",
+                "-c",
+                membership_query,
             ],
             env=env,
             text=True,
@@ -159,7 +183,15 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
         oid, *role = discovery[4].split("|")
         assert int(oid) >= 16_384
         assert role == ["admin", "f", "f", "f", "f", "t", "t"]
-        assert discovery[5:] == ["f"]
+        assert discovery[5:] == ["f", "t|t|f|f|f|f"]
+        extended = subprocess.check_output(
+            [psql, *connection, "-XAt", "-v", "ON_ERROR_STOP=1"],
+            input=f"{role_query} \\bind\n\\g\n{membership_query} \\bind\n\\g\n",
+            env=env,
+            text=True,
+            timeout=40,
+        ).splitlines()
+        assert extended == [discovery[4], discovery[6]]
         sql("CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT)")
         if export_snapshot:
             sql("ALTER TABLE smoke REPLICA IDENTITY FULL")

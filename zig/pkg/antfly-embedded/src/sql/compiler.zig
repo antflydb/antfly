@@ -508,6 +508,19 @@ const Parser = struct {
             const kind = try self.castType();
             try self.expect(.rparen);
             left = try self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind.type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier } });
+        } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "array") and self.pos + 2 < self.tokens.len and self.tokens[self.pos + 1].kind == .lparen and (self.tokens[self.pos + 2].isKeyword(.select) or self.tokens[self.pos + 2].isKeyword(.with))) {
+            self.pos += 2;
+            self.relation_depth += 1;
+            defer self.relation_depth -= 1;
+            if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL subquery nesting limit exceeded");
+            const nested = try self.statement();
+            if (nested != .select) return self.fail(error.InvalidSqlSyntax, "ARRAY subquery requires SELECT");
+            const query = try self.alloc.create(ast.Select);
+            query.* = nested.select;
+            try self.singleColumnSubquery(query.*);
+            query.required_output_columns = 1;
+            try self.expect(.rparen);
+            left = try self.scalarNode(.{ .call = .{ .name = "$array_subquery", .args = &.{}, .subquery = query } });
         } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "array") and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lbracket) {
             self.pos += 1;
             left = try self.arrayConstructor(depth + 1);

@@ -1805,17 +1805,22 @@ const OwnedRead = struct {
             transaction_lease = null;
         }
         const binding = self.stream.context.binding;
-        const policies = try arena.alloc(Policy, if (binding.relation) |relation| relation.scans.len else if (binding.table != null) 1 else 0);
-        for (policies, 0..) |*policy, i| {
+        var policies: std.ArrayList(Policy) = .empty;
+        const table_count: usize = if (binding.relation) |relation| relation.scans.len else if (binding.table != null) 1 else 0;
+        for (0..table_count) |i| {
             const table = if (binding.relation) |relation| relation.scans[i].table else binding.table.?;
-            policy.* = .{ .table = try arena.dupe(u8, table.physical_name), .filter = try http.resolveEffectiveRowFilterJson(arena, self.identity, table.physical_name) };
+            // The guarded catalog checks the current credential. A built-in
+            // relation has no user table ACL or native catalog binding.
+            if (GuardedCatalog.system.owns(table)) continue;
+            var policy: Policy = .{ .table = try arena.dupe(u8, table.physical_name), .filter = try http.resolveEffectiveRowFilterJson(arena, self.identity, table.physical_name) };
             if (table.scope) |scope| {
                 policy.name = .{ .database = try arena.dupe(u8, scope.database), .namespace = try arena.dupe(u8, scope.namespace), .table = try arena.dupe(u8, scope.name) };
                 policy.id = table.id;
                 policy.schema_version = table.schema_version;
             }
+            try policies.append(arena, policy);
         }
-        self.policies = policies;
+        self.policies = try policies.toOwnedSlice(arena);
         const columns = try arena.alloc(wire.Column, self.stream.context.binding.columns.len);
         for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = try arena.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
         self.columns = columns;
@@ -2857,7 +2862,7 @@ const GuardedCatalog = struct {
         try self.authority.credential.validate();
         const table = (try system.resolve(name, action, self.authority.request.database orelse "default")) orelse
             try resolveOnPath(self.native, alloc, name, action, if (self.authority.request.search_path) |*path| path else null);
-        if (self.expected_guard) |guard| try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, table);
+        if (!system.owns(table)) if (self.expected_guard) |guard| try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, table);
         return table;
     }
     fn scanPinned(self: *GuardedCatalog, alloc: std.mem.Allocator, snapshot: ImportedSnapshot, table: catalog.Table, request: catalog.Scan) !catalog.Page {
@@ -2945,6 +2950,7 @@ const GuardedCatalog = struct {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try self.checkTableRead(table);
         if (system.isRoles(table)) return system.scanRole(alloc, request, try self.catalogRole());
+        if (system.isMemberships(table)) return .{ .rows = &.{} };
         if (system.owns(table)) return system.scan(alloc, request);
         if (self.authority.importedSnapshot()) |snapshot| return self.scanPinned(alloc, snapshot, table, request);
         return self.native.vtable.scan(self.native.ptr, alloc, table, request);
@@ -3090,6 +3096,7 @@ const GuardedCatalog = struct {
     }
     fn openSystemScan(self: *GuardedCatalog, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {
         if (system.isRoles(table)) return system.openRole(alloc, request, try self.catalogRole());
+        if (system.isMemberships(table)) return system.openMemberships(self);
         return system.open(alloc, request);
     }
     fn openScan(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
@@ -3220,6 +3227,9 @@ fn statementBindingGuard(alloc: std.mem.Allocator, revision: ?u64, binding: desc
 }
 
 fn collectBindingTable(table: catalog.Table, scans: *[64]catalog.StatementScan, count: *usize) !void {
+    // Built-in catalog layouts are owned by this server binary. They do not
+    // resolve through the native catalog or advance its route revision.
+    if (GuardedCatalog.system.owns(table)) return;
     for (scans[0..count.*]) |scan| {
         if (scan.table.id == table.id and scan.table.schema_version == table.schema_version and std.mem.eql(u8, scan.table.physical_name, table.physical_name)) return;
     }
@@ -3230,10 +3240,10 @@ fn collectBindingTable(table: catalog.Table, scans: *[64]catalog.StatementScan, 
 
 fn collectBindingTables(binding: describe_sql.BoundStatement, scans: *[64]catalog.StatementScan, count: *usize, depth: usize) anyerror!void {
     if (depth >= 64) return error.SqlProgramLimitExceeded;
-    if (binding.table) |table| try collectBindingTable(table, scans, count);
-    if (binding.relation) |relation| for (relation.scans) |scan| {
-        try collectBindingTable(scan.table, scans, count);
-    };
+    if (binding.relation) |relation| {
+        // binding.table describes the synthesized output layout in this case.
+        for (relation.scans) |scan| try collectBindingTable(scan.table, scans, count);
+    } else if (binding.table) |table| try collectBindingTable(table, scans, count);
     if (binding.insert_source) |source| try collectBindingTables(source.*, scans, count, depth + 1);
     if (binding.joined_mutation) |joined| try collectBindingTables(joined.input.*, scans, count, depth + 1);
     if (binding.returning) |returning| try collectBindingTables(returning.*, scans, count, depth + 1);
