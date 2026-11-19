@@ -669,11 +669,12 @@ def test_busy_index_in_another_process_does_not_starve_maintenance(tmp_path: Pat
     # values fill the redo log, so its folds move the physical catalog root
     # and maintenance admission rebases. Changes to the busy index, in this
     # table or another, must not keep rejecting the quiet index's merges.
-    def quiet_segments():
-        return next(i["text_active_segments"] for i in db.stats()["indexes"] if i["name"] == "quiet_text")
+    def quiet_segments(handle):
+        return next(i["text_active_segments"] for i in handle.stats()["indexes"] if i["name"] == "quiet_text")
 
-    def folded_through():
-        return db.status()["storage"]["redo_folded_through"]
+    def peer_progress():
+        writes, folds = (progress.read_text() if progress.exists() else "0 0").split()
+        return int(writes), int(folds)
 
     path = tmp_path / "busy-peer.aflite"
     stop = tmp_path / "stop"
@@ -685,14 +686,17 @@ def test_busy_index_in_another_process_does_not_starve_maintenance(tmp_path: Pat
             db.create_table("busy", {})
         busy = db if same_table else db.open_table("busy")
         busy.add_index({"name": "busy_text", "type": "full_text", "config_json": {"field": "a"}})
+        # The peer reports the folds its own process published, so a fold
+        # it reports is the peer's, not this process's.
         script = (
-            "import antfly_embedded, os, sys; "
-            "db = antfly_embedded.open(sys.argv[1], no_sync=True, busy_timeout=30.0); "
-            + ("busy = db" if same_table else "busy = db.open_table('busy')")
-            + "; n = 0\n"
+            "import antfly_embedded as af, os, sys\n"
+            "db = af.open(sys.argv[1], no_sync=True, busy_timeout=30.0)\n"
+            + ("busy = db\n" if same_table else "busy = db.open_table('busy')\n")
+            + "n = 0\n"
             "while not os.path.exists(sys.argv[2]):\n"
-            "    busy.batch_json({'inserts': {f'a{n % 4}': {'a': f'busydoc{n} ' + 'filler ' * 120}}, 'sync_level': 'full_index'}); n += 1\n"
-            "    open(sys.argv[3] + '.tmp', 'w').write(str(n)); os.replace(sys.argv[3] + '.tmp', sys.argv[3])\n"
+            "    busy.batch_json({'inserts': {f'a{n % 4}': {'a': f'busydoc{n} ' + 'filler ' * 1500}}, 'sync_level': 'full_index'}); n += 1\n"
+            "    folds = db.status()['storage']['reclamation']['allocator_work']['redo_checkpoint_folds']\n"
+            "    open(sys.argv[3] + '.tmp', 'w').write(f'{n} {folds}'); os.replace(sys.argv[3] + '.tmp', sys.argv[3])\n"
             "db.close()"
         )
         peer = subprocess.Popen(
@@ -700,32 +704,39 @@ def test_busy_index_in_another_process_does_not_starve_maintenance(tmp_path: Pat
         )
         try:
             started = time.monotonic() + 60
-            while time.monotonic() < started and int((progress.read_text() if progress.exists() else "") or 0) < 20:
+            while time.monotonic() < started and peer_progress()[0] < 20:
                 time.sleep(0.05)
-            # The quiet index's merges start while its backlog builds.
-            folded_before = folded_through()
+            writes_before, folds_before = peer_progress()
+            # Sample while the backlog builds and drains: it must be seen
+            # pending, and a peer fold must land while it is.
+            backlog = 0
+            overlapped = False
+
+            def sample():
+                nonlocal backlog, overlapped
+                pending = quiet_segments(db)
+                backlog = max(backlog, pending)
+                overlapped = overlapped or (pending > 4 and peer_progress()[1] > folds_before)
+                return pending
+
             for i in range(120):
                 db.batch_json({"inserts": {f"b{i}": {"b": f"quietdoc{i} " + "w " * 200}}, "sync_level": "full_index"})
-            writes_before = int(progress.read_text())
-            backlog = quiet_segments()
+                sample()
             deadline = time.monotonic() + 30
-            segments = backlog
+            segments = sample()
             while time.monotonic() < deadline and segments > 4:
-                time.sleep(0.1)
-                segments = quiet_segments()
-            # Taken when the backlog drained, before the stop request: the
-            # peer folded its redo log while the merges ran.
-            folded_after = folded_through()
+                time.sleep(0.05)
+                segments = sample()
+            # Taken before the stop request: the peer kept writing.
             time.sleep(0.5)
-            writes_after = int(progress.read_text())
+            writes_after = peer_progress()[0]
             still_busy = peer.poll() is None
         finally:
             stop.touch()
             peer.wait(timeout=60)
     assert peer.returncode == 0
-    # The merges had a backlog to drain, across a physical rebase.
     assert backlog > 4, backlog
-    assert folded_after > folded_before, (folded_before, folded_after)
+    assert overlapped, (backlog, folds_before, peer_progress())
     assert still_busy and writes_after > writes_before >= 20, (writes_before, writes_after)
     assert segments <= 4, (backlog, segments)
 
