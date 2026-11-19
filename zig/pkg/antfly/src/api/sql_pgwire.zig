@@ -2951,6 +2951,11 @@ const GuardedCatalog = struct {
         try self.checkTableRead(table);
         if (system.isRoles(table)) return system.scanRole(alloc, request, try self.catalogRole());
         if (system.isMemberships(table)) return .{ .rows = &.{} };
+        if (system.isNamespaces(table)) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            return system.scanNamespaces(alloc, request, try self.catalogNamespaces(arena.allocator(), request.conditions));
+        }
         if (system.owns(table)) return system.scan(alloc, request);
         if (self.authority.importedSnapshot()) |snapshot| return self.scanPinned(alloc, snapshot, table, request);
         return self.native.vtable.scan(self.native.ptr, alloc, table, request);
@@ -3097,7 +3102,40 @@ const GuardedCatalog = struct {
     fn openSystemScan(self: *GuardedCatalog, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {
         if (system.isRoles(table)) return system.openRole(alloc, request, try self.catalogRole());
         if (system.isMemberships(table)) return system.openMemberships(self);
+        if (system.isNamespaces(table)) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            return system.openNamespaces(alloc, request, try self.catalogNamespaces(arena.allocator(), request.conditions));
+        }
         return system.open(alloc, request);
+    }
+    fn catalogNamespaces(self: *GuardedCatalog, a: std.mem.Allocator, conditions: []const catalog.Condition) ![]const system.Namespace {
+        var result: std.ArrayList(system.Namespace) = .empty;
+        if (try system.namespaceMatches(system.builtin_namespace, conditions)) try result.append(a, system.builtin_namespace);
+        const server = self.authority.server orelse return result.items;
+        if (server.source.vtable.system_catalog == null) return result.items;
+        const domain = @import("antfly_local_sources").system_catalog_domain;
+        const database = self.authority.request.database orelse domain.default_database_name;
+        const bytes = try server.source.systemCatalog(a, try self.authority.context(), .{ .read = .{ .kind = .namespace, .database = database } });
+        const state = try std.json.parseFromSliceLeaky(domain.State, a, bytes, .{});
+        const identity = self.authority.identity.* orelse return error.Forbidden;
+        for (state.resources) |resource| {
+            try checkpoint(self);
+            if (resource.kind != .namespace or std.mem.eql(u8, resource.name, system.builtin_namespace.name)) continue;
+            const logical = try @import("../system_catalog/routes.zig").resourceNameAlloc(a, .{ .kind = .namespace, .database = database, .name = resource.name });
+            if (!try http.resourcePermissionCurrentlyAllowed(identity, .namespace, logical, .read)) continue;
+            const item: system.Namespace = .{ .oid = system.namespaceOid(resource.id), .name = resource.name };
+            if (try system.namespaceMatches(item, conditions)) try result.append(a, item);
+        }
+        std.mem.sort(system.Namespace, result.items, {}, struct {
+            fn less(_: void, left: system.Namespace, right: system.Namespace) bool {
+                return left.oid < right.oid;
+            }
+        }.less);
+        for (result.items, 0..) |item, i| {
+            if (i != 0 and item.oid == result.items[i - 1].oid) return error.InvalidSqlBackendResponse;
+        }
+        return result.items;
     }
     fn openScan(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));

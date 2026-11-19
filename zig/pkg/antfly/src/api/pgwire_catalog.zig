@@ -23,6 +23,7 @@ const Element = local.sql_array_value.ElementType;
 const pg_type_name = "pg_type";
 const pg_type_storage = "\x00pg_catalog.pg_type";
 const pg_catalog_oid = 11;
+const pg_namespace_storage = "\x00pg_catalog.pg_namespace";
 const pg_auth_members_storage = "\x00pg_catalog.pg_auth_members";
 const pg_roles_storage = "\x00pg_catalog.pg_roles";
 pub const Role = struct {
@@ -33,10 +34,21 @@ pub const Role = struct {
 pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?catalog.Table {
     const roles = std.mem.eql(u8, name.table, "pg_roles");
     const members = std.mem.eql(u8, name.table, "pg_auth_members");
-    if (!roles and !members and !std.mem.eql(u8, name.table, pg_type_name)) return null;
+    const namespaces = std.mem.eql(u8, name.table, "pg_namespace");
+    if (!roles and !members and !namespaces and !std.mem.eql(u8, name.table, pg_type_name)) return null;
     if (name.namespace) |namespace| if (!std.mem.eql(u8, namespace, "pg_catalog")) return null;
     if (name.database) |qualified| if (!std.mem.eql(u8, qualified, database)) return error.Forbidden;
     if (action != .read) return error.SqlReadOnlyTransaction;
+    if (namespaces) return .{
+        .id = 2615,
+        .physical_name = pg_namespace_storage,
+        .schema_version = 1,
+        .scope = .{ .database = database, .namespace = "pg_catalog", .name = "pg_namespace", .revision = 1 },
+        .columns = &.{
+            .{ .name = "oid", .path = "oid", .type = .integer, .nullable = false },
+            .{ .name = "nspname", .path = "nspname", .type = .string, .nullable = false },
+        },
+    };
     if (members) return .{
         .id = 1261,
         .physical_name = pg_auth_members_storage,
@@ -90,7 +102,94 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
 }
 
 pub fn owns(table: catalog.Table) bool {
-    return std.mem.eql(u8, table.physical_name, pg_type_storage) or isRoles(table) or isMemberships(table);
+    return std.mem.eql(u8, table.physical_name, pg_type_storage) or isRoles(table) or isMemberships(table) or isNamespaces(table);
+}
+
+pub fn isNamespaces(table: catalog.Table) bool {
+    return std.mem.eql(u8, table.physical_name, pg_namespace_storage);
+}
+
+pub const Namespace = struct { oid: u32, name: []const u8 };
+pub const builtin_namespace: Namespace = .{ .oid = pg_catalog_oid, .name = "pg_catalog" };
+
+pub fn namespaceMatches(item: Namespace, conditions: []const catalog.Condition) !bool {
+    for (conditions) |condition| {
+        const value: std.json.Value = if (std.mem.eql(u8, condition.column, "oid"))
+            .{ .integer = item.oid }
+        else if (std.mem.eql(u8, condition.column, "nspname"))
+            .{ .string = item.name }
+        else
+            return error.InvalidSqlBackendResponse;
+        if (condition.op == .is_null) return false;
+        if (condition.op == .is_not_null) continue;
+        if (condition.value == .null) return false;
+        const order = try local.sql_scalar.compare(value, condition.value);
+        if (!switch (condition.op) {
+            .eq => order == .eq,
+            .neq => order != .eq,
+            .lt => order == .lt,
+            .lte => order != .gt,
+            .gt => order == .gt,
+            .gte => order != .lt,
+            .is_null, .is_not_null => unreachable,
+        }) return false;
+    }
+    return true;
+}
+pub fn namespaceOid(id: u64) u32 {
+    if (id == local.system_catalog_domain.default_namespace_id) return 2200;
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, id, .big);
+    return local.sql_scalar.postgresRoleOid(&encoded);
+}
+
+fn namespacePage(a: std.mem.Allocator, items: []const Namespace, start: usize, limit: u32) !catalog.Page {
+    var arena = std.heap.ArenaAllocator.init(a);
+    errdefer arena.deinit();
+    const scratch = arena.allocator();
+    const end = @min(items.len, start +| limit);
+    const rows = try scratch.alloc(catalog.Row, end - start);
+    for (items[start..end], rows) |item, *entry| {
+        var value: std.json.ObjectMap = .empty;
+        try value.put(scratch, "oid", .{ .integer = item.oid });
+        try value.put(scratch, "nspname", .{ .string = try scratch.dupe(u8, item.name) });
+        entry.* = .{ .id = try std.fmt.allocPrint(scratch, "{d:0>10}", .{item.oid}), .version = 1, .value = .{ .object = value } };
+    }
+    return .{ .rows = rows, .owned_arena = arena, .after = if (end < items.len) try std.fmt.allocPrint(scratch, "{d}", .{end}) else null };
+}
+
+pub fn scanNamespaces(a: std.mem.Allocator, request: catalog.Scan, items: []const Namespace) !catalog.Page {
+    if (request.search != null) return error.UnsupportedSqlShape;
+    return namespacePage(a, items, try startOf(request.after, items.len), request.limit);
+}
+
+pub fn openNamespaces(a: std.mem.Allocator, request: catalog.Scan, items: []const Namespace) !catalog.Cursor {
+    if (request.search != null) return error.UnsupportedSqlShape;
+    const start = try startOf(request.after, items.len);
+    const Namespaces = struct {
+        arena: std.heap.ArenaAllocator,
+        items: []Namespace,
+        index: usize,
+        fn next(raw: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const result = try namespacePage(alloc, self.items, self.index, limit);
+            self.index += result.rows.len;
+            return result;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var arena = self.arena;
+            arena.deinit();
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    errdefer arena.deinit();
+    const scratch = arena.allocator();
+    const entries = try scratch.dupe(Namespace, items);
+    for (entries) |*entry| entry.name = try scratch.dupe(u8, entry.name);
+    const cursor = try scratch.create(Namespaces);
+    cursor.* = .{ .arena = arena, .items = entries, .index = start };
+    return .{ .ptr = cursor, .next = Namespaces.next, .close = Namespaces.close, .estimated_rows = items.len - start };
 }
 
 pub fn isMemberships(table: catalog.Table) bool {
@@ -231,10 +330,10 @@ fn row(alloc: std.mem.Allocator, item: Type) !catalog.Row {
     return .{ .id = try std.fmt.allocPrint(alloc, "{d:0>10}", .{item.oid}), .version = 1, .value = .{ .object = value } };
 }
 
-fn startOf(after: ?[]const u8) !usize {
+fn startOf(after: ?[]const u8, length: usize) !usize {
     const token = after orelse return 0;
     const index = std.fmt.parseInt(usize, token, 10) catch return error.InvalidSqlBackendResponse;
-    if (index > types.len) return error.InvalidSqlBackendResponse;
+    if (index > length) return error.InvalidSqlBackendResponse;
     return index;
 }
 
@@ -250,7 +349,7 @@ fn page(a: std.mem.Allocator, start: usize, limit: u32) !catalog.Page {
 
 pub fn scan(a: std.mem.Allocator, request: catalog.Scan) !catalog.Page {
     if (request.search != null) return error.UnsupportedSqlShape;
-    return page(a, try startOf(request.after), request.limit);
+    return page(a, try startOf(request.after, types.len), request.limit);
 }
 
 const Cursor = struct {
@@ -272,7 +371,7 @@ const Cursor = struct {
 
 pub fn open(a: std.mem.Allocator, request: catalog.Scan) !catalog.Cursor {
     if (request.search != null) return error.UnsupportedSqlShape;
-    const index = try startOf(request.after);
+    const index = try startOf(request.after, types.len);
     const cursor = try a.create(Cursor);
     cursor.* = .{ .alloc = a, .index = index };
     return .{ .ptr = cursor, .next = Cursor.next, .close = Cursor.close, .estimated_rows = types.len - index };
@@ -317,4 +416,28 @@ test "pgwire pg_roles describes only the supplied authenticated role" {
     var exhausted = try cursor.next(cursor.ptr, a, 1);
     defer exhausted.deinit();
     try std.testing.expectEqual(@as(usize, 0), exhausted.rows.len);
+}
+
+test "pgwire pg_namespace OIDs join type rows and cursors own the captured names" {
+    const a = std.testing.allocator;
+    const table = (try resolve(.{ .namespace = "pg_catalog", .table = "pg_namespace" }, .read, "default")).?;
+    try std.testing.expect(isNamespaces(table));
+    const lookup: []const catalog.Condition = &.{.{ .column = "nspname", .op = .eq, .value = .{ .string = "public" } }};
+    try std.testing.expect(!try namespaceMatches(builtin_namespace, lookup));
+    try std.testing.expect(try namespaceMatches(.{ .oid = 2200, .name = "public" }, lookup));
+    const request: catalog.Scan = .{ .fields = &.{}, .limit = 1 };
+    var public_name = "public".*;
+    var cursor = try openNamespaces(a, request, &.{ builtin_namespace, .{ .oid = namespaceOid(local.system_catalog_domain.default_namespace_id), .name = &public_name } });
+    defer cursor.close(cursor.ptr);
+    @memset(&public_name, 'x');
+    var first = try cursor.next(cursor.ptr, a, 1);
+    defer first.deinit();
+    var type_rows = try scan(a, request);
+    defer type_rows.deinit();
+    try std.testing.expectEqual(first.rows[0].value.object.get("oid").?.integer, type_rows.rows[0].value.object.get("typnamespace").?.integer);
+    try std.testing.expectEqualStrings("pg_catalog", first.rows[0].value.object.get("nspname").?.string);
+    var second = try cursor.next(cursor.ptr, a, 1);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(i64, 2200), second.rows[0].value.object.get("oid").?.integer);
+    try std.testing.expectEqualStrings("public", second.rows[0].value.object.get("nspname").?.string);
 }

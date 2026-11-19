@@ -150,6 +150,10 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             )
             + " FROM pg_roles r WHERE r.rolname = current_user"
         )
+        namespace_query = (
+            "SELECT n.oid, n.nspname, t.typname FROM pg_catalog.pg_namespace n "
+            "JOIN pg_catalog.pg_type t ON n.oid = t.typnamespace WHERE t.oid = 23"
+        )
         discovery = subprocess.check_output(
             [
                 psql,
@@ -186,12 +190,25 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
         assert discovery[5:] == ["f", "t|t|f|f|f|f"]
         extended = subprocess.check_output(
             [psql, *connection, "-XAt", "-v", "ON_ERROR_STOP=1"],
-            input=f"{role_query} \\bind\n\\g\n{membership_query} \\bind\n\\g\n",
+            input="".join(
+                f"{query} \\bind\n\\g\n"
+                for query in (
+                    role_query,
+                    membership_query,
+                    namespace_query,
+                    "SELECT oid,nspname FROM pg_catalog.pg_namespace WHERE nspname = 'public'",
+                )
+            ),
             env=env,
             text=True,
             timeout=40,
         ).splitlines()
-        assert extended == [discovery[4], discovery[6]]
+        assert extended == [
+            discovery[4],
+            discovery[6],
+            "11|pg_catalog|int4",
+            "2200|public",
+        ]
         sql("CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT)")
         if export_snapshot:
             sql("ALTER TABLE smoke REPLICA IDENTITY FULL")
