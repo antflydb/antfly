@@ -243,6 +243,7 @@ pub const View = struct {
     by_name: std.StringHashMapUnmanaged(usize),
     schema_search_path: ?[]const []const u8 = null,
     snapshot_lsn: ?u64 = null,
+    transaction_xid: ?u64 = null,
 
     pub fn capture(backing: std.mem.Allocator, owner: Owner, scope: Scope, overlay: []const OverlayEntry) !View {
         var arena = std.heap.ArenaAllocator.init(backing);
@@ -590,6 +591,18 @@ test "SQL current_setting evaluates from one authorized pinned view" {
     try std.testing.expectEqualStrings("1/2", wal_result.output.rows[0][0].string);
     try std.testing.expect(wal_result.output.rows[0][1].bool);
     with_capture.setting_capture.?.snapshot_lsn = null;
+
+    var xid = try compiler.compile(std.testing.allocator, "SELECT CASE pg_is_in_recovery() WHEN 't' THEN '0'::xid8 ELSE pg_current_xact_id() END, '18446744073709551615'::pg_catalog.xid8", .{});
+    defer xid.deinit();
+    try std.testing.expect(xid.uses_transaction_xid);
+    try std.testing.expectError(error.NoActiveSqlTransaction, runtime.execute(std.testing.allocator, with_capture, &xid, &.{}, .{}));
+    with_capture.setting_capture.?.transaction_xid = 9007199254740993;
+    var xid_result = try runtime.execute(std.testing.allocator, with_capture, &xid, &.{}, .{});
+    defer xid_result.deinit();
+    try std.testing.expectEqualStrings("9007199254740993", xid_result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("18446744073709551615", xid_result.output.rows[0][1].string);
+    try std.testing.expectError(error.SqlNumericOutOfRange, compiler.compile(std.testing.allocator, "SELECT '18446744073709551616'::xid8", .{}));
+    with_capture.setting_capture.?.transaction_xid = null;
 
     var schemas = try compiler.compile(std.testing.allocator, "SELECT current_schemas(false)[1], pg_catalog.current_schemas(true)[1], current_schemas(true)[3], current_schemas(NULL) IS NULL", .{});
     defer schemas.deinit();

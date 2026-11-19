@@ -3190,6 +3190,12 @@ const GuardedCatalog = struct {
     fn settingCapture(self: *GuardedCatalog, alloc: std.mem.Allocator, adapter: *execution.Adapter, compiled: *const compiler.Compiled) !@FieldType(catalog.Backend, "setting_capture") {
         if (!compiled.uses_current_setting) return null;
         var capture = adapter.settingCapture().?;
+        if (compiled.uses_transaction_xid) if (self.authority.request.session_id) |encoded| {
+            const transaction = try @import("distributed_txn.zig").parseTxnIdHex(encoded);
+            const digest = publication_control.hash(.{ .domain = "antfly:pg-sql-transaction-id:v1", .transaction = transaction });
+            // Keep the compatibility ID in JDBC's signed long range.
+            capture.transaction_xid = 3 + std.mem.readInt(u64, digest[0..8], .big) % (@as(u64, std.math.maxInt(i64)) - 2);
+        };
         if (compiled.uses_snapshot_lsn) if (self.authority.importedSnapshot()) |snapshot| {
             const identity: ReplicationIdentity = .{ .context = self.authority.credential, .read = Adapter.replicationIdentity };
             const context = try self.authority.context();

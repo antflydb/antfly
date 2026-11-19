@@ -83,6 +83,7 @@ pub const Compiled = struct {
     uses_current_setting: bool = false,
     uses_current_schemas: bool = false,
     uses_snapshot_lsn: bool = false,
+    uses_transaction_xid: bool = false,
 
     pub fn deinit(self: *Compiled) void {
         self.arena.deinit();
@@ -162,7 +163,7 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
     const statement = try parser.statement();
     _ = parser.take(.semicolon);
     if (parser.pos != tokens.items.len) return parser.fail(error.UnsupportedSqlShape, "unexpected trailing SQL; only one supported statement is allowed");
-    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting, .uses_current_schemas = parser.uses_current_schemas, .uses_snapshot_lsn = parser.uses_snapshot_lsn };
+    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting, .uses_current_schemas = parser.uses_current_schemas, .uses_snapshot_lsn = parser.uses_snapshot_lsn, .uses_transaction_xid = parser.uses_transaction_xid };
 }
 
 fn lexicalError(kind: lexer.LexErrorKind) Error {
@@ -331,6 +332,7 @@ const Parser = struct {
     uses_current_setting: bool = false,
     uses_current_schemas: bool = false,
     uses_snapshot_lsn: bool = false,
+    uses_transaction_xid: bool = false,
     relation_depth: usize = 0,
 
     fn fail(self: *Parser, err: Error, message: []const u8) Error {
@@ -524,7 +526,7 @@ const Parser = struct {
                 return if (t.owned) std.mem.eql(u8, t.text, expected) else std.ascii.eqlIgnoreCase(t.text, expected);
             }
         }.name;
-        return matches(schema, "pg_catalog") and (matches(function, "current_schemas") or matches(function, "pg_is_in_recovery") or matches(function, "pg_current_wal_lsn") or matches(function, "pg_last_wal_receive_lsn"));
+        return matches(schema, "pg_catalog") and (matches(function, "current_schemas") or matches(function, "pg_is_in_recovery") or matches(function, "pg_current_wal_lsn") or matches(function, "pg_last_wal_receive_lsn") or matches(function, "pg_current_xact_id"));
     }
 
     fn scalar(self: *Parser, depth: usize, minimum: u8) Error!*const ast.Scalar {
@@ -629,6 +631,10 @@ const Parser = struct {
             if (std.mem.eql(u8, name_value, "pg_current_wal_lsn")) {
                 self.uses_current_setting = true;
                 self.uses_snapshot_lsn = true;
+            }
+            if (std.mem.eql(u8, name_value, "pg_current_xact_id")) {
+                self.uses_current_setting = true;
+                self.uses_transaction_xid = true;
             }
             var args: std.ArrayList(*const ast.Scalar) = .empty;
             const distinct = self.keyword(.distinct);
@@ -2082,6 +2088,23 @@ const Parser = struct {
             return self.fail(error.SqlInvalidTextRepresentation, "unknown PostgreSQL catalog relation");
         }
         self.pos = start;
+        const xid_qualified = self.ddlWord("pg_catalog");
+        if ((!xid_qualified or self.take(.dot)) and self.ddlWord("xid8")) {
+            if (operand.* != .literal) return self.fail(error.UnsupportedSqlShape, "expected a literal xid8");
+            if (operand.literal == .null) return self.scalarNode(.{ .cast = .{ .operand = operand, .type = .number, .element_type = .numeric } });
+            const spelling = switch (operand.literal) {
+                .string => |value_| std.mem.trim(u8, value_, " \t\r\n"),
+                .numeric => |value_| value_,
+                .integer => |value_| try std.fmt.allocPrint(self.alloc, "{d}", .{value_}),
+                else => return self.fail(error.UnsupportedSqlShape, "expected a literal xid8"),
+            };
+            const digits = if (spelling.len > 0 and spelling[0] == '+') spelling[1..] else spelling;
+            if (digits.len == 0) return self.fail(error.SqlInvalidTextRepresentation, "expected an unsigned decimal transaction ID");
+            for (digits) |char| if (!std.ascii.isDigit(char)) return self.fail(error.SqlInvalidTextRepresentation, "expected an unsigned decimal transaction ID");
+            const xid = std.fmt.parseInt(u64, digits, 10) catch return self.fail(error.SqlNumericOutOfRange, "xid8 exceeds unsigned 64-bit range");
+            return self.scalarNode(.{ .literal = .{ .numeric = try std.fmt.allocPrint(self.alloc, "{d}", .{xid}) } });
+        }
+        self.pos = start;
         const kind = try self.castType();
         return self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind.type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier } });
     }
@@ -2551,7 +2574,7 @@ const Parser = struct {
             },
             .cast => |part| try self.persistentExpression(part.operand, generated),
             .call => |part| {
-                if (std.mem.eql(u8, part.name, "current_schemas") or std.mem.eql(u8, part.name, "pg_current_wal_lsn")) return self.fail(error.UnsupportedSqlShape, "schema expressions cannot capture session state");
+                if (std.mem.eql(u8, part.name, "current_schemas") or std.mem.eql(u8, part.name, "pg_current_wal_lsn") or std.mem.eql(u8, part.name, "pg_current_xact_id")) return self.fail(error.UnsupportedSqlShape, "schema expressions cannot capture session state");
                 if (part.subquery != null or part.star or part.distinct or part.filter != null or part.window != null or part.within_group != null)
                     return self.fail(error.UnsupportedSqlShape, "subqueries, aggregates and windows are not allowed in schema expressions");
                 for (part.args) |arg| try self.persistentExpression(arg, generated);

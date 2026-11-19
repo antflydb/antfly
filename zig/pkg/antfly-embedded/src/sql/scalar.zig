@@ -281,7 +281,7 @@ pub const EvalLimits = struct {
     regex_checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     regex_context: ?*anyopaque = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, value_identity, is_missing, date_bin, @"$array_subscript", @"$series_step", current_schemas, pg_current_wal_lsn };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, value_identity, is_missing, date_bin, @"$array_subscript", @"$series_step", current_schemas, pg_current_wal_lsn, pg_current_xact_id };
 
 fn regexFunction(function: Function) ?regex_functions.Function {
     return switch (function) {
@@ -746,6 +746,7 @@ pub const Program = struct {
                 .current_setting,
                 .current_schemas,
                 .pg_current_wal_lsn,
+                .pg_current_xact_id,
                 .@"$single",
                 .trunc,
                 .sign,
@@ -2630,7 +2631,7 @@ pub fn validateFunctionArity(function: Function, count: usize) !void {
     }
     const valid = switch (function) {
         .value_identity, .is_missing, .current_schemas => count == 1,
-        .pg_current_wal_lsn => count == 0,
+        .pg_current_wal_lsn, .pg_current_xact_id => count == 0,
         .regexp_like, .regexp_count, .regexp_instr, .regexp_substr, .regexp_replace => unreachable,
         .array_position => count == 2 or count == 3,
         .array_positions, .array_remove, .array_append, .array_prepend, .array_cat => count == 2,
@@ -2844,6 +2845,10 @@ const Binder = struct {
                     if (call.args.len == 0) return error.InvalidSqlParameters;
                     for (call.args) |arg| _ = try self.infer(arg, depth + 1);
                     break :blk .{ .kind = .integer, .nullable = false };
+                }
+                if (std.mem.eql(u8, call.name, "pg_current_xact_id")) {
+                    if (call.args.len != 0) return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = .number, .element_type = .numeric, .nullable = false };
                 }
                 if (std.mem.eql(u8, call.name, "pg_current_wal_lsn") or std.mem.eql(u8, call.name, "pg_last_wal_receive_lsn")) {
                     if (call.args.len != 0) return error.SqlUndefinedFunction;
@@ -4270,6 +4275,14 @@ const Evaluator = struct {
                             break :ordinary if (mixed_number) try mixedNumberQuantified(array.*, element, compare_op, every.bool, &work) else try array.quantified(element, compare_op, if (every.bool) .all else .any, &work);
                         };
                         break :blk if (accepted) |value| Datum.json(.{ .bool = value }) else .{};
+                    },
+                    .pg_current_xact_id => {
+                        const view = self.program.settings orelse return error.NoActiveSqlTransaction;
+                        const xid = view.transaction_xid orelse return error.NoActiveSqlTransaction;
+                        var buffer: [20]u8 = undefined;
+                        const text = std.fmt.bufPrint(&buffer, "{d}", .{xid}) catch unreachable;
+                        var work = self.workBudget();
+                        break :blk try numericTextLeaky(self.alloc, text, &work);
                     },
                     .pg_current_wal_lsn => {
                         const view = self.program.settings orelse return error.SqlSnapshotLsnUnavailable;

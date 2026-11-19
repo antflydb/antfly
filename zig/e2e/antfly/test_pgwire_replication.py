@@ -351,6 +351,10 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                     "SELECT CASE pg_is_in_recovery() WHEN 't' THEN pg_last_wal_receive_lsn() "
                     "ELSE pg_current_wal_lsn() END",
                     "-c",
+                    "SELECT CASE pg_is_in_recovery() WHEN 't' THEN '0'::xid8 ELSE pg_current_xact_id() END",
+                    "-c",
+                    "SELECT pg_catalog.pg_current_xact_id()",
+                    "-c",
                     "SELECT content FROM smoke",
                     "-c",
                     "COMMIT",
@@ -361,11 +365,16 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                 timeout=40,
             )
             assert copied.returncode == 0, copied.stdout + copied.stderr
-            assert copied.stdout.splitlines() == [
+            copied_lines = copied.stdout.splitlines()
+            xid = int(copied_lines[4])
+            assert 3 <= xid <= (1 << 63) - 1
+            assert copied_lines == [
                 "BEGIN",
                 "SET",
                 "SET",
                 point,
+                str(xid),
+                str(xid),
                 "snapshot-before-cut",
                 "COMMIT",
             ]
