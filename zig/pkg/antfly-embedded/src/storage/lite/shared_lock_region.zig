@@ -819,6 +819,11 @@ pub const Region = struct {
     /// version of this reasoning.
     io: Io,
 
+    /// Test support: leaves `writer_holder` naming a writer that died.
+    pub fn markDeadWriterForTest(self: *Region, pid: u32) void {
+        self.header().writer_holder.store(packHolderGen(pid, self.own_liveness_slot, self.own_liveness_generation +% 1), .release);
+    }
+
     fn header(self: *const Region) *Header {
         return @ptrCast(@alignCast(self.mapping.ptr));
     }
@@ -1648,7 +1653,13 @@ pub const Region = struct {
                 if (self.writerHolderDead()) {
                     self.recoverDeadWriter(rec) catch |err| switch (err) {
                         error.WriterHolderStillAlive => {},
-                        else => return err,
+                        else => {
+                            // Give the turn up so the next writer can retry
+                            // the recovery; a live liveness slot would
+                            // otherwise keep this ticket at the head.
+                            self.finishTurn(my_ticket);
+                            return err;
+                        },
                     };
                     continue;
                 }
@@ -1727,7 +1738,9 @@ pub const Region = struct {
     /// if a future caller ever doesn't.
     fn ringHasRoom(self: *const Region) bool {
         const hdr = self.header();
-        const outstanding = hdr.writer_ticket_tail.load(.monotonic) -% hdr.writer_ticket_head.load(.monotonic);
+        // In `head`'s 32-bit width: past 2^32 turns the full 64-bit `tail`
+        // would otherwise read as a permanently full ring.
+        const outstanding = @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))) -% hdr.writer_ticket_head.load(.monotonic);
         return outstanding < hdr.max_readers;
     }
 
@@ -1764,8 +1777,15 @@ pub const Region = struct {
     /// the waiters. Any number of callers may run it concurrently: each
     /// step re-reads `head` and moves it only by compare-and-swap.
     fn skipResolvedHeads(self: *Region) void {
+        if (self.advanceResolvedHeads()) countedWriterFutexWakeShared(&self.header().writer_ticket_head.raw);
+    }
+
+    /// `skipResolvedHeads` without the wake; true when this call moved
+    /// `head`. A poller that finds a live head wakes nobody.
+    fn advanceResolvedHeads(self: *Region) bool {
         const hdr = self.header();
         const slots = self.ticketSlots();
+        var advanced = false;
         while (true) {
             const head = hdr.writer_ticket_head.load(.acquire);
             // Published tickets only: a claim is visible in its slot before
@@ -1773,9 +1793,9 @@ pub const Region = struct {
             if (head == @as(u32, @truncate(hdr.writer_ticket_tail.load(.acquire)))) break;
             const word = slots[head % hdr.max_readers].load(.acquire);
             if (!self.ticketResolvable(word, head)) break;
-            _ = self.advanceHeadFrom(head, word);
+            if (self.advanceHeadFrom(head, word)) advanced = true;
         }
-        countedWriterFutexWakeShared(&hdr.writer_ticket_head.raw);
+        return advanced;
     }
 
     /// Gives up ticket `ticket`, which has not had its turn. Its owner is
@@ -1800,7 +1820,9 @@ pub const Region = struct {
         const advanced = self.advanceHeadFrom(ticket, word);
         // Nobody else resolves a live owner's ticket at the head.
         std.debug.assert(advanced);
-        self.skipResolvedHeads();
+        _ = self.advanceResolvedHeads();
+        // The handoff itself is progress: wake the next ticket.
+        countedWriterFutexWakeShared(&self.header().writer_ticket_head.raw);
     }
 
     /// Releases a writer hold taken by `acquireWriter`/`tryAcquireWriter`.
@@ -1976,11 +1998,15 @@ pub const Region = struct {
             const prior = ticketWordTag(existing) -% 1;
             const head = hdr.writer_ticket_head.load(.acquire);
             // A ticket already behind `head` whose resolver has not freed
-            // (or died before freeing) its slot; or a competing claim of
-            // this same ticket whose owner died before advancing `tail`.
+            // (or died before freeing) its slot.
             const behind = head -% prior -% 1 < (@as(u32, 1) << 31);
-            const dead_same = prior == ticket and self.isReferenceDead(ticketWordLivenessSlot(existing), ticketWordGeneration(existing));
-            if (behind or dead_same) _ = slot.cmpxchgStrong(existing, 0, .acq_rel, .monotonic);
+            // A competing claim of this same ticket whose owner died before
+            // publishing it. Once `tail` has moved past it the ticket is
+            // published: only the head-advance path may retire it, so this
+            // stale contender must leave it.
+            const dead_unpublished = prior == ticket and hdr.writer_ticket_tail.load(.acquire) == t and
+                self.isReferenceDead(ticketWordLivenessSlot(existing), ticketWordGeneration(existing));
+            if (behind or dead_unpublished) _ = slot.cmpxchgStrong(existing, 0, .acq_rel, .monotonic);
             return null;
         }
         if (hdr.writer_ticket_tail.cmpxchgStrong(t, t +% 1, .acq_rel, .monotonic) != null) {
@@ -4030,6 +4056,53 @@ const TicketFixture = struct {
         self.tmp.cleanup();
     }
 };
+
+test "shared lock region: a stale claimant leaves a published dead ticket for the head path" {
+    var fixture = try TicketFixture.init("region-stale-claimant.aflite");
+    defer fixture.deinit();
+    const region = &fixture.region;
+    const hdr = region.header();
+    const pid: u32 = @bitCast(std.c.getpid());
+    // A contender read tail `t` and paused. Another process claimed `t`,
+    // published it, and died before its turn.
+    const t = hdr.writer_ticket_tail.load(.monotonic);
+    const ticket: u32 = @truncate(t);
+    const dead = packTicketWord(ticket, pid +% 1, region.own_liveness_slot, region.own_liveness_generation +% 1);
+    region.ticketSlots()[ticket % hdr.max_readers].store(dead, .release);
+    hdr.writer_ticket_tail.store(t +% 1, .release);
+    // The contender resumes with its stale `t`.
+    try std.testing.expectEqual(@as(?u32, null), region.tryClaimTicket(t, pid));
+    try std.testing.expectEqual(dead, region.ticketSlots()[ticket % hdr.max_readers].load(.acquire));
+    // The head path still retires the dead ticket.
+    _ = try region.acquireWriterFairBounded(std.testing.io, pid, Io.Clock.now(.awake, std.testing.io).addDuration(.fromSeconds(1)), null);
+    region.releaseWriter();
+    try std.testing.expectEqual(@as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))), hdr.writer_ticket_head.load(.monotonic));
+}
+
+test "shared lock region: the queue keeps admitting contended writers across the 32-bit head wrap" {
+    var fixture = try TicketFixture.init("region-head-wrap.aflite");
+    defer fixture.deinit();
+    const region = &fixture.region;
+    const hdr = region.header();
+    const pid: u32 = @bitCast(std.c.getpid());
+    const start: u64 = std.math.maxInt(u32) - 1;
+    hdr.writer_ticket_head.store(@truncate(start), .release);
+    hdr.writer_ticket_tail.store(start, .release);
+    for (0..4) |_| {
+        const ticket = region.tryClaimTicket(hdr.writer_ticket_tail.load(.monotonic), pid).?;
+        region.finishTurn(ticket);
+    }
+    try std.testing.expect(hdr.writer_ticket_tail.load(.monotonic) > std.math.maxInt(u32));
+    try std.testing.expect(region.ringHasRoom());
+    // A contended writer: queued behind a ticketless hold, then admitted.
+    try std.testing.expect(region.tryAcquireWriterFair(pid));
+    const queued = region.tryClaimTicket(hdr.writer_ticket_tail.load(.monotonic), pid).?;
+    region.releaseWriter();
+    try std.testing.expect(region.tryAcquireWriter(pid));
+    region.finishTurn(queued);
+    region.releaseWriter();
+    try std.testing.expectEqual(@as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))), hdr.writer_ticket_head.load(.monotonic));
+}
 
 test "shared lock region: resolving the same abandoned ticket twice never passes tail" {
     var fixture = try TicketFixture.init("region-double-resolve.aflite");
