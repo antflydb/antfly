@@ -1444,7 +1444,8 @@ pub const IndexedObjectStore = struct {
                 if (write.ref.pack != null or write.ref.bytes != write.bytes.len or !std.mem.eql(u8, &write.ref.attempt, &self.attempt)) return error.InvalidGraphPage;
                 total = try std.math.add(usize, total, write.bytes.len);
             }
-            if (total > tree.Forest.max_bytes + tree.max_write_batch * 4096) return error.InvalidObjectBatch;
+            // External WAL payload pages can exceed the forest batching target.
+            if (total > tree.max_pack_bytes) return error.InvalidObjectBatch;
             const a = self.owner.alloc;
             const bytes = try a.alloc(u8, total);
             defer a.free(bytes);
@@ -1813,6 +1814,29 @@ test "serverless indexed WAL survives reopen, retains idempotency and never rese
     try std.testing.expectEqual(@as(u64, 1), try second.appendIdempotent("docs", 10, "hello", "op-1"));
     try std.testing.expectEqual(@as(u64, 3), try second.append("docs", 30, "later"));
     try std.testing.expectEqual(@as(u64, 0), try second.latestLsn("other-table"));
+}
+
+test "serverless indexed WAL replays large packed payloads after reopen" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("test");
+    var writer = try IndexedObjectStore.init(a, client, "test", "packed-payload");
+    defer writer.deinit();
+    writer.packed_pages_enabled = true;
+    const payload = try a.alloc(u8, 512 * 1024 + 1);
+    defer a.free(payload);
+    for (payload, 0..) |*byte, index| byte.* = @intCast(index % 251);
+    try std.testing.expectEqual(@as(u64, 1), try writer.appendIdempotent("docs", 10, payload, "large"));
+
+    var reader = try IndexedObjectStore.init(a, client, "test", "packed-payload");
+    defer reader.deinit();
+    const records = try reader.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 1 });
+    defer types.freeRecords(a, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqualSlices(u8, payload, records[0].payload);
+    try std.testing.expectEqual(@as(u64, 1), try reader.appendIdempotent("docs", 10, payload, "large"));
 }
 
 test "serverless indexed WAL compaction preserves receipts and collection barriers are retryable" {

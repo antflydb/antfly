@@ -2357,8 +2357,9 @@ def test_standalone_postgres_cdc_snapshot_completes_with_embeddings_index(
     )
 
 
+@pytest.mark.parametrize("extra_rows", [0, 16_384], ids=["single-row", "multi-file"])
 def test_standalone_postgres_bootstraps_and_streams_to_writable_iceberg(
-    pg_cdc_source, tmp_path
+    pg_cdc_source, tmp_path, extra_rows
 ):
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     config = tmp_path / "antfly.json"
@@ -2393,12 +2394,26 @@ def test_standalone_postgres_bootstraps_and_streams_to_writable_iceberg(
         )
 
     def rows():
-        return call("POST", "/sql", {"statement": "SELECT id, name FROM cdc_iceberg"})[
-            "rows"
-        ]
+        return call(
+            "POST",
+            "/sql",
+            {
+                "statement": "SELECT id, name FROM cdc_iceberg WHERE id IN ('user-1', 'user-2')"
+            },
+        )["rows"]
+
+    def check_row_count():
+        result = call("POST", "/sql", {"statement": "SELECT COUNT(*) FROM cdc_iceberg"})
+        assert int(result["rows"][0][0]) == extra_rows + 1
 
     try:
         _run_psql(f"alter table {provider} replica identity full")
+        if extra_rows:
+            _run_psql(f"""
+                insert into {provider} (id, name, tier)
+                select 'seed-' || id, 'Seed', 'gold'
+                from generate_series(1, {extra_rows}) as seed(id)
+            """)
         call(
             "POST",
             table,
@@ -2472,6 +2487,7 @@ def test_standalone_postgres_bootstraps_and_streams_to_writable_iceberg(
         cut = initial["antfly.cdc.bootstrap-cut"]
         assert cut == initial["antfly.cdc.checkpoint"]
         assert rows() == [["user-1", "Alice"]]
+        check_row_count()
 
         server.pause(crash=True)
         _run_psql(
@@ -2483,5 +2499,6 @@ def test_standalone_postgres_bootstraps_and_streams_to_writable_iceberg(
         assert resumed["antfly.cdc.bootstrap-cut"] == cut
         assert resumed["antfly.cdc.checkpoint"] != cut
         assert rows() == [["user-2", "Bob"]]
+        check_row_count()
     finally:
         server.stop()
