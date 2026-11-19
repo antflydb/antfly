@@ -81,8 +81,9 @@ root's terminal cursor before certification. Hosted data servers can advance
 a fenced scan through pinned group routes, using read-index lookups and ordered
 authority proposals for initialization, owner takeover, and page commits.
 Hosted readers use the pinned group route for local or authenticated remote
-lookups. Remote requests currently share the private lookup control-size
-limit. Distributed activation still needs a durable scheduler.
+lookups. Remote activation controls use the authenticated document-read POST
+route with a bound sized for a physical cursor. Distributed activation still
+needs a durable scheduler.
 An active source fence allows an ordered catalog change only when activation
 proofs match its pinned snapshot. Raft protocol version 31 gates these commands,
 DAG-bearing transaction prepare, and catalog activation proofs. The source-fence

@@ -1068,13 +1068,16 @@ pub const Operations = struct {
     ) Error!table_reads.LookupResponse {
         try request.ensureActive();
         if (input.options.relational_topology_json.len != 0) {
-            if (input.options.relational_topology_json.len > 4096) return error.InvalidArgument;
+            const dag_activation = @import("antfly_local_sources").storage_db_dag_activation_contract;
+            const max_topology_bytes = if (dag_activation.isLookupControl(input.options.relational_topology_json)) dag_activation.max_lookup_control_bytes else 4096;
+            if (input.options.relational_topology_json.len > max_topology_bytes) return error.InvalidArgument;
             const Probe = struct { transition_id: ?u64 = null, mode: ?[]const u8 = null };
             var probe = std.json.parseFromSlice(Probe, alloc, input.options.relational_topology_json, .{ .ignore_unknown_fields = true }) catch return error.InvalidArgument;
             defer probe.deinit();
             if (probe.value.mode) |mode| {
                 if (std.mem.eql(u8, mode, "dag_activation_checkpoint") or std.mem.eql(u8, mode, "dag_activation_source_page")) {
-                    if (input.key.len != 0 or input.consistency != .read_index or input.options.restore_staging_scope != null or
+                    if (!dag_activation.isLookupControl(input.options.relational_topology_json) or
+                        input.key.len != 0 or input.consistency != .read_index or input.options.restore_staging_scope != null or
                         input.options.restore_staging_plan_id != null or input.options.include_primary_digest or
                         input.options.fields.len != 0 or input.options.relational_integrity_catalog or
                         input.options.relational_integrity_action or input.options.relational_integrity_jobs_json.len != 0 or

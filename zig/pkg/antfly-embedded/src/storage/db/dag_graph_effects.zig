@@ -76,7 +76,7 @@ pub fn scanAccepted(alloc: A, txn: anytype, request: activation.ScanRequest, sta
     }
 
     const max_rows = 256;
-    const max_bytes = 512 * 1024;
+    const max_bytes = activation.max_source_page_bytes;
     var cursor = try txn.openPhysicalCursorAdapter();
     defer cursor.close();
     cursor.setUpperBound(upper);

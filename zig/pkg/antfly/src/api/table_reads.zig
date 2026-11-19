@@ -6956,9 +6956,7 @@ pub const HostedProvisionedTableReadSource = struct {
         // Activation controls use the pinned group instead of selecting a
         // group by document key. The recipient checks the exact root namespace
         // and durable source fence before serving the read.
-        if (std.mem.startsWith(u8, opts.relational_topology_json, "{\"mode\":\"dag_activation_checkpoint\"") or
-            std.mem.startsWith(u8, opts.relational_topology_json, "{\"mode\":\"dag_activation_source_page\""))
-        {
+        if (@import("antfly_local_sources").storage_db_dag_activation_contract.isLookupControl(opts.relational_topology_json)) {
             if (group_id != fence.route.group_id or key.len != 0 or consistency != .read_index)
                 return error.InvalidArgument;
             var destination = (try table_router.resolveGroupRoute(alloc, routed.catalog, routed.router.withBudget(.fromRequest(opts)), group_id, routePolicyForConsistency(.read_index))) orelse
