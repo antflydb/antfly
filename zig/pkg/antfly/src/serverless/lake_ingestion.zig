@@ -307,7 +307,7 @@ fn removeBootstrapStage(a: A, binding: Binding, options: Options, context: Conte
     const manifest = try std.fmt.allocPrint(a, "{s}.manifest", .{stage});
     var client = opened.client;
     const cancellation = catalog.types.contextCancellation(&context);
-    var root = client.getObject(opened.bucket, manifest, .{ .cancellation = cancellation }) catch |err| switch (err) {
+    var root = client.getObject(opened.bucket, manifest, .{ .max_response_bytes = max_bootstrap_manifest_bytes, .cancellation = cancellation }) catch |err| switch (err) {
         error.NotFound, error.ObjectNotFound, error.FileNotFound => {
             try removeBootstrapObject(&opened, context, stage);
             return;
@@ -345,6 +345,8 @@ fn bootstrapStageKey(a: A, base: []const u8, batch: Batch) ![]u8 {
 }
 
 const max_bootstrap_pages = 1024;
+// Each digest is a JSON array of 32 decimal bytes, with commas and brackets.
+const max_bootstrap_manifest_bytes = 2 + max_bootstrap_pages * (32 * 4 + 2);
 
 fn writeBootstrapPage(a: A, binding: Binding, options: Options, context: Context, batch: Batch, rows: []const V) ![32]u8 {
     if (rows.len == 0 or rows.len > max_group_changes) return error.LakeWriteTooLarge;
@@ -374,7 +376,7 @@ fn sealBootstrapPages(a: A, binding: Binding, options: Options, context: Context
     for (pages) |digest| {
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
-        var page = try readBootstrapPage(scratch.allocator(), &client, opened.bucket, context, stage, digest);
+        var page = try readBootstrapPage(scratch.allocator(), &client, opened.bucket, context, stage, digest, catalog.types.max_commit_bytes - total_bytes);
         defer page.deinit(client.allocator);
         if (page.body.len > catalog.types.max_commit_bytes - total_bytes) return error.LakeWriteTooLarge;
         total_bytes += page.body.len;
@@ -388,11 +390,15 @@ fn sealBootstrapPages(a: A, binding: Binding, options: Options, context: Context
     try writeImmutableBootstrap(&opened, context, manifest, bytes);
 }
 
-fn readBootstrapPage(a: A, client: *@import("objectstore").Client, bucket: []const u8, context: Context, stage: []const u8, digest: [32]u8) !@import("objectstore").GetResult {
+fn readBootstrapPage(a: A, client: *@import("objectstore").Client, bucket: []const u8, context: Context, stage: []const u8, digest: [32]u8, remaining_bytes: usize) !@import("objectstore").GetResult {
     try context.ensureActive();
+    if (remaining_bytes == 0) return error.LakeWriteTooLarge;
     const key = try std.fmt.allocPrint(a, "{s}.pages/{s}", .{ stage, &std.fmt.bytesToHex(digest, .lower) });
     defer a.free(key);
-    var page = try client.getObject(bucket, key, .{ .cancellation = catalog.types.contextCancellation(&context) });
+    var page = client.getObject(bucket, key, .{ .max_response_bytes = remaining_bytes, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
+        error.ResponseTooLarge => return error.LakeWriteTooLarge,
+        else => return err,
+    };
     errdefer page.deinit(client.allocator);
     var actual: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(page.body, &actual, .{});
@@ -404,7 +410,7 @@ fn readBootstrapPages(a: A, opened: *local.serverless_object_store_support.Opene
     var client = opened.client;
     const cancellation = catalog.types.contextCancellation(&context);
     const manifest = try std.fmt.allocPrint(a, "{s}.manifest", .{stage});
-    var root = client.getObject(opened.bucket, manifest, .{ .cancellation = cancellation }) catch |err| switch (err) {
+    var root = client.getObject(opened.bucket, manifest, .{ .max_response_bytes = max_bootstrap_manifest_bytes, .cancellation = cancellation }) catch |err| switch (err) {
         error.NotFound, error.ObjectNotFound, error.FileNotFound => return null,
         else => return err,
     };
@@ -414,7 +420,7 @@ fn readBootstrapPages(a: A, opened: *local.serverless_object_store_support.Opene
     var changes: std.ArrayList(Batch.Change) = .empty;
     var total_bytes: usize = 0;
     for (pages) |digest| {
-        var page = try readBootstrapPage(a, &client, opened.bucket, context, stage, digest);
+        var page = try readBootstrapPage(a, &client, opened.bucket, context, stage, digest, catalog.types.max_commit_bytes - total_bytes);
         defer page.deinit(client.allocator);
         if (page.body.len > catalog.types.max_commit_bytes - total_bytes) return error.LakeWriteTooLarge;
         total_bytes += page.body.len;
@@ -434,6 +440,7 @@ fn writeBootstrapStage(a: A, binding: Binding, options: Options, context: Contex
     const base = try prefix(a, opened.prefix, binding, options);
     const key = try bootstrapStageKey(a, base, batch);
     const bytes = try std.json.Stringify.valueAlloc(a, batch, .{});
+    if (bytes.len > catalog.types.max_commit_bytes) return error.LakeWriteTooLarge;
     try writeImmutableBootstrap(&opened, context, key, bytes);
 }
 
@@ -442,7 +449,10 @@ fn writeImmutableBootstrap(opened: *local.serverless_object_store_support.Opened
     try context.ensureActive();
     var stored = client.putObject(opened.bucket, key, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
         error.PreconditionFailed, error.ObjectAlreadyExists => {
-            var existing = try client.getObject(opened.bucket, key, .{ .cancellation = catalog.types.contextCancellation(&context) });
+            var existing = client.getObject(opened.bucket, key, .{ .max_response_bytes = bytes.len, .cancellation = catalog.types.contextCancellation(&context) }) catch |read_err| switch (read_err) {
+                error.ResponseTooLarge => return error.WalIdempotencyConflict,
+                else => return read_err,
+            };
             defer existing.deinit(client.allocator);
             if (!std.mem.eql(u8, bytes, existing.body)) return error.WalIdempotencyConflict;
             return context.ensureActive();
@@ -469,7 +479,7 @@ fn recoverPendingBootstrap(a: A, binding: Binding, unresolved: Options, context:
         if (try readBootstrapPages(a, &opened, context, key, expected)) |assembled| {
             break :blk try std.json.Stringify.valueAlloc(a, assembled, .{});
         }
-        var staged = client.getObject(opened.bucket, key, .{ .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
+        var staged = client.getObject(opened.bucket, key, .{ .max_response_bytes = catalog.types.max_commit_bytes, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
             error.NotFound, error.ObjectNotFound, error.FileNotFound => return false,
             else => return err,
         };
@@ -1391,6 +1401,7 @@ test "external lake filesystem WAL applies the managed PostgreSQL stream owner p
     const stage = try bootstrapStageKey(a, queue_prefix, try bootstrapIdentity(a, "postgres:9:2", "12", "cut", &.{"id"}));
     const staged_key = try std.fmt.allocPrint(a, "{s}.manifest", .{stage});
     const page_key = try std.fmt.allocPrint(a, "{s}.pages/{s}", .{ stage, &std.fmt.bytesToHex(digest, .lower) });
+    try std.testing.expectError(error.LakeWriteTooLarge, readBootstrapPage(a, &queue.client, queue.bucket, .{}, stage, digest, 1));
     var staged_object = try queue.client.statObject(queue.bucket, staged_key);
     staged_object.deinit(queue.client.allocator);
     try std.testing.expectEqual(@as(u64, 0), try watermark(a, bound.binding, options, .{}));
