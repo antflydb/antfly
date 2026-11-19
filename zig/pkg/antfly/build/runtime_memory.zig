@@ -649,9 +649,14 @@ test "native Linux LLVM Debug claims cover measured peaks and account for overla
     fallback = profile;
     fallback.strip = true;
     try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    // Without CPU inference this is the production-archive build, which
+    // claims its own measured peak instead of the fallback.
     fallback = profile;
     fallback.cpu_inference = false;
-    try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    const archive_peak: usize = 17_568_182_272;
+    const archive = runtimeCompileMaxRss(.api_kernel, fallback);
+    try std.testing.expect(archive >= archive_peak + archive_peak / 10);
+    try std.testing.expect(archive <= archive_peak + archive_peak / 10 + 128 * 1024 * 1024);
     fallback = profile;
     fallback.sanitize_thread = true;
     try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
