@@ -1,5 +1,45 @@
 # Gemma 4 E4B QAT: L4 qualification and performance
 
+The integrated small decode tile worker
+`ae83452925cb4d67e50df926445a1050c1db5c1dc40e33fe88f979cc4bcb6b6a`
+passes all eight numerical/argmax gates and all 585 official reference decisions.
+All eight full first-step logit vectors match the previous lossless-projector
+worker bit for bit. Both standalone SM89 and fatbin variants pass 72 bitwise
+kernel checks. Per measured fixed-budget request, the worker records 288 new
+FFN and 288 new PLE launch submissions, including graph capture submissions;
+these counters are not a count of replayed GPU executions. The selected opt-in
+[speed profile](gemma4-l4-speed-profile.json) now uses these kernels and disables the previous PLE gate fusion.
+The flag-off control in the same worker also passes 8/8 and 585/585, records
+zero new-tile calls, and matches the enabled profile on every first-step logit
+bit and all 768 fixed-budget output tokens.
+The clean all-artifact freshness rerun passes: PTX, all seven SASS architectures
+in the fatbin, and standalone SM89 match regeneration from source; all 325
+required symbols are present.
+
+A fresh one-round, two-call comparison gives these medians. All numerical gates,
+reference prefixes, fixed budgets and per-request activity checks pass. No
+compiler or competing GPU job ran during the measurements. This is a preliminary
+screen, not multi-round performance qualification.
+
+| Workload | Small-tile native ms | llama.cpp ms | BF16 PJRT ms |
+|---|---:|---:|---:|
+| text_short_256 | 3590.48 | 3582.80 | 11289.80 |
+| page_summary_128 | 1869.72 | 1871.20 | 5718.46 |
+| long2k_summary_64 | 1175.23 | 1182.67 | 3033.53 |
+| image_64 | 1056.89 | 1035.21 | 2944.89 |
+| audio_1s_64 | 956.50 | 933.71 | 2799.90 |
+| audio_12s_64 | 994.40 | 989.79 | 2864.53 |
+| audio_30s_64 | 1095.48 | 1104.63 | 2954.16 |
+| video_6s_64 | 1083.81 | 1262.93 | 3060.96 |
+
+Short text, image, 1-second audio and 12-second audio remain 0.2–2.4% slower than
+llama.cpp. Page summary, long text and 30-second audio are within 1% faster;
+video latency is about 14% lower. Only video meets the 5% median improvement
+and no-p95-regression criterion in this screen. Native is 2.6–3.1 times faster
+than this BF16 PJRT artifact; this does not reproduce PR #1404's exact unified
+runtime. The all-modality goal and PR readiness remain unmet.
+
+
 ## L4 speed follow-up in progress
 
 The [speed qualification record](gemma4-l4-speed-qualification.json) retains
@@ -9,7 +49,7 @@ No all-modality llama.cpp speed win or PR readiness is claimed yet.
 The rebuilt worker `79468d00046d0ced3714150cd215c1301d94ed218c56fb96e85f60de9e88fae9`
 passes 8/8 numerical/argmax gates and all 585 official decisions with both the
 unfused PLE control and the corrected exact PLE fusion. All 262,144 first-step
-logit bits match between those profiles on every case. The fusion retains the
+logit values match bit for bit between those profiles on every case. The fusion retains the
 qualified BF16 mirror path for prefill; its measured counters confirm that both
 paths execute. This establishes correctness, without a demonstrated fusion
 latency improvement. Production defaults remain at 5/8 numerical gates and

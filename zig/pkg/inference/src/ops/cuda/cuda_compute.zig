@@ -1527,6 +1527,8 @@ pub const RuntimeStats = struct {
     gemma4_ple_prefill_mirror_fallbacks: usize = 0,
     gemma4_projector_f16_weight_count: usize = 0,
     gemma4_projector_f16_calls: usize = 0,
+    gemma4_small_ffn_calls: usize = 0,
+    gemma4_small_ple_calls: usize = 0,
     f16_cublaslt_qkv_calls: usize = 0,
     f16_cublaslt_activation_staging_calls: usize = 0,
     f16_cublaslt_fallbacks: usize = 0,
@@ -6064,6 +6066,8 @@ pub const CudaCompute = struct {
         self.gemma4_dense_qualified = qualified;
         self.gemma4_ple_host_enabled = qualified and e4b and @import("ple_host.zig").requested();
         self.gemma4_e4b_sm89_qualified = qualified and e4b and self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9;
+        self.kernels.gemma4_small_decode_tiles = self.gemma4_e4b_sm89_qualified and !self.resident_training_cache and
+            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_SMALL_DECODE_TILES", false);
         self.gemma4_chunked_upload = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_CHUNKED_UPLOAD", true);
         self.gemma4_temp_lru = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_TEMP_LRU", true);
         self.gemma4_projector_cache_enabled = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_CACHE", true);
@@ -6156,6 +6160,8 @@ pub const CudaCompute = struct {
     pub fn snapshotStats(self: *const CudaCompute) RuntimeStats {
         var stats = self.stats;
         stats.cublaslt_workspace_bytes = self.cublaslt_workspace_scratch.buffer.len;
+        stats.gemma4_small_ffn_calls = self.kernels.gemma4_small_ffn_calls;
+        stats.gemma4_small_ple_calls = self.kernels.gemma4_small_ple_calls;
         stats.kernel_launches = self.ctx.stats.kernel_launches;
         stats.stream_syncs = self.ctx.stats.stream_syncs;
         for (self.temp_buffers.buffers.items) |buffer| {

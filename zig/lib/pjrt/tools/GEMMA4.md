@@ -389,15 +389,41 @@ Warmup-only activity cannot qualify a measured media optimization.
 
 The provisional L4 speed profile is `gemma4-l4-speed-profile.json`. Its current
 worker passes the eight numerical/argmax gates and 585 official decisions, but
-the all-modality llama.cpp latency target remains open. It enables exact E4B
-PLE fusion, persistent BF16 prefill mirrors, resident audio layouts and the
+the all-modality llama.cpp latency target remains open. It enables E4B small
+decode tiles, persistent BF16 prefill mirrors, resident audio layouts and the
 lossless projector-weight conversion. The latter changes activation precision,
 so exact weight storage alone does not qualify it. Require
 `gemma4_projector_f16_weight_count` globally and `gemma4_projector_f16_calls`
 alongside `gemma4_projector_residual_calls` on every measured media request.
-Also require `audio=gemma4_audio_resident_layout_calls` and the exact PLE fusion
-and prefill-fallback counters. The speed qualification record retains the
+Also require `audio=gemma4_audio_resident_layout_calls` and both
+`gemma4_small_ffn_calls` and `gemma4_small_ple_calls` on every measured request
+of each kind. These counters count host launch/capture submissions, not replayed
+GPU executions. The speed qualification record retains the
 worker/source hashes, all gates, rejected variants and preliminary timings.
+
+An additional opt-in experiment uses
+`ANTFLY_INFERENCE_CUDA_GEMMA4_SMALL_DECODE_TILES=1` for E4B on SM89 only.
+It changes output work distribution for single-row FFN and PLE kernels while
+preserving integer partials and the FP32 reduction order. The flag defaults to
+false. The integrated source worker passes all eight numerical gates and all 585
+reference decisions; all eight first-step vectors are bit-identical to the
+previous qualified worker. Matched performance qualification is pending.
+The experimental profile sets `ANTFLY_INFERENCE_CUDA_Q4_0_PLE_GATE_FUSION=0`
+and requires both `gemma4_small_ffn_calls` and `gemma4_small_ple_calls` on
+every measured request of each kind (text, image, audio and video).
+
+The four kernels can be compared bit for bit against a preserved pre-change
+bundle using real E4B layer-zero weights and 18 activation inputs per kernel:
+
+```sh
+python zig/lib/pjrt/tools/qualify_gemma4_small.py \
+  --gguf "$GGUF" --baseline-cubin "$BASELINE_CUBIN" \
+  --candidate-cubin zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels_sm89.cubin \
+  --out "$NEW_REPORT"
+```
+
+This differential check complements the official Transformers gates; it does
+not establish model correctness or a performance win by itself.
 
 The projector conversion predicate can be tested independently with:
 

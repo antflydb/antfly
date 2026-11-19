@@ -22,7 +22,7 @@ const runtime = inference.runtime;
 const a = std.heap.c_allocator;
 const Case = struct { id: []const u8, text: []const u8, kind: enum { text, image, audio, video } = .text, path: ?[]const u8 = null, max_tokens: i32, logits_path: ?[]const u8 = null, ple_input_path: ?[]const u8 = null, expected_prompt_tokens: ?usize = null };
 const Suite = struct { warmups: usize = 2, repeats: usize = 3, context_tokens: u32 = 8192, legacy_ple_normalization: bool = false, kv_dtype: enum { f16, f32 } = .f16, cases: []const Case };
-const Row = struct { id: []const u8, repeat: usize, ms: f64, prompt_tokens: usize, completion_tokens: usize, tokens: []i32, text: []const u8, phases: ?generation.GenerationTimingMs, gemma4_projector_residual_calls: usize, gemma4_audio_resident_layout_calls: usize, gemma4_projector_f16_calls: usize };
+const Row = struct { id: []const u8, repeat: usize, ms: f64, prompt_tokens: usize, completion_tokens: usize, tokens: []i32, text: []const u8, phases: ?generation.GenerationTimingMs, gemma4_projector_residual_calls: usize, gemma4_audio_resident_layout_calls: usize, gemma4_projector_f16_calls: usize, gemma4_small_ffn_calls: usize, gemma4_small_ple_calls: usize };
 fn residualCalls(session: anytype) usize {
     const active = session orelse return 0;
     return if (comptime factory.CudaRuntimeStats == void) 0 else if (factory.getCudaRuntimeStats(active)) |stats| stats.gemma4_projector_residual_calls else 0;
@@ -34,6 +34,14 @@ fn audioLayoutCalls(session: anytype) usize {
 fn projectorF16Calls(session: anytype) usize {
     const active = session orelse return 0;
     return if (comptime factory.CudaRuntimeStats == void) 0 else if (factory.getCudaRuntimeStats(active)) |stats| stats.gemma4_projector_f16_calls else 0;
+}
+fn smallFfnCalls(session: anytype) usize {
+    const active = session orelse return 0;
+    return if (comptime factory.CudaRuntimeStats == void) 0 else if (factory.getCudaRuntimeStats(active)) |stats| stats.gemma4_small_ffn_calls else 0;
+}
+fn smallPleCalls(session: anytype) usize {
+    const active = session orelse return 0;
+    return if (comptime factory.CudaRuntimeStats == void) 0 else if (factory.getCudaRuntimeStats(active)) |stats| stats.gemma4_small_ple_calls else 0;
 }
 fn now() u64 {
     return inference.platform.time.monotonicNs();
@@ -153,6 +161,8 @@ const Runner = struct {
         const residual_before = residualCalls(self.pipeline.session);
         const audio_layout_before = audioLayoutCalls(self.pipeline.session);
         const f16_before = projectorF16Calls(self.pipeline.session);
+        const small_ffn_before = smallFfnCalls(self.pipeline.session);
+        const small_ple_before = smallPleCalls(self.pipeline.session);
         const started = now();
         // Serving resets the model-scoped arena/graph epoch at this boundary.
         try self.pipeline.cb.beginRequest();
@@ -186,7 +196,7 @@ const Runner = struct {
         if (tokens.len != case.max_tokens) return error.IncompleteTokenReadback;
         const saved = try a.dupe(i32, tokens);
         errdefer a.free(saved);
-        return .{ .id = case.id, .repeat = repeat, .ms = @as(f64, @floatFromInt(finished - started)) / 1e6, .prompt_tokens = result.prompt_tokens, .completion_tokens = result.tokens_used, .tokens = saved, .text = try a.dupe(u8, result.text), .phases = result.timing_ms, .gemma4_projector_residual_calls = residualCalls(self.pipeline.session) - residual_before, .gemma4_audio_resident_layout_calls = audioLayoutCalls(self.pipeline.session) - audio_layout_before, .gemma4_projector_f16_calls = projectorF16Calls(self.pipeline.session) - f16_before };
+        return .{ .id = case.id, .repeat = repeat, .ms = @as(f64, @floatFromInt(finished - started)) / 1e6, .prompt_tokens = result.prompt_tokens, .completion_tokens = result.tokens_used, .tokens = saved, .text = try a.dupe(u8, result.text), .phases = result.timing_ms, .gemma4_projector_residual_calls = residualCalls(self.pipeline.session) - residual_before, .gemma4_audio_resident_layout_calls = audioLayoutCalls(self.pipeline.session) - audio_layout_before, .gemma4_projector_f16_calls = projectorF16Calls(self.pipeline.session) - f16_before, .gemma4_small_ffn_calls = smallFfnCalls(self.pipeline.session) - small_ffn_before, .gemma4_small_ple_calls = smallPleCalls(self.pipeline.session) - small_ple_before };
     }
 };
 pub fn main(init: std.process.Init) !void {
