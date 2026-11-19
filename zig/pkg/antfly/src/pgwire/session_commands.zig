@@ -94,13 +94,27 @@ pub const Setting = union(enum) {
     application_name: ApplicationNameSetting,
     client_encoding: EncodingSetting,
     catalog: CatalogSetting,
+    transaction_snapshot: []const u8,
     reset_all,
     discard_all,
 };
 
+fn transactionSnapshot(alloc: std.mem.Allocator, input: []const u8) !?[]const u8 {
+    var p: Parser = .{ .alloc = alloc, .input = input };
+    for ([_][]const u8{ "set", "transaction", "snapshot" }) |keyword| {
+        if (!std.ascii.eqlIgnoreCase(p.word() catch return null, keyword)) return null;
+    }
+    const name = try p.quoted('\'');
+    errdefer alloc.free(name);
+    try p.finish();
+    if (name.len == 0 or name.len > 256 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidParameter;
+    return name;
+}
+
 /// The protocol uses one classifier for Describe, Execute, and both streaming
 /// paths. A locally owned setting must never be sent to the SQL read provider.
 pub fn settingCommand(alloc: std.mem.Allocator, input: []const u8) !?Setting {
+    if (try transactionSnapshot(alloc, input)) |name| return .{ .transaction_snapshot = name };
     if (try readRequirementsSetting(alloc, input)) |value| return .{ .read_requirements = value };
     if (try visibilitySetting(alloc, input, "antfly.read_visibility")) |value| return .{ .read_visibility = value };
     if (try lakeVisibilitySetting(alloc, input)) |value| return .{ .lake_visibility = value };
@@ -949,4 +963,16 @@ test "pgwire canonical read settings parse receipts and reject unsupported visib
     try std.testing.expectError(error.UnsupportedReadVisibility, settingCommand(a, "SET antfly.read_requirements = '{\"visibility\":\"published\"}'"));
     try std.testing.expectError(error.InvalidReadRequirements, settingCommand(a, "SET antfly.read_requirements = '{\"wait_ms\":60001}'"));
     try std.testing.expectError(error.InvalidParameter, settingCommand(a, "SET antfly.read_requirements = '{\"through\":{}}'"));
+}
+
+test "pgwire transaction snapshot setting accepts one quoted name and rejects trailing SQL" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const command = (try settingCommand(a, "SET TRANSACTION SNAPSHOT 'abcd-1';")).?;
+    try std.testing.expectEqualStrings("abcd-1", command.transaction_snapshot);
+    try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(a, "SET TRANSACTION SNAPSHOT 'abcd-1'; SELECT 1"));
+    try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(a, "SET TRANSACTION SNAPSHOT abcd"));
+    try std.testing.expectError(error.InvalidParameter, settingCommand(a, "SET TRANSACTION SNAPSHOT ''"));
+    try std.testing.expect((try settingCommand(a, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")) == null);
 }

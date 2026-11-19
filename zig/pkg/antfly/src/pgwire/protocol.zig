@@ -465,6 +465,7 @@ pub const Session = struct {
                 .formatting => |value| if (value.action == .show) try alloc.dupe(backend.Column, &.{.{ .name = value.kind.name(), .type = .string }}) else &.{},
                 .client_encoding => |value| if (value == .show) &.{.{ .name = "client_encoding", .type = .string }} else &.{},
                 .catalog => |value| if (value == .show) &.{.{ .name = value.show, .type = .string }} else &.{},
+                .transaction_snapshot => &.{},
                 .reset_all => &.{},
                 .discard_all => &.{},
             } };
@@ -554,6 +555,7 @@ pub const Session = struct {
                 .formatting => |value| self.executeFormattingSetting(alloc, value),
                 .client_encoding => |value| self.executeEncodingSetting(alloc, value),
                 .catalog => |value| self.executeCatalogSetting(alloc, statement, value),
+                .transaction_snapshot => error.UnsupportedReplicationOption,
                 .reset_all => self.executeResetAll(),
                 .discard_all => self.executeDiscardAll(),
             };
