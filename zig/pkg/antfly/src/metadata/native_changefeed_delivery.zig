@@ -237,8 +237,16 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
                 if (original != null) return error.ChangefeedResynchronizationRequired;
                 return heartbeat(a, state, before, context, limits);
             };
-            if (header.transaction_scope != .root_local) return error.ChangefeedCapabilityUnsupported;
-            const transaction_id = try hex(a, control.hash(.{ .domain = "antfly:feed-transaction:v1", .scope = scope(state), .namespace = header.namespace, .transaction = header.transaction_id, .sequence = header.sequence }));
+            const completion = switch (header.transaction_scope) {
+                .root_local => null,
+                .coordinated => page.completion orelse return error.ChangefeedCapabilityUnsupported,
+                .unknown => return error.ChangefeedCapabilityUnsupported,
+            };
+            const transaction_identity = if (completion != null)
+                control.hash(.{ .domain = "antfly:feed-coordinated-transaction:v1", .scope = scope(state), .transaction = header.transaction_id })
+            else
+                control.hash(.{ .domain = "antfly:feed-transaction:v1", .scope = scope(state), .namespace = header.namespace, .transaction = header.transaction_id, .sequence = header.sequence });
+            const transaction_id = try hex(a, transaction_identity);
             const table_id = try std.fmt.allocPrint(a, "{d}", .{state.definition.?.tables[0].table_id});
             var events: std.ArrayList(RawJson) = .empty;
             var event_bytes: u64 = 0;
@@ -287,7 +295,12 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
             const envelope: Envelope = .{ .events = events.items, .transaction = if (relevant) .{ .transaction_id = transaction_id, .complete = complete } else null };
             if (try size(a, envelope) > limits.bytes) return error.ChangefeedBackpressure;
             const advances = try a.dupe(control.Advance, &.{.{ .namespace = self.root.namespace, .position = next }});
-            return .{ .body = try std.json.Stringify.valueAlloc(a, envelope, .{}), .events = @intCast(events.items.len), .proof = control.hash(.{ .domain = "antfly:native-document-page:v1", .scope = scope(state), .header = header, .start = start, .next = next, .before_context = context, .after_context = next_context }), .advances = advances, .provider_context = next_context };
+            const position_proof = control.hash(.{ .domain = "antfly:native-document-page:v1", .scope = scope(state), .header = header, .start = start, .next = next, .before_context = context, .after_context = next_context });
+            const proof = if (completion) |certificate|
+                control.hash(.{ .domain = "antfly:native-document-coordinated-page:v1", .position = position_proof, .certificate = certificate })
+            else
+                position_proof;
+            return .{ .body = try std.json.Stringify.valueAlloc(a, envelope, .{}), .events = @intCast(events.items.len), .proof = proof, .advances = advances, .provider_context = next_context };
         }
         fn heartbeat(a: A, state: control.State, before: Digest, context: []const u8, limits: delivery.Limits) !delivery.Prepared {
             const envelope: Envelope = .{ .events = &.{}, .transaction = null };

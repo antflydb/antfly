@@ -247,9 +247,13 @@ pub const Routed = struct {
                 .now_seconds = now,
                 .max_events = max_events,
                 .max_bytes = max_bytes,
+                .include_completion = true,
             },
         }, request);
         errdefer page.deinit();
+        if (page.header) |header| {
+            if (header.transaction_scope == .coordinated and page.completion == null) return error.ReadUnavailable;
+        }
         try request.ensureActive();
         return page;
     }

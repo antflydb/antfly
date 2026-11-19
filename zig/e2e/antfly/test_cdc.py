@@ -25,6 +25,7 @@ import pytest
 import requests
 from conftest import (
     ANTFLY_PUBLIC_API_ROOT,
+    AUTH_BOOTSTRAP_PASSWORD,
     DEFAULT_ANTFLY_BIN,
     EMBEDDINGGEMMA2_MODEL,
     INFERENCE_PUBLIC_API_ROOT,
@@ -884,6 +885,125 @@ def test_stateful_postgres_cdc_snapshot_and_streaming(stateful_api, pg_cdc_sourc
     _wait_until_absent(
         stateful_api, table_name, "user-2", timeout_s=30.0, interval_s=0.25
     )
+
+
+def test_stateful_postgres_cdc_emits_committed_destination_changefeed(pg_cdc_source):
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    table = f"cdc_feed_{time.time_ns()}"
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            response = client.post(
+                f"{server.api_url}/tables/{table}",
+                json={
+                    "num_shards": 1,
+                    "replication_sources": [
+                        {
+                            "type": "postgres",
+                            "dsn": _pg_dsn(),
+                            "postgres_table": pg_cdc_source["table_name"],
+                            "key_template": "id",
+                            "slot_name": pg_cdc_source["slot_name"],
+                            "publication_name": pg_cdc_source["publication_name"],
+                        }
+                    ],
+                },
+                timeout=30,
+            )
+            assert response.status_code in (200, 201), response.text
+
+            def lookup(key):
+                reply = client.get(
+                    f"{server.api_url}{lookup_key_path(table, key)}", timeout=5
+                )
+                if reply.status_code == 404:
+                    return None
+                reply.raise_for_status()
+                return reply.json()
+
+            assert wait_until(
+                lambda: lookup("user-1"), timeout_s=30.0, interval_s=0.25
+            ), server.debug_logs()
+            feeds = f"{server.api_url}/changefeeds"
+            reply = client.post(
+                feeds,
+                headers={"Idempotency-Key": table},
+                json={"tables": [table], "start": "now", "include": "rows"},
+                timeout=30,
+            )
+            assert reply.status_code == 201, reply.text
+            created = reply.json()
+            feed = f"{feeds}/{created['id']}"
+            cursor = created["cursor"]
+            _run_psql(f"""
+                begin;
+                insert into {pg_cdc_source["table_name"]} (id, name, tier)
+                    values ('rolled-back', 'Uncommitted', 'silver');
+                rollback;
+                insert into {pg_cdc_source["table_name"]} (id, name, tier)
+                    values ('user-2', 'Outbound', 'silver');
+            """)
+            event = None
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                page = client.get(f"{feed}/events", params={"after": cursor}, timeout=5)
+                if page.status_code == 503 or (
+                    page.status_code == 409 and "changefeed_retry_required" in page.text
+                ):
+                    time.sleep(0.25)
+                    continue
+                page.raise_for_status()
+                latest = page.headers["Antfly-Changefeed-Cursor"]
+                body = page.json()
+                for item in body["events"]:
+                    name = (item.get("after") or {}).get("name")
+                    assert name != "Uncommitted"
+                    if name == "Outbound":
+                        event = item
+                        break
+                if event is not None:
+                    break
+                if latest != cursor:
+                    acknowledged = client.post(
+                        f"{feed}/ack", json={"cursor": latest}, timeout=5
+                    )
+                    acknowledged.raise_for_status()
+                    cursor = latest
+                time.sleep(0.25)
+            assert event is not None, server.debug_logs()
+            assert event["kind"] == "document_committed"
+            assert event["before"] is None
+            assert body["transaction"]["complete"] is True
+            assert event["transaction_id"] == body["transaction"]["transaction_id"]
+            assert lookup("user-2") is not None
+            assert lookup("rolled-back") is None
+
+            server.restart()
+            replay = client.get(f"{feed}/events", params={"after": cursor}, timeout=5)
+            replay.raise_for_status()
+            assert replay.headers["Antfly-Changefeed-Cursor"] == latest
+            assert replay.json() == body
+
+            ack = client.post(f"{feed}/ack", json={"cursor": latest}, timeout=5)
+            ack.raise_for_status()
+            assert ack.json()["cursor"] == latest
+
+            def close():
+                reply = client.delete(feed, timeout=5)
+                if reply.status_code == 503 or (
+                    reply.status_code == 409
+                    and "changefeed_retry_required" in reply.text
+                ):
+                    return False
+                assert reply.status_code == 204, reply.text
+                return True
+
+            assert wait_until(close, timeout_s=12.0, interval_s=0.25), (
+                server.debug_logs()
+            )
+    finally:
+        server.stop()
 
 
 def test_stateful_postgres_cdc_table_joins_with_foreign_lookup(
