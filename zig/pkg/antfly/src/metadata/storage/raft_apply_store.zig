@@ -7483,7 +7483,11 @@ test "table topology mutation atomically creates and drops catalog ranges" {
             5,
             snapshot,
         ));
-        try restored.ensureDerivedCatalogIndexes(metadata_group_id);
+        const restored_point = try restored.captureCatalogTableProjection(std.testing.allocator, metadata_group_id, table.name, null);
+        defer restored.freeTables(std.testing.allocator, restored_point.tables);
+        defer restored.freeRanges(std.testing.allocator, restored_point.ranges);
+        try std.testing.expectEqual(@as(usize, 1), restored_point.tables.len);
+        try std.testing.expectEqual(table.table_id, restored_point.tables[0].table_id);
         var restored_projection = (try restored.captureTableDropProjection(
             std.testing.allocator,
             metadata_group_id,
@@ -15374,15 +15378,10 @@ pub const RaftApplyStore = struct {
     pub fn captureCatalogTableProjection(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8, deadline_ns: ?u64) !CatalogProjectionSnapshot {
         try catalogProjectionDeadline(deadline_ns, null);
         var txn = try self.store.beginReadTxn();
-        requireDerivedCatalogIndexesTxn(&txn, group_id) catch |err| {
-            txn.abort();
-            if (err != error.InvalidDerivedCatalogIndex) return err;
-            // Only a newly installed or old on-disk projection needs to
-            // initialize its durable indexes. Ordinary catalog writes keep
-            // them current and the read path does not take the apply lock.
-            txn = try self.beginQueryCatalogReadTxn(group_id);
-        };
         defer txn.abort();
+        // A route request must never repair a missing durable index or take
+        // the apply mutex. Startup and snapshot install prepare the indexes.
+        try requireDerivedCatalogIndexesTxn(&txn, group_id);
 
         const cursor = try readCatalogCursorTxn(&txn, group_id);
         var result: CatalogProjectionSnapshot = .{
@@ -16312,9 +16311,8 @@ pub const RaftApplyStore = struct {
     }
 
     /// Builds local, derivable indexes once per metadata projection. These
-    /// rows are intentionally excluded from Raft snapshots: snapshot install
-    /// removes them and the next apply (or indexed read) reconstructs them
-    /// atomically from primary range and extension-member rows.
+    /// rows are intentionally excluded from Raft snapshots. Snapshot install
+    /// reconstructs them atomically from the restored primary rows.
     fn requireDerivedCatalogIndexesTxn(txn: *docstore.DocStore.Txn, group_id: u64) !void {
         var buf: [160]u8 = undefined;
         const marker = txn.get(try derivedCatalogIndexVersionKey(&buf, group_id)) catch |err| switch (err) {
@@ -19084,6 +19082,7 @@ pub const RaftApplyStore = struct {
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
         try self.checkpoints.ensureUnusedCapacity(self.alloc, 1);
+        try self.verified_catalog_groups.ensureUnusedCapacity(self.alloc, 1);
 
         const existing = blk: {
             var read_txn = try self.store.beginReadTxn();
@@ -19142,17 +19141,27 @@ pub const RaftApplyStore = struct {
         var receipt_key_buf: [128]u8 = undefined;
         const receipt_key = try snapshotInstallKeyForGroup(&receipt_key_buf, group_id);
         const receipt = install_cut.encode();
-        const writes = try alloc.alloc(docstore.KVPair, rows.len + 2);
-        defer alloc.free(writes);
-        for (rows, 0..) |row, i| writes[i] = .{ .key = row.key, .value = row.value };
-        writes[rows.len] = .{ .key = watermark_key, .value = &watermark };
-        writes[rows.len + 1] = .{ .key = receipt_key, .value = &receipt };
-        const deletes = try alloc.alloc([]const u8, existing.len + derived_existing.len);
-        defer alloc.free(deletes);
-        for (existing, 0..) |row, i| deletes[i] = row.key;
-        for (derived_existing, existing.len..) |row, i| deletes[i] = row.key;
-        try self.store.putBatch(writes, deletes);
-        _ = self.verified_catalog_groups.remove(group_id);
+        {
+            // Publish the restored rows, their derived indexes, and the
+            // install receipt together. A failed rebuild leaves the previous
+            // snapshot intact and permits the install to retry.
+            var txn = try self.store.beginWriteTxn();
+            var committed = false;
+            defer if (!committed) txn.abort();
+            for ([_][]const docstore.OwnedKVPair{ existing, derived_existing }) |discarded| {
+                for (discarded) |row| txn.delete(row.key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+            }
+            for (rows) |row| try txn.put(row.key, row.value);
+            try txn.put(watermark_key, &watermark);
+            try txn.put(receipt_key, &receipt);
+            _ = try self.ensureDerivedCatalogIndexesTxn(&txn, group_id);
+            try txn.commit();
+            committed = true;
+        }
+        self.verified_catalog_groups.putAssumeCapacity(group_id, {});
 
         self.checkpoints.putAssumeCapacity(group_id, checkpoint);
         self.invalidateProjectedPlacementGroup(group_id);
@@ -34990,6 +34999,21 @@ test "metadata raft apply store catalog projection uses storage snapshot indepen
         try std.testing.expectEqual(snapshot.catalog_revision, missing.catalog_revision);
         try std.testing.expectEqual(@as(usize, 0), missing.tables.len);
         try std.testing.expectEqual(@as(usize, 0), missing.ranges.len);
+
+        // A missing index marker must never wait for the apply mutex.
+        {
+            var write = try store.store.beginWriteTxn();
+            errdefer write.abort();
+            var key_buf: [160]u8 = undefined;
+            try write.delete(try derivedCatalogIndexVersionKey(&key_buf, 41));
+            try write.commit();
+        }
+        try std.testing.expectError(error.InvalidDerivedCatalogIndex, store.captureCatalogTableProjection(
+            std.testing.allocator,
+            41,
+            snapshot.tables[0].name,
+            platform_time.monotonicNs() + std.time.ns_per_s,
+        ));
     }
 }
 

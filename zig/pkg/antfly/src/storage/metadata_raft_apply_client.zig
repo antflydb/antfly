@@ -777,6 +777,7 @@ pub const RaftApplyStore = struct {
             .arg0 = deadline_ns orelse 0,
             .key = .fromSlice(name),
         }) catch |err| switch (err) {
+            error.InvalidArgument => error.InvalidDerivedCatalogIndex,
             error.Timeout => error.CatalogRoutingSnapshotTimeout,
             else => err,
         };

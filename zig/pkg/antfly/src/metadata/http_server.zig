@@ -974,7 +974,10 @@ pub const AdminSource = struct {
         try request.ensureActive();
         const store = svc.projectedStore() orelse return error.MissingMetadataStore;
         const deadline = (api_table_catalog.RoutingBudget{}).deadlineFrom(.{ .deadline_ns = request.deadline_ns, .io = request.deadline_io });
-        const point = try store.captureCatalogTableProjection(svc.alloc, svc.metadata_group_id, table_name, deadline);
+        const point = store.captureCatalogTableProjection(svc.alloc, svc.metadata_group_id, table_name, deadline) catch |err| switch (err) {
+            error.InvalidDerivedCatalogIndex => return error.MetadataSnapshotUnavailable,
+            else => return err,
+        };
         return .{
             .metadata_group_id = svc.metadata_group_id,
             .metadata_incarnation = point.metadata_incarnation,
