@@ -45705,6 +45705,7 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .primary_residual_scope = primaryResidualScopeCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .project_ordinals_to_doc_ids = false,
@@ -45727,6 +45728,7 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .primary_residual_scope = primaryResidualScopeCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .all_docs_visible = allDocsVisibleCallback,
@@ -46139,6 +46141,7 @@ pub const DB = struct {
                 .text_index_entry = textIndexEntryCallback,
                 .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
                 .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+                .primary_residual_scope = primaryResidualScopeCallback,
                 .live_filter_doc_set = liveFilterDocSetCallback,
                 .all_docs_visible = allDocsVisibleCallback,
                 .project_ordinals_to_doc_ids = false,
@@ -46179,6 +46182,7 @@ pub const DB = struct {
             .is_expired_key = isNonvisibleStoredSearchKeyCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .primary_residual_scope = primaryResidualScopeCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .live_filter_doc_set_controlled = textLiveFilterDocSetControlledCallback,
             // An absent legacy summary is unknown, not a reason to scan the
@@ -46697,6 +46701,22 @@ pub const DB = struct {
         return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, generation);
     }
 
+    fn primaryResidualScopeCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        generation: ?u64,
+        control: db_query_search.QueryExecutionControl,
+    ) anyerror!?doc_set.ResolvedDocSet {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        var scope = try self.broadLiveDocSetCachedAllocControlled(alloc, generation, control);
+        errdefer scope.deinit(alloc);
+        if (scope == .all) return null;
+        if (ttlDurationNs(self) == 0) return scope;
+        const visible = try self.ttlVisibleResolvedDocSetNoLockAlloc(alloc, &scope, generation, ttlDurationNs(self));
+        scope.deinit(alloc);
+        return visible;
+    }
+
     fn liveFilterDocSetCallback(
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -47079,6 +47099,7 @@ pub const DB = struct {
             .lookup_doc_ordinals_for_vector_ids = denseOrdinalsForVectorIdsCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .primary_residual_scope = primaryResidualScopeCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
@@ -47225,6 +47246,7 @@ pub const DB = struct {
             .lookup_doc_ordinals_for_vector_ids = denseOrdinalsForVectorIdsCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .primary_residual_scope = primaryResidualScopeCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
@@ -47286,6 +47308,7 @@ pub const DB = struct {
             .sparse_index = sparseIndexCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .primary_residual_scope = primaryResidualScopeCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .lookup_doc_nums_for_ordinals = sparseDocNumsForOrdinalsCallback,
@@ -47624,6 +47647,7 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .primary_residual_scope = primaryResidualScopeCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .project_ordinals_to_doc_ids = false,
@@ -48572,6 +48596,7 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .primary_residual_scope = primaryResidualScopeCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
@@ -156507,6 +156532,43 @@ test "db optional numeric range filters lexical and dense candidates on fresh an
                 }
             }
         }
+    }
+}
+
+test "optional numeric range prefilters dense search without a text index" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("dense-primary-range");
+    defer tmp.cleanup();
+    const PendingDenseMigration = struct {
+        fn authorityPermitted(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    var db = try DB.open(a, tmp.path(), .{
+        .index_backends = .{ .dense_native_migration_policy_source = .{
+            .ptr = &tmp,
+            .authority_permitted = PendingDenseMigration.authorityPermitted,
+        } },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "dv", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"external\":true}" });
+    try db.batch(.{ .sync_level = .full_index, .writes = &.{
+        .{ .key = "a", .value = "{\"rank\":9007199254740992,\"_embeddings\":{\"dv\":[1,0]}}" },
+        .{ .key = "b", .value = "{\"rank\":9007199254740993,\"_embeddings\":{\"dv\":[0.9,0.1]}}" },
+    } });
+
+    for ([_][]const []const u8{ &.{}, &.{ "a", "b" } }) |ids| {
+        var result = try db.searchDenseProfiled(a, .{
+            .index_name = "dv",
+            .limit = 1,
+            .include_stored = false,
+            .filter_doc_ids = ids,
+            .filter_query_json = "{\"range\":{\"rank\":{\"gt\":9007199254740992.5}}}",
+        }, .{ .vector = &.{ 1, 0 }, .k = 1 });
+        defer result.result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.result.hits.len);
+        try std.testing.expectEqualStrings("b", result.result.hits[0].id);
+        try std.testing.expectEqual(@as(u64, 1), result.profile.native_filter_candidate_count);
     }
 }
 

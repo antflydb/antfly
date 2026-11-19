@@ -1362,6 +1362,21 @@ pub const SegmentReader = struct {
         return if (self.native) |native| &native.stored_metadata else self.data[@intCast(self.stored_offset)..][0..@intCast(self.stored_metadata_length)];
     }
 
+    /// Whether scoped typed-value navigation can open without verifying a
+    /// cold whole-column checksum.
+    pub fn hasCheapTypedNavigation(self: *const SegmentReader, field: []const u8) bool {
+        if (self.native) |native| {
+            const section = native.range.findSection(field, .typed_doc_values) orelse return false;
+            return native.range.paged_source != null or native.range.authenticated_source or
+                section.validation.load(.acquire) == integrity_valid;
+        }
+        const info = findSegmentField(FieldInfo, self.fields, self.fields_sorted, field) orelse return false;
+        for (info.sections) |*section| if (section.section_type == .typed_doc_values) {
+            return section.validation.load(.acquire) == integrity_valid;
+        };
+        return false;
+    }
+
     pub fn typedDocValuesScoped(self: *const SegmentReader, allocator: Allocator, field: []const u8) !?typed_dv.TypedDocValuesReader {
         if (self.native) |native| {
             const view = (try native.range.sectionView(field, .typed_doc_values)) orelse return null;
