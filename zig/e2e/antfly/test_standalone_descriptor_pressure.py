@@ -82,6 +82,21 @@ def test_full_index_ingest_and_reopen_with_minimum_file_limit(
         rng = random.Random(1744)
         first_vector = None
 
+        def assert_full_text_hit(session):
+            result = call(
+                session,
+                url,
+                "POST",
+                "/tables/documents/query",
+                {
+                    "full_text_search": {"field": "text", "match": "descriptorcanary"},
+                    "indexes": ["lexical"],
+                    "limit": 2,
+                },
+            )
+            hits = result["responses"][0]["hits"]["hits"]
+            assert [hit["_id"] for hit in hits] == ["d000000000"]
+
         def query_during_ingest(vector):
             count = 0
             with requests.Session() as reader:
@@ -108,6 +123,13 @@ def test_full_index_ingest_and_reopen_with_minimum_file_limit(
                     "external": True,
                 },
             )
+            call(
+                session,
+                url,
+                "POST",
+                "/tables/documents/indexes/lexical",
+                {"type": "full_text", "field": "text"},
+            )
             ingest_queries = None
             try:
                 for batch in range(batches):
@@ -121,7 +143,11 @@ def test_full_index_ingest_and_reopen_with_minimum_file_limit(
                         if index == 0:
                             first_vector = vector
                         rows[f"d{index:09d}"] = {
-                            "text": f"Generated document {index}",
+                            "text": (
+                                "descriptorcanary"
+                                if index == 0
+                                else f"Generated document {index}"
+                            ),
                             "_embeddings": {"vec": vector},
                         }
                     result = call(
@@ -136,6 +162,7 @@ def test_full_index_ingest_and_reopen_with_minimum_file_limit(
                         ingest_queries = executor.submit(
                             query_during_ingest, first_vector
                         )
+                assert_full_text_hit(session)
                 response = session.get(f"{server.health_url}/metrics", timeout=5)
                 response.raise_for_status()
                 metrics = dict(
@@ -165,6 +192,7 @@ def test_full_index_ingest_and_reopen_with_minimum_file_limit(
             for index in range(batch_size - 1, batch_size * batches, batch_size):
                 call(session, url, "GET", f"/tables/documents/documents/d{index:09d}")
             query(session, url, first_vector)
+            assert_full_text_hit(session)
 
         measurements.finish_phase()
         for phase, record in measurements.records().items():
