@@ -68,6 +68,7 @@ pub const Compiled = struct {
     parameter_count: u32,
     /// The statement binds settings or identity from the authorized SQL scope.
     uses_current_setting: bool = false,
+    uses_current_schemas: bool = false,
 
     pub fn deinit(self: *Compiled) void {
         self.arena.deinit();
@@ -147,7 +148,7 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
     const statement = try parser.statement();
     _ = parser.take(.semicolon);
     if (parser.pos != tokens.items.len) return parser.fail(error.UnsupportedSqlShape, "unexpected trailing SQL; only one supported statement is allowed");
-    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting };
+    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting, .uses_current_schemas = parser.uses_current_schemas };
 }
 
 fn lexicalError(kind: lexer.LexErrorKind) Error {
@@ -304,6 +305,7 @@ const Parser = struct {
     node_count: usize = 0,
     parameter_count: u32 = 0,
     uses_current_setting: bool = false,
+    uses_current_schemas: bool = false,
     relation_depth: usize = 0,
 
     fn fail(self: *Parser, err: Error, message: []const u8) Error {
@@ -486,6 +488,17 @@ const Parser = struct {
         }
     }
 
+    fn qualifiedCurrentSchemas(self: *const Parser) bool {
+        if (self.pos + 3 >= self.tokens.len) return false;
+        const schema = self.tokens[self.pos];
+        const function = self.tokens[self.pos + 2];
+        return schema.kind == .identifier and
+            (if (schema.owned) std.mem.eql(u8, schema.text, "pg_catalog") else std.ascii.eqlIgnoreCase(schema.text, "pg_catalog")) and
+            self.tokens[self.pos + 1].kind == .dot and function.kind == .identifier and
+            (if (function.owned) std.mem.eql(u8, function.text, "current_schemas") else std.ascii.eqlIgnoreCase(function.text, "current_schemas")) and
+            self.tokens[self.pos + 3].kind == .lparen;
+    }
+
     fn scalar(self: *Parser, depth: usize, minimum: u8) Error!*const ast.Scalar {
         if (depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL scalar nesting budget exceeded");
         if (self.peek(.lbracket)) return self.fail(error.InvalidSqlSyntax, "bare array brackets require ARRAY constructor context");
@@ -573,13 +586,18 @@ const Parser = struct {
             const negative = self.take(.minus);
             if (!negative) try self.expect(.plus);
             left = try self.scalarNode(.{ .unary = .{ .op = if (negative) .negative else .positive, .operand = try self.scalar(depth + 1, 7) } });
-        } else if (self.peek(.identifier) and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lparen) {
+        } else if ((self.peek(.identifier) and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lparen) or self.qualifiedCurrentSchemas()) {
+            if (self.qualifiedCurrentSchemas()) self.pos += 2;
             const function = self.tokens[self.pos];
             self.pos += 2;
             const name_value = try self.alloc.dupe(u8, function.text);
             if (!function.owned) _ = std.ascii.lowerString(name_value, name_value);
             if (std.mem.startsWith(u8, name_value, "$")) return self.fail(error.UnsupportedSqlShape, "compiler-owned helper functions cannot be called from SQL");
             if (std.mem.eql(u8, name_value, "current_setting") or std.mem.eql(u8, name_value, "current_database") or std.mem.eql(u8, name_value, "pg_has_role")) self.uses_current_setting = true;
+            if (std.mem.eql(u8, name_value, "current_schemas")) {
+                self.uses_current_setting = true;
+                self.uses_current_schemas = true;
+            }
             var args: std.ArrayList(*const ast.Scalar) = .empty;
             const distinct = self.keyword(.distinct);
             const star = self.take(.star);
@@ -2487,6 +2505,7 @@ const Parser = struct {
             },
             .cast => |part| try self.persistentExpression(part.operand, generated),
             .call => |part| {
+                if (std.mem.eql(u8, part.name, "current_schemas")) return self.fail(error.UnsupportedSqlShape, "schema expressions cannot capture the session search path");
                 if (part.subquery != null or part.star or part.distinct or part.filter != null or part.window != null or part.within_group != null)
                     return self.fail(error.UnsupportedSqlShape, "subqueries, aggregates and windows are not allowed in schema expressions");
                 for (part.args) |arg| try self.persistentExpression(arg, generated);

@@ -148,9 +148,11 @@ pub fn describe(allocator: std.mem.Allocator, backend: catalog.Backend, compiled
     errdefer arena.deinit();
     var statement_backend = backend;
     var settings: ?*@import("setting_catalog.zig").View = null;
-    if (backend.setting_capture) |capture| {
+    if (try backend.captureSettings(allocator)) |captured| {
+        var owned = captured;
+        errdefer owned.deinit();
         const view = try arena.allocator().create(@import("setting_catalog.zig").View);
-        view.* = try @import("setting_catalog.zig").View.capture(allocator, capture.owner, capture.scope, capture.overlay);
+        view.* = owned;
         settings = view;
         statement_backend.settings_view = view;
     }

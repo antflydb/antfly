@@ -820,9 +820,11 @@ pub const Stream = struct {
         var statement_backend = backend;
         statement_backend.regex_execution = &self.regex_execution;
         statement_backend.parameter_fallback_types = try runtime.parameterFallbackTypesNative(arena, parameters, limits.parameter_cells);
-        if (backend.setting_capture) |capture| {
+        if (try backend.captureSettings(self.budget.allocator())) |captured| {
+            var owned = captured;
+            errdefer owned.deinit();
             const view = try arena.create(@import("setting_catalog.zig").View);
-            view.* = try @import("setting_catalog.zig").View.capture(self.budget.allocator(), capture.owner, capture.scope, capture.overlay);
+            view.* = owned;
             self.settings = view;
             statement_backend.settings_view = view;
         }

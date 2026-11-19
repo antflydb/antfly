@@ -185,8 +185,8 @@ fn executeInner(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     var statement_backend = backend;
     if (limits.error_context) |context| statement_backend.error_context = context;
     if (parameters.len > 1024) return error.InvalidSqlParameters;
-    if (backend.setting_capture) |capture| {
-        pinned_settings = try @import("setting_catalog.zig").View.capture(alloc, capture.owner, capture.scope, capture.overlay);
+    if (try backend.captureSettings(alloc)) |captured| {
+        pinned_settings = captured;
         statement_backend.settings_view = &pinned_settings.?;
     }
     const memory = try limits.workingMemory();

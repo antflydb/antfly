@@ -1770,7 +1770,7 @@ const OwnedRead = struct {
         self.native_adapter.graph_parameter_cells = request.parameter_cells;
         var stream_backend = self.guarded.backend();
         stream_backend.parameter_descriptor_hints = request.parameter_descriptors;
-        if (plan.compiled().uses_current_setting) stream_backend.setting_capture = self.native_adapter.settingCapture();
+        stream_backend.setting_capture = try self.guarded.settingCapture(arena, &self.native_adapter, plan.compiled());
         // Stream.open captures the owner view once; loadSettings validates the
         // prepared epoch on that same snapshot before binding or reading rows.
         const opened = try Pull.Stream.openOwned(try @import("sql_memory_owner.zig").create(adapter.server.alloc, alloc, adapter.server.shared_resource_manager orelse &adapter.server.local_resource_manager), stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256, .parameter_cells = request.parameter_cells, .parameter_owner = request.parameter_owner });
@@ -2448,6 +2448,9 @@ const Job = struct {
             .revision = &native_adapter.revision,
             .expected_guard = self.request.binding_guard,
         };
+        var settings_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer settings_arena.deinit();
+        const setting_capture = try guarded.settingCapture(settings_arena.allocator(), &native_adapter, compiled);
         if (self.kind == .describe) {
             switch (compiled.statement) {
                 .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => {
@@ -2465,7 +2468,7 @@ const Job = struct {
             };
             var describe_backend = guarded.backend();
             describe_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
-            if (compiled.uses_current_setting) describe_backend.setting_capture = native_adapter.settingCapture();
+            describe_backend.setting_capture = setting_capture;
             var description = try describe_sql.describe(self.request.scratch_allocator orelse self.alloc, describe_backend, compiled, hints);
             defer description.deinit();
             const columns = try self.alloc.alloc(wire.Column, description.binding.columns.len);
@@ -2484,6 +2487,7 @@ const Job = struct {
         const parameters = if (self.request.parameter_cells != null) self.request.parameters else try normalizeParameters(self.alloc, self.request.parameters, self.request.parameter_types);
         var execution_backend = guarded.backend();
         execution_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
+        execution_backend.setting_capture = setting_capture;
         var result = native_adapter.execute(self.request.scratch_allocator orelse self.alloc, compiled, parameters, .{ .result_rows = self.request.limit, .native_result = true, .parameter_cells = self.request.parameter_cells, .parameter_owner = self.request.parameter_owner }, execution_backend) catch |err| {
             if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @fromBackingInt(@backingInt(native_adapter.transaction_status));
             if (err == error.SqlMutationOutcomeUnknown or err == error.SqlTransactionOutcomeUnknown or err == error.SessionLeaseLost) if (self.request.diagnostics) |diagnostic|
@@ -3109,6 +3113,25 @@ const GuardedCatalog = struct {
         }
         return system.open(alloc, request);
     }
+    fn settingCapture(self: *GuardedCatalog, alloc: std.mem.Allocator, adapter: *execution.Adapter, compiled: *const compiler.Compiled) !@FieldType(catalog.Backend, "setting_capture") {
+        if (!compiled.uses_current_setting) return null;
+        var capture = adapter.settingCapture().?;
+        if (!compiled.uses_current_schemas) return capture;
+        const namespaces = try self.catalogNamespaces(alloc, &.{});
+        const path = if (self.authority.request.search_path) |*configured| configured.entries[0..configured.len] else null;
+        var effective: std.ArrayList([]const u8) = .empty;
+        for (0..if (path) |entries| entries.len else 1) |index| {
+            const name = if (path) |entries| entries[index].slice() else self.authority.request.namespace orelse "public";
+            for (namespaces) |candidate| {
+                if (!std.mem.eql(u8, name, candidate.name)) continue;
+                try effective.append(alloc, candidate.name);
+                break;
+            }
+        }
+        capture.schema_search_path = try effective.toOwnedSlice(alloc);
+        return capture;
+    }
+
     fn catalogNamespaces(self: *GuardedCatalog, a: std.mem.Allocator, conditions: []const catalog.Condition) ![]const system.Namespace {
         var result: std.ArrayList(system.Namespace) = .empty;
         if (try system.namespaceMatches(system.builtin_namespace, conditions)) try result.append(a, system.builtin_namespace);

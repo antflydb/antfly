@@ -241,6 +241,7 @@ pub const View = struct {
     values: []const Value,
     by_id: std.AutoHashMapUnmanaged(u64, usize),
     by_name: std.StringHashMapUnmanaged(usize),
+    schema_search_path: ?[]const []const u8 = null,
 
     pub fn capture(backing: std.mem.Allocator, owner: Owner, scope: Scope, overlay: []const OverlayEntry) !View {
         var arena = std.heap.ArenaAllocator.init(backing);
@@ -288,6 +289,13 @@ pub const View = struct {
             .database = try alloc.dupe(u8, scope.database),
         };
         return .{ .arena = arena, .scope = owned_scope, .epoch = raw.epoch, .definitions = definitions, .values = values, .by_id = by_id, .by_name = by_name };
+    }
+
+    pub fn setSchemaSearchPath(self: *View, names: []const []const u8) !void {
+        const alloc = self.arena.allocator();
+        const owned = try alloc.alloc([]const u8, names.len);
+        for (owned, names) |*out, name| out.* = try alloc.dupe(u8, name);
+        self.schema_search_path = owned;
     }
 
     pub fn deinit(self: *View) void {
@@ -571,6 +579,24 @@ test "SQL current_setting evaluates from one authorized pinned view" {
     var result = try runtime.execute(std.testing.allocator, with_capture, &compiled, &.{}, .{});
     defer result.deinit();
     try std.testing.expectEqualStrings("alice-tenant", result.output.rows[0][0].string);
+    var schemas = try compiler.compile(std.testing.allocator, "SELECT current_schemas(false)[1], pg_catalog.current_schemas(true)[1], current_schemas(true)[3], current_schemas(NULL) IS NULL", .{});
+    defer schemas.deinit();
+    try std.testing.expect(schemas.uses_current_schemas and schemas.uses_current_setting);
+    with_capture.setting_capture.?.schema_search_path = &.{ "app", "public" };
+    var schema_result = try runtime.execute(std.testing.allocator, with_capture, &schemas, &.{}, .{});
+    defer schema_result.deinit();
+    const cells = schema_result.output.rows[0];
+    try std.testing.expectEqualStrings("app", cells[0].string);
+    try std.testing.expectEqualStrings("pg_catalog", cells[1].string);
+    try std.testing.expectEqualStrings("public", cells[2].string);
+    try std.testing.expect(cells[3].bool);
+    with_capture.setting_capture.?.schema_search_path = &.{ "app", "pg_catalog" };
+    var explicit_result = try runtime.execute(std.testing.allocator, with_capture, &schemas, &.{}, .{});
+    defer explicit_result.deinit();
+    try std.testing.expectEqualStrings("app", explicit_result.output.rows[0][1].string);
+    try std.testing.expect(explicit_result.output.rows[0][2] == .null);
+    try std.testing.expectEqualStrings("pg_catalog", cells[1].string);
+
     var joined = try compiler.compile(std.testing.allocator, "SELECT a.id FROM a JOIN b ON a.id = b.id AND current_setting('app.tenant') = 'alice-tenant'", .{});
     defer joined.deinit();
     try std.testing.expectError(error.SettingCatalogUnavailable, describe.describe(std.testing.allocator, plain, &joined, &.{}));

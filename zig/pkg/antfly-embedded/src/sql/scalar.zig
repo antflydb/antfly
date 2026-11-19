@@ -281,7 +281,7 @@ pub const EvalLimits = struct {
     regex_checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     regex_context: ?*anyopaque = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, value_identity, is_missing, date_bin, @"$array_subscript", @"$series_step" };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, value_identity, is_missing, date_bin, @"$array_subscript", @"$series_step", current_schemas };
 
 fn regexFunction(function: Function) ?regex_functions.Function {
     return switch (function) {
@@ -744,6 +744,7 @@ pub const Program = struct {
                 .date_trunc,
                 .to_timestamp,
                 .current_setting,
+                .current_schemas,
                 .@"$single",
                 .trunc,
                 .sign,
@@ -2603,7 +2604,7 @@ pub fn validateFunctionArity(function: Function, count: usize) !void {
         return;
     }
     const valid = switch (function) {
-        .value_identity, .is_missing => count == 1,
+        .value_identity, .is_missing, .current_schemas => count == 1,
         .regexp_like, .regexp_count, .regexp_instr, .regexp_substr, .regexp_replace => unreachable,
         .array_position => count == 2 or count == 3,
         .array_positions, .array_remove, .array_append, .array_prepend, .array_cat => count == 2,
@@ -2918,6 +2919,11 @@ const Binder = struct {
                         }
                     }
                     break :blk .{ .kind = .array, .nullable = false, .element_type = kind, .numeric_modifier = try self.commonModifier(call.args, depth) };
+                }
+                if (function == .current_schemas) {
+                    const include_implicit = try self.infer(call.args[0], depth + 1);
+                    if (include_implicit.kind != null and include_implicit.kind != .boolean) return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = .array, .element_type = .text, .nullable = include_implicit.nullable };
                 }
                 if (function == .@"$series_step") {
                     for (call.args) |arg| {
@@ -3399,6 +3405,7 @@ const Binder = struct {
                 const nested_constructor = function == .@"$array" and self.arrayChildren(call.args);
                 for (call.args, args, 0..) |arg, *out, i| {
                     const desired: ?ast.ColumnType = switch (function) {
+                        .current_schemas => .boolean,
                         .@"$like_escape" => if (i == 3) .boolean else .string,
                         .string_to_array => .string,
                         .jsonb_exists => if (i == 0) .json else .string,
@@ -3470,6 +3477,7 @@ const Binder = struct {
                         // NUMERIC into real[]'s element type changes equality;
                         // only an unknown probe adopts the array domain.
                         .@"$array_quantified" => if (i == 0 and actual.kind != null) null else if (i < 2) (try self.infer(call.args[1], depth + 1)).element_type else if (i == 2) .int32 else .boolean,
+                        .current_schemas => .boolean,
                         .nullif => if (actual.kind != null) null else kind.element_type,
                         .@"$array_pattern_quantified" => if (i < 2) .text else .boolean,
                         .cardinality, .array_ndims, .array_length, .array_lower, .array_upper, .@"$array_subscript" => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .int32,
@@ -4209,6 +4217,26 @@ const Evaluator = struct {
                             break :ordinary if (mixed_number) try mixedNumberQuantified(array.*, element, compare_op, every.bool, &work) else try array.quantified(element, compare_op, if (every.bool) .all else .any, &work);
                         };
                         break :blk if (accepted) |value| Datum.json(.{ .bool = value }) else .{};
+                    },
+                    .current_schemas => {
+                        const implicit = try self.runDatum(call.args[0], depth + 1);
+                        if (implicit.sql_null) break :blk .{};
+                        if (implicit.value != .bool) return error.SqlTypeMismatch;
+                        const view = self.program.settings orelse return error.SettingCatalogUnavailable;
+                        const names = view.schema_search_path orelse return error.SettingCatalogUnavailable;
+                        const add_catalog = implicit.value.bool and for (names) |name| {
+                            if (std.mem.eql(u8, name, "pg_catalog")) break false;
+                        } else true;
+                        const offset: usize = @intFromBool(add_catalog);
+                        const elements = try self.alloc.alloc(arrays.Element, names.len + offset);
+                        if (add_catalog) elements[0] = Datum.json(.{ .string = "pg_catalog" });
+                        for (names, elements[offset..]) |name, *element| element.* = Datum.json(.{ .string = try self.alloc.dupe(u8, name) });
+                        const shape = try self.alloc.alloc(arrays.Dimension, @intFromBool(elements.len != 0));
+                        if (shape.len != 0) shape[0] = .{ .length = @intCast(elements.len) };
+                        const result_array = try self.alloc.create(arrays.Value);
+                        var work = self.workBudget();
+                        result_array.* = try arrays.Value.initWithBudget(.text, shape, elements, .{ .bytes = self.limits.output_bytes }, &work);
+                        break :blk Datum.typedArray(result_array);
                     },
                     .@"$series_step" => {
                         const start = try self.runDatum(call.args[0], depth + 1);
