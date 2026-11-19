@@ -9790,7 +9790,7 @@ const IndexedPredicateEvaluator = struct {
     }
 
     fn indexed(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery) !bool {
-        if (self.reconcile_primary_ranges and structuredRangeLeaves(query).range) return false;
+        if (self.reconcile_primary_ranges and hasStoredStandardRange(query)) return false;
         return searchQueryCanUseSnapshotWithControl(self.snapshot, query, self.analysis, self.schema, false, self.control);
     }
 
@@ -9918,9 +9918,9 @@ const IndexedPredicateEvaluator = struct {
         };
     }
 
-    fn probeFrontier(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap) !?roaring.RoaringBitmap {
-        const memo = self.probe_input orelse return null;
-        const frontier = self.frontier orelse return null;
+    fn collectPhysicalProbeScope(self: IndexedPredicateEvaluator, scope: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        const memo = self.probe_input orelse return error.InvalidData;
+        const frontier = self.frontier orelse return error.InvalidData;
         memo.attempted = true;
         if (memo.covered == null) memo.covered = roaring.RoaringBitmap.init(self.alloc);
         var missing: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
@@ -9944,11 +9944,19 @@ const IndexedPredicateEvaluator = struct {
         }
         var requested = scope.iterator();
         var physical_candidates = roaring.RoaringBitmap.init(self.alloc);
-        defer physical_candidates.deinit();
+        errdefer physical_candidates.deinit();
         while (requested.next()) |ordinal| {
             try self.control.check();
             for (memo.batches.items) |batch| try batch.appendDocs(ordinal, &physical_candidates, self.control);
         }
+        return physical_candidates;
+    }
+
+    fn probeFrontier(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap) !?roaring.RoaringBitmap {
+        const memo = self.probe_input orelse return null;
+        if (self.frontier == null) return null;
+        var physical_candidates = try self.collectPhysicalProbeScope(scope);
+        defer physical_candidates.deinit();
         const filter = (try search_mod.searchQueryToFilterArena(self.scratch, query)).withControl(self.control);
         const plan = try query_mod.PredicateProbePlan.compile(filter);
         var rows = roaring.RoaringBitmap.init(self.alloc);
@@ -10371,17 +10379,162 @@ const IndexedPredicateEvaluator = struct {
                 if (domain.get(key)) |ordinal| if (scope.contains(ordinal)) try rows.add(ordinal);
             }
         } else {
-            const identity = ResidualIdentityContext{ .alloc = self.alloc, .executor = self.executor, .control = self.control };
-            const wanted = doc_set.ResolvedDocSet{ .doc_keys = keys };
-            rows = try scope.cloneExact(self.alloc);
-            try restrictMixedFilterScope(identity, &rows, &wanted, true);
+            const lookup = self.executor.resolve_doc_ids_to_doc_set orelse return error.UnsupportedQueryRequest;
+            var resolved = try lookup(self.executor.ctx, self.alloc, keys, self.executor.identity_read_generation);
+            defer resolved.deinit(self.alloc);
+            if (resolved != .doc_keys) {
+                try addResolvedOrdinals(&rows, &resolved);
+                rows.andWith(scope);
+                return rows;
+            }
+            const reverse = self.executor.resolve_doc_set_doc_ids orelse return error.UnsupportedQueryRequest;
+            var wanted: std.StringHashMapUnmanaged(void) = .empty;
+            defer wanted.deinit(self.alloc);
+            for (resolved.doc_keys) |key| {
+                try self.control.check();
+                try wanted.put(self.alloc, key, {});
+            }
+            var scratch = std.heap.ArenaAllocator.init(self.alloc);
+            defer scratch.deinit();
+            var ids = scope.iterator();
+            while (true) {
+                try self.control.check();
+                var ordinals: [64]u32 = undefined;
+                var count: usize = 0;
+                while (count < ordinals.len) : (count += 1) ordinals[count] = ids.next() orelse break;
+                if (count == 0) break;
+                _ = scratch.reset(.retain_capacity);
+                const requested = doc_set.ResolvedDocSet{ .ordinals = ordinals[0..count] };
+                const candidate_keys = (try reverse(self.executor.ctx, scratch.allocator(), &requested, self.executor.identity_read_generation)) orelse return error.StorageReadTemporarilyUnavailable;
+                if (candidate_keys.len != count) return error.InvalidData;
+                for (candidate_keys, ordinals[0..count]) |key, ordinal| {
+                    if (wanted.contains(key)) try rows.add(ordinal);
+                }
+            }
         }
         return rows;
     }
 
-    fn primaryRangeCoverage(self: IndexedPredicateEvaluator, scope: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
-        if (self.probe_input != null) if (try self.probeFrontier(.{ .match_all = {} }, scope)) |covered| return covered;
-        if (self.key_domain == null and scope.cardinality() *| 32 <= self.snapshot.filterPhysicalDocCount()) {
+    const RangeEvidence = struct {
+        covered: roaring.RoaringBitmap,
+        matches: roaring.RoaringBitmap,
+    };
+
+    fn collectRangeEvidence(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, physical: ?*const roaring.RoaringBitmap) !RangeEvidence {
+        const field = query.numeric_range.field;
+        const filter = (try search_mod.searchQueryToFilterArena(self.scratch, query)).withControl(self.control);
+        var covered_docs = roaring.RoaringBitmap.init(self.alloc);
+        defer covered_docs.deinit();
+        var matched_docs = roaring.RoaringBitmap.init(self.alloc);
+        defer matched_docs.deinit();
+        var physical_it = if (physical) |rows| rows.iterator() else null;
+        var next = if (physical_it) |*iter| iter.next() else null;
+        var offset: u32 = 0;
+        for (self.snapshot.segments, 0..) |segment, index| {
+            try self.control.check();
+            const base = offset;
+            offset = try std.math.add(u32, base, segment.reader.doc_count);
+            if (physical != null and next == null) break;
+            if (physical != null and next.? >= offset) continue;
+            var lease = try self.snapshot.leaseSegment(index);
+            defer lease.deinit();
+            const entry = lease.entry;
+            const witness = entry.reader.numericRangeCoverage(field) catch |err| switch (err) {
+                error.InvalidSegment, error.CrcMismatch => null,
+                else => return err,
+            };
+            const coverage = if (entry.liveDocCount() != 0 and witness == .populated)
+                try entry.typedDocValuesCoverageWithValidation(field, .{ .execution_deadline_ns = self.control.deadline_ns, .cancellation = self.control.cancellation })
+            else
+                null;
+            const exact = if (coverage) |value| value.status == .covered and value.value_type == .numeric_val else false;
+            var pending = roaring.RoaringBitmap.init(self.alloc);
+            defer pending.deinit();
+            if (physical_it) |*iter| {
+                while (next != null and next.? < offset) {
+                    try self.control.check();
+                    if (exact) try pending.add(next.? - base);
+                    next = iter.next();
+                }
+            }
+            if (!exact) continue;
+            var matches = if (physical != null)
+                try filter.executeWithinScope(self.alloc, entry, base, &pending, self.control)
+            else
+                try filter.executeWithOffset(self.alloc, entry, base);
+            defer matches.deinit();
+            try entry.shared.lockDeletionSharedWithControl(self.control);
+            defer entry.shared.unlockDeletionShared();
+            if (entry.shared.deleted) |deleted| matches.andNotWith(&deleted);
+            var hits = matches.iterator();
+            while (hits.next()) |doc| {
+                try self.control.check();
+                try matched_docs.add(base + doc);
+            }
+            if (physical != null) {
+                if (entry.shared.deleted) |deleted| pending.andNotWith(&deleted);
+                var candidates = pending.iterator();
+                while (candidates.next()) |doc| {
+                    try self.control.check();
+                    try covered_docs.add(base + doc);
+                }
+            } else if (entry.shared.deleted == null) {
+                try covered_docs.addRange(base, offset);
+            } else {
+                for (0..entry.reader.doc_count) |local| {
+                    if (local % 256 == 0) try self.control.check();
+                    const doc: u32 = @intCast(local);
+                    if (entry.shared.deleted) |deleted| if (deleted.contains(doc)) continue;
+                    try covered_docs.add(base + doc);
+                }
+            }
+        }
+        if (physical != null) {
+            const memo = self.probe_input orelse return error.InvalidData;
+            var evidence = RangeEvidence{ .covered = roaring.RoaringBitmap.init(self.alloc), .matches = roaring.RoaringBitmap.init(self.alloc) };
+            errdefer {
+                evidence.covered.deinit();
+                evidence.matches.deinit();
+            }
+            var all = covered_docs.iterator();
+            while (all.next()) |doc| {
+                try self.control.check();
+                try evidence.covered.add(try memo.ordinalForDoc(doc));
+            }
+            var hits = matched_docs.iterator();
+            while (hits.next()) |doc| {
+                try self.control.check();
+                try evidence.matches.add(try memo.ordinalForDoc(doc));
+            }
+            return evidence;
+        }
+        var ordinal_only = self;
+        ordinal_only.skip_unmapped = true;
+        var covered = try ordinal_only.resolveOrdinals(&covered_docs);
+        errdefer covered.deinit();
+        return .{ .covered = covered, .matches = try ordinal_only.resolveOrdinals(&matched_docs) };
+    }
+
+    fn rangeEvidence(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap, path: []const u8) !RangeEvidence {
+        if (self.key_domain != null) return self.collectRangeEvidence(query, null);
+        const cache = &self.snapshot.graph_predicates;
+        const coverage_key = try std.fmt.allocPrint(self.scratch, "range-field:{s}:{s}", .{ self.presence_cache_prefix orelse self.cache_prefix, query.numeric_range.field });
+        const match_key = try std.fmt.allocPrint(self.scratch, "range-match:{d}:{s}:{s}", .{ self.cache_prefix.len, self.cache_prefix, path });
+        if (try cache.getScoped(self.alloc, coverage_key, self.control, scope)) |owned| {
+            var covered = owned;
+            if (covered.cardinality() == 0) return .{ .covered = covered, .matches = roaring.RoaringBitmap.init(self.alloc) };
+            errdefer covered.deinit();
+            if (try cache.getScoped(self.alloc, match_key, self.control, scope)) |matches| return .{ .covered = covered, .matches = matches };
+            covered.deinit();
+        }
+
+        const narrow = scope.cardinality() *| 32 <= self.snapshot.filterPhysicalDocCount();
+        if (narrow and self.snapshot.graphOrdinalScanCost() <= scope.cardinality() *| 8) {
+            if (self.probe_input != null) {
+                var physical = try self.collectPhysicalProbeScope(scope);
+                defer physical.deinit();
+                return self.collectRangeEvidence(query, &physical);
+            }
             if (self.executor.resolve_doc_set_doc_ids) |resolve| {
                 var temporary = std.heap.ArenaAllocator.init(self.alloc);
                 defer temporary.deinit();
@@ -10401,35 +10554,47 @@ const IndexedPredicateEvaluator = struct {
                 candidate.frontier = frontier;
                 candidate.probe_input = &memo;
                 candidate.scratch = a;
-                if (try candidate.probeFrontier(.{ .match_all = {} }, scope)) |covered| return covered;
+                var physical = try candidate.collectPhysicalProbeScope(scope);
+                defer physical.deinit();
+                return candidate.collectRangeEvidence(query, &physical);
             }
         }
-        var presence = self;
-        presence.cache_prefix = self.presence_cache_prefix orelse self.cache_prefix;
-        return presence.executeIndexedClause(.{ .match_all = {} }, scope, "/range-coverage");
+        const flight = try cache.lockFlight(match_key, self.control);
+        defer flight.unlock();
+        if (try cache.getScoped(self.alloc, match_key, self.control, scope)) |owned| {
+            var matches = owned;
+            errdefer matches.deinit();
+            if (try cache.getScoped(self.alloc, coverage_key, self.control, scope)) |covered| return .{ .covered = covered, .matches = matches };
+            matches.deinit();
+        }
+        var evidence = try self.collectRangeEvidence(query, null);
+        cache.put(self.snapshot.alloc, coverage_key, &evidence.covered);
+        cache.put(self.snapshot.alloc, match_key, &evidence.matches);
+        evidence.covered.andWith(scope);
+        evidence.matches.andWith(scope);
+        return evidence;
     }
 
-    /// A witness covers the rows represented by this snapshot. A primary
-    /// candidate missing from the snapshot still needs stored evaluation.
     fn executeMixedRange(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap, path: []const u8) !roaring.RoaringBitmap {
-        const stored = (query.numeric_range.stored_standard_range orelse return error.UnsupportedQueryRequest).*;
-        if (!self.reconcile_primary_ranges or !try searchQueryCanUseSnapshotWithControl(self.snapshot, query, self.analysis, self.schema, false, self.control)) {
+        const range = query.numeric_range;
+        const stored = (range.stored_standard_range orelse return error.UnsupportedQueryRequest).*;
+        const schema = self.schema orelse return self.executeStoredRange(stored, scope);
+        if (!self.reconcile_primary_ranges or range.exact_bounds == null or !runtime_schema_mod.hasNumericRangeCoverageMapping(schema, range.field)) {
             return self.executeStoredRange(stored, scope);
         }
-
-        var covered = try self.primaryRangeCoverage(scope);
-        defer covered.deinit();
-        if (covered.cardinality() == 0) return self.executeStoredRange(stored, scope);
-        var typed_matches = try self.executeIndexedClause(query, &covered, path);
-        errdefer typed_matches.deinit();
-        if (covered.cardinality() == scope.cardinality()) return typed_matches;
+        var evidence = try self.rangeEvidence(query, scope, path);
+        defer evidence.covered.deinit();
+        errdefer evidence.matches.deinit();
+        evidence.covered.andWith(scope);
+        evidence.matches.andWith(scope);
+        if (evidence.covered.cardinality() == scope.cardinality()) return evidence.matches;
         var missing = try scope.cloneExact(self.alloc);
         defer missing.deinit();
-        missing.andNotWith(&covered);
+        missing.andNotWith(&evidence.covered);
         var residual = try self.executeStoredRange(stored, &missing);
         defer residual.deinit();
-        try typed_matches.orWith(&residual);
-        return typed_matches;
+        try evidence.matches.orWith(&residual);
+        return evidence.matches;
     }
 
     fn executeStoredRange(self: IndexedPredicateEvaluator, range: std.json.Value, scope: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
@@ -10872,22 +11037,16 @@ fn collectPrimaryResidualRange(
     return .{ .ordinal_bitmap = matches };
 }
 
-fn structuredRangeLeaves(query: search_mod.SearchQuery) struct { range: bool, other: bool } {
+fn hasStoredStandardRange(query: search_mod.SearchQuery) bool {
     switch (query) {
-        .numeric_range => |range| return .{ .range = range.stored_standard_range != null, .other = range.stored_standard_range == null },
+        .numeric_range => |range| return range.stored_standard_range != null,
         .bool_query => |boolean| {
-            var range = false;
-            var other = false;
             for ([_][]const search_mod.SearchQuery{ boolean.must, boolean.should, boolean.must_not }) |children| {
-                for (children) |child| {
-                    const leaves = structuredRangeLeaves(child);
-                    range = range or leaves.range;
-                    other = other or leaves.other;
-                }
+                for (children) |child| if (hasStoredStandardRange(child)) return true;
             }
-            return .{ .range = range, .other = other };
+            return false;
         },
-        else => return .{ .range = false, .other = true },
+        else => return false,
     }
 }
 
@@ -10910,10 +11069,9 @@ fn collectStructuredFilterResolvedDocSetAlloc(
         if (query) |search_query| {
             const finite = req.filter_doc_ids_positive or req.filter_doc_ids.len != 0 or
                 (if (resolvedDocFilterFromRequest(req)) |prior| prior.include != .all else false);
-            const leaves = structuredRangeLeaves(search_query);
-            const mixed_range = leaves.range and (leaves.other or has_match);
+            const has_range = hasStoredStandardRange(search_query);
             const has_primary_ids = containsPrimaryIds(search_query);
-            if (!finite and !leaves.range and !has_primary_ids) if (try collectSearchQueryResolvedDocSetAlloc(
+            if (!finite and !has_range and !has_primary_ids) if (try collectSearchQueryResolvedDocSetAlloc(
                 alloc,
                 scratch,
                 executor,
@@ -10923,21 +11081,13 @@ fn collectStructuredFilterResolvedDocSetAlloc(
                 .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
                 null,
             )) |native| return native;
-            const analyzed_policy = leaves.range and req.authorization_filter_query_json.len != 0 and
-                try patternFilterContainsMatch(try graph_exec.parsePatternJsonLeaky(scratch, req.authorization_filter_query_json), 0);
-            const searchable_range_or_finite = (finite or leaves.range) and !mixed_range and capable: {
-                if (!leaves.range) break :capable true;
-                const snapshot = text_entry.persistent.acquireSnapshot();
-                defer snapshot.release();
-                break :capable try searchQueryCanUseSnapshotWithControl(snapshot, search_query, text_entry.text_analysis, text_entry.runtime_schema, false, .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns });
-            };
-            if (has_match or has_primary_ids or analyzed_policy or (leaves.range and (leaves.other or (!finite and executor.primary_residual_scope == null))) or searchable_range_or_finite) {
+            if (has_match or has_primary_ids or has_range or finite) {
                 if (collectMixedStructuredFilterAlloc(alloc, scratch, req, executor, text_entry, search_query, filter_query_json, false, false)) |mixed| {
                     if (executor.structured_visibility_verified) |verified| verified.* = true;
                     return mixed;
                 } else |err| if (err != error.UnsupportedQueryRequest) return err;
             }
-            if (finite and !leaves.range and !has_match) {
+            if (finite and !has_range and !has_match) {
                 return collectSearchQueryResolvedDocSetAlloc(alloc, scratch, executor, text_entry, search_query, false, .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns }, null);
             }
         }
@@ -11027,7 +11177,7 @@ fn collectMixedStructuredFilterAlloc(
     }
     const cache_prefix = try std.fmt.allocPrint(scratch, "{d}:{d}:{d}:{d}:{s}:{s}", .{ entry.instance_id, entry.projection_revision, executor.identity_read_generation orelse 0, deletions.final(), if (skip_unmapped) "ordinal" else "complete", filter_json });
     const presence_key = try std.fmt.allocPrint(scratch, "primary-presence:{d}:{d}:{d}:{d}:{d}", .{ entry.instance_id, entry.projection_revision, executor.identity_read_generation orelse 0, deletions.final(), @intFromBool(skip_unmapped) });
-    const leaves = structuredRangeLeaves(query);
+    const has_range = hasStoredStandardRange(query);
     var missing_rows = roaring.RoaringBitmap.init(alloc);
     defer missing_rows.deinit();
     const matcher = IndexedPredicateEvaluator{
@@ -11042,7 +11192,7 @@ fn collectMixedStructuredFilterAlloc(
         .cache_prefix = cache_prefix,
         .missing_rows = &missing_rows,
         .skip_unmapped = skip_unmapped,
-        .reconcile_primary_ranges = leaves.range,
+        .reconcile_primary_ranges = has_range,
         .presence_cache_prefix = presence_key,
     };
     const identity = ResidualIdentityContext{ .executor = executor, .alloc = alloc, .control = matcher.control };
@@ -11224,6 +11374,50 @@ fn collectMixedStructuredFilterAlloc(
         return doc_set.cloneDocKeysAlloc(alloc, keys);
     }
     return .{ .ordinal_bitmap = result };
+}
+
+test "optional numeric range keeps typed evidence in mixed segment generations" {
+    const alloc = std.testing.allocator;
+    const schema: runtime_schema_mod.TableSchema = .{
+        .default_type = "doc",
+        .exact_fields = &.{.{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .numeric, .doc_values = true } }},
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{.{ .path = "body", .emitted_name = "body", .analyzer = "standard" }} }},
+    };
+    const modern = (try mapper_mod.buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "modern", .doc_ordinal = 5, .value = "{\"body\":\"beacon\",\"rank\":2}" },
+    }, .{}, schema)).?;
+    defer alloc.free(modern);
+    const legacy = (try mapper_mod.buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "legacy", .doc_ordinal = 6, .value = "{\"body\":\"beacon\",\"rank\":2}" },
+    }, .{}, null)).?;
+    defer alloc.free(legacy);
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(modern);
+    try writer.addSegment(legacy);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const parsed = try graph_exec.parsePatternJsonLeaky(scratch, "{\"range\":{\"rank\":{\"gte\":2}}}");
+    const query = try patternFilterValueToSearchQuery(scratch, parsed, .{}, schema);
+    const evaluator = IndexedPredicateEvaluator{
+        .snapshot = writer.snapshot(),
+        .schema = schema,
+        .analysis = .{},
+        .executor = .{ .ctx = null, .text_index_entry = testTextIndexEntryCallback },
+        .control = .{},
+        .alloc = alloc,
+        .scratch = scratch,
+        .cache_prefix = "",
+    };
+    var evidence = try evaluator.collectRangeEvidence(query, null);
+    defer evidence.covered.deinit();
+    defer evidence.matches.deinit();
+    try std.testing.expectEqual(@as(usize, 1), evidence.covered.cardinality());
+    try std.testing.expectEqual(@as(usize, 1), evidence.matches.cardinality());
+    try std.testing.expect(evidence.covered.contains(5));
+    try std.testing.expect(evidence.matches.contains(5));
 }
 
 test "optional numeric range frontier memo coalesces small extensions" {

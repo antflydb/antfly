@@ -156673,6 +156673,23 @@ test "optional numeric range reconciles witnessed text coverage with primary ide
         try std.testing.expectEqual(@as(usize, 1), result.result.hits.len);
         try std.testing.expectEqualStrings(case.expected, result.result.hits[0].id);
     }
+    const forward = try internal_keys.identityDocToOrdinalKeyAlloc(a, "b");
+    defer a.free(forward);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(forward);
+        try txn.commit();
+    }
+    var excluded = try db.searchDenseProfiled(a, .{
+        .index_name = "dv",
+        .primary_text_index_name = "ft",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"bool\":{\"must\":[{\"match\":{\"field\":\"body\",\"text\":\"relay\"}},{\"range\":{\"rank\":{\"gte\":1}}}],\"must_not\":[{\"doc_id\":[\"b\"]}]}}",
+    }, .{ .vector = &.{ 1, 0 }, .k = 1 });
+    defer excluded.result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), excluded.result.hits.len);
 }
 
 test "optional numeric range prefilters dense search without a text index" {
