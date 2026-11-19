@@ -39,6 +39,32 @@ and no-p95-regression criterion in this screen. Native is 2.6–3.1 times faster
 than this BF16 PJRT artifact; this does not reproduce PR #1404's exact unified
 runtime. The all-modality goal and PR readiness remain unmet.
 
+CUDA probes using the matching official Gemma4 QAT assistant passed all eight
+first-step gates and all 585 reference decisions with ordinary and deferred
+materialization in Debug. The deferred path also passed in ReleaseFast, but its
+native-only diagnostic timings were substantially slower than the selected
+checkpoint's prior measurements. No fresh peer comparison was claimed for it.
+Prepared/cached variants and three-row quantized verification changed exact
+reference decisions. All experimental MTP runtime changes have been removed,
+and the qualified V12 runtime source has been restored byte for byte. Their
+patches and raw evidence are retained in the qualification record. The selected
+speed profile remains unchanged.
+
+The qualified worker's full 256-token short-text Nsight trace reproduces all
+256 reference decisions. FFN gate/up and down account for about 53% of GPU
+kernel time, the output head 16%, and attention 5%. A separate real-weight FFN
+hardware-counter probe reaches about 96% of peak DRAM bandwidth with no spilling.
+These are instrumented diagnostics, not comparative latency measurements.
+The earlier 32-token trace uses a smaller replay capacity and a different
+attention route; it does not represent the full benchmark's attention cost.
+
+The comparison tool accepts an explicit `--baseline-env-file` for a qualified
+non-speculative control. Both inference and Gemma4 environment namespaces are
+recorded and isolated between arms; the control does not load the candidate's
+assistant. `--require-native-speculation` rejects inactive MTP on any measured
+request and records the assistant model hash. One-token logit validation remains
+separate from the measured speculation checks.
+
 
 ## L4 speed follow-up in progress
 

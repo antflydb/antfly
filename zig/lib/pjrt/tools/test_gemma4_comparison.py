@@ -22,7 +22,11 @@ from compare_gemma4 import (
     check_cpu_pins,
     check_decisions,
     check_native_activity,
+    check_native_speculation,
     check_rows,
+    native_campaign_suite,
+    native_child_environment,
+    native_profile,
 )
 
 
@@ -43,6 +47,66 @@ class ComparisonCoverageTests(unittest.TestCase):
 
     def test_equal_work_passes(self):
         check_rows(self.rows, self.cases, 2)
+
+    def test_baseline_does_not_inherit_candidate_optimizations_or_assistant(self):
+        ambient = {
+            "PATH": "/bin",
+            "ANTFLY_INFERENCE_CUDA_GEMMA4_SMALL_DECODE_TILES": "1",
+            "ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE": "1",
+        }
+        baseline = native_child_environment(ambient, native_profile({}))
+        self.assertEqual(baseline["PATH"], "/bin")
+        self.assertNotIn("ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE", baseline)
+        self.assertNotIn("ANTFLY_INFERENCE_CUDA_GEMMA4_SMALL_DECODE_TILES", baseline)
+        suite = {"cases": self.cases, "draft_model": "assistant", "speculative_k": 2}
+        self.assertEqual(native_campaign_suite(suite, True), {"cases": self.cases})
+        self.assertEqual(native_campaign_suite(suite), suite)
+        self.assertEqual(suite["draft_model"], "assistant")
+
+    def test_explicit_baseline_profile_is_independent(self):
+        candidate = native_profile({"ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE": "1"})
+        baseline = native_profile(
+            {"ANTFLY_INFERENCE_CUDA_GEMMA4_SMALL_DECODE_TILES": "1"}
+        )
+        env = native_child_environment(candidate, baseline)
+        self.assertNotIn("ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE", env)
+        self.assertEqual(env["ANTFLY_INFERENCE_CUDA_GEMMA4_SMALL_DECODE_TILES"], "1")
+
+    def test_profiles_reject_unrelated_or_non_string_environment(self):
+        for profile in (
+            {"LD_PRELOAD": "override.so"},
+            {"ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE": True},
+            [],
+        ):
+            with (
+                self.subTest(profile=profile),
+                self.assertRaisesRegex(ValueError, "Native profile"),
+            ):
+                native_profile(profile)
+
+    def test_every_measured_request_must_run_speculation(self):
+        active = {
+            "mtp_enabled": True,
+            "rounds": 2,
+            "drafted_tokens": 4,
+            "matched_draft_tokens": 2,
+        }
+        for row in self.rows:
+            row["speculative"] = copy.deepcopy(active)
+        check_native_speculation(self.rows)
+        for bad in (
+            None,
+            {},
+            {**active, "mtp_enabled": False},
+            {**active, "rounds": 0},
+            {**active, "matched_draft_tokens": True},
+        ):
+            with self.subTest(stats=bad):
+                self.rows[1]["speculative"] = bad
+                with self.assertRaisesRegex(ValueError, "Inactive measured"):
+                    check_native_speculation(self.rows)
+        with self.assertRaisesRegex(ValueError, "Missing measured"):
+            check_native_speculation([])
 
     def test_short_output_cannot_win(self):
         self.rows[0].update(completion_tokens=2, tokens=[5, 6])

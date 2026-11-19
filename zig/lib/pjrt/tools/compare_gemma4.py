@@ -37,6 +37,49 @@ REFERENCE_ENV = {
     "ANTFLY_INFERENCE_CUDA_Q4_0_PLE_GATE_FUSION": "0",
     "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "0",
 }
+NATIVE_ENV_PREFIXES = ("ANTFLY_INFERENCE_", "ANTFLY_GEMMA4_")
+
+
+def native_profile(overrides, inherited=None):
+    if not isinstance(overrides, dict) or any(
+        not isinstance(key, str)
+        or not key.startswith(NATIVE_ENV_PREFIXES)
+        or not isinstance(value, str)
+        for key, value in overrides.items()
+    ):
+        raise ValueError("Native profile must map inference/Gemma4 keys to strings")
+    return {**(inherited or {}), **REFERENCE_ENV, **overrides}
+
+
+def native_child_environment(ambient, profile):
+    return {
+        **{k: v for k, v in ambient.items() if not k.startswith(NATIVE_ENV_PREFIXES)},
+        **profile,
+    }
+
+
+def native_campaign_suite(suite, baseline=False):
+    return {
+        key: value
+        for key, value in suite.items()
+        if not baseline or key not in ("draft_model", "speculative_k")
+    }
+
+
+def check_native_speculation(rows):
+    if not rows:
+        raise ValueError("Missing measured speculative rows")
+    for row in rows:
+        stats = row.get("speculative")
+        if (
+            not isinstance(stats, dict)
+            or stats.get("mtp_enabled") is not True
+            or any(
+                type(stats.get(name)) is not int or stats[name] <= 0
+                for name in ("rounds", "drafted_tokens", "matched_draft_tokens")
+            )
+        ):
+            raise ValueError("Inactive measured speculation: " + row["id"])
 
 
 def check_rows(rows, cases, repeats):
@@ -148,6 +191,16 @@ def main():
     p.add_argument("--cpu", type=Path, action="append", required=True)
     p.add_argument("--native-env-file", type=Path)
     p.add_argument("--native-baseline", type=Path)
+    p.add_argument(
+        "--baseline-env-file",
+        type=Path,
+        help="Explicit non-speculative baseline profile; otherwise use reference settings",
+    )
+    p.add_argument(
+        "--require-native-speculation",
+        action="store_true",
+        help="Require active MTP with accepted drafts on every measured native request",
+    )
     p.add_argument("--native-decisions-reference", type=Path)
     p.add_argument("--cpu-qualification", type=Path)
     p.add_argument("--require-native-stat", action="append", default=[])
@@ -165,22 +218,23 @@ def main():
         p.error("Invalid campaign bounds")
     if bool(a.llama_loader) != bool(a.llama_runtime):
         p.error("Specify both compatible loader and runtime")
-    native_environment = {
+    inherited = {
         key: value
         for key, value in os.environ.items()
-        if key.startswith("ANTFLY_INFERENCE_")
+        if key.startswith(NATIVE_ENV_PREFIXES)
     }
-    native_environment.update(REFERENCE_ENV)
-    if a.native_env_file:
-        overrides = json.loads(a.native_env_file.read_text())
-        if not isinstance(overrides, dict) or any(
-            not isinstance(key, str)
-            or not key.startswith("ANTFLY_INFERENCE_")
-            or not isinstance(value, str)
-            for key, value in overrides.items()
-        ):
-            p.error("Native environment must map ANTFLY_INFERENCE_ keys to strings")
-        native_environment.update(overrides)
+    if a.baseline_env_file and not a.native_baseline:
+        p.error("--baseline-env-file requires --native-baseline")
+    try:
+        native_environment = native_profile(
+            json.loads(a.native_env_file.read_text()) if a.native_env_file else {},
+            inherited,
+        )
+        baseline_environment = native_profile(
+            json.loads(a.baseline_env_file.read_text()) if a.baseline_env_file else {}
+        )
+    except ValueError as error:
+        p.error(str(error))
     decision_references = None
     if a.native_decisions_reference:
         reference = json.loads(a.native_decisions_reference.read_text())
@@ -196,6 +250,16 @@ def main():
             p.error("Invalid independent decision reference")
     a.out.mkdir(parents=True, exist_ok=False)
     suite = json.loads(a.suite.read_text())
+    draft_model = suite.get("draft_model")
+    if a.require_native_speculation and not draft_model:
+        p.error("--require-native-speculation requires suite draft_model")
+    draft_identity = None
+    if draft_model:
+        draft_path = Path(draft_model)
+        if not draft_path.is_absolute():
+            draft_path = a.suite.parent / draft_path
+        suite["draft_model"] = str(draft_path.resolve())
+        draft_identity = {"path": suite["draft_model"], "sha256": digest(draft_path)}
     manifest = json.loads(a.manifest.read_text())
     validate_suite(suite, manifest)
     for key in ("gguf", "mmproj"):
@@ -298,12 +362,28 @@ def main():
         "common_case_ids": selected_ids,
         "orders": orders,
         "native_environment": native_environment,
+        "harness_sha256": {
+            name: digest(Path(__file__).with_name(name))
+            for name in (
+                "compare_gemma4.py",
+                "benchmark_gemma4.py",
+                "gemma4_inputs.py",
+                "validate_gemma4.py",
+                "memory.py",
+            )
+        },
+        "native_draft_model": draft_identity,
+        "required_native_speculation": a.require_native_speculation,
         "cpu_vector_sha256": {name: reference_hashes[name] for name in selected_ids},
         "cpu_qualification_sha256": digest(a.cpu_qualification)
         if a.cpu_qualification
         else None,
         "native_baseline": (
-            {"sha256": digest(a.native_baseline), "environment": REFERENCE_ENV}
+            {
+                "sha256": digest(a.native_baseline),
+                "environment": baseline_environment,
+                "draft_model": None,
+            }
             if a.native_baseline
             else None
         ),
@@ -402,24 +482,15 @@ def main():
     def native(directory, validation=False, baseline=False):
         directory.mkdir()
         config = native_suite(
-            suite,
+            native_campaign_suite(suite, baseline),
             a.suite.parent,
             directory,
             1 if validation else a.iterations,
             validation,
         )
         (directory / "suite.json").write_text(json.dumps(config))
-        env = (
-            {
-                **{
-                    key: value
-                    for key, value in os.environ.items()
-                    if not key.startswith("ANTFLY_INFERENCE_")
-                },
-                **REFERENCE_ENV,
-            }
-            if baseline
-            else {**os.environ, **native_environment}
+        env = native_child_environment(
+            os.environ, baseline_environment if baseline else native_environment
         )
         child(
             [
@@ -552,6 +623,8 @@ def main():
             directory = a.out / f"r{index}-{engine}"
             rows = runners[engine](directory)
             check_rows(rows, cases, a.iterations)
+            if engine == "native" and a.require_native_speculation:
+                check_native_speculation(rows)
             if engine in ("native", "baseline") and decision_references is not None:
                 check_decisions(rows, decision_references)
             if engine == "llama":

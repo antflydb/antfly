@@ -7902,5 +7902,301 @@
       ".tools/gemma4-speed/micro-ffn-q8-fused.py": "30693ecf46c14b123ab5f42edd2531b9a93850fbd16a0d3eca2206abb8da4063",
       "zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels_sm89.cubin": "ccf33db14f6ed1fb74feca406f4c05f893aa0701e86ca20edcdbb1d5834d3a6e"
     }
+  },
+  "pending_mtp_probe": {
+    "scope": "Experimental default-off CUDA MTP; preserved V12 checkpoint remains the selected qualified source",
+    "source_checkpoint": "5a7d9f7e29",
+    "status": "All experimental MTP runtime changes removed; selected V12 source restored byte-for-byte. Generic deferred ReleaseFast MTP passed8+585 but was slower; cached/prepared and three-row quantized variants failed exact decisions. No MTP performance win or promotion.",
+    "performance_qualified": false,
+    "assistant_sha256": "d747fcdfdcfaa80d9e0dd214f1a9f3b9c5ea236a782ed989da6afae48b2c2c5b",
+    "experiments": [
+      {
+        "name": "media",
+        "description": "Generic multimodal MTP",
+        "worker_sha256": "df92b73baf8375c2a13b8f72b02600c89c53128c3683603a966f013841aebe71",
+        "numerical_gates_pass": true,
+        "reference_decisions_pass": true,
+        "first_mismatches_zero_based": {},
+        "speculation_active_all_cases": true,
+        "performance_qualified": false,
+        "build_mode": "Debug correctness probe only",
+        "report": "evidence/speed-mtp-media-debug-qualification.json",
+        "report_sha256": "19002a1aec7d32fd078a5eacc47d2c4b8851466f59c020cfa40caaa88b4aebce",
+        "raw_results": "evidence/speed-mtp-media-debug/r0-native/result.json",
+        "raw_results_sha256": "a410960bf29f2cd4da1792b5ca792fd828018631115e2bcae3f133be17204ffe"
+      },
+      {
+        "name": "defer",
+        "description": "Deferred materialization",
+        "worker_sha256": "df92b73baf8375c2a13b8f72b02600c89c53128c3683603a966f013841aebe71",
+        "numerical_gates_pass": true,
+        "reference_decisions_pass": true,
+        "first_mismatches_zero_based": {},
+        "speculation_active_all_cases": true,
+        "performance_qualified": false,
+        "build_mode": "Debug correctness probe only",
+        "report": "evidence/speed-mtp-defer-debug-qualification.json",
+        "report_sha256": "465c2f2790612d3f1901bfe484dc659921a94e31e26cc5c5d25c76ce0625f3cb",
+        "raw_results": "evidence/speed-mtp-defer-debug/r0-native/result.json",
+        "raw_results_sha256": "6bec9ac67bd0e62a016f807e2178906034d37468393ed15245b7b42720236a53"
+      },
+      {
+        "name": "cached",
+        "description": "Prepared materialization and cached target seed",
+        "worker_sha256": "0e2719d8013bf0fb062e7a387dbc897dcf41c6c0b85aa7392f1f7f9ef46fd2ce",
+        "numerical_gates_pass": true,
+        "reference_decisions_pass": false,
+        "first_mismatches_zero_based": {
+          "image_64": [
+            16,
+            211902,
+            152794
+          ]
+        },
+        "speculation_active_all_cases": true,
+        "performance_qualified": false,
+        "build_mode": "Debug correctness probe only",
+        "report": "evidence/speed-mtp-cached-debug-qualification.json",
+        "report_sha256": "53d8c12df64498d7d2bc8ad66079bafc1155c53239052e42de1491966e7a5974",
+        "raw_results": "evidence/speed-mtp-cached-debug/r0-native/result.json",
+        "raw_results_sha256": "523dca7efec22ca97f3cca29f9ae60dde72668cf1d3149a46a6e4924516a44a1"
+      },
+      {
+        "name": "q4-verify-v2",
+        "description": "Global BF16 mirror row selector; rejected",
+        "worker_sha256": "0e2719d8013bf0fb062e7a387dbc897dcf41c6c0b85aa7392f1f7f9ef46fd2ce",
+        "numerical_gates_pass": true,
+        "reference_decisions_pass": false,
+        "first_mismatches_zero_based": {
+          "page_summary_128": [
+            63,
+            2016,
+            1183
+          ],
+          "video_6s_64": [
+            13,
+            28239,
+            7501
+          ]
+        },
+        "speculation_active_all_cases": true,
+        "performance_qualified": false,
+        "build_mode": "Debug correctness probe only",
+        "report": "evidence/speed-mtp-q4-verify-v2-debug-qualification.json",
+        "report_sha256": "96a7591ec627a722131c230208098e1200864ce7f8831b4fe7c9d4900b91bf7b",
+        "raw_results": "evidence/speed-mtp-q4-verify-v2-debug/r0-native/result.json",
+        "raw_results_sha256": "738da351eeabdc614a491964b563ce23450e7f26e8ac4c67bfc2e7fb1b2684aa"
+      },
+      {
+        "name": "quantized-head",
+        "description": "Scoped two-row quantized verification and paired head",
+        "worker_sha256": "056134ad8c4176de016d3889eac94b158e3b815088ee4236e3a05b3df27f7e49",
+        "numerical_gates_pass": true,
+        "reference_decisions_pass": false,
+        "first_mismatches_zero_based": {
+          "page_summary_128": [
+            101,
+            3904,
+            5431
+          ],
+          "image_64": [
+            16,
+            211902,
+            152794
+          ]
+        },
+        "speculation_active_all_cases": true,
+        "performance_qualified": false,
+        "build_mode": "Debug correctness probe only",
+        "report": "evidence/speed-mtp-quantized-head-debug-qualification.json",
+        "report_sha256": "1574a0405e14e2bc7000a781c7ef6ee698bdfc18424b65ad52940f31c3f16c99",
+        "raw_results": "evidence/speed-mtp-quantized-head-debug/r0-native/result.json",
+        "raw_results_sha256": "8084e18d916f6fca91a34c64422cc681c94a5acc771f4b86c7192a4033d4f8a6"
+      },
+      {
+        "name": "window-no-persist",
+        "description": "Window guard with persistent replay disabled",
+        "worker_sha256": "1588e02f6b823e2c96b03941489a80b7379ce64ee6b5ed2bc4b7382118c9b0c5",
+        "numerical_gates_pass": true,
+        "reference_decisions_pass": false,
+        "first_mismatches_zero_based": {
+          "image_64": [
+            16,
+            211902,
+            152794
+          ]
+        },
+        "speculation_active_all_cases": true,
+        "performance_qualified": false,
+        "build_mode": "Debug correctness probe only",
+        "report": "evidence/speed-mtp-window-no-persist-debug-qualification.json",
+        "report_sha256": "662ffd82cfe10256f0f6ea762de9c2adfc4e7507d6ac04bff54f9eb397c7d7c1",
+        "raw_results": "evidence/speed-mtp-window-no-persist-debug/r0-native/result.json",
+        "raw_results_sha256": "726e20a44de1fa4d05127d15301da422b5ffb5fc3432ae125c4cd4efbd760550"
+      },
+      {
+        "name": "window-no-seed",
+        "description": "Window guard with cached target seed disabled; rejected",
+        "worker_sha256": "1588e02f6b823e2c96b03941489a80b7379ce64ee6b5ed2bc4b7382118c9b0c5",
+        "numerical_gates_pass": true,
+        "reference_decisions_pass": false,
+        "first_mismatches_zero_based": {
+          "text_short_256": [
+            116,
+            236764,
+            2299
+          ]
+        },
+        "speculation_active_all_cases": true,
+        "performance_qualified": false,
+        "build_mode": "Debug correctness probe only",
+        "report": "evidence/speed-mtp-window-no-seed-debug-qualification.json",
+        "report_sha256": "2c5b73a386a7fc993acc8b64836ba48069025ae319804a83216d3be823b017d0",
+        "raw_results": "evidence/speed-mtp-window-no-seed-debug/r0-native/result.json",
+        "raw_results_sha256": "405a8bc7c7b0411faa7f027ecfed2192e19569b844a77af3db62c44209cf3d12"
+      },
+      {
+        "name": "defer-release",
+        "description": "Generic deferred MTP; correctness passed, native timing screen rejected as slower than selected checkpoint",
+        "worker_sha256": "508cfc6d0a6688ade32bb990fe5e499d170974fc739290275d6bb1b74c36b7eb",
+        "numerical_gates_pass": true,
+        "reference_decisions_pass": true,
+        "matched_reference_decisions": 585,
+        "speculation_active_all_cases": true,
+        "performance_qualified": false,
+        "build_mode": "ReleaseFast",
+        "report": "evidence/speed-mtp-defer-release-qualification.json",
+        "report_sha256": "3bcc50c51ce50d7d11d85be223ba9fa9ec8ed77f1d255d6cc990fa8329d4c598",
+        "native_only_diagnostic_ms": {
+          "text_short_256": 6260.888994,
+          "page_summary_128": 3702.031234,
+          "long2k_summary_64": 2868.834998,
+          "image_64": 2071.963663,
+          "audio_1s_64": 2812.174872,
+          "audio_12s_64": 1334.764933,
+          "audio_30s_64": 1845.16055,
+          "video_6s_64": 1983.928176
+        },
+        "timing_scope": "One native-only diagnostic row per case; no fresh peer comparison or latency-win claim"
+      },
+      {
+        "name": "three-row-quantized",
+        "worker_sha256": "51e65ce07767a1ab88d08165815c35d1012752f81caac926cba1982fd41c82b7",
+        "build_mode": "Debug correctness probe only",
+        "numerical_gates_pass": true,
+        "reference_decisions_pass": false,
+        "first_mismatches_zero_based": {
+          "text_short_256": [
+            75,
+            19541,
+            10916
+          ]
+        },
+        "quantized_activity": [
+          {
+            "id": "text_short_256",
+            "gemma4_mtp_quantized_verify_calls": 127,
+            "gemma4_mtp_quantized_head_calls": 127
+          },
+          {
+            "id": "page_summary_128",
+            "gemma4_mtp_quantized_verify_calls": 65,
+            "gemma4_mtp_quantized_head_calls": 65
+          },
+          {
+            "id": "long2k_summary_64",
+            "gemma4_mtp_quantized_verify_calls": 38,
+            "gemma4_mtp_quantized_head_calls": 38
+          },
+          {
+            "id": "image_64",
+            "gemma4_mtp_quantized_verify_calls": 35,
+            "gemma4_mtp_quantized_head_calls": 35
+          },
+          {
+            "id": "audio_1s_64",
+            "gemma4_mtp_quantized_verify_calls": 54,
+            "gemma4_mtp_quantized_head_calls": 54
+          },
+          {
+            "id": "audio_12s_64",
+            "gemma4_mtp_quantized_verify_calls": 22,
+            "gemma4_mtp_quantized_head_calls": 22
+          },
+          {
+            "id": "audio_30s_64",
+            "gemma4_mtp_quantized_verify_calls": 26,
+            "gemma4_mtp_quantized_head_calls": 26
+          },
+          {
+            "id": "video_6s_64",
+            "gemma4_mtp_quantized_verify_calls": 30,
+            "gemma4_mtp_quantized_head_calls": 30
+          }
+        ],
+        "performance_qualified": false,
+        "report": "evidence/speed-mtp-three-row-debug-qualification.json",
+        "report_sha256": "2bad3841b9690c6c14ce9aa446b38b0a679e6cf1e69aacc100d3b9e6c5551f78",
+        "raw_results": "evidence/speed-mtp-three-row-debug/r0-native/result.json",
+        "raw_results_sha256": "375b22f519d18ef2b784dbed8df2769f3d5b9c275ad1095db76fbdd69dfb4da7",
+        "rejected_runtime_patch": ".tools/gemma4-speed/rejected-v21-runtime.patch",
+        "rejected_runtime_patch_sha256": "2f14ad74365eb7c8eafe71939f422f24e481585b1bf73390036bdf29c6a8b0fe"
+      }
+    ],
+    "full_prior_report": "evidence/speed-mtp-probe-history-before-compaction.json",
+    "full_prior_report_sha256": "e9e84fe9167dd9602cd93dcdfe13cf8de864794ab1b71df4459817f13a1efada",
+    "component_bitproofs": [
+      {
+        "path": "evidence/speed-mtp-paired-head-bitproof.json",
+        "sha256": "cc684b8caa62fcf67a1004f8396a0f3e4fc708de5d50107377fdab3e9258f994"
+      },
+      {
+        "path": "evidence/speed-mtp-ffn-warp-order.json",
+        "sha256": "5b60a60ad79f934196659755b56e32d1efa557f532cdb3bb185bacfdd0a4bd78"
+      },
+      {
+        "path": "evidence/speed-mtp-rms-order.json",
+        "sha256": "5cf5fd2c6b81bdd6300ebe5325b60da8f67d5d8d6e6ba9471fcb4c324eb6b6f9",
+        "summary": "36/36 FP32 output comparisons match singleton RMS/Q8 mirror exactly; covers plain and BF16-mirror two-row RMS with real weights"
+      }
+    ],
+    "rejected_runtime_patch": {
+      "path": ".tools/gemma4-speed/rejected-v19-runtime.patch",
+      "sha256": "0adec88b5b9642fd710d90be3294d8e463ade4422b606755f7fd104728f47f5f"
+    }
+  },
+  "native_profiling": {
+    "scope": "Instrumented diagnostics only; selected profile and published clean comparison remain unchanged",
+    "full_budget_trace": {
+      "directory": "evidence/speed-native-nsys256",
+      "report_sha256": "3e47953480e4e1346cbfbb84642cc63f60bdc095d4a0a0e0b6034fff56f40d84",
+      "receipt_sha256": "17cf36c5d5daf7b9a4b41e768f0f9f383bf9258621d15dd328db440e404ec637",
+      "raw_results_sha256": "dfb591108a9fb65e487dbc3523f33774c824a0bf0f5b1ca8c1aabee01cb13993",
+      "reference_decisions": 256,
+      "reference_decisions_pass": true,
+      "kernel_time_percent": {
+        "small_ffn_pair": 35.0,
+        "small_ffn_down": 17.9,
+        "q6_q8_head_stage1": 15.9,
+        "f16_warp_attention_stage1": 4.2,
+        "attention_stage2": 0.8
+      }
+    },
+    "ffn_hardware_counters": {
+      "receipt": "evidence/speed-native-ffn-ncu/receipt.json",
+      "receipt_sha256": "7d90ba1bdb29c9fb620a3937d93fcb9d091bc434e502120ca445a0ec1a40663e",
+      "dram_peak_percent": 95.91,
+      "dram_gbytes_per_second": 287.2,
+      "no_spilling": true,
+      "clocks_locked": false
+    },
+    "short_trace_caveat": "32-token exploratory trace uses a smaller replay capacity and takes a different attention route; use full256 trace for the benchmark shape",
+    "explicit_split_toggle": {
+      "report": "evidence/speed-explicit-split-attention-qualification.json",
+      "report_sha256": "7ebe3bc8afe65796cea1fcf9fff611ea85e30f80dfad96f3bb3a2cf267d37d3e",
+      "equivalence_proof": "evidence/speed-explicit-split-attention-bitidentity.json",
+      "equivalence_proof_sha256": "ac472f7c55dda4ca95382116c37faffcd79e1c4bd89577ce7a52d107997544b5",
+      "result": "Already the model default; all8 full vectors and768 tokens match V12; no source change, promotion, or speed claim"
+    }
   }
 }
