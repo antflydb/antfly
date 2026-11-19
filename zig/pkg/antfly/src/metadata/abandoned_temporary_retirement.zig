@@ -16,14 +16,14 @@
 //! Metadata source retirement is separate from native image loss. A surviving
 //! native image still traverses the ordinary physical retirement state machine.
 const std = @import("std");
-const scopes = @import("scope_retirement_ledger.zig");
+const scopes = @import("retirement/scope/ledger.zig");
 const sources = @import("../system_catalog/temporary_source_binding.zig");
-const records = @import("schema_validation_publication.zig");
+const records = @import("schema_validation/publication.zig");
 const A = std.mem.Allocator;
 const local = @import("antfly_local_sources");
 const locks = local.storage_pessimistic_lock_authority;
 const native = local.storage_pessimistic_lock_control;
-const table = @import("table_retirement_ledger.zig");
+const table = @import("retirement/table/ledger.zig");
 const prepared = @import("../system_catalog/prepared_transactions.zig");
 const Participant = struct { lookup: scopes.Lookup, value: locks.Data.Participant };
 const ParticipantRecord = records.Record(Participant, "STAP", 8192);

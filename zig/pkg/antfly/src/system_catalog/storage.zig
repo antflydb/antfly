@@ -1338,7 +1338,7 @@ fn requireCallableReferencesWritable(a: std.mem.Allocator, txn: anytype, group: 
     var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(a, resource);
     defer dependencies.deinit(a);
     for (dependencies.uses) |use| {
-        const selected = (try @import("../metadata/scope_retirement_ledger.zig").member(txn, group, .routine, use.reference.id)) orelse continue;
+        const selected = (try @import("../metadata/retirement/scope/ledger.zig").member(txn, group, .routine, use.reference.id)) orelse continue;
         // Holding a support function freezes its definition. New unrelated
         // users may still bind it; only retiring sources forbid new edges.
         if (selected.intent == .retire) return error.TableTransitionActive;
@@ -1683,7 +1683,7 @@ pub fn requireScopeResourceWritable(alloc: std.mem.Allocator, txn: anytype, grou
     return requireScopeResourceWritableWithParents(alloc, txn, group, resource, &.{});
 }
 fn requireScopeResourceWritableWithParents(alloc: std.mem.Allocator, txn: anytype, group: u64, resource: domain.Resource, planned: []const domain.Resource) !void {
-    const retirement = @import("../metadata/scope_retirement_ledger.zig");
+    const retirement = @import("../metadata/retirement/scope/ledger.zig");
     if (try retirement.member(txn, group, resource.kind, resource.id) != null) return error.TableTransitionActive;
     switch (domain.parentScope(resource.kind)) {
         .global => {},

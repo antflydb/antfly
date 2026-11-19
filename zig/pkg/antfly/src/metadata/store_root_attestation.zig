@@ -121,7 +121,7 @@ pub fn ProofFor(comptime message_domain: []const u8, comptime accepted_domain: [
             }
             if (self.native_pin) |pin| {
                 if (self.authority != .native) return error.InvalidGenerationPublication;
-                const actual = try @import("sql_relation_attestation.zig").nativeAuthorityDigest(self.identity, pin);
+                const actual = try @import("sql/relation_lifecycle/attestation.zig").nativeAuthorityDigest(self.identity, pin);
                 if (!std.mem.eql(u8, &actual, &self.authority.native)) return error.InvalidGenerationPublication;
                 hash.update("native-physical-pin/v1\x00");
                 hash.update(&try pin.encode());
@@ -179,7 +179,7 @@ pub const NativeView = struct {
         if (self.reporter_incarnation == 0 or !std.mem.eql(u8, &metadata_incarnation, &self.identity.metadata_incarnation))
             return error.InvalidCatalogRecord;
         if (self.native_pin) |pin| {
-            const actual = try @import("sql_relation_attestation.zig").nativeAuthorityDigest(self.identity, pin);
+            const actual = try @import("sql/relation_lifecycle/attestation.zig").nativeAuthorityDigest(self.identity, pin);
             if (!std.mem.eql(u8, &actual, &self.binding_digest)) return error.InvalidCatalogRecord;
             return;
         }

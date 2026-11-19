@@ -805,7 +805,7 @@ fn validateOrdinaryRaftPayload(payload: BatchMutationPayload) !void {
     const base = batchMutationVersion(payload.request);
     if (payload.schema_version == 25) {
         if (base != 24) return error.InvalidBatchRequest;
-        if (payload.request.sql_lock != null) try @import("../pessimistic_lock_control.zig").validateBatch(payload.request);
+        if (payload.request.sql_lock != null) try @import("../pessimistic_lock/control.zig").validateBatch(payload.request);
     } else if (payload.schema_version == 23) {
         if (base != 22) return error.InvalidBatchRequest;
     } else if (payload.schema_version == 19) {

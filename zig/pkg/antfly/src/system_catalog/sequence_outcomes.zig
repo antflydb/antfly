@@ -280,8 +280,8 @@ pub const Pending = struct {
     revision: u64,
     identity: Identity,
     work: union(enum) {
-        schema: @import("../metadata/schema_validation_read.zig").Lookup,
-        sequence_schema: @import("../metadata/schema_validation_read.zig").Lookup,
+        schema: @import("../metadata/schema_validation/read.zig").Lookup,
+        sequence_schema: @import("../metadata/schema_validation/read.zig").Lookup,
         restore: RestoreWork,
         policy_pair: PolicyPairWork,
     },
@@ -293,7 +293,7 @@ pub const Pending = struct {
                     pair.logical_relation_id > std.math.maxInt(u32) or pair.schema_version == 0 or self.identity.generation != pair.schema_version or
                     pair.policy_generation == 0 or pair.catalog_epoch == 0 or std.mem.allEqual(u8, &pair.incarnation, 0) or std.mem.allEqual(u8, &pair.pair_digest, 0)) return error.InvalidSequenceOutcome;
             },
-            .schema, .sequence_schema => |lookup| try (@import("../metadata/schema_validation_read.zig").OwnerReadRequest{ .lookup = lookup, .ordinal = 0 }).validate(),
+            .schema, .sequence_schema => |lookup| try (@import("../metadata/schema_validation/read.zig").OwnerReadRequest{ .lookup = lookup, .ordinal = 0 }).validate(),
             .restore => |lookup| {
                 try lookup.validate();
                 if (!std.meta.eql(self.identity, lookup.identity)) return error.InvalidSequenceOutcome;
@@ -455,7 +455,7 @@ pub fn Store(comptime Txn: type) type {
                 const retiring = pending.work == .sequence_schema;
                 const schema_lookup = if (retiring) pending.work.sequence_schema else pending.work.schema;
                 if (schema_lookup.group != self.group) return error.InvalidSequenceOutcome;
-                const job_head = try @import("../metadata/schema_validation_ledger.zig").readHead(self.txn, schema_lookup);
+                const job_head = try @import("../metadata/schema_validation/ledger.zig").readHead(self.txn, schema_lookup);
                 if (retiring) {
                     const retired = job_head.sequence_retirement orelse return error.InvalidSequenceOutcome;
                     if (retired.id != pending.identity.id or retired.generation != pending.identity.generation or
@@ -641,8 +641,8 @@ fn pendingTypeOutcome(rejected: bool) !void {
     const a = std.testing.allocator;
     const local = @import("antfly_local_sources");
     const DocStore = local.storage_docstore.DocStore;
-    const ledger = @import("../metadata/schema_validation_ledger.zig");
-    const Head = @import("../metadata/schema_validation_publication.zig").Head;
+    const ledger = @import("../metadata/schema_validation/ledger.zig");
+    const Head = @import("../metadata/schema_validation/publication.zig").Head;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/pending-type", .{temporary.sub_path}, 0);

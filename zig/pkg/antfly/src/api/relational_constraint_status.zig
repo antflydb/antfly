@@ -126,7 +126,7 @@ fn collectObserved(alloc: std.mem.Allocator, source: anytype, reader: reads.Tabl
             diagnostic.stage = .boot_read;
             const bytes = try source.systemCatalog(temporary, private, .{ .sql_relation_boot_read = .{ .node = descriptor.owner_node_id, .binding_table = table.table_id } });
             if (bytes.len > 64 * 1024) return error.InvalidSqlBackendResponse;
-            const observed = try std.json.parseFromSliceLeaky(@import("../metadata/sql_relation_boots.zig").Observation, temporary, bytes, .{});
+            const observed = try std.json.parseFromSliceLeaky(@import("../metadata/sql/relation_lifecycle/boots.zig").Observation, temporary, bytes, .{});
             diagnostic.registered = observed.registration_current;
             diagnostic.initialized = observed.initialized != null;
             diagnostic.boot = if (observed.record) |record| record.generation else 0;
@@ -378,8 +378,8 @@ test "SQL relation lifetime unconstrained readiness requires actual initialized 
     const a = std.testing.allocator;
     const local = @import("antfly_local_sources");
     const persistence = local.common_topology_records.RelationPersistence;
-    const attest = @import("../metadata/sql_relation_attestation.zig");
-    const boots = @import("../metadata/sql_relation_boots.zig");
+    const attest = @import("../metadata/sql/relation_lifecycle/attestation.zig");
+    const boots = @import("../metadata/sql/relation_lifecycle/boots.zig");
     const client = @import("../storage/kernel_owner_client.zig");
     const abi = @import("kernel_owner_abi");
     const services = @import("../storage/kernel_runtime_services.zig");

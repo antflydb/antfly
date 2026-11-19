@@ -19,7 +19,7 @@ const std = @import("std");
 const wire = @import("../pgwire/completion.zig");
 const server_mod = @import("http_server.zig");
 const operation = @import("antfly_local_sources").api_operation;
-const refs = @import("../metadata/sql_completion_references.zig");
+const refs = @import("../metadata/sql/completion_references.zig");
 const catalog = @import("antfly_local_sources").sql_catalog;
 fn registrationStore(server: *server_mod.ApiHttpServer) !*@import("transactions.zig").DurableSessionStore {
     const store = server.txn_sessions.durable orelse return error.DurabilityUnavailable;

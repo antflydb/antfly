@@ -20,8 +20,8 @@
 const http_server = @import("api/http_server.zig");
 test {
     _ = @import("system_catalog/sql_notifications.zig");
-    _ = @import("api/sql_notification_hub.zig");
-    _ = @import("api/sql_notification_maintenance.zig");
+    _ = @import("api/sql/notifications/hub.zig");
+    _ = @import("api/sql/notifications/maintenance.zig");
     _ = @import("api/relational_expression_contract.zig");
     _ = @import("api/row_policy_publication_coordinator.zig");
     _ = @import("api/retained_read_rpc.zig");
@@ -106,8 +106,8 @@ test "system catalog routing and transport discovery" {
 }
 
 test "system catalog schema validation submission discovery" {
-    _ = @import("api/schema_validation_recovery.zig");
-    _ = @import("api/schema_validation_admission.zig");
+    _ = @import("api/schema_validation/recovery.zig");
+    _ = @import("api/schema_validation/admission.zig");
     _ = @import("metadata/http_client.zig");
     _ = @import("metadata/http_server.zig");
     _ = @import("system_catalog/operations.zig");

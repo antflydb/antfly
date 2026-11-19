@@ -17,5 +17,5 @@ pub const antfly_sources = @import("source_owner_control.zig");
 pub const local_test_sources = @import("local_test_sources.zig");
 
 test {
-    _ = @import("metadata/schema_validation_source_outbox.zig");
+    _ = @import("metadata/schema_validation/source_outbox.zig");
 }

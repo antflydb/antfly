@@ -17,7 +17,7 @@
 //! have crossed the proposal boundary, neither cancellation nor transport loss
 //! permits replaying it. Only immutable job observations resolve uncertainty.
 const std = @import("std");
-const root = @import("../metadata/table_retirement_ledger.zig");
+const root = @import("../metadata/retirement/table/ledger.zig");
 const operation = @import("antfly_local_sources").api_operation;
 const Server = @import("http_server.zig").ApiHttpServer;
 
@@ -40,7 +40,7 @@ fn stepInternal(server: *Server, after: u64, context: operation.RequestContext, 
     defer arena.deinit();
     const a = arena.allocator();
     const page_bytes = try server.source.systemCatalog(a, context, .{ .table_retirement_queue = after });
-    const page = try std.json.parseFromSliceLeaky(@import("../metadata/table_retirement_work.zig").Page, a, page_bytes, .{});
+    const page = try std.json.parseFromSliceLeaky(@import("../metadata/retirement/table/work.zig").Page, a, page_bytes, .{});
     const lookup = page.lookup orelse return page.next;
     return stepLookup(server, a, lookup, page.next, context, lose_owner_reply, null);
 }
@@ -48,13 +48,13 @@ fn stepInternal(server: *Server, after: u64, context: operation.RequestContext, 
 /// A source shutting down can own a retained TEMP scope whose ancestor runs
 /// on metadata. Drive only its already admitted physical child while ordinary
 /// session maintenance is joined; never discover an unrelated table job.
-pub fn stepScopeChild(server: *Server, child: @import("../metadata/scope_retirement_ledger.zig").Child, context: operation.RequestContext) !void {
+pub fn stepScopeChild(server: *Server, child: @import("../metadata/retirement/scope/ledger.zig").Child, context: operation.RequestContext) !void {
     try child.validate();
     var arena = std.heap.ArenaAllocator.init(server.alloc);
     defer arena.deinit();
     const a = arena.allocator();
     const lookup: root.Lookup = .{ .group = child.lookup.group, .table = child.table, .id = child.id };
-    const receipts = @import("../metadata/table_retirement_receipt.zig");
+    const receipts = @import("../metadata/retirement/table/receipt.zig");
     const expected: receipts.Request = .{ .lookup = lookup, .effect = .{ .scope_admission = child } };
     const bytes = try server.source.systemCatalog(a, context, .{ .table_retirement_receipt = expected });
     const admitted = try std.json.parseFromSliceLeaky(receipts.Observation, a, bytes, .{});
@@ -63,18 +63,18 @@ pub fn stepScopeChild(server: *Server, child: @import("../metadata/scope_retirem
     _ = try stepLookup(server, a, lookup, 0, context, false, child);
 }
 
-fn stepLookup(server: *Server, a: std.mem.Allocator, lookup: root.Lookup, next: u64, context: operation.RequestContext, comptime lose_owner_reply: bool, expected_parent: ?@import("../metadata/scope_retirement_ledger.zig").Child) !u64 {
+fn stepLookup(server: *Server, a: std.mem.Allocator, lookup: root.Lookup, next: u64, context: operation.RequestContext, comptime lose_owner_reply: bool, expected_parent: ?@import("../metadata/retirement/scope/ledger.zig").Child) !u64 {
     const work_bytes = try server.source.systemCatalog(a, context, .{ .table_retirement_owner_work = lookup });
     const work = try std.json.parseFromSliceLeaky(root.Work, a, work_bytes, .{});
     try work.head.validate();
     if (!std.meta.eql(work.head.lookup, lookup)) return error.InvalidCatalogRecord;
-    if (expected_parent) |parent| if (!std.meta.eql(work.head.scope.parent, @as(?@import("../metadata/scope_retirement_ledger.zig").Child, parent))) return error.InvalidCatalogRecord;
+    if (expected_parent) |parent| if (!std.meta.eql(work.head.scope.parent, @as(?@import("../metadata/retirement/scope/ledger.zig").Child, parent))) return error.InvalidCatalogRecord;
     if (work.head.scope.parent != null and work.head.phase == .physical_ready) return next;
     var command: root.Command = undefined;
     switch (work.head.phase) {
         .reserved, .physical_ready => {
             const bytes = try server.source.systemCatalog(a, context, .{ .table_retirement_effects = lookup });
-            var effects = try @import("../metadata/table_retirement_manifest.zig").Owned.parse(a, bytes);
+            var effects = try @import("../metadata/retirement/table/manifest.zig").Owned.parse(a, bytes);
             defer effects.deinit();
             if (!std.meta.eql(try effects.value.reference(), work.head.effects) or !std.mem.eql(u8, &effects.value.metadata_incarnation, &work.head.incarnation)) return error.InvalidCatalogRecord;
             if (effects.value.root_ranges.len == 0) return error.GenerationAdmissionPending;
@@ -86,12 +86,12 @@ fn stepLookup(server: *Server, a: std.mem.Allocator, lookup: root.Lookup, next: 
             } else if (effects.value.survivors.len == 0) {
                 command = .{ .publish = .{ .lookup = lookup, .expected_revision = work.head.revision } };
             } else {
-                var transport: @import("schema_validation_owner_transport.zig").Transport = .{ .server = server, .alloc = a };
+                var transport: @import("schema_validation/owner_transport.zig").Transport = .{ .server = server, .alloc = a };
                 defer transport.deinit();
                 const io = server.sharedApiIo() orelse return error.MissingBackendRuntimeIo;
-                var prepared = try @import("schema_validation_plan_builder.zig").buildTableRetirement(&transport, a, io, context, work.head, effects.value, if (server.cfg.deployment_mode == .standalone) .native else .raft);
+                var prepared = try @import("schema_validation/plan_builder.zig").buildTableRetirement(&transport, a, io, context, work.head, effects.value, if (server.cfg.deployment_mode == .standalone) .native else .raft);
                 defer prepared.deinit();
-                const accepted = try @import("schema_validation_admission.zig").beginWhenReady(server.source, a, io, context, prepared.command);
+                const accepted = try @import("schema_validation/admission.zig").beginWhenReady(server.source, a, io, context, prepared.command);
                 switch (accepted) {
                     .reply => {},
                     .rejected => |err| return err,
@@ -104,7 +104,7 @@ fn stepLookup(server: *Server, a: std.mem.Allocator, lookup: root.Lookup, next: 
             // Scheduling is selected from the admitted immutable preimage,
             // never a fresh table name or an unrelated Raft group leader.
             const bytes = try server.source.systemCatalog(a, context, .{ .table_retirement_effects = lookup });
-            var effects = try @import("../metadata/table_retirement_manifest.zig").Owned.parse(a, bytes);
+            var effects = try @import("../metadata/retirement/table/manifest.zig").Owned.parse(a, bytes);
             defer effects.deinit();
             if (!std.meta.eql(try effects.value.reference(), work.head.effects) or !std.mem.eql(u8, &effects.value.metadata_incarnation, &work.head.incarnation)) return error.InvalidCatalogRecord;
             const captured = try capturedOwner(effects.value, owner.table, owner.group);
@@ -137,7 +137,7 @@ fn stepLookup(server: *Server, a: std.mem.Allocator, lookup: root.Lookup, next: 
     return next;
 }
 
-fn capturedOwner(manifest: @import("../metadata/table_retirement_manifest.zig").Manifest, table: u64, group: u64) !@import("table_retirement_preparation.zig").Selection {
+fn capturedOwner(manifest: @import("../metadata/retirement/table/manifest.zig").Manifest, table: u64, group: u64) !@import("table_retirement_preparation.zig").Selection {
     if (manifest.root.table_id == table) {
         for (manifest.root_ranges) |range| if (range.group_id == group and range.table_id == table) return .{ .table = manifest.root, .range = range };
     }
@@ -154,8 +154,8 @@ fn capturedOwner(manifest: @import("../metadata/table_retirement_manifest.zig").
 }
 
 test "SQL relation lifetime scoped cleanup drives only an admitted exact child and rejects substituted custody before owner effects" {
-    const scopes = @import("../metadata/scope_retirement_ledger.zig");
-    const receipts = @import("../metadata/table_retirement_receipt.zig");
+    const scopes = @import("../metadata/retirement/scope/ledger.zig");
+    const receipts = @import("../metadata/retirement/table/receipt.zig");
     const a = std.testing.allocator;
     const lookup: scopes.Lookup = .{ .group = 2188, .reference = .{ .id = @splat(1), .digest = @splat(2), .database = 1, .root = 2, .kind = .namespace, .tables = 1, .resources = 1 } };
     const child: scopes.Child = .{ .lookup = lookup, .ordinal = 0, .table = 3, .id = try lookup.reference.childId(3), .definition = @splat(4), .ranges = @splat(5) };
@@ -213,7 +213,7 @@ test "SQL relation lifetime scoped cleanup drives only an admitted exact child a
 
 test "SQL relation lifetime retirement delivery preserves the exact captured native owner and range without fresh Raft lookup" {
     const records = @import("antfly_local_sources").common_topology_records;
-    const manifests = @import("../metadata/table_retirement_manifest.zig");
+    const manifests = @import("../metadata/retirement/table/manifest.zig");
     const a = std.testing.allocator;
     const schema = "{\"version\":1}";
     var digest: [32]u8 = undefined;

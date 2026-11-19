@@ -2935,7 +2935,7 @@ pub const AntflyApiHandler = struct {
         var service = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
         defer service.deinit(self.api_server.alloc);
         if (!service.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
-        const execution = @import("relational_index_owner_execution.zig");
+        const execution = @import("relational_index/owner_execution.zig");
         const budget_header = ctx.header(if (claims) execution.claim_remaining_ms_header else execution.control_remaining_ms_header) orelse return textResponse(ctx, 400, "private index operation budget required");
         const budget_ms = std.fmt.parseUnsigned(u32, budget_header, 10) catch return textResponse(ctx, 400, "invalid private index operation budget");
         if (budget_ms == 0 or budget_ms > execution.max_claim_budget_ms) return textResponse(ctx, 400, "invalid private index operation budget");
@@ -2971,7 +2971,7 @@ pub const AntflyApiHandler = struct {
         var service = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
         defer service.deinit(self.api_server.alloc);
         if (!service.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
-        const preparation = @import("schema_validation_preparation.zig");
+        const preparation = @import("schema_validation/preparation.zig");
         const budget_header = ctx.header(preparation.remaining_ms_header) orelse return textResponse(ctx, 400, "schema preparation budget required");
         const budget_ms = std.fmt.parseUnsigned(u32, budget_header, 10) catch return textResponse(ctx, 400, "invalid schema preparation budget");
         if (budget_ms == 0 or budget_ms > preparation.max_budget_ms) return textResponse(ctx, 400, "invalid schema preparation budget");
@@ -4546,7 +4546,7 @@ pub const AntflyApiHandler = struct {
         };
         if (input.req.trigger_receipts.len != 0) {
             const route = input.route_fence orelse return textResponse(ctx, 403, "trigger route authority required");
-            input.route_fence = @import("sql_trigger_authority.zig").admitHttp(self.api_server, ctx.allocator, route, input.req, body, ctx.header(@import("antfly_local_sources").common_trigger_preparation_authority.header), .prepare) catch |err|
+            input.route_fence = @import("sql/triggers/authority.zig").admitHttp(self.api_server, ctx.allocator, route, input.req, body, ctx.header(@import("antfly_local_sources").common_trigger_preparation_authority.header), .prepare) catch |err|
                 return textResponse(ctx, 403, @errorName(err));
         }
         var native_context = operationContext(ctx, null);
@@ -7362,7 +7362,7 @@ pub const AntflyApiHandler = struct {
             const compiled = lease.compiled();
             // COPY owns a wire streaming contract. Neither JSON execution nor
             // JSON prepared resources may silently expose its SELECT body.
-            if ((compiled.statement == .copy_to or compiled.statement == .copy_from) and @import("sql_copy_server.zig").target(compiled.statement) == null) return error.UnsupportedSqlExecution;
+            if ((compiled.statement == .copy_to or compiled.statement == .copy_from) and @import("sql/copy/server.zig").target(compiled.statement) == null) return error.UnsupportedSqlExecution;
             if (self.prepared_mode == .prepare) {
                 if (self.statement.len > prepared.max_statement_bytes) return error.SqlProgramLimitExceeded;
                 switch (compiled.statement) {
@@ -7650,7 +7650,7 @@ pub const AntflyApiHandler = struct {
         defer parsed.deinit();
         const limit = parsed.value.limit orelse 128;
         if (limit < 1 or limit > 128) return error.SqlInvalidParameterValue;
-        const delivery = @import("sql_notification_delivery.zig");
+        const delivery = @import("sql/notifications/delivery.zig");
         const acknowledgement = if (parsed.value.acknowledge) |token| try delivery.decodeCursor(token) else null;
         const io = self.api_server.sharedApiIo() orelse return error.SqlConnectionUnavailable;
         const Job = struct {
@@ -11150,7 +11150,7 @@ pub const AntflyApiHandler = struct {
         var context = operationContext(ctx, identity);
         context.setting_admin = true;
         context.schema_validation_authority = true;
-        const recovery = @import("schema_validation_recovery.zig");
+        const recovery = @import("schema_validation/recovery.zig");
         const bytes = recovery.readTable(self.api_server.source, alloc, context, target, ctx.header("x-antfly-schema-validation-token") orelse "") catch |err| return jsonErrorResponse(ctx, recovery.httpStatus(err), @errorName(err));
         defer alloc.free(bytes);
         try ctx.setHeader("cache-control", "no-store");
@@ -12744,7 +12744,7 @@ test "public index publication recovery requires table admin and preserves exact
                     if (self.wrong_incarnation) return error.MetadataIncarnationMismatch;
                     try std.testing.expectEqualStrings("by/email", request.index_name);
                     try std.testing.expectEqualStrings("items/a", request.guard.logical_table);
-                    return std.json.Stringify.valueAlloc(a, @import("../metadata/relational_index_publication.zig").AdmissionStatus{ .metadata_incarnation = @splat('1') }, .{});
+                    return std.json.Stringify.valueAlloc(a, @import("../metadata/relational_index/publication.zig").AdmissionStatus{ .metadata_incarnation = @splat('1') }, .{});
                 },
                 else => return error.TestUnexpectedResult,
             }
@@ -16558,7 +16558,7 @@ fn documentMutationCampaign(reference_bytes: []const u8) !void {
     var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, reads.source(), writes.source());
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
-    const parity = @import("sql_parity_reference.zig");
+    const parity = @import("sql/testing/parity_reference.zig");
     const reference = try std.json.parseFromSlice(parity.DocumentReference, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
     defer reference.deinit();
     try parity.runDocuments(alloc, &handler, &db, &source, reference.value);
@@ -16688,7 +16688,7 @@ test "httpx SQL LATERAL original campaign executes captured native table relatio
     const ids = try alloc.alloc([]const u8, parsed.value.entries.len);
     defer alloc.free(ids);
     for (parsed.value.entries, ids) |entry, *id| id.* = entry.id;
-    try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, ids, reference_bytes);
+    try @import("sql/testing/parity_reference.zig").runReferenceStrict(alloc, &handler, ids, reference_bytes);
     try std.testing.expectEqual(ids.len, source.captures);
     var corpus = try @import("antfly_local_sources").sql_parity_fixtures.Corpus.init(alloc);
     defer corpus.deinit();
@@ -16733,7 +16733,7 @@ test "httpx SQL PostgreSQL original set reads preserve cross table bags and null
         parsed.value.profile.additional_tables[0],
         parsed.value.profile.additional_tables[1],
     };
-    const Source = @import("sql_parity_sources.zig").Tables(3);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(3);
     var source: Source = undefined;
     source.captures = 0;
     var databases: [3]db_mod.DB = undefined;
@@ -16767,7 +16767,7 @@ test "httpx SQL PostgreSQL original set reads preserve cross table bags and null
         "sql-0543", "sql-0544", "sql-0547", "sql-0548",
         "sql-0553",
     };
-    try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
+    try @import("sql/testing/parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
     try std.testing.expectEqual(ids.len, source.captures);
 }
 
@@ -16792,7 +16792,7 @@ test "httpx SQL PostgreSQL original aggregate reads preserve filters captures an
     const writes = try a.alloc(db_mod.types.BatchWrite, profile.value.profile.rows.len);
     for (profile.value.profile.rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(a, row.value, .{}) };
     try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
-    const Source = @import("sql_parity_sources.zig").Tables(1);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
     var source: Source = .{
         .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }},
         .reads = .{table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
@@ -16806,7 +16806,7 @@ test "httpx SQL PostgreSQL original aggregate reads preserve filters captures an
         "sql-1225", "sql-1232", "sql-1242", "sql-1243", "sql-1244", "sql-1245",
         "sql-1246", "sql-1247", "sql-1248", "sql-1250", "sql-1251", "sql-1252",
     };
-    try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
+    try @import("sql/testing/parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
     // Single-table aggregates use the retained native scan, not the separate
     // multi-table capture hook exercised by the set-operation fixture above.
     try std.testing.expectEqual(@as(usize, 0), source.captures);
@@ -16832,7 +16832,7 @@ fn postgresNativeSingleTableReads(reference_bytes: []const u8, table_name: []con
     const writes = try a.alloc(db_mod.types.BatchWrite, profile.value.profile.rows.len);
     for (profile.value.profile.rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(a, row.value, .{}) };
     try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
-    const Source = @import("sql_parity_sources.zig").Tables(1);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
     var source: Source = .{
         .records = .{.{ .table_id = 7, .name = table_name, .schema_json = schema }},
         .reads = .{table_reads.BoundTableReadSource.init(table_name, 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
@@ -16847,11 +16847,11 @@ fn postgresNativeSingleTableReads(reference_bytes: []const u8, table_name: []con
         try std.testing.expectEqual(ids.len, expected_codes.len);
         for (ids, expected_codes, profile.value.entries) |id, code, entry| {
             try std.testing.expectEqualStrings(code, entry.sqlstate orelse return error.MissingRejectionContract);
-            try @import("sql_parity_reference.zig").expectRejection(alloc, &handler, id, code);
+            try @import("sql/testing/parity_reference.zig").expectRejection(alloc, &handler, id, code);
         }
         try std.testing.expectEqual(@as(usize, 0), source.captures);
         try std.testing.expectEqual(@as(usize, 0), source.native_reads.load(.monotonic));
-    } else try @import("sql_parity_reference.zig").runReferenceDescribedTransportStrict(alloc, &handler, ids, reference_bytes);
+    } else try @import("sql/testing/parity_reference.zig").runReferenceDescribedTransportStrict(alloc, &handler, ids, reference_bytes);
 }
 
 test "httpx SQL PostgreSQL original users alias read preserves the bounded matching frontier" {
@@ -16910,7 +16910,7 @@ test "httpx SQL catalog JSON generated rows preserve public DDL and restart sema
     }
     var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
-    const Source = @import("sql_parity_sources.zig").Tables(1);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
     var source: Source = .{
         .records = .{.{ .table_id = 7, .name = "payloads", .schema_json = schema }},
         .reads = .{table_reads.BoundTableReadSource.init("payloads", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
@@ -16995,7 +16995,7 @@ test "httpx SQL catalog original multi column generated rows match PostgreSQL af
     }
     var db = try db_mod.DB.open(alloc, directory.path(), options);
     defer db.close();
-    const Source = @import("sql_parity_sources.zig").Tables(1);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
     var source: Source = .{
         .records = .{.{ .table_id = 7, .name = "generated_expr_records", .schema_json = schema }},
         .reads = .{table_reads.BoundTableReadSource.init("generated_expr_records", 8, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
@@ -17060,7 +17060,7 @@ test "httpx SQL generated immutable planning preserves PostgreSQL stored rows af
         }
         var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
         defer db.close();
-        const Source = @import("sql_parity_sources.zig").Tables(1);
+        const Source = @import("sql/testing/parity_sources.zig").Tables(1);
         var source: Source = .{
             .records = .{.{ .table_id = 7, .name = "generated_probe", .schema_json = schema }},
             .reads = .{table_reads.BoundTableReadSource.init("generated_probe", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
@@ -17110,7 +17110,7 @@ test "httpx SQL generated immutable planning preserves PostgreSQL rejection diag
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
     ;
     try db.setSchemaJson(alloc, schema);
-    const Source = @import("sql_parity_sources.zig").Tables(1);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
     var source: Source = .{
         .records = .{.{ .table_id = 7, .name = "generated_input", .schema_json = schema }},
         .reads = .{table_reads.BoundTableReadSource.init("generated_input", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
@@ -17160,7 +17160,7 @@ test "httpx SQL immutable index planning preserves PostgreSQL rejection diagnost
     const schema = try local.sql_ddl_runtime.createSchemaAlloc(alloc, base.statement.create_table);
     defer alloc.free(schema);
     try db.setSchemaJson(alloc, schema);
-    const Source = @import("sql_parity_sources.zig").Tables(1);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
     var source: Source = .{
         .records = .{.{ .table_id = 7, .name = "index_probe", .schema_json = schema }},
         .reads = .{table_reads.BoundTableReadSource.init("index_probe", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
@@ -17232,7 +17232,7 @@ test "httpx SQL transaction timestamp results retain typed values through public
     ;
     try db.setSchemaJson(alloc, schema);
     try db.batch(.{ .writes = &.{.{ .key = "u1", .value = "{\"id\":\"u1\"}" }}, .timestamp_ns = 42 });
-    const Source = @import("sql_parity_sources.zig").Tables(1);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
     var source: Source = .{
         .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }},
         .reads = .{table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
@@ -17312,7 +17312,7 @@ test "httpx SQL transaction timestamp results retain typed values through public
         const result = try std.json.parseFromSlice(sql_wire.SQLResponse, arena.allocator(), response.body.?, .{});
         try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
         try std.testing.expectEqual(@as(usize, 1), result.value.columns.len);
-        try std.testing.expect(@import("sql_parity_reference.zig").postgresColumnMatches(result.value.columns[0], 2950));
+        try std.testing.expect(@import("sql/testing/parity_reference.zig").postgresColumnMatches(result.value.columns[0], 2950));
         try std.testing.expectEqualStrings(uuid_contract.columns[0], result.value.columns[0].name);
         try std.testing.expect(!result.value.sql_nulls.?[0][0]);
         next.* = try local.common_uuid.parse(result.value.rows[0][0].string);
@@ -17344,7 +17344,7 @@ test "httpx SQL PostgreSQL original digest read preserves case nulls and duplica
     const writes = try a.alloc(db_mod.types.BatchWrite, profile.value.profile.rows.len);
     for (profile.value.profile.rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(a, row.value, .{}) };
     try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
-    const Source = @import("sql_parity_sources.zig").Tables(1);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
     var source: Source = .{
         .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }},
         .reads = .{table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
@@ -17354,7 +17354,7 @@ test "httpx SQL PostgreSQL original digest read preserves case nulls and duplica
     var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
-    try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &.{"sql-0257"}, reference_bytes);
+    try @import("sql/testing/parity_reference.zig").runReferenceStrict(alloc, &handler, &.{"sql-0257"}, reference_bytes);
 }
 
 test "httpx SQL joined source RETURNING preserves native array storage and PostgreSQL images" {
@@ -17374,7 +17374,7 @@ test "httpx SQL joined source RETURNING preserves native array storage and Postg
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const Source = @import("sql_parity_sources.zig").Tables(2);
+        const Source = @import("sql/testing/parity_sources.zig").Tables(2);
         var source: Source = .{ .records = undefined, .reads = undefined };
         var databases: [2]db_mod.DB = undefined;
         var opened: usize = 0;
@@ -17702,8 +17702,8 @@ fn postgresNativeMutationCampaignsWithReadPolicy(comptime selected: []const []co
     var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
     defer fixture_allocator.deinit();
     const alloc = fixture_allocator.allocator();
-    const parity = @import("sql_parity_reference.zig");
-    const Source = @import("sql_parity_sources.zig").Tables(3);
+    const parity = @import("sql/testing/parity_reference.zig");
+    const Source = @import("sql/testing/parity_sources.zig").Tables(3);
     var completed_campaigns: usize = 0;
     for ([_]struct { bytes: []const u8, ids: []const []const u8, expected_captures: ?usize = null, unique: bool = false, expression: bool = false, rejections: bool = false }{
         .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.mutation_rejection_reference, .ids = &.{}, .unique = true, .rejections = true },
@@ -17999,10 +17999,10 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         "sql-1375", "sql-1377", "sql-1382", "sql-1383", "sql-1384", "sql-1385", "sql-1386",
         "sql-1387",
     };
-    try @import("sql_parity_reference.zig").runUuidExpressions(alloc, &handler);
-    try @import("sql_parity_reference.zig").runArrayExpressions(alloc, &handler);
-    try @import("sql_parity_reference.zig").runJsonExistenceExpressions(alloc, &handler);
-    try @import("sql_parity_reference.zig").runInternalArrayQueries(alloc, &handler);
+    try @import("sql/testing/parity_reference.zig").runUuidExpressions(alloc, &handler);
+    try @import("sql/testing/parity_reference.zig").runArrayExpressions(alloc, &handler);
+    try @import("sql/testing/parity_reference.zig").runJsonExistenceExpressions(alloc, &handler);
+    try @import("sql/testing/parity_reference.zig").runInternalArrayQueries(alloc, &handler);
     // SQL integer transport is lossless text, whereas a JSON numeric value
     // remains a number even when its physical cell also uses an i64 tag.
     for ([_]struct { sql: []const u8, integer: i64 }{
@@ -18027,11 +18027,11 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     }
     // These historical SQLite-positive originals are invalid in PostgreSQL:
     // an output alias is not an input variable inside ORDER BY arithmetic.
-    for ([_][]const u8{ "sql-1219", "sql-1373" }) |id| try @import("sql_parity_reference.zig").expectRejection(alloc, &handler, id, "42703");
-    try @import("sql_parity_reference.zig").run(alloc, &handler, &reference_cases);
-    try @import("sql_parity_reference.zig").runScalarKernels(alloc, &handler);
+    for ([_][]const u8{ "sql-1219", "sql-1373" }) |id| try @import("sql/testing/parity_reference.zig").expectRejection(alloc, &handler, id, "42703");
+    try @import("sql/testing/parity_reference.zig").run(alloc, &handler, &reference_cases);
+    try @import("sql/testing/parity_reference.zig").runScalarKernels(alloc, &handler);
     {
-        const parity = @import("sql_parity_reference.zig");
+        const parity = @import("sql/testing/parity_reference.zig");
         const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.read_campaign_reference;
         try parity.runNumberWireContracts(alloc);
         try parity.runArrayWireContracts(alloc);
@@ -18072,7 +18072,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         }
         try parity.runReferenceStrict(alloc, &campaign_handler, ids, reference_bytes);
     }
-    try @import("sql_parity_reference.zig").runNativeContracts(alloc, &handler, &.{ "sql-0208", "sql-1369" });
+    try @import("sql/testing/parity_reference.zig").runNativeContracts(alloc, &handler, &.{ "sql-0208", "sql-1369" });
     for ([_][]const u8{
         "{\"statement\":\"SELECT id, name FROM usage_records WHERE id = $1 LIMIT 1\",\"parameters\":[9007199254740993]}",
         "{\"statement\":\"SELECT id, name FROM usage_records WHERE _id = $1\",\"parameters\":[\"a\"]}",
@@ -19123,13 +19123,13 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var mutation_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &mutation_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, mutation_reads.source(), mutation_writes.source());
         defer mutation_server.deinit();
         var mutation_handler = AntflyApiHandler{ .api_server = &mutation_server };
-        try @import("sql_parity_reference.zig").runPointMutations(alloc, &mutation_handler, &mutation_db, &.{
+        try @import("sql/testing/parity_reference.zig").runPointMutations(alloc, &mutation_handler, &mutation_db, &.{
             "sql-1497", "sql-1498", "sql-1504", "sql-1505", "sql-1506", "sql-1507",
             "sql-1513", "sql-1518", "sql-1519", "sql-1520", "sql-1521", "sql-1522",
         });
     }
     {
-        const parity = @import("sql_parity_reference.zig");
+        const parity = @import("sql/testing/parity_reference.zig");
         const reference = try std.json.parseFromSlice(parity.MutationReference, alloc, @import("antfly_local_sources").sql_parity_fixtures.mutation_reference, .{ .ignore_unknown_fields = true });
         defer reference.deinit();
         const mutation_schema = try std.json.Stringify.valueAlloc(alloc, reference.value.schema, .{});
@@ -20453,7 +20453,7 @@ test "httpx SQL policy observation rejects public capabilities even in legacy in
 
 test "httpx private index claims require explicit service authentication and bounded identity-only payloads" {
     const alloc = std.testing.allocator;
-    const execution = @import("relational_index_owner_execution.zig");
+    const execution = @import("relational_index/owner_execution.zig");
     const Fixture = struct {
         batches: usize = 0,
         fn execute(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, group: u64, value: execution.ClaimRequest, context: operation_contract.RequestContext) !execution.ClaimResult {
@@ -20580,7 +20580,7 @@ test "httpx private index claims require explicit service authentication and bou
 
 test "httpx private schema preparation requires service authority a bounded budget and exact routing scope" {
     const a = std.testing.allocator;
-    const preparation = @import("schema_validation_preparation.zig");
+    const preparation = @import("schema_validation/preparation.zig");
     const Fixture = struct {
         calls: usize = 0,
         fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group: u64, table: []const u8, _: preparation.Request, context: operation_contract.RequestContext) ![]u8 {
@@ -20642,7 +20642,7 @@ test "httpx private schema preparation requires service authority a bounded budg
 
 test "httpx private index control requires explicit service authority and mounts bounded fence reserve requests" {
     const alloc = std.testing.allocator;
-    const execution = @import("relational_index_owner_execution.zig");
+    const execution = @import("relational_index/owner_execution.zig");
     const Fixture = struct {
         effects: usize = 0,
         operation: @FieldType(execution.Request, "operation") = .fence,
@@ -21504,7 +21504,7 @@ test "SQL catalog NUMERIC HTTP delivery preserves exact cells descriptors and NU
     defer db.close();
     try db.setSchemaJson(alloc, schema);
     try db.batch(.{ .writes = &.{.{ .key = "1", .value = "{\"id\":1}" }} });
-    const Source = @import("sql_parity_sources.zig").Tables(1);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
     var source: Source = .{ .records = .{.{ .table_id = 7, .name = "docs", .schema_json = schema }}, .reads = .{table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())} };
     var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer runtime.deinit();
@@ -24974,7 +24974,7 @@ test "distributed SQL API control routes authenticate cancellation and share ter
 test "httpx private schema preparation retirement alternative binds service authority scope and budget" {
     const a = std.testing.allocator;
     const preparation = @import("table_retirement_preparation.zig");
-    const schema_preparation = @import("schema_validation_preparation.zig");
+    const schema_preparation = @import("schema_validation/preparation.zig");
     const Fixture = struct {
         calls: usize = 0,
         fn prepare(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, request: preparation.Request, context: operation_contract.RequestContext) ![]u8 {

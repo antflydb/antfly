@@ -25,7 +25,7 @@ const describe = @import("describe.zig");
 const relations = @import("relation_binding.zig");
 const runtime = @import("runtime.zig");
 const scalar = @import("scalar.zig");
-const contracts = @import("../storage/pessimistic_lock_contract.zig");
+const contracts = @import("../storage/pessimistic_lock/contract.zig");
 const A = std.mem.Allocator;
 
 pub const Identity = struct { key: []const u8, version: u64, digest: ?[32]u8 = null };

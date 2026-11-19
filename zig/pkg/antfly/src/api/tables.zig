@@ -4829,11 +4829,11 @@ test "relational declarations bound predicate responses preserve integer datetim
     var columns: @import("relational_expression_contract.zig").ColumnTypes = .{ .alloc = alloc, .source = .{ .parsed = &parsed } };
     defer columns.deinit();
     const definition = parsed.relational_indexes.?.value[0];
-    const config = try @import("relational_index_mutation.zig").configForDefinition(alloc, definition, &columns);
+    const config = try @import("relational_index/mutation.zig").configForDefinition(alloc, definition, &columns);
     defer alloc.free(config);
     try std.testing.expectEqual(@as(u32, 3), columns.cache.count());
     try std.testing.expectEqualStrings("9007199254740993", definition.where.?[0].value.value.number_string);
-    const updated = try @import("relational_index_mutation.zig").create(alloc, table, "partial", config);
+    const updated = try @import("relational_index/mutation.zig").create(alloc, table, "partial", config);
     defer metadata_table_manager.freeTable(alloc, updated);
     try std.testing.expectEqual(@as(u32, 1), try schemaVersion(updated.schema_json));
 }

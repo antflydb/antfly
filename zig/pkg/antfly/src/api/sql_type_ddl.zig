@@ -149,15 +149,15 @@ fn beginTypeEpoch(root: *execution.Adapter, allocators: catalog.DdlAllocators, c
         var region = std.heap.ArenaAllocator.init(allocators.scratch);
         defer region.deinit();
         const captured = try snapshot(root, region.allocator(), .{ .targets = &.{}, .reference = .{ .id = selected.record.identity.id, .namespace_id = selected.record.identity.namespace_id }, .include_dependents = true, .prepare_activation = true });
-        var transport: @import("schema_validation_owner_transport.zig").Transport = .{ .server = root.server, .alloc = allocators.scratch };
+        var transport: @import("schema_validation/owner_transport.zig").Transport = .{ .server = root.server, .alloc = allocators.scratch };
         defer transport.deinit();
-        var owned = try @import("schema_validation_plan_builder.zig").buildType(&transport, allocators.scratch, io, private, captured, request);
+        var owned = try @import("schema_validation/plan_builder.zig").buildType(&transport, allocators.scratch, io, private, captured, request);
         defer owned.deinit();
         try root.context.ensureActive();
         // Share the ordinary schema admission boundary. Only explicit
         // pre-proposal report lag may retry this same signed immutable plan;
         // an uncertain proposal is observed through the original nonce.
-        const admission = @import("schema_validation_admission.zig");
+        const admission = @import("schema_validation/admission.zig");
         const attempt: ?admission.BeginAttempt = admission.beginWhenReady(root.server.source, allocators.scratch, io, private, owned.command) catch |err| switch (err) {
             error.MetadataReplicationPending => return error.CatalogPublicationProofPending,
             error.Forbidden, error.CatalogGenerationChanged, error.GenerationPublicationChanged, error.MetadataIncarnationMismatch, error.TableTopologyProtocolUpgradeRequired, error.CatalogOccupancyNotReady, error.CatalogPublicationProofPending, error.UnsupportedNativeIndexOwner, error.RowPolicyUnsupported => return err,

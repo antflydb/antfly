@@ -69,7 +69,7 @@ test "httpx SQL PostgreSQL original joins preserve match scopes nulls and bags" 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    var source: @import("sql_parity_sources.zig").Tables(2) = .{ .records = undefined, .reads = undefined };
+    var source: @import("sql/testing/parity_sources.zig").Tables(2) = .{ .records = undefined, .reads = undefined };
     var databases: [2]db.DB = undefined;
     var opened: usize = 0;
     defer for (databases[0..opened]) |*database| database.close();
@@ -97,7 +97,7 @@ test "httpx SQL PostgreSQL original joins preserve match scopes nulls and bags" 
     // Inputs are immutable throughout this local qualification. The retained
     // native capture proves execution/ownership, not distributed snapshot or
     // concurrent schema-publication correctness.
-    try @import("sql_parity_reference.zig").runReferenceStrict(a, &handler, &ids, reference);
+    try @import("sql/testing/parity_reference.zig").runReferenceStrict(a, &handler, &ids, reference);
     try std.testing.expectEqual(ids.len, source.captures);
     try std.testing.expectEqual(@as(usize, 0), source.lookup_calls.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 0), source.unbounded_reads.load(.monotonic));

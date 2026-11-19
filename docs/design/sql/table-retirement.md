@@ -450,7 +450,7 @@ still required. No inventory disposition is changed by directory qualification.
 
 ## Immutable effects capture
 
-`metadata/table_retirement_manifest.zig` now defines a bounded logical effects
+`metadata/retirement/table/manifest.zig` now defines a bounded logical effects
 manifest and compact digest reference. Native preparation uses one pinned read
 transaction and indexed dependency discovery. The union includes active FK
 survivors and borrowers of the root's owned counters; a self-reference consumes
@@ -501,7 +501,7 @@ original parity case is marked complete by these preparation tests.
 
 ## Durable root reservation
 
-`metadata/table_retirement_ledger.zig` now persists the immutable effects body
+`metadata/retirement/table/ledger.zig` now persists the immutable effects body
 once, separately from a compact checksummed head. Its lookup contains the
 metadata group, immutable root table ID and job ID. The head binds the effects
 reference, creator principal, database/namespace scope and participant/range

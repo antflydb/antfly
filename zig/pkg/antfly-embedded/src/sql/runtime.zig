@@ -9450,13 +9450,13 @@ test "SQL LockRows skips contenders refills LIMIT locks OFFSET and defers fallib
         skip_first: bool = true,
         change_first: bool = false,
         nowait: bool = false,
-        fn table(raw: *anyopaque, _: std.mem.Allocator, target: catalog.Table, mode: @import("../storage/pessimistic_lock_contract.zig").TableMode, _: ast.LockWait) !void {
+        fn table(raw: *anyopaque, _: std.mem.Allocator, target: catalog.Table, mode: @import("../storage/pessimistic_lock/contract.zig").TableMode, _: ast.LockWait) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(@as(u64, 19), target.id);
             try std.testing.expectEqual(.row_share, mode);
             self.tables += 1;
         }
-        fn row(raw: *anyopaque, a: std.mem.Allocator, target: catalog.Table, identity: Locking.Identity, _: catalog.Row, _: @import("../storage/pessimistic_lock_contract.zig").RowMode, wait: ast.LockWait, _: []const []const u8) !?catalog.Row {
+        fn row(raw: *anyopaque, a: std.mem.Allocator, target: catalog.Table, identity: Locking.Identity, _: catalog.Row, _: @import("../storage/pessimistic_lock/contract.zig").RowMode, wait: ast.LockWait, _: []const []const u8) !?catalog.Row {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(@as(u64, 99), identity.version);
             self.locks += 1;

@@ -17,8 +17,8 @@
 //! evaluators. Uses existing policy publication and pgwire engine contracts.
 const std = @import("std");
 const local = @import("antfly_local_sources");
-const fixture = @import("sql_owner_test_fixture.zig");
-const client = @import("sql_owner_test_client.zig");
+const fixture = @import("sql/testing/owner_test_fixture.zig");
+const client = @import("sql/testing/owner_test_client.zig");
 const http = @import("http_server.zig");
 const platform = @import("antfly_platform");
 const wire = @import("../pgwire/backend.zig");

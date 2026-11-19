@@ -149,7 +149,7 @@ def main():
         "--output",
         type=Path,
         default=Path(__file__).resolve().parents[1]
-        / "zig/pkg/antfly/src/api/fixtures/sql_temporal_conflict_reference.json",
+        / "zig/pkg/antfly/src/api/sql/testing/fixtures/sql_temporal_conflict_reference.json",
     )
     args = parser.parse_args()
     actual = reference()

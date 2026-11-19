@@ -18,8 +18,8 @@
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const module = @import("abandoned_temporary_retirement.zig");
-const scopes = @import("scope_retirement_ledger.zig");
-const table = @import("table_retirement_ledger.zig");
+const scopes = @import("retirement/scope/ledger.zig");
+const table = @import("retirement/table/ledger.zig");
 const locks = local.storage_pessimistic_lock_authority;
 const authority = @import("../system_catalog/lock_authority.zig");
 const sources = @import("../system_catalog/temporary_source_binding.zig");
@@ -100,7 +100,7 @@ test "SQL scope retirement abandonment archive retains exact old participants th
         const image: local.common_topology_records.TableRecord = .{ .table_id = route.table_id, .name = spec.table_name, .sql_persistence = descriptor };
         const ranges = [_]local.common_topology_records.RangeRecord{.{ .table_id = route.table_id, .group_id = route.route.group_id, .range_id = route.route.range_id, .doc_identity_shard_id = 301, .start_key = "" }};
         const fences = [_]local.storage_db_relational_integrity_topology_contract.Fence{.{ .transition_id = std.mem.readInt(u64, child.id[0..8], .little), .attempt = std.mem.readInt(u64, child.id[8..16], .little), .peer_group_id = 300, .owner_group_id = 300, .role = .document_retirement_source, .namespace = admitted.admission.binding.identity, .catalog_digest = catalog_digest }};
-        const effects: @import("table_retirement_manifest.zig").Reference = .{ .digest = @splat(17), .root_table = route.table_id, .survivors = 0, .counters = 0, .views = 0 };
+        const effects: @import("retirement/table/manifest.zig").Reference = .{ .digest = @splat(17), .root_table = route.table_id, .survivors = 0, .counters = 0, .views = 0 };
         const plan: @import("fk_generation_publication.zig").Plan = .{ .id = child.id, .child_before = image, .child_after = image, .child_catalog_before_b64 = "", .child_ranges = &ranges, .child_fences = &fences, .parents = &.{}, .table_retirement = effects, .sql_drop = .{ .target = .{ .database = "tenant", .namespace = "private", .name = "items" }, .logical_table = "items", .incarnation = incarnation, .owner = .{ .table_id = route.table_id, .schema_version = 0, .schema_digest = catalog_digest, .kind = .table } } };
         const physical = try table.physical.prepare(gpa, gpa, plan);
         const head: table.Head = .{ .lookup = child_lookup, .incarnation = std.fmt.bytesToHex(incarnation, .lower), .effects = effects, .scope = .{ .database = 10, .namespace = 20, .creator = .bootstrap, .parent = child }, .participant_count = 1, .range_count = 1, .participants_digest = @splat(18), .revision = 2, .phase = .retiring, .physical = .{ .summary = physical.summary } };

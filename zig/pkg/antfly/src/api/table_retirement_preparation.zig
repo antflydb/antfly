@@ -18,9 +18,9 @@
 //! callers supply neither a physical root nor arbitrary lookup options.
 const std = @import("std");
 const local = @import("antfly_local_sources");
-const ledger = @import("../metadata/table_retirement_ledger.zig");
-const manifests = @import("../metadata/table_retirement_manifest.zig");
-const scopes = @import("../metadata/scope_retirement_ledger.zig");
+const ledger = @import("../metadata/retirement/table/ledger.zig");
+const manifests = @import("../metadata/retirement/table/manifest.zig");
+const scopes = @import("../metadata/retirement/scope/ledger.zig");
 const tables = @import("../metadata/table_manager.zig");
 const persistence = local.common_topology_records.RelationPersistence;
 const operation = local.api_operation;

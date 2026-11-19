@@ -145,7 +145,7 @@ test "SQL relation lifetime native restore acceptance binds actual image positio
         .boot_generation = 5,
         .native_instance = initialized.native_instance,
         .installed = .{ .scope = install.scope, .origin_kind = install.origin.kind(), .origin_digest = try install.origin.digest(), .install_digest = try install.digest(), .position = .{ .namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 27 }, .sequence = 2 } },
-        .proof = .{ .identity = enrolled, .reporter_incarnation = 3, .authority = .{ .native = try @import("sql_relation_attestation.zig").nativeAuthorityDigest(enrolled, pin) }, .native_pin = pin, .root_generation = 1, .signature = @splat(0) },
+        .proof = .{ .identity = enrolled, .reporter_incarnation = 3, .authority = .{ .native = try @import("sql/relation_lifecycle/attestation.zig").nativeAuthorityDigest(enrolled, pin) }, .native_pin = pin, .root_generation = 1, .signature = @splat(0) },
     };
     receipt.proof = try receipt.proof.sign(root, try receipt.digest());
     try receipt.requireLogical(17, receipt.plan_digest, install.scope, install, descriptor, receipt.installed.position.namespace);
@@ -247,7 +247,7 @@ test "SQL relation lifetime native restore acceptance binds actual image positio
     altered = receipt;
     const other_pin = try lifetime.PhysicalPin.fromBinding(other_image);
     altered.proof.native_pin = other_pin;
-    altered.proof.authority = .{ .native = try @import("sql_relation_attestation.zig").nativeAuthorityDigest(enrolled, other_pin) };
+    altered.proof.authority = .{ .native = try @import("sql/relation_lifecycle/attestation.zig").nativeAuthorityDigest(enrolled, other_pin) };
     altered.initialized_digest = try other_image.digest();
     altered.proof = try altered.proof.sign(root, try altered.digest());
     try altered.requireInitialized(other_image, 5, initialized.native_instance, altered.attempt);

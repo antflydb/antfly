@@ -415,8 +415,8 @@ const DataRaftBatchRoute = struct {
     /// Process-local permission fetched by the authenticated owner receiver.
     /// Never serialized or inherited by an ordinary/forwarded batch request.
     index_owner_permission: ?struct {
-        decision: *const @import("../metadata/relational_index_publication.zig").OwnerDecision,
-        request: @import("../metadata/relational_index_publication.zig").OwnerRequest,
+        decision: *const @import("../metadata/relational_index/publication.zig").OwnerDecision,
+        request: @import("../metadata/relational_index/publication.zig").OwnerRequest,
         root_generation: u64,
         context: antfly.public_api.operation.RequestContext,
         accepted_source: ?@import("antfly_local_sources").storage_db_relational_index_owner_job.private_claims.SourceStream.Accepted = null,
@@ -5675,8 +5675,8 @@ pub const DataServer = struct {
         ack_stage: std.atomic.Value(u8) = .init(0),
         last_error: std.atomic.Value(u16) = .init(0),
     } else struct {} = .{},
-    schema_recovery_cursor: @import("../metadata/schema_validation_work.zig").Cursor = .{ .scan = 0 },
-    schema_source_recovery_cursor: ?@import("../metadata/schema_validation_source_outbox.zig").RecoveryCursor = null,
+    schema_recovery_cursor: @import("../metadata/schema_validation/work.zig").Cursor = .{ .scan = 0 },
+    schema_source_recovery_cursor: ?@import("../metadata/schema_validation/source_outbox.zig").RecoveryCursor = null,
     schema_recovery_discovery_at_ns: u64 = 0,
     schema_recovery_pass_had_local_work: bool = false,
     schema_recovery_attempts: std.atomic.Value(u64) = .init(0),
@@ -6999,8 +6999,8 @@ pub const DataServer = struct {
     /// One existing-maintenance-executor slice; never network or disk work on
     /// the Raft progress driver. A single directory entry bounds owner work.
     fn recoverNativeRelationSlice(self: *DataServer, a: std.mem.Allocator, context: antfly.public_api.operation.RequestContext) !bool {
-        const wire = @import("../metadata/sql_relation_boot_wire.zig");
-        const work = @import("../metadata/sql_relation_recovery_work.zig");
+        const wire = @import("../metadata/sql/relation_lifecycle/boot_wire.zig");
+        const work = @import("../metadata/sql/relation_lifecycle/recovery_work.zig");
         const source = try self.ensureKernelOwnerSource();
         const registration = self.store_registration orelse return error.StoreRegistrationRequired;
         const identity = try self.schemaRecoveryIdentity();
@@ -7110,7 +7110,7 @@ pub const DataServer = struct {
         return true;
     }
 
-    fn requestNativeRelationRecovery(self: *DataServer, a: std.mem.Allocator, boot: @import("../metadata/sql_relation_boots.zig").Record, entry: @import("../metadata/sql_relation_lifetimes.zig").Entry, context: antfly.public_api.operation.RequestContext) !void {
+    fn requestNativeRelationRecovery(self: *DataServer, a: std.mem.Allocator, boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, entry: @import("../metadata/sql/relation_lifecycle/lifetimes.zig").Entry, context: antfly.public_api.operation.RequestContext) !void {
         const control = @import("../metadata/query_population_job.zig");
         const bytes = try self.status_source.systemCatalog(a, context, .{ .query_population_job = .{ .recover_native_entry = .{ .entry = entry, .boot = boot } } });
         defer a.free(bytes);
@@ -7120,19 +7120,19 @@ pub const DataServer = struct {
         if (entry.descriptor.kind != .temporary) return error.InvalidSqlBackendResponse;
     }
 
-    fn submitNativeRelationBoot(self: *DataServer, a: std.mem.Allocator, source: *antfly.public_api.ProvisionedKernelOwnerSource, request: @import("../metadata/sql_relation_boot_wire.zig").Request, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: antfly.public_api.operation.RequestContext) !@import("../metadata/sql_relation_boots.zig").Observation {
+    fn submitNativeRelationBoot(self: *DataServer, a: std.mem.Allocator, source: *antfly.public_api.ProvisionedKernelOwnerSource, request: @import("../metadata/sql/relation_lifecycle/boot_wire.zig").Request, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: antfly.public_api.operation.RequestContext) !@import("../metadata/sql/relation_lifecycle/boots.zig").Observation {
         const signed = try source.attestRelationBoot(request, root);
         const encoded = try std.json.Stringify.valueAlloc(a, signed, .{});
         defer a.free(encoded);
         const bytes = try self.status_source.systemCatalog(a, .{ .setting_admin = true, .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation }, .{ .sql_relation_boot_submit = encoded });
         defer a.free(bytes);
-        var result = try std.json.parseFromSlice(@import("../metadata/sql_relation_boots.zig").Observation, a, bytes, .{});
+        var result = try std.json.parseFromSlice(@import("../metadata/sql/relation_lifecycle/boots.zig").Observation, a, bytes, .{});
         defer result.deinit();
         _ = try signed.requireApplied(result.value);
         return result.value;
     }
 
-    fn recoverHiddenNativeRelation(self: *DataServer, a: std.mem.Allocator, metadata_group: u64, boot: @import("../metadata/sql_relation_boots.zig").Record, candidate: @import("../metadata/sql_relation_recovery_work.zig").Entry, hidden: @import("../metadata/sql_relation_hidden_lifetimes.zig").Reference, context: antfly.public_api.operation.RequestContext) !void {
+    fn recoverHiddenNativeRelation(self: *DataServer, a: std.mem.Allocator, metadata_group: u64, boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, candidate: @import("../metadata/sql/relation_lifecycle/recovery_work.zig").Entry, hidden: @import("../metadata/sql/relation_lifecycle/hidden_lifetimes.zig").Reference, context: antfly.public_api.operation.RequestContext) !void {
         const staging = @import("../metadata/restore_staging.zig");
         const encoded = (try self.status_source.getRestoreStaging(a, hidden.plan.plan_id, context)) orelse return error.RestoreStagingScopeChanged;
         defer a.free(encoded);
@@ -7198,9 +7198,9 @@ pub const DataServer = struct {
         } else try self.initializeNativeDescriptor(a, metadata_group, boot, hidden.group, target.table.name, path, owned.descriptor, hidden.plan, context);
     }
 
-    fn recoverHiddenNativeEmptyImage(self: *DataServer, a: std.mem.Allocator, metadata_group: u64, boot: @import("../metadata/sql_relation_boots.zig").Record, target: @import("../metadata/restore_staging.zig").Target, job: @import("../metadata/restore_staging.zig").Job, descriptor: @import("../storage/kernel_owner_descriptor.zig").Descriptor, path: []const u8, context: antfly.public_api.operation.RequestContext) !void {
+    fn recoverHiddenNativeEmptyImage(self: *DataServer, a: std.mem.Allocator, metadata_group: u64, boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, target: @import("../metadata/restore_staging.zig").Target, job: @import("../metadata/restore_staging.zig").Job, descriptor: @import("../storage/kernel_owner_descriptor.zig").Descriptor, path: []const u8, context: antfly.public_api.operation.RequestContext) !void {
         const source = try self.ensureKernelOwnerSource();
-        const creation: @import("../metadata/sql_relation_attestation.zig").CreationScope = .{ .plan_id = job.plan.id, .plan_digest = job.plan_digest };
+        const creation: @import("../metadata/sql/relation_lifecycle/attestation.zig").CreationScope = .{ .plan_id = job.plan.id, .plan_digest = job.plan_digest };
         const observed = try self.write_source.catalog.sqlRelationBinding(a, .{ .node = boot.node_id, .binding_table = target.table.table_id, .creation_scope = creation }, context.deadline_ns);
         if (!observed.registration_current or observed.record == null or !std.meta.eql(observed.record.?, boot)) return error.SqlRelationOwnerChanged;
         if (observed.initialized) |proof| {
@@ -7223,7 +7223,7 @@ pub const DataServer = struct {
         _ = try self.submitNativeRelationBoot(a, source, .{ .metadata_group_id = metadata_group, .identity = boot.identity, .reporter_incarnation = boot.reporter_incarnation, .native_instance = boot.instance, .command = .{ .initialized_empty = .{ .proof = initialized, .attempt = actual } } }, root, context);
     }
 
-    fn retireLostHiddenNativeEntry(self: *DataServer, a: std.mem.Allocator, metadata_group: u64, boot: @import("../metadata/sql_relation_boots.zig").Record, candidate: @import("../metadata/sql_relation_recovery_work.zig").Entry, job: @import("../metadata/restore_staging.zig").Job, context: antfly.public_api.operation.RequestContext) !void {
+    fn retireLostHiddenNativeEntry(self: *DataServer, a: std.mem.Allocator, metadata_group: u64, boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, candidate: @import("../metadata/sql/relation_lifecycle/recovery_work.zig").Entry, job: @import("../metadata/restore_staging.zig").Job, context: antfly.public_api.operation.RequestContext) !void {
         const ref = candidate.hidden orelse return error.RestoreStagingScopeChanged;
         const source = try self.ensureKernelOwnerSource();
         const runtime = try self.ensureBackendRuntime();
@@ -7264,7 +7264,7 @@ pub const DataServer = struct {
         // restore-job owner. Data-local HTTP servers own no coordinator Store.
     }
 
-    fn beginNativeRelationShutdown(self: *DataServer, a: std.mem.Allocator, deadline: antfly.common.runtime_lifecycle.ShutdownDeadline) ?@import("../metadata/sql_relation_boots.zig").Record {
+    fn beginNativeRelationShutdown(self: *DataServer, a: std.mem.Allocator, deadline: antfly.common.runtime_lifecycle.ShutdownDeadline) ?@import("../metadata/sql/relation_lifecycle/boots.zig").Record {
         if (comptime !linked_storage) return null;
         if (@import("../metadata/topology_protocol.zig").current_version < @import("../metadata/topology_protocol.zig").sql_relation_persistence_version) return null;
         const source = self.kernel_owner_source orelse return null;
@@ -7281,7 +7281,7 @@ pub const DataServer = struct {
         return result.record;
     }
 
-    fn finishNativeRelationShutdown(self: *DataServer, a: std.mem.Allocator, boot: @import("../metadata/sql_relation_boots.zig").Record, deadline: antfly.common.runtime_lifecycle.ShutdownDeadline) !void {
+    fn finishNativeRelationShutdown(self: *DataServer, a: std.mem.Allocator, boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, deadline: antfly.common.runtime_lifecycle.ShutdownDeadline) !void {
         const source = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
         const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
         const io = runtime.apiIo() orelse return error.BackendRuntimeIoUnavailable;
@@ -7300,7 +7300,7 @@ pub const DataServer = struct {
         continue_audit: bool = false,
         // Pointer-free, fixed-size proof facts only, never a request arena,
         // row snapshot or physical mutation ticket. The FIFO bounds retention.
-        pending_adoption: ?@import("../metadata/schema_validation_root_epoch.zig").Request = null,
+        pending_adoption: ?@import("../metadata/schema_validation/root_epoch.zig").Request = null,
         pending_state: ?antfly.public_api.ProvisionedKernelOwnerSource.RootedSchemaOwnerState = null,
     };
 
@@ -7493,7 +7493,7 @@ pub const DataServer = struct {
     /// groups. Visit one pending namespace per shared maintenance slice; no
     /// leader/provider/owner route is required to retire node-owned bytes.
     fn recoverSchemaSourceWork(self: *DataServer, io: std.Io, context: antfly.public_api.operation.RequestContext) !bool {
-        const outbox = @import("../metadata/schema_validation_source_outbox.zig");
+        const outbox = @import("../metadata/schema_validation/source_outbox.zig");
         const owner_source = self.kernel_owner_source orelse return false;
         const retained = owner_source.schema_snapshot_retention orelse return false;
         if (self.schema_source_recovery_cursor == null) self.schema_source_recovery_cursor = try outbox.RecoveryCursor.init(self.alloc, io, owner_source.replica_root_dir);
@@ -7506,13 +7506,13 @@ pub const DataServer = struct {
         const root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(self.alloc, io, owner_source.replica_root_dir);
         const location: outbox.Location = .{ .alloc = self.alloc, .io = io, .root_dir = owner_source.replica_root_dir, .root_incarnation = root.root_incarnation, .namespace = namespace, .context = context };
         const Reader = struct {
-            fn read(raw: *anyopaque, alloc: std.mem.Allocator, request_context: antfly.public_api.operation.RequestContext, expected: @import("../metadata/schema_validation_receipt.zig").Request) !std.json.Parsed(@import("../metadata/schema_validation_receipt.zig").Observation) {
+            fn read(raw: *anyopaque, alloc: std.mem.Allocator, request_context: antfly.public_api.operation.RequestContext, expected: @import("../metadata/schema_validation/receipt.zig").Request) !std.json.Parsed(@import("../metadata/schema_validation/receipt.zig").Observation) {
                 const server: *DataServer = @ptrCast(@alignCast(raw));
                 const call = server.status_source.vtable.system_catalog orelse return error.MetadataUnavailable;
                 const bytes = try call(server.status_source.ptr, alloc, request_context, .{ .schema_validation_receipt_read = expected });
                 defer alloc.free(bytes);
                 if (bytes.len > 64 * 1024) return error.InvalidGenerationPublication;
-                return std.json.parseFromSlice(@import("../metadata/schema_validation_receipt.zig").Observation, alloc, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .max_value_len = 64 * 1024 });
+                return std.json.parseFromSlice(@import("../metadata/schema_validation/receipt.zig").Observation, alloc, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .max_value_len = 64 * 1024 });
             }
         };
         try outbox.recoverRetirement(location, .{ .ptr = self, .read = Reader.read }, retained);
@@ -7520,7 +7520,7 @@ pub const DataServer = struct {
     }
 
     fn discoverSchemaRecoveryWork(self: *DataServer) !bool {
-        const work = @import("../metadata/schema_validation_work.zig");
+        const work = @import("../metadata/schema_validation/work.zig");
         const call = self.status_source.vtable.system_catalog orelse return false;
         const runtime = self.backend_runtime orelse return false;
         var io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
@@ -7619,8 +7619,8 @@ pub const DataServer = struct {
 
     fn recoverSchemaOwnerAtGroup(self: *DataServer, job: *SchemaRecoveryJob) !bool {
         const local = @import("antfly_local_sources");
-        const reads = @import("../metadata/schema_validation_read.zig");
-        const ledger = @import("../metadata/schema_validation_ledger.zig");
+        const reads = @import("../metadata/schema_validation/read.zig");
+        const ledger = @import("../metadata/schema_validation/ledger.zig");
         const group = job.group;
         const table = job.table;
         const table_id = job.table_id;
@@ -7746,7 +7746,7 @@ pub const DataServer = struct {
                 if (discovered.state.header) |prior| if (prior.phase != .released and prior.phase != .canceled) return error.SchemaValidationJobChanged;
                 // A lagging replica must replay accepted progress; it cannot turn
                 // an existing ACK into a new empty/beginning validation job.
-                for (std.meta.tags(@import("../metadata/schema_validation_publication.zig").Stage)) |stage| if (control.owner.has(stage)) return true;
+                for (std.meta.tags(@import("../metadata/schema_validation/publication.zig").Stage)) |stage| if (control.owner.has(stage)) return true;
                 const input = try call(self.status_source.ptr, a, context, .{ .schema_validation_owner_read = .{ .lookup = lookup, .ordinal = control.owner.ordinal, .projection = .replay_inputs, .source_owner = address } });
                 _ = self.schema_recovery_input_fetches.fetchAdd(1, .monotonic);
                 if (native) {
@@ -7767,7 +7767,7 @@ pub const DataServer = struct {
             const header = discovered.state.header.?;
             // Catch-up may still be applying the phase metadata already accepted.
             // Do not repeatedly audit a prefix that cannot possibly be adopted.
-            @import("../metadata/schema_validation_root_epoch.zig").requireReplayPhase(control.head, control.owner, header) catch return true;
+            @import("../metadata/schema_validation/root_epoch.zig").requireReplayPhase(control.head, control.owner, header) catch return true;
             var audited = try source.stepSchemaOwnerAuditAtRoot(group, table, header.binding, "", root, .{}, context);
             if (audited.result == .needs_inputs) {
                 _ = self.schema_recovery_input_fetches.fetchAdd(1, .monotonic);
@@ -7806,7 +7806,7 @@ pub const DataServer = struct {
         // read through immutable root epochs/CAS, never by replaying a physical
         // operation, recapturing an artifact or resetting logical ACK counts.
         const response = try call(self.status_source.ptr, a, context, .{ .schema_validation_submit = command });
-        const observed = try std.json.parseFromSliceLeaky(@import("../metadata/schema_validation_receipt.zig").Observation, a, response, .{ .ignore_unknown_fields = false });
+        const observed = try std.json.parseFromSliceLeaky(@import("../metadata/schema_validation/receipt.zig").Observation, a, response, .{ .ignore_unknown_fields = false });
         const expected = try ledger.commandReceipt(.{ .adopt_root = request }, observed.head orelse return error.MetadataMutationOutcomeUnknown);
         if (!try observed.isAcknowledged(expected)) return error.MetadataMutationOutcomeUnknown;
         _ = self.schema_recovery_adopted.fetchAdd(1, .monotonic);
@@ -7816,8 +7816,8 @@ pub const DataServer = struct {
     /// Look up lineage only from the independently audited physical image.
     /// Missing authorization permits the ordinary certified replay path; an
     /// unavailable or invalid observation is never converted into absence.
-    fn schemaRestorationControl(self: *DataServer, a: std.mem.Allocator, lookup: @import("../metadata/schema_validation_read.zig").Lookup, destination: @import("antfly_local_sources").storage_db_relational_schema_root_contract.Evidence, context: antfly.public_api.operation.RequestContext) !?@import("../metadata/schema_validation_read.zig").RestorationControl {
-        const reads = @import("../metadata/schema_validation_read.zig");
+    fn schemaRestorationControl(self: *DataServer, a: std.mem.Allocator, lookup: @import("../metadata/schema_validation/read.zig").Lookup, destination: @import("antfly_local_sources").storage_db_relational_schema_root_contract.Evidence, context: antfly.public_api.operation.RequestContext) !?@import("../metadata/schema_validation/read.zig").RestorationControl {
+        const reads = @import("../metadata/schema_validation/read.zig");
         const installed = destination.value.qualification.installation orelse return null;
         const image = try reads.ImageIdentity.fromInstallation(installed);
         const call = self.status_source.vtable.system_catalog orelse return error.MetadataUnavailable;
@@ -7839,7 +7839,7 @@ pub const DataServer = struct {
 
     /// Interrupt only after the physical effect and signed observation exist,
     /// before its metadata ACK. Cold recovery must resume that exact durable cut.
-    pub fn pauseSchemaValidationAckForTest(self: *DataServer, table: u64, stage: @import("../metadata/schema_validation_publication.zig").Stage) void {
+    pub fn pauseSchemaValidationAckForTest(self: *DataServer, table: u64, stage: @import("../metadata/schema_validation/publication.zig").Stage) void {
         comptime std.debug.assert(@import("builtin").is_test);
         self.schema_validation_test_gate.observed.store(false, .release);
         self.schema_validation_test_gate.ack_stage.store(@as(u8, @backingInt(stage)) + 1, .release);
@@ -7873,16 +7873,16 @@ pub const DataServer = struct {
         remote.test_faults.schema_begin_reply_lost.store(false, .release);
     }
 
-    fn stepSchemaOwner(self: *DataServer, job: *SchemaRecoveryJob, a: std.mem.Allocator, control: @import("../metadata/schema_validation_read.zig").ReplayControl, discovered: antfly.public_api.ProvisionedKernelOwnerSource.RootedSchemaOwnerState, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: antfly.public_api.operation.RequestContext) !bool {
+    fn stepSchemaOwner(self: *DataServer, job: *SchemaRecoveryJob, a: std.mem.Allocator, control: @import("../metadata/schema_validation/read.zig").ReplayControl, discovered: antfly.public_api.ProvisionedKernelOwnerSource.RootedSchemaOwnerState, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: antfly.public_api.operation.RequestContext) !bool {
         const local = @import("antfly_local_sources");
-        const reads = @import("../metadata/schema_validation_read.zig");
-        const barriers = @import("../metadata/schema_validation_publication.zig");
-        const ledger = @import("../metadata/schema_validation_ledger.zig");
+        const reads = @import("../metadata/schema_validation/read.zig");
+        const barriers = @import("../metadata/schema_validation/publication.zig");
+        const ledger = @import("../metadata/schema_validation/ledger.zig");
         const binding = control.owner.binding;
         const lookup = reads.Lookup.fromHead(control.head);
         const source = self.kernel_owner_source orelse return error.BackendRuntimeUnavailable;
         const call = self.status_source.vtable.system_catalog orelse return error.MetadataUnavailable;
-        const attestation = @import("../metadata/schema_validation_attestation.zig");
+        const attestation = @import("../metadata/schema_validation/attestation.zig");
         const native = binding.authority == .native;
         const native_scope = if (native) try self.schemaRecoveryNativeScope(job.table, binding, discovered.root_generation, discovered.state.physical_root_incarnation, lookup.metadata_incarnation, root, context) else null;
         const raft_scope = if (!native) try self.schemaRecoveryRaftScope(binding, discovered.root_generation, discovered.state.physical_root_incarnation, lookup.metadata_incarnation, root, context) else null;
@@ -7960,7 +7960,7 @@ pub const DataServer = struct {
                     @import("../metadata/table_manager.zig").rangeDocIdentityShardId(range) == binding.fence.namespace.shard_id and
                     @import("../metadata/table_manager.zig").rangeDocIdentityRangeId(range) == binding.fence.namespace.range_id) break range;
             } else return error.GenerationPublicationChanged;
-            const result = try @import("../api/schema_validation_rows.zig").step(a, self.read_source.source(), self.write_source.source(), snapshot.tables, snapshot.ranges, selected, binding, inputs orelse return error.SchemaValidationJobRequired, discovered.state.physical_root_incarnation, action == .cancel, context);
+            const result = try @import("../api/schema_validation/rows.zig").step(a, self.read_source.source(), self.write_source.source(), snapshot.tables, snapshot.ranges, selected, binding, inputs orelse return error.SchemaValidationJobRequired, discovered.state.physical_root_incarnation, action == .cancel, context);
             if (result == .pending) return true;
         }
         if (@import("builtin").is_test) {
@@ -7982,7 +7982,7 @@ pub const DataServer = struct {
             const command: ledger.Command = .{ .ack = .{ .lookup = lookup, .ordinal = control.owner.ordinal, .revision = permission.head.revision, .signed = signed orelse return error.SchemaValidationJobChanged } };
             const bytes = try std.json.Stringify.valueAlloc(a, command, .{});
             const raw = try call(self.status_source.ptr, a, context, .{ .schema_validation_submit = bytes });
-            const observed = try std.json.parseFromSliceLeaky(@import("../metadata/schema_validation_receipt.zig").Observation, a, raw, .{ .ignore_unknown_fields = false });
+            const observed = try std.json.parseFromSliceLeaky(@import("../metadata/schema_validation/receipt.zig").Observation, a, raw, .{ .ignore_unknown_fields = false });
             const expected = try ledger.commandReceipt(command, observed.head orelse return error.MetadataMutationOutcomeUnknown);
             if (!try observed.isAcknowledged(expected)) return error.MetadataMutationOutcomeUnknown;
             return work.ack == .failed;
@@ -8111,11 +8111,11 @@ pub const DataServer = struct {
         }
     }
 
-    fn schemaRecoveryRaftScope(self: *DataServer, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, generation: u64, physical_root: u128, incarnation: [32]u8, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: antfly.public_api.operation.RequestContext) !@import("../metadata/schema_validation_attestation.zig").RaftScope {
+    fn schemaRecoveryRaftScope(self: *DataServer, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, generation: u64, physical_root: u128, incarnation: [32]u8, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: antfly.public_api.operation.RequestContext) !@import("../metadata/schema_validation/attestation.zig").RaftScope {
         const actual = try self.raftLocalOwnerScopeAtRoot(binding.fence.owner_group_id, binding.fence.namespace, generation, context);
         return .{
             .metadata_incarnation = incarnation,
-            .binding_digest = try @import("../metadata/schema_validation_attestation.zig").bindingDigest(binding),
+            .binding_digest = try @import("../metadata/schema_validation/attestation.zig").bindingDigest(binding),
             .identity = .{ .metadata_incarnation = incarnation, .node_id = actual.reporter.node_id, .store_id = actual.reporter.store_id, .root_incarnation = root.root_incarnation, .public_key = root.public_key },
             .reporter_incarnation = actual.reporter_incarnation,
             .replica_id = actual.replica_id,
@@ -8127,7 +8127,7 @@ pub const DataServer = struct {
         };
     }
 
-    fn schemaRecoveryNativeScope(self: *DataServer, table: []const u8, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, generation: u64, physical_root: u128, incarnation: [32]u8, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: antfly.public_api.operation.RequestContext) !@import("../metadata/schema_validation_attestation.zig").NativeScope {
+    fn schemaRecoveryNativeScope(self: *DataServer, table: []const u8, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, generation: u64, physical_root: u128, incarnation: [32]u8, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: antfly.public_api.operation.RequestContext) !@import("../metadata/schema_validation/attestation.zig").NativeScope {
         try context.ensureActive();
         const source = try self.ensureKernelOwnerSource();
         if (try source.nativeGroupProofAtRoot(self.alloc, binding.fence.owner_group_id, table, context)) |proof| {
@@ -8135,7 +8135,7 @@ pub const DataServer = struct {
                 proof.initialized.physical_root_incarnation != physical_root or proof.initialized.table_id != binding.fence.namespace.table_id or
                 proof.initialized.shard_id != binding.fence.namespace.shard_id or proof.initialized.range_id != binding.fence.namespace.range_id or
                 proof.boot.identity.root_incarnation != root.root_incarnation or !std.mem.eql(u8, &proof.boot.identity.public_key, &root.public_key)) return error.StoreRootEnrollmentChanged;
-            const scope: @import("../metadata/schema_validation_attestation.zig").NativeScope = .{ .metadata_incarnation = incarnation, .binding_digest = try @import("../metadata/schema_validation_attestation.zig").bindingDigest(binding), .signing = proof.signing, .root_generation = generation, .physical_root_incarnation = physical_root };
+            const scope: @import("../metadata/schema_validation/attestation.zig").NativeScope = .{ .metadata_incarnation = incarnation, .binding_digest = try @import("../metadata/schema_validation/attestation.zig").bindingDigest(binding), .signing = proof.signing, .root_generation = generation, .physical_root_incarnation = physical_root };
             try scope.requireBinding(binding);
             return scope;
         }
@@ -8148,9 +8148,9 @@ pub const DataServer = struct {
         if (!std.mem.eql(u8, &registration.identity.metadata_incarnation, &incarnation) or
             registration.identity.root_incarnation != root.root_incarnation or
             !std.mem.eql(u8, &registration.identity.public_key, &root.public_key)) return error.StoreRootEnrollmentChanged;
-        const scope: @import("../metadata/schema_validation_attestation.zig").NativeScope = .{
+        const scope: @import("../metadata/schema_validation/attestation.zig").NativeScope = .{
             .metadata_incarnation = incarnation,
-            .binding_digest = try @import("../metadata/schema_validation_attestation.zig").bindingDigest(binding),
+            .binding_digest = try @import("../metadata/schema_validation/attestation.zig").bindingDigest(binding),
             .signing = .{ .identity = registration.identity, .reporter_incarnation = registration.reporter_incarnation, .binding_digest = try registration.binding().digest() },
             .root_generation = generation,
             .physical_root_incarnation = physical_root,
@@ -13114,7 +13114,7 @@ pub const DataServer = struct {
         const index_status = @import("antfly_local_sources").storage_db_relational_index_status_contract;
         for (names) |name| {
             try context.ensureActive();
-            const expected_comparison = try @import("../api/relational_index_status.zig").expectedComparison(scratch, parent_schema, name);
+            const expected_comparison = try @import("../api/relational_index/status.zig").expectedComparison(scratch, parent_schema, name);
             const request_json = try std.json.Stringify.valueAlloc(scratch, index_status.Request{ .name = name, .schema_version = parent_schema.version }, .{});
             var response = (read_source.lookupGroupLocal(scratch, group_id, table_name, range.start_key, .{ .relational_index_status_json = request_json, .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation }, consistency) catch |err| switch (err) {
                 error.IndexNotFound, error.PreparedGenerationChanged, error.RelationalTableRequired, error.TableNotFound => return error.GenerationAdmissionPending,
@@ -13123,7 +13123,7 @@ pub const DataServer = struct {
             defer response.deinit(scratch);
             if (response.json.len > index_status.max_response_bytes) return error.GenerationAdmissionPending;
             const status = try std.json.parseFromSliceLeaky(index_status.Status, scratch, response.json, .{});
-            try @import("../api/relational_index_status.zig").requireInitialFkSupportReady(status, table.table_id, parent_schema.version, range.start_key, range.end_key orelse "", expected_comparison);
+            try @import("../api/relational_index/status.zig").requireInitialFkSupportReady(status, table.table_id, parent_schema.version, range.start_key, range.end_key orelse "", expected_comparison);
         }
     }
 
@@ -13135,7 +13135,7 @@ pub const DataServer = struct {
         const status_contract = @import("antfly_local_sources").storage_db_relational_index_status_contract;
         for (names) |name| {
             try context.ensureActive();
-            const comparison = try @import("../api/relational_index_status.zig").expectedComparison(a, schema, name);
+            const comparison = try @import("../api/relational_index/status.zig").expectedComparison(a, schema, name);
             var response = (source.lookupNativeFkIndexStatus(a, group, table_name, .{ .name = name, .schema_version = schema.version }, context) catch |err| switch (err) {
                 error.IndexNotFound, error.PreparedGenerationChanged, error.RelationalTableRequired, error.TableNotFound => return error.GenerationAdmissionPending,
                 else => return err,
@@ -13143,7 +13143,7 @@ pub const DataServer = struct {
             defer response.deinit(a);
             if (response.json.len > status_contract.max_response_bytes) return error.GenerationAdmissionPending;
             const status = try std.json.parseFromSliceLeaky(status_contract.Status, a, response.json, .{});
-            try @import("../api/relational_index_status.zig").requireInitialFkSupportReady(status, table.table_id, schema.version, range.start_key, range.end_key orelse "", comparison);
+            try @import("../api/relational_index/status.zig").requireInitialFkSupportReady(status, table.table_id, schema.version, range.start_key, range.end_key orelse "", comparison);
         }
     }
 
@@ -13204,8 +13204,8 @@ pub const DataServer = struct {
     fn tableRetirementPreparationControl(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: antfly.public_api.table_retirement_preparation.Request, context: antfly.public_api.operation.RequestContext) ![]u8 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const preparation = antfly.public_api.table_retirement_preparation;
-        const retirement = @import("../metadata/table_retirement_ledger.zig");
-        const manifests = @import("../metadata/table_retirement_manifest.zig");
+        const retirement = @import("../metadata/retirement/table/ledger.zig");
+        const manifests = @import("../metadata/retirement/table/manifest.zig");
         if (!context.setting_admin or !context.schema_validation_authority or !context.fk_generation_publication_authority) return error.Forbidden;
         try context.ensureActive();
         try request.validate(group_id);
@@ -14004,8 +14004,8 @@ pub const DataServer = struct {
 
     fn raftIndexClaimsControl(self: *DataServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.ClaimRequest, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.ClaimResult {
         const execution = antfly.public_api.relational_index_owner_execution;
-        const publication = @import("../metadata/relational_index_publication.zig");
-        var groups: [@import("../metadata/relational_index_source_delivery.zig").max_parts]u64 = undefined;
+        const publication = @import("../metadata/relational_index/publication.zig");
+        var groups: [@import("../metadata/relational_index/source_delivery.zig").max_parts]u64 = undefined;
         var group_count: usize = 0;
         if (request.closure) |closure| {
             for (closure.targets.items, groups[0..closure.targets.items.len]) |target, *group| group.* = target.signed.outcome.binding.fence.owner_group_id;
@@ -14031,7 +14031,7 @@ pub const DataServer = struct {
         const scope = try self.raftIndexLocalScope(group_id, rooted, context);
         try (try permission.value.raftSigningView(lookup)).requireLocal(scope);
         if (request.consume) |consume| {
-            const journal = @import("../metadata/relational_index_delivery_journal.zig");
+            const journal = @import("../metadata/relational_index/delivery_journal.zig");
             const query: journal.Query = .{ .table_id = request.table_id, .group_id = group_id, .id = request.id };
             var authority = context;
             authority.index_publication_authority = true;
@@ -14079,7 +14079,7 @@ pub const DataServer = struct {
             return .{ .raft_consumed = response };
         }
         if (request.closure) |closure| {
-            const delivery = @import("../metadata/relational_index_source_delivery.zig");
+            const delivery = @import("../metadata/relational_index/source_delivery.zig");
             var wire = try session.claimSource(alloc);
             defer wire.deinit();
             var read = try wire.value.decodeRaft(alloc, identity);
@@ -14122,14 +14122,14 @@ pub const DataServer = struct {
         return .{ .raft_applied = response };
     }
 
-    fn signRaftIndexConsumption(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, decision: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, request: @import("../metadata/relational_index_publication.zig").OwnerRequest, binding: @import("antfly_local_sources").storage_db_relational_index_owner_job.Binding, record: @import("antfly_local_sources").storage_db_relational_index_owner_job.private_claims.SourceStream.Consumption, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index_publication.zig").RootProof {
+    fn signRaftIndexConsumption(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, decision: *const @import("../metadata/relational_index/publication.zig").OwnerDecision, request: @import("../metadata/relational_index/publication.zig").OwnerRequest, binding: @import("antfly_local_sources").storage_db_relational_index_owner_job.Binding, record: @import("antfly_local_sources").storage_db_relational_index_owner_job.private_claims.SourceStream.Consumption, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index/publication.zig").RootProof {
         const runtime = try self.ensureBackendRuntime();
         const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
         const root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir);
         return decision.signRaftConsumption(request, binding, record, try self.raftIndexLocalScope(group_id, rooted, context), root);
     }
 
-    fn signRaftIndexClaims(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, decision: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, request: @import("../metadata/relational_index_publication.zig").OwnerRequest, command: @import("antfly_local_sources").storage_db_relational_index_owner_control.ClaimCommand, outcome: @import("antfly_local_sources").storage_db_relational_index_owner_control.DeliveredClaims, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index_publication.zig").RootProof {
+    fn signRaftIndexClaims(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, decision: *const @import("../metadata/relational_index/publication.zig").OwnerDecision, request: @import("../metadata/relational_index/publication.zig").OwnerRequest, command: @import("antfly_local_sources").storage_db_relational_index_owner_control.ClaimCommand, outcome: @import("antfly_local_sources").storage_db_relational_index_owner_control.DeliveredClaims, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index/publication.zig").RootProof {
         const runtime = try self.ensureBackendRuntime();
         const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
         const root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir);
@@ -14264,7 +14264,7 @@ pub const DataServer = struct {
     /// Recovery never repeats a fence-lifting effect. Nonterminal root-local
     /// audits are bounded and disposable; terminal recovery may only resume
     /// companion GC against the exact already-committed release record.
-    fn raftIndexRecoverControl(self: *DataServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.Request, permission: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.Result {
+    fn raftIndexRecoverControl(self: *DataServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.Request, permission: *const @import("../metadata/relational_index/publication.zig").OwnerDecision, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.Result {
         const execution = antfly.public_api.relational_index_owner_execution;
         const local = @import("antfly_local_sources");
         const grant = permission.raft_recovery orelse return error.PrivateIndexRootRecoveryRequired;
@@ -14310,7 +14310,7 @@ pub const DataServer = struct {
                 // Installation can have committed before its ACK was observed.
                 // Its audited predecessor is the same frozen validation; never
                 // reconstruct the retired preimage from current mutable rows.
-                const intent: local.storage_db_relational_index_validation.InstallIntent = .{ .validation = grant.retained.validation, .metadata_decision = try @import("../metadata/relational_index_publication.zig").InstallGrant.decisionDigest(permission.metadata_group_id, permission.metadata_incarnation, permission.head) };
+                const intent: local.storage_db_relational_index_validation.InstallIntent = .{ .validation = grant.retained.validation, .metadata_decision = try @import("../metadata/relational_index/publication.zig").InstallGrant.decisionDigest(permission.metadata_group_id, permission.metadata_incarnation, permission.head) };
                 var installed = try session.lifecycle(alloc, .{ .install = .{ .intent = intent, .budget = request.build_budget orelse .{} } }, true, root_scope);
                 defer installed.deinit();
                 const physical = installed.value.progress.install;
@@ -14335,7 +14335,7 @@ pub const DataServer = struct {
         return .{ .raft_recovery = response };
     }
 
-    fn raftIndexRecoverTerminal(self: *DataServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.Request, permission: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, session: *antfly.public_api.ProvisionedKernelOwnerSource.RaftIndexOwnerSession, scope: @import("../metadata/relational_index_publication.zig").RaftLocalScope, context: antfly.public_api.operation.RequestContext) !?antfly.public_api.relational_index_owner_execution.Result {
+    fn raftIndexRecoverTerminal(self: *DataServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.Request, permission: *const @import("../metadata/relational_index/publication.zig").OwnerDecision, session: *antfly.public_api.ProvisionedKernelOwnerSource.RaftIndexOwnerSession, scope: @import("../metadata/relational_index/publication.zig").RaftLocalScope, context: antfly.public_api.operation.RequestContext) !?antfly.public_api.relational_index_owner_execution.Result {
         const execution = antfly.public_api.relational_index_owner_execution;
         const local = @import("antfly_local_sources");
         const grant = permission.raft_recovery orelse return error.PrivateIndexRootRecoveryRequired;
@@ -14399,7 +14399,7 @@ pub const DataServer = struct {
         return .{ .raft_recovery = response };
     }
 
-    fn raftIndexValidationControl(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: antfly.public_api.relational_index_owner_execution.Request, lookup: @import("../metadata/relational_index_publication.zig").OwnerRequest, permission: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, session: *antfly.public_api.ProvisionedKernelOwnerSource.RaftIndexOwnerSession, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, original_route: DataRaftBatchRoute) !antfly.public_api.relational_index_owner_execution.Result {
+    fn raftIndexValidationControl(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: antfly.public_api.relational_index_owner_execution.Request, lookup: @import("../metadata/relational_index/publication.zig").OwnerRequest, permission: *const @import("../metadata/relational_index/publication.zig").OwnerDecision, session: *antfly.public_api.ProvisionedKernelOwnerSource.RaftIndexOwnerSession, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, original_route: DataRaftBatchRoute) !antfly.public_api.relational_index_owner_execution.Result {
         const execution = antfly.public_api.relational_index_owner_execution;
         const local = @import("antfly_local_sources");
         const context = original_route.index_owner_permission.?.context;
@@ -14454,10 +14454,10 @@ pub const DataServer = struct {
         return .{ .raft_validation = response };
     }
 
-    fn raftIndexCancellationControl(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: antfly.public_api.relational_index_owner_execution.Request, lookup: @import("../metadata/relational_index_publication.zig").OwnerRequest, permission: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, session: *antfly.public_api.ProvisionedKernelOwnerSource.RaftIndexOwnerSession, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.Result {
+    fn raftIndexCancellationControl(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: antfly.public_api.relational_index_owner_execution.Request, lookup: @import("../metadata/relational_index/publication.zig").OwnerRequest, permission: *const @import("../metadata/relational_index/publication.zig").OwnerDecision, session: *antfly.public_api.ProvisionedKernelOwnerSource.RaftIndexOwnerSession, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.Result {
         const execution = antfly.public_api.relational_index_owner_execution;
         const local = @import("antfly_local_sources");
-        const publication = @import("../metadata/relational_index_publication.zig");
+        const publication = @import("../metadata/relational_index/publication.zig");
         const contract = local.storage_db_relational_index_raft_contract;
         const input: contract.CancellationRequest = if (request.operation == .cancel_release) .{ .release = try permission.raftCancellationReleaseIntent(lookup) } else .{ .cancel = try permission.raftCancellationIntent() };
         var prepared = try session.cancelStep(alloc, input, true);
@@ -14536,7 +14536,7 @@ pub const DataServer = struct {
         return .{ .raft_cancellation = response };
     }
 
-    fn raftIndexLifecycleControl(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: antfly.public_api.relational_index_owner_execution.Request, lookup: @import("../metadata/relational_index_publication.zig").OwnerRequest, permission: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, session: *antfly.public_api.ProvisionedKernelOwnerSource.RaftIndexOwnerSession, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, original_route: DataRaftBatchRoute) !antfly.public_api.relational_index_owner_execution.Result {
+    fn raftIndexLifecycleControl(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: antfly.public_api.relational_index_owner_execution.Request, lookup: @import("../metadata/relational_index/publication.zig").OwnerRequest, permission: *const @import("../metadata/relational_index/publication.zig").OwnerDecision, session: *antfly.public_api.ProvisionedKernelOwnerSource.RaftIndexOwnerSession, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, original_route: DataRaftBatchRoute) !antfly.public_api.relational_index_owner_execution.Result {
         const execution = antfly.public_api.relational_index_owner_execution;
         const local = @import("antfly_local_sources");
         const contract = local.storage_db_relational_index_raft_contract;
@@ -14586,14 +14586,14 @@ pub const DataServer = struct {
         return .{ .raft_lifecycle = response };
     }
 
-    fn signRaftIndexValidation(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, permission: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, lookup: @import("../metadata/relational_index_publication.zig").OwnerRequest, audited: @import("antfly_local_sources").storage_db_relational_index_raft_contract.AuditProgress, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index_publication.zig").Ack {
+    fn signRaftIndexValidation(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, permission: *const @import("../metadata/relational_index/publication.zig").OwnerDecision, lookup: @import("../metadata/relational_index/publication.zig").OwnerRequest, audited: @import("antfly_local_sources").storage_db_relational_index_raft_contract.AuditProgress, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index/publication.zig").Ack {
         const runtime = try self.ensureBackendRuntime();
         const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
         const root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir);
         return permission.signRaftValidation(lookup, audited, audited.outcome.audit.physical_root_incarnation, try self.raftIndexLocalScope(group_id, rooted, context), root);
     }
 
-    fn signRaftIndexOwnerControl(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, decision: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, request_: @import("../metadata/relational_index_publication.zig").OwnerRequest, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index_publication.zig").Ack {
+    fn signRaftIndexOwnerControl(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, decision: *const @import("../metadata/relational_index/publication.zig").OwnerDecision, request_: @import("../metadata/relational_index/publication.zig").OwnerRequest, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index/publication.zig").Ack {
         var request = request_;
         const registration = self.store_registration orelse return error.IndexOwnerReceiptChanged;
         request.raft_reporter = .{ .node_id = registration.node_id, .store_id = registration.store_id };
@@ -14604,7 +14604,7 @@ pub const DataServer = struct {
         return decision.signRaftControl(request, rooted.observation, scope, root);
     }
 
-    fn signRaftIndexSource(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, decision: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, request: @import("../metadata/relational_index_publication.zig").OwnerRequest, wire: @import("antfly_local_sources").storage_db_relational_index_owner_control.SourceWire, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index_publication.zig").RootProof {
+    fn signRaftIndexSource(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, decision: *const @import("../metadata/relational_index/publication.zig").OwnerDecision, request: @import("../metadata/relational_index/publication.zig").OwnerRequest, wire: @import("antfly_local_sources").storage_db_relational_index_owner_control.SourceWire, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index/publication.zig").RootProof {
         const runtime = try self.ensureBackendRuntime();
         const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
         const root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir);
@@ -14616,12 +14616,12 @@ pub const DataServer = struct {
     /// shared completed prefix. This reads no caller-supplied term/replica and
     /// never creates a new reporter identity during receipt recovery. Proposal
     /// must still CAS this exact term; this snapshot is not a leadership lease.
-    fn raftIndexLocalScope(self: *DataServer, group_id: u64, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index_publication.zig").RaftLocalScope {
+    fn raftIndexLocalScope(self: *DataServer, group_id: u64, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index/publication.zig").RaftLocalScope {
         try rooted.observation.validate(rooted.identity);
         return self.raftIndexLocalScopeAtRoot(group_id, rooted.identity, rooted.root_generation, context);
     }
 
-    fn raftIndexLocalScopeAtRoot(self: *DataServer, group_id: u64, identity: @import("antfly_local_sources").storage_db_relational_index_raft_contract.Identity, root_generation: u64, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index_publication.zig").RaftLocalScope {
+    fn raftIndexLocalScopeAtRoot(self: *DataServer, group_id: u64, identity: @import("antfly_local_sources").storage_db_relational_index_raft_contract.Identity, root_generation: u64, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index/publication.zig").RaftLocalScope {
         try context.ensureActive();
         try identity.validate();
         if (group_id == 0 or identity.owner_group_id != group_id) return error.PrivateIndexOwnerJobChanged;
@@ -14971,7 +14971,7 @@ pub const DataServer = struct {
             const native = descriptor.sql_persistence orelse return error.InvalidSqlRelationPersistence;
             if (input.native_execution) |hint| if (!native.eql(hint)) return error.SqlRelationOwnerChanged;
             const identity = try self.schemaRecoveryIdentity();
-            const creation: @import("../metadata/sql_relation_attestation.zig").CreationScope = .{ .plan_id = input.scope.plan_id, .plan_digest = input.scope.plan_digest };
+            const creation: @import("../metadata/sql/relation_lifecycle/attestation.zig").CreationScope = .{ .plan_id = input.scope.plan_id, .plan_digest = input.scope.plan_digest };
             const observed = try self.write_source.catalog.sqlRelationBinding(alloc, .{ .node = native.owner_node_id, .binding_table = descriptor.identity.table_id, .creation_scope = creation }, context.deadline_ns);
             const boot = try nativeInitializationBoot(observed, descriptor.native_reset_source != null);
             const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.write_source.replica_root_dir, group_id });
@@ -21455,7 +21455,7 @@ pub const DataServer = struct {
     const NativeOwnerInitStage = enum(u4) { load_descriptor, boot_observation, boot_validation, existing_binding, actual_initializer, sign_request, publish_binding, confirm_binding, serving_reconcile, runtime_report };
     var native_init_pending_sites: std.atomic.Value(u16) = .init(0);
     var native_init_failure_sites: std.atomic.Value(u16) = .init(0);
-    fn diagnoseNativeOwnerInit(stage: NativeOwnerInitStage, err: anyerror, table: u64, group: u64, boot: @import("../metadata/sql_relation_boots.zig").Record, initialized: bool, uninitialized: bool) void {
+    fn diagnoseNativeOwnerInit(stage: NativeOwnerInitStage, err: anyerror, table: u64, group: u64, boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, initialized: bool, uninitialized: bool) void {
         if (comptime @import("builtin").mode == .debug) {
             const mask: u16 = @as(u16, 1) << @intCast(@backingInt(stage));
             const seen = if (err == error.SqlRelationRecoveryIncomplete or err == error.SqlRelationOwnerUnavailable) &native_init_pending_sites else &native_init_failure_sites;
@@ -21467,7 +21467,7 @@ pub const DataServer = struct {
     /// Complete one actual native owner birth before serving/catalog readiness.
     /// The Boot worker enumerates bounded lifetime entries and invokes this;
     /// ordinary Raft provisioning never opens these roots or invents receipts.
-    pub fn initializeNativeOwnerGroup(self: *DataServer, a: std.mem.Allocator, metadata_group: u64, boot: @import("../metadata/sql_relation_boots.zig").Record, group: u64, table: []const u8, context: antfly.public_api.operation.RequestContext) !void {
+    pub fn initializeNativeOwnerGroup(self: *DataServer, a: std.mem.Allocator, metadata_group: u64, boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, group: u64, table: []const u8, context: antfly.public_api.operation.RequestContext) !void {
         var stage: NativeOwnerInitStage = .load_descriptor;
         var table_id: u64 = 0;
         return self.initializeNativeOwnerGroupObserved(a, metadata_group, boot, group, table, context, &stage, &table_id) catch |err| {
@@ -21476,7 +21476,7 @@ pub const DataServer = struct {
         };
     }
 
-    fn initializeNativeOwnerGroupObserved(self: *DataServer, a: std.mem.Allocator, metadata_group: u64, boot: @import("../metadata/sql_relation_boots.zig").Record, group: u64, table: []const u8, context: antfly.public_api.operation.RequestContext, stage: *NativeOwnerInitStage, table_id: *u64) !void {
+    fn initializeNativeOwnerGroupObserved(self: *DataServer, a: std.mem.Allocator, metadata_group: u64, boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, group: u64, table: []const u8, context: antfly.public_api.operation.RequestContext, stage: *NativeOwnerInitStage, table_id: *u64) !void {
         if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
         const source = try self.ensureKernelOwnerSource();
         var descriptor = try source.loadDescriptorWithDeadline(a, group, table, context.deadline_ns);
@@ -21496,7 +21496,7 @@ pub const DataServer = struct {
         if (installed.state != .complete) return error.SqlRelationRecoveryIncomplete;
     }
 
-    fn nativeInitializationBoot(observed: @import("../metadata/sql_relation_boots.zig").Observation, reset_target: bool) !@import("../metadata/sql_relation_boots.zig").Record {
+    fn nativeInitializationBoot(observed: @import("../metadata/sql/relation_lifecycle/boots.zig").Observation, reset_target: bool) !@import("../metadata/sql/relation_lifecycle/boots.zig").Record {
         if (!reset_target and observed.uninitialized == null) return observed.requireReady();
         const current = observed.record orelse return error.SqlRelationOwnerUnavailable;
         try current.validate();
@@ -21509,7 +21509,7 @@ pub const DataServer = struct {
     }
 
     const NativeInitDiagnostic = struct { stage: NativeOwnerInitStage = .boot_observation, initialized: bool = false, uninitialized: bool = false };
-    fn initializeNativeDescriptor(self: *DataServer, a: std.mem.Allocator, metadata_group: u64, boot: @import("../metadata/sql_relation_boots.zig").Record, group: u64, table: []const u8, path: []const u8, descriptor: @import("../storage/kernel_owner_descriptor.zig").Descriptor, scope: ?@import("../metadata/sql_relation_attestation.zig").CreationScope, context: antfly.public_api.operation.RequestContext) !void {
+    fn initializeNativeDescriptor(self: *DataServer, a: std.mem.Allocator, metadata_group: u64, boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, group: u64, table: []const u8, path: []const u8, descriptor: @import("../storage/kernel_owner_descriptor.zig").Descriptor, scope: ?@import("../metadata/sql/relation_lifecycle/attestation.zig").CreationScope, context: antfly.public_api.operation.RequestContext) !void {
         var diagnostic: NativeInitDiagnostic = .{};
         return self.initializeNativeDescriptorObserved(a, metadata_group, boot, group, table, path, descriptor, scope, context, &diagnostic) catch |err| {
             diagnoseNativeOwnerInit(diagnostic.stage, err, descriptor.identity.table_id, group, boot, diagnostic.initialized, diagnostic.uninitialized);
@@ -21517,7 +21517,7 @@ pub const DataServer = struct {
         };
     }
 
-    fn initializeNativeDescriptorObserved(self: *DataServer, a: std.mem.Allocator, metadata_group: u64, boot: @import("../metadata/sql_relation_boots.zig").Record, group: u64, table: []const u8, path: []const u8, descriptor: @import("../storage/kernel_owner_descriptor.zig").Descriptor, scope: ?@import("../metadata/sql_relation_attestation.zig").CreationScope, context: antfly.public_api.operation.RequestContext, diagnostic: *NativeInitDiagnostic) !void {
+    fn initializeNativeDescriptorObserved(self: *DataServer, a: std.mem.Allocator, metadata_group: u64, boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, group: u64, table: []const u8, path: []const u8, descriptor: @import("../storage/kernel_owner_descriptor.zig").Descriptor, scope: ?@import("../metadata/sql/relation_lifecycle/attestation.zig").CreationScope, context: antfly.public_api.operation.RequestContext, diagnostic: *NativeInitDiagnostic) !void {
         const persistence = descriptor.sql_persistence orelse return error.InvalidSqlRelationPersistence;
         const source = try self.ensureKernelOwnerSource();
         const observed = try self.write_source.catalog.sqlRelationBinding(a, .{ .node = persistence.owner_node_id, .binding_table = descriptor.identity.table_id, .creation_scope = scope }, context.deadline_ns);
@@ -21548,7 +21548,7 @@ pub const DataServer = struct {
         diagnostic.stage = .publish_binding;
         const bytes = try self.status_source.systemCatalog(a, .{ .setting_admin = true, .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation }, .{ .sql_relation_boot_submit = encoded });
         defer a.free(bytes);
-        var result = try std.json.parseFromSlice(@import("../metadata/sql_relation_boots.zig").Observation, a, bytes, .{});
+        var result = try std.json.parseFromSlice(@import("../metadata/sql/relation_lifecycle/boots.zig").Observation, a, bytes, .{});
         defer result.deinit();
         diagnostic.stage = .confirm_binding;
         _ = try request.requireApplied(result.value);
@@ -21593,7 +21593,7 @@ pub const DataServer = struct {
         defer a.free(request_json);
         const encoded = try self.status_source.systemCatalog(a, .{ .setting_admin = true, .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation }, .{ .sql_relation_boot_submit = request_json });
         defer a.free(encoded);
-        var response = try std.json.parseFromSlice(@import("../metadata/sql_relation_boots.zig").Observation, a, encoded, .{});
+        var response = try std.json.parseFromSlice(@import("../metadata/sql/relation_lifecycle/boots.zig").Observation, a, encoded, .{});
         defer response.deinit();
         _ = try request.requireApplied(response.value);
     }
@@ -30064,7 +30064,7 @@ const RemoteMetadataSource = struct {
         return antfly.public_api.table_catalog.readGraphPreparation(self.statusSource(), alloc, request, deadline_ns);
     }
 
-    fn remoteSqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+    fn remoteSqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql/relation_lifecycle/boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql/relation_lifecycle/boots.zig").Observation {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         const bytes = try remoteSystemCatalog(ptr, alloc, .{
             .setting_admin = true,
@@ -30072,7 +30072,7 @@ const RemoteMetadataSource = struct {
             .deadline_io = runtime_io_abi.Borrow.init(&self.io),
         }, .{ .sql_relation_boot_read = query });
         defer alloc.free(bytes);
-        const parsed = try std.json.parseFromSlice(@import("../metadata/sql_relation_boots.zig").Observation, alloc, bytes, .{});
+        const parsed = try std.json.parseFromSlice(@import("../metadata/sql/relation_lifecycle/boots.zig").Observation, alloc, bytes, .{});
         defer parsed.deinit();
         return parsed.value;
     }
@@ -32141,7 +32141,7 @@ const RemoteMetadataSource = struct {
             // can retire names and deliberately remain conservative below.
             .relational_index_source_accept, .relational_index_source_complete => false,
             .sql_relation_boot_submit => |bytes| report: {
-                var parsed = @import("../metadata/sql_relation_boot_wire.zig").Request.parse(self.alloc, bytes) catch break :report true;
+                var parsed = @import("../metadata/sql/relation_lifecycle/boot_wire.zig").Request.parse(self.alloc, bytes) catch break :report true;
                 defer parsed.deinit();
                 break :report parsed.value.command != .group_report;
             },
@@ -32190,7 +32190,7 @@ const RemoteMetadataSource = struct {
                 ctx: anytype,
             ) ![]u8 {
                 try ctx.request.ensureActive();
-                const is_schema_begin = ctx.input == .schema_validation_submit and @import("../metadata/schema_validation_ledger.zig").requiresAdmissionAuthority(ctx.input.schema_validation_submit);
+                const is_schema_begin = ctx.input == .schema_validation_submit and @import("../metadata/schema_validation/ledger.zig").requiresAdmissionAuthority(ctx.input.schema_validation_submit);
                 if (@import("builtin").is_test) {
                     if (is_schema_begin and remote.test_faults.schema_begin_reply_lost.load(.acquire)) _ = remote.test_faults.schema_begin_replays.fetchAdd(1, .monotonic);
                 }
@@ -38497,8 +38497,8 @@ fn consumerTests() type {
             const metadata_root = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/reset-birth-metadata", .{tmp.sub_path});
             const local = @import("antfly_local_sources");
             const stages = @import("../metadata/restore_staging.zig");
-            const boots = @import("../metadata/sql_relation_boots.zig");
-            const wire = @import("../metadata/sql_relation_boot_wire.zig");
+            const boots = @import("../metadata/sql/relation_lifecycle/boots.zig");
+            const wire = @import("../metadata/sql/relation_lifecycle/boot_wire.zig");
             const domain = local.system_catalog_domain;
             const group = local.common_group_ids.main_metadata_group_id;
             const incarnation = "07070707070707070707070707070707".*;
@@ -38550,7 +38550,7 @@ fn consumerTests() type {
                                 if (parsed.value.command == .begin_drain or parsed.value.command == .finish_drain)
                                     return error.MetadataUnavailable;
                             }
-                            break :submission @import("../metadata/sql_relation_boot_service.zig").submitStandalone(self.store, alloc, group, context, bytes);
+                            break :submission @import("../metadata/sql/relation_lifecycle/boot_service.zig").submitStandalone(self.store, alloc, group, context, bytes);
                         },
                         else => error.UnexpectedResetBirthCatalogCall,
                     };
@@ -38582,7 +38582,7 @@ fn consumerTests() type {
                 }
                 fn submit(self: *@This(), alloc: std.mem.Allocator, owner: *antfly.public_api.ProvisionedKernelOwnerSource, root: local.storage_db_root_signing_identity.State, reporter: u64, command: wire.Command) !boots.Observation {
                     const request = try owner.attestRelationBoot(.{ .metadata_group_id = group, .identity = .{ .metadata_incarnation = incarnation, .node_id = 9, .store_id = 11, .root_incarnation = root.root_incarnation, .public_key = root.public_key }, .reporter_incarnation = reporter, .native_instance = try owner.nativeExecutionInstance(), .command = command }, root);
-                    const bytes = try @import("../metadata/sql_relation_boot_service.zig").submitStandalone(self.store, alloc, group, .{ .setting_admin = true }, try std.json.Stringify.valueAlloc(alloc, request, .{}));
+                    const bytes = try @import("../metadata/sql/relation_lifecycle/boot_service.zig").submitStandalone(self.store, alloc, group, .{ .setting_admin = true }, try std.json.Stringify.valueAlloc(alloc, request, .{}));
                     return std.json.parseFromSliceLeaky(boots.Observation, alloc, bytes, .{});
                 }
                 fn register(self: *@This(), alloc: std.mem.Allocator, root: local.storage_db_root_signing_identity.State, reporter: u64) !void {
@@ -38593,7 +38593,7 @@ fn consumerTests() type {
             };
             var provider: Provider = .{ .store = &store, .scratch = scratch };
             var old_table: antfly.metadata.TableRecord = undefined;
-            var before: @import("../metadata/sql_relation_attestation.zig").SignedBinding = undefined;
+            var before: @import("../metadata/sql/relation_lifecycle/attestation.zig").SignedBinding = undefined;
             var previous: boots.Record = undefined;
             var signing_root: local.storage_db_root_signing_identity.State = undefined;
             const old_range: antfly.metadata.RangeRecord = .{ .table_id = 7, .group_id = 42, .range_id = 42, .doc_identity_shard_id = 42, .doc_identity_range_id = 42, .start_key = "" };
@@ -38666,7 +38666,7 @@ fn consumerTests() type {
             successor.generation_instance = instance;
             const target_range: antfly.metadata.RangeRecord = .{ .table_id = 8, .group_id = 43, .range_id = 43, .doc_identity_shard_id = 43, .doc_identity_range_id = 43, .start_key = "" };
             const target_table: antfly.metadata.TableRecord = .{ .table_id = 8, .name = "rows", .schema_json = schema, .sql_persistence = successor, .desired_replica_count = 1 };
-            const guard: @import("../metadata/sql_relation_recovery.zig").Guard = .{ .before = before, .source_group_id = 42, .lost_boot_generation = boot.generation, .lost_native_instance = instance, .catalog_revision = (try store.systemCatalogMeta(scratch, group)).revision };
+            const guard: @import("../metadata/sql/relation_lifecycle/recovery.zig").Guard = .{ .before = before, .source_group_id = 42, .lost_boot_generation = boot.generation, .lost_native_instance = instance, .catalog_revision = (try store.systemCatalogMeta(scratch, group)).revision };
             const target: stages.Target = .{ .source_table_id = 7, .table = target_table, .ranges = &.{target_range}, .catalog_binding = try old_binding.withPhysicalRelationId(8), .empty_generation = true, .native_reset = guard, .replace = .{ .table = old_table, .ranges = &.{old_range} } };
             const plan: stages.Plan = .{ .id = @splat(5), .cohort_digest = @splat(6), .targets = &.{target} };
             try plan.validate(scratch);
@@ -38694,7 +38694,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 8), initialized.binding.table_id);
             try std.testing.expectEqual(@as(u64, 43), initialized.binding.shard_id);
             try std.testing.expectEqual(@as(u64, 43), initialized.binding.range_id);
-            try std.testing.expectEqualDeep(@as(?@import("../metadata/sql_relation_attestation.zig").CreationScope, .{ .plan_id = plan.id, .plan_digest = digest }), initialized.creation_scope);
+            try std.testing.expectEqualDeep(@as(?@import("../metadata/sql/relation_lifecycle/attestation.zig").CreationScope, .{ .plan_id = plan.id, .plan_digest = digest }), initialized.creation_scope);
             try std.testing.expect(!initialized.binding.has_user_data and !initialized.binding.has_transaction_state);
             const plain_status = try DataServer.restoreOwnerControl(&restarted, scratch, "rows", 43, .{ .scope = scope, .action = .status }, .{});
             try std.testing.expect(plain_status.native_empty_identity == null);
@@ -41565,7 +41565,7 @@ fn consumerTests() type {
 
         test "data runtime schema recovery discovers sparse work without opening ten thousand idle owners" {
             const a = std.testing.allocator;
-            const work = @import("../metadata/schema_validation_work.zig");
+            const work = @import("../metadata/schema_validation/work.zig");
             const catalog_mod = antfly.public_api.table_catalog;
             const records = @import("antfly_local_sources").common_topology_records;
             var arena = std.heap.ArenaAllocator.init(a);
@@ -47765,7 +47765,7 @@ fn consumerTests() type {
             defer schema.deinit(a);
             var prior = try local.schema_relational_declarations.compileCatalog(a, schema, 101, null);
             defer prior.deinit();
-            var candidate = try @import("../metadata/relational_index_candidate.zig").Candidate.prepare(a, 101, schema_json, after_json, prior.value, "email_idx");
+            var candidate = try @import("../metadata/relational_index/candidate.zig").Candidate.prepare(a, 101, schema_json, after_json, prior.value, "email_idx");
             defer candidate.deinit();
             const header: contract.Admission = .{ .id = identity.id, .plan_digest = identity.plan_digest, .owner_digest = identity.owner_digest, .ordinal = identity.ordinal, .fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .owner_group_id = 11, .peer_group_id = 11, .namespace = identity.namespace, .catalog_digest = local.storage_db_relational_index_inputs.digest(prior.value) }, .candidate_digest = local.storage_db_relational_index_inputs.digest(candidate.next.value), .reservation_digest = local.storage_db_relational_index_inputs.digest(candidate.reservation.value) };
             const prepared = try owner.raftIndexOwnerAdmissionPreparation(a, "items", header, candidate.inputs.bytes, .{});
@@ -52146,7 +52146,7 @@ fn consumerTests() type {
         }
 
         test "remote metadata native report cache neutrality requires a verified report subtype" {
-            const wire = @import("../metadata/sql_relation_boot_wire.zig");
+            const wire = @import("../metadata/sql/relation_lifecycle/boot_wire.zig");
             const signing = @import("antfly_local_sources").storage_db_root_signing_identity;
             const seed: [32]u8 = @splat(7);
             const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);

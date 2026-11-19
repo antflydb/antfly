@@ -273,7 +273,7 @@ pub const Parent = struct {
     /// No parent generation is published into a namespace that the same
     /// ancestor is deleting. Its own registered source fence is mandatory at
     /// the root publication boundary instead; ordinary plans cannot use this.
-    scope_retirement: ?@import("scope_retirement_ledger.zig").Child = null,
+    scope_retirement: ?@import("retirement/scope/ledger.zig").Child = null,
     table: records.TableRecord,
     ranges: []const records.RangeRecord,
     fences: []const topology.Fence,
@@ -314,7 +314,7 @@ pub const Plan = struct {
     /// child schema or a row-by-row unique-claim drain.
     sql_drop: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard = null,
     /// A root-bound owner plan is never an independent FK schema publication.
-    table_retirement: ?@import("table_retirement_manifest.zig").Reference = null,
+    table_retirement: ?@import("retirement/table/manifest.zig").Reference = null,
     id: Id,
     child_before: records.TableRecord,
     child_after: records.TableRecord,

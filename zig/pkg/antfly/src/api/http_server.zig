@@ -1779,9 +1779,9 @@ pub const ApiHttpServerConfig = struct {
     fk_generation_parent: ?@import("relational_fk_generation_publication.zig").Port = null,
     fk_generation_source: ?@import("relational_fk_generation_publication.zig").SourcePort = null,
     fk_initial_child: ?@import("relational_fk_generation_publication.zig").InitialChildPort = null,
-    relational_index_claims: ?@import("relational_index_owner_execution.zig").ClaimPort = null,
-    relational_index_control: ?@import("relational_index_owner_execution.zig").ControlPort = null,
-    schema_validation_preparation: ?@import("schema_validation_preparation.zig").Port = null,
+    relational_index_claims: ?@import("relational_index/owner_execution.zig").ClaimPort = null,
+    relational_index_control: ?@import("relational_index/owner_execution.zig").ControlPort = null,
+    schema_validation_preparation: ?@import("schema_validation/preparation.zig").Port = null,
     native_relation_maintenance: ?@import("native_relation_maintenance.zig").Port = null,
     table_retirement_preparation: ?@import("table_retirement_preparation.zig").Port = null,
     row_policy_install: ?@import("row_policy_install.zig").Port = null,
@@ -3764,7 +3764,7 @@ fn createIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []co
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     if (extensionOwnsIndex(&snapshot, table_name, index_name)) return error.ExtensionOwnedObject;
-    const relational = @import("relational_index_mutation.zig");
+    const relational = @import("relational_index/mutation.zig");
     if (try relational.isRelational(alloc, index_json)) {
         const replacement = try relational.create(alloc, table.*, index_name, index_json);
         defer metadata_table_manager.freeTable(alloc, replacement);
@@ -3794,7 +3794,7 @@ fn dropIndexOnServiceStamped(svc: anytype, alloc: std.mem.Allocator, table_name:
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     if (extensionOwnsIndex(&snapshot, table_name, index_name)) return error.ExtensionOwnedObject;
-    if (try @import("relational_index_mutation.zig").drop(alloc, table.*, index_name)) |replacement| {
+    if (try @import("relational_index/mutation.zig").drop(alloc, table.*, index_name)) |replacement| {
         defer metadata_table_manager.freeTable(alloc, replacement);
         const stamp = try svc.replaceTableDefinitionStamped(table.*, replacement);
         runPostCommitMutationRound(svc, "drop_relational_index");
@@ -4363,8 +4363,8 @@ pub const ApiHttpServer = struct {
     lake_index_recovery_cursor: usize = 0,
     lake_index_recovery_after_ns: u64 = 0,
     backup_maintenance_closing: std.atomic.Value(bool) = .init(false),
-    sql_notification_hub: @import("sql_notification_hub.zig").Hub = .{},
-    sql_notification_work_cursor: @import("sql_notification_maintenance.zig").Cursor = .{},
+    sql_notification_hub: @import("sql/notifications/hub.zig").Hub = .{},
+    sql_notification_work_cursor: @import("sql/notifications/maintenance.zig").Cursor = .{},
     sql_notification_work_in_flight: std.atomic.Value(bool) = .init(false),
     sql_notification_work_due_ns: std.atomic.Value(u64) = .init(0),
     sql_notification_work_completed: std.atomic.Value(u64) = .init(0),
@@ -5385,7 +5385,7 @@ pub const ApiHttpServer = struct {
                 const native = recovery.entry.descriptor;
                 const observed_bytes = try self.source.systemCatalog(a, context, .{ .sql_relation_boot_read = .{ .node = native.owner_node_id, .binding_table = recovery.entry.table_id } });
                 defer a.free(observed_bytes);
-                var observed = try std.json.parseFromSlice(@import("../metadata/sql_relation_boots.zig").Observation, a, observed_bytes, .{});
+                var observed = try std.json.parseFromSlice(@import("../metadata/sql/relation_lifecycle/boots.zig").Observation, a, observed_bytes, .{});
                 defer observed.deinit();
                 if (!observed.value.registration_current or observed.value.record == null or !std.meta.eql(observed.value.record.?, recovery.boot)) return error.SqlRelationOwnerChanged;
                 if (native.kind == .unlogged) {
@@ -5427,7 +5427,7 @@ pub const ApiHttpServer = struct {
                 if (target.table.table_id != lost.table_id or target.ranges.len != 1 or target.native_reset != null or target.rewrite != null or target.schema_only_snapshot != null or target.source_artifacts.len != 0) return error.RestoreStagingScopeChanged;
                 const observed_bytes = try self.source.systemCatalog(a, context, .{ .sql_relation_boot_read = .{ .node = native.owner_node_id, .binding_table = lost.table_id, .creation_scope = lost.scope } });
                 defer a.free(observed_bytes);
-                var observed = try std.json.parseFromSlice(@import("../metadata/sql_relation_boots.zig").Observation, a, observed_bytes, .{});
+                var observed = try std.json.parseFromSlice(@import("../metadata/sql/relation_lifecycle/boots.zig").Observation, a, observed_bytes, .{});
                 defer observed.deinit();
                 try lost.requireObserved(target, observed.value);
                 const reference: control.Reference = .{ .job_id = job_id, .namespace = state.value.idempotency_namespace, .key = state.value.idempotency_key, .fingerprint = state.value.request_fingerprint, .plan_digest = lost.scope.plan_digest };
@@ -6078,7 +6078,7 @@ pub const ApiHttpServer = struct {
         };
         self.runScopeRetirementMaintenanceOnce();
         self.advanceTableRetirementOnce() catch |err| {
-            if (!@import("../metadata/schema_validation_coordinator.zig").isDeferred(err) and err != error.UnsupportedOperation and err != error.TableNotFound)
+            if (!@import("../metadata/schema_validation/coordinator.zig").isDeferred(err) and err != error.UnsupportedOperation and err != error.TableNotFound)
                 std.log.warn("table retirement deferred err={s}", .{@errorName(err)});
         };
         self.advanceFkGenerationPublicationBackgroundOnce() catch |err| switch (err) {
@@ -6275,7 +6275,7 @@ pub const ApiHttpServer = struct {
         }
     };
     fn scheduleSqlNotificationMaintenance(self: *ApiHttpServer) !void {
-        if (!self.source.vtable.supports_sql_command_ownership or !@import("sql_notification_maintenance.zig").owns(self)) return;
+        if (!self.source.vtable.supports_sql_command_ownership or !@import("sql/notifications/maintenance.zig").owns(self)) return;
         if (platform_time.monotonicNs() < self.sql_notification_work_due_ns.load(.acquire) or self.sql_notification_work_in_flight.swap(true, .acq_rel)) return;
         var submitted = false;
         defer if (!submitted) self.sql_notification_work_in_flight.store(false, .release);
@@ -6288,7 +6288,7 @@ pub const ApiHttpServer = struct {
         submitted = true;
     }
     fn advanceSqlNotificationMaintenance(self: *ApiHttpServer) !void {
-        const next = @import("sql_notification_maintenance.zig").advance(self, &self.sql_notification_work_cursor) catch |err| {
+        const next = @import("sql/notifications/maintenance.zig").advance(self, &self.sql_notification_work_cursor) catch |err| {
             self.sql_notification_work_due_ns.store(platform_time.monotonicNs() +| std.time.ns_per_s, .release);
             _ = self.sql_notification_work_failures.fetchAdd(1, .monotonic);
             return err;
@@ -6625,7 +6625,7 @@ pub const ApiHttpServer = struct {
     fn runScopeRetirementMaintenanceOnce(self: *ApiHttpServer) void {
         if (!self.mutationBackgroundExecutionPermitted()) return;
         self.advanceScopeRetirementOnce() catch |err| {
-            if (!@import("../metadata/schema_validation_coordinator.zig").isDeferred(err) and err != error.UnsupportedOperation and err != error.TableNotFound)
+            if (!@import("../metadata/schema_validation/coordinator.zig").isDeferred(err) and err != error.UnsupportedOperation and err != error.TableNotFound)
                 std.log.warn("scope retirement deferred err={s}", .{@errorName(err)});
         };
     }
@@ -9235,11 +9235,11 @@ pub const ApiHttpServer = struct {
         return storage_status_buf[0..];
     }
 
-    fn apiHttpServerCatalogSqlRelationBoot(raw: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+    fn apiHttpServerCatalogSqlRelationBoot(raw: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql/relation_lifecycle/boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql/relation_lifecycle/boots.zig").Observation {
         const self: *ApiHttpServer = @ptrCast(@alignCast(raw));
         const bytes = try self.source.systemCatalog(alloc, .{ .setting_admin = true, .deadline_ns = deadline_ns }, .{ .sql_relation_boot_read = query });
         defer alloc.free(bytes);
-        var parsed = try std.json.parseFromSlice(@import("../metadata/sql_relation_boots.zig").Observation, alloc, bytes, .{});
+        var parsed = try std.json.parseFromSlice(@import("../metadata/sql/relation_lifecycle/boots.zig").Observation, alloc, bytes, .{});
         defer parsed.deinit();
         return parsed.value;
     }
@@ -13206,7 +13206,7 @@ pub const ApiHttpServer = struct {
             }
             var manifest = try backups_api.createManifest(self.alloc, backup_id, format, table, shards);
             defer manifest.deinit(self.alloc);
-            try @import("sql_trigger_backup.zig").decorate(self.alloc, self.source, .{ .deadline_ns = operation_control.deadline_ns, .cancellation = operation_control.token() }, table.*, &manifest);
+            try @import("sql/triggers/backup.zig").decorate(self.alloc, self.source, .{ .deadline_ns = operation_control.deadline_ns, .cancellation = operation_control.token() }, table.*, &manifest);
             try operation_control.ensureActive();
             cleanup_safe.* = false;
             backups_api.writeManifestToLocationWithIoAndCancellation(
@@ -13336,7 +13336,7 @@ pub const ApiHttpServer = struct {
         try operation_control.ensureActive();
         var manifest = try backups_api.createManifest(self.alloc, backup_id, format, table, shards);
         defer manifest.deinit(self.alloc);
-        try @import("sql_trigger_backup.zig").decorate(self.alloc, self.source, .{ .deadline_ns = operation_control.deadline_ns, .cancellation = operation_control.token() }, table.*, &manifest);
+        try @import("sql/triggers/backup.zig").decorate(self.alloc, self.source, .{ .deadline_ns = operation_control.deadline_ns, .cancellation = operation_control.token() }, table.*, &manifest);
         try writer_lease.ensureOwned();
         try operation_control.ensureActive();
         cleanup_safe.* = false;
@@ -15478,7 +15478,7 @@ pub const ApiHttpServer = struct {
         defer column_defaults.deinit();
         var preparation_request = column_defaults.attach(self, integrity_reads.attach(request));
         if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
-        const raw_api = @import("sql_trigger_raw.zig");
+        const raw_api = @import("sql/triggers/raw.zig");
         const protocol = @import("../metadata/topology_protocol.zig");
         var raw = raw_api.Owner.create(self, alloc, preparation_request, tables, protocol.current_version >= protocol.sql_table_triggers_version) catch |err| return raw_api.captureFailure(.method_create, err);
         defer if (raw) |owner| owner.deinit();
@@ -15539,7 +15539,7 @@ pub const ApiHttpServer = struct {
         const lifetimes = @import("sql_relation_lifetimes.zig");
         const bound = try lifetimes.bindParticipants(alloc, request, catalog_tables, tables);
         const owners = try lifetimes.attachOwnerMinters(self, alloc, request, bound);
-        const captured = try @import("sql_trigger_authority.zig").attachMinters(self, alloc, request, owners);
+        const captured = try @import("sql/triggers/authority.zig").attachMinters(self, alloc, request, owners);
         if (!hasRowPolicyWritePrincipal(request)) return captured;
         const a = alloc;
         const signed = try a.dupe(distributed_txn.TableCommitRequest, captured);
@@ -15588,7 +15588,7 @@ pub const ApiHttpServer = struct {
     ) ![]const distributed_txn.TableCommitRequest {
         if (!hasRowPolicyWritePrincipal(request)) {
             const owners = try @import("sql_relation_lifetimes.zig").attachOwnerMinters(self, alloc, request, tables);
-            return @import("sql_trigger_authority.zig").attachMinters(self, alloc, request, owners);
+            return @import("sql/triggers/authority.zig").attachMinters(self, alloc, request, owners);
         }
         var snapshot_opt = try self.source.cachedAdminSnapshot();
         if (snapshot_opt == null) snapshot_opt = try self.source.adminSnapshot();
@@ -15653,8 +15653,8 @@ pub const ApiHttpServer = struct {
     ) !?distributed_txn.CommitOutcome {
         var arena_state = std.heap.ArenaAllocator.init(alloc);
         defer arena_state.deinit();
-        const signed = self.signRowPolicyMutationParticipants(arena_state.allocator(), tables, catalog_tables, request) catch |err| return @import("sql_trigger_raw.zig").captureFailure(.sign, err);
-        return source.commitBatchWithCancellation(alloc, signed, sync_level, request.cancellation) catch |err| return @import("sql_trigger_raw.zig").captureFailure(.commit, err);
+        const signed = self.signRowPolicyMutationParticipants(arena_state.allocator(), tables, catalog_tables, request) catch |err| return @import("sql/triggers/raw.zig").captureFailure(.sign, err);
+        return source.commitBatchWithCancellation(alloc, signed, sync_level, request.cancellation) catch |err| return @import("sql/triggers/raw.zig").captureFailure(.commit, err);
     }
 
     /// Only use at read-only preparation boundaries, never around commit.
@@ -15674,7 +15674,7 @@ pub const ApiHttpServer = struct {
         retained_preparation: *?@import("antfly_local_sources").api_relational_integrity_commit.Prepared,
     ) !?distributed_txn.CommitOutcome {
         return self.commitPublicTableBatchWithIntegrityImpl(alloc, source, tables, sync_level, request, retained_preparation) catch |failure| {
-            return @import("sql_trigger_raw.zig").captureFailure(.integrity_preparation, failure);
+            return @import("sql/triggers/raw.zig").captureFailure(.integrity_preparation, failure);
         };
     }
 
@@ -15695,7 +15695,7 @@ pub const ApiHttpServer = struct {
         defer column_defaults.deinit();
         var preparation_request = column_defaults.attach(self, integrity_reads.attach(request));
         if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
-        const raw_api = @import("sql_trigger_raw.zig");
+        const raw_api = @import("sql/triggers/raw.zig");
         const protocol = @import("../metadata/topology_protocol.zig");
         var raw = raw_api.Owner.create(self, alloc, preparation_request, tables, protocol.current_version >= protocol.sql_table_triggers_version) catch |err| return raw_api.captureFailure(.method_create, err);
         defer if (raw) |owner| owner.deinit();
@@ -18128,7 +18128,7 @@ pub const ApiHttpServer = struct {
         var bounded = request;
         const ceiling = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s;
         bounded.deadline_ns = @min(bounded.deadline_ns orelse ceiling, ceiling);
-        var collected = @import("relational_index_status.zig").collectAllWithParsedSchema(alloc, self.source, self.table_reads orelse return error.Unavailable, table.name, table.schema_json, parsed, bounded) catch |err| return switch (err) {
+        var collected = @import("relational_index/status.zig").collectAllWithParsedSchema(alloc, self.source, self.table_reads orelse return error.Unavailable, table.name, table.schema_json, parsed, bounded) catch |err| return switch (err) {
             error.Canceled, error.Cancelled => error.Canceled,
             error.DeadlineExceeded, error.Timeout => error.DeadlineExceeded,
             error.IndexNotFound, error.TableNotFound => error.NotFound,
@@ -18144,11 +18144,11 @@ pub const ApiHttpServer = struct {
         for (definitions, 0..) |definition, i| {
             try ensureTableOperationActive(bounded);
             if (artifacts.len > 2 or i != 0) out.writer.writeByte(',') catch return error.InternalFailure;
-            const raw_config = @import("relational_index_mutation.zig").configForDefinition(alloc, definition, &columns) catch return error.InternalFailure;
+            const raw_config = @import("relational_index/mutation.zig").configForDefinition(alloc, definition, &columns) catch return error.InternalFailure;
             defer alloc.free(raw_config);
             const config = indexes_api.encodeCreatedIndexConfig(alloc, definition.name, raw_config) catch return error.InternalFailure;
             defer alloc.free(config);
-            const resource = @import("relational_index_status.zig").encodeResourceValue(alloc, config, collected.statuses[i]) catch return error.InternalFailure;
+            const resource = @import("relational_index/status.zig").encodeResourceValue(alloc, config, collected.statuses[i]) catch return error.InternalFailure;
             defer alloc.free(resource);
             if (out.written().len + resource.len > 16 * 1024 * 1024) return error.Unavailable;
             out.writer.writeAll(resource) catch return error.InternalFailure;
@@ -18269,7 +18269,7 @@ pub const ApiHttpServer = struct {
         if (parsed.external_base_source != null) {
             var column_types: @import("relational_expression_contract.zig").ColumnTypes = .{ .alloc = alloc, .source = .{ .parsed = parsed } };
             defer column_types.deinit();
-            const json = @import("relational_index_mutation.zig").configForDefinition(alloc, definition, &column_types) catch return error.InternalFailure;
+            const json = @import("relational_index/mutation.zig").configForDefinition(alloc, definition, &column_types) catch return error.InternalFailure;
             defer alloc.free(json);
             var config = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return error.InternalFailure;
             defer config.deinit();
@@ -18288,7 +18288,7 @@ pub const ApiHttpServer = struct {
         var bounded = request;
         const ceiling = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s;
         bounded.deadline_ns = @min(bounded.deadline_ns orelse ceiling, ceiling);
-        const status = @import("relational_index_status.zig").collect(alloc, self.source, reader, table.name, definition.name, table.schema_json, bounded) catch |err| return switch (err) {
+        const status = @import("relational_index/status.zig").collect(alloc, self.source, reader, table.name, definition.name, table.schema_json, bounded) catch |err| return switch (err) {
             error.Canceled, error.Cancelled => error.Canceled,
             error.DeadlineExceeded, error.Timeout => error.DeadlineExceeded,
             error.IndexNotFound, error.TableNotFound => error.NotFound,
@@ -18298,11 +18298,11 @@ pub const ApiHttpServer = struct {
         defer alloc.free(status);
         var columns: @import("relational_expression_contract.zig").ColumnTypes = .{ .alloc = alloc, .source = .{ .parsed = parsed } };
         defer columns.deinit();
-        const raw_config = @import("relational_index_mutation.zig").configForDefinition(alloc, definition, &columns) catch return error.InternalFailure;
+        const raw_config = @import("relational_index/mutation.zig").configForDefinition(alloc, definition, &columns) catch return error.InternalFailure;
         defer alloc.free(raw_config);
         const config = indexes_api.encodeCreatedIndexConfig(alloc, definition.name, raw_config) catch return error.InternalFailure;
         defer alloc.free(config);
-        return @import("relational_index_status.zig").encodeResource(alloc, config, status) catch return error.InternalFailure;
+        return @import("relational_index/status.zig").encodeResource(alloc, config, status) catch return error.InternalFailure;
     }
 
     fn executePublicListArtifactEnrichments(
@@ -19059,7 +19059,7 @@ pub const ApiHttpServer = struct {
         const external_table = table_schema.external_base_source != null;
         const index_json = table_contract.parseCreateIndexRequest(alloc, index_name, body) catch return error.InvalidIndexRequest;
         defer alloc.free(index_json);
-        const relational = @import("relational_index_mutation.zig");
+        const relational = @import("relational_index/mutation.zig");
         if (relational.isRelational(alloc, index_json) catch return error.InvalidIndexRequest) {
             const replacement = relational.create(alloc, table_before, index_name, index_json) catch |err| switch (err) {
                 error.TableGenerationChanged, error.TableTransitionActive => return error.Conflict,
@@ -19641,7 +19641,7 @@ pub const ApiHttpServer = struct {
         var digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(encoded_request, &digest, .{});
         const backup_id = try alloc.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
-        var start: restore_jobs.StartRequest = .{ .scope = .cluster, .source_kind = .schema_rewrite, .routine_actor = if (try @import("sql_trigger_restore.zig").needsActorForTables(alloc, cohort)) try @import("sql_trigger_restore.zig").actorForAdmission(self, identity) else null, .backup_id = backup_id, .location = try std.fmt.allocPrint(alloc, "metadata://schema-rewrite/{s}", .{std.fmt.bytesToHex(plan_id, .lower)}), .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = namespace, .idempotency_key = key, .destination_authorization_principal = storedDestinationPrincipal(identity) };
+        var start: restore_jobs.StartRequest = .{ .scope = .cluster, .source_kind = .schema_rewrite, .routine_actor = if (try @import("sql/triggers/restore.zig").needsActorForTables(alloc, cohort)) try @import("sql/triggers/restore.zig").actorForAdmission(self, identity) else null, .backup_id = backup_id, .location = try std.fmt.allocPrint(alloc, "metadata://schema-rewrite/{s}", .{std.fmt.bytesToHex(plan_id, .lower)}), .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = namespace, .idempotency_key = key, .destination_authorization_principal = storedDestinationPrincipal(identity) };
         if (try self.restore_job_store.existingRewriteAdmission(self.alloc, start)) |existing| {
             defer self.alloc.free(existing);
             if (context.sql_completion_submission) |observed| observed.* = true;
@@ -19726,7 +19726,7 @@ pub const ApiHttpServer = struct {
                 defer schema.deinit(alloc);
                 external_table = schema.external_base_source != null;
             }
-            if (@import("relational_index_mutation.zig").drop(alloc, before, index_name) catch |err| switch (err) {
+            if (@import("relational_index/mutation.zig").drop(alloc, before, index_name) catch |err| switch (err) {
                 error.PrivacyManagedGraph, error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
                 else => return error.InternalFailure,
             }) |replacement| {
@@ -20149,7 +20149,7 @@ pub const ApiHttpServer = struct {
         try ensureTableOperationActive(request);
         const writer = self.table_writes orelse return error.MethodNotAllowed;
         const reader = self.table_reads orelse return error.MethodNotAllowed;
-        return @import("relational_index_maintenance.zig").execute(alloc, self.source, reader, writer, table_name, index_name, action, body, request) catch |err| switch (err) {
+        return @import("relational_index/maintenance.zig").execute(alloc, self.source, reader, writer, table_name, index_name, action, body, request) catch |err| switch (err) {
             error.Canceled => error.Canceled,
             error.DeadlineExceeded, error.PreDecisionDeadlineExceeded => error.DeadlineExceeded,
             error.HAReadOnlyStandby, error.HAPromotedStandbyRequiresPrimaryOpen, error.HAFencedPrimary, error.NotLeader, error.LeaderUnavailable => error.NotLeader,
@@ -21182,7 +21182,7 @@ pub const ApiHttpServer = struct {
         if (command.action == .begin_cutover or command.action == .begin_activation or command.action == .publish) {
             var authorization = std.heap.ArenaAllocator.init(self.alloc);
             defer authorization.deinit();
-            try @import("sql_trigger_restore.zig").reauthorizeJob(authorization.allocator(), self, context, job.value);
+            try @import("sql/triggers/restore.zig").reauthorizeJob(authorization.allocator(), self, context, job.value);
         }
         const encoded = try std.json.Stringify.valueAlloc(self.alloc, command, .{});
         defer self.alloc.free(encoded);
@@ -21374,7 +21374,7 @@ pub const ApiHttpServer = struct {
         if (!failed and !worker_state.value.cancel_requested) {
             var authorization = std.heap.ArenaAllocator.init(self.alloc);
             defer authorization.deinit();
-            @import("sql_trigger_restore.zig").reauthorizeJob(authorization.allocator(), self, context, job.value) catch |failure| {
+            @import("sql/triggers/restore.zig").reauthorizeJob(authorization.allocator(), self, context, job.value) catch |failure| {
                 zig017_return_error = failure;
                 return failure;
             };
@@ -22372,7 +22372,7 @@ pub const ApiHttpServer = struct {
                 const alloc = slot.arena.allocator();
                 const scope = try stages.ownerScope(alloc, plan, digest, slot.target, slot.range);
                 if (slot.target.table.sql_persistence) |descriptor| {
-                    const terminal = @import("../metadata/sql_relation_restore_terminal.zig");
+                    const terminal = @import("../metadata/sql/relation_lifecycle/restore_terminal.zig");
                     const query: terminal.Query = .{ .creation_scope = .{ .plan_id = plan.id, .plan_digest = digest }, .table_id = slot.target.table.table_id, .group_id = slot.range.group_id, .scope_digest = scope.digest() };
                     var private = control;
                     private.setting_admin = true;
@@ -22381,7 +22381,7 @@ pub const ApiHttpServer = struct {
                     private.sql_completion_submission = null;
                     const bytes = try server.source.systemCatalog(alloc, private, .{ .sql_relation_boot_read = .{ .restore_terminal = query } });
                     if (bytes.len > 64 * 1024) return error.InvalidSqlBackendResponse;
-                    const observed = try std.json.parseFromSliceLeaky(@import("../metadata/sql_relation_boots.zig").Observation, alloc, bytes, .{});
+                    const observed = try std.json.parseFromSliceLeaky(@import("../metadata/sql/relation_lifecycle/boots.zig").Observation, alloc, bytes, .{});
                     if (observed.restore_terminal) |proof| {
                         try proof.require(query, descriptor);
                         // Only the existing API delivery cursor advances. The
@@ -22785,7 +22785,7 @@ pub const ApiHttpServer = struct {
                 source.existing_name = physical;
             }
         }
-        try @import("sql_trigger_restore.zig").prepare(a, self, context, principal, state.value.routine_actor, req.routine_mappings, &logical_index, logical_state.revision, sources);
+        try @import("sql/triggers/restore.zig").prepare(a, self, context, principal, state.value.routine_actor, req.routine_mappings, &logical_index, logical_state.revision, sources);
         var snapshot = (try self.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
         defer self.source.freeAdminSnapshot(&snapshot);
         const manifest_json = if (aggregate) |manifest| try std.json.Stringify.valueAlloc(a, manifest.*, .{}) else try std.json.Stringify.valueAlloc(a, independent.?.*, .{});
@@ -26802,8 +26802,8 @@ pub const ApiHttpServer = struct {
         };
         const portable_guarded = portableForeignKeyRestoreGuarded(self.alloc, &manifest, self.cfg.allow_unverified_portable_fk_restore_for_tests) catch
             return try contextualJsonErrorResponse(self.alloc, 400, "invalid relational backup declarations");
-        const trigger_authority_required = try @import("sql_trigger_restore.zig").needsActorForSchema(self.alloc, manifest.schema_json);
-        const trigger_actor = if (trigger_authority_required) try @import("sql_trigger_restore.zig").actorForAdmission(self, authenticated_identity) else null;
+        const trigger_authority_required = try @import("sql/triggers/restore.zig").needsActorForSchema(self.alloc, manifest.schema_json);
+        const trigger_actor = if (trigger_authority_required) try @import("sql/triggers/restore.zig").actorForAdmission(self, authenticated_identity) else null;
         if (trigger_authority_required) {
             @import("sql_preparation_authority_keys.zig").requireConfiguration(self.cfg) catch return try contextualJsonErrorResponse(self.alloc, 503, "restore requires SQL preparation authority: configure antfly.sql_preparation.secret and antfly.sql_preparation.issuer, or the persisted antfly.sql_preparation.authority bundle");
             if (self.cfg.auth_enabled and trigger_actor == null) return try contextualJsonErrorResponse(self.alloc, 422, "restoring trigger attachments requires durable Basic or API-key authentication");
@@ -26875,7 +26875,7 @@ pub const ApiHttpServer = struct {
             .connection = connection,
             .restore_mode = restore_mode,
             .routine_mappings = req.routine_mappings,
-            .routine_actor = try @import("sql_trigger_restore.zig").actorForAdmission(self, authenticated_identity),
+            .routine_actor = try @import("sql/triggers/restore.zig").actorForAdmission(self, authenticated_identity),
             .table_names = req.table_names,
             .idempotency_namespace = idempotency_namespace,
             .idempotency_key = idempotency_key,
@@ -26962,7 +26962,7 @@ pub const ApiHttpServer = struct {
                 break :blk children.foreign_keys_guarded;
             } else clusterPortableForeignKeyRestoreGuarded(self.alloc, &location, &manifest, selected, self.cfg.allow_unverified_portable_fk_restore_for_tests) catch
                 return try contextualJsonErrorResponse(self.alloc, 400, "invalid relational backup declarations");
-            if (!try @import("sql_trigger_restore.zig").needsActorForCluster(self.alloc, &location, &manifest, selected)) start_request.routine_actor = null else {
+            if (!try @import("sql/triggers/restore.zig").needsActorForCluster(self.alloc, &location, &manifest, selected)) start_request.routine_actor = null else {
                 @import("sql_preparation_authority_keys.zig").requireConfiguration(self.cfg) catch return try contextualJsonErrorResponse(self.alloc, 503, "restore requires SQL preparation authority: configure antfly.sql_preparation.secret and antfly.sql_preparation.issuer, or the persisted antfly.sql_preparation.authority bundle");
                 if (self.cfg.auth_enabled and start_request.routine_actor == null) return try contextualJsonErrorResponse(self.alloc, 422, "restoring trigger attachments requires durable Basic or API-key authentication");
             }
@@ -64254,7 +64254,7 @@ test "SQL pgwire native FK settlement uses durable child lookup and exact public
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expect(context.fk_generation_publication_authority);
             try std.testing.expect(call == .sql_completion_reference);
-            const refs = @import("../metadata/sql_completion_references.zig");
+            const refs = @import("../metadata/sql/completion_references.zig");
             self.calls += 1;
             return std.json.Stringify.valueAlloc(alloc, refs.Status{ .record = .{ .reference_id = call.sql_completion_reference, .owner = .{ .table_id = 7, .schema_version = if (self.initial) 0 else 2, .kind = if (self.initial) .fk_initial else .fk_generation, .publication_id = self.plan_id }, .complete = std.mem.eql(u8, self.phase, "published") or std.mem.eql(u8, self.phase, "canceled") } }, .{});
         }
@@ -64376,7 +64376,7 @@ test "SQL pgwire native uncertain pin responses retain recoverable consumer iden
     defer a.free(path);
     var storage = try docstore_mod.DocStore.open(a, path, .{});
     defer storage.close();
-    const refs = @import("../metadata/sql_completion_references.zig");
+    const refs = @import("../metadata/sql/completion_references.zig");
     const Fixture = struct {
         storage: *docstore_mod.DocStore,
         admitted: ?[16]u8 = null,
@@ -64945,7 +64945,7 @@ test "SQL pgwire native schema rewrite pre-submission failure retires its prepar
                     defer alloc.free(bytes);
                     try self.metadata.preflightSqlCompletionReference(group, bytes);
                     try self.metadata.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = bytes });
-                    const refs = @import("../metadata/sql_completion_references.zig");
+                    const refs = @import("../metadata/sql/completion_references.zig");
                     const observed = try self.metadata.sqlCompletionReferenceJson(alloc, group, command.reference_id);
                     defer alloc.free(observed);
                     var status = try std.json.parseFromSlice(refs.Status, alloc, observed, .{});
@@ -65109,7 +65109,7 @@ test "SQL pgwire native CREATE preflight failure retires prepared owner" {
                     defer alloc.free(bytes);
                     try self.metadata.preflightSqlCompletionReference(group, bytes);
                     try self.metadata.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = bytes });
-                    const refs = @import("../metadata/sql_completion_references.zig");
+                    const refs = @import("../metadata/sql/completion_references.zig");
                     const observed = try self.metadata.sqlCompletionReferenceJson(alloc, group, command.reference_id);
                     defer alloc.free(observed);
                     var status = try std.json.parseFromSlice(refs.Status, alloc, observed, .{});

@@ -1248,7 +1248,7 @@ pub fn fkGenerationPublicationSourceDecisionJson(svc: anytype, alloc: std.mem.Al
     return store.fkGenerationPublicationSourceDecisionJson(alloc, svc.metadata_group_id, request);
 }
 
-pub fn relationalIndexStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").StatusRequest) ![]u8 {
+pub fn relationalIndexStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index/publication.zig").StatusRequest) ![]u8 {
     if (!context.setting_admin or !context.index_publication_authority) return error.Forbidden;
     try context.ensureActive();
     try request.validate();
@@ -1257,7 +1257,7 @@ pub fn relationalIndexStatusJson(svc: anytype, alloc: std.mem.Allocator, context
     return store.relationalIndexStatusJson(alloc, svc.metadata_group_id, request);
 }
 
-pub fn prepareRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").PrepareRequest) ![]u8 {
+pub fn prepareRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index/publication.zig").PrepareRequest) ![]u8 {
     if (!context.setting_admin or !context.index_publication_authority) return error.Forbidden;
     try context.ensureActive();
     try request.validate();
@@ -1266,8 +1266,8 @@ pub fn prepareRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator,
     return store.relationalIndexPrepareCutJson(alloc, svc.metadata_group_id, request);
 }
 
-pub fn beginRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").BeginRequest) ![]u8 {
-    const publication = @import("../metadata/relational_index_publication.zig");
+pub fn beginRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index/publication.zig").BeginRequest) ![]u8 {
+    const publication = @import("../metadata/relational_index/publication.zig");
     if (!context.setting_admin or !context.index_publication_authority) return error.Forbidden;
     try context.ensureActive();
     var prepared = try request.begin.plan.prepare(alloc);
@@ -1298,7 +1298,7 @@ pub fn beginRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, c
 }
 
 test "relational index publication admission releases its gate and recovers lost replies without replay" {
-    const publication = @import("../metadata/relational_index_publication.zig");
+    const publication = @import("../metadata/relational_index/publication.zig");
     const Mock = struct {
         metadata_group_id: u64 = 13,
         locked: bool = false,
@@ -1387,7 +1387,7 @@ test "relational index publication admission releases its gate and recovers lost
     try std.testing.expect(!svc.locked);
 }
 
-pub fn relationalIndexAdmissionStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").AdmissionRequest) ![]u8 {
+pub fn relationalIndexAdmissionStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index/publication.zig").AdmissionRequest) ![]u8 {
     if (!context.index_publication_authority) return error.Forbidden;
     try context.ensureActive();
     try request.validate();
@@ -1397,7 +1397,7 @@ pub fn relationalIndexAdmissionStatusJson(svc: anytype, alloc: std.mem.Allocator
 }
 
 test "relational index publication admission status requires authority and a linearizable cut" {
-    const publication = @import("../metadata/relational_index_publication.zig");
+    const publication = @import("../metadata/relational_index/publication.zig");
     const Mock = struct {
         metadata_group_id: u64 = 13,
         reads: usize = 0,
@@ -1433,7 +1433,7 @@ test "relational index publication admission status requires authority and a lin
     try std.testing.expectEqual(@as(usize, 1), svc.store.calls);
 }
 
-pub fn relationalIndexOwnerAckStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").Ack) ![]u8 {
+pub fn relationalIndexOwnerAckStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index/publication.zig").Ack) ![]u8 {
     if (!context.index_publication_authority) return error.Forbidden;
     try context.ensureActive();
     try request.validate();
@@ -1442,7 +1442,7 @@ pub fn relationalIndexOwnerAckStatusJson(svc: anytype, alloc: std.mem.Allocator,
     return store.relationalIndexOwnerAckStatusJson(alloc, svc.metadata_group_id, request);
 }
 
-pub fn relationalIndexPublicationDecisionStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").DecidePublish) ![]u8 {
+pub fn relationalIndexPublicationDecisionStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index/publication.zig").DecidePublish) ![]u8 {
     if (!context.index_publication_authority) return error.Forbidden;
     try context.ensureActive();
     try request.validate();
@@ -1451,15 +1451,15 @@ pub fn relationalIndexPublicationDecisionStatusJson(svc: anytype, alloc: std.mem
     return store.relationalIndexPublicationDecisionStatusJson(alloc, svc.metadata_group_id, request);
 }
 
-pub fn decideRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").DecidePublish) ![]u8 {
+pub fn decideRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index/publication.zig").DecidePublish) ![]u8 {
     return decideRelationalIndex(svc, alloc, context, request, false);
 }
 
-pub fn cancelRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").CancelDecision) ![]u8 {
+pub fn cancelRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index/publication.zig").CancelDecision) ![]u8 {
     return decideRelationalIndex(svc, alloc, context, request, true);
 }
 
-pub fn relationalIndexCancellationStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").CancelDecision) ![]u8 {
+pub fn relationalIndexCancellationStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index/publication.zig").CancelDecision) ![]u8 {
     if (!context.index_publication_authority) return error.Forbidden;
     try context.ensureActive();
     try request.validate();
@@ -1487,7 +1487,7 @@ fn decideRelationalIndex(svc: anytype, alloc: std.mem.Allocator, context: operat
     svc.unlockCatalogMutation();
     gate_held = false;
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
-    const publication = @import("../metadata/relational_index_publication.zig");
+    const publication = @import("../metadata/relational_index/publication.zig");
     const observed = (if (comptime cancel) store.relationalIndexCancellationStatusJson(alloc, svc.metadata_group_id, request) else store.relationalIndexPublicationDecisionStatusJson(alloc, svc.metadata_group_id, request)) catch return error.MetadataMutationOutcomeUnknown;
     errdefer alloc.free(observed);
     var parsed = std.json.parseFromSlice(if (cancel) publication.CancellationStatus else publication.DecisionStatus, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
@@ -1497,7 +1497,7 @@ fn decideRelationalIndex(svc: anytype, alloc: std.mem.Allocator, context: operat
     return observed;
 }
 
-pub fn acknowledgeRelationalIndexOwner(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").Ack) ![]u8 {
+pub fn acknowledgeRelationalIndexOwner(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index/publication.zig").Ack) ![]u8 {
     if (!context.index_publication_authority) return error.Forbidden;
     try context.ensureActive();
     try request.validate();
@@ -1510,7 +1510,7 @@ pub fn acknowledgeRelationalIndexOwner(svc: anytype, alloc: std.mem.Allocator, c
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
     defer alloc.free(bytes);
-    const publication = @import("../metadata/relational_index_publication.zig");
+    const publication = @import("../metadata/relational_index/publication.zig");
     if (bytes.len > publication.max_ack_bytes) return error.CatalogCommandTooLarge;
     try store.validateRelationalIndexOwnerAck(svc.metadata_group_id, bytes);
     try context.ensureActive();
@@ -1528,8 +1528,8 @@ pub fn acknowledgeRelationalIndexOwner(svc: anytype, alloc: std.mem.Allocator, c
 
 /// Submit once, observe exactly, never turn a lost wait/read into nonadmission.
 /// Callers retain the immutable command/receipt identity for status recovery.
-pub fn submitScopeRetirement(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/scope_retirement_wire.zig").Request) ![]u8 {
-    const wire = @import("../metadata/scope_retirement_wire.zig");
+pub fn submitScopeRetirement(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/retirement/scope/wire.zig").Request) ![]u8 {
+    const wire = @import("../metadata/retirement/scope/wire.zig");
     if (!context.schema_validation_authority or !context.setting_admin) return error.Forbidden;
     try context.ensureActive();
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_scope_retirement_version);
@@ -1580,12 +1580,12 @@ pub fn submitTableRetirement(svc: anytype, alloc: std.mem.Allocator, context: op
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const checked = try store.tableRetirementPreflightJson(alloc, svc.metadata_group_id, command);
     defer alloc.free(checked);
-    var expected = try std.json.parseFromSlice(@import("../metadata/table_retirement_receipt.zig").Request, alloc, checked, .{});
+    var expected = try std.json.parseFromSlice(@import("../metadata/retirement/table/receipt.zig").Request, alloc, checked, .{});
     defer expected.deinit();
     const prior = try store.tableRetirementReceiptJson(alloc, svc.metadata_group_id, expected.value);
     var prior_owned = true;
     defer if (prior_owned) alloc.free(prior);
-    var observed = try std.json.parseFromSlice(@import("../metadata/table_retirement_receipt.zig").Observation, alloc, prior, .{});
+    var observed = try std.json.parseFromSlice(@import("../metadata/retirement/table/receipt.zig").Observation, alloc, prior, .{});
     defer observed.deinit();
     try observed.value.requireFor(expected.value);
     if (observed.value.accepted) {
@@ -1599,7 +1599,7 @@ pub fn submitTableRetirement(svc: anytype, alloc: std.mem.Allocator, context: op
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
     const bytes = store.tableRetirementReceiptJson(alloc, svc.metadata_group_id, expected.value) catch return error.MetadataMutationOutcomeUnknown;
     errdefer alloc.free(bytes);
-    var accepted = std.json.parseFromSlice(@import("../metadata/table_retirement_receipt.zig").Observation, alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+    var accepted = std.json.parseFromSlice(@import("../metadata/retirement/table/receipt.zig").Observation, alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
     defer accepted.deinit();
     accepted.value.requireFor(expected.value) catch return error.MetadataMutationOutcomeUnknown;
     if (!accepted.value.accepted) return error.MetadataMutationOutcomeUnknown;
@@ -1622,8 +1622,8 @@ fn readTableRetirement(svc: anytype, alloc: std.mem.Allocator, context: operatio
 
 pub fn submitSchemaValidation(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: []const u8) ![]u8 {
     if (!context.schema_validation_authority) return error.Forbidden;
-    const ledger = @import("../metadata/schema_validation_ledger.zig");
-    const receipts = @import("../metadata/schema_validation_receipt.zig");
+    const ledger = @import("../metadata/schema_validation/ledger.zig");
+    const receipts = @import("../metadata/schema_validation/receipt.zig");
     if (ledger.requiresAdmissionAuthority(command) and !context.setting_admin) return error.Forbidden;
     try context.ensureActive();
     if (command.len == 0 or command.len > ledger.max_command_bytes) return error.InvalidGenerationPublication;
@@ -1665,9 +1665,9 @@ pub fn submitSchemaValidation(svc: anytype, alloc: std.mem.Allocator, context: o
 }
 
 test "system catalog schema validation submissions preflight once observe exact acceptance and never replay uncertainty" {
-    const receipts = @import("../metadata/schema_validation_receipt.zig");
-    const ledger = @import("../metadata/schema_validation_ledger.zig");
-    const barriers = @import("../metadata/schema_validation_publication.zig");
+    const receipts = @import("../metadata/schema_validation/receipt.zig");
+    const ledger = @import("../metadata/schema_validation/ledger.zig");
+    const barriers = @import("../metadata/schema_validation/publication.zig");
     const Fixture = struct {
         request: receipts.Request,
         initial: barriers.Head,
@@ -1821,7 +1821,7 @@ test "system catalog schema validation submissions preflight once observe exact 
     }
 }
 
-pub fn schemaValidationReceiptRead(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/schema_validation_receipt.zig").Request) ![]u8 {
+pub fn schemaValidationReceiptRead(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/schema_validation/receipt.zig").Request) ![]u8 {
     if (!context.schema_validation_authority) return error.Forbidden;
     try request.validate();
     try context.ensureActive();
@@ -1832,7 +1832,7 @@ pub fn schemaValidationReceiptRead(svc: anytype, alloc: std.mem.Allocator, conte
 }
 
 test "system catalog schema validation receipts require narrow authority without proposing mutations" {
-    const receipts = @import("../metadata/schema_validation_receipt.zig");
+    const receipts = @import("../metadata/schema_validation/receipt.zig");
     const Fake = struct {
         metadata_group_id: u64 = 21,
         barriers: usize = 0,
@@ -1876,7 +1876,7 @@ test "system catalog schema validation receipts require narrow authority without
     try std.testing.expectEqual(2, svc.barriers);
 }
 
-pub fn schemaValidationPrepare(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/schema_validation_admission.zig").Request) ![]u8 {
+pub fn schemaValidationPrepare(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/schema_validation/admission.zig").Request) ![]u8 {
     if (!context.setting_admin or !context.schema_validation_authority) return error.Forbidden;
     try request.validate();
     try context.ensureActive();
@@ -1888,7 +1888,7 @@ pub fn schemaValidationPrepare(svc: anytype, alloc: std.mem.Allocator, context: 
     return store.schemaValidationPrepareCut(alloc, svc.metadata_group_id, request);
 }
 
-pub fn schemaValidationWork(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/schema_validation_work.zig").Query) ![]u8 {
+pub fn schemaValidationWork(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/schema_validation/work.zig").Query) ![]u8 {
     if (!context.schema_validation_authority) return error.Forbidden;
     try request.validate();
     try context.ensureActive();
@@ -1898,7 +1898,7 @@ pub fn schemaValidationWork(svc: anytype, alloc: std.mem.Allocator, context: ope
     return store.schemaValidationWork(alloc, svc.metadata_group_id, request);
 }
 
-pub fn schemaValidationDiscover(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/schema_validation_read.zig").DiscoveryRequest) ![]u8 {
+pub fn schemaValidationDiscover(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/schema_validation/read.zig").DiscoveryRequest) ![]u8 {
     if (!context.schema_validation_authority) return error.Forbidden;
     try request.validate();
     try context.ensureActive();
@@ -1908,7 +1908,7 @@ pub fn schemaValidationDiscover(svc: anytype, alloc: std.mem.Allocator, context:
     return store.schemaValidationDiscover(alloc, svc.metadata_group_id, request);
 }
 
-pub fn schemaValidationOwnerRead(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/schema_validation_read.zig").OwnerReadRequest) ![]u8 {
+pub fn schemaValidationOwnerRead(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/schema_validation/read.zig").OwnerReadRequest) ![]u8 {
     if (!context.schema_validation_authority) return error.Forbidden;
     try request.validate();
     try context.ensureActive();
@@ -1919,7 +1919,7 @@ pub fn schemaValidationOwnerRead(svc: anytype, alloc: std.mem.Allocator, context
 }
 
 test "system catalog schema validation owner reads require narrow authority and preserve binary projection" {
-    const ledger = @import("../metadata/schema_validation_read.zig");
+    const ledger = @import("../metadata/schema_validation/read.zig");
     const Fake = struct {
         metadata_group_id: u64 = 21,
         barriers: usize = 0,
@@ -1932,9 +1932,9 @@ test "system catalog schema validation owner reads require narrow authority and 
                 self.control += 1;
                 return a.dupe(u8, "null");
             }
-            pub fn schemaValidationWork(self: *@This(), a: std.mem.Allocator, _: u64, _: @import("../metadata/schema_validation_work.zig").Query) ![]u8 {
+            pub fn schemaValidationWork(self: *@This(), a: std.mem.Allocator, _: u64, _: @import("../metadata/schema_validation/work.zig").Query) ![]u8 {
                 self.control += 1;
-                return std.json.Stringify.valueAlloc(a, @import("../metadata/schema_validation_work.zig").Page{}, .{});
+                return std.json.Stringify.valueAlloc(a, @import("../metadata/schema_validation/work.zig").Page{}, .{});
             }
             pub fn schemaValidationOwnerRead(self: *@This(), a: std.mem.Allocator, group: u64, request: ledger.OwnerReadRequest) ![]u8 {
                 return switch (request.projection) {
@@ -1984,7 +1984,7 @@ test "system catalog schema validation owner reads require narrow authority and 
     const no_job = try schemaValidationDiscover(&svc, a, context, discovery);
     defer a.free(no_job);
     try std.testing.expectEqualStrings("null", no_job);
-    const work_query: @import("../metadata/schema_validation_work.zig").Query = .{ .group = request.lookup.group, .metadata_incarnation = request.lookup.metadata_incarnation };
+    const work_query: @import("../metadata/schema_validation/work.zig").Query = .{ .group = request.lookup.group, .metadata_incarnation = request.lookup.metadata_incarnation };
     for ([_]operation.RequestContext{ .{}, .{ .setting_admin = true }, .{ .index_publication_authority = true }, .{ .fk_generation_publication_authority = true } }) |untrusted|
         try std.testing.expectError(error.Forbidden, schemaValidationWork(&svc, a, untrusted, work_query));
     try std.testing.expectError(error.DeadlineExceeded, schemaValidationWork(&svc, a, .{ .schema_validation_authority = true, .deadline_ns = 0 }, work_query));
@@ -1993,7 +1993,7 @@ test "system catalog schema validation owner reads require narrow authority and 
     try std.testing.expectError(error.InvalidGenerationPublication, schemaValidationWork(&svc, a, context, foreign_work));
     const work_page = try schemaValidationWork(&svc, a, context, work_query);
     defer a.free(work_page);
-    var parsed_work = try std.json.parseFromSlice(@import("../metadata/schema_validation_work.zig").Page, a, work_page, .{});
+    var parsed_work = try std.json.parseFromSlice(@import("../metadata/schema_validation/work.zig").Page, a, work_page, .{});
     defer parsed_work.deinit();
     try parsed_work.value.validate(work_query);
     try std.testing.expectEqual(@as(u8, 0), parsed_work.value.len);
@@ -2020,7 +2020,7 @@ test "system catalog schema validation owner reads require narrow authority and 
     try std.testing.expectEqual(3, svc.barriers);
 }
 
-pub fn relationalIndexOwnerDecisionJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").OwnerRequest) ![]u8 {
+pub fn relationalIndexOwnerDecisionJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index/publication.zig").OwnerRequest) ![]u8 {
     if (!context.index_publication_authority) return error.Forbidden;
     try request.validate();
     try context.ensureActive();
@@ -2029,7 +2029,7 @@ pub fn relationalIndexOwnerDecisionJson(svc: anytype, alloc: std.mem.Allocator, 
     return store.relationalIndexOwnerDecisionJson(alloc, svc.metadata_group_id, request);
 }
 
-pub fn relationalIndexSourceAcceptanceStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, query: @import("../metadata/relational_index_delivery_journal.zig").Query) ![]u8 {
+pub fn relationalIndexSourceAcceptanceStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, query: @import("../metadata/relational_index/delivery_journal.zig").Query) ![]u8 {
     if (!context.index_publication_authority) return error.Forbidden;
     try context.ensureActive();
     try query.validate();
@@ -2037,8 +2037,8 @@ pub fn relationalIndexSourceAcceptanceStatusJson(svc: anytype, alloc: std.mem.Al
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     return store.relationalIndexSourceAcceptanceStatusJson(alloc, svc.metadata_group_id, query);
 }
-pub fn acceptRelationalIndexSource(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_delivery_journal.zig").Request) ![]u8 {
-    const journal = @import("../metadata/relational_index_delivery_journal.zig");
+pub fn acceptRelationalIndexSource(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index/delivery_journal.zig").Request) ![]u8 {
+    const journal = @import("../metadata/relational_index/delivery_journal.zig");
     if (!context.index_publication_authority) return error.Forbidden;
     try context.ensureActive();
     try request.signed.verify();
@@ -2066,8 +2066,8 @@ pub fn acceptRelationalIndexSource(svc: anytype, alloc: std.mem.Allocator, conte
     return observed;
 }
 
-pub fn completeRelationalIndexSource(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_delivery_journal.zig").CompletionRequest) ![]u8 {
-    const journal = @import("../metadata/relational_index_delivery_journal.zig");
+pub fn completeRelationalIndexSource(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index/delivery_journal.zig").CompletionRequest) ![]u8 {
+    const journal = @import("../metadata/relational_index/delivery_journal.zig");
     if (!context.index_publication_authority) return error.Forbidden;
     try context.ensureActive();
     try request.validate();
@@ -2096,7 +2096,7 @@ pub fn completeRelationalIndexSource(svc: anytype, alloc: std.mem.Allocator, con
 }
 
 test "relational index publication decision dispatch preserves authority gates and uncertain outcomes" {
-    const publication = @import("../metadata/relational_index_publication.zig");
+    const publication = @import("../metadata/relational_index/publication.zig");
     const Mock = struct {
         metadata_group_id: u64 = 13,
         locked: bool = false,
@@ -2187,7 +2187,7 @@ test "relational index publication decision dispatch preserves authority gates a
 }
 
 test "relational index publication cancellation dispatch fences authority and preserves uncertain outcomes" {
-    const publication = @import("../metadata/relational_index_publication.zig");
+    const publication = @import("../metadata/relational_index/publication.zig");
     const Mock = struct {
         metadata_group_id: u64 = 13,
         locked: bool = false,
@@ -2267,7 +2267,7 @@ test "relational index publication cancellation dispatch fences authority and pr
 }
 
 test "relational index publication ACK submission fences capabilities releases mutation gates and preserves ambiguous outcomes" {
-    const publication = @import("../metadata/relational_index_publication.zig");
+    const publication = @import("../metadata/relational_index/publication.zig");
     const Mock = struct {
         metadata_group_id: u64 = 13,
         locked: bool = false,
@@ -2348,7 +2348,7 @@ test "system catalog relational index publication read requires authority before
         metadata_group_id: u64 = 13,
         reads: usize = 0,
         const Store = struct {
-            pub fn relationalIndexOwnerDecisionJson(_: *@This(), _: std.mem.Allocator, _: u64, _: @import("../metadata/relational_index_publication.zig").OwnerRequest) ![]u8 {
+            pub fn relationalIndexOwnerDecisionJson(_: *@This(), _: std.mem.Allocator, _: u64, _: @import("../metadata/relational_index/publication.zig").OwnerRequest) ![]u8 {
                 return error.UnexpectedRead;
             }
         };
@@ -2360,7 +2360,7 @@ test "system catalog relational index publication read requires authority before
         }
     };
     var svc: Mock = .{};
-    const request: @import("../metadata/relational_index_publication.zig").OwnerRequest = .{ .table_id = 1, .group_id = 2, .id = @splat(3), .operation = .fence };
+    const request: @import("../metadata/relational_index/publication.zig").OwnerRequest = .{ .table_id = 1, .group_id = 2, .id = @splat(3), .operation = .fence };
     try std.testing.expectError(error.Forbidden, relationalIndexOwnerDecisionJson(&svc, std.testing.allocator, .{}, request));
     try std.testing.expectEqual(@as(usize, 0), svc.reads);
     try std.testing.expectError(error.MissingMetadataStore, relationalIndexOwnerDecisionJson(&svc, std.testing.allocator, .{ .index_publication_authority = true }, request));
@@ -2674,7 +2674,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             break :blk store.sqlRelationLifetimesJson(alloc, svc.metadata_group_id, query.selection, query.after, query.limit, query.include_hidden);
         },
-        .sql_relation_boot_submit => |bytes| @import("../metadata/sql_relation_boot_service.zig").submit(svc, alloc, context, bytes),
+        .sql_relation_boot_submit => |bytes| @import("../metadata/sql/relation_lifecycle/boot_service.zig").submit(svc, alloc, context, bytes),
         .scope_retirement_observation => |query| blk: {
             if (!context.setting_admin or !context.schema_validation_authority) return error.Forbidden;
             try svc.ensureLinearizableReadWithContext(context);
@@ -2732,7 +2732,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
             const observed = try store.sqlCompletionReferenceJson(alloc, svc.metadata_group_id, command.reference_id);
             defer alloc.free(observed);
-            const refs = @import("../metadata/sql_completion_references.zig");
+            const refs = @import("../metadata/sql/completion_references.zig");
             var status = try std.json.parseFromSlice(refs.Status, alloc, observed, .{});
             defer status.deinit();
             try refs.validateApplied(command, status.value);

@@ -201,7 +201,7 @@ pub const Owner = struct {
         output.graph_writes = try writes.toOwnedSlice(self.a);
         output.graph_deletes = try deletes.toOwnedSlice(self.a);
         if (self.names.len != 0) {
-            try @import("sql_trigger_authority.zig").requireConfiguration(self.server.cfg);
+            try @import("sql/triggers/authority.zig").requireConfiguration(self.server.cfg);
             const proof = try self.admit();
             var absent = try manifest.Absence.fromAdmission(proof, 0);
             absent.schema_present = false;

@@ -267,13 +267,13 @@ pub fn attachStatistics(root: *execution.Adapter, backing: A, table: catalog.Tab
     return owner;
 }
 
-fn observeIndexes(root: *execution.Adapter, a: A, table: catalog.Table) !@import("relational_index_status.zig").Collection {
+fn observeIndexes(root: *execution.Adapter, a: A, table: catalog.Table) !@import("relational_index/status.zig").Collection {
     const reader = root.server.table_reads orelse return error.UnsupportedSqlExecution;
     while (true) {
         try root.context.ensureActive();
         // Status performs a before/after catalog check. Retry an unstable
         // observation without changing or readmitting the repair owner ticket.
-        return @import("relational_index_status.zig").collectAll(a, root.server.source, reader, table.physical_name, table.schema_json, root.context) catch |err| switch (err) {
+        return @import("relational_index/status.zig").collectAll(a, root.server.source, reader, table.physical_name, table.schema_json, root.context) catch |err| switch (err) {
             error.TopologyChanged, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.Unavailable => {
                 try wait(root);
                 continue;
@@ -283,7 +283,7 @@ fn observeIndexes(root: *execution.Adapter, a: A, table: catalog.Table) !@import
     }
 }
 
-fn readyIndexes(root: *execution.Adapter, a: A, table: catalog.Table, selected: ?[]const u8) !@import("relational_index_status.zig").Collection {
+fn readyIndexes(root: *execution.Adapter, a: A, table: catalog.Table, selected: ?[]const u8) !@import("relational_index/status.zig").Collection {
     while (true) {
         var cut = try observeIndexes(root, a, table);
         var retained = false;
@@ -327,7 +327,7 @@ fn reindex(root: *execution.Adapter, a: A, scratch_backing: A, table: catalog.Ta
             const body = try std.json.Stringify.valueAlloc(ca, wire.IndexMaintenanceRequest{ .table_id = status.table_id, .schema_version = status.schema_version, .owners = owners[offset..end] }, .{});
             // An ambiguous reply is retried with exactly the same owner proofs.
             while (true) {
-                const admitted = @import("relational_index_maintenance.zig").execute(scratch_backing, root.server.source, reader, writer, table.physical_name, status.index_name, .repair, body, root.context) catch |err| switch (err) {
+                const admitted = @import("relational_index/maintenance.zig").execute(scratch_backing, root.server.source, reader, writer, table.physical_name, status.index_name, .repair, body, root.context) catch |err| switch (err) {
                     error.TopologyChanged, error.LeaderUnavailable, error.Unavailable => {
                         try wait(root);
                         continue;

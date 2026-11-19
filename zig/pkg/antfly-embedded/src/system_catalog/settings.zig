@@ -373,7 +373,7 @@ test "role defaults bootstrap only known typed controls and reject invalid nativ
     try std.testing.expectError(error.InvalidSettingRecord, invalid_definition.validate());
 }
 
-pub const CommandFence = @import("../storage/pessimistic_lock_authority.zig").CommandFence;
+pub const CommandFence = @import("../storage/pessimistic_lock/authority.zig").CommandFence;
 
 fn stringifyScoped(value: anytype, writer: anytype) !void {
     try writer.beginObject();

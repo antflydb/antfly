@@ -20,7 +20,7 @@ const std = @import("std");
 const local = @import("antfly_local_sources");
 const producer = @import("sql_command_producer.zig");
 const namespaces = @import("../system_catalog/temporary_namespace_index.zig");
-const wire = @import("../metadata/scope_retirement_wire.zig");
+const wire = @import("../metadata/retirement/scope/wire.zig");
 const http = @import("http_server.zig");
 const A = std.mem.Allocator;
 const Context = local.api_operation.RequestContext;
@@ -107,7 +107,7 @@ pub fn advance(server: *http.ApiHttpServer, input: Context, backing: A, source: 
                 // normally advances physical children on session maintenance.
                 // That lane is joined during shutdown, so this same durable
                 // source must continue its exact admitted child quantum.
-                const scopes = @import("../metadata/scope_retirement_ledger.zig");
+                const scopes = @import("../metadata/retirement/scope/ledger.zig");
                 const bytes = try server.source.systemCatalog(a, context, .{ .scope_retirement_work = head.sequence - 1 });
                 const current = (try std.json.parseFromSliceLeaky(?scopes.Work, a, bytes, .{})) orelse break :blk .pending;
                 try current.head.validate();
@@ -167,8 +167,8 @@ pub fn advance(server: *http.ApiHttpServer, input: Context, backing: A, source: 
 /// One bounded recovery quantum for a public TEMP image lost at native restart.
 /// This is metadata retirement, not a SQL session or an attempt to reopen the
 /// old physical image. Only the canonical checkpoint permits Boot to advance.
-pub fn retireLostNativeEntry(server: *http.ApiHttpServer, backing: A, current_boot: @import("../metadata/sql_relation_boots.zig").Record, entry: @import("../metadata/sql_relation_lifetimes.zig").Entry, input: Context) !void {
-    const boots = @import("../metadata/sql_relation_boots.zig");
+pub fn retireLostNativeEntry(server: *http.ApiHttpServer, backing: A, current_boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, entry: @import("../metadata/sql/relation_lifecycle/lifetimes.zig").Entry, input: Context) !void {
+    const boots = @import("../metadata/sql/relation_lifecycle/boots.zig");
     try current_boot.validate();
     try entry.validate();
     if (entry.descriptor.kind != .temporary or entry.descriptor.owner == null or entry.descriptor.owner_node_id != current_boot.node_id or

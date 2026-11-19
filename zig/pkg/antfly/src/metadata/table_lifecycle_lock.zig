@@ -90,8 +90,8 @@ pub fn read(txn: anytype, group_id: u64, table_id: u64) !?Lock {
 /// revision, never by guessing that an equal lock means begin was completed.
 pub fn acquire(txn: anytype, group_id: u64, table_id: u64, lock: Lock) !void {
     const bytes = try lock.encode();
-    try @import("scope_retirement_fence.zig").requireTableWritable(txn, group_id, table_id);
-    if (lock.kind == .generation or lock.kind == .sql_drop or lock.kind == .table_retirement) try @import("schema_validation_dependencies.zig").requireUnleased(txn, group_id, table_id);
+    try @import("retirement/scope/fence.zig").requireTableWritable(txn, group_id, table_id);
+    if (lock.kind == .generation or lock.kind == .sql_drop or lock.kind == .table_retirement) try @import("schema_validation/dependencies.zig").requireUnleased(txn, group_id, table_id);
     if (try read(txn, group_id, table_id) != null) return error.GenerationPublicationChanged;
     var buf: [160]u8 = undefined;
     try txn.put(try key(&buf, group_id, table_id), &bytes);

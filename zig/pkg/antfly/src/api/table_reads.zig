@@ -1643,7 +1643,7 @@ const RoutePinnedCatalog = struct {
         return cast(ptr).base.graphPreparationRead(alloc, request, deadline_ns);
     }
 
-    fn sqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+    fn sqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql/relation_lifecycle/boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql/relation_lifecycle/boots.zig").Observation {
         return cast(ptr).base.sqlRelationBinding(alloc, query, deadline_ns);
     }
 
@@ -19548,9 +19548,9 @@ fn consumerTests() type {
             try std.testing.expectError(error.InvalidResponse, http_client.TypedLookup.requireCanonical("{\"a\":null,\"b\":null}", &.{ "b", "a" }));
             var references = try std.json.parseFromSlice(std.json.Value, alloc, "{\"a\":null,\"b\":0}", .{});
             defer references.deinit();
-            try @import("sql_trigger_raw.zig").requireNullFieldReferences(references.value, &.{"a"});
-            try std.testing.expectError(error.InvalidResponse, @import("sql_trigger_raw.zig").requireNullFieldReferences(references.value, &.{"b"}));
-            try std.testing.expectError(error.InvalidResponse, @import("sql_trigger_raw.zig").requireNullFieldReferences(references.value, &.{"missing"}));
+            try @import("sql/triggers/raw.zig").requireNullFieldReferences(references.value, &.{"a"});
+            try std.testing.expectError(error.InvalidResponse, @import("sql/triggers/raw.zig").requireNullFieldReferences(references.value, &.{"b"}));
+            try std.testing.expectError(error.InvalidResponse, @import("sql/triggers/raw.zig").requireNullFieldReferences(references.value, &.{"missing"}));
             capture.malformed_nulls = true;
             try std.testing.expectError(error.InvalidResponse, lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true, .include_json_null_fields = true }, .read_index));
         }
@@ -37622,8 +37622,8 @@ test "SQL relation lifetime snapshot cohorts retain native routes Boot authority
     const client = @import("../storage/kernel_owner_client.zig");
     const rpc = @import("retained_read_rpc.zig");
     const registry = @import("../storage/retained_read_registry.zig");
-    const boots = @import("../metadata/sql_relation_boots.zig");
-    const attestation = @import("../metadata/sql_relation_attestation.zig");
+    const boots = @import("../metadata/sql/relation_lifecycle/boots.zig");
+    const attestation = @import("../metadata/sql/relation_lifecycle/attestation.zig");
     const Provider = @import("../storage/relational_read_provider.zig").Provider;
     const Fixture = struct {
         fence: metadata_api.CatalogRouteFence,

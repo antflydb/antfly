@@ -154,7 +154,7 @@ const RetirementCaptures = struct {
     server: *server_mod.ApiHttpServer,
     alloc: std.mem.Allocator,
     context: operation.RequestContext,
-    head: @import("../metadata/table_retirement_ledger.zig").Head,
+    head: @import("../metadata/retirement/table/ledger.zig").Head,
     entries: std.AutoHashMapUnmanaged(Key, Facts) = .empty,
     root_catalog: ?struct { key: Key, base64: []u8 } = null,
     fn deinit(self: *@This()) void {
@@ -235,10 +235,10 @@ const RetirementCaptures = struct {
 
 const RetirementRoot = struct {
     id: publication.Id,
-    effects: @import("../metadata/table_retirement_manifest.zig").Reference,
-    retiring_parents: []const @import("../metadata/scope_retirement_ledger.zig").Child = &.{},
+    effects: @import("../metadata/retirement/table/manifest.zig").Reference,
+    retiring_parents: []const @import("../metadata/retirement/scope/ledger.zig").Child = &.{},
     captures: ?*RetirementCaptures = null,
-    fn parent(self: @This(), id: u64) ?@import("../metadata/scope_retirement_ledger.zig").Child {
+    fn parent(self: @This(), id: u64) ?@import("../metadata/retirement/scope/ledger.zig").Child {
         for (self.retiring_parents) |retiring| if (retiring.table == id) return retiring;
         return null;
     }
@@ -247,17 +247,17 @@ const RetirementRoot = struct {
 /// Plan only the accepted root's immutable source and outgoing parents. No
 /// whole-catalog snapshot is needed; seal rechecks this cut in the root txn.
 /// Allocations belong to the caller's preparation arena.
-pub fn buildTableRetirement(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, id: publication.Id, manifest: @import("../metadata/table_retirement_manifest.zig").Manifest) !publication.Plan {
+pub fn buildTableRetirement(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, id: publication.Id, manifest: @import("../metadata/retirement/table/manifest.zig").Manifest) !publication.Plan {
     return buildTableRetirementImpl(server, alloc, context, id, manifest, null);
 }
 
-pub fn buildReservedTableRetirement(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, head: @import("../metadata/table_retirement_ledger.zig").Head, manifest: @import("../metadata/table_retirement_manifest.zig").Manifest) !publication.Plan {
+pub fn buildReservedTableRetirement(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, head: @import("../metadata/retirement/table/ledger.zig").Head, manifest: @import("../metadata/retirement/table/manifest.zig").Manifest) !publication.Plan {
     var captures: RetirementCaptures = .{ .server = server, .alloc = alloc, .context = context, .head = head };
     defer captures.deinit();
     return buildTableRetirementImpl(server, alloc, context, head.lookup.id, manifest, &captures);
 }
 
-fn buildTableRetirementImpl(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, id: publication.Id, manifest: @import("../metadata/table_retirement_manifest.zig").Manifest, captures: ?*RetirementCaptures) !publication.Plan {
+fn buildTableRetirementImpl(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, id: publication.Id, manifest: @import("../metadata/retirement/table/manifest.zig").Manifest, captures: ?*RetirementCaptures) !publication.Plan {
     try context.ensureActive();
     try manifest.validate(alloc);
     if (manifest.view_backings.len != 0) return error.UnsupportedOperation;
@@ -279,7 +279,7 @@ fn buildTableRetirementImpl(server: *server_mod.ApiHttpServer, alloc: std.mem.Al
             .child_fences = try ownerFencesCaptured(server, alloc, context, id, manifest.root, document_ranges, .document_retirement_source, .checks_v1, captures),
         };
         try plan.validate(alloc);
-        const physical = @import("../metadata/table_retirement_physical.zig");
+        const physical = @import("../metadata/retirement/table/physical.zig");
         try physical.requireManifest(alloc, .{ .group = manifest.metadata_group_id, .table = manifest.root.table_id, .id = id }, try physical.prepare(alloc, alloc, plan), manifest);
         return plan;
     }
@@ -299,7 +299,7 @@ fn buildTableRetirementImpl(server: *server_mod.ApiHttpServer, alloc: std.mem.Al
     _ = parsed.value.object.swapRemove("foreign_keys");
     const target = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
     const plan = try buildFromCut(server, alloc, context, null, .{ .tables = selected.items, .ranges = ranges.items }, manifest.root, target, null, manifest.guard, .{ .id = id, .effects = try manifest.reference(), .retiring_parents = manifest.retiring_parents, .captures = captures });
-    const physical = @import("../metadata/table_retirement_physical.zig");
+    const physical = @import("../metadata/retirement/table/physical.zig");
     const prepared = try physical.prepare(alloc, alloc, plan);
     try physical.requireManifest(alloc, .{ .group = manifest.metadata_group_id, .table = manifest.root.table_id, .id = id }, prepared, manifest);
     return plan;
@@ -458,7 +458,7 @@ test "SQL relation lifetime reserved native planner captures once without generi
     const descriptor: records.RelationPersistence.Descriptor = .{ .kind = .unlogged, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(3), .data_generation = 1 };
     const table: records.TableRecord = .{ .table_id = 7, .name = "table:seven", .schema_json = "{\"version\":0}", .sql_persistence = descriptor };
     const range: records.RangeRecord = .{ .group_id = 72, .table_id = 7, .doc_identity_shard_id = 172, .doc_identity_range_id = 173, .start_key = "" };
-    const head: @import("../metadata/table_retirement_ledger.zig").Head = .{ .lookup = .{ .group = 2188, .table = 7, .id = @splat(1) }, .incarnation = "11111111111111111111111111111111".*, .effects = .{ .digest = @splat(2), .root_table = 7, .survivors = 0, .counters = 0, .views = 0 }, .scope = .{ .database = 1, .namespace = 2, .creator = .bootstrap }, .participant_count = 1, .range_count = 1, .participants_digest = @splat(3) };
+    const head: @import("../metadata/retirement/table/ledger.zig").Head = .{ .lookup = .{ .group = 2188, .table = 7, .id = @splat(1) }, .incarnation = "11111111111111111111111111111111".*, .effects = .{ .digest = @splat(2), .root_table = 7, .survivors = 0, .counters = 0, .views = 0 }, .scope = .{ .database = 1, .namespace = 2, .creator = .bootstrap }, .participant_count = 1, .range_count = 1, .participants_digest = @splat(3) };
     var prepared = try local.storage_db_relational_integrity_catalog.prepare(a, null, @splat(1), 0, @splat(2), &.{});
     defer prepared.deinit();
     const base64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(prepared.value.len));
@@ -575,7 +575,7 @@ test "SQL relation lifetime retirement capture metadata cache releases many owne
     const descriptor: records.RelationPersistence.Descriptor = .{ .kind = .unlogged, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(3), .data_generation = 1 };
     const table: records.TableRecord = .{ .table_id = 7, .name = "table:seven", .schema_json = "{\"version\":0}", .sql_persistence = descriptor };
     const root_range: records.RangeRecord = .{ .group_id = 72, .table_id = 7, .doc_identity_shard_id = 172, .doc_identity_range_id = 173, .start_key = "" };
-    const head: @import("../metadata/table_retirement_ledger.zig").Head = .{ .lookup = .{ .group = 2188, .table = 7, .id = @splat(1) }, .incarnation = "11111111111111111111111111111111".*, .effects = .{ .digest = @splat(2), .root_table = 7, .survivors = 0, .counters = 0, .views = 0 }, .scope = .{ .database = 1, .namespace = 2, .creator = .bootstrap }, .participant_count = 1, .range_count = 513, .participants_digest = @splat(3) };
+    const head: @import("../metadata/retirement/table/ledger.zig").Head = .{ .lookup = .{ .group = 2188, .table = 7, .id = @splat(1) }, .incarnation = "11111111111111111111111111111111".*, .effects = .{ .digest = @splat(2), .root_table = 7, .survivors = 0, .counters = 0, .views = 0 }, .scope = .{ .database = 1, .namespace = 2, .creator = .bootstrap }, .participant_count = 1, .range_count = 513, .participants_digest = @splat(3) };
     const Spy = struct {
         catalog: []const u8,
         digest: [32]u8,

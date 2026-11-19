@@ -175,7 +175,7 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         // Valid synthetic signing data deliberately cannot turn a real
         // empty owner observation into a receipt. This is not enrollment or
         // positive metadata/publication evidence.
-        const attestation = @import("../metadata/schema_validation_attestation.zig");
+        const attestation = @import("../metadata/schema_validation/attestation.zig");
         const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(9));
         const signing_root: local.storage_db_root_signing_identity.State = .{ .seed = @splat(9), .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
         const signing_identity: @import("../metadata/store_root_enrollment.zig").Identity = .{
@@ -267,7 +267,7 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         schema_session.initial.observation.physical_root_incarnation -= 1;
         try schema_session.reacquireAfterApply();
         try std.testing.expectEqualDeep(empty_schema, try schema_session.observe());
-        const attestation = @import("../metadata/schema_validation_attestation.zig");
+        const attestation = @import("../metadata/schema_validation/attestation.zig");
         const seed: [32]u8 = @splat(9);
         const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
         const signing_root: local.storage_db_root_signing_identity.State = .{ .seed = seed, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
@@ -352,9 +352,9 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         var control = try source.acquireRaftSchemaOwnerSession(7501, "items", actual_binding, .{ .cancellation = local.api_operation.CancellationToken.fromAtomic(&canceled) });
         defer control.deinit();
         const bootstrap_root = try local.storage_db_root_signing_identity.loadOrCreate(alloc, std.testing.io, schema_root);
-        const bootstrap_scope: @import("../metadata/schema_validation_attestation.zig").RaftScope = .{
+        const bootstrap_scope: @import("../metadata/schema_validation/attestation.zig").RaftScope = .{
             .metadata_incarnation = "61616161616161616161616161616161".*,
-            .binding_digest = try @import("../metadata/schema_validation_attestation.zig").bindingDigest(actual_binding),
+            .binding_digest = try @import("../metadata/schema_validation/attestation.zig").bindingDigest(actual_binding),
             .identity = .{ .metadata_incarnation = "61616161616161616161616161616161".*, .node_id = 2, .store_id = 3, .root_incarnation = bootstrap_root.root_incarnation, .public_key = bootstrap_root.public_key },
             .reporter_incarnation = 4,
             .replica_id = 5,
@@ -424,23 +424,23 @@ test "native index owner adapter inspects cold native ownership and rejects fore
             bootstrap_barrier.check_lease_order = false;
             try std.testing.expectEqualDeep(before_capture, try source.schemaOwnerStateAtRoot(7501, "items", .{}));
             {
-                const builder = @import("../api/schema_validation_plan_builder.zig");
+                const builder = @import("../api/schema_validation/plan_builder.zig");
                 const manager = @import("../metadata/table_manager.zig");
                 const before = (try Catalog.snapshot(&catalog)).tables[0];
                 const after = try @import("../api/tables.zig").prepareNullabilityPublicationRecord(alloc, &before, &.{"id"});
                 defer manager.freeTable(alloc, after);
                 const guard: local.system_catalog_domain.RelationMutationGuard = .{ .target = .{ .name = "items" }, .logical_table = "items", .owner = .{ .table_id = 101, .schema_version = 1, .schema_digest = local.storage_db_relational_schema_owner_contract.hash(before.schema_json), .kind = .table }, .incarnation = @splat(0x61) };
-                const cut: @import("../metadata/schema_validation_admission.zig").Cut = .{ .metadata_group_id = 21, .metadata_incarnation = bootstrap_scope.metadata_incarnation, .table_guard = guard, .before = before, .after = after, .ranges = &.{.{ .range_id = 7501, .table_id = 101, .group_id = 7501, .start_key = "", .end_key = null }}, .authority = .raft };
+                const cut: @import("../metadata/schema_validation/admission.zig").Cut = .{ .metadata_group_id = 21, .metadata_incarnation = bootstrap_scope.metadata_incarnation, .table_guard = guard, .before = before, .after = after, .ranges = &.{.{ .range_id = 7501, .table_id = 101, .group_id = 7501, .start_key = "", .end_key = null }}, .authority = .raft };
                 const Owners = struct {
                     source: *kernel_owner_source.ProvisionedKernelOwnerSource,
                     signer: kernel_owner_source.ProvisionedKernelOwnerSource.SchemaPreparationSigner,
                     root: local.storage_db_root_signing_identity.State,
                     calls: usize = 0,
-                    pub fn prepare(self: *@This(), a: std.mem.Allocator, group: u64, table: []const u8, query: @import("../api/schema_validation_preparation.zig").Request, context: local.api_operation.RequestContext) ![]u8 {
+                    pub fn prepare(self: *@This(), a: std.mem.Allocator, group: u64, table: []const u8, query: @import("../api/schema_validation/preparation.zig").Request, context: local.api_operation.RequestContext) ![]u8 {
                         self.calls += 1;
                         var value = try self.source.captureSchemaPreparationAtRoot(a, group, table, .{ .id = query.id, .provisional_plan = query.provisional_plan, .transition_id = query.transition_id, .namespace = query.namespace }, query.before_schema, query.after_schema, query.selection, self.signer, self.root, context);
                         defer value.deinit();
-                        return @import("../api/schema_validation_preparation.zig").encode(a, value.signed, value.inputs);
+                        return @import("../api/schema_validation/preparation.zig").encode(a, value.signed, value.inputs);
                     }
                 };
                 var actual_owners: Owners = .{ .source = &source, .signer = .{ .identity = bootstrap_scope.identity, .reporter_incarnation = bootstrap_scope.reporter_incarnation, .authority = .{ .raft = bootstrap_scope.replica_id } }, .root = bootstrap_root };
@@ -449,13 +449,13 @@ test "native index owner adapter inspects cold native ownership and rejects fore
                 defer built.deinit();
                 try std.testing.expectEqual(@as(usize, 1), actual_owners.calls);
                 try std.testing.expectEqualDeep(before_capture, try source.schemaOwnerStateAtRoot(7501, "items", .{}));
-                var command = try @import("../metadata/schema_validation_ledger.zig").parseCommand(alloc, built.command);
+                var command = try @import("../metadata/schema_validation/ledger.zig").parseCommand(alloc, built.command);
                 defer command.deinit();
                 try std.testing.expectEqual(@as(usize, 1), command.value.begin.inputs.len);
                 try std.testing.expectEqual(@as(usize, 1), command.value.begin.preparations.len);
                 try command.value.begin.preparations[0].verifyFor(built.prepared.owners[0].binding, before_capture.state.physical_root_incarnation);
                 try std.testing.expectEqual(built.lookup.plan_digest, try command.value.begin.plan.digest());
-                try std.testing.expectEqualDeep(built.lookup, try @import("../api/schema_validation_recovery.zig").Token.decode(&built.recovery_token));
+                try std.testing.expectEqualDeep(built.lookup, try @import("../api/schema_validation/recovery.zig").Token.decode(&built.recovery_token));
                 try std.testing.expect(command.value.begin.plan.before.schema_json.ptr != before.schema_json.ptr);
                 try std.testing.expectError(error.Forbidden, builder.build(&actual_owners, alloc, std.testing.io, .{}, cut, .{ .guard = guard, .selection = .{ .not_null = &.{"id"} } }));
                 try std.testing.expectEqual(@as(usize, 1), actual_owners.calls);
@@ -465,7 +465,7 @@ test "native index owner adapter inspects cold native ownership and rejects fore
                 try std.testing.expectError(error.SchemaValidationJobChanged, builder.build(&actual_owners, alloc, std.testing.io, context, foreign, .{ .guard = guard, .selection = .{ .not_null = &.{"id"} } }));
                 try std.testing.expectEqualDeep(before_capture, try source.schemaOwnerStateAtRoot(7501, "items", .{}));
             }
-            const transport = @import("../api/schema_validation_preparation.zig");
+            const transport = @import("../api/schema_validation/preparation.zig");
             var request: transport.Request = .{ .group_id = 7501, .metadata_incarnation = bootstrap_scope.metadata_incarnation, .id = actual_binding.id, .provisional_plan = actual_binding.plan_digest, .transition_id = actual_binding.fence.transition_id, .namespace = actual_binding.fence.namespace, .before_schema = before_json, .after_schema = tightened, .selection = .{ .not_null = &.{"id"} } };
             const frame = try transport.encode(alloc, captured.signed, captured.inputs);
             defer alloc.free(frame);
@@ -646,7 +646,7 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         {
             // Real retained kernel observation plus a runtime barrier fixture:
             // a completed no-op does not rewrite the durable data entry (1,1).
-            const attestation = @import("../metadata/schema_validation_attestation.zig");
+            const attestation = @import("../metadata/schema_validation/attestation.zig");
             const Barrier = struct {
                 captures: usize = 0,
                 validations: usize = 0,
@@ -839,7 +839,7 @@ test "native index owner adapter inspects cold native ownership and rejects fore
                 try std.testing.expectError(error.NotLeader, control.attestSnapshotParent(alloc, request, scope, root_key));
                 // Persist the real capture BEFORE certification. Leadership
                 // loss there leaves a recoverable obligation, not a lost pin.
-                const outbox = @import("../metadata/schema_validation_source_outbox.zig");
+                const outbox = @import("../metadata/schema_validation/source_outbox.zig");
                 const producer_root = try local.storage_db_root_signing_identity.loadOrCreate(alloc, std.testing.io, schema_root);
                 var producer_scope = scope;
                 producer_scope.identity.root_incarnation = producer_root.root_incarnation;
@@ -1244,8 +1244,8 @@ fn waitSchemaReplay(source: *kernel_owner_source.ProvisionedKernelOwnerSource, g
 test "native index owner adapter executes fresh permission stages and recovers reserved LSM receipts after restart" {
     const alloc = std.testing.allocator;
     const local = @import("antfly_local_sources");
-    const publication = @import("../metadata/relational_index_publication.zig");
-    const execution = @import("../api/relational_index_owner_execution.zig");
+    const publication = @import("../metadata/relational_index/publication.zig");
+    const execution = @import("../api/relational_index/owner_execution.zig");
     const progress = local.storage_db_relational_index_publication_progress;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1299,7 +1299,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
     const Metadata = struct {
         value: publication.OwnerDecision,
         admission_reads: usize = 0,
-        acceptance: ?@import("../metadata/relational_index_delivery_journal.zig").Head = null,
+        acceptance: ?@import("../metadata/relational_index/delivery_journal.zig").Head = null,
         acceptance_pending: bool = false,
         acceptance_reads: usize = 0,
         acceptance_writes: usize = 0,
@@ -1313,12 +1313,12 @@ test "native index owner adapter executes fresh permission stages and recovers r
         cancellation_status_reads: usize = 0,
         lose_cleanup_ack_reply: bool = true,
         lose_release_ack_reply: bool = true,
-        pub fn currentAuthority(self: *@This()) !?@import("../metadata/relational_index_worker.zig").Authority {
+        pub fn currentAuthority(self: *@This()) !?@import("../metadata/relational_index/worker.zig").Authority {
             const view = self.value.native_signing orelse return null;
             return .{ .metadata_incarnation = view.identity.metadata_incarnation, .binding_digest = view.binding_digest, .writer_generation = 1 };
         }
-        pub fn workJson(self: *@This(), a: std.mem.Allocator, query: @import("../metadata/relational_index_work.zig").Query) ![]u8 {
-            const work = @import("../metadata/relational_index_work.zig");
+        pub fn workJson(self: *@This(), a: std.mem.Allocator, query: @import("../metadata/relational_index/work.zig").Query) ![]u8 {
+            const work = @import("../metadata/relational_index/work.zig");
             const response: work.Response = switch (query) {
                 .discover => |after| .{ .discovered = .{ .head = if (after == 0 and self.value.head.phase != .canceled) self.value.head else null, .after_table = self.value.head.table_id, .exhausted = after != 0 or self.value.head.phase == .canceled } },
                 .head => |identity| blk: {
@@ -1363,7 +1363,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
                 return std.json.Stringify.valueAlloc(a, publication.AckStatus{ .head = self.value.head, .owner = self.value.owner, .replication_pending = false }, .{});
             }
             if (call == .relational_index_source_complete) {
-                const journal = @import("../metadata/relational_index_delivery_journal.zig");
+                const journal = @import("../metadata/relational_index/delivery_journal.zig");
                 const request_ = call.relational_index_source_complete;
                 try request_.validate();
                 try request_.consumed.requireHead(self.acceptance orelse return error.InvalidPrivateIndexClaimReceipt);
@@ -1376,9 +1376,9 @@ test "native index owner adapter executes fresh permission stages and recovers r
                 return std.json.Stringify.valueAlloc(a, journal.Status{ .query = request_.query, .head = self.acceptance, .completed = true }, .{});
             }
             if (call == .relational_index_source_accept) {
-                const journal = @import("../metadata/relational_index_delivery_journal.zig");
+                const journal = @import("../metadata/relational_index/delivery_journal.zig");
                 const request = call.relational_index_source_accept;
-                self.acceptance = try @import("../api/relational_index_delivery_producer.zig").testing.acceptedHead(request, self.acceptance);
+                self.acceptance = try @import("../api/relational_index/delivery_producer.zig").testing.acceptedHead(request, self.acceptance);
                 self.acceptance_writes += 1;
                 if (self.lose_acceptance_reply) {
                     self.lose_acceptance_reply = false;
@@ -1388,7 +1388,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
             }
             if (call == .relational_index_source_accept_status) {
                 self.acceptance_reads += 1;
-                return std.json.Stringify.valueAlloc(a, @import("../metadata/relational_index_delivery_journal.zig").Status{ .query = call.relational_index_source_accept_status, .head = self.acceptance, .replication_pending = self.acceptance_pending, .completed = self.completed }, .{});
+                return std.json.Stringify.valueAlloc(a, @import("../metadata/relational_index/delivery_journal.zig").Status{ .query = call.relational_index_source_accept_status, .head = self.acceptance, .replication_pending = self.acceptance_pending, .completed = self.completed }, .{});
             }
             var value = self.value;
             if (call.relational_index_owner_decision.operation == .cancel or call.relational_index_owner_decision.operation == .cancel_release) {
@@ -1418,7 +1418,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         metadata: *Metadata,
         signing_root: local.storage_db_root_signing_identity.State,
         calls: usize = 0,
-        fn localTransport(self: *@This()) @import("../api/relational_index_local_delivery.zig").Transport {
+        fn localTransport(self: *@This()) @import("../api/relational_index/local_delivery.zig").Transport {
             return .{ .control_port = .{ .ptr = self, .execute_fn = controlDirect }, .claim_port = .{ .ptr = self, .execute_fn = claimsDirect } };
         }
         fn controlDirect(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, owner_group: u64, value: execution.Request, context: local.api_operation.RequestContext) !execution.Result {
@@ -1689,7 +1689,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         const consume_command: native.ConsumeCommand = .{ .binding = source_read.binding, .accepted = accepted };
         const consume_request: execution.ClaimRequest = .{ .table_id = plan.before.table_id, .group_id = group, .id = plan.id, .consume = .{ .ordinal = 1, .batch_digest = header.digest() } };
         try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, execution.claimStep(alloc, &owners, &metadata, plan.before.name, consume_request, .{}));
-        var accepted_head: @import("../metadata/relational_index_delivery_journal.zig").Head = .{
+        var accepted_head: @import("../metadata/relational_index/delivery_journal.zig").Head = .{
             .metadata_incarnation = accepted.metadata_incarnation,
             .binding_digest = accepted.binding_digest,
             .scope_digest = accepted.scope_digest,
@@ -1723,7 +1723,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         // Drive the actual compiled owner, with explicitly synthetic metadata
         // acceptance. Lose the committed metadata reply, destroy all volatile
         // producer state, and resume without reissuing delivery/acceptance.
-        const producer_module = @import("../api/relational_index_delivery_producer.zig");
+        const producer_module = @import("../api/relational_index/delivery_producer.zig");
         var cohort = try local.storage_db_relational_index_owner_job.private_claims.delivery.Cohort.init(alloc, &.{.{ .owner = metadata.value.owner.owner, .start = "", .end = "" }});
         defer cohort.deinit();
         var transport: Transport = .{ .owners = &owners, .metadata = &metadata, .signing_root = signing_root };
@@ -1791,7 +1791,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, forged_consumption.verify());
         var wrong_authority = consumed.outcome.value.record.?;
         wrong_authority.position = .{ .raft = .{ .term = 1, .index = accepted.source_sequence + 1 } };
-        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, @import("../metadata/relational_index_delivery_journal.zig").Consumed.fromRecord(wrong_authority, signed_consumption.proof));
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, @import("../metadata/relational_index/delivery_journal.zig").Consumed.fromRecord(wrong_authority, signed_consumption.proof));
         metadata.acceptance = null;
         try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, execution.claimStep(alloc, &owners, &metadata, plan.before.name, consume_request, .{}));
         metadata.acceptance = accepted_head;
@@ -1805,7 +1805,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
             // Synthetic work/metadata directory, actual leased compiled owner.
             // Automatic scheduling must resume a consumed prefix without
             // publishing an index or proposing acceptance a second time.
-            var scheduler: @import("../metadata/relational_index_worker.zig").Coordinator = .{};
+            var scheduler: @import("../metadata/relational_index/worker.zig").Coordinator = .{};
             defer scheduler.deinit(std.testing.io);
             const before = transport.calls;
             var now = @import("antfly_platform").time.monotonicNs();
@@ -1950,7 +1950,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         const cleanup_progress = try progress.acknowledge(metadata.value.head, metadata.value.owner, metadata.value.head.revision, cleanup_ack.signed.receipt);
         // Resume cancellation through the SAME private control port as normal
         // builds, using a real compiled owner and a synthetic metadata journal.
-        var cancellation_scheduler: @import("../metadata/relational_index_worker.zig").Coordinator = .{};
+        var cancellation_scheduler: @import("../metadata/relational_index/worker.zig").Coordinator = .{};
         defer cancellation_scheduler.deinit(std.testing.io);
         var cancellation_now = @import("antfly_platform").time.monotonicNs();
         for (0..80) |_| {

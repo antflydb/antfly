@@ -1337,7 +1337,7 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     }
 
     const create_started_ns = platform.time.monotonicNs();
-    var create_context: @import("sql_owner_test_fixture.zig").Context = .{
+    var create_context: @import("sql/testing/owner_test_fixture.zig").Context = .{
         .alloc = alloc,
         .io = io,
         .metadata = &metadata,
@@ -1350,7 +1350,7 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
         .base = base,
         .progress = .{ &meta_raft, &meta_control, &data_raft, &data_control },
     };
-    var create = try @import("sql_owner_test_client.zig").execute(&create_context, if (snapshot_probe)
+    var create = try @import("sql/testing/owner_test_client.zig").execute(&create_context, if (snapshot_probe)
         "CREATE TABLE usage_records (id TEXT PRIMARY KEY, status TEXT, organization_id TEXT)"
     else
         "CREATE TABLE nodes (id BIGINT PRIMARY KEY, parent_id BIGINT)", .write_admission);

@@ -41,7 +41,7 @@ test "httpx SQL original index names and stream-only COPY reject before catalog 
     var server = Server.init(a, .{}, .{ .ptr = &guard, .vtable = &.{ .status = Guard.status, .system_catalog = Guard.catalogCall, .supports_query_definitions = true } }, null, null);
     defer server.deinit();
     var handler: Handler = .{ .api_server = &server };
-    for ([_][]const u8{ "sql-0708", "sql-0709" }) |id| try @import("sql_parity_reference.zig").expectRejection(a, &handler, id, "42601");
+    for ([_][]const u8{ "sql-0708", "sql-0709" }) |id| try @import("sql/testing/parity_reference.zig").expectRejection(a, &handler, id, "42601");
     for ([_][]const u8{ "COPY usage_records TO STDOUT", "COPY (SELECT 1 AS n) TO STDOUT" }) |statement| {
         const body = try std.json.Stringify.valueAlloc(a, .{ .statement = statement }, .{});
         defer a.free(body);
@@ -120,7 +120,7 @@ pub fn run(ids: []const []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    var source: @import("sql_parity_sources.zig").Tables(2) = .{ .records = undefined, .reads = undefined };
+    var source: @import("sql/testing/parity_sources.zig").Tables(2) = .{ .records = undefined, .reads = undefined };
     var databases: [2]db.DB = undefined;
     var opened: usize = 0;
     defer for (databases[0..opened]) |*database| database.close();
@@ -149,7 +149,7 @@ pub fn run(ids: []const []const u8) !void {
     var handler: Handler = .{ .api_server = &server };
     for (ids, campaign.value.entries) |id, entry| {
         try std.testing.expectEqualStrings(id, entry.id);
-        @import("sql_parity_reference.zig").expectRejection(a, &handler, id, entry.sqlstate) catch |err| {
+        @import("sql/testing/parity_reference.zig").expectRejection(a, &handler, id, entry.sqlstate) catch |err| {
             std.debug.print("original name-resolution case {s} failed\n", .{id});
             return err;
         };

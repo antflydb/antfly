@@ -20,8 +20,8 @@ const local = @import("antfly_local_sources");
 const catalog = local.sql_catalog;
 const domain = local.system_catalog_domain;
 const http = @import("http_server.zig");
-const root = @import("../metadata/table_retirement_ledger.zig");
-const receipts = @import("../metadata/table_retirement_receipt.zig");
+const root = @import("../metadata/retirement/table/ledger.zig");
+const receipts = @import("../metadata/retirement/table/receipt.zig");
 const operation = local.api_operation;
 const Token = struct { version: u8 = 6, kind: catalog.CatalogOperationReceipt.Kind = .table, target: domain.Target, request: receipts.Request };
 const base64 = std.base64.url_safe_no_pad;
@@ -64,10 +64,10 @@ fn observe(server: *http.ApiHttpServer, context: operation.RequestContext, a: st
     if (head.phase != .published) return;
     var revision = head.direct_catalog_revision;
     if (head.survivor) |survivor| {
-        const lookup: @import("../metadata/schema_validation_read.zig").Lookup = .{ .group = head.lookup.group, .metadata_incarnation = head.incarnation, .table = survivor.table, .id = survivor.id, .plan_digest = survivor.digest };
-        const request: @import("../metadata/schema_validation_receipt.zig").Request = .{ .lookup = lookup, .expected = .admission };
+        const lookup: @import("../metadata/schema_validation/read.zig").Lookup = .{ .group = head.lookup.group, .metadata_incarnation = head.incarnation, .table = survivor.table, .id = survivor.id, .plan_digest = survivor.digest };
+        const request: @import("../metadata/schema_validation/receipt.zig").Request = .{ .lookup = lookup, .expected = .admission };
         const state = try server.source.systemCatalog(a, context, .{ .schema_validation_receipt_read = request });
-        const cohort = try std.json.parseFromSliceLeaky(@import("../metadata/schema_validation_receipt.zig").Observation, a, state, .{});
+        const cohort = try std.json.parseFromSliceLeaky(@import("../metadata/schema_validation/receipt.zig").Observation, a, state, .{});
         if (!try cohort.isAcknowledged(request) or cohort.head.?.phase != .succeeded) return;
         revision = cohort.head.?.catalog_revision;
     }
@@ -99,7 +99,7 @@ pub fn recoverIfTable(server: *http.ApiHttpServer, identity: ?http.Authenticated
     private.setting_admin = true;
     private.schema_validation_authority = true;
     observe(server, private, scratch, token.request, &result) catch |err| {
-        if (!@import("../metadata/schema_validation_coordinator.zig").isDeferred(err)) return err;
+        if (!@import("../metadata/schema_validation/coordinator.zig").isDeferred(err)) return err;
     };
     return result;
 }
@@ -118,7 +118,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
     context.schema_validation_authority = true;
     context.fk_generation_publication_authority = true;
     const bytes = try server.source.systemCatalog(a, context, .{ .table_retirement_prepare = guard });
-    var manifest = try @import("../metadata/table_retirement_manifest.zig").Owned.parse(a, bytes);
+    var manifest = try @import("../metadata/retirement/table/manifest.zig").Owned.parse(a, bytes);
     defer manifest.deinit();
     const Source = struct { storage_mode: enum { document, relational } = .document };
     const source: Source = if (manifest.value.root.schema_json.len != 0) try std.json.parseFromSliceLeaky(Source, a, manifest.value.root.schema_json, .{ .ignore_unknown_fields = true }) else .{};

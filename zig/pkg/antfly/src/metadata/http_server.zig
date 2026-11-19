@@ -2140,9 +2140,9 @@ pub const MetadataHttpServer = struct {
         try server.postWithBodyLimit(@import("../common/secret_delivery.zig").path, @import("../common/secret_delivery.zig").max_request_bytes, httpx.Handler.bind(self, metadataSecretRead));
         try server.post("/internal/v1/system-catalog", httpx.Handler.bind(self, metadataSystemCatalog));
         try server.post(routes.Routes.internal_schema_validation, httpx.Handler.bind(self, metadataSchemaValidation));
-        try server.postWithBodyLimit(routes.Routes.internal_table_retirement, @import("table_retirement_ledger.zig").max_command_bytes, httpx.Handler.bind(self, metadataTableRetirement));
+        try server.postWithBodyLimit(routes.Routes.internal_table_retirement, @import("retirement/table/ledger.zig").max_command_bytes, httpx.Handler.bind(self, metadataTableRetirement));
         try server.postWithBodyLimit(routes.Routes.internal_query_population_job, @import("query_population_job.zig").max_command_bytes, httpx.Handler.bind(self, metadataQueryPopulationJob));
-        try server.postWithBodyLimit(routes.Routes.internal_scope_retirement, @import("scope_retirement_wire.zig").max_command_bytes, httpx.Handler.bind(self, metadataScopeRetirement));
+        try server.postWithBodyLimit(routes.Routes.internal_scope_retirement, @import("retirement/scope/wire.zig").max_command_bytes, httpx.Handler.bind(self, metadataScopeRetirement));
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
         try server.post(routes.Routes.internal_catalog_group_retirement_check, httpx.Handler.bind(self, metadataCatalogGroupRetirementCheck));
@@ -2237,12 +2237,12 @@ pub const MetadataHttpServer = struct {
         try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
         const body = (try ctx.body()) orelse return ctx.status(400).text("missing body");
         const Call = @import("../system_catalog/server_call.zig").Call;
-        const ledger = @import("schema_validation_ledger.zig");
-        const maximum: usize = if (raw_population) @import("query_population_job.zig").max_command_bytes else if (raw_scope) @import("scope_retirement_wire.zig").max_command_bytes else if (raw_retirement) @import("table_retirement_ledger.zig").max_command_bytes else if (raw_schema) (if (ledger.requiresAdmissionAuthority(body)) ledger.max_command_bytes else ledger.max_control_command_bytes) else system_catalog.max_command_bytes;
+        const ledger = @import("schema_validation/ledger.zig");
+        const maximum: usize = if (raw_population) @import("query_population_job.zig").max_command_bytes else if (raw_scope) @import("retirement/scope/wire.zig").max_command_bytes else if (raw_retirement) @import("retirement/table/ledger.zig").max_command_bytes else if (raw_schema) (if (ledger.requiresAdmissionAuthority(body)) ledger.max_command_bytes else ledger.max_control_command_bytes) else system_catalog.max_command_bytes;
         if (body.len > maximum) return ctx.status(413).text("catalog request too large");
         var parsed: ?std.json.Parsed(Call) = null;
         defer if (parsed) |*value| value.deinit();
-        var scope: ?std.json.Parsed(@import("scope_retirement_wire.zig").Request) = null;
+        var scope: ?std.json.Parsed(@import("retirement/scope/wire.zig").Request) = null;
         defer if (scope) |*value| value.deinit();
         var population: ?std.json.Parsed(@import("query_population_job.zig").Request) = null;
         defer if (population) |*value| value.deinit();
@@ -2253,7 +2253,7 @@ pub const MetadataHttpServer = struct {
             break :blk .{ .query_population_job = population.?.value };
         } else if (raw_scope) blk: {
             if (!std.mem.eql(u8, ctx.header("content-type") orelse "", "application/octet-stream")) return ctx.status(415).text("lifecycle submission requires raw transport");
-            scope = std.json.parseFromSlice(@import("scope_retirement_wire.zig").Request, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid scope retirement");
+            scope = std.json.parseFromSlice(@import("retirement/scope/wire.zig").Request, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid scope retirement");
             break :blk .{ .scope_retirement_submit = scope.?.value };
         } else if (raw_retirement) blk: {
             if (!std.mem.eql(u8, ctx.header("content-type") orelse "", "application/octet-stream")) return ctx.status(415).text("lifecycle submission requires raw transport");
@@ -5859,7 +5859,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
                 try std.testing.expect(!context.fk_generation_publication_authority);
                 try std.testing.expect(!context.setting_admin);
                 if (call == .schema_validation_owner_read and call.schema_validation_owner_read.projection == .inputs) return alloc.dupe(u8, "\x00\xffASVI-transport-fixture");
-                if (call == .schema_validation_receipt_read) return std.json.Stringify.valueAlloc(alloc, @import("schema_validation_receipt.zig").Observation{ .lookup = call.schema_validation_receipt_read.lookup }, .{});
+                if (call == .schema_validation_receipt_read) return std.json.Stringify.valueAlloc(alloc, @import("schema_validation/receipt.zig").Observation{ .lookup = call.schema_validation_receipt_read.lookup }, .{});
             }
             return alloc.dupe(u8, "{}");
         }
@@ -6010,7 +6010,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
         try std.testing.expectEqual(@as(u16, 200), granted.status.code);
     }
     try std.testing.expectEqual(@as(usize, 1), fixture.index_reads);
-    for ([_]@import("../metadata/schema_validation_read.zig").OwnerReadRequest{
+    for ([_]@import("schema_validation/read.zig").OwnerReadRequest{
         .{ .lookup = .{ .group = 1, .table = 7, .id = @splat(1), .metadata_incarnation = @splat('1'), .plan_digest = @splat(2) }, .ordinal = 0 },
         .{ .lookup = .{ .group = 1, .table = 7, .id = @splat(1), .metadata_incarnation = @splat('1'), .plan_digest = @splat(2) }, .ordinal = 0, .projection = .inputs },
     }) |read| {
@@ -6053,8 +6053,8 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
     }
     try std.testing.expectEqual(@as(usize, 2), fixture.schema_reads);
     {
-        const receipts = @import("schema_validation_receipt.zig");
-        const lookup: @import("schema_validation_read.zig").Lookup = .{ .group = 1, .table = 7, .id = @splat(1), .metadata_incarnation = @splat('1'), .plan_digest = @splat(2) };
+        const receipts = @import("schema_validation/receipt.zig");
+        const lookup: @import("schema_validation/read.zig").Lookup = .{ .group = 1, .table = 7, .id = @splat(1), .metadata_incarnation = @splat('1'), .plan_digest = @splat(2) };
         const receipt_request: receipts.Request = .{ .lookup = lookup, .expected = .admission };
         const receipt_body = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").Call{ .schema_validation_receipt_read = receipt_request }, .{});
         defer alloc.free(receipt_body);
@@ -6087,7 +6087,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
     // synthetic commands. Real command validation belongs to the ledger/store.
     for ([_][]const u8{ "SVBI\x01\x00\x00\x00\xff\x00raw-begin", "raw-owner-command\x00\xff" }) |command| {
         fixture.schema_command = command;
-        const admission = @import("schema_validation_ledger.zig").requiresAdmissionAuthority(command);
+        const admission = @import("schema_validation/ledger.zig").requiresAdmissionAuthority(command);
         const good = try authority.sign(alloc, "separate-setting-authority-secret", "cluster-a", if (admission) .admin else .read, command, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
         defer alloc.free(good);
         const wrong = try authority.sign(alloc, "separate-setting-authority-secret", "cluster-a", if (admission) .read else .admin, command, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
@@ -6140,7 +6140,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
         fixture.schema_error = null;
         fixture.schema_effect = false;
     }
-    const index_ack = try @import("relational_index_publication.zig").testing.fencedAck();
+    const index_ack = try @import("relational_index/publication.zig").testing.fencedAck();
     const Call = @import("../system_catalog/server_call.zig").Call;
     for ([_]Call{ .{ .relational_index_owner_ack = index_ack }, .{ .relational_index_owner_ack_status = index_ack } }) |call| {
         const ack_body = try std.json.Stringify.valueAlloc(alloc, call, .{});

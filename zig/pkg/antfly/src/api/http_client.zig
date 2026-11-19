@@ -321,7 +321,7 @@ pub const EmptyResponse = struct {
 
 test "private index claim client requires service credentials preserves binary values and never replays conflicts" {
     const alloc = std.testing.allocator;
-    const execution = @import("relational_index_owner_execution.zig");
+    const execution = @import("relational_index/owner_execution.zig");
     const Fixture = struct {
         calls: usize = 0,
         status: u16 = 200,
@@ -366,7 +366,7 @@ test "private index claim client requires service credentials preserves binary v
 
 test "private index control client authenticates scope bounds budgets and never retries owner effects" {
     const alloc = std.testing.allocator;
-    const execution = @import("relational_index_owner_execution.zig");
+    const execution = @import("relational_index/owner_execution.zig");
     const Fixture = struct {
         calls: usize = 0,
         status: u16 = 200,
@@ -453,10 +453,10 @@ pub const RelationalIndexDeliveryTransport = struct {
         }
         return error.PrivateIndexOwnerJobChanged;
     }
-    pub fn control(self: *RelationalIndexDeliveryTransport, _: std.mem.Allocator, table: []const u8, request: @import("relational_index_owner_execution.zig").Request, context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("relational_index_owner_execution.zig").ControlResponse) {
+    pub fn control(self: *RelationalIndexDeliveryTransport, _: std.mem.Allocator, table: []const u8, request: @import("relational_index/owner_execution.zig").Request, context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("relational_index/owner_execution.zig").ControlResponse) {
         return self.api.fetchRelationalIndexControl(try self.endpoint(request.group_id), request.group_id, table, request, context);
     }
-    pub fn claims(self: *RelationalIndexDeliveryTransport, _: std.mem.Allocator, table: []const u8, request: @import("relational_index_owner_execution.zig").ClaimRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("relational_index_owner_execution.zig").ClaimResponse) {
+    pub fn claims(self: *RelationalIndexDeliveryTransport, _: std.mem.Allocator, table: []const u8, request: @import("relational_index/owner_execution.zig").ClaimRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("relational_index/owner_execution.zig").ClaimResponse) {
         return self.api.fetchRelationalIndexClaims(try self.endpoint(request.group_id), request.group_id, table, request, context);
     }
     pub fn systemCatalog(self: *RelationalIndexDeliveryTransport, alloc: std.mem.Allocator, input: @import("antfly_local_sources").api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
@@ -477,7 +477,7 @@ pub const RelationalIndexDeliveryTransport = struct {
 
 test "relational index publication delivery transport uses typed metadata status and bounded owner routing" {
     const alloc = std.testing.allocator;
-    const journal = @import("../metadata/relational_index_delivery_journal.zig");
+    const journal = @import("../metadata/relational_index/delivery_journal.zig");
     const Fixture = struct {
         calls: usize = 0,
         fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
@@ -525,7 +525,7 @@ test "relational index publication delivery transport uses typed metadata status
     var transport = try RelationalIndexDeliveryTransport.init(&api, &metadata, "http://metadata", &.{.{ .group_id = 7, .uri = "http://owner" }}, &cohort);
     try transport.validate(&cohort);
     try std.testing.expectError(error.PrivateIndexOwnerJobChanged, transport.endpoint(8));
-    var producer = try @import("relational_index_delivery_producer.zig").Producer.init(alloc, &cohort, "items", .{ .table_id = 101, .group_id = 7, .id = @splat(1), .operation = .source }, .{ .deadline_ns = platform_time.monotonicNs() + 30 * std.time.ns_per_s });
+    var producer = try @import("relational_index/delivery_producer.zig").Producer.init(alloc, &cohort, "items", .{ .table_id = 101, .group_id = 7, .id = @splat(1), .operation = .source }, .{ .deadline_ns = platform_time.monotonicNs() + 30 * std.time.ns_per_s });
     defer producer.deinit();
     _ = try producer.step(&transport, &transport);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
@@ -1243,18 +1243,18 @@ pub const ApiHttpClient = struct {
     }
 
     /// Owned physical progress; no automatic retry or build-completion ACK.
-    pub fn fetchRelationalIndexClaims(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_index_owner_execution.zig").ClaimRequest, input_context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("relational_index_owner_execution.zig").ClaimResponse) {
+    pub fn fetchRelationalIndexClaims(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_index/owner_execution.zig").ClaimRequest, input_context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("relational_index/owner_execution.zig").ClaimResponse) {
         return self.fetchRelationalIndexOwner(true, base_uri, group_id, table_name, request, input_context);
     }
 
-    pub fn fetchRelationalIndexControl(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_index_owner_execution.zig").Request, input_context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("relational_index_owner_execution.zig").ControlResponse) {
+    pub fn fetchRelationalIndexControl(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_index/owner_execution.zig").Request, input_context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("relational_index/owner_execution.zig").ControlResponse) {
         return self.fetchRelationalIndexOwner(false, base_uri, group_id, table_name, request, input_context);
     }
 
     pub const SchemaPreparationResponse = struct {
         alloc: std.mem.Allocator,
         transport: http_common.HttpResponse,
-        value: @import("schema_validation_preparation.zig").Response,
+        value: @import("schema_validation/preparation.zig").Response,
 
         pub fn deinit(self: *@This()) void {
             self.transport.deinit(self.alloc);
@@ -1262,8 +1262,8 @@ pub const ApiHttpClient = struct {
         }
     };
 
-    pub fn fetchSchemaValidationPreparation(self: *ApiHttpClient, base_uri: []const u8, group: u64, table: []const u8, request: @import("schema_validation_preparation.zig").Request, input: @import("antfly_local_sources").api_operation.RequestContext) !SchemaPreparationResponse {
-        const preparation = @import("schema_validation_preparation.zig");
+    pub fn fetchSchemaValidationPreparation(self: *ApiHttpClient, base_uri: []const u8, group: u64, table: []const u8, request: @import("schema_validation/preparation.zig").Request, input: @import("antfly_local_sources").api_operation.RequestContext) !SchemaPreparationResponse {
+        const preparation = @import("schema_validation/preparation.zig");
         const context = try input.platformDeadline();
         try context.ensureActive();
         try request.validate(group);
@@ -1306,7 +1306,7 @@ pub const ApiHttpClient = struct {
     /// descriptor. Transport retains the exact response bytes and allocator.
     pub fn fetchTableRetirementPreparation(self: *ApiHttpClient, base_uri: []const u8, group: u64, table: []const u8, request: @import("table_retirement_preparation.zig").Request, input: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         const preparation = @import("table_retirement_preparation.zig");
-        const transport = @import("schema_validation_preparation.zig");
+        const transport = @import("schema_validation/preparation.zig");
         const context = try input.platformDeadline();
         try context.ensureActive();
         try request.validate(group);
@@ -1351,8 +1351,8 @@ pub const ApiHttpClient = struct {
         return result;
     }
 
-    fn fetchRelationalIndexOwner(self: *ApiHttpClient, comptime claims: bool, base_uri: []const u8, group_id: u64, table_name: []const u8, request: if (claims) @import("relational_index_owner_execution.zig").ClaimRequest else @import("relational_index_owner_execution.zig").Request, input_context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(if (claims) @import("relational_index_owner_execution.zig").ClaimResponse else @import("relational_index_owner_execution.zig").ControlResponse) {
-        const execution = @import("relational_index_owner_execution.zig");
+    fn fetchRelationalIndexOwner(self: *ApiHttpClient, comptime claims: bool, base_uri: []const u8, group_id: u64, table_name: []const u8, request: if (claims) @import("relational_index/owner_execution.zig").ClaimRequest else @import("relational_index/owner_execution.zig").Request, input_context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(if (claims) @import("relational_index/owner_execution.zig").ClaimResponse else @import("relational_index/owner_execution.zig").ControlResponse) {
+        const execution = @import("relational_index/owner_execution.zig");
         const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
         const invalid_receipt = if (claims) error.InvalidPrivateIndexClaimReceipt else error.InvalidPrivateIndexNativeReceipt;
         const context = try input_context.platformDeadline();
@@ -1373,7 +1373,7 @@ pub const ApiHttpClient = struct {
         var budget_buffer: [20]u8 = undefined;
         const budget = try std.fmt.bufPrint(&budget_buffer, "{d}", .{remaining_ms});
         var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
-        const max_response_bytes: usize = if (claims) (if (request.closure != null) @import("../metadata/relational_index_source_delivery.zig").max_wire_bytes else 32 * 1024) else if (request.operation == .source) native.SourceWire.max_wire_bytes + 4096 else 32 * 1024;
+        const max_response_bytes: usize = if (claims) (if (request.closure != null) @import("../metadata/relational_index/source_delivery.zig").max_wire_bytes else 32 * 1024) else if (request.operation == .source) native.SourceWire.max_wire_bytes + 4096 else 32 * 1024;
         var response = self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = remaining_ms, .cancellation = &cancellation, .max_response_bytes = max_response_bytes, .headers = &.{.{ .name = if (claims) execution.claim_remaining_ms_header else execution.control_remaining_ms_header, .value = budget }} }) catch |err| switch (err) {
             error.ResponseTooLarge => return invalid_receipt,
             else => return err,
@@ -7785,7 +7785,7 @@ test "privacy reprocess transport preserves pending catalog retries without acce
 test "table retirement preparation transport reuses strict private schema route without replay" {
     const a = std.testing.allocator;
     const preparation = @import("table_retirement_preparation.zig");
-    const schema_preparation = @import("schema_validation_preparation.zig");
+    const schema_preparation = @import("schema_validation/preparation.zig");
     const request: preparation.Request = .{ .lookup = .{ .group = 2188, .table = 3, .id = @splat(1) }, .expected_revision = 1, .effects = .{ .digest = @splat(2), .root_table = 3, .survivors = 0, .counters = 0, .views = 0 }, .metadata_incarnation = "11111111111111111111111111111111".*, .table_id = 3, .owner_group_id = 7, .namespace = .{ .table_id = 3, .shard_id = 72, .range_id = 172 } };
     const Fixture = struct {
         calls: usize = 0,

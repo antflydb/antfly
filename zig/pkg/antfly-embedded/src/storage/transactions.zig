@@ -2169,8 +2169,8 @@ pub const TxnManager = struct {
         try pin.validate();
         if (try readHasPrefix(read, hot_standby_batch_outbox_prefix) or try readHasPrefix(read, hot_standby_replay_outbox_prefix))
             return error.SqlRelationRecoveryIncomplete;
-        if (try @import("pessimistic_lock_resource.zig").Binding.load(read)) |binding| {
-            if (try @import("pessimistic_lock_authority.zig").activeCount(read, binding.namespace) != 0) return error.SqlRelationRecoveryIncomplete;
+        if (try @import("pessimistic_lock/resource.zig").Binding.load(read)) |binding| {
+            if (try @import("pessimistic_lock/authority.zig").activeCount(read, binding.namespace) != 0) return error.SqlRelationRecoveryIncomplete;
         }
         var cursor = try read.openCursor();
         defer cursor.close();
@@ -2230,8 +2230,8 @@ pub const TxnManager = struct {
     fn hasTopologySensitiveTransactionsPolicy(alloc: Allocator, read: anytype, include_external_ack: bool) !bool {
         // Enrollment owns identity before the first row grant. Moving or
         // restoring that owner must not strand even an empty, fenced scope.
-        if (try @import("pessimistic_lock_resource.zig").Binding.load(read)) |binding| {
-            if (try @import("pessimistic_lock_authority.zig").activeCount(read, binding.namespace) != 0) return true;
+        if (try @import("pessimistic_lock/resource.zig").Binding.load(read)) |binding| {
+            if (try @import("pessimistic_lock/authority.zig").activeCount(read, binding.namespace) != 0) return true;
         }
 
         return hasRowTransactionStateInView(alloc, read, include_external_ack);
@@ -3412,7 +3412,7 @@ pub const TxnManager = struct {
         defer arena.deinit();
         var read = try self.store.beginRead();
         defer read.abort();
-        return @import("pessimistic_lock_transaction.zig").cleanupReady(arena.allocator(), &read, txn_id);
+        return @import("pessimistic_lock/transaction.zig").cleanupReady(arena.allocator(), &read, txn_id);
     }
 
     fn deleteTransactionMetadataKnownRecord(self: *TxnManager, txn_id: TxnId, record: TxnRecord, extra_batch: MutationExtraBatch) !void {
@@ -3428,7 +3428,7 @@ pub const TxnManager = struct {
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer deletes.deinit(self.alloc);
-        const lock_key = @import("pessimistic_lock_transaction.zig").key(txn_id);
+        const lock_key = @import("pessimistic_lock/transaction.zig").key(txn_id);
         try deletes.append(self.alloc, &lock_key);
         const admission_key = makeSidecarKey(intent_admission_prefix, txn_id);
         try deletes.append(self.alloc, &admission_key);
@@ -7096,7 +7096,7 @@ test "external decision ACK validates exact terminal owner before changing reten
 }
 
 comptime {
-    if (@import("builtin").is_test) _ = @import("pessimistic_lock_native_test.zig");
+    if (@import("builtin").is_test) _ = @import("pessimistic_lock/native_test.zig");
 }
 
 test "SQL relation lifetime native participant records pin actual images across every decision mutation" {

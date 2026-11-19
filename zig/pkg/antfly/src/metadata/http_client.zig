@@ -1167,8 +1167,8 @@ pub const MetadataHttpClient = struct {
         return parsed.value;
     }
 
-    pub fn relationalIndexOwnerAck(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_publication.zig").Ack, remaining_ms: u32) !@import("relational_index_publication.zig").AckStatus {
-        const publication = @import("relational_index_publication.zig");
+    pub fn relationalIndexOwnerAck(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index/publication.zig").Ack, remaining_ms: u32) !@import("relational_index/publication.zig").AckStatus {
+        const publication = @import("relational_index/publication.zig");
         if (remaining_ms == 0) return error.Timeout;
         try request.validate();
         const bytes = try self.forwardSystemCatalog(base_uri, .{ .relational_index_owner_ack = request }, .{ .remaining_ms = remaining_ms, .forwards_remaining = 2, .campaign_allowed = true }, false);
@@ -1180,11 +1180,11 @@ pub const MetadataHttpClient = struct {
         return parsed.value;
     }
 
-    pub fn acceptRelationalIndexSource(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_delivery_journal.zig").Request, remaining_ms: u32) !@import("relational_index_delivery_journal.zig").Status {
+    pub fn acceptRelationalIndexSource(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index/delivery_journal.zig").Request, remaining_ms: u32) !@import("relational_index/delivery_journal.zig").Status {
         return self.acceptRelationalIndexSourceControlled(base_uri, request, remaining_ms, null);
     }
-    pub fn acceptRelationalIndexSourceControlled(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_delivery_journal.zig").Request, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_delivery_journal.zig").Status {
-        const journal = @import("relational_index_delivery_journal.zig");
+    pub fn acceptRelationalIndexSourceControlled(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index/delivery_journal.zig").Request, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index/delivery_journal.zig").Status {
+        const journal = @import("relational_index/delivery_journal.zig");
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         if (remaining_ms == 0) return error.Timeout;
         try request.signed.verify();
@@ -1196,8 +1196,8 @@ pub const MetadataHttpClient = struct {
         if (!(parsed.value.isAccepted(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
         return parsed.value;
     }
-    pub fn relationalIndexSourceAcceptanceStatus(self: *MetadataHttpClient, base_uri: []const u8, query: @import("relational_index_delivery_journal.zig").Query, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_delivery_journal.zig").Status {
-        const journal = @import("relational_index_delivery_journal.zig");
+    pub fn relationalIndexSourceAcceptanceStatus(self: *MetadataHttpClient, base_uri: []const u8, query: @import("relational_index/delivery_journal.zig").Query, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index/delivery_journal.zig").Status {
+        const journal = @import("relational_index/delivery_journal.zig");
         if (remaining_ms == 0) return error.Timeout;
         try query.validate();
         const observed = try self.readSystemCatalog(base_uri, .{ .relational_index_source_accept_status = query }, remaining_ms, cancellation);
@@ -1212,8 +1212,8 @@ pub const MetadataHttpClient = struct {
         }
         return parsed.value;
     }
-    pub fn completeRelationalIndexSourceControlled(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_delivery_journal.zig").CompletionRequest, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_delivery_journal.zig").Status {
-        const journal = @import("relational_index_delivery_journal.zig");
+    pub fn completeRelationalIndexSourceControlled(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index/delivery_journal.zig").CompletionRequest, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index/delivery_journal.zig").Status {
+        const journal = @import("relational_index/delivery_journal.zig");
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         if (remaining_ms == 0) return error.Timeout;
         try request.validate();
@@ -1226,8 +1226,8 @@ pub const MetadataHttpClient = struct {
         return parsed.value;
     }
 
-    pub fn relationalIndexStatus(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_publication.zig").StatusRequest, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_publication.zig").AdmissionStatus {
-        const publication = @import("relational_index_publication.zig");
+    pub fn relationalIndexStatus(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index/publication.zig").StatusRequest, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index/publication.zig").AdmissionStatus {
+        const publication = @import("relational_index/publication.zig");
         try request.validate();
         const observed = try self.readSystemCatalog(base_uri, .{ .relational_index_status = request }, remaining_ms, cancellation);
         defer observed.deinit(self.alloc);
@@ -1239,8 +1239,8 @@ pub const MetadataHttpClient = struct {
         return parsed.value;
     }
 
-    pub fn relationalIndexAdmissionStatus(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_publication.zig").AdmissionRequest, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_publication.zig").AdmissionStatus {
-        const publication = @import("relational_index_publication.zig");
+    pub fn relationalIndexAdmissionStatus(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index/publication.zig").AdmissionRequest, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index/publication.zig").AdmissionStatus {
+        const publication = @import("relational_index/publication.zig");
         try request.validate();
         const observed = try self.readSystemCatalog(base_uri, .{ .relational_index_admission_status = request }, remaining_ms, cancellation);
         defer observed.deinit(self.alloc);
@@ -1252,8 +1252,8 @@ pub const MetadataHttpClient = struct {
         return parsed.value;
     }
 
-    pub fn relationalIndexOwnerAckStatus(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_publication.zig").Ack, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_publication.zig").AckStatus {
-        const publication = @import("relational_index_publication.zig");
+    pub fn relationalIndexOwnerAckStatus(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index/publication.zig").Ack, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index/publication.zig").AckStatus {
+        const publication = @import("relational_index/publication.zig");
         try request.validate();
         const observed = try self.readSystemCatalog(base_uri, .{ .relational_index_owner_ack_status = request }, remaining_ms, cancellation);
         defer observed.deinit(self.alloc);
@@ -1303,9 +1303,9 @@ pub const MetadataHttpClient = struct {
         if (input.isSchemaValidationCall()) {
             if (response.status != 200) {
                 if (input == .scope_retirement_prepare or input == .scope_retirement_work or input == .scope_retirement_manifest or input == .scope_retirement_observation) {
-                    if (@import("scope_retirement_wire.zig").definiteHttpFailure(response.status, response.body)) |err| return err;
+                    if (@import("retirement/scope/wire.zig").definiteHttpFailure(response.status, response.body)) |err| return err;
                 }
-                return @import("schema_validation_read.zig").ownerReadHttpFailure(response.status, response.body) orelse error.RemoteUnavailable;
+                return @import("schema_validation/read.zig").ownerReadHttpFailure(response.status, response.body) orelse error.RemoteUnavailable;
             }
             const media = responseHeader(response, "content-type") orelse return error.InvalidGenerationPublication;
             const token = std.mem.trim(u8, media[0 .. std.mem.indexOfScalar(u8, media, ';') orelse media.len], " \t");
@@ -1318,7 +1318,7 @@ pub const MetadataHttpClient = struct {
             if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
             if (response.status == 405 and std.mem.eql(u8, response.body, "ExtensionOwnedObject")) return error.ExtensionOwnedObject;
         }
-        if (input.isRelationalIndexOwnerCall()) if (@import("relational_index_publication.zig").ownerAckHttpFailure(response.status, response.body)) |err| return err;
+        if (input.isRelationalIndexOwnerCall()) if (@import("relational_index/publication.zig").ownerAckHttpFailure(response.status, response.body)) |err| return err;
         if (response.status != 200) return switch (response.status) {
             // Older peers reject an unknown private Call tag before dispatch.
             // Only this exact response permits the authoritative legacy read;
@@ -1391,11 +1391,11 @@ pub const MetadataHttpClient = struct {
         };
     }
 
-    pub fn readSchemaValidationOwnerControl(self: *MetadataHttpClient, base_uri: []const u8, request: @import("schema_validation_read.zig").OwnerReadRequest, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !std.json.Parsed(@import("schema_validation_read.zig").OwnerControlRead) {
+    pub fn readSchemaValidationOwnerControl(self: *MetadataHttpClient, base_uri: []const u8, request: @import("schema_validation/read.zig").OwnerReadRequest, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !std.json.Parsed(@import("schema_validation/read.zig").OwnerControlRead) {
         if (request.projection != .control) return error.InvalidGenerationPublication;
         const read = try self.readSystemCatalog(base_uri, .{ .schema_validation_owner_read = request }, remaining_ms, cancellation);
         defer read.deinit(self.alloc);
-        var parsed = std.json.parseFromSlice(@import("schema_validation_read.zig").OwnerControlRead, self.alloc, read.body, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        var parsed = std.json.parseFromSlice(@import("schema_validation/read.zig").OwnerControlRead, self.alloc, read.body, .{ .allocate = .alloc_always }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidGenerationPublication,
         };
@@ -1404,7 +1404,7 @@ pub const MetadataHttpClient = struct {
         return parsed;
     }
 
-    pub fn readSchemaValidationOwnerInputs(self: *MetadataHttpClient, base_uri: []const u8, request: @import("schema_validation_read.zig").OwnerReadRequest, expected_digest: [32]u8, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
+    pub fn readSchemaValidationOwnerInputs(self: *MetadataHttpClient, base_uri: []const u8, request: @import("schema_validation/read.zig").OwnerReadRequest, expected_digest: [32]u8, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
         if (request.projection != .inputs or std.mem.allEqual(u8, &expected_digest, 0)) return error.InvalidGenerationPublication;
         const read = try self.readSystemCatalog(base_uri, .{ .schema_validation_owner_read = request }, remaining_ms, cancellation);
         errdefer read.deinit(self.alloc);
@@ -1414,10 +1414,10 @@ pub const MetadataHttpClient = struct {
         return read.body;
     }
 
-    pub fn readSchemaValidationReceipt(self: *MetadataHttpClient, base_uri: []const u8, request: @import("schema_validation_receipt.zig").Request, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !std.json.Parsed(@import("schema_validation_receipt.zig").Observation) {
+    pub fn readSchemaValidationReceipt(self: *MetadataHttpClient, base_uri: []const u8, request: @import("schema_validation/receipt.zig").Request, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !std.json.Parsed(@import("schema_validation/receipt.zig").Observation) {
         const read = try self.readSystemCatalog(base_uri, .{ .schema_validation_receipt_read = request }, remaining_ms, cancellation);
         defer read.deinit(self.alloc);
-        var parsed = std.json.parseFromSlice(@import("schema_validation_receipt.zig").Observation, self.alloc, read.body, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        var parsed = std.json.parseFromSlice(@import("schema_validation/receipt.zig").Observation, self.alloc, read.body, .{ .allocate = .alloc_always }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidGenerationPublication,
         };
@@ -1426,16 +1426,16 @@ pub const MetadataHttpClient = struct {
         return parsed;
     }
 
-    pub fn readSchemaValidationRestoration(self: *MetadataHttpClient, base_uri: []const u8, lookup: @import("schema_validation_read.zig").Lookup, image: @import("schema_validation_read.zig").ImageIdentity, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !std.json.Parsed(?@import("schema_validation_read.zig").RestorationControl) {
+    pub fn readSchemaValidationRestoration(self: *MetadataHttpClient, base_uri: []const u8, lookup: @import("schema_validation/read.zig").Lookup, image: @import("schema_validation/read.zig").ImageIdentity, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !std.json.Parsed(?@import("schema_validation/read.zig").RestorationControl) {
         const response = try self.readSystemCatalog(base_uri, .{ .schema_validation_owner_read = .{ .lookup = lookup, .ordinal = 0, .projection = .parent, .source_image = image } }, remaining_ms, cancellation);
         defer response.deinit(self.alloc);
-        var parsed = std.json.parseFromSlice(?@import("schema_validation_read.zig").RestorationControl, self.alloc, response.body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidGenerationPublication;
+        var parsed = std.json.parseFromSlice(?@import("schema_validation/read.zig").RestorationControl, self.alloc, response.body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidGenerationPublication;
         errdefer parsed.deinit();
         if (parsed.value) |value| try value.requireFor(lookup, image);
         return parsed;
     }
 
-    pub fn readSchemaValidationRecoveryInputs(self: *MetadataHttpClient, base_uri: []const u8, parent: @import("schema_validation_parent.zig").Request, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
+    pub fn readSchemaValidationRecoveryInputs(self: *MetadataHttpClient, base_uri: []const u8, parent: @import("schema_validation/parent.zig").Request, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
         try parent.validate();
         const response = try self.readSystemCatalog(base_uri, .{ .schema_validation_owner_read = .{ .lookup = parent.lookup, .ordinal = parent.ordinal, .projection = .recovery_inputs, .source_image = try parent.image() } }, remaining_ms, cancellation);
         errdefer response.deinit(self.alloc);
@@ -1445,18 +1445,18 @@ pub const MetadataHttpClient = struct {
         return response.body;
     }
 
-    pub fn readSchemaValidationReplay(self: *MetadataHttpClient, base_uri: []const u8, lookup: @import("schema_validation_read.zig").Lookup, address: @import("schema_validation_read.zig").OwnerAddress, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !std.json.Parsed(?@import("schema_validation_read.zig").ReplayControl) {
+    pub fn readSchemaValidationReplay(self: *MetadataHttpClient, base_uri: []const u8, lookup: @import("schema_validation/read.zig").Lookup, address: @import("schema_validation/read.zig").OwnerAddress, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !std.json.Parsed(?@import("schema_validation/read.zig").ReplayControl) {
         const response = try self.readSystemCatalog(base_uri, .{ .schema_validation_owner_read = .{ .lookup = lookup, .ordinal = 0, .projection = .replay, .source_owner = address } }, remaining_ms, cancellation);
         defer response.deinit(self.alloc);
-        var parsed = std.json.parseFromSlice(?@import("schema_validation_read.zig").ReplayControl, self.alloc, response.body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidGenerationPublication;
+        var parsed = std.json.parseFromSlice(?@import("schema_validation/read.zig").ReplayControl, self.alloc, response.body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidGenerationPublication;
         errdefer parsed.deinit();
         if (parsed.value) |value| try value.requireFor(lookup, address);
         return parsed;
     }
 
-    pub fn readSchemaValidationReplayInputs(self: *MetadataHttpClient, base_uri: []const u8, control: @import("schema_validation_read.zig").ReplayControl, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
-        const lookup = @import("schema_validation_read.zig").Lookup.fromHead(control.head);
-        const address = @import("schema_validation_read.zig").OwnerAddress.fromBinding(control.owner.binding);
+    pub fn readSchemaValidationReplayInputs(self: *MetadataHttpClient, base_uri: []const u8, control: @import("schema_validation/read.zig").ReplayControl, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
+        const lookup = @import("schema_validation/read.zig").Lookup.fromHead(control.head);
+        const address = @import("schema_validation/read.zig").OwnerAddress.fromBinding(control.owner.binding);
         try control.requireFor(lookup, address);
         const response = try self.readSystemCatalog(base_uri, .{ .schema_validation_owner_read = .{ .lookup = lookup, .ordinal = control.owner.ordinal, .projection = .replay_inputs, .source_owner = address } }, remaining_ms, cancellation);
         errdefer response.deinit(self.alloc);
@@ -1488,7 +1488,7 @@ pub const MetadataHttpClient = struct {
     /// a new one for an uncertain operation. Full command decoding remains on
     /// submission so large binary admission inputs are parsed only once.
     pub fn prepareSchemaValidationGrant(self: *MetadataHttpClient, command: []const u8, setting_admin: bool) ![]u8 {
-        const ledger = @import("schema_validation_ledger.zig");
+        const ledger = @import("schema_validation/ledger.zig");
         if (command.len == 0 or command.len > ledger.max_command_bytes) return error.InvalidGenerationPublication;
         if (setting_admin != ledger.requiresAdmissionAuthority(command)) return error.Forbidden;
         const authority = @import("../system_catalog/setting_authority.zig");
@@ -1504,8 +1504,8 @@ pub const MetadataHttpClient = struct {
 
     fn submitSchemaValidationGranted(self: *MetadataHttpClient, base_uri: []const u8, command: []const u8, grant: []const u8, remaining_ms: u32, setting_admin: bool, cancellation: ?*const http_common.RequestCancellation, delivery: *http_common.RequestDeliveryTracker, verify_grant: bool, submitted: ?*bool) ![]u8 {
         delivery.markNotSent();
-        const ledger = @import("schema_validation_ledger.zig");
-        const receipts = @import("schema_validation_receipt.zig");
+        const ledger = @import("schema_validation/ledger.zig");
+        const receipts = @import("schema_validation/receipt.zig");
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         if (remaining_ms == 0) return error.Timeout;
         if (command.len == 0 or command.len > ledger.max_command_bytes) return error.InvalidGenerationPublication;
@@ -1591,9 +1591,9 @@ pub const MetadataHttpClient = struct {
                 if (@import("query_population_job.zig").definiteHttpFailure(response.status, response.body)) |err| return err;
             }
             if (std.mem.eql(u8, path, routes.Routes.internal_scope_retirement)) {
-                if (@import("scope_retirement_wire.zig").definiteHttpFailure(response.status, response.body)) |err| return err;
+                if (@import("retirement/scope/wire.zig").definiteHttpFailure(response.status, response.body)) |err| return err;
             }
-            if (@import("schema_validation_read.zig").ownerReadHttpFailure(response.status, response.body)) |err| return err;
+            if (@import("schema_validation/read.zig").ownerReadHttpFailure(response.status, response.body)) |err| return err;
             return error.MetadataMutationOutcomeUnknown;
         }
         if (response.status < 200 or response.status >= 300 or !std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_committed)) return error.MetadataMutationOutcomeUnknown;
@@ -1603,8 +1603,8 @@ pub const MetadataHttpClient = struct {
         return self.alloc.dupe(u8, response.body) catch return error.MetadataMutationOutcomeUnknown;
     }
 
-    fn submitScopeRetirementWithControl(self: *MetadataHttpClient, base_uri: []const u8, request: @import("scope_retirement_wire.zig").Request, remaining_ms: u32, setting_admin: bool, control: CatalogControl) ![]u8 {
-        const wire = @import("scope_retirement_wire.zig");
+    fn submitScopeRetirementWithControl(self: *MetadataHttpClient, base_uri: []const u8, request: @import("retirement/scope/wire.zig").Request, remaining_ms: u32, setting_admin: bool, control: CatalogControl) ![]u8 {
+        const wire = @import("retirement/scope/wire.zig");
         if (!setting_admin) return error.Forbidden;
         if (remaining_ms == 0) return error.Timeout;
         if (control.cancellation) |value| if (value.isCancelled()) return error.Cancelled;
@@ -1637,16 +1637,16 @@ pub const MetadataHttpClient = struct {
         if (!setting_admin) return error.Forbidden;
         if (remaining_ms == 0) return error.Timeout;
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
-        var input = try @import("table_retirement_ledger.zig").Input.parse(self.alloc, command);
+        var input = try @import("retirement/table/ledger.zig").Input.parse(self.alloc, command);
         defer input.deinit();
-        const expected = try @import("table_retirement_receipt.zig").Request.fromInput(&input);
+        const expected = try @import("retirement/table/receipt.zig").Request.fromInput(&input);
         const authority = @import("../system_catalog/setting_authority.zig");
         const grant = try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .admin, command, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
         defer self.alloc.free(grant);
         var delivery: http_common.RequestDeliveryTracker = .{};
         const bytes = try self.executeLifecycleSubmission(base_uri, routes.Routes.internal_table_retirement, command, grant, remaining_ms, cancellation, &delivery, 32768, control.submitted);
         errdefer self.alloc.free(bytes);
-        var observed = std.json.parseFromSlice(@import("table_retirement_receipt.zig").Observation, self.alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+        var observed = std.json.parseFromSlice(@import("retirement/table/receipt.zig").Observation, self.alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
         defer observed.deinit();
         observed.value.requireFor(expected) catch return error.MetadataMutationOutcomeUnknown;
         if (!observed.value.accepted) return error.MetadataMutationOutcomeUnknown;
@@ -1722,7 +1722,7 @@ pub const MetadataHttpClient = struct {
             if (response.status == 400 and std.mem.eql(u8, response.body, "InvalidRowPolicyPublication")) return error.InvalidRowPolicyPublication;
             if (response.status == 400 and std.mem.eql(u8, response.body, "InvalidRowPolicyRecord")) return error.InvalidRowPolicyRecord;
         }
-        if (input.isRelationalIndexOwnerCall()) if (@import("relational_index_publication.zig").ownerAckHttpFailure(response.status, response.body)) |err| return err;
+        if (input.isRelationalIndexOwnerCall()) if (@import("relational_index/publication.zig").ownerAckHttpFailure(response.status, response.body)) |err| return err;
         if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
         return switch (response.status) {
             400 => if (input == .store_root_enroll and std.mem.eql(u8, response.body, "InvalidStoreRootEnrollment"))
@@ -5181,9 +5181,9 @@ test "system catalog index prepare unsupported owner returns after one request" 
 
 test "system catalog schema validation binary submissions bind raw grants exact receipts and single attempt delivery" {
     const a = std.testing.allocator;
-    const ledger = @import("schema_validation_ledger.zig");
-    const barriers = @import("schema_validation_publication.zig");
-    const receipts = @import("schema_validation_receipt.zig");
+    const ledger = @import("schema_validation/ledger.zig");
+    const barriers = @import("schema_validation/publication.zig");
+    const receipts = @import("schema_validation/receipt.zig");
     const authority = @import("../system_catalog/setting_authority.zig");
     const Executor = struct {
         command: []const u8,
@@ -5311,7 +5311,7 @@ test "system catalog schema validation binary submissions bind raw grants exact 
     executor.not_sent = false;
     // Framing contract only: deliberately unsigned preparation fixtures are
     // not physical admission evidence. ASVI includes non-UTF-8 catalog bytes.
-    var fixture = try @import("schema_validation_plan.zig").test_support.PlanFixture.init(a);
+    var fixture = try @import("schema_validation/plan.zig").test_support.PlanFixture.init(a);
     defer fixture.deinit();
     const native = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
     const input = try native.encodeInputs(a, .{ fixture.plan().before.schema_json, fixture.plan().after.schema_json, "\x00\xffcatalog", "[\"id\"]" });
@@ -5320,9 +5320,9 @@ test "system catalog schema validation binary submissions bind raw grants exact 
         intent.binding.inputs = native.hash(input);
         intent.binding.fence.catalog_digest = native.hash("\x00\xffcatalog");
     }
-    var prepared = try @import("schema_validation_plan.zig").Prepared.init(a, fixture.plan());
+    var prepared = try @import("schema_validation/plan.zig").Prepared.init(a, fixture.plan());
     defer prepared.deinit();
-    const unsigned: @import("schema_validation_attestation.zig").SignedPreparation = .{
+    const unsigned: @import("schema_validation/attestation.zig").SignedPreparation = .{
         .value = .{ .binding = prepared.owners[0].binding, .physical_root_incarnation = prepared.owners[0].physical_root_incarnation, .position = null },
         .proof = .{
             .identity = .{ .metadata_incarnation = prepared.head.metadata_incarnation, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = @splat(0) },
@@ -5348,8 +5348,8 @@ test "system catalog schema validation binary submissions bind raw grants exact 
 
 test "system catalog schema validation client binds exact identity projection frames and negative replies" {
     const a = std.testing.allocator;
-    const read_contract = @import("schema_validation_read.zig");
-    const plan = @import("schema_validation_plan.zig");
+    const read_contract = @import("schema_validation/read.zig");
+    const plan = @import("schema_validation/plan.zig");
     const native = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
     var fixture = try plan.test_support.PlanFixture.init(a);
     defer fixture.deinit();
@@ -5367,8 +5367,8 @@ test "system catalog schema validation client binds exact identity projection fr
     var request: read_contract.OwnerReadRequest = .{ .lookup = .fromHead(prepared.head), .ordinal = 0 };
     const Executor = struct {
         expected: read_contract.OwnerReadRequest,
-        receipt_expected: ?@import("schema_validation_receipt.zig").Request = null,
-        work_expected: ?@import("schema_validation_work.zig").Query = null,
+        receipt_expected: ?@import("schema_validation/receipt.zig").Request = null,
+        work_expected: ?@import("schema_validation/work.zig").Query = null,
         body: []const u8,
         media: ?[]const u8 = null,
         media_field: bool = false,
@@ -5381,7 +5381,7 @@ test "system catalog schema validation client binds exact identity projection fr
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             try std.testing.expect(req.header(internal_service_auth.header_name) != null);
-            try std.testing.expectEqual(@as(?usize, if (self.work_expected != null) @import("schema_validation_work.zig").max_wire_bytes else if (self.receipt_expected != null) 16 * 1024 else self.expected.responseLimit()), req.max_response_bytes);
+            try std.testing.expectEqual(@as(?usize, if (self.work_expected != null) @import("schema_validation/work.zig").max_wire_bytes else if (self.receipt_expected != null) 16 * 1024 else self.expected.responseLimit()), req.max_response_bytes);
             try std.testing.expectEqualStrings("0", req.header(routes.Routes.raft_mutation_forwards_remaining_header).?);
             try std.testing.expectEqualStrings("false", req.header(routes.Routes.raft_mutation_campaign_allowed_header).?);
             const authority = @import("../system_catalog/setting_authority.zig");
@@ -5497,7 +5497,7 @@ test "system catalog schema validation client binds exact identity projection fr
     const before_loss = executor.calls;
     try std.testing.expectError(error.ConnectionResetByPeer, client.readSchemaValidationOwnerInputs("http://metadata.invalid", request, native.hash(frame), 25, null));
     try std.testing.expectEqual(before_loss + 1, executor.calls);
-    const receipts = @import("schema_validation_receipt.zig");
+    const receipts = @import("schema_validation/receipt.zig");
     const receipt_request: receipts.Request = .{ .lookup = request.lookup, .expected = .admission };
     executor.lose_reply = false;
     executor.receipt_expected = receipt_request;
@@ -5527,15 +5527,15 @@ test "system catalog schema validation client binds exact identity projection fr
     // Restoration must not first ask the departed source for ordinary owner
     // permission. The historical image lookup returns one coherent current
     // predecessor, while its raw immutable input stays on the binary path.
-    const attestation = @import("schema_validation_attestation.zig");
+    const attestation = @import("schema_validation/attestation.zig");
     const root_seed: [32]u8 = @splat(9);
     const root: @import("antfly_local_sources").storage_db_root_signing_identity.State = .{ .seed = root_seed, .root_incarnation = 7, .public_key = (try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(root_seed)).public_key.toBytes() };
     const owner = prepared.owners[1];
-    const parent: @import("schema_validation_parent.zig").Request = .{
+    const parent: @import("schema_validation/parent.zig").Request = .{
         .lookup = request.lookup,
         .ordinal = owner.ordinal,
         .revision = prepared.head.revision,
-        .owner_digest = try @import("schema_validation_parent.zig").ownerDigest(owner, prepared.head),
+        .owner_digest = try @import("schema_validation/parent.zig").ownerDigest(owner, prepared.head),
         .signed = try attestation.SignedSnapshotParent.sign(.{
             .binding = owner.binding,
             .origin = .{ .physical_root_incarnation = owner.physical_root_incarnation, .namespace = owner.binding.fence.namespace, .authority = null, .applied = .{ .term = 2, .index = 1 }, .schema_header = null, .transaction_directory = null, .schema_outcomes = null },
@@ -5597,7 +5597,7 @@ test "system catalog schema validation client binds exact identity projection fr
     try std.testing.expectEqualSlices(u8, frame, replay_input);
     executor.body = corrupt;
     try std.testing.expectError(error.InvalidSchemaValidationJob, client.readSchemaValidationReplayInputs("http://metadata.invalid", replay_control, 25, null));
-    const work = @import("schema_validation_work.zig");
+    const work = @import("schema_validation/work.zig");
     const work_query: work.Query = .{ .group = request.lookup.group, .metadata_incarnation = request.lookup.metadata_incarnation };
     const work_bytes = try std.json.Stringify.valueAlloc(a, work.Page{}, .{});
     defer a.free(work_bytes);
@@ -5622,7 +5622,7 @@ test "system catalog schema validation client binds exact identity projection fr
 }
 
 fn catalogResponseLimit(input: @import("../system_catalog/server_call.zig").Call) ?usize {
-    const publication = @import("relational_index_publication.zig");
+    const publication = @import("relational_index/publication.zig");
     return switch (input) {
         .sql_index_annotations => @import("antfly_local_sources").system_catalog_domain.object_annotations.max_index_description_bytes,
         .relational_index_prepare => publication.PrepareCut.max_wire_bytes,
@@ -5633,26 +5633,26 @@ fn catalogResponseLimit(input: @import("../system_catalog/server_call.zig").Call
         .schema_validation_owner_read => |request| request.responseLimit(),
         .schema_validation_receipt_read => 16 * 1024,
         .schema_validation_discover => 1024,
-        .schema_validation_work => @import("schema_validation_work.zig").max_wire_bytes,
-        .schema_validation_prepare => @import("schema_validation_admission.zig").max_wire_bytes,
+        .schema_validation_work => @import("schema_validation/work.zig").max_wire_bytes,
+        .schema_validation_prepare => @import("schema_validation/admission.zig").max_wire_bytes,
         .scope_retirement_work => 8192,
         .sql_relation_boot_read => |query| if (query.recovery_capture != null) @import("../system_catalog/trigger_snapshot.zig").max_snapshot_bytes else 64 * 1024,
         .sql_relation_boot_submit => 64 * 1024,
         .sql_graph_preparation_read => @import("../system_catalog/trigger_snapshot.zig").max_snapshot_bytes + 512,
         .sql_graph_preparation_admit, .sql_graph_preparation_outcome => @import("../system_catalog/sequence_outcomes.zig").max_record_bytes,
-        .sql_relation_lifetime_page => 128 * @import("sql_relation_lifetimes.zig").max_record_bytes,
+        .sql_relation_lifetime_page => 128 * @import("sql/relation_lifecycle/lifetimes.zig").max_record_bytes,
         .scope_retirement_prepare, .scope_retirement_manifest => @import("antfly_local_sources").system_catalog_domain.scope_retirement.max_manifest_bytes,
         .scope_retirement_observation => 16384,
-        .table_retirement_prepare, .table_retirement_effects => @import("table_retirement_manifest.zig").max_bytes,
+        .table_retirement_prepare, .table_retirement_effects => @import("retirement/table/manifest.zig").max_bytes,
         .sql_sequence_snapshot => |request| if (request.prepare_retirement) @import("../system_catalog/sequence_catalog.zig").Snapshot.max_retirement_bytes else null,
-        .schema_validation_status => @import("schema_validation_admission.zig").Status.max_wire_bytes,
+        .schema_validation_status => @import("schema_validation/admission.zig").Status.max_wire_bytes,
         else => null,
     };
 }
 
 test "relational index publication ACK client binds read grants and never retries an ambiguous mutation" {
     const alloc = std.testing.allocator;
-    const publication = @import("relational_index_publication.zig");
+    const publication = @import("relational_index/publication.zig");
     const authority = @import("../system_catalog/setting_authority.zig");
     const Executor = struct {
         body: []const u8,
@@ -5723,7 +5723,7 @@ test "relational index publication ACK client binds read grants and never retrie
     try std.testing.expectEqual(@as(usize, 6), executor.calls);
     // Synthetic accepted head qualifies transport ownership and cluster binding,
     // not delivery authority or a durable metadata acceptance transaction.
-    const journal = @import("relational_index_delivery_journal.zig");
+    const journal = @import("relational_index/delivery_journal.zig");
     var accepted_head: journal.Head = .{ .metadata_incarnation = @splat('1'), .binding_digest = @splat(2), .scope_digest = @splat(3), .ordinal = 1, .rows = 0, .batch_rows = 0, .source_sequence = 4, .batch_digest = @splat(5), .logical_digest = @splat(6), .previous_decision = @splat(0), .decision_digest = @splat(0), .accepted_root = @splat(7), .provenance = @splat(0), .previous_rows = 0, .previous_provenance = @splat(0), .state = .ready };
     accepted_head.decision_digest = accepted_head.accepted().computedDigest();
     var provenance = std.crypto.hash.Blake3.init(.{});
@@ -6092,7 +6092,7 @@ test "table retirement manifest HTTP reads bind authority incarnation response l
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
-            try std.testing.expectEqual(@as(?usize, @import("table_retirement_manifest.zig").max_bytes), request.max_response_bytes);
+            try std.testing.expectEqual(@as(?usize, @import("retirement/table/manifest.zig").max_bytes), request.max_response_bytes);
             try authority.verify("retirement-secret", "retirement", .admin, request.body, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name) orelse return error.TestUnexpectedResult);
             const headers = try alloc.alloc(http_common.Header, 2);
             var initialized: usize = 0;

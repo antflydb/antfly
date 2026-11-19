@@ -171,7 +171,7 @@ fn expectClosedDiagnostic(ids: []const []const u8, code: []const u8) !void {
     var handler: Handler = .{ .api_server = &server };
     for (ids) |id| {
         errdefer std.debug.print("PostgreSQL syntax original {s}\\n", .{id});
-        try @import("sql_parity_reference.zig").expectRejection(a, &handler, id, code);
+        try @import("sql/testing/parity_reference.zig").expectRejection(a, &handler, id, code);
         try std.testing.expectEqual(@as(usize, 0), closed.calls);
     }
 }
@@ -558,7 +558,7 @@ fn runDocumentRootCase(a: std.mem.Allocator, corpus: anytype, golden: anytype, i
             try std.testing.expectEqual(entry.columns.len, result.value.columns.len);
             for (result.value.columns, entry.columns, entry.column_oids) |column, name, oid| {
                 try std.testing.expectEqualStrings(name, column.name);
-                try std.testing.expect(@import("sql_parity_reference.zig").postgresColumnMatches(column, oid));
+                try std.testing.expect(@import("sql/testing/parity_reference.zig").postgresColumnMatches(column, oid));
             }
             try std.testing.expectEqual(entry.rows.len, result.value.rows.len);
             const used = try arena.allocator().alloc(bool, entry.rows.len);
@@ -570,7 +570,7 @@ fn runDocumentRootCase(a: std.mem.Allocator, corpus: anytype, golden: anytype, i
                         if (std.mem.eql(u8, column.name, "_version") and !flag and !expected_flag) {
                             const version = if (cell == .string) try std.fmt.parseUnsigned(u64, cell.string, 10) else @as(u64, @intCast(cell.integer));
                             if (version != @as(u64, @intCast(expected.integer))) break false;
-                        } else if (!try @import("sql_parity_reference.zig").rowMatchesWithNulls(a, &.{column}, &.{cell}, &.{flag}, &.{expected}, &.{expected_flag})) break false;
+                        } else if (!try @import("sql/testing/parity_reference.zig").rowMatchesWithNulls(a, &.{column}, &.{cell}, &.{flag}, &.{expected}, &.{expected_flag})) break false;
                     } else true;
                     if (!matches) continue;
                     used[position] = true;
@@ -664,7 +664,7 @@ fn runDocumentRootCase(a: std.mem.Allocator, corpus: anytype, golden: anytype, i
         defer stored.deinit(a);
         var parsed = try std.json.parseFromSlice(std.json.Value, a, stored.json, .{});
         defer parsed.deinit();
-        try std.testing.expect(try @import("sql_parity_reference.zig").rowMatchesWithNulls(a, &.{.{ .name = "_doc", .type = .json }}, &.{parsed.value}, &.{false}, &.{want.value}, &.{false}));
+        try std.testing.expect(try @import("sql/testing/parity_reference.zig").rowMatchesWithNulls(a, &.{.{ .name = "_doc", .type = .json }}, &.{parsed.value}, &.{false}, &.{want.value}, &.{false}));
         version.* = stored.version orelse return error.MissingDocumentVersion;
         digest.* = stored.expected_content_digest orelse return error.MissingDocumentDigest;
         const untouched = if (entry.untouched) |keys| blk: {

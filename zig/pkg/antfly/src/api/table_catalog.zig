@@ -92,7 +92,7 @@ pub const CatalogSource = struct {
         /// Caller-owned bounded allocation region; the vote must be read before
         /// storage owner fences are acquired. No routing-cache fallback exists.
         graph_preparation_read: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../system_catalog/graph_preparation.zig").Source, deadline_ns: ?u64) anyerror!@import("../system_catalog/graph_preparation.zig").Prepared = null,
-        sql_relation_boot: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) anyerror!@import("../metadata/sql_relation_boots.zig").Observation = null,
+        sql_relation_boot: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql/relation_lifecycle/boots.zig").Query, deadline_ns: ?u64) anyerror!@import("../metadata/sql/relation_lifecycle/boots.zig").Observation = null,
         restore_scope_for_group: ?*const fn (ptr: *anyopaque, table_name: []const u8, group_id: u64) anyerror!?[32]u8 = null,
         restore_plan_for_group: ?*const fn (ptr: *anyopaque, table_name: []const u8, group_id: u64) anyerror!?[16]u8 = null,
         /// Snapshot slices and all transitively referenced bytes must remain
@@ -148,7 +148,7 @@ pub const CatalogSource = struct {
     };
 
     /// Only lifetime operations pay for this compact linearizable boot read.
-    pub fn sqlRelationBoot(self: CatalogSource, alloc: std.mem.Allocator, node: u64, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+    pub fn sqlRelationBoot(self: CatalogSource, alloc: std.mem.Allocator, node: u64, deadline_ns: ?u64) !@import("../metadata/sql/relation_lifecycle/boots.zig").Observation {
         return self.sqlRelationBinding(alloc, .{ .node = node }, deadline_ns);
     }
 
@@ -164,7 +164,7 @@ pub const CatalogSource = struct {
         return result;
     }
 
-    pub fn sqlRelationBinding(self: CatalogSource, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+    pub fn sqlRelationBinding(self: CatalogSource, alloc: std.mem.Allocator, query: @import("../metadata/sql/relation_lifecycle/boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql/relation_lifecycle/boots.zig").Observation {
         const observe = self.vtable.sql_relation_boot orelse return error.SqlRelationOwnerChanged;
         try self.budget(deadline_ns).checkpoint();
         return observe(self.ptr, alloc, query, deadline_ns);
@@ -780,7 +780,7 @@ pub const RoutingSession = struct {
         return cast(ptr).base.graphPreparationRead(alloc, request, deadline_ns);
     }
 
-    fn sqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+    fn sqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql/relation_lifecycle/boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql/relation_lifecycle/boots.zig").Observation {
         return cast(ptr).base.sqlRelationBinding(alloc, query, deadline_ns);
     }
 
@@ -3099,22 +3099,22 @@ fn metadataServerGraphPreparationRead(ptr: *anyopaque, alloc: std.mem.Allocator,
     return readGraphPreparation(@import("http_server.zig").StatusSource.fromMetadataHttpService(server.svc), alloc, request, deadline_ns);
 }
 
-fn readSqlRelationBoot(source: @import("http_server.zig").StatusSource, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+fn readSqlRelationBoot(source: @import("http_server.zig").StatusSource, alloc: std.mem.Allocator, query: @import("../metadata/sql/relation_lifecycle/boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql/relation_lifecycle/boots.zig").Observation {
     const bytes = try source.systemCatalog(alloc, .{ .setting_admin = true, .deadline_ns = deadline_ns }, .{ .sql_relation_boot_read = query });
     defer alloc.free(bytes);
-    var parsed = try std.json.parseFromSlice(@import("../metadata/sql_relation_boots.zig").Observation, alloc, bytes, .{});
+    var parsed = try std.json.parseFromSlice(@import("../metadata/sql/relation_lifecycle/boots.zig").Observation, alloc, bytes, .{});
     defer parsed.deinit();
     return parsed.value;
 }
-fn metadataServiceSqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+fn metadataServiceSqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql/relation_lifecycle/boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql/relation_lifecycle/boots.zig").Observation {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
     return readSqlRelationBoot(@import("http_server.zig").StatusSource.fromMetadataService(svc), alloc, query, deadline_ns);
 }
-fn metadataHttpServiceSqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+fn metadataHttpServiceSqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql/relation_lifecycle/boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql/relation_lifecycle/boots.zig").Observation {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     return readSqlRelationBoot(@import("http_server.zig").StatusSource.fromMetadataHttpService(svc), alloc, query, deadline_ns);
 }
-fn metadataServerSqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+fn metadataServerSqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql/relation_lifecycle/boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql/relation_lifecycle/boots.zig").Observation {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     return readSqlRelationBoot(@import("http_server.zig").StatusSource.fromMetadataHttpService(srv.svc), alloc, query, deadline_ns);
 }

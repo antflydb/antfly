@@ -68,7 +68,7 @@ args = parser.parse_args()
 ROOT = args.repository_root.resolve()
 REFERENCE = (
     args.reference
-    or ROOT / "zig/pkg/antfly/src/api/fixtures/sql_extension_lifecycle_reference.json"
+    or ROOT / "zig/pkg/antfly/src/api/sql/testing/fixtures/sql_extension_lifecycle_reference.json"
 ).resolve()
 if args.postgres_bin is not None:
     PG = args.postgres_bin.resolve()
@@ -91,7 +91,7 @@ if hashlib.sha256(inventory_bytes).hexdigest() != INVENTORY_SHA256:
 inventory = json.loads(inventory_bytes)
 by_id = {entry["id"]: entry for entry in inventory["entries"]}
 originals_path = (
-    ROOT / "zig/pkg/antfly/src/api/fixtures/sql_extension_lifecycle_originals.json"
+    ROOT / "zig/pkg/antfly/src/api/sql/testing/fixtures/sql_extension_lifecycle_originals.json"
 )
 originals_fixture = json.loads(originals_path.read_bytes())
 actual_originals = {entry["id"]: entry for entry in originals_fixture["entries"]}

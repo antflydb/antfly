@@ -1548,7 +1548,7 @@ fn runPopulationPublicMode(comptime Driver: type, case_id: []const u8, document:
     server.restore_leadership_term.store(1, .release);
 
     const local = @import("antfly_local_sources");
-    const SourceTables = @import("sql_parity_sources.zig").Tables(2);
+    const SourceTables = @import("sql/testing/parity_sources.zig").Tables(2);
     var inputs: SourceTables = .{ .records = undefined, .reads = undefined };
     const profile = try std.json.parseFromSliceLeaky(struct { schema: std.json.Value, rows: []const struct { key: []const u8, value: std.json.Value } }, a, local.sql_parity_fixtures.read_campaign_profile, .{ .ignore_unknown_fields = true });
     var original = try db.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/source", .{root}), .{ .backend_runtime = &runtime, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });

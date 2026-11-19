@@ -294,8 +294,8 @@ test "SQL relation lifetime DDL preserves native intent and refuses backends wit
 const CreationFixture = struct {
     cfg: struct { trusted_principal_secret: ?[]const u8 = "configured-user-key", trusted_principal_issuer: ?[]const u8 = "issuer" } = .{},
     source: Source,
-    const boots = @import("../metadata/sql_relation_boots.zig");
-    const directory = @import("../metadata/sql_relation_lifetimes.zig");
+    const boots = @import("../metadata/sql/relation_lifecycle/boots.zig");
+    const directory = @import("../metadata/sql/relation_lifecycle/lifetimes.zig");
     const Source = struct {
         host: boots.Record,
         prior: ?lifetimes.Descriptor = null,

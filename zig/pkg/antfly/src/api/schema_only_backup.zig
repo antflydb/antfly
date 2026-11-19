@@ -29,7 +29,7 @@ pub fn capture(a: A, server: anytype, table: local.common_topology_records.Table
     context.setting_admin = true;
     const raw = try server.source.systemCatalog(a, context, .{ .sql_relation_boot_read = .{ .recovery_capture = .{ .table_id = table.table_id } } });
     defer a.free(raw);
-    var captured = try std.json.parseFromSlice(@import("../metadata/sql_relation_recovery_capture.zig").Capture, a, raw, .{});
+    var captured = try std.json.parseFromSlice(@import("../metadata/sql/relation_lifecycle/recovery_capture.zig").Capture, a, raw, .{});
     defer captured.deinit();
     const cut = captured.value;
     if (!eligible(cut.relation.record, format) or cut.relation.record.table_id != table.table_id or !std.mem.eql(u8, cut.relation.record.name, table.name) or cut.ranges.len != 1) return error.CatalogGenerationChanged;
@@ -41,6 +41,6 @@ pub fn capture(a: A, server: anytype, table: local.common_topology_records.Table
     if (range.start_key.len != 0 or range.end_key != null) return error.InvalidSqlRelationPersistence;
     var manifest = try backups.createManifest(a, backup_id, format, &cut.relation.record, &.{.{ .group_id = range.group_id, .range_id = range.range_id, .doc_identity_shard_id = range.doc_identity_shard_id, .doc_identity_range_id = range.doc_identity_range_id, .start_key = "", .snapshot_path = "" }});
     errdefer manifest.deinit(a);
-    try @import("sql_trigger_backup.zig").decorate(a, server.source, context, cut.relation.record, &manifest);
+    try @import("sql/triggers/backup.zig").decorate(a, server.source, context, cut.relation.record, &manifest);
     return manifest;
 }

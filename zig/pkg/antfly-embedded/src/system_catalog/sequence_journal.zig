@@ -49,7 +49,7 @@ pub const Request = struct {
     /// retried with a new revision/identity just because its reply was lost.
     request_id: [16]u8,
     operation: Operation,
-    command_fence: ?@import("../storage/pessimistic_lock_authority.zig").CommandFence = null,
+    command_fence: ?@import("../storage/pessimistic_lock/authority.zig").CommandFence = null,
 
     pub fn validate(self: Request) !void {
         if (self.expected.generation == 0 or self.expected.revision == 0 or

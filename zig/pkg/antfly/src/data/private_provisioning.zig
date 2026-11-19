@@ -52,7 +52,7 @@ pub const Owner = struct {
     bootstrap: @import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap,
     scope: @import("antfly_local_sources").storage_db_restore_staging_contract.Scope,
     cancel_recovery: bool = false,
-    native_reset: ?@import("../metadata/sql_relation_recovery.zig").Guard = null,
+    native_reset: ?@import("../metadata/sql/relation_lifecycle/recovery.zig").Guard = null,
 };
 pub const InitialOwner = struct {
     descriptor: staging.ProvisioningProjection.InitialFkOwner,

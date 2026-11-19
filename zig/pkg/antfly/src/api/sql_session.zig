@@ -325,7 +325,7 @@ pub const Coordinator = struct {
         // this authenticated immediate execution may reconstruct user authority;
         // recovery uses the existing external decision owner instead.
         const owner_tables = try @import("sql_relation_lifetimes.zig").attachOwnerMinters(server, proof_arena.allocator(), commit_context, plan.value);
-        const execution_tables = try @import("sql_trigger_authority.zig").attachMinters(server, proof_arena.allocator(), commit_context, owner_tables);
+        const execution_tables = try @import("sql/triggers/authority.zig").attachMinters(server, proof_arena.allocator(), commit_context, owner_tables);
         const outcome = (source.commitTransactionWithIdAndCancellation(alloc, id, info.begin_timestamp, execution_tables, frozen.sync_level, self.context.cancellation) catch |err| {
             if (transactions.classifyCommitRejection(info, err) == .fresh) {
                 _ = (server.txn_sessions.recordTerminalAbort(alloc, id) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };

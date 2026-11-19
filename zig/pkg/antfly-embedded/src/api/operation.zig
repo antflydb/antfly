@@ -142,7 +142,7 @@ pub const RequestContext = struct {
     } = null,
     /// Captured by the durable SQL command owner. Catalog adapters bind this
     /// into their existing mutation identities before any forwarding.
-    sql_command_fence: ?*const @import("../storage/pessimistic_lock_authority.zig").CommandFence = null,
+    sql_command_fence: ?*const @import("../storage/pessimistic_lock/authority.zig").CommandFence = null,
     /// Session identity captured from the authenticated durable connection
     /// under its command lease. Never parsed from public request JSON or
     /// borrowed from a cached table owner. Native host epochs are per table.

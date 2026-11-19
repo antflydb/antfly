@@ -53,7 +53,7 @@ fn expectSuccess(a: std.mem.Allocator, handler: *Handler, statement: []const u8,
 
 test "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes" {
     const a = std.testing.allocator;
-    const Source = @import("sql_parity_sources.zig").Tables(1);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
     var declaration = try local.sql_compiler.compile(a, "CREATE TABLE usage_records(id TEXT PRIMARY KEY,status TEXT DEFAULT 'initial',quantity BIGINT,amount BIGINT,enabled BOOLEAN)", .{});
     defer declaration.deinit();
     const schema = try local.sql_ddl_runtime.createSchemaAlloc(a, declaration.statement.create_table);
@@ -85,7 +85,7 @@ test "httpx SQL original conflict references reject ambiguity before reads and p
         const lookups = source.lookup_calls.load(.monotonic);
         for ([_][]const u8{ "sql-1388", "sql-1389", "sql-1391", "sql-1438", "sql-1444", "sql-1478", "sql-1479" }) |id| {
             errdefer std.debug.print("conflict scope original {s}, seeded={}\n", .{ id, seeded });
-            try @import("sql_parity_reference.zig").expectRejection(a, &handler, id, "42702");
+            try @import("sql/testing/parity_reference.zig").expectRejection(a, &handler, id, "42702");
             var after = try db.scan(a, "", "", .{ .include_documents = true, .limit = 10 });
             defer after.deinit(a);
             try std.testing.expectEqual(before.documents.len, after.documents.len);

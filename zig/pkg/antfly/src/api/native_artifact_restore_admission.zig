@@ -29,7 +29,7 @@ pub fn require(a: A, server: anytype, input: local.api_operation.RequestContext,
     try context.ensureActive();
     const bytes = try server.source.systemCatalog(a, context, .{ .sql_relation_boot_read = .{ .required_data_version = @import("../metadata/table_manager.zig").native_nonempty_restore_protocol_version } });
     defer a.free(bytes);
-    var observed = try std.json.parseFromSlice(@import("../metadata/sql_relation_boots.zig").Observation, a, bytes, .{});
+    var observed = try std.json.parseFromSlice(@import("../metadata/sql/relation_lifecycle/boots.zig").Observation, a, bytes, .{});
     defer observed.deinit();
     if (observed.value.data_version_ready != true) return error.NativeArtifactRestoreUpgradeRequired;
 }

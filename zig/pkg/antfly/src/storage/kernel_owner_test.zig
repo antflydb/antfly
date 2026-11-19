@@ -4001,7 +4001,7 @@ test "opaque metadata compound rewrite admission preserves job and source reserv
 
 test "opaque metadata schema validation reads cross compiled projection without activation" {
     const a = std.testing.allocator;
-    const read = @import("../metadata/schema_validation_read.zig");
+    const read = @import("../metadata/schema_validation/read.zig");
     const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4025,7 +4025,7 @@ test "opaque metadata schema validation reads cross compiled projection without 
 
 test "opaque metadata relational index controls cross compiled projection without mutation" {
     const alloc = std.testing.allocator;
-    const publication = @import("../metadata/relational_index_publication.zig");
+    const publication = @import("../metadata/relational_index/publication.zig");
     const protocol = @import("../metadata/topology_protocol.zig");
     const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
     var tmp = std.testing.tmpDir(.{});

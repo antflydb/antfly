@@ -616,7 +616,7 @@ const OwnedRead = struct {
         var moved = false;
         defer if (!moved) plan.release(server.sqlPlanCacheIo());
         if (plan.compiled().statement != .select and plan.compiled().statement != .copy_to) return null;
-        if (@import("sql_copy_server.zig").target(plan.compiled().statement) != null) return null;
+        if (@import("sql/copy/server.zig").target(plan.compiled().statement) != null) return null;
         var admission = try server.acquireSqlExecution(false);
         defer if (!moved) admission.release();
         const self = try alloc.create(OwnedRead);
@@ -1098,7 +1098,7 @@ const Credential = struct {
     /// A socket owns one native command identity, independently of its transaction.
     native_connection: ?[32]u8 = null,
     notification_interest: bool = false,
-    notification_observation: @import("sql_notification_hub.zig").Observation = .{},
+    notification_observation: @import("sql/notifications/hub.zig").Observation = .{},
 
     fn ensureNativeConnection(self: *Credential, server: *http.ApiHttpServer, identity_value: ?http.AuthenticatedIdentity, request: wire.Request) !?[32]u8 {
         if (!server.source.vtable.supports_sql_command_ownership) return null;
@@ -1323,7 +1323,7 @@ const Job = struct {
         defer if (!finished) command.finish() catch {};
         if (!try command.start(server, context, user, &lease, .{ .native_backend_identity = self.request.backend_pid })) return error.SqlConnectionUnavailable;
         var root: execution.Adapter = .{ .server = server, .identity = &user, .context = command.attach(context), .database = self.request.database orelse "default", .namespace = self.request.namespace orelse "public", .connection_id = id, .backend_pid = self.request.backend_pid };
-        if (try @import("sql_notification_execution.zig").bindIdentity(&root, self.alloc) == null) return error.TableTopologyProtocolUpgradeRequired;
+        if (try @import("sql/notifications/execution.zig").bindIdentity(&root, self.alloc) == null) return error.TableTopologyProtocolUpgradeRequired;
         try command.finish();
         finished = true;
     }
@@ -1341,7 +1341,7 @@ const Job = struct {
         var authority: Authority = .{ .credential = self.credential, .identity = &user, .request = self.request };
         var context = try (try authority.context()).platformDeadline();
         context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 250 * std.time.ns_per_ms);
-        const owner: @import("sql_notification_delivery.zig").Owner = .{ .server = server, .user = user, .context = context, .connection = id, .observation = &self.credential.notification_observation };
+        const owner: @import("sql/notifications/delivery.zig").Owner = .{ .server = server, .user = user, .context = context, .connection = id, .observation = &self.credential.notification_observation };
         switch (self.notification_control) {
             .poll => |maximum| {
                 self.notification_page = try owner.poll(self.alloc, null, maximum);
@@ -1541,7 +1541,7 @@ const Job = struct {
                 .cursor_readable = compiled.statement == .select,
                 .copy_out = if (compiled.statement == .copy_to and compiled.statement.copy_to.target == null) try compiled.statement.copy_to.options.clone(self.alloc) else null,
                 .copy_in = if (copy_columns != null and compiled.statement.copy_from.target == null) .{ .source_statement = if (compiled.statement.copy_from.predicate != null) try self.alloc.dupe(u8, self.request.statement) else null, .table = try cloneName(self.alloc, compiled.statement.copy_from.table), .columns = copy_columns.?, .options = try compiled.statement.copy_from.options.clone(self.alloc) } else null,
-                .columns = if (@import("sql_copy_server.zig").target(compiled.statement) != null) &.{} else columns,
+                .columns = if (@import("sql/copy/server.zig").target(compiled.statement) != null) &.{} else columns,
                 .parameter_types = if (copy_input != null) filter_types else parameter_types,
                 .parameter_descriptors = if (copy_input != null) filter_descriptors else owned_descriptors,
                 .binding_guard = if (hasViewBindings(captured_bindings.items)) try encodeViewBindings(self.alloc, captured_bindings.items) else try statementBindingGuard(self.alloc, native_adapter.revision, description.binding),
@@ -2631,7 +2631,7 @@ test "SQL pgwire native COPY originals stream PostgreSQL byte contracts over dur
     const db_mod = local.storage_db_selected_root.db;
     const raft = @import("../raft/mod.zig");
     const reads = @import("antfly_source_root").antfly_sources.table_reads;
-    const Source = @import("sql_parity_sources.zig").Tables(1);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
     const Copy = @import("../pgwire/copy_out.zig");
     const Reference = struct { rows: []const []const std.json.Value, profiles: []const struct { options: Copy.Options, sql: []const u8, hex: []const u8 } };
     const reference = try std.json.parseFromSlice(Reference, a, @embedFile("../pgwire/fixtures/copy_out_reference.json"), .{});

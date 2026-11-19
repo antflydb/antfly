@@ -18,11 +18,11 @@
 //! native source receipt, catalog image, transaction vote or successor image.
 const std = @import("std");
 const local = @import("antfly_local_sources");
-const scopes = @import("scope_retirement_ledger.zig");
-const lifetimes = @import("sql_relation_lifetimes.zig");
-const boots = @import("sql_relation_boots.zig");
-const recovery = @import("sql_relation_recovery.zig");
-const records = @import("schema_validation_publication.zig");
+const scopes = @import("retirement/scope/ledger.zig");
+const lifetimes = @import("sql/relation_lifecycle/lifetimes.zig");
+const boots = @import("sql/relation_lifecycle/boots.zig");
+const recovery = @import("sql/relation_lifecycle/recovery.zig");
+const records = @import("schema_validation/publication.zig");
 const A = std.mem.Allocator;
 
 pub const Checkpoint = struct {
@@ -221,7 +221,7 @@ pub fn removeSubject(txn: anytype, group: u64, table: u64) !void {
 /// Lost-TEMP children have no surviving physical parent namespace to mutate.
 /// Every declared FK parent must be another child of the same admitted scope;
 /// ordinary or external parents continue through genuine native retirement.
-pub fn requireManifest(reader: anytype, checkpoint: Checkpoint, manifest: @import("table_retirement_manifest.zig").Manifest) !void {
+pub fn requireManifest(reader: anytype, checkpoint: Checkpoint, manifest: @import("retirement/table/manifest.zig").Manifest) !void {
     _ = try requireHead(reader, checkpoint);
     const child = checkpoint.child;
     if (!std.meta.eql(manifest.scope_child, @as(?scopes.Child, child)) or

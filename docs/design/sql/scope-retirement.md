@@ -46,7 +46,7 @@ service and opaque storage-owner ABI. Source reads do not reserve a scope,
 terminate a connection or acknowledge physical completion. Mounted qualification
 uses real authenticated SQL setup and complete metadata/session/data restart.
 
-`metadata/scope_retirement_ledger.zig` implements transaction-local reservation
+`metadata/retirement/scope/ledger.zig` implements transaction-local reservation
 custody. It stores immutable membership once, compact progress separately, an
 ordered work reference and exact leases on selected identities. Namespace jobs
 can coexist; an intersecting database job conflicts. Exact replay observes its

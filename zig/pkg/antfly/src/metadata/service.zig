@@ -4188,7 +4188,7 @@ fn baseRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command: metadata
     if (command == .apply_sql_sequence_counter) return metadata_topology_protocol.sql_sequence_catalog_version;
     if (command == .apply_sql_settings and @import("schema_reader_wire.zig").requiresDatabaseDefaults(command.apply_sql_settings)) return metadata_topology_protocol.sql_database_defaults_version;
     if (command == .apply_sql_settings and @import("schema_reader_wire.zig").requiresRoleDefaults(command.apply_sql_settings)) return metadata_topology_protocol.sql_role_defaults_version;
-    if (command == .apply_schema_validation) return @import("schema_validation_ledger.zig").requiredDecoderVersion(command.apply_schema_validation);
+    if (command == .apply_schema_validation) return @import("schema_validation/ledger.zig").requiredDecoderVersion(command.apply_schema_validation);
     const bound_text = switch (command) {
         .upsert_table => |table| table.full_text_read_index != null,
         .compare_and_replace_table => |cas| cas.expected.full_text_read_index != null or cas.replacement.full_text_read_index != null,
@@ -13676,7 +13676,7 @@ pub const MetadataHttpService = struct {
         return self.raft.host.owned_metadata_store;
     }
 
-    pub fn relationalIndexWorkJson(self: *MetadataHttpService, alloc: std.mem.Allocator, request: api_operation.RequestContext, query: @import("relational_index_work.zig").Query) ![]u8 {
+    pub fn relationalIndexWorkJson(self: *MetadataHttpService, alloc: std.mem.Allocator, request: api_operation.RequestContext, query: @import("relational_index/work.zig").Query) ![]u8 {
         try self.ensureLinearizableReadWithContext(request);
         try request.ensureActive();
         self.lockRuntime();

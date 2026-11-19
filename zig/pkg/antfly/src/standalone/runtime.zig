@@ -775,8 +775,8 @@ const LocalStandaloneMetadata = struct {
         revision: u64,
     } = null,
     relation_reconciliation: @import("../metadata/standalone_relation_reconciliation.zig").Coordinator = .{},
-    index_reconciliation: @import("../metadata/relational_index_worker.zig").Coordinator = .{},
-    schema_reconciliation: @import("../metadata/schema_validation_coordinator.zig").Coordinator = .{},
+    index_reconciliation: @import("../metadata/relational_index/worker.zig").Coordinator = .{},
+    schema_reconciliation: @import("../metadata/schema_validation/coordinator.zig").Coordinator = .{},
     /// Only private owners actually primed in this process need resident
     /// retirement. Durable terminal metadata remains the authority.
     initial_fk_primed: std.AutoHashMapUnmanaged(u64, TrackedInitialOwner) = .empty,
@@ -1136,11 +1136,11 @@ const LocalStandaloneMetadata = struct {
         return antfly.public_api.table_catalog.readGraphPreparation(self.statusSource(), alloc, request, deadline_ns);
     }
 
-    fn catalogSqlRelationBoot(raw: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+    fn catalogSqlRelationBoot(raw: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql/relation_lifecycle/boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql/relation_lifecycle/boots.zig").Observation {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(raw));
         const bytes = try self.statusSource().systemCatalog(alloc, .{ .setting_admin = true, .deadline_ns = deadline_ns }, .{ .sql_relation_boot_read = query });
         defer alloc.free(bytes);
-        var parsed = try std.json.parseFromSlice(@import("../metadata/sql_relation_boots.zig").Observation, alloc, bytes, .{});
+        var parsed = try std.json.parseFromSlice(@import("../metadata/sql/relation_lifecycle/boots.zig").Observation, alloc, bytes, .{});
         defer parsed.deinit();
         return parsed.value;
     }
@@ -3124,8 +3124,8 @@ const LocalStandaloneMetadata = struct {
         return reply;
     }
 
-    fn beginRelationalIndexPublication(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").BeginRequest, receiving_context: antfly.public_api.operation.RequestContext) ![]u8 {
-        const publication = @import("../metadata/relational_index_publication.zig");
+    fn beginRelationalIndexPublication(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, request: @import("../metadata/relational_index/publication.zig").BeginRequest, receiving_context: antfly.public_api.operation.RequestContext) ![]u8 {
+        const publication = @import("../metadata/relational_index/publication.zig");
         if (!context.setting_admin or !context.index_publication_authority) return error.Forbidden;
         try context.ensureActive();
         var prepared = try request.begin.plan.prepare(alloc);
@@ -3268,7 +3268,7 @@ const LocalStandaloneMetadata = struct {
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
                 return store.sqlRelationLifetimesJson(alloc, group_ids.main_metadata_group_id, query.selection, query.after, query.limit, query.include_hidden);
             },
-            .sql_relation_boot_submit => |bytes| return @import("../metadata/sql_relation_boot_service.zig").submitStandalone(self.lifecycle_store orelse return error.UnsupportedOperation, alloc, group_ids.main_metadata_group_id, context, bytes),
+            .sql_relation_boot_submit => |bytes| return @import("../metadata/sql/relation_lifecycle/boot_service.zig").submitStandalone(self.lifecycle_store orelse return error.UnsupportedOperation, alloc, group_ids.main_metadata_group_id, context, bytes),
             .query_population_job => unreachable, // Routed to the attached coordinator before locking.
             .scope_retirement_work, .scope_retirement_manifest, .scope_retirement_observation, .scope_retirement_prepare, .table_retirement_prepare => unreachable,
             .sql_snapshot_cohort => |request| {
@@ -3341,7 +3341,7 @@ const LocalStandaloneMetadata = struct {
                 return std.json.Stringify.valueAlloc(alloc, observed.value, .{});
             },
             .scope_retirement_submit => |request| {
-                const wire = @import("../metadata/scope_retirement_wire.zig");
+                const wire = @import("../metadata/retirement/scope/wire.zig");
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
                 const command = try request.encodeAlloc(alloc);
                 defer alloc.free(command);
@@ -3385,7 +3385,7 @@ const LocalStandaloneMetadata = struct {
                     break :blk try store.tableRetirementPreflightJson(alloc, group_ids.main_metadata_group_id, command);
                 };
                 defer alloc.free(checked);
-                var expected = try std.json.parseFromSlice(@import("../metadata/table_retirement_receipt.zig").Request, alloc, checked, .{});
+                var expected = try std.json.parseFromSlice(@import("../metadata/retirement/table/receipt.zig").Request, alloc, checked, .{});
                 defer expected.deinit();
                 var prior = try self.readTableRetirementReceipt(alloc, expected.value);
                 defer prior.deinit();
@@ -3403,7 +3403,7 @@ const LocalStandaloneMetadata = struct {
                         self.durable_revision = 0;
                         const bytes = store.tableRetirementPublicationProjectionJson(alloc, group_ids.main_metadata_group_id, expected.value.lookup) catch return error.MetadataMutationOutcomeUnknown;
                         defer alloc.free(bytes);
-                        var delta = std.json.parseFromSlice(@import("../metadata/table_retirement_work.zig").PublicationProjection, alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+                        var delta = std.json.parseFromSlice(@import("../metadata/retirement/table/work.zig").PublicationProjection, alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
                         defer delta.deinit();
                         delta.value.requireFor(observed.value.head.?) catch return error.MetadataMutationOutcomeUnknown;
                         self.refreshPublicationDeltaLocked(alloc, delta.value, revision) catch return error.MetadataMutationOutcomeUnknown;
@@ -3414,7 +3414,7 @@ const LocalStandaloneMetadata = struct {
                 return std.json.Stringify.valueAlloc(alloc, observed.value, .{}) catch return error.MetadataMutationOutcomeUnknown;
             },
             .schema_validation_submit => |command| {
-                const receipts = @import("../metadata/schema_validation_receipt.zig");
+                const receipts = @import("../metadata/schema_validation/receipt.zig");
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
                 const checked = try store.schemaValidationPreflightJson(alloc, group_ids.main_metadata_group_id, command);
                 defer alloc.free(checked);
@@ -3465,7 +3465,7 @@ const LocalStandaloneMetadata = struct {
                 return store.relationalIndexSourceAcceptanceStatusJson(alloc, group_ids.main_metadata_group_id, query);
             },
             .relational_index_source_accept => |request| {
-                const journal = @import("../metadata/relational_index_delivery_journal.zig");
+                const journal = @import("../metadata/relational_index/delivery_journal.zig");
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
                 const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
                 defer alloc.free(bytes);
@@ -3486,7 +3486,7 @@ const LocalStandaloneMetadata = struct {
                 return observed;
             },
             .relational_index_source_complete => |request| {
-                const journal = @import("../metadata/relational_index_delivery_journal.zig");
+                const journal = @import("../metadata/relational_index/delivery_journal.zig");
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
                 const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
                 defer alloc.free(bytes);
@@ -3511,7 +3511,7 @@ const LocalStandaloneMetadata = struct {
                 return store.relationalIndexCancellationStatusJson(alloc, group_ids.main_metadata_group_id, request);
             },
             .relational_index_cancel => |request| {
-                const publication = @import("../metadata/relational_index_publication.zig");
+                const publication = @import("../metadata/relational_index/publication.zig");
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
                 try request.validate();
                 try store.validateRelationalIndexCancellation(group_ids.main_metadata_group_id, request);
@@ -3538,7 +3538,7 @@ const LocalStandaloneMetadata = struct {
                 return store.relationalIndexPublicationDecisionStatusJson(alloc, group_ids.main_metadata_group_id, request);
             },
             .relational_index_publish_decide => |request| {
-                const publication = @import("../metadata/relational_index_publication.zig");
+                const publication = @import("../metadata/relational_index/publication.zig");
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
                 try request.validate();
                 try store.validateRelationalIndexPublicationDecision(group_ids.main_metadata_group_id, request);
@@ -3563,7 +3563,7 @@ const LocalStandaloneMetadata = struct {
                 return observed;
             },
             .relational_index_owner_ack => |request| {
-                const publication = @import("../metadata/relational_index_publication.zig");
+                const publication = @import("../metadata/relational_index/publication.zig");
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
                 try request.validate();
                 const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
@@ -5622,7 +5622,7 @@ const LocalStandaloneMetadata = struct {
 
     const IndexWorkHost = struct {
         metadata: *LocalStandaloneMetadata,
-        pub fn currentAuthority(self: *@This()) !?@import("../metadata/relational_index_worker.zig").Authority {
+        pub fn currentAuthority(self: *@This()) !?@import("../metadata/relational_index/worker.zig").Authority {
             const metadata = self.metadata;
             // Only a short local authority capture under this lane. Root and
             // metadata I/O belong to receiving ports, which revalidate current
@@ -5636,7 +5636,7 @@ const LocalStandaloneMetadata = struct {
             if (!std.mem.eql(u8, &binding.metadata_incarnation, &incarnation)) return error.StoreRootEnrollmentChanged;
             return .{ .metadata_incarnation = incarnation, .binding_digest = try binding.digest(), .writer_generation = metadata.hot_standby_binding_generation };
         }
-        pub fn workJson(self: *@This(), alloc: std.mem.Allocator, query: @import("../metadata/relational_index_work.zig").Query) ![]u8 {
+        pub fn workJson(self: *@This(), alloc: std.mem.Allocator, query: @import("../metadata/relational_index/work.zig").Query) ![]u8 {
             const store = self.metadata.lifecycle_store orelse return error.UnsupportedOperation;
             return store.relationalIndexWorkJson(alloc, group_ids.main_metadata_group_id, query);
         }
@@ -5656,12 +5656,12 @@ const LocalStandaloneMetadata = struct {
             schema_error = err;
             break :blk false;
         };
-        var transport: @import("../api/relational_index_local_delivery.zig").Transport = .{ .control_port = control, .claim_port = claims };
+        var transport: @import("../api/relational_index/local_delivery.zig").Transport = .{ .control_port = control, .claim_port = claims };
         _ = self.index_reconciliation.step(io, self.alloc, &server.provisioned_storage.resource_manager, &host, &transport, platform_time.monotonicNs()) catch |err| switch (err) {
             error.Canceled, error.DeadlineExceeded, error.Timeout, error.NotLeader, error.GenerationPublicationChanged, error.GenerationAdmissionPending, error.IndexOwnerReceiptChanged, error.MetadataMutationOutcomeUnknown, error.MetadataReplicationPending, error.ResourceBudgetExceeded, error.OutOfMemory, error.ResourceTemporarilyUnavailable, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.UnsupportedNativeIndexOwner, error.PrivateIndexRootRecoveryRequired, error.PrivateIndexBuildFailed, error.PrivateIndexTargetInventoryMismatch, error.PrivateIndexGenerationValidationFailed, error.UniqueConstraintViolation, error.TableTopologyProtocolUpgradeRequired => false,
             else => return err,
         };
-        if (schema_error) |err| if (!@import("../metadata/schema_validation_coordinator.zig").isDeferred(err)) return err;
+        if (schema_error) |err| if (!@import("../metadata/schema_validation/coordinator.zig").isDeferred(err)) return err;
     }
 
     fn reconcileResolverNamespaces(self: *LocalStandaloneMetadata) !void {
@@ -6413,16 +6413,16 @@ const LocalStandaloneMetadata = struct {
         self.durable_revision = durable_revision;
     }
 
-    fn readTableRetirementReceipt(self: *LocalStandaloneMetadata, a: std.mem.Allocator, request: @import("../metadata/table_retirement_receipt.zig").Request) !std.json.Parsed(@import("../metadata/table_retirement_receipt.zig").Observation) {
+    fn readTableRetirementReceipt(self: *LocalStandaloneMetadata, a: std.mem.Allocator, request: @import("../metadata/retirement/table/receipt.zig").Request) !std.json.Parsed(@import("../metadata/retirement/table/receipt.zig").Observation) {
         const bytes = try (self.lifecycle_store orelse return error.UnsupportedOperation).tableRetirementReceiptJson(a, group_ids.main_metadata_group_id, request);
         defer a.free(bytes);
-        var parsed = try std.json.parseFromSlice(@import("../metadata/table_retirement_receipt.zig").Observation, a, bytes, .{ .allocate = .alloc_always });
+        var parsed = try std.json.parseFromSlice(@import("../metadata/retirement/table/receipt.zig").Observation, a, bytes, .{ .allocate = .alloc_always });
         errdefer parsed.deinit();
         try parsed.value.requireFor(request);
         return parsed;
     }
 
-    fn refreshSchemaPublicationLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, lookup: @import("../metadata/schema_validation_read.zig").Lookup, revision: u64) !void {
+    fn refreshSchemaPublicationLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, lookup: @import("../metadata/schema_validation/read.zig").Lookup, revision: u64) !void {
         const store = self.lifecycle_store orelse return error.UnsupportedOperation;
         // A partial allocation failure must never label a mixed cache current.
         // Every subsequent read repairs it from one native snapshot instead.
@@ -6432,7 +6432,7 @@ const LocalStandaloneMetadata = struct {
             return err;
         };
         defer alloc.free(bytes);
-        var projected = try std.json.parseFromSlice(@import("../metadata/schema_validation_read.zig").PublicationProjection, alloc, bytes, .{});
+        var projected = try std.json.parseFromSlice(@import("../metadata/schema_validation/read.zig").PublicationProjection, alloc, bytes, .{});
         defer projected.deinit();
         try self.refreshPublicationDeltaLocked(alloc, projected.value, revision);
     }
@@ -15394,7 +15394,7 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool, pub
         // Exercise accepted-root physical barriers through real native owners.
         // Earlier ordinary publications remain on this table deliberately: an
         // old FK head must not shadow this root's exact ID during decisions.
-        const retirement = @import("../metadata/table_retirement_ledger.zig");
+        const retirement = @import("../metadata/retirement/table/ledger.zig");
         const domain = @import("antfly_local_sources").system_catalog_domain;
         // A NULL outgoing key permits the first row in the mutual FK cohort;
         // the surviving row then holds a real reference to the retiring root.
@@ -15437,7 +15437,7 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool, pub
         const guard: domain.RelationMutationGuard = .{ .target = .{ .name = "nodes" }, .logical_table = found.logical_table, .owner = found.owner, .incarnation = resolved_many.value.relation_epoch.?.incarnation };
         const manifest_json = try metadata.lifecycle_store.?.prepareTableRetirementManifestJsonWithContext(alloc, group_id, guard, context);
         defer alloc.free(manifest_json);
-        var captured = try @import("../metadata/table_retirement_manifest.zig").Owned.parse(alloc, manifest_json);
+        var captured = try @import("../metadata/retirement/table/manifest.zig").Owned.parse(alloc, manifest_json);
         defer captured.deinit();
         var preparation = std.heap.ArenaAllocator.init(alloc);
         defer preparation.deinit();
@@ -15518,12 +15518,12 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool, pub
         var work = try std.json.parseFromSlice(retirement.Work, alloc, work_json, .{});
         defer work.deinit();
         const validation_context: antfly.public_api.operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = true };
-        var transport: @import("../api/schema_validation_owner_transport.zig").Transport = .{ .server = &server.http_server.?, .alloc = alloc };
+        var transport: @import("../api/schema_validation/owner_transport.zig").Transport = .{ .server = &server.http_server.?, .alloc = alloc };
         defer transport.deinit();
-        var survivor = try @import("../api/schema_validation_plan_builder.zig").buildTableRetirement(&transport, alloc, io, validation_context, work.value.head, captured.value, .native);
+        var survivor = try @import("../api/schema_validation/plan_builder.zig").buildTableRetirement(&transport, alloc, io, validation_context, work.value.head, captured.value, .native);
         defer survivor.deinit();
         {
-            var survivor_plan = try @import("../metadata/schema_validation_plan.zig").parse(alloc, survivor.prepared.encoded);
+            var survivor_plan = try @import("../metadata/schema_validation/plan.zig").parse(alloc, survivor.prepared.encoded);
             defer survivor_plan.deinit();
             _ = try retirement.requireSurvivorPlan(work.value.head, captured.value, survivor_plan.value);
             var substituted = survivor_plan.value;
@@ -15546,7 +15546,7 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool, pub
             try LocalStandaloneMetadata.runRound(&metadata);
             const observed = try metadata.statusSource().systemCatalog(alloc, validation_context, .{ .schema_validation_receipt_read = .{ .lookup = survivor.lookup, .expected = .admission } });
             defer alloc.free(observed);
-            var status = try std.json.parseFromSlice(@import("../metadata/schema_validation_receipt.zig").Observation, alloc, observed, .{});
+            var status = try std.json.parseFromSlice(@import("../metadata/schema_validation/receipt.zig").Observation, alloc, observed, .{});
             defer status.deinit();
             if (status.value.head.?.phase == .succeeded) break;
             if (!restarted and server.schemaValidationScanPausedForTest()) {
@@ -15595,7 +15595,7 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool, pub
             defer projected.deinit();
             const bytes = try metadata.statusSource().systemCatalog(alloc, validation_context, .{ .schema_validation_receipt_read = .{ .lookup = survivor.lookup, .expected = .admission } });
             defer alloc.free(bytes);
-            var state = try std.json.parseFromSlice(@import("../metadata/schema_validation_receipt.zig").Observation, alloc, bytes, .{});
+            var state = try std.json.parseFromSlice(@import("../metadata/schema_validation/receipt.zig").Observation, alloc, bytes, .{});
             defer state.deinit();
             try projected.value.requireFor(state.value.head.?, projected.value.revision);
             try std.testing.expectEqual(child.table_id, projected.value.removed_table);
@@ -15635,7 +15635,7 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool, pub
         const remaining_guard: domain.RelationMutationGuard = .{ .target = .{ .name = "other_nodes" }, .logical_table = remaining_owner.logical_table, .owner = remaining_owner.owner, .incarnation = remaining_many.value.relation_epoch.?.incarnation };
         const remaining_json = try metadata.lifecycle_store.?.prepareTableRetirementManifestJsonWithContext(alloc, group_id, remaining_guard, context);
         defer alloc.free(remaining_json);
-        var remaining = try @import("../metadata/table_retirement_manifest.zig").Owned.parse(alloc, remaining_json);
+        var remaining = try @import("../metadata/retirement/table/manifest.zig").Owned.parse(alloc, remaining_json);
         defer remaining.deinit();
         try std.testing.expectEqual(@as(usize, 0), remaining.value.survivors.len);
         const direct_lookup: retirement.Lookup = .{ .group = group_id, .table = retained.table_id, .id = @splat(0x6a) };
@@ -15645,7 +15645,7 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool, pub
         defer alloc.free(direct_begin);
         var admission_input = try retirement.Input.parse(alloc, direct_begin);
         defer admission_input.deinit();
-        const admission_request = try @import("../metadata/table_retirement_receipt.zig").Request.fromInput(&admission_input);
+        const admission_request = try @import("../metadata/retirement/table/receipt.zig").Request.fromInput(&admission_input);
         {
             var absent = try metadata.lifecycle_store.?.tableRetirementReceipt(alloc, group_id, admission_request);
             defer absent.deinit();
@@ -15666,12 +15666,12 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool, pub
         {
             const queue_json = try metadata.statusSource().systemCatalog(alloc, root_context, .{ .table_retirement_queue = 0 });
             defer alloc.free(queue_json);
-            var queued = try std.json.parseFromSlice(@import("../metadata/table_retirement_work.zig").Page, alloc, queue_json, .{});
+            var queued = try std.json.parseFromSlice(@import("../metadata/retirement/table/work.zig").Page, alloc, queue_json, .{});
             defer queued.deinit();
             try std.testing.expectEqualDeep(direct_lookup, queued.value.lookup.?);
             const effects_json = try metadata.statusSource().systemCatalog(alloc, root_context, .{ .table_retirement_effects = direct_lookup });
             defer alloc.free(effects_json);
-            var immutable = try @import("../metadata/table_retirement_manifest.zig").Owned.parse(alloc, effects_json);
+            var immutable = try @import("../metadata/retirement/table/manifest.zig").Owned.parse(alloc, effects_json);
             defer immutable.deinit();
             try std.testing.expectEqualDeep(try remaining.value.reference(), try immutable.value.reference());
             try std.testing.expectError(error.Forbidden, metadata.statusSource().systemCatalog(alloc, context, .{ .table_retirement_queue = 0 }));
@@ -15686,11 +15686,11 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool, pub
         {
             var input = try retirement.Input.parse(alloc, premature);
             defer input.deinit();
-            var unaccepted = try metadata.lifecycle_store.?.tableRetirementReceipt(alloc, group_id, try @import("../metadata/table_retirement_receipt.zig").Request.fromInput(&input));
+            var unaccepted = try metadata.lifecycle_store.?.tableRetirementReceipt(alloc, group_id, try @import("../metadata/retirement/table/receipt.zig").Request.fromInput(&input));
             defer unaccepted.deinit();
             try std.testing.expect(!unaccepted.value.accepted);
         }
-        var final_request: ?@import("../metadata/table_retirement_receipt.zig").Request = null;
+        var final_request: ?@import("../metadata/retirement/table/receipt.zig").Request = null;
         var direct_receipts: usize = 0;
         for (0..4) |iteration| {
             const direct_work_json = try metadata.lifecycle_store.?.tableRetirementWorkJson(alloc, group_id, direct_lookup);
@@ -15704,7 +15704,7 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool, pub
                 defer alloc.free(direct_publish);
                 var input = try retirement.Input.parse(alloc, direct_publish);
                 defer input.deinit();
-                final_request = try @import("../metadata/table_retirement_receipt.zig").Request.fromInput(&input);
+                final_request = try @import("../metadata/retirement/table/receipt.zig").Request.fromInput(&input);
                 try submitStandaloneRetirementFixture(&metadata, alloc, root_context, direct_publish);
                 {
                     var accepted = try metadata.lifecycle_store.?.tableRetirementReceipt(alloc, group_id, final_request.?);
@@ -15727,7 +15727,7 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool, pub
             {
                 var input = try retirement.Input.parse(alloc, direct_ack);
                 defer input.deinit();
-                const expected = try @import("../metadata/table_retirement_receipt.zig").Request.fromInput(&input);
+                const expected = try @import("../metadata/retirement/table/receipt.zig").Request.fromInput(&input);
                 var accepted = try metadata.lifecycle_store.?.tableRetirementReceipt(alloc, group_id, expected);
                 defer accepted.deinit();
                 try std.testing.expect(accepted.value.accepted);
@@ -15818,7 +15818,7 @@ fn preparePublicCascadeSql(a: std.mem.Allocator, metadata: *LocalStandaloneMetad
     defer result.deinit();
     if (result.value.catalog_receipt) |receipt| try std.testing.expectEqualStrings("committed", receipt.state);
     if (result.value.ddl_receipt) |receipt| if (receipt.schema_validation_token) |token| {
-        const lookup = try @import("../api/schema_validation_recovery.zig").Token.decode(token);
+        const lookup = try @import("../api/schema_validation/recovery.zig").Token.decode(token);
         const context: antfly.public_api.operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = true };
         const deadline = @import("antfly_platform").time.monotonicNs() +| 45 * std.time.ns_per_s;
         while (true) {
@@ -15827,7 +15827,7 @@ fn preparePublicCascadeSql(a: std.mem.Allocator, metadata: *LocalStandaloneMetad
             try LocalStandaloneMetadata.runRound(metadata);
             const bytes = try metadata.statusSource().systemCatalog(a, context, .{ .schema_validation_receipt_read = .{ .lookup = lookup, .expected = .admission } });
             defer a.free(bytes);
-            var observed = try std.json.parseFromSlice(@import("../metadata/schema_validation_receipt.zig").Observation, a, bytes, .{});
+            var observed = try std.json.parseFromSlice(@import("../metadata/schema_validation/receipt.zig").Observation, a, bytes, .{});
             defer observed.deinit();
             if (observed.value.head) |head| {
                 if (head.phase == .succeeded) break;
@@ -15932,11 +15932,11 @@ fn exerciseStandalonePublicCascade(a: std.mem.Allocator, metadata: *LocalStandal
             const raw = try a.alloc(u8, size);
             defer a.free(raw);
             try std.base64.url_safe_no_pad.Decoder.decode(raw, token);
-            var bound = try std.json.parseFromSlice(struct { request: @import("../metadata/table_retirement_receipt.zig").Request }, a, raw, .{ .ignore_unknown_fields = true });
+            var bound = try std.json.parseFromSlice(struct { request: @import("../metadata/retirement/table/receipt.zig").Request }, a, raw, .{ .ignore_unknown_fields = true });
             defer bound.deinit();
             const debug_work = try metadata.lifecycle_store.?.tableRetirementWorkJson(a, group_ids.main_metadata_group_id, bound.value.request.lookup);
             defer a.free(debug_work);
-            var state = try std.json.parseFromSlice(@import("../metadata/table_retirement_ledger.zig").Work, a, debug_work, .{});
+            var state = try std.json.parseFromSlice(@import("../metadata/retirement/table/ledger.zig").Work, a, debug_work, .{});
             defer state.deinit();
             std.debug.print("public CASCADE timeout root_phase={s} revision={d} physical={s} schema_error={s} deferred={s} deployment={s}\n", .{ @tagName(state.value.head.phase), state.value.head.revision, if (state.value.head.physical) |physical| @tagName(physical.phase) else "none", data.schemaValidationLastErrorForTest(), if (last_deferred) |err| @errorName(err) else "none", @tagName(server.cfg.deployment_mode) });
             return error.TableRetirementPublicTimeout;
@@ -15944,7 +15944,7 @@ fn exerciseStandalonePublicCascade(a: std.mem.Allocator, metadata: *LocalStandal
         // Same production quantum as the periodic supervisor; the shared FK
         // test pause only makes scheduling deterministic, not acceptance.
         cursor = @import("../api/table_retirement_coordinator.zig").step(server, cursor, context) catch |err| blk: {
-            if (!@import("../metadata/schema_validation_coordinator.zig").isDeferred(err)) return err;
+            if (!@import("../metadata/schema_validation/coordinator.zig").isDeferred(err)) return err;
             last_deferred = err;
             break :blk cursor;
         };
@@ -15973,7 +15973,7 @@ fn exerciseStandalonePublicCascade(a: std.mem.Allocator, metadata: *LocalStandal
 fn submitStandaloneRetirementFixture(metadata: *LocalStandaloneMetadata, a: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, bytes: []const u8) !void {
     const reply = try metadata.statusSource().systemCatalog(a, context, .{ .table_retirement_submit = bytes });
     defer a.free(reply);
-    var observed = try std.json.parseFromSlice(@import("../metadata/table_retirement_receipt.zig").Observation, a, reply, .{});
+    var observed = try std.json.parseFromSlice(@import("../metadata/retirement/table/receipt.zig").Observation, a, reply, .{});
     defer observed.deinit();
     try std.testing.expect(observed.value.accepted);
 }
@@ -16786,11 +16786,11 @@ test "standalone metadata replay refreshes colliding revisions and only publishe
 
 test "standalone native index owner catalog calls preserve authority and capability barriers" {
     const alloc = std.testing.allocator;
-    const publication = @import("../metadata/relational_index_publication.zig");
+    const publication = @import("../metadata/relational_index/publication.zig");
     const Call = @import("../system_catalog/server_call.zig").Call;
     const ack = try publication.testing.fencedAck();
     const enrollment = try @import("../metadata/store_root_enrollment.zig").Request.sign(ack.signed.proof.identity, @splat(9));
-    const schema_lookup: @import("../metadata/schema_validation_read.zig").Lookup = .{ .group = group_ids.main_metadata_group_id, .table = 7, .id = @splat(1), .plan_digest = @splat(2), .metadata_incarnation = ack.signed.proof.identity.metadata_incarnation };
+    const schema_lookup: @import("../metadata/schema_validation/read.zig").Lookup = .{ .group = group_ids.main_metadata_group_id, .table = 7, .id = @splat(1), .plan_digest = @splat(2), .metadata_incarnation = ack.signed.proof.identity.metadata_incarnation };
     const calls = [_]Call{
         .{ .schema_validation_submit = "{}" },
         .{ .schema_validation_submit = "SVBI\x01\x00\x00\x00" },
@@ -16866,9 +16866,9 @@ fn withOwnerCatalogForTest(store: *antfly.metadata.RaftApplyStore, request: anyt
     try check(&metadata, request, revision);
 }
 
-fn testIndexCancellationCatalog(source: *antfly.metadata.RaftApplyStore, ack: @import("../metadata/relational_index_publication.zig").Ack) !void {
+fn testIndexCancellationCatalog(source: *antfly.metadata.RaftApplyStore, ack: @import("../metadata/relational_index/publication.zig").Ack) !void {
     const a = std.testing.allocator;
-    const publication = @import("../metadata/relational_index_publication.zig");
+    const publication = @import("../metadata/relational_index/publication.zig");
     const group = group_ids.main_metadata_group_id;
     const snapshot = try source.snapshotBuilder().buildSnapshot(a, group);
     defer a.free(snapshot);
@@ -16947,14 +16947,14 @@ test "standalone native index owner catalog calls commit enrolled receipts and r
             try std.testing.expectEqual(revision + 1, try metadata.lifecycle_store.?.standaloneRevision());
         }
 
-        pub fn apply(store: *antfly.metadata.RaftApplyStore, ack: @import("../metadata/relational_index_publication.zig").Ack, _: @import("../metadata/storage/raft_apply_store.zig").TransitionCommand) !void {
+        pub fn apply(store: *antfly.metadata.RaftApplyStore, ack: @import("../metadata/relational_index/publication.zig").Ack, _: @import("../metadata/storage/raft_apply_store.zig").TransitionCommand) !void {
             try withOwnerCatalogForTest(store, ack, ackThroughCatalog);
             if (ack.signed.receipt.action == .fenced) try testIndexCancellationCatalog(store, ack);
         }
 
-        fn ackThroughCatalog(metadata: *LocalStandaloneMetadata, ack: @import("../metadata/relational_index_publication.zig").Ack, revision: u64) !void {
+        fn ackThroughCatalog(metadata: *LocalStandaloneMetadata, ack: @import("../metadata/relational_index/publication.zig").Ack, revision: u64) !void {
             const a = std.testing.allocator;
-            const publication = @import("../metadata/relational_index_publication.zig");
+            const publication = @import("../metadata/relational_index/publication.zig");
             const store = metadata.lifecycle_store.?;
             const context: antfly.public_api.operation.RequestContext = .{ .index_publication_authority = true };
             {
@@ -20189,7 +20189,7 @@ test "system catalog prepared ordinary DDL submits exact native outcomes through
 test "SQL scope retirement standalone publication refreshes the shared catalog before conditional CREATE and cold replay" {
     if (comptime control_only_storage_sources) return error.SkipZigTest;
     const a = std.testing.allocator;
-    const wire = @import("../metadata/scope_retirement_wire.zig");
+    const wire = @import("../metadata/retirement/scope/wire.zig");
     const protocol = @import("../metadata/topology_protocol.zig");
     const C = @import("../system_catalog/catalog_mutations.zig");
     const Command = @import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand;
@@ -20292,7 +20292,7 @@ test "SQL scope retirement standalone reservation and recovery use the native ow
     const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/scope-standalone.json", .{tmp.sub_path});
     var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
     defer backend.deinit();
-    const wire = @import("../metadata/scope_retirement_wire.zig");
+    const wire = @import("../metadata/retirement/scope/wire.zig");
     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = true };
     var request: wire.Request = undefined;
     var accepted: wire.Outcome = undefined;

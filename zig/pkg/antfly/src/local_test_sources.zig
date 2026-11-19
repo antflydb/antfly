@@ -16,7 +16,7 @@
 //! Test-only server fixtures used by local implementation tests.
 pub const api_agent_tools = @import("api/agent_tools.zig");
 pub const api_distributed_graph = @import("api/distributed_graph.zig");
-pub const api_relational_index_status = @import("api/relational_index_status.zig");
+pub const api_relational_index_status = @import("api/relational_index/status.zig");
 pub const api_relational_row_merge = @import("api/relational_row_merge.zig");
 pub const api_table_router = @import("api/table_router.zig");
 pub const api_tables = @import("api/tables.zig");

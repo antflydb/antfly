@@ -33,8 +33,8 @@ const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const reranking = @import("../reranking/mod.zig");
 const restore_jobs = @import("../api/restore_jobs.zig");
-const index_worker = @import("relational_index_worker.zig");
-const index_execution = @import("../api/relational_index_owner_execution.zig");
+const index_worker = @import("relational_index/worker.zig");
+const index_execution = @import("../api/relational_index/owner_execution.zig");
 const api_operation = @import("antfly_local_sources").api_operation;
 const raft = @import("../raft/mod.zig");
 const raft_host = @import("../raft/host.zig");
@@ -151,7 +151,7 @@ pub const MetadataServer = struct {
     restore_supervisor_owner_id: u64 = 0,
     restore_supervisor_stop: std.atomic.Value(bool) = .init(false),
     index_reconciliation: index_worker.Coordinator = .{},
-    schema_reconciliation: @import("schema_validation_coordinator.zig").Coordinator = .{},
+    schema_reconciliation: @import("schema_validation/coordinator.zig").Coordinator = .{},
     index_supervisor_owner_id: u64 = 0,
     index_supervisor_stop: std.atomic.Value(bool) = .init(false),
     index_service_secret: ?[]const u8 = null,
@@ -650,7 +650,7 @@ pub const MetadataServer = struct {
             return false;
         }
 
-        pub fn workJson(self: *@This(), alloc: std.mem.Allocator, query: @import("relational_index_work.zig").Query) ![]u8 {
+        pub fn workJson(self: *@This(), alloc: std.mem.Allocator, query: @import("relational_index/work.zig").Query) ![]u8 {
             try self.requireCurrent();
             return self.server.svc.relationalIndexWorkJson(alloc, .{
                 .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s,
@@ -753,7 +753,7 @@ pub const MetadataServer = struct {
         const index_advanced = try self.index_reconciliation.step(io, self.alloc, manager, &host, &transport, @import("antfly_platform").time.monotonicNs());
         // A pending or damaged schema job cannot starve unrelated index
         // maintenance. Unexpected failures still reach supervisor diagnostics.
-        if (schema_error) |err| if (!@import("schema_validation_coordinator.zig").isDeferred(err)) return err;
+        if (schema_error) |err| if (!@import("schema_validation/coordinator.zig").isDeferred(err)) return err;
         return index_advanced or schema_advanced;
     }
 

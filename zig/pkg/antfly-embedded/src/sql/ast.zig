@@ -130,7 +130,7 @@ pub const Window = struct {
 /// identities and transaction authority after binding and authorization.
 pub const LockWait = enum { block, nowait, skip_locked };
 pub const RowLockClause = struct {
-    mode: @import("../storage/pessimistic_lock_contract.zig").RowMode,
+    mode: @import("../storage/pessimistic_lock/contract.zig").RowMode,
     relations: []const []const u8 = &.{},
     wait: LockWait = .block,
 };
@@ -138,7 +138,7 @@ pub const RowLocking = struct { clauses: []const RowLockClause };
 pub const TableLock = struct {
     pub const Target = struct { name: Name, only: bool = false };
     targets: []const Target,
-    mode: @import("../storage/pessimistic_lock_contract.zig").TableMode = .access_exclusive,
+    mode: @import("../storage/pessimistic_lock/contract.zig").TableMode = .access_exclusive,
     wait: LockWait = .block,
 };
 

@@ -273,7 +273,7 @@ pub const Target = struct {
     source_table_name: []const u8 = "",
     target_schema_digest: ?Digest = null,
     empty_generation: bool = false,
-    native_reset: ?@import("sql_relation_recovery.zig").Guard = null,
+    native_reset: ?@import("sql/relation_lifecycle/recovery.zig").Guard = null,
     schema_only_snapshot: ?@FieldType(@import("antfly_local_sources").storage_db_native_empty_origin.Origin, "schema_only_snapshot") = null,
     native_loss_generations: []const NativeLossGeneration = &.{},
     population: ?@import("antfly_local_sources").storage_db_relational_population_contract.Capture = null,
@@ -578,7 +578,7 @@ pub fn prepareNativeLossGenerationsAlloc(a: std.mem.Allocator, targets: []Target
 pub fn nativeEmptyOriginForTarget(plan: Plan, plan_digest: Digest, target: Target) !?@import("antfly_local_sources").storage_db_native_empty_origin.Origin {
     if (target.native_reset) |guard| {
         if (target.schema_only_snapshot != null) return error.InvalidRestoreStaging;
-        var fence: @import("sql_relation_recovery.zig").LossFence = .{ .metadata_group_id = guard.before.metadata_group_id, .metadata_incarnation = guard.before.identity.metadata_incarnation, .plan_id = plan.id, .plan_digest = plan_digest, .source = guard, .revision = 1, .checkpoint_digest = @splat(0) };
+        var fence: @import("sql/relation_lifecycle/recovery.zig").LossFence = .{ .metadata_group_id = guard.before.metadata_group_id, .metadata_incarnation = guard.before.identity.metadata_incarnation, .plan_id = plan.id, .plan_digest = plan_digest, .source = guard, .revision = 1, .checkpoint_digest = @splat(0) };
         fence.checkpoint_digest = try fence.checkpointDigest();
         return .{ .lost_source = .{ .checkpoint_digest = fence.checkpoint_digest, .source = try @import("antfly_local_sources").common_topology_records.RelationPersistence.PhysicalPin.fromBinding(guard.before.binding) } };
     }

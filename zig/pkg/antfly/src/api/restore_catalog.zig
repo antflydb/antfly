@@ -93,13 +93,13 @@ pub const Catalog = struct {
     /// Closed participant observation for this immutable unpublished cohort.
     /// No arbitrary Boot query, live name lookup or public serving grant crosses
     /// the projection. Metadata independently rejoins the actual Job and image.
-    fn nativeBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+    fn nativeBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql/relation_lifecycle/boots.zig").Query, deadline: ?u64) !@import("../metadata/sql/relation_lifecycle/boots.zig").Observation {
         const self = cast(ptr);
         try self.source().budget(deadline).checkpoint();
         try self.verify();
         const table_id = query.binding_table orelse return error.RestoreStagingScopeChanged;
         const node = query.node orelse return error.RestoreStagingScopeChanged;
-        const expected: @import("../metadata/sql_relation_boots.zig").Query = .{ .node = node, .binding_table = table_id };
+        const expected: @import("../metadata/sql/relation_lifecycle/boots.zig").Query = .{ .node = node, .binding_table = table_id };
         if (!std.meta.eql(query, expected)) return error.RestoreStagingScopeChanged;
         const table = for (self.snapshot.tables) |candidate| {
             if (candidate.table_id == table_id) break candidate;
@@ -121,7 +121,7 @@ pub const Catalog = struct {
             !std.meta.eql(boot.identity, proof.identity) or proof.boot_generation != boot.generation or proof.reporter_incarnation != boot.reporter_incarnation or
             !std.mem.eql(u8, &boot.instance, &proof.binding.native_instance) or !proof.binding.descriptor.eql(native) or
             proof.binding.table_id != scope.target_namespace.table_id or proof.binding.shard_id != scope.target_namespace.shard_id or proof.binding.range_id != scope.target_namespace.range_id or
-            !std.meta.eql(proof.creation_scope, @as(?@import("../metadata/sql_relation_attestation.zig").CreationScope, .{ .plan_id = self.plan_id, .plan_digest = self.plan_digest }))) return error.SqlRelationOwnerChanged;
+            !std.meta.eql(proof.creation_scope, @as(?@import("../metadata/sql/relation_lifecycle/attestation.zig").CreationScope, .{ .plan_id = self.plan_id, .plan_digest = self.plan_digest }))) return error.SqlRelationOwnerChanged;
         if (boot.phase == .recovering) {
             const empty = observed.empty_target orelse return error.SqlRelationRecoveryIncomplete;
             try empty.require(scope, native, scope.target_namespace, observed.attempt);

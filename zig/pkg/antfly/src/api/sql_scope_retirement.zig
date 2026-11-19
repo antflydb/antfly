@@ -19,7 +19,7 @@ const std = @import("std");
 const local = @import("antfly_local_sources");
 const catalog = local.sql_catalog;
 const contract = local.system_catalog_domain.scope_retirement;
-const wire = @import("../metadata/scope_retirement_wire.zig");
+const wire = @import("../metadata/retirement/scope/wire.zig");
 const http = @import("http_server.zig");
 const A = std.mem.Allocator;
 const Context = local.api_operation.RequestContext;
@@ -115,7 +115,7 @@ pub fn recoverIfScope(server: *http.ApiHttpServer, identity: ?http.Authenticated
     context.setting_admin = true;
     context.schema_validation_authority = true;
     observe(server, context, scratch, token, &result) catch |err| {
-        if (!@import("../metadata/schema_validation_coordinator.zig").isDeferred(err)) return err;
+        if (!@import("../metadata/schema_validation/coordinator.zig").isDeferred(err)) return err;
     };
     return result;
 }
@@ -217,7 +217,7 @@ test "SQL scope retirement schema receipts reject relabeled kinds names and repl
         .digest = @splat(3),
     } };
     try token.validate();
-    const head: @import("../metadata/scope_retirement_ledger.zig").Head = .{ .lookup = token.query.lookup, .metadata_incarnation = @splat(4), .creator = .bootstrap, .target_digest = contract.Scope.targetDigest("default", "tenant_ops"), .sequence = 1, .progress = .{ .reference = token.query.lookup.reference, .revision = 3, .phase = .published, .catalog_revision = 19 } };
+    const head: @import("../metadata/retirement/scope/ledger.zig").Head = .{ .lookup = token.query.lookup, .metadata_incarnation = @splat(4), .creator = .bootstrap, .target_digest = contract.Scope.targetDigest("default", "tenant_ops"), .sequence = 1, .progress = .{ .reference = token.query.lookup.reference, .revision = 3, .phase = .published, .catalog_revision = 19 } };
     const observation: wire.Observation = .{ .current = head, .outcome = .{ .query = token.query, .result = .{ .accepted = head } } };
     const encoded = try encode(a, a, token);
     var result = receipt(a, token, encoded) catch |err| {

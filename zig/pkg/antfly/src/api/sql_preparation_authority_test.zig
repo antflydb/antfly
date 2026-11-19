@@ -16,7 +16,7 @@
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const http = @import("http_server.zig");
-const signing = @import("sql_trigger_authority.zig");
+const signing = @import("sql/triggers/authority.zig");
 
 test "dedicated SQL preparation keystore restart readonly partial pair and transport isolation" {
     try local.common_sql_preparation_authority_config.checkStandaloneLifecycle(std.testing.allocator, std.testing.io);
@@ -99,7 +99,7 @@ test "default auth disabled SQL owner grants use the persisted private key and r
 
 test "restored and created trigger functions share authenticated destination ABI and namespace admission" {
     const a = std.testing.allocator;
-    const guard = @import("sql_trigger_function_admission.zig");
+    const guard = @import("sql/triggers/function_admission.zig");
     const users = @import("../usermgr/mod.zig");
     var record: local.sql_catalog.routines.records.Record = .{ .id = 9, .generation = 1, .definition = .{ .arguments = &.{}, .returns_trigger = true, .language = .plpgsql, .body = "BEGIN RETURN NEW; END", .owner = .auth_disabled } };
     const target: local.system_catalog_domain.Target = .{ .namespace = "private", .table = "touch" };

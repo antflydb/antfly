@@ -229,12 +229,12 @@ fn beginRetirementIfNeeded(server: *http.ApiHttpServer, identity: ?http.Authenti
         defer preparation_region.deinit();
         const captured = try snapshot(server, preparation_region.allocator(), private, .{ .targets = &.{request.target}, .sequence_ids = &.{request.operation.drop.expected.?.id}, .incarnation = request.incarnation, .prepare_retirement = true });
         if ((captured.retirement orelse return error.CatalogGenerationChanged).references.count == 0) return null;
-        var transport: @import("schema_validation_owner_transport.zig").Transport = .{ .server = server, .alloc = allocators.scratch };
+        var transport: @import("schema_validation/owner_transport.zig").Transport = .{ .server = server, .alloc = allocators.scratch };
         defer transport.deinit();
-        var owned = try @import("schema_validation_plan_builder.zig").buildSequenceRetirement(&transport, allocators.scratch, io, private, captured, request);
+        var owned = try @import("schema_validation/plan_builder.zig").buildSequenceRetirement(&transport, allocators.scratch, io, private, captured, request);
         defer owned.deinit();
         try context.ensureActive();
-        const admission = @import("schema_validation_admission.zig");
+        const admission = @import("schema_validation/admission.zig");
         const attempt: ?admission.BeginAttempt = admission.beginWhenReady(server.source, allocators.scratch, io, private, owned.command) catch |err| switch (err) {
             error.MetadataReplicationPending => return error.CatalogPublicationProofPending,
             error.Forbidden, error.CatalogGenerationChanged, error.GenerationPublicationChanged, error.MetadataIncarnationMismatch, error.TableTopologyProtocolUpgradeRequired, error.CatalogOccupancyNotReady, error.CatalogPublicationProofPending, error.UnsupportedNativeIndexOwner, error.RowPolicyUnsupported => return err,

@@ -18,10 +18,10 @@
 //! SQL. Canonical typed tuples reuse UNIQUE's equality codec; source JSON is
 //! never reparsed to classify a prepared relational write.
 const std = @import("std");
-const binding_mod = @import("../pessimistic_lock_resource.zig");
-const scopes = @import("../pessimistic_lock_authority.zig");
+const binding_mod = @import("../pessimistic_lock/resource.zig");
+const scopes = @import("../pessimistic_lock/authority.zig");
 const ledger = scopes.ledger;
-const contracts = @import("../pessimistic_lock_contract.zig");
+const contracts = @import("../pessimistic_lock/contract.zig");
 const store_mod = @import("../docstore.zig");
 const transactions = @import("../transactions.zig");
 const schemas = @import("schema_registry.zig");

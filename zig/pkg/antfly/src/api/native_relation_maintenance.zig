@@ -17,7 +17,7 @@
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const operation = local.api_operation;
-pub const Request = @import("../metadata/sql_relation_boots.zig").MaintenanceRequest;
+pub const Request = @import("../metadata/sql/relation_lifecycle/boots.zig").MaintenanceRequest;
 pub const Result = enum { enforced, pending, invalid };
 
 pub fn requestFor(table: local.common_topology_records.TableRecord, range: local.common_topology_records.RangeRecord) !Request {

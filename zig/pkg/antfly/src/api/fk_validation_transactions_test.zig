@@ -200,7 +200,7 @@ test "foreign key validation native transaction preserves atomic pages and publi
         const parts = try local.storage_db_relational_schema_owner_contract.inputParts(candidate.inputs);
         try std.testing.expectEqualStrings(parts[3], payload);
         const metadata_tables = @import("tables.zig");
-        const metadata_plans = @import("../metadata/schema_validation_plan.zig");
+        const metadata_plans = @import("../metadata/schema_validation/plan.zig");
         const before_record: local.common_topology_records.TableRecord = .{ .table_id = 300, .name = "rows", .schema_json = declaration, .indexes_json = "{}" };
         const after_record = try metadata_tables.prepareSchemaValidationPublicationRecord(a, &before_record, .{ .foreign_keys = &.{"fk"} });
         defer @import("../metadata/table_manager.zig").freeTable(a, after_record);
@@ -220,7 +220,7 @@ test "foreign key validation native transaction preserves atomic pages and publi
     const initial_record = try record.encode(a);
     defer a.free(initial_record);
     const scope: activation.ForeignKeyValidationScope = .{ .binding = source_binding, .physical_root = db.root_incarnation, .action = .page };
-    const rows = @import("schema_validation_rows.zig");
+    const rows = @import("schema_validation/rows.zig");
     try std.testing.expectEqual(rows.Result.pending, try rows.step(a, fixture.source(), fixture.writer(), &tables, &ranges, ranges[0], source_binding, candidate.inputs, db.root_incarnation, false, .{}));
     try expectCheckpoint(&db, initial_record);
     // Control-plane cancellation cannot bypass the progress key's 2PC lock.
@@ -619,7 +619,7 @@ fn expectReplacementCancellation(source: *db_mod.DB, directory: []const u8, name
 // Restore preserves that transaction; root restart cannot overtake its decision.
 fn expectPreparedPageRestore(source: *Fixture, directory: []const u8, options: db_mod.OpenOptions, binding: local.storage_db_relational_schema_owner_contract.Binding, inputs: []const u8) !void {
     const lifecycle = local.storage_db_generation_lifecycle;
-    const rows = @import("schema_validation_rows.zig");
+    const rows = @import("schema_validation/rows.zig");
     try std.testing.expectEqual(rows.Result.pending, try rows.step(a, source.source(), source.writer(), &tables, &ranges, ranges[0], binding, inputs, source.db.root_incarnation, false, .{}));
     const initial = (try source.db.core.getStoreValue(a, activation.validation_key)).?;
     defer a.free(initial);
@@ -735,7 +735,7 @@ fn replayValidationJournal(journal: *@import("../storage/hot_standby/primary.zig
 test "foreign key validation native snapshot restarts unaccepted coverage on the actual replacement root" {
     const job = local.storage_db_relational_nullability_job;
     const lifecycle = local.storage_db_generation_lifecycle;
-    const rows = @import("schema_validation_rows.zig");
+    const rows = @import("schema_validation/rows.zig");
     var directory = try local.common_test_directory.TestDirectory.init("fk-validation-root-restart");
     defer directory.cleanup();
     const source_path = try std.fs.path.join(a, &.{ directory.path(), "source" });

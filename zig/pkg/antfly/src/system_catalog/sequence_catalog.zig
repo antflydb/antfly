@@ -154,7 +154,7 @@ pub const Snapshot = struct {
         database_id: u64,
         references: @import("sequence_default_dependencies.zig").Stamp,
         dependents: []const sources.common_topology_records.TableRecord,
-        activation: ?@import("../metadata/schema_validation_publication.zig").OwnerCut = null,
+        activation: ?@import("../metadata/schema_validation/publication.zig").OwnerCut = null,
     };
     retirement: ?Retirement = null,
     metadata_group_id: u64 = 0,
@@ -221,7 +221,7 @@ pub const Snapshot = struct {
             if (retirement.activation) |activation| {
                 if (retirement.dependents.len == 0 or activation.metadata_group_id != self.metadata_group_id or activation.metadata_group_id == 0 or
                     !std.mem.eql(u8, &activation.metadata_incarnation, &std.fmt.bytesToHex(self.incarnation, .lower)) or
-                    activation.ranges.len == 0 or activation.ranges.len > @import("../metadata/schema_validation_publication.zig").max_owners) return error.InvalidSqlBackendResponse;
+                    activation.ranges.len == 0 or activation.ranges.len > @import("../metadata/schema_validation/publication.zig").max_owners) return error.InvalidSqlBackendResponse;
                 var ordinal: usize = 0;
                 for (retirement.dependents) |table| {
                     const start = ordinal;

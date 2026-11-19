@@ -916,7 +916,7 @@ pub fn encodeLakeIndexListWithProof(alloc: std.mem.Allocator, table: metadata_ta
         defer columns.deinit();
         if (schema.relational_indexes) |definitions| for (definitions.value) |definition| {
             if (configs.object.contains(definition.name)) return error.InvalidTableIndexMetadata;
-            const json = try @import("relational_index_mutation.zig").configForDefinition(a, definition, &columns);
+            const json = try @import("relational_index/mutation.zig").configForDefinition(a, definition, &columns);
             try configs.object.put(a, definition.name, try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{}));
         };
     }

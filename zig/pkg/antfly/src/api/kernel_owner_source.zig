@@ -1352,7 +1352,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .{ .group_id = ranges[0].group_id, .table_name = name, .loaded = loaded };
     }
 
-    pub fn initializedRelationBindingAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, metadata_group: u64, group: u64, table_name: []const u8, boot: @import("../metadata/sql_relation_boots.zig").Record, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !@import("../metadata/sql_relation_attestation.zig").SignedBinding {
+    pub fn initializedRelationBindingAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, metadata_group: u64, group: u64, table_name: []const u8, boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !@import("../metadata/sql/relation_lifecycle/attestation.zig").SignedBinding {
         try context.ensureActive();
         const normalized = try platformDeadlineContext(context);
         var descriptor = try self.loadDescriptorWithDeadline(alloc, group, table_name, normalized.deadline_ns);
@@ -1362,7 +1362,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     /// Hidden targets use the immutable already-admitted job descriptor; the
     /// metadata receipt receiver separately rejoins this exact plan and scope.
-    pub fn initializedRelationBindingForDescriptorAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, metadata_group: u64, group: u64, table_name: []const u8, path: []const u8, descriptor: descriptor_contract.Descriptor, creation_scope: ?@import("../metadata/sql_relation_attestation.zig").CreationScope, boot: @import("../metadata/sql_relation_boots.zig").Record, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !@import("../metadata/sql_relation_attestation.zig").SignedBinding {
+    pub fn initializedRelationBindingForDescriptorAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, metadata_group: u64, group: u64, table_name: []const u8, path: []const u8, descriptor: descriptor_contract.Descriptor, creation_scope: ?@import("../metadata/sql/relation_lifecycle/attestation.zig").CreationScope, boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !@import("../metadata/sql/relation_lifecycle/attestation.zig").SignedBinding {
         try context.ensureActive();
         try self.beginNativeInitialization(group, table_name);
         defer self.endNativeInitialization(group);
@@ -1420,7 +1420,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (retained) return error.SqlRelationOwnerUnavailable;
         try context.ensureActive();
         if (!std.mem.eql(u8, &actual, &try self.nativeExecutionInstance())) return error.SqlRelationOwnerChanged;
-        return try @import("../metadata/sql_relation_attestation.zig").SignedBinding.sign(.{
+        return try @import("../metadata/sql/relation_lifecycle/attestation.zig").SignedBinding.sign(.{
             .kind = .initialized,
             .metadata_group_id = metadata_group,
             .boot_generation = boot.generation,
@@ -1434,7 +1434,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// Reopen the exact durably initialized image through a binding-only
     /// control capability. Failed flush/close remains counted in this registry;
     /// no publication can mistake a missing initialized root for an empty one.
-    pub fn adoptedRelationBindingForDescriptorAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, metadata_group: u64, group: u64, table_name: []const u8, path: []const u8, descriptor: descriptor_contract.Descriptor, before: @import("../metadata/sql_relation_attestation.zig").SignedBinding, boot: @import("../metadata/sql_relation_boots.zig").Record, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !@import("../metadata/sql_relation_attestation.zig").SignedBinding {
+    pub fn adoptedRelationBindingForDescriptorAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, metadata_group: u64, group: u64, table_name: []const u8, path: []const u8, descriptor: descriptor_contract.Descriptor, before: @import("../metadata/sql/relation_lifecycle/attestation.zig").SignedBinding, boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !@import("../metadata/sql/relation_lifecycle/attestation.zig").SignedBinding {
         const P = @import("antfly_local_sources").common_topology_records.RelationPersistence;
         try context.ensureActive();
         try self.beginNativeInitialization(group, table_name);
@@ -1476,7 +1476,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (retained) return error.SqlRelationOwnerUnavailable;
         try context.ensureActive();
         if (!std.mem.eql(u8, &actual, &try self.nativeExecutionInstance())) return error.SqlRelationOwnerChanged;
-        const proof = try @import("../metadata/sql_relation_attestation.zig").SignedBinding.sign(.{
+        const proof = try @import("../metadata/sql/relation_lifecycle/attestation.zig").SignedBinding.sign(.{
             .kind = .adopted,
             .metadata_group_id = metadata_group,
             .boot_generation = boot.generation,
@@ -1487,11 +1487,11 @@ pub const ProvisionedKernelOwnerSource = struct {
             .previous_descriptor_fingerprint = try lifetime.fingerprint(),
             .previous_binding_digest = try before.digest(),
         }, root);
-        try @import("../metadata/sql_relation_lifetimes.zig").requireAdoption(before, proof);
+        try @import("../metadata/sql/relation_lifecycle/lifetimes.zig").requireAdoption(before, proof);
         return proof;
     }
 
-    pub fn attestRelationBoot(self: *ProvisionedKernelOwnerSource, request: @import("../metadata/sql_relation_boot_wire.zig").Request, root: @import("antfly_local_sources").storage_db_root_signing_identity.State) !@import("../metadata/sql_relation_boot_wire.zig").Request {
+    pub fn attestRelationBoot(self: *ProvisionedKernelOwnerSource, request: @import("../metadata/sql/relation_lifecycle/boot_wire.zig").Request, root: @import("antfly_local_sources").storage_db_root_signing_identity.State) !@import("../metadata/sql/relation_lifecycle/boot_wire.zig").Request {
         const actual = try self.nativeExecutionInstance();
         if (!std.mem.eql(u8, &actual, &request.native_instance)) return error.SqlRelationOwnerChanged;
         if (request.command == .begin_drain) {
@@ -2404,7 +2404,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// This is a private replacement producer, not a recovery-capable user
     /// owner open. Source publication excludes all old owners and cold openers
     /// before the fresh registered metadata attempt is observed.
-    pub fn replaceNativeEmptyImageAtRoot(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, metadata_group: u64, group: u64, table: []const u8, path: []const u8, descriptor: descriptor_contract.Descriptor, creation_scope: @import("../metadata/sql_relation_attestation.zig").CreationScope, expected_boot: @import("../metadata/sql_relation_boots.zig").Record, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, io: std.Io, context: request_operation.RequestContext) !@import("../metadata/sql_relation_attestation.zig").SignedBinding {
+    pub fn replaceNativeEmptyImageAtRoot(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, metadata_group: u64, group: u64, table: []const u8, path: []const u8, descriptor: descriptor_contract.Descriptor, creation_scope: @import("../metadata/sql/relation_lifecycle/attestation.zig").CreationScope, expected_boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, io: std.Io, context: request_operation.RequestContext) !@import("../metadata/sql/relation_lifecycle/attestation.zig").SignedBinding {
         const P = @import("antfly_local_sources").common_topology_records.RelationPersistence;
         const restore = @import("antfly_local_sources").storage_db_restore_staging_contract;
         try context.ensureActive();
@@ -2451,7 +2451,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer abi.antfly_storage_owner_buffer_destroy(&output);
         var captured = try std.json.parseFromSlice(P.NativeBinding, a, output.slice(), .{});
         defer captured.deinit();
-        const signed = try @import("../metadata/sql_relation_attestation.zig").SignedBinding.sign(.{ .kind = .initialized, .metadata_group_id = metadata_group, .boot_generation = boot.generation, .identity = boot.identity, .reporter_incarnation = boot.reporter_incarnation, .binding = captured.value, .creation_scope = creation_scope }, root);
+        const signed = try @import("../metadata/sql/relation_lifecycle/attestation.zig").SignedBinding.sign(.{ .kind = .initialized, .metadata_group_id = metadata_group, .boot_generation = boot.generation, .identity = boot.identity, .reporter_incarnation = boot.reporter_incarnation, .binding = captured.value, .creation_scope = creation_scope }, root);
         try attempt.requireInitialized(signed);
         return signed;
     }
@@ -3854,7 +3854,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         } = null,
         /// Only an already initialized current hidden empty image can borrow
         /// a recovering host. New/replacement birth uses separate admission.
-        native_empty_admission: ?@import("../metadata/sql_relation_empty_target.zig").Admission = null,
+        native_empty_admission: ?@import("../metadata/sql/relation_lifecycle/empty_target.zig").Admission = null,
         native_empty_host: ?@import("antfly_local_sources").common_topology_records.RelationPersistence.Context = null,
         native_adoption: ?struct {
             boot: @import("antfly_local_sources").common_topology_records.RelationPersistence.Boot,
@@ -4708,7 +4708,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         return lease;
     }
 
-    const SchemaAttestation = @import("../metadata/schema_validation_attestation.zig");
+    const SchemaAttestation = @import("../metadata/schema_validation/attestation.zig");
     pub const RootedNativeSchemaOwnerObservation = SchemaAttestation.RootedObservation;
 
     pub const SchemaPreparationSigner = struct {
@@ -4825,7 +4825,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             before_json.len == 0 or before_json.len > contract.max_schema or after_json.len == 0 or after_json.len > contract.max_schema or signer.reporter_incarnation == 0) return error.InvalidSchemaValidationJob;
         if (signer.authority == .native) {
             if (signer.native_pin) |pin| {
-                if (!std.mem.eql(u8, &try @import("../metadata/sql_relation_attestation.zig").nativeAuthorityDigest(signer.identity, pin), &signer.authority.native)) return error.SchemaValidationJobChanged;
+                if (!std.mem.eql(u8, &try @import("../metadata/sql/relation_lifecycle/attestation.zig").nativeAuthorityDigest(signer.identity, pin), &signer.authority.native)) return error.SchemaValidationJobChanged;
             } else {
                 const binding: @import("../metadata/standalone_native_owner.zig").Binding = .{ .metadata_incarnation = signer.identity.metadata_incarnation, .node_id = signer.identity.node_id, .store_id = signer.identity.store_id, .root_incarnation = signer.identity.root_incarnation };
                 if (!std.mem.eql(u8, &try binding.digest(), &signer.authority.native)) return error.SchemaValidationJobChanged;
@@ -4887,7 +4887,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// Zero-progress root recovery uses real native candidate preparation plus
     /// an independently completed shared Raft prefix. No job header, data-entry
     /// index or row-audit evidence is invented for a pre-begin replica.
-    pub fn attestSchemaBootstrapAtRoot(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, descriptor: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.PreparationDescriptor, inputs: []const u8, expected: SchemaAttestation.RaftScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !@import("../metadata/schema_validation_bootstrap.zig").CertifiedPreparation {
+    pub fn attestSchemaBootstrapAtRoot(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, descriptor: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.PreparationDescriptor, inputs: []const u8, expected: SchemaAttestation.RaftScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !@import("../metadata/schema_validation/bootstrap.zig").CertifiedPreparation {
         try context.ensureActive();
         try expected.validate();
         if (descriptor.authority != .raft or expected.group_id != group_id) return error.SchemaValidationJobChanged;
@@ -4908,7 +4908,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             return error.IndexOwnerReceiptChanged;
         const visible = try @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(self.visibleRootGeneration(group_id));
         if (visible != expected.root_generation) return error.SchemaValidationRuntimeRecoveryRequired;
-        const signed = try @import("../metadata/schema_validation_bootstrap.zig").CertifiedPreparation.sign(prepared, completed, expected, root);
+        const signed = try @import("../metadata/schema_validation/bootstrap.zig").CertifiedPreparation.sign(prepared, completed, expected, root);
         try context.ensureActive();
         return signed;
     }
@@ -6335,7 +6335,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
     };
 
-    fn requireNativeMaintenanceLease(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, request: @import("native_relation_maintenance.zig").Request, context: request_operation.RequestContext) !@import("../metadata/sql_relation_boots.zig").MaintenanceLease {
+    fn requireNativeMaintenanceLease(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, request: @import("native_relation_maintenance.zig").Request, context: request_operation.RequestContext) !@import("../metadata/sql/relation_lifecycle/boots.zig").MaintenanceLease {
         try @import("native_relation_maintenance.zig").requireAuthority(context);
         const observed = try self.catalog.sqlRelationBinding(a, .{ .maintenance = request }, context.deadline_ns);
         const grant = observed.maintenance orelse return error.SqlTemporaryRelationNotOwned;
@@ -6479,7 +6479,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!context.setting_admin or !context.schema_validation_authority or !context.fk_generation_publication_authority) return error.Forbidden;
         try context.ensureActive();
         try expected.descriptor.validate();
-        const max_metadata = @import("../metadata/table_retirement_manifest.zig").max_bytes;
+        const max_metadata = @import("../metadata/retirement/table/manifest.zig").max_bytes;
         if (expected.schema_json.len == 0 or expected.schema_json.len > max_metadata or expected.indexes_json.len > max_metadata or table.len > 1024) return error.InvalidTableRetirementManifest;
         if (group == 0 or table.len == 0 or expected.namespace.table_id == 0 or expected.namespace.shard_id == 0 or expected.namespace.range_id == 0) return error.IdentityNamespaceMismatch;
         const normalized = try platformDeadlineContext(context);
@@ -6716,7 +6716,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         actual.connection = null;
         if (!std.mem.eql(u8, &actual.execution_instance, &boot.instance)) return error.SqlRelationOwnerChanged;
         try selected.requireHost(actual);
-        const signing: @import("../metadata/relational_index_publication.zig").NativeSigningView = .{ .identity = boot.identity, .reporter_incarnation = boot.reporter_incarnation, .native_pin = pin, .binding_digest = try @import("../metadata/sql_relation_attestation.zig").nativeAuthorityDigest(boot.identity, pin) };
+        const signing: @import("../metadata/relational_index/publication.zig").NativeSigningView = .{ .identity = boot.identity, .reporter_incarnation = boot.reporter_incarnation, .native_pin = pin, .binding_digest = try @import("../metadata/sql/relation_lifecycle/attestation.zig").nativeAuthorityDigest(boot.identity, pin) };
         try signing.validate(boot.identity.metadata_incarnation);
         var lease = if (boot.phase == .draining)
             try self.acquireExistingNativeRetirement(group, table, captured.view())
@@ -7110,19 +7110,19 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     pub const NativeGroupProof = struct {
-        boot: @import("../metadata/sql_relation_boots.zig").Record,
+        boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record,
         initialized: @import("antfly_local_sources").common_topology_records.RelationPersistence.NativeBinding,
-        signing: @import("../metadata/relational_index_publication.zig").NativeSigningView,
+        signing: @import("../metadata/relational_index/publication.zig").NativeSigningView,
         metadata_group_id: u64,
         attempt: ?@import("../metadata/native_restore_acceptance.zig").Attempt = null,
-        empty_target: ?@import("../metadata/sql_relation_empty_target.zig").Admission = null,
+        empty_target: ?@import("../metadata/sql/relation_lifecycle/empty_target.zig").Admission = null,
     };
 
     fn initializedForDescriptor(self: *ProvisionedKernelOwnerSource, descriptor: descriptor_contract.Descriptor, controls: ReadControls) !@import("antfly_local_sources").common_topology_records.RelationPersistence.NativeBinding {
         return (try self.nativeProofForDescriptor(descriptor, controls)).initialized;
     }
 
-    fn requireHiddenEmptyBoot(descriptor: descriptor_contract.Descriptor, scope: @import("antfly_local_sources").storage_db_restore_staging_contract.Scope, observed: @import("../metadata/sql_relation_boots.zig").Observation) !@import("../metadata/sql_relation_boots.zig").Record {
+    fn requireHiddenEmptyBoot(descriptor: descriptor_contract.Descriptor, scope: @import("antfly_local_sources").storage_db_restore_staging_contract.Scope, observed: @import("../metadata/sql/relation_lifecycle/boots.zig").Observation) !@import("../metadata/sql/relation_lifecycle/boots.zig").Record {
         const boot = observed.record orelse return error.SqlRelationOwnerUnavailable;
         try boot.validate();
         if (!observed.registration_current) return error.SqlRelationOwnerChanged;
@@ -7140,7 +7140,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     /// Recovery is availability only after authenticating the enrolled current
     /// process. A foreign/stale reporter or TEMP execution epoch stays fenced.
-    fn requireCurrentNativeBoot(self: *ProvisionedKernelOwnerSource, native: @import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor, observed: @import("../metadata/sql_relation_boots.zig").Observation) !@import("../metadata/sql_relation_boots.zig").Record {
+    fn requireCurrentNativeBoot(self: *ProvisionedKernelOwnerSource, native: @import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor, observed: @import("../metadata/sql/relation_lifecycle/boots.zig").Observation) !@import("../metadata/sql/relation_lifecycle/boots.zig").Record {
         try native.validate();
         const boot = observed.record orelse return error.SqlRelationOwnerUnavailable;
         try boot.validate();
@@ -7155,7 +7155,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const native = descriptor.sql_persistence orelse return error.InvalidSqlRelationPersistence;
         var region = std.heap.ArenaAllocator.init(self.alloc);
         defer region.deinit();
-        var creation_scope: ?@import("../metadata/sql_relation_attestation.zig").CreationScope = null;
+        var creation_scope: ?@import("../metadata/sql/relation_lifecycle/attestation.zig").CreationScope = null;
         var restore_table: []const u8 = "";
         var restore_scope: ?@import("antfly_local_sources").storage_db_restore_staging_contract.Scope = null;
         if (descriptor.restore_bootstrap_json.len != 0) {
@@ -7178,7 +7178,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 !std.mem.eql(u8, actual.schema_json, descriptor.schema_json) or !std.mem.eql(u8, actual.indexes_json, descriptor.indexes_json) or
                 !std.mem.eql(u8, actual.restore_bootstrap_json, descriptor.restore_bootstrap_json)) return error.RestoreStagingScopeChanged;
         }
-        const publication_request: ?@import("../metadata/sql_relation_boots.zig").PublishedRestoreRequest = if (published) |selected| .{ .creation_scope = creation_scope orelse return error.RestoreStagingScopeChanged, .scope_digest = selected.scope, .table_id = descriptor.identity.table_id, .group_id = selected.group_id } else null;
+        const publication_request: ?@import("../metadata/sql/relation_lifecycle/boots.zig").PublishedRestoreRequest = if (published) |selected| .{ .creation_scope = creation_scope orelse return error.RestoreStagingScopeChanged, .scope_digest = selected.scope, .table_id = descriptor.identity.table_id, .group_id = selected.group_id } else null;
         const observed = try self.catalog.sqlRelationBinding(self.alloc, .{ .node = native.owner_node_id, .binding_table = descriptor.identity.table_id, .creation_scope = creation_scope, .published_restore = publication_request }, controls.execution_deadline_ns);
         if (publication_request) |expected| try (observed.published_restore orelse return error.RestoreStagingScopeChanged).requireFor(expected);
         const current_boot = try self.requireCurrentNativeBoot(native, observed);
@@ -7217,7 +7217,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         actual.connection = null;
         try native.requireHost(actual);
         const pin = try @import("antfly_local_sources").common_topology_records.RelationPersistence.PhysicalPin.fromBinding(signed.binding);
-        const signing: @import("../metadata/relational_index_publication.zig").NativeSigningView = .{ .identity = boot.identity, .reporter_incarnation = boot.reporter_incarnation, .native_pin = pin, .binding_digest = try @import("../metadata/sql_relation_attestation.zig").nativeAuthorityDigest(boot.identity, pin) };
+        const signing: @import("../metadata/relational_index/publication.zig").NativeSigningView = .{ .identity = boot.identity, .reporter_incarnation = boot.reporter_incarnation, .native_pin = pin, .binding_digest = try @import("../metadata/sql/relation_lifecycle/attestation.zig").nativeAuthorityDigest(boot.identity, pin) };
         try signing.validate(boot.identity.metadata_incarnation);
         const attempt: ?@import("../metadata/native_restore_acceptance.zig").Attempt = if (creation_scope != null) captured: {
             const current = observed.attempt orelse return error.SqlRelationRecoveryIncomplete;
@@ -7843,7 +7843,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 var bootstrap = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap, self.alloc, descriptor.restore_bootstrap_json, .{});
                 defer bootstrap.deinit();
                 const empty = controls.native_empty_admission.?;
-                try empty.require(bootstrap.value.scope, lifetime, .{ .table_id = descriptor.identity.table_id, .shard_id = descriptor.identity.shard_id, .range_id = descriptor.identity.range_id }, @as(?@import("../metadata/sql_relation_empty_target.zig").Attempt, empty.attempt));
+                try empty.require(bootstrap.value.scope, lifetime, .{ .table_id = descriptor.identity.table_id, .shard_id = descriptor.identity.shard_id, .range_id = descriptor.identity.range_id }, @as(?@import("../metadata/sql/relation_lifecycle/empty_target.zig").Attempt, empty.attempt));
                 if (!std.mem.eql(u8, &recovering.execution_instance, &controls.native_initialized.?.native_instance)) return error.SqlRelationOwnerChanged;
             }
             if (controls.native_uninitialized != null and (!controls.native_initialization or controls.native_adoption != null or controls.native_empty_host != null)) return error.InvalidSqlRelationPersistence;
@@ -13851,8 +13851,8 @@ test "SQL relation lifetime initialized native owner reports actual source while
     const binding = try initialize.owner().nativeRelationBinding(a, "rows");
     initialize.requestTransientRetirement();
     initialize.deinit();
-    const boots = @import("../metadata/sql_relation_boots.zig");
-    const attestation = @import("../metadata/sql_relation_attestation.zig");
+    const boots = @import("../metadata/sql/relation_lifecycle/boots.zig");
+    const attestation = @import("../metadata/sql/relation_lifecycle/attestation.zig");
     const ownership = @import("group_work_ownership.zig");
     const root = try @import("antfly_local_sources").storage_db_root_signing_identity.loadOrCreate(a, std.testing.io, path);
     const identity: @import("../metadata/store_root_enrollment.zig").Identity = .{ .metadata_incarnation = @splat('a'), .node_id = 9, .store_id = 11, .root_incarnation = root.root_incarnation, .public_key = root.public_key };
@@ -14841,8 +14841,8 @@ test "row-policy coupled Source CAPI desired descriptor preserves predecessor un
 test "SQL relation lifetime native retirement preparation captures only exact initialized image and catalog across cold owner reopen" {
     const local = @import("antfly_local_sources");
     const P = local.common_topology_records.RelationPersistence;
-    const boots = @import("../metadata/sql_relation_boots.zig");
-    const attestation = @import("../metadata/sql_relation_attestation.zig");
+    const boots = @import("../metadata/sql/relation_lifecycle/boots.zig");
+    const attestation = @import("../metadata/sql/relation_lifecycle/attestation.zig");
     const services = @import("../storage/kernel_runtime_services.zig");
     const a = std.testing.allocator;
     const schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"unique_constraints\":[{\"name\":\"pk\",\"columns\":[\"id\"]}],\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}}}";
@@ -15073,8 +15073,8 @@ test "SQL relation lifetime published native restore control authenticates curre
     const local = @import("antfly_local_sources");
     const P = local.common_topology_records.RelationPersistence;
     const staging = local.storage_db_restore_staging_contract;
-    const boots = @import("../metadata/sql_relation_boots.zig");
-    const attestation = @import("../metadata/sql_relation_attestation.zig");
+    const boots = @import("../metadata/sql/relation_lifecycle/boots.zig");
+    const attestation = @import("../metadata/sql/relation_lifecycle/attestation.zig");
     const services = @import("../storage/kernel_runtime_services.zig");
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -51,11 +51,11 @@ pub const Reference = struct {
     }
 };
 pub const LostNative = struct {
-    scope: @import("sql_relation_attestation.zig").CreationScope,
+    scope: @import("sql/relation_lifecycle/attestation.zig").CreationScope,
     table_id: u64,
-    expected_boot: @import("sql_relation_boots.zig").Record,
+    expected_boot: @import("sql/relation_lifecycle/boots.zig").Record,
 
-    pub fn requireObserved(self: LostNative, target: stages.Target, observed: @import("sql_relation_boots.zig").Observation) !void {
+    pub fn requireObserved(self: LostNative, target: stages.Target, observed: @import("sql/relation_lifecycle/boots.zig").Observation) !void {
         const native = target.table.sql_persistence orelse return error.InvalidSqlRelationPersistence;
         try native.validate();
         if (target.table.table_id != self.table_id or target.ranges.len != 1 or target.native_reset != null or target.rewrite != null or target.schema_only_snapshot != null or target.source_artifacts.len != 0) return error.RestoreStagingScopeChanged;
@@ -70,13 +70,13 @@ pub const LostNative = struct {
         if (!lost_image) return error.SqlRelationOwnerChanged;
         if (observed.initialized) |initialized| {
             try initialized.verify();
-            if (!initialized.binding.descriptor.eql(native) or initialized.binding.table_id != self.table_id or !std.meta.eql(initialized.creation_scope, @as(?@import("sql_relation_attestation.zig").CreationScope, self.scope))) return error.SqlRelationOwnerChanged;
+            if (!initialized.binding.descriptor.eql(native) or initialized.binding.table_id != self.table_id or !std.meta.eql(initialized.creation_scope, @as(?@import("sql/relation_lifecycle/attestation.zig").CreationScope, self.scope))) return error.SqlRelationOwnerChanged;
         }
     }
 };
 pub const NativeRecovery = struct {
-    entry: @import("sql_relation_lifetimes.zig").Entry,
-    boot: @import("sql_relation_boots.zig").Record,
+    entry: @import("sql/relation_lifecycle/lifetimes.zig").Entry,
+    boot: @import("sql/relation_lifecycle/boots.zig").Record,
     pub fn validate(self: NativeRecovery) !void {
         try self.entry.validate();
         try self.boot.validate();
@@ -310,8 +310,8 @@ test "SQL scope retirement population controls bind exact job custody and keep o
 test "SQL native population cancellation rejoins exact lost image and refuses healthy or superseded owners" {
     const local = @import("antfly_local_sources");
     const persistence = local.common_topology_records.RelationPersistence;
-    const attest = @import("sql_relation_attestation.zig");
-    const boots = @import("sql_relation_boots.zig");
+    const attest = @import("sql/relation_lifecycle/attestation.zig");
+    const boots = @import("sql/relation_lifecycle/boots.zig");
     const seed: [32]u8 = @splat(7);
     const keys = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
     const root: local.storage_db_root_signing_identity.State = .{ .root_incarnation = 11, .seed = seed, .public_key = keys.public_key.toBytes() };

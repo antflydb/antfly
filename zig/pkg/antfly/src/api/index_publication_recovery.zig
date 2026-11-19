@@ -17,7 +17,7 @@
 //! A checksum detects damaged handles; it is not a signature or authorization.
 const std = @import("std");
 const local = @import("antfly_local_sources");
-const publication = @import("../metadata/relational_index_publication.zig");
+const publication = @import("../metadata/relational_index/publication.zig");
 const wire = @import("antfly_indexes_openapi").types;
 const Allocator = std.mem.Allocator;
 

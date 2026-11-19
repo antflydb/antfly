@@ -3461,7 +3461,7 @@ not completion of the remaining SQL architecture.
 ### Shared mounted owner qualification for index lifecycles
 
 The next delivery extracts the existing PK campaign's real metadata/data-owner
-setup into `api/sql_owner_test_fixture.zig`. Campaigns borrow a context only
+setup into `api/sql/testing/owner_test_fixture.zig`. Campaigns borrow a context only
 while both runtimes and their progress drivers are alive. The harness owns
 startup, driver-error checks, orderly cold data-owner restart and teardown;
 callbacks own their expected postimages and durable table identities. The
@@ -3692,7 +3692,7 @@ there is no original-case disposition credit or claim of public SQL parity.
 
 ### Independent private UNIQUE candidate validation
 
-`metadata/relational_index_candidate.zig` now prepares owned candidate and
+`metadata/relational_index/candidate.zig` now prepares owned candidate and
 reservation catalogs only after independently validating the entire schema
 delta. Exactly one index and one `origin: index` UNIQUE rule may be added. All
 other schema fields, including unknown future fields, CHECKs, defaults, generated
@@ -3811,7 +3811,7 @@ parity claim; the earlier intermittent metadata read timeout remains open.
 
 ### Immutable staged UNIQUE plan preparation
 
-`metadata/relational_index_publication.zig` binds the exact schema-only before
+`metadata/relational_index/publication.zig` binds the exact schema-only before
 and after table records, logical table guard, proposed namespace/index name,
 owner catalog predecessor and complete ordered range cohort in an immutable
 format-versioned frame. A counting writer enforces an 8 MiB escaped-frame limit
@@ -15467,7 +15467,7 @@ profile remains 60: understanding these records is not activation of their
 complete writer/worker protocol. New snapshots containing bindings cannot be
 accepted under the currently advertised profile.
 
-`metadata/schema_validation_plan.zig` prepares canonical, bounded immutable
+`metadata/schema_validation/plan.zig` prepares canonical, bounded immutable
 plans committing predecessor/successor table images, ordered validation
 columns, complete range descriptors, owner bindings, physical preparation roots
 and optional SQL relation guards. It independently derives the only permitted

@@ -17,9 +17,9 @@
 //! every effect; discovery never recaptures a mutable database/schema name.
 const std = @import("std");
 const local = @import("antfly_local_sources");
-const scopes = @import("../metadata/scope_retirement_ledger.zig");
-const wire = @import("../metadata/scope_retirement_wire.zig");
-const roots = @import("../metadata/table_retirement_ledger.zig");
+const scopes = @import("../metadata/retirement/scope/ledger.zig");
+const wire = @import("../metadata/retirement/scope/wire.zig");
+const roots = @import("../metadata/retirement/table/ledger.zig");
 const locks = @import("../system_catalog/lock_authority.zig");
 const Server = @import("http_server.zig").ApiHttpServer;
 
@@ -106,7 +106,7 @@ fn stepInternal(server: *Server, after: u64, context: local.api_operation.Reques
         .retiring_tables => blk: {
             const child = work.child orelse return error.InvalidScopeRetirement;
             const lookup: roots.Lookup = .{ .group = child.lookup.group, .table = child.table, .id = child.id };
-            const receipts = @import("../metadata/table_retirement_receipt.zig");
+            const receipts = @import("../metadata/retirement/table/receipt.zig");
             const expected: receipts.Request = .{ .lookup = lookup, .effect = .{ .scope_admission = child } };
             const admitted = try std.json.parseFromSliceLeaky(receipts.Observation, a, try server.source.systemCatalog(a, context, .{ .table_retirement_receipt = expected }), .{});
             try admitted.requireFor(expected);

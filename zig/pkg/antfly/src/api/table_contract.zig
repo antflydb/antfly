@@ -97,7 +97,7 @@ pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDis
 
 pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tables_api.CreateTableRequest {
     if (body.len == 0) return .{ .indexes_json = try coverage_policy.withMissingIncarnationsAlloc(alloc, tables_api.default_indexes_json) };
-    if (try @import("relational_index_mutation.zig").normalizeCreateTableBody(alloc, body)) |normalized| {
+    if (try @import("relational_index/mutation.zig").normalizeCreateTableBody(alloc, body)) |normalized| {
         defer alloc.free(normalized);
         return parseCreateTableRequest(alloc, normalized);
     }
@@ -446,7 +446,7 @@ pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, index_name: []const u8,
 
     // Typed literal binding must see the caller's exact numeric token. Keep
     // artifact validation's established numeric representation unchanged.
-    const relational = try @import("relational_index_mutation.zig").isRelational(alloc, body);
+    const relational = try @import("relational_index/mutation.zig").isRelational(alloc, body);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = !relational });
     defer parsed.deinit();
     const root = switch (parsed.value) {

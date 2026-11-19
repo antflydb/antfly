@@ -192,7 +192,7 @@ fn beginIndex(server: *server_mod.ApiHttpServer, context: operation.RequestConte
     var private = try context.platformDeadline();
     private.setting_admin = true;
     private.index_publication_authority = true;
-    var owned = @import("relational_index_plan_builder.zig").prepare(server.source, reader, allocators.scratch, io, private, .{ .guard = guard, .index_name = index_name }, schema_json) catch |err| switch (err) {
+    var owned = @import("relational_index/plan_builder.zig").prepare(server.source, reader, allocators.scratch, io, private, .{ .guard = guard, .index_name = index_name }, schema_json) catch |err| switch (err) {
         error.MetadataReplicationPending => return error.CatalogPublicationProofPending,
         else => return err,
     };
@@ -209,7 +209,7 @@ fn beginIndex(server: *server_mod.ApiHttpServer, context: operation.RequestConte
     }
     receipt.index_publication_token = try a.dupe(u8, &owned.recovery_token);
     transferred = true;
-    return @import("relational_index_admission.zig").submitOwned(server.source, allocators.scratch, io, private, &owned, receipt, allocators.completion);
+    return @import("relational_index/admission.zig").submitOwned(server.source, allocators.scratch, io, private, &owned, receipt, allocators.completion);
 }
 
 fn beginSchemaValidation(server: *server_mod.ApiHttpServer, context: operation.RequestContext, allocators: catalog.DdlAllocators, target: domain.Target, guard: domain.RelationMutationGuard, selection: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Selection) !catalog.DdlOutcome {
@@ -219,9 +219,9 @@ fn beginSchemaValidation(server: *server_mod.ApiHttpServer, context: operation.R
     // capabilities are never decoded from SQL, tokens, or public request JSON.
     private.setting_admin = true;
     private.schema_validation_authority = true;
-    var transport: @import("schema_validation_owner_transport.zig").Transport = .{ .server = server, .alloc = allocators.scratch };
+    var transport: @import("schema_validation/owner_transport.zig").Transport = .{ .server = server, .alloc = allocators.scratch };
     defer transport.deinit();
-    var owned = @import("schema_validation_plan_builder.zig").prepare(server.source, &transport, allocators.scratch, io, private, .{ .guard = guard, .selection = selection }) catch |err| switch (err) {
+    var owned = @import("schema_validation/plan_builder.zig").prepare(server.source, &transport, allocators.scratch, io, private, .{ .guard = guard, .selection = selection }) catch |err| switch (err) {
         error.MetadataReplicationPending => return error.CatalogPublicationProofPending,
         else => return err,
     };
@@ -238,7 +238,7 @@ fn beginSchemaValidation(server: *server_mod.ApiHttpServer, context: operation.R
     }
     receipt.schema_validation_token = try a.dupe(u8, &owned.recovery_token);
     transferred = true;
-    return @import("schema_validation_admission.zig").submitOwned(server.source, allocators.scratch, io, private, &owned, receipt, allocators.completion);
+    return @import("schema_validation/admission.zig").submitOwned(server.source, allocators.scratch, io, private, &owned, receipt, allocators.completion);
 }
 
 fn validatesDeferredConstraint(schema: std.json.Value, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, collection: []const u8) bool {
@@ -1171,7 +1171,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         var actor = identity;
         var adapter: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = &actor, .context = context, .database = database, .namespace = namespace, .ddl_search_path = path };
         defer adapter.releaseExecutionOwners();
-        return @import("sql_trigger_ddl.zig").execute(&adapter, allocators, input.catalog_ddl);
+        return @import("sql/triggers/ddl.zig").execute(&adapter, allocators, input.catalog_ddl);
     }
     if (input == .catalog_ddl and input.catalog_ddl.kind == .database and input.catalog_ddl.action == .drop)
         return @import("sql_scope_retirement.zig").executeDatabase(server, identity, context, database, allocators, input.catalog_ddl);
@@ -1533,7 +1533,7 @@ fn observeIndexActivation(server: *server_mod.ApiHttpServer, reader: @import("an
     defer server.source.freeAdminSnapshot(&snapshot);
     const table = tables.findTableByName(&snapshot, physical) orelse return error.TableNotFound;
     if (table.table_id != table_id or try tables.schemaVersion(table.schema_json) != version) return error.SchemaVersionChanged;
-    const bytes = try @import("relational_index_status.zig").collect(alloc, server.source, reader, physical, name, table.schema_json, context);
+    const bytes = try @import("relational_index/status.zig").collect(alloc, server.source, reader, physical, name, table.schema_json, context);
     defer alloc.free(bytes);
     var result = try std.json.parseFromSlice(@import("antfly_indexes_openapi").types.RelationalIndexStatus, alloc, bytes, .{});
     defer result.deinit();
@@ -2724,7 +2724,7 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
 
 test "SQL catalog regular UNIQUE admits an owned private build without publishing through schema CAS" {
     const local = @import("antfly_local_sources");
-    const publication = @import("../metadata/relational_index_publication.zig");
+    const publication = @import("../metadata/relational_index/publication.zig");
     const reads = local.api_table_read_source;
     const consistency = local.storage_read_consistency.ReadConsistency;
     const Source = struct {

@@ -300,7 +300,7 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
     const start_request: jobs.StartRequest = .{
         .scope = .cluster,
         .source_kind = .query_population,
-        .routine_actor = if (try @import("sql_trigger_restore.zig").needsActorForPlan(a, plan)) try @import("sql_trigger_restore.zig").actorForAdmission(server, identity) else null,
+        .routine_actor = if (try @import("sql/triggers/restore.zig").needsActorForPlan(a, plan)) try @import("sql/triggers/restore.zig").actorForAdmission(server, identity) else null,
         .restore_mode = if (refresh != null) "overwrite" else "fail_if_exists",
         .backup_id = try a.dupe(u8, &std.fmt.bytesToHex(source.definition, .lower)),
         .location = "metadata://query-population",

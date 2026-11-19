@@ -182,10 +182,10 @@ test "shard adapter archive boundary preserves busy retry and topology read erro
     try std.testing.expectError(error.Canceled, adapter.topologyRead(std.testing.allocator, 17, "rows", request, .fromAtomic(&canceled)));
 }
 
-extern fn schema_preparation_test_provider(*@import("api/schema_validation_preparation.zig").Port, *errors.Status) callconv(.c) void;
+extern fn schema_preparation_test_provider(*@import("api/schema_validation/preparation.zig").Port, *errors.Status) callconv(.c) void;
 
 test "shard adapter archive boundary schema preparation retains actual admission errors and validates owned responses" {
-    const preparation = @import("api/schema_validation_preparation.zig");
+    const preparation = @import("api/schema_validation/preparation.zig");
     var failure: errors.Status = .ok;
     var port: preparation.Port = undefined;
     schema_preparation_test_provider(&port, &failure);

@@ -81,7 +81,7 @@ pub const Snapshot = struct {
             return writer.write(.{ .scope = self.scope, .record = self.record });
         }
     };
-    pub const Activation = @import("../metadata/schema_validation_publication.zig").OwnerCut;
+    pub const Activation = @import("../metadata/schema_validation/publication.zig").OwnerCut;
     activation: ?Activation = null,
     has_dependents: bool = false,
     revision: u64,
@@ -139,7 +139,7 @@ pub const Snapshot = struct {
         if (self.activation) |activation| {
             if (!request.prepare_activation or self.dependents.len == 0 or activation.metadata_group_id == 0 or
                 !std.mem.eql(u8, &activation.metadata_incarnation, &std.fmt.bytesToHex(self.incarnation, .lower)) or
-                activation.ranges.len == 0 or activation.ranges.len > @import("../metadata/schema_validation_publication.zig").max_owners) return error.InvalidSqlBackendResponse;
+                activation.ranges.len == 0 or activation.ranges.len > @import("../metadata/schema_validation/publication.zig").max_owners) return error.InvalidSqlBackendResponse;
             var ordinal: usize = 0;
             for (self.dependents) |table| {
                 const start = ordinal;

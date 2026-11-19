@@ -207,7 +207,7 @@ pub const MergeReplicationCheckpoint = struct {
 /// replay is deterministic on followers and after restart.
 pub const TransactionMutation = union(enum) {
     begin: struct {
-        sql_locks: ?@import("../pessimistic_lock_transaction.zig").Ref = null,
+        sql_locks: ?@import("../pessimistic_lock/transaction.zig").Ref = null,
         external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
         txn_id: TxnId,
         begin_timestamp: u64,
@@ -263,7 +263,7 @@ pub const DocumentVersionScheme = enum { legacy, revision_v1, admit_current };
 pub const BatchRequest = struct {
     graph_preparation: ?@import("prepared_graph_effects.zig").Admission = null,
     /// Private owner-leader checked lock control; never public batch JSON.
-    sql_lock: ?@import("../pessimistic_lock_control.zig").Command = null,
+    sql_lock: ?@import("../pessimistic_lock/control.zig").Command = null,
     /// Private ordered curator decision; never accepted from public batch JSON.
     resolver_review: ?@import("resolver_review.zig").Command = null,
     /// Trusted ingress attaches a signed write principal and the admission
@@ -4645,7 +4645,7 @@ pub const IndexRepairWake = union(enum) {
 /// One borrowed, synchronous native resolution authority. Ordered replay
 /// supplies its own receipt; public commit bodies cannot construct this value.
 pub const ExternalTransactionBegin = struct {
-    sql_locks: ?@import("../pessimistic_lock_transaction.zig").Ref = null,
+    sql_locks: ?@import("../pessimistic_lock/transaction.zig").Ref = null,
     txn_id: TxnId,
     owner: @import("../transactions.zig").ExternalDecisionOwner,
     begin_timestamp: u64,

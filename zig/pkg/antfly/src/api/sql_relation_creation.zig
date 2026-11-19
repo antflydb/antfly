@@ -18,8 +18,8 @@
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const lifetimes = @import("sql_relation_lifetimes.zig");
-const boots = @import("../metadata/sql_relation_boots.zig");
-const directory = @import("../metadata/sql_relation_lifetimes.zig");
+const boots = @import("../metadata/sql/relation_lifecycle/boots.zig");
+const directory = @import("../metadata/sql/relation_lifecycle/lifetimes.zig");
 const domain = local.system_catalog_domain;
 const A = std.mem.Allocator;
 pub const Capture = struct { target: domain.Target, descriptor: ?lifetimes.Descriptor };

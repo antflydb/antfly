@@ -6479,8 +6479,8 @@ pub const HttpHandler = struct {
             return error.InvalidIndexRequest;
         };
         defer alloc.free(index_json);
-        if (@import("../../api/relational_index_mutation.zig").isRelational(alloc, index_json) catch return error.InvalidIndexRequest) return error.MethodNotAllowed;
-        if (@import("../../api/relational_index_mutation.zig").contains(alloc, table.schema_json, index_name) catch return error.InternalFailure) return error.Conflict;
+        if (@import("../../api/relational_index/mutation.zig").isRelational(alloc, index_json) catch return error.InvalidIndexRequest) return error.MethodNotAllowed;
+        if (@import("../../api/relational_index/mutation.zig").contains(alloc, table.schema_json, index_name) catch return error.InternalFailure) return error.Conflict;
         tables_api.validatePublicAlgebraicIndexJson(alloc, index_json) catch {
             return error.InvalidIndexRequest;
         };
@@ -6558,7 +6558,7 @@ pub const HttpHandler = struct {
         if (self.runtime_status.role == .query_only) return error.MethodNotAllowed;
         var table = (self.catalog.getTableAlloc(self.alloc, table_name) catch return error.InternalFailure) orelse return error.NotFound;
         defer table.deinit(self.alloc);
-        if (@import("../../api/relational_index_mutation.zig").contains(alloc, table.schema_json, index_name) catch return error.InternalFailure) return error.MethodNotAllowed;
+        if (@import("../../api/relational_index/mutation.zig").contains(alloc, table.schema_json, index_name) catch return error.InternalFailure) return error.MethodNotAllowed;
 
         const next_indexes_json = (indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name) catch return error.InternalFailure) orelse {
             return error.NotFound;

@@ -23,7 +23,7 @@ work. Their old case counts and activation lists are not current status.
 
 ## Native resource contract
 
-`storage/pessimistic_lock_contract.zig` defines the eight table, four row and two
+`storage/pessimistic_lock/contract.zig` defines the eight table, four row and two
 advisory modes. Resource identity includes the catalog incarnation. The bigint
 and two-int advisory key spaces use different domain tags, including for negative
 values with identical underlying bits. Aggregate mode counts count distinct
@@ -41,7 +41,7 @@ unrelated session-owned resources remain on the live connection.
 
 ## Transaction-local journal
 
-`storage/pessimistic_lock_ledger.zig` runs within the accepting native writer
+`storage/pessimistic_lock/ledger.zig` runs within the accepting native writer
 transaction. Its caller must abort that transaction on **any** error. Registration,
 read-only observation, effect admission and prepared handoff require independent
 caller-supplied authority checks. They are not optional hooks or client claims.
@@ -256,7 +256,7 @@ remain the next activation boundary.
 
 ## Native command scopes and decision-gated cleanup
 
-`storage/pessimistic_lock_authority.zig` now owns the durable execution scope
+`storage/pessimistic_lock/authority.zig` now owns the durable execution scope
 around the shared journal. Registration binds backend identity and fence,
 connection ID, database, principal, deployment realm and lease. A retained
 connection binding prevents an old registration from adopting a replacement

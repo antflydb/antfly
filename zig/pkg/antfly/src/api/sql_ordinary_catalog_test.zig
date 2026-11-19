@@ -714,7 +714,7 @@ test "SQL catalog ordinary schema preparation waits for the complete route cut b
     defer server.deinit();
     server.cfg.deployment_mode = .distributed;
     server.cfg.session_router = .{ .ptr = &state, .vtable = &.{ .local_node_id = State.node, .local_status = State.status, .node_base_uri = State.endpoint, .resolve_group_routes = State.resolve } };
-    var transport: @import("schema_validation_owner_transport.zig").Transport = .{ .server = &server, .alloc = a };
+    var transport: @import("schema_validation/owner_transport.zig").Transport = .{ .server = &server, .alloc = a };
     defer transport.deinit();
     try transport.prepareCohort(&.{ .{ .group_id = 11, .table_id = 1, .start_key = "" }, .{ .group_id = 12, .table_id = 1, .start_key = "x" } }, .{});
     try std.testing.expectEqual(@as(usize, 2), state.calls);
@@ -724,7 +724,7 @@ test "SQL catalog ordinary schema preparation waits for the complete route cut b
 }
 
 test "SQL catalog ordinary schema preparation retries owner readiness but never authorization or submission" {
-    const preparation = @import("schema_validation_preparation.zig");
+    const preparation = @import("schema_validation/preparation.zig");
     const State = struct {
         calls: usize = 0,
         fn prepare(raw: *anyopaque, _: A, group_id: u64, _: []const u8, request: preparation.Request, _: Context) ![]u8 {
@@ -741,7 +741,7 @@ test "SQL catalog ordinary schema preparation retries owner readiness but never 
     defer server.deinit();
     server.cfg.deployment_mode = .standalone;
     server.cfg.schema_validation_preparation = .{ .ptr = &state, .prepare_fn = State.prepare };
-    var transport: @import("schema_validation_owner_transport.zig").Transport = .{ .server = &server, .alloc = a };
+    var transport: @import("schema_validation/owner_transport.zig").Transport = .{ .server = &server, .alloc = a };
     defer transport.deinit();
     try transport.prepareCohort(&.{.{ .group_id = 11, .table_id = 1, .start_key = "" }}, .{});
     const request: preparation.Request = .{ .group_id = 11, .metadata_incarnation = @splat('1'), .id = @splat(2), .provisional_plan = @splat(3), .transition_id = 4, .namespace = .{ .table_id = 1, .shard_id = 11, .range_id = 11 }, .before_schema = "{}", .after_schema = "{}", .selection = .{ .not_null = &.{"n"} } };

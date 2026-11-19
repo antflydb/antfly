@@ -1011,11 +1011,11 @@ pub const RaftApplyStore = struct {
     pub fn fkGenerationPublicationSourceDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.SourceDecisionRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_generation_publication_source_decision = request });
     }
-    pub fn relationalIndexStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").StatusRequest) ![]u8 {
+    pub fn relationalIndexStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index/publication.zig").StatusRequest) ![]u8 {
         try request.validate();
         return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_status = request });
     }
-    pub fn relationalIndexPrepareCutJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").PrepareRequest) ![]u8 {
+    pub fn relationalIndexPrepareCutJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index/publication.zig").PrepareRequest) ![]u8 {
         try request.validate();
         return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_prepare = request });
     }
@@ -1029,27 +1029,27 @@ pub const RaftApplyStore = struct {
         try request.validate();
         return self.catalogProjection(@import("../metadata/standalone_native_owner.zig").RestartObservation, self.alloc, group_id, .{ .standalone_native_reporter_observation = request });
     }
-    pub fn relationalIndexAdmissionStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").AdmissionRequest) ![]u8 {
+    pub fn relationalIndexAdmissionStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index/publication.zig").AdmissionRequest) ![]u8 {
         try request.validate();
         return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_admission_status = request });
     }
-    pub fn validateRelationalIndexBegin(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/relational_index_publication.zig").BeginRequest, prepared: *const @import("../metadata/relational_index_publication.zig").Prepared) !void {
+    pub fn validateRelationalIndexBegin(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/relational_index/publication.zig").BeginRequest, prepared: *const @import("../metadata/relational_index/publication.zig").Prepared) !void {
         _ = try request.observation(prepared);
         if (!try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_begin_preflight = request })) return error.InvalidGenerationPublication;
     }
-    pub fn validateRelationalIndexPublicationDecision(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/relational_index_publication.zig").DecidePublish) !void {
+    pub fn validateRelationalIndexPublicationDecision(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/relational_index/publication.zig").DecidePublish) !void {
         try request.validate();
         if (!try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_publish_preflight = request })) return error.InvalidGenerationPublication;
     }
-    pub fn relationalIndexPublicationDecisionStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").DecidePublish) ![]u8 {
+    pub fn relationalIndexPublicationDecisionStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index/publication.zig").DecidePublish) ![]u8 {
         try request.validate();
         return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_publish_status = request });
     }
-    pub fn validateRelationalIndexCancellation(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/relational_index_publication.zig").CancelDecision) !void {
+    pub fn validateRelationalIndexCancellation(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/relational_index/publication.zig").CancelDecision) !void {
         try request.validate();
         if (!try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_cancel_preflight = request })) return error.InvalidGenerationPublication;
     }
-    pub fn relationalIndexCancellationStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").CancelDecision) ![]u8 {
+    pub fn relationalIndexCancellationStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index/publication.zig").CancelDecision) ![]u8 {
         try request.validate();
         return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_cancel_status = request });
     }
@@ -1063,32 +1063,32 @@ pub const RaftApplyStore = struct {
         return alloc.dupe(u8, response.slice());
     }
 
-    pub fn schemaValidationDiscover(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/schema_validation_read.zig").DiscoveryRequest) ![]u8 {
+    pub fn schemaValidationDiscover(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/schema_validation/read.zig").DiscoveryRequest) ![]u8 {
         try request.validate();
         if (request.group != group_id) return error.InvalidGenerationPublication;
         return self.rawCatalogProjection(alloc, group_id, .{ .schema_validation_discover = request }, 1024);
     }
 
-    pub fn schemaValidationPublicationProjection(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, lookup: @import("../metadata/schema_validation_read.zig").Lookup) !std.json.Parsed(@import("../metadata/schema_validation_read.zig").PublicationProjection) {
+    pub fn schemaValidationPublicationProjection(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, lookup: @import("../metadata/schema_validation/read.zig").Lookup) !std.json.Parsed(@import("../metadata/schema_validation/read.zig").PublicationProjection) {
         if (lookup.group != group) return error.InvalidGenerationPublication;
-        const Projection = @import("../metadata/schema_validation_read.zig").PublicationProjection;
+        const Projection = @import("../metadata/schema_validation/read.zig").PublicationProjection;
         const bytes = try self.rawCatalogProjection(alloc, group, .{ .schema_validation_publication_projection = lookup }, Projection.max_wire_bytes);
         defer alloc.free(bytes);
         return std.json.parseFromSlice(Projection, alloc, bytes, .{ .allocate = .alloc_always });
     }
 
-    pub fn schemaValidationWork(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/schema_validation_work.zig").Query) ![]u8 {
+    pub fn schemaValidationWork(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/schema_validation/work.zig").Query) ![]u8 {
         try request.validate();
         if (request.group != group_id) return error.InvalidGenerationPublication;
-        return self.rawCatalogProjection(alloc, group_id, .{ .schema_validation_work = request }, @import("../metadata/schema_validation_work.zig").max_wire_bytes);
+        return self.rawCatalogProjection(alloc, group_id, .{ .schema_validation_work = request }, @import("../metadata/schema_validation/work.zig").max_wire_bytes);
     }
 
-    pub fn schemaValidationPrepareCut(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/schema_validation_admission.zig").Request) ![]u8 {
+    pub fn schemaValidationPrepareCut(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/schema_validation/admission.zig").Request) ![]u8 {
         try request.validate();
-        return self.rawCatalogProjection(alloc, group_id, .{ .schema_validation_prepare = request }, @import("../metadata/schema_validation_admission.zig").max_wire_bytes);
+        return self.rawCatalogProjection(alloc, group_id, .{ .schema_validation_prepare = request }, @import("../metadata/schema_validation/admission.zig").max_wire_bytes);
     }
 
-    pub fn schemaValidationOwnerRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/schema_validation_read.zig").OwnerReadRequest) ![]u8 {
+    pub fn schemaValidationOwnerRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/schema_validation/read.zig").OwnerReadRequest) ![]u8 {
         try request.validate();
         if (request.lookup.group != group_id) return error.InvalidGenerationPublication;
         return self.rawCatalogProjection(alloc, group_id, .{ .schema_validation_owner_read = request }, request.responseLimit());
@@ -1102,61 +1102,61 @@ pub const RaftApplyStore = struct {
         if (response.len > limit) return error.StorageKernelFailure;
         return alloc.dupe(u8, response.slice());
     }
-    pub fn schemaValidationOwnerControlJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, lookup: @import("../metadata/schema_validation_read.zig").Lookup, ordinal: u16, action: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Action) ![]u8 {
+    pub fn schemaValidationOwnerControlJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, lookup: @import("../metadata/schema_validation/read.zig").Lookup, ordinal: u16, action: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Action) ![]u8 {
         return self.schemaValidationOwnerRead(alloc, group_id, .{ .lookup = lookup, .ordinal = ordinal, .action = action });
     }
-    pub fn schemaValidationOwnerInputBytes(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, lookup: @import("../metadata/schema_validation_read.zig").Lookup, ordinal: u16) ![]u8 {
+    pub fn schemaValidationOwnerInputBytes(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, lookup: @import("../metadata/schema_validation/read.zig").Lookup, ordinal: u16) ![]u8 {
         return self.schemaValidationOwnerRead(alloc, group_id, .{ .lookup = lookup, .ordinal = ordinal, .projection = .inputs });
     }
 
-    pub fn schemaValidationParentJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, lookup: @import("../metadata/schema_validation_read.zig").Lookup, image: @import("../metadata/schema_validation_read.zig").ImageIdentity) ![]u8 {
+    pub fn schemaValidationParentJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, lookup: @import("../metadata/schema_validation/read.zig").Lookup, image: @import("../metadata/schema_validation/read.zig").ImageIdentity) ![]u8 {
         return self.schemaValidationOwnerRead(alloc, group_id, .{ .lookup = lookup, .ordinal = 0, .projection = .parent, .source_image = image });
     }
 
-    pub fn schemaValidationRecoveryInputBytes(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, lookup: @import("../metadata/schema_validation_read.zig").Lookup, ordinal: u16, image: @import("../metadata/schema_validation_read.zig").ImageIdentity) ![]u8 {
+    pub fn schemaValidationRecoveryInputBytes(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, lookup: @import("../metadata/schema_validation/read.zig").Lookup, ordinal: u16, image: @import("../metadata/schema_validation/read.zig").ImageIdentity) ![]u8 {
         return self.schemaValidationOwnerRead(alloc, group_id, .{ .lookup = lookup, .ordinal = ordinal, .projection = .recovery_inputs, .source_image = image });
     }
 
-    pub fn schemaValidationStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/schema_validation_admission.zig").StatusRequest) ![]u8 {
+    pub fn schemaValidationStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/schema_validation/admission.zig").StatusRequest) ![]u8 {
         try request.validate();
         if (request.lookup.group != group_id) return error.InvalidGenerationPublication;
-        return self.rawCatalogProjection(alloc, group_id, .{ .schema_validation_status = request }, @import("../metadata/schema_validation_admission.zig").Status.max_wire_bytes);
+        return self.rawCatalogProjection(alloc, group_id, .{ .schema_validation_status = request }, @import("../metadata/schema_validation/admission.zig").Status.max_wire_bytes);
     }
 
-    pub fn schemaValidationReceiptJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/schema_validation_receipt.zig").Request) ![]u8 {
+    pub fn schemaValidationReceiptJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/schema_validation/receipt.zig").Request) ![]u8 {
         try request.validate();
         if (request.lookup.group != group_id) return error.InvalidGenerationPublication;
         return self.rawCatalogProjection(alloc, group_id, .{ .schema_validation_receipt_read = request }, 16 * 1024);
     }
 
-    pub fn relationalIndexOwnerDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").OwnerRequest) ![]u8 {
+    pub fn relationalIndexOwnerDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index/publication.zig").OwnerRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_owner_decision = request });
     }
-    pub fn relationalIndexOwnerAckStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").Ack) ![]u8 {
+    pub fn relationalIndexOwnerAckStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index/publication.zig").Ack) ![]u8 {
         try request.validate();
         return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_owner_ack_status = request });
     }
     pub fn validateRelationalIndexOwnerAck(self: *RaftApplyStore, group_id: u64, bytes: []const u8) !void {
-        const publication = @import("../metadata/relational_index_publication.zig");
+        const publication = @import("../metadata/relational_index/publication.zig");
         if (bytes.len == 0 or bytes.len > publication.max_ack_bytes) return error.InvalidGenerationPublication;
         const valid = try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_owner_ack_preflight = bytes });
         if (!valid) return error.InvalidIndexOwnerReceipt;
     }
-    pub fn relationalIndexWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_work.zig").Query) ![]u8 {
+    pub fn relationalIndexWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index/work.zig").Query) ![]u8 {
         try request.validate();
         return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_work = request });
     }
-    pub fn relationalIndexSourceAcceptanceStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_delivery_journal.zig").Query) ![]u8 {
+    pub fn relationalIndexSourceAcceptanceStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index/delivery_journal.zig").Query) ![]u8 {
         try request.validate();
         return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_source_accept_status = request });
     }
     pub fn validateRelationalIndexSourceAcceptance(self: *RaftApplyStore, group_id: u64, bytes: []const u8) !void {
-        const journal = @import("../metadata/relational_index_delivery_journal.zig");
+        const journal = @import("../metadata/relational_index/delivery_journal.zig");
         if (bytes.len == 0 or bytes.len > journal.max_command_bytes) return error.InvalidGenerationPublication;
         if (!try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_source_accept_preflight = bytes })) return error.InvalidPrivateIndexClaimReceipt;
     }
     pub fn validateRelationalIndexSourceCompletion(self: *RaftApplyStore, group_id: u64, bytes: []const u8) !void {
-        if (bytes.len == 0 or bytes.len > @import("../metadata/relational_index_delivery_journal.zig").max_completion_bytes) return error.InvalidGenerationPublication;
+        if (bytes.len == 0 or bytes.len > @import("../metadata/relational_index/delivery_journal.zig").max_completion_bytes) return error.InvalidGenerationPublication;
         if (!try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_source_complete_preflight = bytes })) return error.InvalidPrivateIndexClaimReceipt;
     }
     pub fn prepareRelationCreateJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relation_create.zig").Request, purpose: @import("../metadata/relation_create.zig").Purpose, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
@@ -1179,59 +1179,59 @@ pub const RaftApplyStore = struct {
     pub fn tableRetirementQueueJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, value: u64) ![]u8 {
         return self.rawCatalogProjection(a, group, .{ .table_retirement_queue = value }, 32768);
     }
-    pub fn tableRetirementEffectsJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, value: @import("../metadata/table_retirement_ledger.zig").Lookup) ![]u8 {
-        return self.rawCatalogProjection(a, group, .{ .table_retirement_effects = value }, @import("../metadata/table_retirement_manifest.zig").max_bytes);
+    pub fn tableRetirementEffectsJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, value: @import("../metadata/retirement/table/ledger.zig").Lookup) ![]u8 {
+        return self.rawCatalogProjection(a, group, .{ .table_retirement_effects = value }, @import("../metadata/retirement/table/manifest.zig").max_bytes);
     }
     pub fn tableRetirementPreflightJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, value: []const u8) ![]u8 {
         return self.rawCatalogProjection(a, group, .{ .table_retirement_preflight = value }, 32768);
     }
-    pub fn tableRetirementPublicationProjectionJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, value: @import("../metadata/table_retirement_ledger.zig").Lookup) ![]u8 {
+    pub fn tableRetirementPublicationProjectionJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, value: @import("../metadata/retirement/table/ledger.zig").Lookup) ![]u8 {
         return self.rawCatalogProjection(a, group, .{ .table_retirement_publication_projection = value }, 128 * 1024);
     }
-    pub fn tableRetirementReceiptJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, request: @import("../metadata/table_retirement_receipt.zig").Request) ![]u8 {
+    pub fn tableRetirementReceiptJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, request: @import("../metadata/retirement/table/receipt.zig").Request) ![]u8 {
         try request.validate();
         return self.rawCatalogProjection(a, group, .{ .table_retirement_receipt = request }, 32768);
     }
-    pub fn schemaValidationPublicationProjectionJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, lookup: @import("../metadata/schema_validation_read.zig").Lookup) ![]u8 {
-        return self.rawCatalogProjection(a, group, .{ .schema_validation_publication_projection = lookup }, @import("../metadata/schema_validation_read.zig").PublicationProjection.max_wire_bytes);
+    pub fn schemaValidationPublicationProjectionJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, lookup: @import("../metadata/schema_validation/read.zig").Lookup) ![]u8 {
+        return self.rawCatalogProjection(a, group, .{ .schema_validation_publication_projection = lookup }, @import("../metadata/schema_validation/read.zig").PublicationProjection.max_wire_bytes);
     }
-    pub fn tableRetirementReceipt(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, request: @import("../metadata/table_retirement_receipt.zig").Request) !std.json.Parsed(@import("../metadata/table_retirement_receipt.zig").Observation) {
+    pub fn tableRetirementReceipt(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, request: @import("../metadata/retirement/table/receipt.zig").Request) !std.json.Parsed(@import("../metadata/retirement/table/receipt.zig").Observation) {
         try request.validate();
         const bytes = try self.rawCatalogProjection(a, group, .{ .table_retirement_receipt = request }, 32768);
         defer a.free(bytes);
-        var parsed = try std.json.parseFromSlice(@import("../metadata/table_retirement_receipt.zig").Observation, a, bytes, .{ .allocate = .alloc_always });
+        var parsed = try std.json.parseFromSlice(@import("../metadata/retirement/table/receipt.zig").Observation, a, bytes, .{ .allocate = .alloc_always });
         errdefer parsed.deinit();
         try parsed.value.requireFor(request);
         return parsed;
     }
-    pub fn tableRetirementWorkJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, lookup: @import("../metadata/table_retirement_ledger.zig").Lookup) ![]u8 {
+    pub fn tableRetirementWorkJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, lookup: @import("../metadata/retirement/table/ledger.zig").Lookup) ![]u8 {
         return self.rawCatalogProjection(a, group, .{ .table_retirement_work = lookup }, 32768);
     }
     pub fn scopeRetirementWorkJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, after: u64) ![]u8 {
         return self.rawCatalogProjection(a, group, .{ .scope_retirement_work = after }, 8192);
     }
-    pub fn sqlRelationBootJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, query: @import("../metadata/sql_relation_boots.zig").Query) ![]u8 {
+    pub fn sqlRelationBootJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, query: @import("../metadata/sql/relation_lifecycle/boots.zig").Query) ![]u8 {
         return self.rawCatalogProjection(a, group, .{ .sql_relation_boot = query }, if (query.recovery_capture != null) @import("../system_catalog/trigger_snapshot.zig").max_snapshot_bytes else 64 * 1024);
     }
     pub fn sqlRelationBootPreflightJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, bytes: []const u8) ![]u8 {
         return self.rawCatalogProjection(a, group, .{ .sql_relation_boot_preflight = bytes }, 64 * 1024);
     }
-    pub fn sqlRelationLifetimesJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, selection: @import("../metadata/sql_relation_lifetimes.zig").Selection, after: ?u64, limit: u16, include_hidden: bool) ![]u8 {
+    pub fn sqlRelationLifetimesJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, selection: @import("../metadata/sql/relation_lifecycle/lifetimes.zig").Selection, after: ?u64, limit: u16, include_hidden: bool) ![]u8 {
         if (limit == 0 or limit > 128) return error.InvalidSqlRelationPersistence;
-        return self.rawCatalogProjection(a, group, .{ .sql_relation_lifetimes = .{ .selection = selection, .after = after, .limit = limit, .include_hidden = include_hidden } }, if (include_hidden) @import("../metadata/sql_relation_recovery_work.zig").max_wire_bytes else 128 * @import("../metadata/sql_relation_lifetimes.zig").max_record_bytes);
+        return self.rawCatalogProjection(a, group, .{ .sql_relation_lifetimes = .{ .selection = selection, .after = after, .limit = limit, .include_hidden = include_hidden } }, if (include_hidden) @import("../metadata/sql/relation_lifecycle/recovery_work.zig").max_wire_bytes else 128 * @import("../metadata/sql/relation_lifecycle/lifetimes.zig").max_record_bytes);
     }
-    pub fn scopeRetirementManifestJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, lookup: @import("../metadata/scope_retirement_ledger.zig").Lookup) ![]u8 {
+    pub fn scopeRetirementManifestJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, lookup: @import("../metadata/retirement/scope/ledger.zig").Lookup) ![]u8 {
         try lookup.validate();
         return self.rawCatalogProjection(a, group, .{ .scope_retirement_manifest = lookup }, @import("antfly_local_sources").system_catalog_domain.scope_retirement.max_manifest_bytes);
     }
     pub fn scopeRetirementPreflightJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, bytes: []const u8) ![]u8 {
         return self.rawCatalogProjection(a, group, .{ .scope_retirement_preflight = bytes }, 8192);
     }
-    pub fn scopeRetirementObservationJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, query: @import("../metadata/scope_retirement_wire.zig").Query) ![]u8 {
+    pub fn scopeRetirementObservationJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, query: @import("../metadata/retirement/scope/wire.zig").Query) ![]u8 {
         try query.validate();
         const bytes = try self.rawCatalogProjection(a, group, .{ .scope_retirement_observation = query }, 16384);
         errdefer a.free(bytes);
-        var parsed = try std.json.parseFromSlice(@import("../metadata/scope_retirement_wire.zig").Observation, a, bytes, .{});
+        var parsed = try std.json.parseFromSlice(@import("../metadata/retirement/scope/wire.zig").Observation, a, bytes, .{});
         defer parsed.deinit();
         try parsed.value.requireFor(query);
         return bytes;
@@ -1246,7 +1246,7 @@ pub const RaftApplyStore = struct {
     }
     pub fn prepareTableRetirementManifestJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, guard: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         const normalized = try context.platformDeadline();
-        const bytes = try self.rawCatalogProjection(alloc, group_id, .{ .table_retirement_prepare = .{ .guard = guard, .deadline_ns = normalized.deadline_ns } }, @import("../metadata/table_retirement_manifest.zig").max_bytes);
+        const bytes = try self.rawCatalogProjection(alloc, group_id, .{ .table_retirement_prepare = .{ .guard = guard, .deadline_ns = normalized.deadline_ns } }, @import("../metadata/retirement/table/manifest.zig").max_bytes);
         errdefer alloc.free(bytes);
         try context.ensureActive();
         return bytes;

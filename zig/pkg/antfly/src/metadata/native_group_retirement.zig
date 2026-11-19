@@ -17,10 +17,10 @@
 //! disappeared. Only the existing published retirement journal grants GC.
 const std = @import("std");
 const local = @import("antfly_local_sources");
-const retirement = @import("table_retirement_ledger.zig");
-const manifests = @import("table_retirement_manifest.zig");
+const retirement = @import("retirement/table/ledger.zig");
+const manifests = @import("retirement/table/manifest.zig");
 const tables = @import("table_manager.zig");
-const records = @import("schema_validation_publication.zig");
+const records = @import("schema_validation/publication.zig");
 const A = std.mem.Allocator;
 pub const Record = struct {
     lookup: retirement.Lookup,
@@ -115,7 +115,7 @@ pub fn readPublished(a: A, reader: anytype, group: u64, source_group: u64) !?Rec
     } else return error.InvalidCatalogRecord;
     if (!std.meta.eql(try selected(head, body.value, range), value)) return error.InvalidCatalogRecord;
     if (head.scope.parent) |parent| {
-        _ = try @import("scope_retirement_children.zig").requirePublished(a, reader, parent);
+        _ = try @import("retirement/scope/children.zig").requirePublished(a, reader, parent);
     } else {
         _ = try retirement.verifyPhysical(a, reader, head, body.value);
     }

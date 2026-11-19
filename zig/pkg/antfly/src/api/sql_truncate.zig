@@ -373,7 +373,7 @@ pub fn executeWithAdapter(root: *@import("sql_execution.zig").Adapter, alloc: st
             var lifecycle_context = context;
             lifecycle_context.setting_admin = true;
             const bytes = try server.source.systemCatalog(a, lifecycle_context, .{ .sql_relation_boot_read = .{ .node = previous.owner_node_id } });
-            const observed = try std.json.parseFromSliceLeaky(@import("../metadata/sql_relation_boots.zig").Observation, a, bytes, .{});
+            const observed = try std.json.parseFromSliceLeaky(@import("../metadata/sql/relation_lifecycle/boots.zig").Observation, a, bytes, .{});
             const current = try observed.requireReady();
             if (current.identity.store_id != previous.owner_store_id or
                 (previous.kind == .temporary and !std.mem.eql(u8, &previous.generation_instance, &current.instance))) return error.SqlRelationOwnerChanged;
@@ -481,7 +481,7 @@ pub fn executeWithAdapter(root: *@import("sql_execution.zig").Adapter, alloc: st
     const location = try std.fmt.allocPrint(a, "metadata://empty-generation/{s}", .{std.fmt.bytesToHex(id, .lower)});
     const generation_plan = try std.json.Stringify.valueAlloc(a, plan, .{});
     const job_control = @import("../metadata/query_population_job.zig");
-    const start_request: jobs.StartRequest = .{ .scope = .cluster, .source_kind = .empty_generation, .routine_actor = if (try @import("sql_trigger_restore.zig").needsActorForPlan(a, plan)) try @import("sql_trigger_restore.zig").actorForAdmission(server, identity) else null, .backup_id = &std.fmt.bytesToHex(digest, .lower), .location = location, .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = idempotency_namespace, .idempotency_key = &key, .destination_authorization_principal = principal, .generation_plan_json = generation_plan };
+    const start_request: jobs.StartRequest = .{ .scope = .cluster, .source_kind = .empty_generation, .routine_actor = if (try @import("sql/triggers/restore.zig").needsActorForPlan(a, plan)) try @import("sql/triggers/restore.zig").actorForAdmission(server, identity) else null, .backup_id = &std.fmt.bytesToHex(digest, .lower), .location = location, .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = idempotency_namespace, .idempotency_key = &key, .destination_authorization_principal = principal, .generation_plan_json = generation_plan };
     const reference: job_control.Reference = .{ .job_id = job_id, .namespace = idempotency_namespace, .key = &key, .fingerprint = try jobs.requestFingerprintAlloc(a, start_request), .plan_digest = try plan.digest(a) };
     const completion_owner: operation.SQLCompletionOwner = .{ .id = job_id, .schema_version = primary_schema.version, .kind = .restore };
     try @import("sql_completion.zig").prepareMetadataWithContext(context, completion_owner);
@@ -628,7 +628,7 @@ fn diagnoseNativeReset(stage: NativeResetDiagnosticStage, err: anyerror, _: ?*st
 /// Native restart origin. No user trigger, RLS bypass masquerading as a SQL
 /// principal, source JSON scan, or source-row replay participates in this path.
 /// Every irreversible loss is independently rejoined by native metadata admit.
-pub fn recoverNativeLoss(server: *server_mod.ApiHttpServer, backing: std.mem.Allocator, boot: @import("../metadata/sql_relation_boots.zig").Record, entry: @import("../metadata/sql_relation_lifetimes.zig").Entry, input: operation.RequestContext) !void {
+pub fn recoverNativeLoss(server: *server_mod.ApiHttpServer, backing: std.mem.Allocator, boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, entry: @import("../metadata/sql/relation_lifecycle/lifetimes.zig").Entry, input: operation.RequestContext) !void {
     var diagnostic_stage: NativeResetDiagnosticStage = .planning;
     return recoverNativeLossObserved(server, backing, boot, entry, input, &diagnostic_stage) catch |err| {
         diagnoseNativeReset(diagnostic_stage, err, @errorReturnTrace());
@@ -636,9 +636,9 @@ pub fn recoverNativeLoss(server: *server_mod.ApiHttpServer, backing: std.mem.All
     };
 }
 
-fn recoverNativeLossObserved(server: *server_mod.ApiHttpServer, backing: std.mem.Allocator, boot: @import("../metadata/sql_relation_boots.zig").Record, entry: @import("../metadata/sql_relation_lifetimes.zig").Entry, input: operation.RequestContext, diagnostic_stage: *NativeResetDiagnosticStage) !void {
+fn recoverNativeLossObserved(server: *server_mod.ApiHttpServer, backing: std.mem.Allocator, boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record, entry: @import("../metadata/sql/relation_lifecycle/lifetimes.zig").Entry, input: operation.RequestContext, diagnostic_stage: *NativeResetDiagnosticStage) !void {
     const persistence = @import("antfly_local_sources").common_topology_records.RelationPersistence;
-    const recovery = @import("../metadata/sql_relation_recovery.zig");
+    const recovery = @import("../metadata/sql/relation_lifecycle/recovery.zig");
     try input.ensureActive();
     try entry.validate();
     const original = entry.initialized orelse return error.SqlRelationRecoveryIncomplete;
@@ -882,9 +882,9 @@ fn buildRecoveryExternalParents(server: *server_mod.ApiHttpServer, context: oper
     return result;
 }
 
-const RecoveryCapture = @import("../metadata/sql_relation_recovery_capture.zig").Capture;
+const RecoveryCapture = @import("../metadata/sql/relation_lifecycle/recovery_capture.zig").Capture;
 const RecoveryCatalog = struct { tables: []const records.TableRecord, ranges: []const records.RangeRecord };
-fn loadRecoveryCapture(server: *server_mod.ApiHttpServer, a: std.mem.Allocator, context: operation.RequestContext, captures: *std.ArrayList(RecoveryCapture), request: @import("../metadata/sql_relation_recovery_capture.zig").Request) !RecoveryCapture {
+fn loadRecoveryCapture(server: *server_mod.ApiHttpServer, a: std.mem.Allocator, context: operation.RequestContext, captures: *std.ArrayList(RecoveryCapture), request: @import("../metadata/sql/relation_lifecycle/recovery_capture.zig").Request) !RecoveryCapture {
     for (captures.items) |value| {
         if ((request.table_id != null and request.table_id.? == value.relation.record.table_id) or
             (request.storage_name != null and std.mem.eql(u8, request.storage_name.?, value.relation.record.name))) return value;
@@ -943,9 +943,9 @@ fn freeCapturedNotices(a: std.mem.Allocator, notices: []const catalog.notices.No
 const TruncateCapture = struct {
     a: std.mem.Allocator,
     root: *@import("sql_execution.zig").Adapter,
-    broker: ?*@import("sql_trigger_commit.zig").Broker = null,
+    broker: ?*@import("sql/triggers/commit.zig").Broker = null,
     fn begin(self: *@This(), table: records.TableRecord) !void {
-        if (self.broker == null) self.broker = try @import("sql_trigger_commit.zig").Broker.create(self.a, self.root);
+        if (self.broker == null) self.broker = try @import("sql/triggers/commit.zig").Broker.create(self.a, self.root);
         try self.broker.?.beginTruncate(table);
     }
 };

@@ -17,8 +17,8 @@
 //! Existing scope jobs still own every actual table/participant retirement.
 const std = @import("std");
 const local = @import("antfly_local_sources");
-const boots = @import("../metadata/sql_relation_boots.zig");
-const wire = @import("../metadata/scope_retirement_wire.zig");
+const boots = @import("../metadata/sql/relation_lifecycle/boots.zig");
+const wire = @import("../metadata/retirement/scope/wire.zig");
 const Server = @import("http_server.zig").ApiHttpServer;
 
 pub fn step(server: *Server, input: local.api_operation.RequestContext) !void {

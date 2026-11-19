@@ -753,7 +753,7 @@ fn abandonedWork(server: *Server, a: A, context: operation.RequestContext, admis
 
 /// Bound to one archived old directory participant and one actual child source
 /// fence. One native mutation or scoped metadata completion per call.
-pub fn abandonedPrivateQuantum(server: *Server, a: A, context: operation.RequestContext, child: @import("../metadata/table_retirement_ledger.zig").Head) !bool {
+pub fn abandonedPrivateQuantum(server: *Server, a: A, context: operation.RequestContext, child: @import("../metadata/retirement/table/ledger.zig").Head) !bool {
     if (child.scope.parent == null) return true;
     var incarnation: [16]u8 = undefined;
     _ = try std.fmt.hexToBytes(&incarnation, &child.incarnation);

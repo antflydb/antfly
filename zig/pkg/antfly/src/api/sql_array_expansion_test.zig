@@ -43,7 +43,7 @@ test "httpx SQL typed array expansion matches PostgreSQL through native captures
         .{ .key = "1", .value = try std.json.Stringify.valueAlloc(scratch, .{ .id = @as(i64, 9007199254740993), .tags = empty_wire }, .{}) },
         .{ .key = "2", .value = "{\"id\":9007199254740993}" },
     }, .timestamp_ns = 42 });
-    var source: @import("sql_parity_sources.zig").Tables(1) = .{
+    var source: @import("sql/testing/parity_sources.zig").Tables(1) = .{
         .records = .{.{ .table_id = 7, .name = "things", .schema_json = schema }},
         .reads = .{reads.BoundTableReadSource.init("things", 7, &database, raft.read_gate.alreadyReadSafeBarrier())},
     };
@@ -52,7 +52,7 @@ test "httpx SQL typed array expansion matches PostgreSQL through native captures
     var server = Server.init(a, .{ .backend_runtime = runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = @TypeOf(source).status, .system_catalog = @TypeOf(source).systemCatalog, .supports_query_definitions = true } }, source.source(), null);
     defer server.deinit();
     var handler: Handler = .{ .api_server = &server };
-    try @import("sql_parity_reference.zig").runArrayExpansion(a, &handler);
+    try @import("sql/testing/parity_reference.zig").runArrayExpansion(a, &handler);
     try std.testing.expectEqual(@as(usize, 6), source.captures);
     try std.testing.expectEqual(@as(usize, 0), source.lookup_calls.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 0), source.unbounded_reads.load(.monotonic));

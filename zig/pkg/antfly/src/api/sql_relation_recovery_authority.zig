@@ -18,7 +18,7 @@
 //! original credential checks.
 const std = @import("std");
 const staging = @import("../metadata/restore_staging.zig");
-const boots = @import("../metadata/sql_relation_boots.zig");
+const boots = @import("../metadata/sql/relation_lifecycle/boots.zig");
 const operation = @import("antfly_local_sources").api_operation;
 
 pub fn requiresNativeRecovery(plan: staging.Plan) bool {

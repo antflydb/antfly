@@ -585,7 +585,7 @@ pub const OwnedBatchRequest = struct {
     restore_staging: ?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control) = null,
     online_source: ?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command) = null,
     group_source: ?std.json.Parsed(@import("../storage/db/group_source_contract.zig").Command) = null,
-    sql_lock: ?std.json.Parsed(@import("../storage/pessimistic_lock_control.zig").Command) = null,
+    sql_lock: ?std.json.Parsed(@import("../storage/pessimistic_lock/control.zig").Command) = null,
     resolver_review: ?std.json.Parsed(@import("../storage/db/resolver_review.zig").Command) = null,
     artifact_catalog: ?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Command) = null,
     artifact_publication: ?std.json.Parsed(@import("../storage/db/artifact_publication.zig").Command) = null,
@@ -1122,10 +1122,10 @@ noinline fn parseBatchRowsAndControls(alloc: std.mem.Allocator, root: std.json.O
         if (marker != .object or marker.object.count() != 1) return error.InvalidBatchRequest;
         const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
         if (kind != .string or !std.mem.eql(u8, kind.string, "sql_lock_v1")) return error.InvalidBatchRequest;
-        const parsed_control = try std.json.parseFromValue(@import("../storage/pessimistic_lock_control.zig").Command, alloc, value, .{ .allocate = .alloc_always });
+        const parsed_control = try std.json.parseFromValue(@import("../storage/pessimistic_lock/control.zig").Command, alloc, value, .{ .allocate = .alloc_always });
         errdefer parsed_control.deinit();
         try parsed_control.value.validate();
-        break :control @as(?std.json.Parsed(@import("../storage/pessimistic_lock_control.zig").Command), parsed_control);
+        break :control @as(?std.json.Parsed(@import("../storage/pessimistic_lock/control.zig").Command), parsed_control);
     } else null;
     out.resolver_review = if (root.get("_resolver_review")) |value| control: {
         if (!allow_internal) return error.InvalidBatchRequest;
@@ -1714,7 +1714,7 @@ noinline fn parseBatchTransitions(alloc: std.mem.Allocator, root: std.json.Objec
                 .external_decision_owner = external_owner,
                 .sql_locks = if (object.get("sql_locks")) |lock_value| ref: {
                     if (!external_begin) return error.InvalidBatchRequest;
-                    const parsed_ref = try std.json.parseFromValue(@import("../storage/pessimistic_lock_transaction.zig").Ref, alloc, lock_value, .{});
+                    const parsed_ref = try std.json.parseFromValue(@import("../storage/pessimistic_lock/transaction.zig").Ref, alloc, lock_value, .{});
                     defer parsed_ref.deinit();
                     try parsed_ref.value.validate(txn_id, external_owner.?);
                     break :ref parsed_ref.value;
@@ -2005,7 +2005,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_types.BatchRequest,
     try @import("../storage/db/relational_index_raft_contract.zig").validateBatchRequest(req);
     try @import("../storage/db/resolver_review.zig").validateRequest(req);
     try db_types.validateLeannRecordCommand(req);
-    if (req.sql_lock != null) try @import("../storage/pessimistic_lock_control.zig").validateBatch(req);
+    if (req.sql_lock != null) try @import("../storage/pessimistic_lock/control.zig").validateBatch(req);
     try @import("../storage/db/group_source_contract.zig").validateRequest(req);
     try @import("../storage/db/artifact_publication.zig").validateRequest(alloc, req);
     try @import("../storage/db/artifact_publication_transport.zig").validateBatchRequest(req);

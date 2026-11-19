@@ -57,7 +57,7 @@ fn runCampaign(ids: []const []const u8, reference: []const u8, quantity_sum: ?[]
     const writes = try scratch.alloc(db.types.BatchWrite, parsed.value.profile.rows.len);
     for (parsed.value.profile.rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(scratch, row.value, .{}) };
     try database.batch(.{ .writes = writes, .timestamp_ns = 42 });
-    var source: @import("sql_parity_sources.zig").Tables(1) = .{
+    var source: @import("sql/testing/parity_sources.zig").Tables(1) = .{
         .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }},
         .reads = .{reads.BoundTableReadSource.init("usage_records", 7, &database, raft.read_gate.alreadyReadSafeBarrier())},
     };
@@ -66,7 +66,7 @@ fn runCampaign(ids: []const []const u8, reference: []const u8, quantity_sum: ?[]
     var server = @import("http_server.zig").ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = @TypeOf(source).status, .system_catalog = @TypeOf(source).systemCatalog, .supports_query_definitions = true } }, source.source(), null);
     defer server.deinit();
     var handler: @import("httpx_handler.zig").AntflyApiHandler = .{ .api_server = &server };
-    try @import("sql_parity_reference.zig").runReferenceDescribedTransportStrict(a, &handler, ids, reference);
+    try @import("sql/testing/parity_reference.zig").runReferenceDescribedTransportStrict(a, &handler, ids, reference);
     if (ids.len == 1 and std.mem.eql(u8, ids[0], "sql-0274")) try byteaBufferedQueries(a, &handler);
     // Single-table reads retain native views directly, not the multi-table
     // statement-vector fixture. Full key ranges are legitimate here; the
@@ -179,7 +179,7 @@ test "httpx SQL PostgreSQL original phonetic filtering and UUID generation execu
         const writes = try owned.alloc(db.types.BatchWrite, profile.rows.len);
         for (profile.rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(owned, row.value, .{}) };
         try database.batch(.{ .writes = writes, .timestamp_ns = 42 });
-        var source: @import("sql_parity_sources.zig").Tables(1) = .{
+        var source: @import("sql/testing/parity_sources.zig").Tables(1) = .{
             .records = .{.{ .table_id = 7, .name = profile.table, .schema_json = schema }},
             .reads = .{reads.BoundTableReadSource.init(profile.table, 7, &database, raft.read_gate.alreadyReadSafeBarrier())},
         };
@@ -200,7 +200,7 @@ test "httpx SQL PostgreSQL original phonetic filtering and UUID generation execu
         var result = try std.json.parseFromSlice(wire.SQLResponse, a, response.body.?, .{});
         defer result.deinit();
         try std.testing.expectEqual(profile.oids.len, result.value.columns.len);
-        for (profile.oids, result.value.columns) |oid, column| try std.testing.expect(@import("sql_parity_reference.zig").postgresColumnMatches(column, oid));
+        for (profile.oids, result.value.columns) |oid, column| try std.testing.expect(@import("sql/testing/parity_reference.zig").postgresColumnMatches(column, oid));
         try std.testing.expectEqual(profile.row_count, result.value.rows.len);
         try std.testing.expect(profile.row_count > 0);
         if (profile.expected_rows) |rows| {

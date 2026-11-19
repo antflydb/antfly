@@ -3805,5 +3805,5 @@ test "pgwire producer capacity rejects execution before backend and preserves ro
 }
 
 comptime {
-    _ = @import("../api/sql_copy_io.zig");
+    _ = @import("../api/sql/copy/io.zig");
 }

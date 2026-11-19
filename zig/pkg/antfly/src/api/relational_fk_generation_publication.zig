@@ -27,7 +27,7 @@ const persistence = @import("antfly_local_sources").common_topology_records.Rela
 pub const NativeBoot = struct {
     generation: u64,
     instance: [16]u8,
-    pub fn requireCurrent(self: NativeBoot, current: @import("../metadata/sql_relation_boots.zig").Record) !void {
+    pub fn requireCurrent(self: NativeBoot, current: @import("../metadata/sql/relation_lifecycle/boots.zig").Record) !void {
         try current.validate();
         if (current.phase != .ready or self.generation != current.generation or !std.mem.eql(u8, &self.instance, &current.instance)) return error.InvalidGenerationPublication;
     }
@@ -542,13 +542,13 @@ test "SQL relation lifetime FK receipts bind actual native position descriptor a
     const native: persistence.Descriptor = .{ .kind = .unlogged, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(1), .data_generation = 3 };
     const pin: persistence.PhysicalPin = .{ .physical_root_incarnation = 99, .table_id = 7, .shard_id = 17, .range_id = 27, .data_generation = 3 };
     const enrolled: @import("../metadata/store_root_enrollment.zig").Identity = .{ .metadata_incarnation = @splat('a'), .node_id = 9, .store_id = 11, .root_incarnation = root.root_incarnation, .public_key = root.public_key };
-    const template: NativeProof = .{ .identity = enrolled, .reporter_incarnation = 3, .authority = .{ .native = try @import("../metadata/sql_relation_attestation.zig").nativeAuthorityDigest(enrolled, pin) }, .native_pin = pin, .root_generation = 1, .signature = @splat(0) };
+    const template: NativeProof = .{ .identity = enrolled, .reporter_incarnation = 3, .authority = .{ .native = try @import("../metadata/sql/relation_lifecycle/attestation.zig").nativeAuthorityDigest(enrolled, pin) }, .native_pin = pin, .root_generation = 1, .signature = @splat(0) };
     const request: SourceRequest = .{ .plan_id = @splat(2), .child_table_id = 7, .child_table_name = "native", .child_group_id = 17, .action = .fence };
     var receipt: SourceReceipt = .{ .plan_id = request.plan_id, .child_table_id = 7, .child_group_id = 17, .action = .fence, .plan_digest = @splat(3), .fence_digest = @splat(4), .before_schema_version = 1, .before_schema_digest = @splat(5), .before_catalog_digest = @splat(6), .after_schema_version = 2, .after_schema_digest = @splat(7), .after_catalog_digest = @splat(8), .applied_term = 0, .applied_index = 0, .native_position = .{ .namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 27 }, .sequence = 9 }, .native_descriptor_fingerprint = try native.fingerprint(), .native_boot = .{ .generation = 2, .instance = @splat(1) } };
     receipt.native_proof = try template.sign(root, receipt.digest());
     try receipt.validate(request);
     try requireCapturedPosition(receipt, native, receipt.native_position.?.namespace);
-    var current_boot: @import("../metadata/sql_relation_boots.zig").Record = .{ .node_id = enrolled.node_id, .identity = enrolled, .reporter_incarnation = template.reporter_incarnation, .generation = 2, .instance = @splat(1), .claim_digest = @splat(2), .unclean_restart = false, .phase = .ready };
+    var current_boot: @import("../metadata/sql/relation_lifecycle/boots.zig").Record = .{ .node_id = enrolled.node_id, .identity = enrolled, .reporter_incarnation = template.reporter_incarnation, .generation = 2, .instance = @splat(1), .claim_digest = @splat(2), .unclean_restart = false, .phase = .ready };
     try receipt.native_boot.?.requireCurrent(current_boot);
     current_boot.generation += 1;
     try std.testing.expectError(error.InvalidGenerationPublication, receipt.native_boot.?.requireCurrent(current_boot));

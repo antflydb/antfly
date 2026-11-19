@@ -11459,7 +11459,7 @@ pub const DB = struct {
     }
 
     fn applySqlLockBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
-        const locks = @import("../pessimistic_lock_control.zig");
+        const locks = @import("../pessimistic_lock/control.zig");
         try locks.validateBatch(req);
         if (self.sql_persistence != null and req.sql_lock.?.native_control == null) switch (req.sql_lock.?.operation) {
             .prepare, .resolve => return error.ExternalTransactionDecisionChanged,
@@ -11553,7 +11553,7 @@ pub const DB = struct {
     /// Closing a captured owner is progress UNDER its fence, never permission
     /// for new execution. Keep the ordinary topology, artifact and validation
     /// admission unchanged for every other SQL lock operation.
-    fn requireSqlLockTopologyAdmission(self: *DB, txn: anytype, command: @import("../pessimistic_lock_control.zig").Command) !void {
+    fn requireSqlLockTopologyAdmission(self: *DB, txn: anytype, command: @import("../pessimistic_lock/control.zig").Command) !void {
         const topology = @import("relational_integrity_topology.zig");
         try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
         try topology.requireNoActiveValidation(txn);
@@ -11579,7 +11579,7 @@ pub const DB = struct {
             try transactions_mod.requireResolvedExternalLockControl(txn, command.admission.transaction);
             var region = std.heap.ArenaAllocator.init(self.alloc);
             defer region.deinit();
-            if (try @import("../pessimistic_lock_transaction.zig").read(region.allocator(), txn, command.admission.transaction)) |frozen| {
+            if (try @import("../pessimistic_lock/transaction.zig").read(region.allocator(), txn, command.admission.transaction)) |frozen| {
                 if (!std.meta.eql(frozen.ref.admission, command.admission) or !std.meta.eql(frozen.ref.decision, control.decision)) return error.ExternalTransactionDecisionChanged;
             } else if (actual.status != .aborted) return error.ExternalTransactionDecisionChanged;
             // locks.apply independently rechecks the exact Ref and native
@@ -11591,7 +11591,7 @@ pub const DB = struct {
         return error.IntegrityTopologyBusy;
     }
 
-    fn requireNativeSqlLockControl(self: *DB, txn: anytype, id: types.TxnId, control: @import("../pessimistic_lock_control.zig").NativeControl) !void {
+    fn requireNativeSqlLockControl(self: *DB, txn: anytype, id: types.TxnId, control: @import("../pessimistic_lock/control.zig").NativeControl) !void {
         const descriptor = self.sql_persistence orelse {
             diagnoseNativeSqlLockGuard("missing_native_descriptor");
             return error.ExternalTransactionDecisionChanged;
@@ -11622,7 +11622,7 @@ pub const DB = struct {
         if (raw.len > 32768) return error.InvalidLockRecord;
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
-        const locks = @import("../pessimistic_lock_control.zig");
+        const locks = @import("../pessimistic_lock/control.zig");
         const query = try std.json.parseFromSliceLeaky(locks.Query, arena.allocator(), raw, .{});
         try query.validate();
         if (self.sql_persistence != null and query.admission.purpose == .resolution and
@@ -28730,7 +28730,7 @@ pub const DB = struct {
         var writes: std.ArrayList(docstore_mod.KVPair) = .empty;
         defer writes.deinit(self.alloc);
         if (marker) |write| try writes.append(self.alloc, write);
-        const lock_key = @import("../pessimistic_lock_transaction.zig").key(request.txn_id);
+        const lock_key = @import("../pessimistic_lock/transaction.zig").key(request.txn_id);
         var lock_bytes: ?[]u8 = null;
         defer if (lock_bytes) |bytes| self.alloc.free(bytes);
         if (request.sql_locks) |ref| {
@@ -28738,8 +28738,8 @@ pub const DB = struct {
             defer arena.deinit();
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            try @import("../pessimistic_lock_transaction.zig").requireBegin(arena.allocator(), &read, self.core.identity_namespace, request.txn_id, request.owner, ref);
-            lock_bytes = try @import("../pessimistic_lock_transaction.zig").encode(self.alloc, .{ .ref = ref });
+            try @import("../pessimistic_lock/transaction.zig").requireBegin(arena.allocator(), &read, self.core.identity_namespace, request.txn_id, request.owner, ref);
+            lock_bytes = try @import("../pessimistic_lock/transaction.zig").encode(self.alloc, .{ .ref = ref });
             try writes.append(self.alloc, .{ .key = &lock_key, .value = lock_bytes.? });
         }
         return self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(request.txn_id, request.begin_timestamp, request.created_at_ns, request.participants, request.coordinator, true, .{
@@ -159228,9 +159228,9 @@ test "db native source retirement admits only exact captured close and resolved 
     const a = std.testing.allocator;
     const persistence = @import("../../common/relation_persistence.zig");
     const topology = @import("relational_integrity_topology.zig");
-    const locks = @import("../pessimistic_lock_control.zig");
-    const scopes = @import("../pessimistic_lock_authority.zig");
-    const frozen = @import("../pessimistic_lock_transaction.zig");
+    const locks = @import("../pessimistic_lock/control.zig");
+    const scopes = @import("../pessimistic_lock/authority.zig");
+    const frozen = @import("../pessimistic_lock/transaction.zig");
     const realm: [16]u8 = @splat(1);
     const namespace: doc_identity.Namespace = .{ .table_id = 717, .shard_id = 172, .range_id = 272 };
     const group: u64 = 719;
@@ -159254,7 +159254,7 @@ test "db native source retirement admits only exact captured close and resolved 
         defer db.close();
         const pin = (try db.relationPhysicalPin()).?;
         const route: @import("../../metadata/catalog_route_contract.zig").CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = std.fmt.bytesToHex(realm, .lower), .catalog_revision = 2, .table_id = namespace.table_id, .topology_epoch = 1, .route = .{ .group_id = group, .range_id = namespace.range_id, .identity_namespace = .{ .table_id = namespace.table_id, .shard_id = namespace.shard_id, .range_id = namespace.range_id }, .execution = .{ .native_local = descriptor } }, .native_participant = pin };
-        const admission: @import("../pessimistic_lock_participant.zig").Admission = .{ .purpose = .execution, .binding = .{ .namespace = .{ .home = .data, .group = group, .incarnation = realm }, .identity = namespace }, .source = .{ .group = 1, .lease = .{ .backend = .{ .incarnation = realm, .id = @splat(2), .fence = 1 }, .database = 4, .node = 7, .principal = @splat(4), .expires_at_ms = now + 60_000 }, .connection = @splat('a'), .nonce = @splat(8), .standalone = false }, .transaction = @splat(9), .generation = 1, .parent_command = .{ .sequence = 1, .nonce = @splat(10), .executor = @splat(3) }, .serial = 1 };
+        const admission: @import("../pessimistic_lock/participant.zig").Admission = .{ .purpose = .execution, .binding = .{ .namespace = .{ .home = .data, .group = group, .incarnation = realm }, .identity = namespace }, .source = .{ .group = 1, .lease = .{ .backend = .{ .incarnation = realm, .id = @splat(2), .fence = 1 }, .database = 4, .node = 7, .principal = @splat(4), .expires_at_ms = now + 60_000 }, .connection = @splat('a'), .nonce = @splat(8), .standalone = false }, .transaction = @splat(9), .generation = 1, .parent_command = .{ .sequence = 1, .nonce = @splat(10), .executor = @splat(3) }, .serial = 1 };
         const participant: scopes.Data.Participant = .{ .spec = .{ .table_name = "rows", .route = route, .schema_version = db.core.index_manager.activeSchemaVersion() }, .admission = admission };
         var directory: scopes.Data.Header = .{ .next_generation = 2, .open = 1 };
         directory.slots[0] = 1;

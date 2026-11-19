@@ -72,7 +72,7 @@ pub fn Session(comptime Source: type) type {
                 const table = for (snapshot.tables) |value| {
                     if (std.mem.eql(u8, value.name, selection.name)) break value;
                 } else return error.TableNotFound;
-                const trigger_source = try @import("sql_trigger_backup.zig").capture(a, source, request, table);
+                const trigger_source = try @import("sql/triggers/backup.zig").capture(a, source, request, table);
                 try proofs.append(a, .{ .schema_only = marker.format == .native and (if (table.sql_persistence) |native| native.kind == .unlogged else false), .table_id = table.table_id, .name = table.name, .definition = metadata.tableDefinitionFingerprint(table), .manifest_definition = cohort.manifestDefinition(table.name, table.description, table.schema_json, table.read_schema_json, table.indexes_json, table.replication_sources_json), .trigger_source_columns_digest = if (trigger_source) |value| value.digest else null });
                 if (proofs.items[proofs.items.len - 1].schema_only) continue;
                 var ranges = std.ArrayListUnmanaged(metadata.RangeRecord).empty;

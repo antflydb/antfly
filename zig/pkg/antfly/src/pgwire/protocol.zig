@@ -2137,7 +2137,7 @@ pub const Session = struct {
         rolled.deinit();
     }
 
-    const CopyBatch = @import("../api/sql_copy_input_batch.zig").Batch;
+    const CopyBatch = @import("../api/sql/copy/input_batch.zig").Batch;
     const CopyDriver = struct {
         fn check(ptr: *anyopaque) !void {
             const session: *Session = @ptrCast(@alignCast(ptr));

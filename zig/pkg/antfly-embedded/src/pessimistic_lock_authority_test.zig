@@ -16,7 +16,7 @@
 //! Pure native authority contracts, independent of the server compilation.
 
 test {
-    _ = @import("storage/pessimistic_lock_authority.zig");
-    _ = @import("storage/pessimistic_lock_resource.zig");
-    _ = @import("storage/pessimistic_lock_participant.zig");
+    _ = @import("storage/pessimistic_lock/authority.zig");
+    _ = @import("storage/pessimistic_lock/resource.zig");
+    _ = @import("storage/pessimistic_lock/participant.zig");
 }

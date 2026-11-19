@@ -26,7 +26,7 @@ pub const max_bytes = 16384;
 pub const decoder_version: u16 = @import("../metadata/topology_protocol.zig").sql_native_lock_custody_version;
 pub const Ref = struct { backend: locks.Backend, command: scopes.Command };
 pub const EffectInput = struct { command: scopes.Command, effect: scopes.ledger.Effect };
-const recovery = @import("../metadata/sql_relation_recovery.zig");
+const recovery = @import("../metadata/sql/relation_lifecycle/recovery.zig");
 pub const NativeRetirement = struct {
     generation: u64,
     query: recovery.Query,
@@ -37,7 +37,7 @@ pub const NativeRetirement = struct {
 const DataRetirement = struct { generation: u64, native: local.storage_pessimistic_lock_control.Snapshot };
 pub const Request = struct {
     abandoned_private: ?@import("../metadata/abandoned_temporary_retirement.zig").Selection = null,
-    scope_retirement: ?@import("../metadata/scope_retirement_ledger.zig").SourceControl = null,
+    scope_retirement: ?@import("../metadata/retirement/scope/ledger.zig").SourceControl = null,
     notification_generation: ?u64 = null,
     admission: outcomes.Admission,
     incarnation: [16]u8,
@@ -336,7 +336,7 @@ pub const Context = struct {
         // Exact registration replay observes its existing native owner. A new
         // backend cannot enter a database after retirement has reserved it.
         if (try scopes.read(self.a, txn, ns, value.lease.backend) == null)
-            try @import("../metadata/scope_retirement_admission.zig").requireConnectionAdmission(txn, ns.group, value.lease.database);
+            try @import("../metadata/retirement/scope/admission.zig").requireConnectionAdmission(txn, ns.group, value.lease.database);
     }
     pub fn requireRead(self: Context, value: scopes.Record) !void {
         try self.requireOwner(value);
@@ -346,7 +346,7 @@ pub const Context = struct {
         // Retirement cannot strand an already admitted body's FINISH, abort,
         // delivery ACK or exact replay. Only admission of a new body is fenced.
         if (self.starting_command and value.command == null and command.sequence >= value.next_command)
-            try @import("../metadata/scope_retirement_admission.zig").requireConnectionAdmission(txn, ns.group, value.registration.lease.database);
+            try @import("../metadata/retirement/scope/admission.zig").requireConnectionAdmission(txn, ns.group, value.registration.lease.database);
     }
     pub fn requireTransaction(self: Context, _: anytype, _: scopes.ledger.Namespace, value: scopes.Record, id: [16]u8) !void {
         try self.requireOwner(value);
@@ -449,7 +449,7 @@ pub fn applyWithEnrollmentAndRetirement(a: A, txn: anytype, group: u64, request:
     try request.validate();
     const ns: scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = request.incarnation };
     if (request.scope_retirement) |root| {
-        const retirement = @import("../metadata/scope_retirement_ledger.zig");
+        const retirement = @import("../metadata/retirement/scope/ledger.zig");
         if (root.root.group != group) return error.Forbidden;
         const head = (try retirement.head(txn, root.root)) orelse return error.CatalogGenerationChanged;
         if (!head.force or head.progress.phase != .draining_connections or
@@ -523,7 +523,7 @@ pub fn applyWithEnrollmentAndRetirement(a: A, txn: anytype, group: u64, request:
         },
     }
     if (request.scope_retirement) |control|
-        try @import("../metadata/scope_retirement_ledger.zig").stageSourceCursor(txn, control, request.backend);
+        try @import("../metadata/retirement/scope/ledger.zig").stageSourceCursor(txn, control, request.backend);
     const result = receipt orelse return null;
     const effect = switch (request.operation) {
         .effect, .cancel, .step => |value| value.effect,
