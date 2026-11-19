@@ -69,6 +69,11 @@ const Policy = struct {
         };
     }
 
+    pub fn snapshotImage(self: *Policy, a: A, _: control.State, key: []const u8, row: ?std.json.Value, request: Context) !@import("antfly_local_sources").api_local_table_writes.table_write_source.changefeed_projection.Image {
+        try request.ensureActive();
+        return .{ .row = row, .readable = try self.visible(a, key, row) };
+    }
+
     fn visible(self: *Policy, a: A, key: []const u8, row: ?std.json.Value) !bool {
         const value = row orelse return false;
         const filter = self.filter orelse return true;

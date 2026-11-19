@@ -18,7 +18,7 @@
 //! table incarnation, COMPLETE selected root set and exact policy revision, and
 //! authorize/redact BOTH historical images. This provider cannot substitute for
 //! that authority. Coordinated/legacy frames require separate completion proof;
-//! relational tuples, snapshots and lifecycle sources have distinct providers.
+//! relational tuples and lifecycle sources have distinct providers.
 const std = @import("std");
 const local = @import("antfly_local_sources").api_local_table_writes;
 const page_types = local.table_write_source.history_page;
@@ -68,6 +68,20 @@ const Event = struct {
     before: ?Json,
     after: ?Json,
 };
+const SnapshotEvent = struct {
+    kind: enum { document_snapshot } = .document_snapshot,
+    event_id: []const u8,
+    table_id: []const u8,
+    key: Key,
+    version: []const u8,
+    after: ?Json,
+};
+const SnapshotEnvelope = struct {
+    version: u8 = 1,
+    events: []const RawJson,
+    transaction: ?Transaction = null,
+    snapshot: struct { complete: bool },
+};
 const Transaction = struct { transaction_id: []const u8, complete: bool };
 const Envelope = struct { version: u8 = 1, events: []const RawJson, transaction: ?Transaction };
 fn size(a: A, value: anytype) !u64 {
@@ -106,10 +120,96 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
         pub fn replay(self: *Self, a: A, state: control.State, receipt: control.Delivery, limits: delivery.Limits, request: anytype) !delivery.Prepared {
             return self.render(a, state, receipt.before, receipt, limits, request);
         }
+        fn snapshotOrdinal(position: control.BootstrapPosition) !u32 {
+            if (position.page == 0) return 0;
+            const ordinal = std.fmt.parseInt(u32, position.continuation, 10) catch return error.ChangefeedResynchronizationRequired;
+            if (ordinal == 0 and !position.done) return error.ChangefeedResynchronizationRequired;
+            return ordinal;
+        }
+
+        fn renderSnapshot(self: *Self, a: A, state: control.State, root: control.Root, original: ?control.Delivery, limits: delivery.Limits, request: anytype) !delivery.Prepared {
+            if (comptime !@hasDecl(Root, "readBootstrap") or !@hasDecl(Policy, "snapshotImage")) return error.ChangefeedCapabilityUnsupported;
+            const pin = root.snapshot orelse return error.ChangefeedResynchronizationRequired;
+            const position = root.snapshot_delivered;
+            if (position.done) return error.ChangefeedBackpressure;
+            const start = try snapshotOrdinal(position);
+            var target: ?control.BootstrapPosition = null;
+            var max_rows = limits.events;
+            if (original) |receipt| {
+                if (receipt.advances.len != 1 or !equal(receipt.advances[0].namespace, root.namespace) or
+                    receipt.advances[0].position.order(.{ .sequence = root.start }) != .eq) return error.ChangefeedResynchronizationRequired;
+                target = receipt.advances[0].snapshot orelse return error.ChangefeedResynchronizationRequired;
+                const stop = try snapshotOrdinal(target.?);
+                if (stop < start or stop - start > 1024 or (stop == start and !target.?.done)) return error.ChangefeedResynchronizationRequired;
+                max_rows = @max(stop - start, 1);
+            }
+            const raw_limit = @min(self.raw_bytes_limit, local.table_write_source.history_consumer.max_bootstrap_bytes);
+            var page = try self.root.readBootstrap(a, state, start, try self.nowSeconds(request), max_rows, raw_limit, request);
+            defer page.deinit();
+            if (page.rows.len > max_rows or page.next_row != start + @as(u32, @intCast(page.rows.len)) or (page.rows.len == 0 and !page.done))
+                return error.ChangefeedResynchronizationRequired;
+
+            const table = state.definition.?.tables[0];
+            const table_id = try std.fmt.allocPrint(a, "{d}", .{table.table_id});
+            const scope_id = scope(state);
+            const projected: projection.Projection = switch (state.definition.?.projection) {
+                .rows => .rows,
+                .keys_and_versions => .keys_and_versions,
+            };
+            const envelope_budget = @max(
+                try size(a, SnapshotEnvelope{ .events = &.{}, .snapshot = .{ .complete = true } }),
+                try size(a, SnapshotEnvelope{ .events = &.{}, .snapshot = .{ .complete = false } }),
+            );
+            var events: std.ArrayList(RawJson) = .empty;
+            var event_bytes: u64 = 0;
+            var consumed: u32 = 0;
+            for (page.rows) |row| {
+                try request.ensureActive();
+                const document = try page_types.documentId(a, row.key);
+                const image = try self.policy.snapshotImage(a, state, document, try parseImage(a, row.value), request);
+                if (try projection.project(a, table, projected, .{}, image)) |effect| {
+                    const ordinal = start + consumed;
+                    const event: SnapshotEvent = .{
+                        .event_id = try hex(a, control.hash(.{ .domain = "antfly:feed-snapshot-event:v1", .scope = scope_id, .pin = pin.digest, .ordinal = ordinal })),
+                        .table_id = table_id,
+                        .key = try key(a, document),
+                        .version = try hex(a, control.hash(.{ .domain = "antfly:feed-snapshot-version:v1", .scope = scope_id, .pin = pin.digest, .ordinal = ordinal, .key = document })),
+                        .after = if (effect.after) |value| .{ .a = a, .value = value } else null,
+                    };
+                    const bytes = try size(a, event);
+                    if (envelope_budget + event_bytes + bytes + events.items.len > limits.bytes or events.items.len >= limits.events) {
+                        if (original != null or consumed == 0) return error.ChangefeedBackpressure;
+                        break;
+                    }
+                    try events.append(a, .{ .value = try std.json.Stringify.valueAlloc(a, event, .{}) });
+                    event_bytes += bytes;
+                }
+                consumed += 1;
+            }
+            const next: control.BootstrapPosition = .{
+                .page = std.math.add(u64, position.page, 1) catch return error.ChangefeedBackpressure,
+                .continuation = try std.fmt.allocPrint(a, "{d}", .{start + consumed}),
+                .done = page.done and consumed == page.rows.len,
+            };
+            if (target) |expected| {
+                if (expected.page != next.page or expected.done != next.done or !std.mem.eql(u8, expected.continuation, next.continuation))
+                    return error.ChangefeedResynchronizationRequired;
+            }
+            const body = try std.json.Stringify.valueAlloc(a, SnapshotEnvelope{ .events = events.items, .snapshot = .{ .complete = next.done } }, .{});
+            if (body.len > limits.bytes) return error.ChangefeedBackpressure;
+            return .{
+                .body = body,
+                .events = @intCast(events.items.len),
+                .proof = control.hash(.{ .domain = "antfly:feed-snapshot-page:v1", .scope = scope_id, .pin = pin.digest, .from = position, .to = next }),
+                .advances = try a.dupe(control.Advance, &.{.{ .namespace = root.namespace, .position = .{ .sequence = root.start }, .snapshot = next }}),
+            };
+        }
+
         fn render(self: *Self, a: A, state: control.State, before: Digest, original: ?control.Delivery, limits: delivery.Limits, request: anytype) !delivery.Prepared {
             try limits.validate();
             try self.authorize(state, request);
             const roots = try state.rootsAt(a, before);
+            if (state.phase == .bootstrap) return self.renderSnapshot(a, state, roots[0], original, limits, request);
             const context = try state.contextAt(before);
             const seen = try continuation.decode(a, scope(state), roots, context);
             if (original) |receipt| if (receipt.advances.len == 0) {

@@ -175,7 +175,7 @@ pub const Routed = struct {
     pub fn validateScope(self: *Routed, state: control.State) !control.Table {
         try state.validate();
         const definition = state.definition orelse return error.ChangefeedConflict;
-        if (definition.start != .now or definition.events != 1 or definition.tables.len != 1)
+        if ((definition.start == .snapshot_then_changes and self.source.bootstrap_pages == null) or definition.events != 1 or definition.tables.len != 1)
             return error.ChangefeedCapabilityUnsupported;
         const table = definition.tables[0];
         if (table.contract != .native_document) return error.ChangefeedCapabilityUnsupported;
@@ -183,9 +183,42 @@ pub const Routed = struct {
         if (selected.fence.table_id != table.table_id or !same(selected.table_binding, table.binding))
             return error.ChangefeedResynchronizationRequired;
         if (state.roots.len != 1 or !same(state.roots[0].namespace, self.namespace) or
-            state.roots[0].ownership_epoch != 1 or state.roots[0].released or state.roots[0].snapshot != null)
+            state.roots[0].ownership_epoch != 1 or state.roots[0].released)
             return error.ChangefeedResynchronizationRequired;
         return table;
+    }
+
+    pub fn readBootstrap(self: *Routed, a: A, state: control.State, after_rows: u32, now: u64, max_rows: u32, max_bytes: u32, request: Context) !root_page.BootstrapPage {
+        try request.ensureActive();
+        _ = try self.validateScope(state);
+        if (state.phase != .bootstrap) return error.ChangefeedResynchronizationRequired;
+        const root = state.roots[0];
+        const pin = root.snapshot orelse return error.ChangefeedResynchronizationRequired;
+        if (root.snapshot_released or root.consumer_epoch == 0) return error.ChangefeedResynchronizationRequired;
+        if (now == 0 or now >= state.expires_at or now >= pin.expires_at) return error.ChangefeedLeaseExpired;
+        const selected = try self.captured.find(self.namespace);
+        const port = self.source.bootstrap_pages orelse return error.ChangefeedCapabilityUnsupported;
+        var page = try port.read(a, selected.fence, selected.table_name, .{
+            .version = 1,
+            .request = .{
+                .reference = .{
+                    .namespace = self.namespace,
+                    .authority = state.authority,
+                    .consumer = state.consumerId(),
+                    .epoch = root.consumer_epoch,
+                    .grant = root.grant_sequence,
+                    .definition = state.definition.?.identity(),
+                },
+                .digest = pin.digest,
+                .now_seconds = now,
+                .after_rows = after_rows,
+                .max_rows = max_rows,
+                .max_bytes = max_bytes,
+            },
+        }, request);
+        errdefer page.deinit();
+        try request.ensureActive();
+        return page;
     }
 
     pub fn readWithContext(self: *Routed, a: A, state: control.State, cursor: Digest, now: u64, max_events: u32, max_bytes: u32, request: Context) !root_page.Page {

@@ -70,6 +70,9 @@ const Policy = struct {
     pub fn nowSeconds(_: *@This(), _: Request) !u64 {
         return 200;
     }
+    pub fn snapshotImage(_: *@This(), _: A, _: control.State, _: []const u8, row: ?std.json.Value, _: Request) !local.table_write_source.changefeed_projection.Image {
+        return .{ .row = row };
+    }
     pub fn images(_: *@This(), _: A, _: control.State, _: anytype, _: []const u8, before: ?std.json.Value, after: ?std.json.Value, _: Request) !provider.Images {
         return .{ .before = .{ .row = before }, .after = .{ .row = after } };
     }
@@ -195,4 +198,94 @@ pub fn run() !void {
     try std.testing.expectError(error.ChangefeedCapabilityUnsupported, coordinator.pull(&svc, &p, a, @splat(4), latest.cursor, .{}, Request{}));
     policy.denied = true;
     try std.testing.expectError(error.TestDenied, coordinator.pull(&svc, &p, a, @splat(4), @splat(99), .{}, Request{}));
+}
+
+pub fn bootstrap() !void {
+    const a = std.testing.allocator;
+    const history = local.table_write_source.history_consumer;
+    const pages = local.table_write_source.history_page;
+    const Root = struct {
+        namespace: control.Namespace,
+        db: *local.db_mod.DB,
+        pub fn validateScope(_: *@This(), state: control.State) !control.Table {
+            return state.definition.?.tables[0];
+        }
+        pub fn readBootstrap(self: *@This(), alloc: A, state: control.State, after: u32, now: u64, max_rows: u32, max_bytes: u32, _: Request) !pages.BootstrapPage {
+            const root = state.roots[0];
+            return self.db.historyBootstrapPage(alloc, .{
+                .reference = .{ .namespace = self.namespace, .authority = state.authority, .consumer = state.consumerId(), .epoch = root.consumer_epoch, .grant = root.grant_sequence, .definition = state.definition.?.identity() },
+                .digest = root.snapshot.?.digest,
+                .now_seconds = now,
+                .after_rows = after,
+                .max_rows = max_rows,
+                .max_bytes = max_bytes,
+            }, null);
+        }
+        pub fn readWithContext(_: *@This(), _: A, _: control.State, _: control.Digest, _: u64, _: u32, _: u32, _: Request) !pages.Page {
+            return error.TestUnexpectedStreamingRead;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bootstrap-data", .{tmp.sub_path});
+    defer a.free(path);
+    const meta_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bootstrap-meta", .{tmp.sub_path});
+    defer a.free(meta_path);
+    var db = try local.db_mod.DB.open(a, path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .online_source_authority = .native });
+    defer db.close();
+    var store = try Store.init(a, .{ .root_dir = meta_path });
+    defer store.deinit();
+    var svc: Service = .{ .store = &store };
+    const table: Table = .{ .table_id = 7, .name = "docs", .schema_json = "{}" };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    const namespace = try db.nativeSourceAdmissionNamespace();
+    var root: Root = .{ .namespace = namespace, .db = &db };
+    var policy: Policy = .{};
+    var p: provider.ProviderFor(Root, Policy) = .{ .root = &root, .policy = &policy };
+    const definition: control.Definition = .{ .start = .snapshot_then_changes, .owner = @splat(1), .authorization = @splat(2), .projection = .rows, .tables = &.{.{ .table_id = 7, .binding = control.tableBinding(table), .policy_revision = 1, .contract = .native_document, .fields = &.{"value"}, .predicates = &.{.{ .field = "tenant", .value = .{ .string = "A" } }} }} };
+    try svc.mutate(a, .{ .create = .{ .id = @splat(4), .definition = definition, .now = 100, .expires_at = 1000, .bootstrap_expires_at = 500 } });
+    try svc.mutate(a, .{ .plan_roots = &.{.{ .namespace = namespace, .ownership_epoch = 1 }} });
+    try db.batch(.{ .writes = &.{
+        .{ .key = "one", .value = "{\"tenant\":\"A\",\"value\":1,\"secret\":\"never-return\"}" },
+        .{ .key = "two", .value = "{\"tenant\":\"B\",\"value\":2}" },
+    } });
+    {
+        var before = try svc.load(a);
+        defer before.deinit();
+        const state = before.value;
+        const grant_sequence = state.roots[0].grant_sequence;
+        const grant: history.Grant = .{ .namespace = namespace, .authority = state.authority, .consumer = state.consumerId(), .definition = definition.identity(), .sequence = grant_sequence, .expires_at_seconds = 1000, .policy_revision = 1 };
+        const enrolled = (try db.nativeHistoryConsumerControl(.{ .capture_bootstrap = .{ .grant = grant, .expires_at_seconds = 500 } })).consumer.?;
+        var identity = history.GrantIdentity.fromGrant(grant);
+        identity.include_bootstrap = true;
+        const pin = (try db.nativeHistoryGrant(identity)).active.bootstrap.?;
+        try svc.mutate(a, .{ .enroll = .{ .namespace = namespace, .ownership_epoch = 1, .grant_sequence = grant_sequence, .consumer_epoch = enrolled.epoch, .start = enrolled.start, .snapshot = .{ .id = state.consumerId(), .digest = pin.digest, .expires_at = pin.expires_at_seconds } } });
+    }
+    try svc.mutate(a, .{ .seal = .{ .cut = @splat(7) } });
+    var initial = try svc.load(a);
+    defer initial.deinit();
+    try db.batch(.{ .writes = &.{.{ .key = "one", .value = "{\"tenant\":\"A\",\"value\":9}" }} });
+    var first = try coordinator.pull(&svc, &p, a, @splat(4), initial.value.latest_cursor, .{ .events = 1 }, Request{});
+    defer first.deinit();
+    var first_body = try body(a, first.body);
+    defer first_body.deinit();
+    const first_event = first_body.value.object.get("events").?.array.items[0].object;
+    try std.testing.expectEqualStrings("document_snapshot", first_event.get("kind").?.string);
+    try std.testing.expectEqualStrings("1", first_event.get("after").?.object.get("value").?.number_string);
+    try std.testing.expect(first_event.get("after").?.object.get("secret") == null);
+    try std.testing.expect(!first_body.value.object.get("snapshot").?.object.get("complete").?.bool);
+    var replay = try coordinator.pull(&svc, &p, a, @splat(4), initial.value.latest_cursor, .{}, Request{});
+    defer replay.deinit();
+    try std.testing.expect(replay.replayed);
+    try std.testing.expectEqualStrings(first.body, replay.body);
+    var final = try coordinator.pull(&svc, &p, a, @splat(4), first.cursor, .{}, Request{});
+    defer final.deinit();
+    var final_body = try body(a, final.body);
+    defer final_body.deinit();
+    try std.testing.expectEqual(@as(usize, 0), final_body.value.object.get("events").?.array.items.len);
+    try std.testing.expect(final_body.value.object.get("snapshot").?.object.get("complete").?.bool);
+    var acknowledged = try coordinator.acknowledge(&svc, &p, a, @splat(4), final.cursor, Request{});
+    defer acknowledged.deinit();
+    try std.testing.expect(acknowledged.value.roots[0].snapshot_acknowledged.done);
+    _ = try acknowledged.value.bootstrapCompletionProof();
 }
