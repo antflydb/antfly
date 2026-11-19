@@ -440,15 +440,26 @@ fn holderClaimGeneration(word: u128) u32 {
 /// module uses anywhere, which is why `owner` stays the narrow encoding
 /// rather than also widening to carry a claim generation inline; see
 /// `ticket_generations`'s own doc comment for where that lives instead.
-fn packTicketSlot(tag: u64, owner: u64) u128 {
-    return (@as(u128, tag) << 64) | @as(u128, owner);
+/// A ticket's ring word: its tag (`ticket + 1`) and its owner's pid,
+/// liveness slot and claim generation, published together. A pid of zero
+/// marks a ticket its owner gave up.
+fn packTicketWord(ticket: u32, pid: u32, liveness_slot: u32, generation: u32) u128 {
+    return (@as(u128, ticket +% 1) << 96) | (@as(u128, generation) << 64) | (@as(u128, liveness_slot) << 32) | @as(u128, pid);
 }
 
-fn ticketSlotTag(word: u128) u64 {
+fn ticketWordTag(word: u128) u32 {
+    return @truncate(word >> 96);
+}
+
+fn ticketWordGeneration(word: u128) u32 {
     return @truncate(word >> 64);
 }
 
-fn ticketSlotOwner(word: u128) u64 {
+fn ticketWordLivenessSlot(word: u128) u32 {
+    return @truncate(word >> 32);
+}
+
+fn ticketWordPid(word: u128) u32 {
     return @truncate(word);
 }
 
@@ -1430,27 +1441,17 @@ pub const Region = struct {
             const head = hdr.writer_ticket_head.load(.acquire);
             if (head == my_ticket) break;
             countedRawFutexWaitShared(&hdr.writer_ticket_head.raw, head, dead_ticket_check_step_ms);
-            const head2 = hdr.writer_ticket_head.load(.acquire);
-            if (head2 == my_ticket) break;
-            if (head2 == head) self.tryHelpDeadTicketAt(head2);
+            self.skipResolvedHeads();
         }
         while (true) {
+            // Sample the release epoch before trying: a release between the
+            // attempt and the sample would otherwise park this waiter on a
+            // free writer word.
+            const epoch = hdr.writer_release_epoch.load(.acquire);
             if (self.tryAcquireWriter(pid)) {
-                // Won. Advance head (and past any already-abandoned or
-                // dead-owned tickets right after it -- see
-                // `advanceHeadPastAbandoned`) so ticket `my_ticket + 1`
-                // (if any) leaves phase 1 and enters its own phase 2, and
-                // wake whoever is parked for that -- including a
-                // spurious wake of a later ticket still waiting on the
-                // old head value, which simply re-checks and re-parks.
-                self.advanceHeadPastAbandoned();
+                self.finishTurn(my_ticket);
                 return;
             }
-            // Still held by the previous winner. Wait on
-            // `writer_release_epoch`, not `head` and not `writer_holder`
-            // itself (see this function's own doc comment, and
-            // `writer_release_epoch`'s own, for why).
-            const epoch = hdr.writer_release_epoch.load(.acquire);
             countedRawFutexWaitShared(&hdr.writer_release_epoch.raw, epoch, null);
         }
     }
@@ -1511,12 +1512,11 @@ pub const Region = struct {
         const tail: u32 = @truncate(hdr.writer_ticket_tail.load(.monotonic));
         if (head == tail) return false;
         const slots = self.ticketSlots();
-        const flags = self.ticketAbandonedFlags();
         var t = head;
         while (t != tail) : (t +%= 1) {
-            const idx = t % hdr.max_readers;
-            if (flags[idx].load(.acquire) != 0) continue;
-            const owner = ticketSlotOwner(slots[idx].load(.acquire));
+            const word = slots[t % hdr.max_readers].load(.acquire);
+            if (word == 0 or ticketWordTag(word) != t +% 1 or ticketWordPid(word) == 0) continue;
+            const owner = packHolder(ticketWordPid(word), ticketWordLivenessSlot(word));
             // `0`: this exact ring index is mid-transition (its own
             // claimant is between `tryClaimTicket`'s own two steps, or a
             // resolver just cleared it and hasn't advanced `head` past it
@@ -1524,7 +1524,7 @@ pub const Region = struct {
             // is transitioning it will finish the job.
             if (owner == 0) continue;
             if (narrowHolderPid(owner) == own_pid and narrowHolderLivenessSlot(owner) == self.own_liveness_slot) continue;
-            if (self.isReferenceDead(narrowHolderLivenessSlot(owner), self.ticketGenerations()[idx].load(.acquire))) continue;
+            if (self.isReferenceDead(ticketWordLivenessSlot(word), ticketWordGeneration(word))) continue;
             return true;
         }
         return false;
@@ -1621,22 +1621,27 @@ pub const Region = struct {
         while (true) {
             const head = hdr.writer_ticket_head.load(.acquire);
             if (head == my_ticket) break;
-            if (Io.Clock.now(.awake, io).compare(.gte, deadline)) {
+            const now = Io.Clock.now(.awake, io);
+            if (now.compare(.gte, deadline)) {
                 self.abandonTicket(my_ticket);
                 return error.Timeout;
             }
+            // A dead queued owner never moves `head`: recheck on a short
+            // step rather than only when this caller's deadline expires.
+            const step_deadline = now.addDuration(.fromMilliseconds(dead_ticket_check_step_ms));
             // A canceled waiter gives its ticket up like a timed-out one:
             // its owner stays alive, so nobody else would ever skip it.
-            countedFutexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, head, deadline) catch {
+            countedFutexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, head, if (step_deadline.compare(.lt, deadline)) step_deadline else deadline) catch {
                 self.abandonTicket(my_ticket);
                 return error.Canceled;
             };
-            const head2 = hdr.writer_ticket_head.load(.acquire);
-            if (head2 == head) self.tryHelpDeadTicketAt(head2);
+            self.skipResolvedHeads();
         }
         while (true) {
+            // Sample before trying; see `acquireWriter`'s phase 2.
+            const epoch = hdr.writer_release_epoch.load(.acquire);
             if (self.tryAcquireWriter(pid)) {
-                self.advanceHeadPastAbandoned();
+                self.finishTurn(my_ticket);
                 return true;
             }
             if (recovery) |rec| {
@@ -1652,16 +1657,15 @@ pub const Region = struct {
                 // Our own turn, but we're giving it up: step aside
                 // ourselves, exactly like a real win's own advance, just
                 // without ever touching `writer_holder`.
-                self.advanceHeadPastAbandoned();
+                self.finishTurn(my_ticket);
                 return error.Timeout;
             }
-            const epoch = hdr.writer_release_epoch.load(.acquire);
             const wait_deadline = if (recovery != null) blk: {
                 const step_deadline = Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(dead_ticket_check_step_ms));
                 break :blk if (step_deadline.compare(.lt, deadline)) step_deadline else deadline;
             } else deadline;
             countedFutexWaitSharedBounded(io, &hdr.writer_release_epoch.raw, epoch, wait_deadline) catch {
-                self.advanceHeadPastAbandoned();
+                self.finishTurn(my_ticket);
                 return error.Canceled;
             };
         }
@@ -1734,104 +1738,69 @@ pub const Region = struct {
     /// in the meantime. See `tryHelpDeadTicketAt`'s own doc comment.
     const dead_ticket_check_step_ms: u32 = 50;
 
-    /// `true` (and clears the abandonment flag and the ticket's own ring
-    /// slot, if that is why -- freeing this exact ring index for a
-    /// future generation, same as a real winner's own ticket gets
-    /// cleared in `advanceHeadPastAbandoned`) when ticket `ticket` is
-    /// already resolved one way or another -- either explicitly
-    /// abandoned, or its recorded owner is provably dead -- without this
-    /// call itself needing to own or win it.
-    ///
-    /// A ring slot read as genuinely empty (`owner == 0`) here -- not
-    /// just "not yet this call's concern" -- answers `false`: it means
-    /// some other, concurrent caller (this same ticket's own real
-    /// claimant publishing it, or another helper that already resolved
-    /// it) is actively transitioning this exact slot, so there is
-    /// nothing for *this* call to do; whoever is responsible will finish
-    /// the job.
-    fn ticketResolvedWithoutOwning(self: *Region, ticket: u32) bool {
+    /// Whether ticket `ticket`'s slot word `word` shows it resolved without
+    /// its owner taking the turn: given up (pid cleared by `abandonTicket`)
+    /// or owned by a process that has died. Only a word carrying this
+    /// ticket's own tag counts; any other word belongs to a claim not yet
+    /// published or to another ticket using the same ring index.
+    fn ticketResolvable(self: *const Region, word: u128, ticket: u32) bool {
+        if (word == 0 or ticketWordTag(word) != ticket +% 1) return false;
+        return ticketWordPid(word) == 0 or self.isReferenceDead(ticketWordLivenessSlot(word), ticketWordGeneration(word));
+    }
+
+    /// Moves `head` off ticket `ticket` if it is still there, then frees
+    /// the ticket's slot if it still holds `word`. The head transition is
+    /// the single winner for that ticket; the tagged compare-and-swap on
+    /// the slot cannot free a later ticket that reuses the ring index.
+    fn advanceHeadFrom(self: *Region, ticket: u32, word: u128) bool {
         const hdr = self.header();
-        const idx = ticket % hdr.max_readers;
-        const flags = self.ticketAbandonedFlags();
+        if (hdr.writer_ticket_head.cmpxchgStrong(ticket, ticket +% 1, .acq_rel, .monotonic) != null) return false;
+        _ = self.ticketSlots()[ticket % hdr.max_readers].cmpxchgStrong(word, 0, .acq_rel, .monotonic);
+        return true;
+    }
+
+    /// Advances `head` past every resolved ticket at the front of the
+    /// queue, stopping at the first live or unpublished one, then wakes
+    /// the waiters. Any number of callers may run it concurrently: each
+    /// step re-reads `head` and moves it only by compare-and-swap.
+    fn skipResolvedHeads(self: *Region) void {
+        const hdr = self.header();
         const slots = self.ticketSlots();
-        if (flags[idx].load(.acquire) != 0) {
-            flags[idx].store(0, .monotonic);
-            slots[idx].store(0, .release);
-            return true;
-        }
-        const existing = slots[idx].load(.acquire);
-        const owner = ticketSlotOwner(existing);
-        if (owner != 0 and self.isReferenceDead(narrowHolderLivenessSlot(owner), self.ticketGenerations()[idx].load(.acquire))) {
-            slots[idx].store(0, .release);
-            return true;
-        }
-        return false;
-    }
-
-    /// Called by a waiter stuck making no progress on `head` (any phase,
-    /// any ticket -- it only ever looks at `head`'s *current* value, not
-    /// its own ticket) to check whether `head`'s current occupant is a
-    /// ticket whose own recorded owner has died -- `kill -9` of a queued
-    /// waiter, in either of *its* phases, same as the abandonment case
-    /// `acquireWriterFairBounded`'s own doc comment covers, except this
-    /// one never got the chance to mark its own flag. Nobody else is
-    /// normally responsible for moving `head` past a ticket once it's
-    /// stuck there, so without this, a dead queued waiter would wedge
-    /// every ticket after it exactly as a leaked abandonment would.
-    ///
-    /// A `cmpxchg`, not an unconditional advance like
-    /// `advanceHeadPastAbandoned`'s own first step: more than one other
-    /// waiter can notice the same dead occupant on the same bounded
-    /// step, and only the one that wins should continue the skip-chain.
-    /// The others simply loop back to their own wait, see the new `head`
-    /// value, and proceed normally.
-    /// Gives up a ticket that has not reached its turn yet. The previous
-    /// writer may already have advanced `head` to it and checked its flag
-    /// before the flag was set; then nobody would skip it until a waiter
-    /// behind it ran out its wait. Skip it here once it is the head: the
-    /// compare-and-swap in `tryHelpDeadTicketAt` moves `head` only off this
-    /// exact ticket, and nothing else can move it off without the flag.
-    fn abandonTicket(self: *Region, ticket: u32) void {
-        const hdr = self.header();
-        self.ticketAbandonedFlags()[ticket % hdr.max_readers].store(1, .release);
-        if (hdr.writer_ticket_head.load(.acquire) == ticket) self.tryHelpDeadTicketAt(ticket);
-    }
-
-    fn tryHelpDeadTicketAt(self: *Region, stuck_head: u32) void {
-        if (!self.ticketResolvedWithoutOwning(stuck_head)) return;
-        const hdr = self.header();
-        if (hdr.writer_ticket_head.cmpxchgStrong(stuck_head, stuck_head +% 1, .release, .monotonic) != null) return;
-        self.continueSkippingFrom(stuck_head +% 1);
-    }
-
-    /// After `head` has just become `current_head` -- because its own
-    /// rightful ticket just won or stepped aside, or because
-    /// `tryHelpDeadTicketAt` just won the right to advance past a dead
-    /// occupant -- keeps advancing past any immediately following
-    /// tickets that are themselves already resolved, then wakes once.
-    fn continueSkippingFrom(self: *Region, current_head: u32) void {
-        const hdr = self.header();
-        var head = current_head;
-        while (self.ticketResolvedWithoutOwning(head)) {
-            head = hdr.writer_ticket_head.fetchAdd(1, .release) +% 1;
+        while (true) {
+            const head = hdr.writer_ticket_head.load(.acquire);
+            // Published tickets only: a claim is visible in its slot before
+            // `tail` advances past it.
+            if (head == @as(u32, @truncate(hdr.writer_ticket_tail.load(.acquire)))) break;
+            const word = slots[head % hdr.max_readers].load(.acquire);
+            if (!self.ticketResolvable(word, head)) break;
+            _ = self.advanceHeadFrom(head, word);
         }
         countedWriterFutexWakeShared(&hdr.writer_ticket_head.raw);
     }
 
-    /// After winning ticket `my_ticket`'s CAS, or voluntarily stepping
-    /// aside for it (`acquireWriterFairBounded`'s own phase-2 timeout),
-    /// clears this now-resolved ticket's own ring slot (freeing this
-    /// exact ring index for a future generation, the same cleanup
-    /// `ticketResolvedWithoutOwning` does for a ticket resolved the
-    /// *other* way), advances `head` past it, and delegates to
-    /// `continueSkippingFrom` for anything immediately following that is
-    /// also already resolved.
-    fn advanceHeadPastAbandoned(self: *Region) void {
+    /// Gives up ticket `ticket`, which has not had its turn. Its owner is
+    /// alive, so it marks the slot itself; if the previous writer already
+    /// handed the turn to it before the mark, skip it now rather than
+    /// leave it at the head until a later waiter's check.
+    fn abandonTicket(self: *Region, ticket: u32) void {
         const hdr = self.header();
-        const my_ticket = hdr.writer_ticket_head.load(.monotonic);
-        self.ticketSlots()[my_ticket % hdr.max_readers].store(0, .release);
-        const new_head = hdr.writer_ticket_head.fetchAdd(1, .release) +% 1;
-        self.continueSkippingFrom(new_head);
+        const slot = &self.ticketSlots()[ticket % hdr.max_readers];
+        var word = slot.load(.acquire);
+        while (word != 0 and ticketWordTag(word) == ticket +% 1 and ticketWordPid(word) != 0) {
+            word = slot.cmpxchgWeak(word, word & ~@as(u128, 0xffff_ffff), .acq_rel, .acquire) orelse break;
+        }
+        self.skipResolvedHeads();
+    }
+
+    /// Ends ticket `ticket`'s turn: the owner won the writer word, or is
+    /// giving the turn up (deadline or cancellation in phase 2).
+    fn finishTurn(self: *Region, ticket: u32) void {
+        const hdr = self.header();
+        const word = self.ticketSlots()[ticket % hdr.max_readers].load(.acquire);
+        const advanced = self.advanceHeadFrom(ticket, word);
+        // Nobody else resolves a live owner's ticket at the head.
+        std.debug.assert(advanced);
+        self.skipResolvedHeads();
     }
 
     /// Releases a writer hold taken by `acquireWriter`/`tryAcquireWriter`.
@@ -1998,30 +1967,27 @@ pub const Region = struct {
     /// claim with a freshly read `t`.
     fn tryClaimTicket(self: *Region, t: u64, pid: u32) ?u32 {
         const hdr = self.header();
-        const idx: u32 = @intCast(t % @as(u64, hdr.max_readers));
-        const slots = self.ticketSlots();
-        const want = packTicketSlot(t +% 1, packHolder(pid, self.own_liveness_slot));
-        if (slots[idx].cmpxchgStrong(0, want, .acq_rel, .monotonic)) |existing| {
-            if (ticketSlotTag(existing) == t +% 1) {
-                const owner = ticketSlotOwner(existing);
-                if (self.isReferenceDead(narrowHolderLivenessSlot(owner), self.ticketGenerations()[idx].load(.acquire))) {
-                    _ = slots[idx].cmpxchgStrong(existing, 0, .acq_rel, .monotonic);
-                }
-            }
+        const ticket: u32 = @truncate(t);
+        const slot = &self.ticketSlots()[ticket % hdr.max_readers];
+        // Owner and liveness generation publish in one word, so no reader
+        // can pair this owner with a previous claimant's generation.
+        const want = packTicketWord(ticket, pid, self.own_liveness_slot, self.own_liveness_generation);
+        if (slot.cmpxchgStrong(0, want, .acq_rel, .acquire)) |existing| {
+            const prior = ticketWordTag(existing) -% 1;
+            const head = hdr.writer_ticket_head.load(.acquire);
+            // A ticket already behind `head` whose resolver has not freed
+            // (or died before freeing) its slot; or a competing claim of
+            // this same ticket whose owner died before advancing `tail`.
+            const behind = head -% prior -% 1 < (@as(u32, 1) << 31);
+            const dead_same = prior == ticket and self.isReferenceDead(ticketWordLivenessSlot(existing), ticketWordGeneration(existing));
+            if (behind or dead_same) _ = slot.cmpxchgStrong(existing, 0, .acq_rel, .monotonic);
             return null;
         }
-        // Step 1 won: publish this claim's own liveness-slot generation
-        // right away, a few instructions after `want` above already
-        // published its (pid, slot) -- see `ticketGenerations`'s own doc
-        // comment for why this is a separate store rather than packed
-        // into `want` itself, and why the narrow window between the two
-        // is benign.
-        self.ticketGenerations()[idx].store(self.own_liveness_generation, .release);
-        if (hdr.writer_ticket_tail.cmpxchgStrong(t, t +% 1, .monotonic, .monotonic) != null) {
-            slots[idx].store(0, .release);
+        if (hdr.writer_ticket_tail.cmpxchgStrong(t, t +% 1, .acq_rel, .monotonic) != null) {
+            _ = slot.cmpxchgStrong(want, 0, .acq_rel, .monotonic);
             return null;
         }
-        return @truncate(t);
+        return ticket;
     }
 
     /// LMDB calls the same condition (a fixed `maxreaders` table with no
@@ -4042,6 +4008,98 @@ test "shared lock region: a ticket abandoned after the handoff reached it is ski
     _ = try region.acquireWriterFairBounded(io, pid, started.addDuration(.fromSeconds(2)), null);
     region.releaseWriter();
     try std.testing.expect(started.durationTo(Io.Clock.now(.awake, io)).toMilliseconds() < 1000);
+}
+
+const TicketFixture = struct {
+    tmp: std.testing.TmpDir,
+    path: []u8,
+    region: Region,
+    fn init(name: []const u8) !TicketFixture {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir_len = try tmp.dir.realPath(std.testing.io, &buf);
+        const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ buf[0..dir_len], name });
+        errdefer a.free(path);
+        return .{ .tmp = tmp, .path = path, .region = try Region.open(a, std.testing.io, path) };
+    }
+    fn deinit(self: *TicketFixture) void {
+        self.region.close();
+        std.testing.allocator.free(self.path);
+        self.tmp.cleanup();
+    }
+};
+
+test "shared lock region: resolving the same abandoned ticket twice never passes tail" {
+    var fixture = try TicketFixture.init("region-double-resolve.aflite");
+    defer fixture.deinit();
+    const region = &fixture.region;
+    const hdr = region.header();
+    const pid: u32 = @bitCast(std.c.getpid());
+    const first = region.tryClaimTicket(hdr.writer_ticket_tail.load(.monotonic), pid).?;
+    const second = region.tryClaimTicket(hdr.writer_ticket_tail.load(.monotonic), pid).?;
+    // The later waiter gives up while the first still holds the turn;
+    // then the first's handoff and the abandoning waiter's own skip both
+    // try to resolve it. Exactly one may move head off it.
+    region.abandonTicket(second);
+    try std.testing.expectEqual(first, hdr.writer_ticket_head.load(.monotonic));
+    region.finishTurn(first);
+    region.skipResolvedHeads();
+    region.abandonTicket(second);
+    const tail: u32 = @truncate(hdr.writer_ticket_tail.load(.monotonic));
+    try std.testing.expectEqual(tail, hdr.writer_ticket_head.load(.monotonic));
+    try std.testing.expect(region.ringHasRoom());
+    _ = try region.acquireWriterFairBounded(std.testing.io, pid, Io.Clock.now(.awake, std.testing.io).addDuration(.fromMilliseconds(500)), null);
+    region.releaseWriter();
+}
+
+test "shared lock region: a dead queued ticket at the head is skipped on a short cadence" {
+    var fixture = try TicketFixture.init("region-dead-head.aflite");
+    defer fixture.deinit();
+    const region = &fixture.region;
+    const hdr = region.header();
+    const pid: u32 = @bitCast(std.c.getpid());
+    // Publish a ticket whose owner's liveness generation is no longer
+    // current: a queued writer that died.
+    const t = hdr.writer_ticket_tail.load(.monotonic);
+    const ticket: u32 = @truncate(t);
+    region.ticketSlots()[ticket % hdr.max_readers].store(packTicketWord(ticket, pid +% 1, region.own_liveness_slot, region.own_liveness_generation +% 1), .release);
+    hdr.writer_ticket_tail.store(t +% 1, .release);
+    try std.testing.expectEqual(ticket, hdr.writer_ticket_head.load(.monotonic));
+    const started = Io.Clock.now(.awake, std.testing.io);
+    _ = try region.acquireWriterFairBounded(std.testing.io, pid, started.addDuration(.fromSeconds(5)), null);
+    region.releaseWriter();
+    try std.testing.expect(started.durationTo(Io.Clock.now(.awake, std.testing.io)).toMilliseconds() < 1000);
+}
+
+test "shared lock region: concurrent bounded writers with expiring deadlines keep the queue consistent" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var fixture = try TicketFixture.init("region-ticket-stress.aflite");
+    defer fixture.deinit();
+    const region = &fixture.region;
+    const pid: u32 = @bitCast(std.c.getpid());
+    const Worker = struct {
+        fn run(r: *Region, owner: u32, seed: u64) void {
+            var prng = std.Random.DefaultPrng.init(seed);
+            const random = prng.random();
+            for (0..300) |_| {
+                const budget_us = random.uintLessThan(u64, 400);
+                const deadline = Io.Clock.now(.awake, std.testing.io).addDuration(.fromMicroseconds(@intCast(budget_us)));
+                if (r.acquireWriterFairBounded(std.testing.io, owner, deadline, null)) |_| {
+                    r.releaseWriter();
+                } else |_| {}
+            }
+        }
+    };
+    var threads: [6]std.Thread = undefined;
+    for (&threads, 0..) |*thread, i| thread.* = try std.Thread.spawn(.{}, Worker.run, .{ region, pid, i + 1 });
+    for (threads) |thread| thread.join();
+    const hdr = region.header();
+    try std.testing.expectEqual(@as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))), hdr.writer_ticket_head.load(.monotonic));
+    try std.testing.expectEqual(@as(u128, 0), hdr.writer_holder.load(.monotonic));
+    _ = try region.acquireWriterFairBounded(std.testing.io, pid, Io.Clock.now(.awake, std.testing.io).addDuration(.fromMilliseconds(500)), null);
+    region.releaseWriter();
 }
 
 test "shared lock region: an abandoned ticket does not wedge an earlier or a later one" {
