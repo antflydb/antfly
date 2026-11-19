@@ -31,6 +31,11 @@ end-to-end suite. Single-table and two-table cases cover feedback, restart,
 resume, and slot drop. The exported-snapshot cases read pre-cut rows using
 `psql` and verify that `pg_recvlogical` receives the post-cut changes. The
 two-table cases also exercise transaction rollback and rollback to savepoint.
+Changing replica identity invalidates the old slot binding and returns a
+resynchronization error before streaming. Schema changes require the
+publication and slot to be created for the new relation definition.
+Publications advertise `pubtruncate=false`. Antfly SQL TRUNCATE replaces the
+table generation and invalidates the previous binding.
 Run these cases from the `zig` directory.
 
 ```sh
@@ -97,8 +102,9 @@ and match exact scalar values.
 A selector table name matches an entry in `tables`. Each selector supports up to
 64 top-level fields and 16 exact predicates. All predicates must match. Field
 selection applies to the payload after authorization and predicate matching.
-The feed evaluates both historical row images to produce `enter`, `update`,
-`leave`, and `delete` effects. Delivery is at least once. Use `event_id` for
+The feed evaluates both historical row images. Committed row events include
+inserts, updates, and deletes. Predicated feeds also report `enter` and `leave`
+when an update changes whether the row matches. Delivery is at least once. Use `event_id` for
 deduplication and the transaction completion marker before applying a whole
 transaction.
 

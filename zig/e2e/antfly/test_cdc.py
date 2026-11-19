@@ -2742,6 +2742,10 @@ def test_public_changefeed_multiple_tables_use_independent_row_filters():
                 == enrollment
             )
             feed = f"{feeds}/{enrollment['id']}"
+            assert (
+                reader.get(feed, auth=("limited", "limited"), timeout=15).status_code
+                == 403
+            )
             cursor = enrollment["cursor"]
             seen = {}
             for _ in range(6):
@@ -2768,6 +2772,9 @@ def test_public_changefeed_multiple_tables_use_independent_row_filters():
             denied = reader.get(f"{feed}/events", params={"after": cursor}, timeout=15)
             assert denied.status_code == 409, denied.text
             assert "events" not in denied.json()
+            inspection = reader.get(feed, timeout=15)
+            assert inspection.status_code == 409, inspection.text
+            assert "unacknowledged_deliveries" not in inspection.json()
     finally:
         server.stop()
 

@@ -134,30 +134,29 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot, multi_ta
             for fields in (line.split("|") for line in result)
         ]
 
+    def stream_command(output):
+        return [
+            client,
+            *connection,
+            "--slot=smoke_slot",
+            "--start",
+            "--no-loop",
+            "--status-interval=1",
+            "--fsync-interval=1",
+            "-o",
+            "proto_version=1",
+            "-o",
+            "publication_names=changes",
+            "-o",
+            "messages=true",
+            "-f",
+            str(output),
+        ]
+
     @contextmanager
     def stream(output):
         with output.with_suffix(".log").open("wb") as log:
-            reader = subprocess.Popen(
-                [
-                    client,
-                    *connection,
-                    "--slot=smoke_slot",
-                    "--start",
-                    "--no-loop",
-                    "--status-interval=1",
-                    "--fsync-interval=1",
-                    "-o",
-                    "proto_version=1",
-                    "-o",
-                    "publication_names=changes",
-                    "-o",
-                    "messages=true",
-                    "-f",
-                    str(output),
-                ],
-                env=env,
-                stderr=log,
-            )
+            reader = subprocess.Popen(stream_command(output), env=env, stderr=log)
             try:
                 yield reader
             finally:
@@ -570,6 +569,21 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot, multi_ta
             assert reader.poll() is None
             assert resumed.is_file()
         assert resumed.read_bytes() == b""
+        if not export_snapshot and not multi_table:
+            # Change the replica identity after the slot persisted its
+            # immutable binding. Old images cannot use the new contract.
+            sql("ALTER TABLE smoke REPLICA IDENTITY FULL")
+            rejected_output = tmp_path / "rejected.bin"
+            rejected = subprocess.run(
+                stream_command(rejected_output),
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=20,
+            )
+            assert rejected.returncode != 0
+            assert "ChangefeedResynchronizationRequired" in rejected.stderr
+            assert not rejected_output.exists() or not rejected_output.read_bytes()
         slot("--drop-slot")
         assert catalog_slot() == []
         sql("DROP PUBLICATION changes")
