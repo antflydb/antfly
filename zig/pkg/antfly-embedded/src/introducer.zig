@@ -527,6 +527,9 @@ pub const TextDocument = struct {
     index_sort_projection_valid: bool = true,
     /// Exact numeric fields whose source and typed projection agree for this row.
     complete_numeric_fields: []const []const u8 = &.{},
+    /// When supplied, includes owned subsets and the builder's shared list
+    /// allocation on the row that creates it.
+    numeric_coverage_bytes: ?usize = null,
     id: []const u8,
     stored_data: []const u8,
     text_fields: []const TextField,
@@ -541,6 +544,10 @@ pub const TextDocument = struct {
     stored_source: ?std.json.Value = null,
     /// Exact typed source size for columnar builders without a JSON body.
     stored_source_bytes: u64 = 0,
+
+    pub fn numericCoverageInputBytes(self: TextDocument) usize {
+        return self.numeric_coverage_bytes orelse self.complete_numeric_fields.len * @sizeOf([]const u8);
+    }
 };
 
 pub const TextField = struct {
@@ -751,7 +758,7 @@ fn estimateTextDocumentInputBytes(alloc: Allocator, doc: TextDocument) !u64 {
         aliases.finish();
     }
     var total: u64 = @intCast(doc.id.len + doc.stored_data.len);
-    total +|= doc.complete_numeric_fields.len * @sizeOf([]const u8);
+    total +|= doc.numericCoverageInputBytes();
     if (doc.stored_source_bytes != 0) total +|= estimateTypedSourceBytes(doc.stored_source.?, &aliases);
     total +|= @as(u64, @intCast(doc.text_fields.len)) * (@sizeOf(TextField) + 16);
     for (doc.text_fields) |field| {

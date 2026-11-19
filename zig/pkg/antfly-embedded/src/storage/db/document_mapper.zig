@@ -966,7 +966,7 @@ pub const TextProjectionBatchBuilder = struct {
     selected_field: ?[]const u8 = null,
     store_source_columns: bool = false,
     text_docs: std.ArrayListUnmanaged(introducer_mod.TextDocument) = .empty,
-    numeric_projection_lookup: std.StringHashMapUnmanaged(?f64) = .empty,
+    numeric_projection_lookup: std.StringHashMapUnmanaged(?typed_dv.NumericValue) = .empty,
     numeric_coverage_fields: ?[]const []const u8 = null,
 
     pub fn init(
@@ -1041,13 +1041,18 @@ pub const TextProjectionBatchBuilder = struct {
         if (!retain_empty and extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0 and !extractedHasTypedFields(extracted)) return;
 
         const order = if (!has_selected_field) try mappedIndexSortProjection(self.arena, extraction_root, self.schema, extracted.typed_fields) else IndexSortProjection{};
+        const had_numeric_schema = self.numeric_coverage_fields != null;
         const complete_numeric_fields = if (has_selected_field)
             &.{}
         else
             try self.completeNumericFields(extraction_root, extracted.typed_fields orelse &.{});
+        const shared = self.numeric_coverage_fields orelse &.{};
+        const subset_count = if (complete_numeric_fields.ptr == shared.ptr) 0 else complete_numeric_fields.len;
+        const new_shared_count = if (had_numeric_schema) 0 else shared.len;
         try self.text_docs.append(self.arena, .{
             .index_sort_values = order.values,
             .complete_numeric_fields = complete_numeric_fields,
+            .numeric_coverage_bytes = (subset_count + new_shared_count) * @sizeOf([]const u8),
             .index_sort_projection_valid = order.valid and !has_selected_field,
             .id = doc.key,
             .stored_data = if (self.store_source_columns) "" else doc.stored_data,
@@ -1093,7 +1098,7 @@ pub const TextProjectionBatchBuilder = struct {
             slot.value_ptr.* = if (slot.found_existing or typed.conflicted or typed.value != .numeric_val)
                 null
             else
-                typed_dv.numericValueAsF64(typed.value.numeric_val);
+                typed.value.numeric_val;
         }
 
         var complete: ?std.ArrayList([]const u8) = null;
@@ -1578,7 +1583,7 @@ pub fn splitProjectionDocsEnd(docs: []const introducer_mod.TextDocument, start: 
 
 fn estimateProjectedTextDocBytes(doc: introducer_mod.TextDocument) usize {
     var total: usize = 64 + doc.id.len + @max(doc.stored_data.len, @as(usize, @intCast(doc.stored_source_bytes)));
-    total +|= doc.complete_numeric_fields.len * @sizeOf([]const u8);
+    total +|= doc.numericCoverageInputBytes();
     for (doc.text_fields) |field| {
         total +|= 16 + field.field_name.len + field.text.len;
     }
@@ -3161,16 +3166,16 @@ fn mappedTypedDocValueFieldAlloc(
     };
 }
 
-fn numericSourceMatchesProjection(root: std.json.Value, field: []const u8, observed: ??f64) bool {
+fn numericSourceMatchesProjection(root: std.json.Value, field: []const u8, observed: ??typed_dv.NumericValue) bool {
     const raw = numericCoverageSourceValue(root, field) orelse return false;
-    const expected: ?f64 = switch (raw) {
-        .null => null,
-        .integer => |number| @floatFromInt(number),
-        .float => |number| if (std.math.isFinite(number)) number else return false,
+    const expected: typed_dv.NumericValue = switch (raw) {
+        .null => return observed == null,
+        .integer => |number| .{ .i64_val = number },
+        .float => |number| if (std.math.isFinite(number)) .{ .f64_val = number } else return false,
         else => return false,
     };
-    const emitted = observed orelse return expected == null;
-    return emitted != null and emitted == expected;
+    const emitted = (observed orelse return false) orelse return false;
+    return typed_dv.compareNumericValues(emitted, expected) == .eq;
 }
 
 /// A literal dotted key can alias the typed column, and a multivalued

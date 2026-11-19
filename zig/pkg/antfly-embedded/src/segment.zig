@@ -101,6 +101,7 @@ pub const doc_key_range_field = "\x00__antfly_doc_key_range";
 // readers can open the segment and ignore the witness, and their merges drop it.
 const numeric_range_coverage_field = "\x00__antfly_numeric_range_coverage";
 const numeric_range_coverage_section: SectionType = .synonym;
+const numeric_range_coverage_header = "AFNR\x02";
 
 pub const NumericRangeCoverage = enum(u8) { empty = 1, populated = 2 };
 pub const NumericRangeWitness = struct {
@@ -134,7 +135,7 @@ fn encodeNumericRangeWitnesses(alloc: Allocator, witnesses: []NumericRangeWitnes
     }.lessThan);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
-    try out.append(alloc, 1);
+    try out.appendSlice(alloc, numeric_range_coverage_header);
     for (witnesses) |witness| {
         try appendU16BE(alloc, &out, std.math.cast(u16, witness.field.len) orelse return error.InvalidSegment);
         try out.append(alloc, @backingInt(witness.coverage));
@@ -1045,6 +1046,10 @@ pub const SegmentReader = struct {
                     navigation.* = try typed_dv.RangeTypedDocValuesReader.init(alloc, view, std.math.maxInt(usize), std.math.maxInt(usize));
                     section.typed_navigation = navigation;
                 }
+                // Optional coverage is fetched on demand so a damaged proof
+                // cannot prevent unrelated queries from opening the segment.
+                if (section.section_type == numeric_range_coverage_section and
+                    std.mem.eql(u8, field.name, numeric_range_coverage_field)) continue;
                 switch (section.section_type) {
                     .inverted_text, .typed_doc_values, .doc_ordinals, .vector, .columnar_stored => continue,
                     else => {},
@@ -2221,8 +2226,10 @@ pub const SegmentReader = struct {
 
     fn numericRangeWitnesses(self: *const SegmentReader) !NumericRangeWitnessIterator {
         const bytes = (try self.getSection(numeric_range_coverage_field, numeric_range_coverage_section)) orelse return .{};
-        if (bytes.len == 0 or bytes[0] != 1) return .{};
-        return .{ .remaining = bytes[1..] };
+        // Earlier witness encodings could attest a merged legacy column
+        // without evidence of its source projection.
+        if (!std.mem.startsWith(u8, bytes, numeric_range_coverage_header)) return .{};
+        return .{ .remaining = bytes[numeric_range_coverage_header.len..] };
     }
 
     /// A producer witness for an exact, source-backed numeric field.
@@ -5723,31 +5730,13 @@ const MergeNumericRangeCoverage = struct {
         if (!self.fields.contains(field)) return null;
         for (inputs, self.by_input) |input, map| {
             if (!inputHasLiveDocs(input)) continue;
-            if (map.get(field)) |proof| {
-                if (proof == .empty or wrote_typed_values) continue;
-            }
+            // A dense legacy column proves membership, but it cannot certify
+            // that its values represent the declared source path.
+            const proof = map.get(field) orelse return null;
+            if (proof == .empty or wrote_typed_values) continue;
             var typed = (try input.reader.typedDocValuesScoped(alloc, field)) orelse return null;
             defer typed.deinit();
             if (!typedDocValuesValueTypeIsNumeric(typed.value_type)) return null;
-            if (map.contains(field)) continue;
-
-            // An older column can independently prove complete coverage if
-            // its validated typed IDs cover every surviving document.
-            var last: ?u32 = null;
-            var live: u32 = 0;
-            for (0..typed.num_chunks) |chunk| {
-                const ids = typed.readValidatedChunkDocIds(@intCast(chunk)) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => return null,
-                };
-                defer alloc.free(ids);
-                for (ids) |id| {
-                    if (id >= input.reader.doc_count or (last != null and id <= last.?)) return null;
-                    last = id;
-                    if (!input.isDeleted(id)) live += 1;
-                }
-            }
-            if (live != input.reader.doc_count - input.deletedBefore(input.reader.doc_count)) return null;
         }
         return if (wrote_typed_values) .populated else .empty;
     }
@@ -13083,4 +13072,40 @@ test "privacy wide segment directories use sorted navigation and reject duplicat
     defer a.free(invalid);
     try std.testing.expectError(error.InvalidSegment, SegmentReader.init(a, invalid));
     try std.testing.expectError(error.InvalidSegment, RangeSegmentReader.init(a, .{ .contiguous = invalid }, .{}));
+}
+
+test "optional numeric range damaged witness does not prevent range-backed posting reads" {
+    const a = std.testing.allocator;
+    var postings = inverted.InvertedIndexBuilder.init(a, .{});
+    defer postings.deinit();
+    try postings.addDocument(0, &.{.{ .term = "beacon", .freq = 1 }});
+    const payload = try postings.build();
+    defer a.free(payload);
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    try writer.addStoredDoc("a", "{}");
+    try writer.addSection(try writer.addField("body"), .inverted_text, payload);
+    // Place the witness on a different integrity page from postings and
+    // stored-document metadata.
+    const padding = try a.alloc(u8, integrity.page_size);
+    defer a.free(padding);
+    @memset(padding, 0);
+    try writer.addSection(try writer.addField("padding"), .vector, padding);
+    var coverage = [_]NumericRangeWitness{.{ .field = "rank", .coverage = .empty }};
+    try writer.addNumericRangeWitnesses(&coverage);
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    {
+        var reader = try SegmentReader.init(a, bytes);
+        defer reader.deinit();
+        const witness = (try reader.getSection(numeric_range_coverage_field, numeric_range_coverage_section)).?;
+        bytes[@intFromPtr(witness.ptr) - @intFromPtr(bytes.ptr)] ^= 1;
+    }
+
+    var native = try SegmentReader.initSource(a, .{ .contiguous = bytes });
+    defer native.deinit();
+    try std.testing.expectError(error.CrcMismatch, native.numericRangeCoverage("rank"));
+    var body = (try native.invertedIndexScoped(a, "body")).?;
+    defer body.deinit();
+    try std.testing.expect((try body.lookup("beacon")) != null);
 }
