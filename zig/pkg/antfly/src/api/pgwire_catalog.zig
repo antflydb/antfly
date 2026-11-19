@@ -259,37 +259,39 @@ pub fn openRole(a: std.mem.Allocator, request: catalog.Scan, role: Role) !catalo
     return .{ .ptr = cursor, .next = RoleCursor.next, .close = RoleCursor.close, .estimated_rows = 1 };
 }
 
+const PostgresInputProcedure = local.sql_compiler.PostgresInputProcedure;
+
 const Type = struct {
     oid: u32,
     name: []const u8,
     category: []const u8,
     length: i16,
-    input: []const u8,
+    input: PostgresInputProcedure,
     element: u32 = 0,
     array: u32 = 0,
 
-    fn builtin(element: Element, name: []const u8, category: []const u8, length: i16, input: []const u8) Type {
+    fn builtin(element: Element, name: []const u8, category: []const u8, length: i16, input: PostgresInputProcedure) Type {
         return .{ .oid = element.oid(), .name = name, .category = category, .length = length, .input = input, .array = element.arrayOid() };
     }
 
     fn arrayType(item: Type, comptime name: []const u8) Type {
-        return .{ .oid = item.array, .name = name, .category = "A", .length = -1, .input = "array_in", .element = item.oid };
+        return .{ .oid = item.array, .name = name, .category = "A", .length = -1, .input = .array_in, .element = item.oid };
     }
 };
 
 const base_types = [_]Type{
-    .builtin(.boolean, "bool", "B", 1, "boolin"),
-    .builtin(.int64, "int8", "N", 8, "int8in"),
-    .builtin(.int16, "int2", "N", 2, "int2in"),
-    .builtin(.int32, "int4", "N", 4, "int4in"),
-    .builtin(.text, "text", "S", -1, "textin"),
-    .builtin(.float32, "float4", "N", 4, "float4in"),
-    .builtin(.float64, "float8", "N", 8, "float8in"),
-    .{ .oid = 1043, .name = "varchar", .category = "S", .length = -1, .input = "varcharin" },
-    .{ .oid = 1184, .name = "timestamptz", .category = "D", .length = 8, .input = "timestamptz_in" },
-    .builtin(.numeric, "numeric", "N", -1, "numeric_in"),
-    .builtin(.uuid, "uuid", "U", 16, "uuid_in"),
-    .builtin(.jsonb, "jsonb", "U", -1, "jsonb_in"),
+    .builtin(.boolean, "bool", "B", 1, .boolin),
+    .builtin(.int64, "int8", "N", 8, .int8in),
+    .builtin(.int16, "int2", "N", 2, .int2in),
+    .builtin(.int32, "int4", "N", 4, .int4in),
+    .builtin(.text, "text", "S", -1, .textin),
+    .builtin(.float32, "float4", "N", 4, .float4in),
+    .builtin(.float64, "float8", "N", 8, .float8in),
+    .{ .oid = 1043, .name = "varchar", .category = "S", .length = -1, .input = .varcharin },
+    .{ .oid = 1184, .name = "timestamptz", .category = "D", .length = 8, .input = .timestamptz_in },
+    .builtin(.numeric, "numeric", "N", -1, .numeric_in),
+    .builtin(.uuid, "uuid", "U", 16, .uuid_in),
+    .builtin(.jsonb, "jsonb", "U", -1, .jsonb_in),
 };
 
 const types = blk: {
@@ -322,7 +324,7 @@ fn row(alloc: std.mem.Allocator, item: Type) !catalog.Row {
     try value.put(alloc, "typtype", .{ .string = "b" });
     try value.put(alloc, "typcategory", .{ .string = item.category });
     try value.put(alloc, "typnotnull", .{ .bool = false });
-    try value.put(alloc, "typinput", .{ .string = item.input });
+    try value.put(alloc, "typinput", .{ .string = @tagName(item.input) });
     try value.put(alloc, "typelem", .{ .integer = item.element });
     try value.put(alloc, "typarray", .{ .integer = item.array });
     try value.put(alloc, "typbasetype", .{ .integer = 0 });

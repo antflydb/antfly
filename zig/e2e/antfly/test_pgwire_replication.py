@@ -154,6 +154,10 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             "SELECT n.oid, n.nspname, t.typname FROM pg_catalog.pg_namespace n "
             "JOIN pg_catalog.pg_type t ON n.oid = t.typnamespace WHERE t.oid = 23"
         )
+        type_query = (
+            "SELECT oid, typname, typelem, typarray, typinput = 'array_in'::regproc "
+            "FROM pg_catalog.pg_type WHERE oid IN (23, 1007) ORDER BY oid"
+        )
         discovery = subprocess.check_output(
             [
                 psql,
@@ -166,7 +170,7 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                 "-c",
                 "SELECT version(), current_user, current_database(), current_catalog",
                 "-c",
-                "SELECT oid, typname, typelem, typarray FROM pg_catalog.pg_type WHERE oid IN (23, 1007) ORDER BY oid",
+                type_query,
                 "-c",
                 role_query,
                 "-c",
@@ -181,8 +185,8 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
         assert discovery[:4] == [
             "logical",
             "PostgreSQL 16.0 compatibility (Antfly)|admin|default|default",
-            "23|int4|0|1007",
-            "1007|_int4|23|0",
+            "23|int4|0|1007|f",
+            "1007|_int4|23|0|t",
         ]
         oid, *role = discovery[4].split("|")
         assert int(oid) >= 16_384
@@ -196,6 +200,7 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                     role_query,
                     membership_query,
                     namespace_query,
+                    type_query,
                     "SELECT oid,nspname FROM pg_catalog.pg_namespace WHERE nspname = 'public'",
                 )
             ),
@@ -207,6 +212,7 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             discovery[4],
             discovery[6],
             "11|pg_catalog|int4",
+            *discovery[2:4],
             "2200|public",
         ]
         sql("CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT)")

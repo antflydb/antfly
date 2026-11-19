@@ -29,6 +29,22 @@ pub const Limits = struct {
     max_insert_rows: usize = 1_000,
 };
 
+pub const PostgresInputProcedure = enum {
+    array_in,
+    boolin,
+    int8in,
+    int2in,
+    int4in,
+    textin,
+    float4in,
+    float8in,
+    varcharin,
+    timestamptz_in,
+    numeric_in,
+    uuid_in,
+    jsonb_in,
+};
+
 pub const Error = std.mem.Allocator.Error || error{
     InvalidSqlSyntax,
     UnsupportedSqlShape,
@@ -265,6 +281,17 @@ test "compiler treats TIMESTAMPTZ quoted literals as typed datetime casts" {
     try std.testing.expect(expression.* == .cast);
     try std.testing.expectEqual(ast.ColumnType.datetime, expression.cast.type);
     try std.testing.expectEqualStrings("2025-01-01T01:30:00+01:30", expression.cast.operand.literal.string);
+}
+
+test "compiler resolves built-in input procedure regproc literals" {
+    var compiled = try compile(std.testing.allocator, "INSERT INTO types (input) VALUES ('ARRAY_IN'::regproc), (CAST('pg_catalog.textin' AS pg_catalog.regproc)), (NULL::regproc)", .{});
+    defer compiled.deinit();
+    const values = compiled.statement.insert.rows;
+
+    try std.testing.expectEqualStrings("array_in", values[0][0].string);
+    try std.testing.expectEqualStrings("textin", values[1][0].string);
+    try std.testing.expectEqual(ast.ColumnType.string, compiled.statement.insert.expressions[2][0].?.cast.type);
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, compile(std.testing.allocator, "SELECT 'missing'::regproc", .{}));
 }
 
 const Parser = struct {
@@ -505,9 +532,8 @@ const Parser = struct {
             try self.expect(.lparen);
             const operand = try self.scalar(depth + 1, 0);
             try self.expectKeyword(.as);
-            const kind = try self.castType();
+            left = try self.explicitCast(operand);
             try self.expect(.rparen);
-            left = try self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind.type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier } });
         } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "array") and self.pos + 2 < self.tokens.len and self.tokens[self.pos + 1].kind == .lparen and (self.tokens[self.pos + 2].isKeyword(.select) or self.tokens[self.pos + 2].isKeyword(.with))) {
             self.pos += 2;
             self.relation_depth += 1;
@@ -711,8 +737,7 @@ const Parser = struct {
             if (self.peek(.colon_colon)) {
                 if (minimum > 8) break;
                 self.pos += 1;
-                const kind = try self.castType();
-                left = try self.scalarNode(.{ .cast = .{ .operand = left, .type = kind.type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier } });
+                left = try self.explicitCast(left);
                 continue;
             }
             // PostgreSQL's postfix spellings share the ordinary IS NULL
@@ -1881,6 +1906,28 @@ const Parser = struct {
         const scale = if (count == 2) casts.integerText(arguments[1], .int32) catch |err| return self.fail(if (err == error.SqlNumericOutOfRange) error.SqlNumericOutOfRange else error.SqlInvalidTextRepresentation, "invalid NUMERIC scale") else 0;
         if (precision < 1 or precision > 1000 or scale < -1000 or scale > 1000) return self.fail(error.SqlInvalidParameterValue, "NUMERIC precision must be 1..1000 and scale -1000..1000");
         return .{ .precision = @intCast(precision), .scale = @intCast(scale) };
+    }
+
+    fn explicitCast(self: *Parser, operand: *const ast.Scalar) Error!*const ast.Scalar {
+        const start = self.pos;
+        const qualified = self.ddlWord("pg_catalog");
+        if ((!qualified or self.take(.dot)) and self.ddlWord("regproc")) {
+            // pg_type exposes input procedures by name. Resolve the same
+            // known symbols here so clients can compare typinput to regproc.
+            if (operand.* != .literal) return self.fail(error.UnsupportedSqlShape, "expected a literal input procedure name");
+            if (operand.literal == .null) return self.scalarNode(.{ .cast = .{ .operand = operand, .type = .string } });
+            if (operand.literal != .string) return self.fail(error.UnsupportedSqlShape, "expected a literal input procedure name");
+            const spelling = operand.literal.string;
+            const prefix = "pg_catalog.";
+            const symbol = if (std.ascii.startsWithIgnoreCase(spelling, prefix)) spelling[prefix.len..] else spelling;
+            inline for (std.meta.tags(PostgresInputProcedure)) |procedure| {
+                if (std.ascii.eqlIgnoreCase(symbol, @tagName(procedure))) return self.scalarNode(.{ .literal = .{ .string = @tagName(procedure) } });
+            }
+            return self.fail(error.SqlInvalidTextRepresentation, "unknown built-in input procedure");
+        }
+        self.pos = start;
+        const kind = try self.castType();
+        return self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind.type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier } });
     }
 
     fn castType(self: *Parser) Error!CastType {
