@@ -666,7 +666,7 @@ fn releaseStreamingSnapshot(client: *config.Client, policy: anytype, a: A, state
     } }, request);
 }
 
-fn retireOne(client: *config.Client, policy: anytype, a: A, state: control.State, request: Context) !bool {
+pub fn retireOne(client: *config.Client, policy: anytype, a: A, state: control.State, request: Context) !bool {
     const definition = state.definition.?;
     for (state.roots) |root| {
         if (!root.released or root.snapshot_released) continue;

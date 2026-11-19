@@ -19,18 +19,19 @@ checkpoint contracts; it does not imply those additional source APIs exist today
 A native data node can serve a configured Antfly publication over pgwire. The
 slot binds to that publication at creation. It retains whole committed
 transactions in `pgoutput` format and advances retention after durable client
-feedback. The qualified deployment uses one native history root. Clients can
+feedback. A slot can cover multiple native relational tables and up to 128
+history roots. Coordinated transactions become visible only after all their
+published participants can be emitted under one Begin and Commit. Clients can
 start with `NOEXPORT_SNAPSHOT` or create a slot with `EXPORT_SNAPSHOT` and adopt
-its initial LSN after importing the cut in a repeatable-read SQL transaction.
+its initial LSN after importing the coherent cut in a repeatable-read SQL
+transaction.
 
-The end-to-end suite ran against Antfly revision `7774536cf6`, which reports
-PostgreSQL 16.0 wire compatibility. Stock `psql` and `pg_recvlogical` 18.6 used
-`pgoutput` protocol version 1 with an authenticated publication over a native
-table with a `BIGINT` primary key and `TEXT` payload. The streaming test covers
-feedback, restart, resume without replay of acknowledged transactions, and slot
-drop. The exported-snapshot test reads the pre-cut row using `psql` and verifies
-that `pg_recvlogical` receives the post-cut update with its full old image. Run
-both cases from the `zig` directory.
+Stock `psql` and `pg_recvlogical` 18.6 use `pgoutput` protocol version 1 in the
+end-to-end suite. Single-table and two-table cases cover feedback, restart,
+resume, and slot drop. The exported-snapshot cases read pre-cut rows using
+`psql` and verify that `pg_recvlogical` receives the post-cut changes. The
+two-table cases also exercise transaction rollback and rollback to savepoint.
+Run these cases from the `zig` directory.
 
 ```sh
 ANTFLY_BIN="$PWD/zig-out/bin/antfly" uv run --project e2e/antfly pytest e2e/antfly/test_pgwire_replication.py
@@ -71,6 +72,27 @@ Keep the namespace and the fencing inventory with the spool volume. At startup,
 a missing or different spool incarnation prevents the node from serving that
 configuration. A replacement spool requires resynchronizing consumers that were
 bound to the original incarnation.
+
+## Retained HTTP feed benchmark
+
+From the `zig` directory, run the isolated fixture against a local binary.
+
+```sh
+uv run --project e2e/antfly python e2e/antfly/bench_changefeed.py zig-out/bin/antfly --rows 32 --batch-size 8 --fanout 0 2 4
+```
+
+A macOS arm64 debug run with one metadata node, one data node, and one table
+root gave the following results. At each nonzero fan-out, one consumer stayed
+offline until both servers restarted. Active consumers pulled and acknowledged
+each batch serially. Lag includes the pull and durable acknowledgement. The
+replica allocation column measures whole replica directory growth during the
+workload. The no-feed baseline provides a comparison for the retention cost.
+
+| Consumers | Write rows/s | Write and deliver rows/s | Median batch ACK lag | Replica growth | Restart | Offline catch-up |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 38.3 | 38.3 | — | 104 KiB | — | — |
+| 2 | 38.7 | 2.11 | 3.58 s | 312 KiB | 1.40 s | 14.39 s |
+| 4 | 38.9 | 0.73 | 7.20 s | 352 KiB | 1.64 s | 14.34 s |
 
 ## Metadata substrate
 

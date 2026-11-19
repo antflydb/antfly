@@ -170,6 +170,7 @@ def run(options, directory):
     table, publication, slot = (
         f"qualification_{kind}_{suffix}" for kind in ("records", "pub", "slot")
     )
+    second = f"{table}_other" if options.multi_table else None
     client = Client(directory, network, client_name, options.image)
     host = options.host if options.external else pg
     password = os.environ.get("QUALIFICATION_DATABASE_PASSWORD", "local-test-only")
@@ -264,7 +265,16 @@ def run(options, directory):
         sql(
             f"INSERT INTO public.{table} {columns} VALUES (1, 'snapshot', 12345678901234567890.12345678, true)"
         )
-        sql(f"CREATE PUBLICATION {publication} FOR TABLE public.{table}")
+        members = [f"public.{table}"]
+        if second:
+            sql(
+                f"CREATE TABLE public.{second} (id integer PRIMARY KEY, label text NOT NULL)"
+            )
+            sql(
+                f"INSERT INTO public.{second} (id, label) VALUES (11, 'second-snapshot')"
+            )
+            members.append(f"public.{second}")
+        sql(f"CREATE PUBLICATION {publication} FOR TABLE {', '.join(members)}")
         config = {
             "name": "antfly-qualification",
             "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
@@ -280,7 +290,7 @@ def run(options, directory):
             "slot.drop.on.stop": "false",
             "publication.name": publication,
             "publication.autocreate.mode": "disabled",
-            "table.include.list": f"public.{table}",
+            "table.include.list": ",".join(members),
             "snapshot.mode": "initial",
             "decimal.handling.mode": "precise",
             "offset.storage": "org.apache.kafka.connect.storage.FileOffsetBackingStore",
@@ -310,12 +320,25 @@ def run(options, directory):
             scaled.to_bytes((scaled.bit_length() + 8) // 8, "big", signed=True)
         ).decode()
         assert after["amount"] == expected_decimal, snapshot
+        extra_write = []
+        if second:
+            second_snapshot = client.wait(lambda event: row(event, "r", 11))
+            assert second_snapshot["value"]["source"]["table"] == second, (
+                second_snapshot
+            )
+            assert second_snapshot["value"]["after"]["label"] == "second-snapshot", (
+                second_snapshot
+            )
+            extra_write = [
+                f"INSERT INTO public.{second} (id, label) VALUES (12, 'second-stream')"
+            ]
         for attempt in range(4):
             try:
                 sql(
                     "BEGIN",
                     f"INSERT INTO public.{table} {columns} VALUES (2, 'stream', 2.5, false)",
                     f"UPDATE public.{table} SET label='updated' WHERE id=1",
+                    *extra_write,
                     "COMMIT",
                 )
                 break
@@ -325,7 +348,12 @@ def run(options, directory):
                 if (
                     attempt == 3
                     or "ERROR:  53300:" not in error.stderr
-                    or error.stdout.splitlines() != ["BEGIN", "INSERT 0 1"]
+                    or error.stdout.splitlines()
+                    not in (
+                        [["BEGIN", "INSERT 0 1"], ["BEGIN", "INSERT 0 1", "UPDATE 1"]]
+                        if second
+                        else [["BEGIN", "INSERT 0 1"]]
+                    )
                 ):
                     raise
                 time.sleep(0.05 * (2**attempt))
@@ -337,19 +365,30 @@ def run(options, directory):
         # PostgreSQL's Debezium transaction id includes each record's LSN;
         # source.txId is the stable transaction identity across row messages.
         assert inserted["value"]["source"]["txId"] == updated["value"]["source"]["txId"]
+        if second:
+            other = client.wait(lambda event: row(event, "c", 12))
+            assert other["value"]["source"]["table"] == second, other
+            assert (
+                other["value"]["source"]["txId"] == inserted["value"]["source"]["txId"]
+            )
+        expected_rows = 3 if second else 2
         # PostgreSQL emits WAL record order. Antfly emits each transaction's
         # net row effects in durable storage-key order.
         transaction_rows = [
-            event for event in client.events if row(event, "c", 2) or row(event, "u", 1)
+            event
+            for event in client.events
+            if row(event, "c", 2)
+            or row(event, "u", 1)
+            or (second and row(event, "c", 12))
         ]
         assert [
             event["value"]["transaction"]["total_order"] for event in transaction_rows
-        ] == [1, 2]
+        ] == list(range(1, expected_rows + 1))
         client.wait(
             lambda event: (
                 event.get("topic") == "qualification.transaction"
                 and (event.get("value") or {}).get("status") == "END"
-                and (event.get("value") or {}).get("event_count") == 2
+                and (event.get("value") or {}).get("event_count") == expected_rows
             )
         )
         client.stop()
@@ -388,6 +427,7 @@ def run(options, directory):
                 {
                     "client": "Debezium 3.3.0.Final",
                     "target": "external" if options.external else POSTGRES,
+                    "tables": len(members),
                     "snapshot": True,
                     "stream": True,
                     "numeric_precision": True,
@@ -414,6 +454,7 @@ def run(options, directory):
             for text in (
                 f"DROP PUBLICATION IF EXISTS {publication}",
                 f"DROP TABLE IF EXISTS public.{table}",
+                *([f"DROP TABLE IF EXISTS public.{second}"] if second else []),
             ):
                 try:
                     sql(text)
@@ -434,6 +475,11 @@ if __name__ == "__main__":
         "--network",
         default="bridge",
         help="existing Docker network; no daemon-wide network changes",
+    )
+    parser.add_argument(
+        "--multi-table",
+        action="store_true",
+        help="qualify one transaction across two published tables",
     )
     parser.add_argument("--host", default="host.docker.internal")
     parser.add_argument("--port", type=int, default=5432)

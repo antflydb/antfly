@@ -29,9 +29,11 @@ from port_reservations import find_free_port
 
 @pytest.mark.e2e_resource("antfly_process")
 @pytest.mark.parametrize(
-    "export_snapshot", [False, True], ids=["stream-only", "exported-snapshot"]
+    "export_snapshot, multi_table",
+    [(False, False), (True, False), (False, True), (True, True)],
+    ids=["stream-only", "exported-snapshot", "multi-table", "multi-table-snapshot"],
 )
-def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
+def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot, multi_table):
     binary = harness.resolve_binary_path(
         os.environ.get("ANTFLY_BIN", str(harness.DEFAULT_ANTFLY_BIN))
     )
@@ -61,13 +63,34 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
     }
     connection = ["-h", "127.0.0.1", "-p", str(port), "-U", "admin", "-d", "default"]
 
-    def sql(statement):
-        subprocess.run(
-            [psql, *connection, "-X", "-v", "ON_ERROR_STOP=1", "-c", statement],
-            env=env,
-            check=True,
-            timeout=40,
-        )
+    def sql(*statements, retry_uncommitted=False):
+        args = [
+            psql,
+            *connection,
+            "-X",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-v",
+            "VERBOSITY=verbose",
+            *(arg for statement in statements for arg in ("-c", statement)),
+        ]
+        expires = time.monotonic() + 12
+        while True:
+            result = subprocess.run(
+                args, env=env, text=True, capture_output=True, timeout=40
+            )
+            if result.returncode == 0:
+                return
+            if (
+                retry_uncommitted
+                and "ERROR:  53300: A consistent SQL statement read" in result.stderr
+                and len(result.stdout.splitlines()) < len(statements) - 1
+                and time.monotonic() < expires
+            ):
+                # ON_ERROR_STOP ends this psql connection before COMMIT can be sent.
+                time.sleep(0.2)
+                continue
+            raise AssertionError(result.stdout + result.stderr)
 
     def slot(*action):
         subprocess.run(
@@ -281,6 +304,8 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             "2200|public",
         ]
         sql("CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT)")
+        if multi_table:
+            sql("CREATE TABLE smoke_other (id BIGINT PRIMARY KEY, content TEXT)")
         if export_snapshot:
             sql("ALTER TABLE smoke REPLICA IDENTITY FULL")
         replica_identity = subprocess.check_output(
@@ -387,11 +412,16 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             "first_key|2|ordered_primary",
         ]
         assert catalog_publication() == []
-        sql("CREATE PUBLICATION changes FOR TABLE smoke")
+        published = "smoke, smoke_other" if multi_table else "smoke"
+        sql(f"CREATE PUBLICATION changes FOR TABLE {published}")
         assert catalog_publication() == ["f|t|t|t|f"]
         assert catalog_slot() == []
         if export_snapshot:
             sql("INSERT INTO smoke (id, content) VALUES (6, 'snapshot-before-cut')")
+            if multi_table:
+                sql(
+                    "INSERT INTO smoke_other (id, content) VALUES (5, 'other-before-cut')"
+                )
             exporter_connection = [
                 *connection[:-1],
                 "dbname=default replication=database",
@@ -416,6 +446,10 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             assert snapshot.startswith("antfly_v1_")
             assert plugin == "pgoutput"
             sql("UPDATE smoke SET content = 'snapshot-after-cut' WHERE id = 6")
+            second_table = []
+            if multi_table:
+                sql("UPDATE smoke_other SET content = 'other-after-cut' WHERE id = 5")
+                second_table = ["-c", "SELECT content FROM smoke_other"]
             copied = subprocess.run(
                 [
                     psql,
@@ -444,6 +478,7 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                     "SELECT CURRENT_TIMESTAMP",
                     "-c",
                     "SELECT content FROM smoke",
+                    *second_table,
                     "-c",
                     "COMMIT",
                 ],
@@ -469,6 +504,7 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                 timestamp,
                 timestamp,
                 "snapshot-before-cut",
+                *(["other-before-cut"] if multi_table else []),
                 "COMMIT",
             ]
         else:
@@ -480,13 +516,38 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
         assert catalog_slot(plugin="wrong_plugin") == []
         first = tmp_path / "first.bin"
         with stream(first) as reader:
-            sql("INSERT INTO smoke (id, content) VALUES (7, 'retained-stream-smoke')")
+            insert = (
+                "INSERT INTO smoke (id, content) VALUES (7, 'retained-stream-smoke')"
+            )
+            markers = [b"retained-stream-smoke"]
+            if multi_table:
+                sql(
+                    "BEGIN",
+                    "INSERT INTO smoke (id, content) VALUES (8, 'retained-rolled-back-transaction')",
+                    "ROLLBACK",
+                    "BEGIN",
+                    insert,
+                    "SAVEPOINT discarded",
+                    "INSERT INTO smoke_other (id, content) VALUES (10, 'retained-rolled-back-savepoint')",
+                    "ROLLBACK TO SAVEPOINT discarded",
+                    "INSERT INTO smoke_other (id, content) VALUES (9, 'retained-stream-other')",
+                    "COMMIT",
+                    retry_uncommitted=True,
+                )
+                markers.append(b"retained-stream-other")
+            else:
+                sql(insert)
             deadline = time.monotonic() + 30
+            payload = b""
             while time.monotonic() < deadline and reader.poll() is None:
-                if first.exists() and b"retained-stream-smoke" in first.read_bytes():
-                    break
+                if first.exists():
+                    payload = first.read_bytes()
+                    if all(marker in payload for marker in markers):
+                        break
                 time.sleep(0.2)
-            assert first.exists() and b"retained-stream-smoke" in first.read_bytes()
+            assert all(payload.count(marker) == 1 for marker in markers)
+            if multi_table:
+                assert b"retained-rolled-back-" not in payload
             if export_snapshot:
                 payload = first.read_bytes()
                 assert payload.count(b"snapshot-after-cut") == 1

@@ -445,9 +445,8 @@ pub const CatalogReplicationSlots = struct {
         const snapshot = try control.SlotSnapshot.parse(name);
         var qualified = try self.qualifySnapshot(a, snapshot, try @import("../pgwire/retained_stream.zig").metadataContext(request));
         defer qualified.deinit();
-        if (qualified.value.roots.len != 1) return error.ChangefeedCapabilityUnsupported;
         try request.check();
-        return .{ .transaction = id, .token = snapshot, .namespace = qualified.value.roots[0].namespace };
+        return .{ .transaction = id, .token = snapshot };
     }
 
     fn validateSnapshotTransaction(transaction: @import("transactions.zig").SessionRegistry.SqlState, database: []const u8, namespace: []const u8) !void {
@@ -467,7 +466,10 @@ pub const CatalogReplicationSlots = struct {
         const snapshot = try control.SlotSnapshot.parse(name);
         var observed = try self.qualifySnapshot(a, snapshot, context);
         defer observed.deinit();
-        const state = observed.value;
+        return self.readQualifiedSnapshot(a, snapshot, observed.value, namespace, after, rows, bytes, context);
+    }
+
+    fn readQualifiedSnapshot(self: CatalogReplicationSlots, a: std.mem.Allocator, snapshot: control.SlotSnapshot, state: control.State, namespace: control.Namespace, after: u32, rows: u32, bytes: u32, context: operation.RequestContext) !@import("history_page_operations.zig").pages.BootstrapPage {
         const source = self.server.cfg.native_history_roots orelse return error.ChangefeedCapabilityUnsupported;
         const port = source.bootstrap_pages orelse return error.ChangefeedCapabilityUnsupported;
         const root = state.roots[try state.rootIndex(namespace)];
@@ -512,13 +514,44 @@ pub const CatalogReplicationSlots = struct {
         return @import("../pgwire/values.zig").HistoricalSnapshot.decode(a, raw);
     }
 
-    pub fn readExportedSnapshotCatalogPage(self: CatalogReplicationSlots, a: std.mem.Allocator, name: []const u8, namespace: control.Namespace, table: catalog.Table, after: ?[]const u8, rows: u32, bytes: u32, context: operation.RequestContext) !catalog.Page {
-        if (std.mem.readInt(u64, namespace[0..8], .big) != table.id) return error.ChangefeedResynchronizationRequired;
-        const offset = if (after) |cursor| std.fmt.parseUnsigned(u32, cursor, 10) catch return error.HistoryCheckpointConflict else 0;
-        var raw = try self.readExportedSnapshot(a, name, namespace, offset, rows, bytes, context);
-        defer raw.deinit();
-        try normalizeSnapshotSchema(&raw);
-        return @import("../pgwire/values.zig").historicalCatalogPage(a, raw, table);
+    pub fn readExportedSnapshotCatalogPage(self: CatalogReplicationSlots, a: std.mem.Allocator, name: []const u8, table: catalog.Table, after: ?[]const u8, rows: u32, bytes: u32, context: operation.RequestContext) !catalog.Page {
+        var root_index: usize = 0;
+        var offset: u32 = 0;
+        if (after) |cursor| {
+            const separator = std.mem.indexOfScalar(u8, cursor, '/') orelse return error.HistoryCheckpointConflict;
+            root_index = std.fmt.parseUnsigned(usize, cursor[0..separator], 10) catch return error.HistoryCheckpointConflict;
+            offset = std.fmt.parseUnsigned(u32, cursor[separator + 1 ..], 10) catch return error.HistoryCheckpointConflict;
+        }
+        const snapshot = try control.SlotSnapshot.parse(name);
+        var observed = try self.qualifySnapshot(a, snapshot, context);
+        defer observed.deinit();
+        const state = observed.value;
+        const first = for (state.roots, 0..) |root, index| {
+            if (std.mem.readInt(u64, root.namespace[0..8], .big) == table.id) break index;
+        } else return error.ChangefeedResynchronizationRequired;
+        var end = first;
+        while (end < state.roots.len and std.mem.readInt(u64, state.roots[end].namespace[0..8], .big) == table.id) : (end += 1) {}
+        if (after == null) root_index = first;
+        if (root_index < first or root_index >= end) return error.HistoryCheckpointConflict;
+        while (root_index < end) : (root_index += 1) {
+            var raw = try self.readQualifiedSnapshot(a, snapshot, state, state.roots[root_index].namespace, offset, rows, bytes, context);
+            defer raw.deinit();
+            try normalizeSnapshotSchema(&raw);
+            var page = try @import("../pgwire/values.zig").historicalCatalogPage(a, raw, table);
+            errdefer page.deinit();
+            const page_allocator = page.owned_arena.?.allocator();
+            if (page.after) |next| {
+                page.after = try std.fmt.allocPrint(page_allocator, "{d}/{s}", .{ root_index, next });
+                return page;
+            }
+            if (page.rows.len != 0 or root_index + 1 == end) {
+                if (root_index + 1 < end) page.after = try std.fmt.allocPrint(page_allocator, "{d}/0", .{root_index + 1});
+                return page;
+            }
+            page.deinit();
+            offset = 0;
+        }
+        unreachable;
     }
 
     pub fn dropWrite(self: CatalogReplicationSlots, a: std.mem.Allocator, name: []const u8, now: u64, context: operation.RequestContext) !control.Write {
@@ -653,7 +686,7 @@ pub const CatalogRetainedStream = struct {
     policy: LiveReplicationPublication,
 
     publication_worker: ?*PublicationWorker = null,
-    collected_history_sequence: ?u64 = null,
+    collected_history_delivery: ?u64 = null,
     publication_group: std.Io.Group = .init,
 
     const PublicationWorker = struct {
@@ -730,15 +763,17 @@ pub const CatalogRetainedStream = struct {
             defer observed.deinit();
             const state = observed.value;
             try selected.authorizeCleanup(state, self.context);
-            if (state.roots.len != 1) return error.ChangefeedCapabilityUnsupported;
-            const root = state.roots[0];
-            const target = root.acknowledged.sequence;
-            if (target == root.start or host.collected_history_sequence == target) return;
+            if (state.acknowledged_delivery == 0 or host.collected_history_delivery == state.acknowledged_delivery) return;
             var captured = try self.source.capture(allocator, state.definition.?, self.context);
             defer captured.deinit();
+            try captured.validateInitialRoutes(state.roots);
             var history_policy: HistoryPolicy = .{ .source = self.source, .selected = selected, .io = selected.policy.io };
-            const more = try @import("history_roots.zig").flushAcknowledged(&client, &history_policy, allocator, state, try captured.find(root.namespace), self.context);
-            if (!more) host.collected_history_sequence = target;
+            for (state.roots, captured.roots) |root, route| {
+                if (root.acknowledged.sequence == root.start) continue;
+                const more = try @import("history_roots.zig").flushAcknowledged(&client, &history_policy, allocator, state, route, self.context);
+                if (more) return;
+            }
+            host.collected_history_delivery = state.acknowledged_delivery;
         }
 
         fn drive(self: *PublicationWorker) !void {
@@ -867,7 +902,7 @@ pub const CatalogRetainedStream = struct {
         self.actor = actor;
         self.config = config;
         self.publication_worker = null;
-        self.collected_history_sequence = null;
+        self.collected_history_delivery = null;
         self.publication_group = .init;
         self.policy = .{ .allocator = retained_alloc, .io = request_value.io, .identity = slots.identity, .resolver = self.catalog_resolver.resolver(), .expected = expected };
         return Bridge.Bridge(CatalogRetainedStream).open(self, a, request_value, start);
@@ -1064,8 +1099,7 @@ pub const ReplicationFactory = struct {
     }
 };
 
-/// Enroll a resolved publication at one native root for a no-snapshot slot.
-/// A host must supply the exact publication set before it offers this mode.
+/// Enroll the complete retained root set for a resolved publication.
 pub const CatalogSlotEnrollment = struct {
     const control = publication_control;
     const roots = @import("history_roots.zig");
@@ -1079,6 +1113,11 @@ pub const CatalogSlotEnrollment = struct {
         owner: control.Digest,
         allocator: std.mem.Allocator,
         io: std.Io,
+        retirement_collected: bool = false,
+
+        pub fn deferRetirementSettlement(self: *const Policy) bool {
+            return !self.retirement_collected;
+        }
 
         pub fn authorizeRoot(self: *Policy, state: control.State, _: control.Namespace, context_value: operation.RequestContext) !void {
             var scratch = std.heap.ArenaAllocator.init(self.allocator);
@@ -1112,6 +1151,13 @@ pub const CatalogSlotEnrollment = struct {
         }
     };
 
+    fn singleRootCut(state: control.State, root: roots.Root, authority: control.Digest) control.Digest {
+        const enrolled = state.roots[0];
+        const continuation = control.hash(.{ .domain = "antfly:pg-slot-enrollment:v1", .authority = authority, .definition = state.definition.?.identity(), .root = root.namespace, .consumer_epoch = enrolled.consumer_epoch, .start = enrolled.start });
+        if (enrolled.snapshot) |pin| return control.hash(.{ .domain = "antfly:pg-slot-snapshot-enrollment:v1", .continuation = continuation, .pin = pin });
+        return continuation;
+    }
+
     pub fn create(slots: CatalogReplicationSlots, a: std.mem.Allocator, names: []const []const u8, command: wire.replication_commands.Create, request: wire.Request, context: operation.RequestContext) !wire.Result {
         if (command.snapshot == .use_snapshot or command.temporary) return error.UnsupportedReplicationOption;
         if (!control.pg_slot.validName(command.slot)) return error.InvalidReplicationSlotName;
@@ -1120,7 +1166,8 @@ pub const CatalogSlotEnrollment = struct {
         if (export_snapshot and source.bootstrap_pages == null) return error.ChangefeedCapabilityUnsupported;
         const port = slots.server.source.changefeeds orelse return error.ChangefeedCapabilityUnsupported;
         const maintenance = CatalogReplicationSlots.maintenanceContext(context);
-        var arena = std.heap.ArenaAllocator.init(a);
+        const working_allocator = request.scratch_allocator orelse a;
+        var arena = std.heap.ArenaAllocator.init(working_allocator);
         defer arena.deinit();
         const scratch = arena.allocator();
         var resolver: CatalogReplicationPublication = .{ .server = slots.server, .identity = slots.identity, .database_name = slots.database_name };
@@ -1140,7 +1187,8 @@ pub const CatalogSlotEnrollment = struct {
         };
         var captured = try source.capture(scratch, definition, maintenance);
         defer captured.deinit();
-        if (captured.roots.len != 1) return error.ChangefeedCapabilityUnsupported;
+        if (captured.roots.len == 0 or captured.roots.len > control.max_advances)
+            return error.ChangefeedCapabilityUnsupported;
         const root = captured.roots[0];
         const authority = try @import("history_policy_provisioning.zig").authority(root.fence);
         if (try port.authority(scratch, maintenance)) |registered| {
@@ -1148,13 +1196,14 @@ pub const CatalogSlotEnrollment = struct {
         }
         const id = control.pg_slot.feedId(slots.database, command.slot);
         var client: metadata.Client = .{ .port = port };
-        var policy: Policy = .{ .slots = slots, .source = source, .services = &resolver, .expected = binding, .owner = owner, .allocator = a, .io = request.io };
+        var policy: Policy = .{ .slots = slots, .source = source, .services = &resolver, .expected = binding, .owner = owner, .allocator = working_allocator, .io = request.io };
         const ns = std.Io.Clock.now(.real, request.io).nanoseconds;
         if (ns <= 0) return error.ChangefeedResynchronizationRequired;
         const now = std.math.cast(u64, @divFloor(ns, std.time.ns_per_s)) orelse return error.ChangefeedResynchronizationRequired;
-        for (0..8) |_| {
+        // Each root can require separate preparation, dispatch and reconciliation.
+        for (0..8 + 8 * captured.roots.len) |_| {
             try request.check();
-            var iteration = std.heap.ArenaAllocator.init(a);
+            var iteration = std.heap.ArenaAllocator.init(working_allocator);
             defer iteration.deinit();
             const work = iteration.allocator();
             const bytes = try port.read(work, id, maintenance);
@@ -1168,24 +1217,42 @@ pub const CatalogSlotEnrollment = struct {
             var write: control.Write = .{ .id = id, .authority = authority, .owner = owner, .authorization = definition.authorization, .expected_revision = state.revision, .expected_epoch = state.epoch, .mutation = undefined };
             if (state.phase == .empty) {
                 write.mutation = .{ .create = .{ .id = id, .definition = definition, .now = now, .expires_at = now +| 3600, .bootstrap_expires_at = if (export_snapshot) now +| control.max_bootstrap_seconds else 0 } };
+            } else if (state.phase == .reset_required and state.slot == null and
+                state.reset_reason == .history_expired and !state.expiryDue(now))
+            {
+                if (try @import("changefeed_public.zig").retireOne(&client, &policy, work, state, maintenance)) continue;
+                write.mutation = .{ .restart = .{
+                    .definition = definition,
+                    .now = now,
+                    .expires_at = state.expires_at,
+                    .bootstrap_expires_at = state.bootstrap_expires_at,
+                } };
             } else if (state.phase == .enrolling and !state.expiryDue(now)) {
                 if (state.roots.len == 0) {
                     write.mutation = .{ .plan_roots = try captured.initialPlans(work) };
                 } else {
-                    if (state.roots.len != 1 or !std.meta.eql(state.roots[0].namespace, root.namespace)) return error.ChangefeedResynchronizationRequired;
-                    const enrolled = state.roots[0];
-                    if (enrolled.consumer_epoch == 0) {
-                        try roots.enrollRoot(&client, &policy, work, state, root, tables[0].policy_revision, maintenance);
-                        continue;
+                    try captured.validateInitialRoutes(state.roots);
+                    for (state.roots, captured.roots) |planned, route| {
+                        if (planned.consumer_epoch != 0) continue;
+                        const table = for (tables) |selected| {
+                            if (selected.table_id == route.fence.table_id) break selected;
+                        } else return error.ChangefeedResynchronizationRequired;
+                        try roots.enrollRoot(&client, &policy, work, state, route, table.policy_revision, maintenance);
+                        break;
+                    } else {
+                        const cut = if (state.roots.len == 1) singleRootCut(state, root, authority) else roots.qualifyEnrollmentCut(work, source, &policy, &captured, state, maintenance) catch |err| switch (err) {
+                            error.ChangefeedEnrollmentCutAdvanced => {
+                                write.mutation = .{ .reset = .history_expired };
+                                try port.mutate(work, write, maintenance);
+                                continue;
+                            },
+                            else => return err,
+                        };
+                        try policy.validateRoot(state, root.namespace, root.fence, root.table_name, maintenance);
+                        write.mutation = .{ .seal = .{ .cut = cut, .slot = .{ .database = slots.database, .name = command.slot, .binding = binding } } };
+                        return SlotCommands.create(port, a, command, write, now, maintenance);
                     }
-                    try policy.validateRoot(state, root.namespace, root.fence, root.table_name, maintenance);
-                    const continuation = control.hash(.{ .domain = "antfly:pg-slot-enrollment:v1", .authority = authority, .definition = definition.identity(), .root = root.namespace, .consumer_epoch = enrolled.consumer_epoch, .start = enrolled.start });
-                    const cut = if (enrolled.snapshot) |pin|
-                        control.hash(.{ .domain = "antfly:pg-slot-snapshot-enrollment:v1", .continuation = continuation, .pin = pin })
-                    else
-                        continuation;
-                    write.mutation = .{ .seal = .{ .cut = cut, .slot = .{ .database = slots.database, .name = command.slot, .binding = binding } } };
-                    return SlotCommands.create(port, a, command, write, now, maintenance);
+                    continue;
                 }
             } else return error.ChangefeedConflict;
             try port.mutate(work, write, maintenance);
@@ -2046,7 +2113,6 @@ pub const trusted_principal_username = "__antfly_trusted_principal__";
 const ImportedSnapshot = struct {
     transaction: [16]u8,
     token: publication_control.SlotSnapshot,
-    namespace: publication_control.Namespace,
 };
 
 const Credential = struct {
@@ -2890,7 +2956,7 @@ const GuardedCatalog = struct {
         const server = authority.server orelse return error.ChangefeedCapabilityUnsupported;
         const context = try @import("../pgwire/retained_stream.zig").metadataContext(authority.request);
         const slots = try CatalogReplicationSlots.open(server, .{ .context = authority.credential, .read = Adapter.replicationIdentity }, alloc, authority.request.database orelse "default", context);
-        return slots.readExportedSnapshotCatalogPage(alloc, &snapshot.token.name(), snapshot.namespace, table, request.after, @min(request.limit, 256), 4 * 1024 * 1024, context) catch |err| {
+        return slots.readExportedSnapshotCatalogPage(alloc, &snapshot.token.name(), table, request.after, @min(request.limit, 256), 4 * 1024 * 1024, context) catch |err| {
             std.log.warn("exported snapshot page unavailable err={s}", .{@errorName(err)});
             return err;
         };
@@ -4584,7 +4650,7 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
         try std.testing.expectError(error.ChangefeedCapabilityUnsupported, slots.readExportedSnapshotRows(alloc, &token.name(), namespace, 0, 1, 4096, .{}));
         const sql_table: catalog.Table = .{ .id = after.members[0].table.table_id, .physical_name = "physical", .schema_version = 1, .columns = &.{} };
         const transaction: [16]u8 = @splat(9);
-        credential.imported_snapshot = .{ .transaction = transaction, .token = token, .namespace = namespace };
+        credential.imported_snapshot = .{ .transaction = transaction, .token = token };
         defer credential.imported_snapshot = null;
         var wrong_request = authority.request;
         var bound_authority: Authority = .{ .credential = credential, .identity = &identity, .request = wrong_request };
@@ -4594,8 +4660,8 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
         bound_authority.request = wrong_request;
         try std.testing.expectEqualDeep(token, bound_authority.importedSnapshot().?.token);
         try std.testing.expect(!Authority.allowsWrite(&bound_authority, "physical"));
-        try std.testing.expectError(error.HistoryCheckpointConflict, slots.readExportedSnapshotCatalogPage(alloc, &token.name(), namespace, sql_table, "bad", 1, 4096, .{}));
-        try std.testing.expectError(error.ChangefeedCapabilityUnsupported, slots.readExportedSnapshotCatalogPage(alloc, &token.name(), namespace, sql_table, null, 1, 4096, .{}));
+        try std.testing.expectError(error.HistoryCheckpointConflict, slots.readExportedSnapshotCatalogPage(alloc, &token.name(), sql_table, "bad", 1, 4096, .{}));
+        try std.testing.expectError(error.ChangefeedCapabilityUnsupported, slots.readExportedSnapshotCatalogPage(alloc, &token.name(), sql_table, null, 1, 4096, .{}));
         try std.testing.expectError(error.ChangefeedConflict, SlotCommands.startExported(server.source.changefeeds.?, alloc, fixture.slot_state, 2, now, CatalogReplicationSlots.maintenanceContext(.{})));
         try SlotCommands.startExported(server.source.changefeeds.?, alloc, fixture.slot_state, 1, now, CatalogReplicationSlots.maintenanceContext(.{}));
         try std.testing.expectEqual(publication_control.Phase.streaming, fixture.slot_state.phase);

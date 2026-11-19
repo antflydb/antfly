@@ -50,7 +50,9 @@ To run the same stock client against an existing target, set
 `QUALIFICATION_DATABASE_PASSWORD` and use `--external --host HOST --port PORT
 --database DATABASE --user USER`. The target must support the ordinary SQL setup
 and catalog/replication operations used by the connector. Each run uses a unique
-source table, publication, and slot and reports any cleanup failures.
+source table, publication, and slot and reports any cleanup failures. Pass
+`--multi-table` to verify two snapshots and one committed transaction spanning
+both tables under the same publication and slot.
 
 `--artifacts DIRECTORY` retains JSONL event logs, diagnostics, connector offsets,
 and the credential-bearing properties file in a mode-0700 directory (properties
@@ -77,14 +79,19 @@ reconnect after killing the connector. Stock `pg_recvlogical` 18.6 separately
 covers Antfly restart for streaming-only and exported-snapshot slots. The
 Debezium run reported an unknown outcome for the final fixture `DROP TABLE`.
 
-The qualified publication contains one native relational table on one retained
-root, with an integer primary key, text, numeric, and boolean columns and
-`REPLICA IDENTITY FULL`. Use a replication principal authorized for the
-whole table. The stream delivers committed text-format inserts, updates, and
+The two-table run on the multi-root implementation observed 25 events.
+The connector copied both tables, reported one transaction ID and three
+ordered changes for the cross-table commit, and resumed through both graceful
+disconnect and an abrupt client kill. Slot and publication cleanup succeeded.
+The final fixture table drops returned unknown outcomes, and both tables were
+still present in the catalog when checked. The fixture cluster was disposable.
+
+The primary relation uses an integer primary key, text, numeric, and boolean
+columns and `REPLICA IDENTITY FULL`. The second relation uses an integer primary
+key and text. Use a replication principal authorized for both tables. The stream delivers committed text-format inserts, updates, and
 deletes with transaction boundaries and durable per-slot positions. Antfly
 orders a committed transaction's net effects by retained storage key.
 Binary tuples, in-progress transaction streaming, two-phase replication,
 native PostgreSQL failover slots, and physical replication are unsupported.
-Logical-message options produce the same row stream. Multi-table and
-multi-root publications, shard movement, TRUNCATE, and schema evolution
-remain outside this qualification.
+Logical-message options produce the same row stream. Shard movement, remote
+failover, TRUNCATE, and schema evolution remain outside this qualification.
