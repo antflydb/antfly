@@ -447,6 +447,10 @@ pub const Server = struct {
                 }
                 return try textResponse(self.alloc, 404, "not found");
             },
+            .patch => {
+                if (knownRoute(path)) return try textResponse(self.alloc, 405, "method not allowed");
+                return try textResponse(self.alloc, 404, "not found");
+            },
         }
     }
 
@@ -1650,6 +1654,7 @@ fn requestFromLegacy(req: http_common.HttpRequest) http_operation.Request {
             .POST => .post,
             .PUT => .put,
             .DELETE => .delete,
+            .PATCH => .patch,
         },
         .target = req.uri,
         .authorization = req.authorization orelse req.header("authorization"),
@@ -2224,6 +2229,7 @@ fn methodText(method: http_common.Method) []const u8 {
         .POST => "POST",
         .PUT => "PUT",
         .DELETE => "DELETE",
+        .PATCH => "PATCH",
     };
 }
 
@@ -4832,18 +4838,22 @@ test "storage.hot_standby http admin returns method errors for generated admin r
     var server = Server.init(alloc, .{});
     defer server.deinit();
 
+    var checked: usize = 0;
     for (admin_api.openapi.server.routes) |route| {
-        if (!std.mem.startsWith(u8, route.path, "/ha/")) continue;
+        if (!std.mem.startsWith(u8, route.path, "/standby/")) continue;
+        checked += 1;
 
         const path = try generatedRoutePathAlloc(alloc, route.path);
         defer alloc.free(path);
 
         const method = generatedRouteUnsupportedMethod(route.path) orelse return error.TestExpectedUnsupportedMethod;
-        var response = try server.handle(.{ .method = method, .uri = path });
-        defer response.deinit(alloc);
-
-        try std.testing.expectEqual(@as(u16, 405), response.status);
+        for ([_]http_common.Method{ method, .PATCH }) |unsupported| {
+            var response = try server.handle(.{ .method = unsupported, .uri = path });
+            defer response.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 405), response.status);
+        }
     }
+    try std.testing.expect(checked > 0);
 }
 
 test "storage.hot_standby http admin handles every generated admin route method" {
@@ -4851,8 +4861,10 @@ test "storage.hot_standby http admin handles every generated admin route method"
     var server = Server.init(alloc, .{});
     defer server.deinit();
 
+    var checked: usize = 0;
     for (admin_api.openapi.server.routes) |route| {
-        if (!std.mem.startsWith(u8, route.path, "/ha/")) continue;
+        if (!std.mem.startsWith(u8, route.path, "/standby/")) continue;
+        checked += 1;
 
         const path = try generatedRoutePathAlloc(alloc, route.path);
         defer alloc.free(path);
@@ -4869,6 +4881,7 @@ test "storage.hot_standby http admin handles every generated admin route method"
             return error.TestExpectedGeneratedRouteDispatched;
         }
     }
+    try std.testing.expect(checked > 0);
 }
 
 test "storage.hot_standby http admin implemented admin routes are documented" {

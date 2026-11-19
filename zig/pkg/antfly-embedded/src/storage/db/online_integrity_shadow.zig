@@ -99,7 +99,7 @@ pub fn cleanup(alloc: std.mem.Allocator, txn: anytype, donor: ByteRange, after: 
     var cursor = try txn.openCursor();
     defer cursor.close();
     const initial = if (after.len != 0) (try integrity.parseKey(after)).kind else integrity.Kind.claim;
-    for ([_]integrity.Kind{ .claim, .reference, .job }) |kind| {
+    for ([_]integrity.Kind{ .claim, .reference, .job, .interval }) |kind| {
         if (@backingInt(kind) < @backingInt(initial)) continue;
         var prefix: [integrity.namespace.len + 1]u8 = undefined;
         @memcpy(prefix[0..integrity.namespace.len], integrity.namespace);

@@ -19,6 +19,9 @@ const std = @import("std");
 const Types = @import("read_session_types").types;
 const contract = Types.contract;
 const A = std.mem.Allocator;
+const ReaderValues = Types.reader_values;
+const SessionValues = Types.values;
+const native = @import("antfly_runtime_abi").native_abi;
 pub const StatementReadFence = struct {
     handle: ?contract.Handle,
     owner: ?*const anyopaque,
@@ -37,12 +40,14 @@ pub const StatementReadFence = struct {
         self.owner = null;
     }
 };
+pub const GraphStatementSnapshot = opaque {};
 pub const Statement = struct {
+    document: bool,
     handle: contract.Handle,
     schema_version: u32,
     pub fn fromIssued(value: contract.Statement) !Statement {
         try value.handle.validate(.statement);
-        return .{ .handle = value.handle, .schema_version = value.schema_version };
+        return .{ .handle = value.handle, .schema_version = value.schema_version, .document = value.document };
     }
     pub fn deinit(self: *Statement) void {
         contract.call("close", .statement, self.handle, .{self.handle}) catch @panic("incompatible read session owner");
@@ -94,6 +99,10 @@ pub const Relational = struct {
     pub fn normalizeRows(self: *Relational, alloc: A, writes: []const Types.types.BatchWrite) ![]Types.types.BatchWrite {
         return contract.call("normalize", .relational, self.handle, .{ self.handle, alloc, writes });
     }
+    pub fn normalizeDomainRows(self: *Relational, alloc: A, writes: []const Types.types.BatchWrite, admissions: []const ?ReaderValues.domain_row.Admission, output: *ReaderValues.domain_handoff.Contract) ![]Types.types.BatchWrite {
+        return contract.call("normalize_domains", .relational, self.handle, .{ self.handle, alloc, writes, admissions, output });
+    }
+
     pub fn nextTypedPage(self: *Relational, alloc: A, io: ?std.Io, budget: Types.values.Budget) !Types.values.Page {
         var retained_io = io;
         const borrow: ?contract.IoBorrow = if (retained_io) |*value| .init(value) else null;
@@ -104,14 +113,20 @@ pub const Relational = struct {
     }
 };
 pub const Document = struct {
+    text_filter_digest: ?[32]u8,
     handle: contract.Handle,
     alloc: A,
     pub fn fromHandle(alloc: A, handle: contract.Handle) !*Document {
         try handle.validate(.document);
         errdefer contract.call("close", .document, handle, .{handle}) catch @panic("incompatible read session owner");
         const self = try alloc.create(Document);
-        self.* = .{ .alloc = alloc, .handle = handle };
+        errdefer alloc.destroy(self);
+        const metadata = try contract.call("document_metadata", .document, handle, .{handle});
+        self.* = .{ .alloc = alloc, .handle = handle, .text_filter_digest = metadata.text_filter_digest };
         return self;
+    }
+    pub fn textFilterDigest(self: *const Document) ?[32]u8 {
+        return self.text_filter_digest;
     }
     pub fn deinit(self: *Document) void {
         contract.call("close", .document, self.handle, .{self.handle}) catch @panic("incompatible read session owner");
@@ -139,7 +154,40 @@ pub const RelationalRows = struct {
     pub const Budget = Types.values.Budget;
     pub const Row = Types.values.Row;
     pub const Page = Types.values.Page;
+    pub const ExpressionEquality = ReaderValues.ExpressionEquality;
+    pub const NullabilityPage = ReaderValues.NullabilityPage;
+    pub const NullabilityResume = ReaderValues.NullabilityResume;
+    pub const NullabilityReplayBoundary = ReaderValues.NullabilityReplayBoundary;
+    pub const ForeignKeyValidationPage = ReaderValues.ForeignKeyValidationPage;
+    pub const ForeignKeyReplayBoundary = ReaderValues.ForeignKeyReplayBoundary;
     pub const Reader = struct {
+        pub fn nextNullabilityPage(self: *Reader, a: std.mem.Allocator, io: ?std.Io, budget: SessionValues.Budget, plan: *const ReaderValues.nullability.Plan, control: ReaderValues.nullability.Control) !ReaderValues.NullabilityPage {
+            var retained_io = io;
+            const borrow: ?contract.IoBorrow = if (retained_io) |*value| .init(value) else null;
+            return contract.call("nullability_page", .reader, self.handle, .{ self.handle, a, borrow, budget, plan, control });
+        }
+        pub fn nextNullabilityReplayPage(self: *Reader, a: std.mem.Allocator, io: ?std.Io, expected: ReaderValues.NullabilityReplayBoundary, plan: *const ReaderValues.nullability.Plan, control: ReaderValues.nullability.Control) !ReaderValues.NullabilityPage {
+            var retained_io = io;
+            const borrow: ?contract.IoBorrow = if (retained_io) |*value| .init(value) else null;
+            return contract.call("nullability_replay", .reader, self.handle, .{ self.handle, a, borrow, expected, plan, control });
+        }
+        pub fn nextForeignKeyValidationPage(self: *Reader, a: std.mem.Allocator, io: ?std.Io, budget: SessionValues.Budget, plan: *ReaderValues.foreign_validation.ChildPlan, control: ReaderValues.nullability.Control) !ReaderValues.ForeignKeyValidationPage {
+            var retained_io = io;
+            const borrow: ?contract.IoBorrow = if (retained_io) |*value| .init(value) else null;
+            return contract.call("foreign_validation_page", .reader, self.handle, .{ self.handle, a, borrow, budget, plan, control });
+        }
+        pub fn nextForeignKeyValidationReplayPage(self: *Reader, a: std.mem.Allocator, io: ?std.Io, expected: ReaderValues.ForeignKeyReplayBoundary, plan: *ReaderValues.foreign_validation.ChildPlan, control: ReaderValues.nullability.Control) !ReaderValues.ForeignKeyValidationPage {
+            var retained_io = io;
+            const borrow: ?contract.IoBorrow = if (retained_io) |*value| .init(value) else null;
+            return contract.call("foreign_validation_replay", .reader, self.handle, .{ self.handle, a, borrow, expected, plan, control });
+        }
+        pub fn resumeNullabilityScan(self: *Reader, plan: *const ReaderValues.nullability.Plan, continuation: ReaderValues.NullabilityResume, control: ReaderValues.nullability.Control) !void {
+            return contract.call("resume_nullability", .reader, self.handle, .{ self.handle, plan, continuation, control });
+        }
+        pub fn resumeForeignKeyValidationScan(self: *Reader, plan: *const ReaderValues.foreign_validation.ChildPlan, continuation: ReaderValues.NullabilityResume, control: ReaderValues.nullability.Control) !void {
+            return contract.call("resume_foreign_validation", .reader, self.handle, .{ self.handle, plan, continuation, control });
+        }
+
         handle: contract.Handle,
         pub const Hydrated = Types.reader_values.Hydrated;
         pub fn fromHandle(handle: contract.Handle) !Reader {

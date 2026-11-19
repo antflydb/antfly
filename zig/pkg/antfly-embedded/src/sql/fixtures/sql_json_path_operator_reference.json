@@ -1,0 +1,136 @@
+{
+  "reference": "PostgreSQL exact SQL",
+  "entries": [
+    {
+      "sql": "'{\"a\":[1,\"last\"]}'::jsonb #>> '{a,-1}'",
+      "value": "last",
+      "oid": 25
+    },
+    {
+      "sql": "'{\"a\":null}'::jsonb #> ARRAY['a']",
+      "value": null,
+      "sql_null": false,
+      "oid": 3802
+    },
+    {
+      "sql": "'{\"a\":null}'::jsonb #>> ARRAY['a']",
+      "value": null,
+      "oid": 25
+    },
+    {
+      "sql": "'true'::jsonb #> '{}'::text[]",
+      "value": true,
+      "oid": 3802
+    },
+    {
+      "sql": "'true'::jsonb #>> '{}'::text[]",
+      "value": "true",
+      "oid": 25
+    },
+    {
+      "sql": "'{}'::jsonb #> '{absent}'",
+      "value": null,
+      "oid": 3802
+    },
+    {
+      "sql": "'{\"a\":1}'::jsonb #>> ARRAY['a',NULL]",
+      "value": null,
+      "oid": 25
+    },
+    {
+      "sql": "'{\"a\":1}'::jsonb #> NULL::text[]",
+      "value": null,
+      "oid": 3802
+    },
+    {
+      "sql": "'{\"a\":[1,2]}'::jsonb #>> '[-2:-1]={a,-1}'::text[]",
+      "value": "2",
+      "oid": 25
+    },
+    {
+      "sql": "'{\"a\":{\"b\":1}}'::jsonb #>> ARRAY[['a','b']]",
+      "value": "1",
+      "oid": 25
+    },
+    {
+      "sql": "'{}'::jsonb #> ARRAY[1]",
+      "error": "42883"
+    },
+    {
+      "sql": "'{}'::jsonb #> 1",
+      "error": "42883"
+    },
+    {
+      "sql": "'{}'::jsonb #> '{a'",
+      "error": "22P02"
+    },
+    {
+      "sql": "NULL::jsonb #> ARRAY[(1/0)::text]",
+      "error": "22012"
+    },
+    {
+      "sql": "'{}'::jsonb #> ARRAY['missing',(1/0)::text]",
+      "error": "22012"
+    },
+    {
+      "sql": "'{\"a\":1}'::jsonb || '{\"a\":2}'::jsonb #> '{a}'",
+      "value": 2,
+      "oid": 3802
+    },
+    {
+      "sql": "'{\"a\":1}'::jsonb || '{\"a\":2}'::jsonb #>> '{a}'",
+      "value": "2",
+      "oid": 25
+    },
+    {
+      "sql": "'{\"a\":1}'::jsonb || '{\"a\":2}'::jsonb -> 'a'",
+      "value": 2,
+      "oid": 3802
+    },
+    {
+      "sql": "'{\"a\":1}'::jsonb || '{\"a\":2}'::jsonb ->> 'a'",
+      "value": "2",
+      "oid": 25
+    },
+    {
+      "sql": "'{\"flags\":[\"rated\"]}'::jsonb #> '{flags}' = '[\"rated\"]'",
+      "value": true,
+      "oid": 16
+    },
+    {
+      "sql": "'[\"rated\"]' = '{\"flags\":[\"rated\"]}'::jsonb #> '{flags}'",
+      "value": true,
+      "oid": 16
+    },
+    {
+      "sql": "'null'::jsonb = 'null'",
+      "value": true,
+      "oid": 16
+    },
+    {
+      "sql": "'{}'::jsonb = 'not-json'",
+      "error": "22P02"
+    },
+    {
+      "sql": "'{}'::jsonb = '{}'::text",
+      "error": "42883"
+    },
+    {
+      "sql": "'{}'::jsonb || '{\"a\":1}'",
+      "value": {
+        "a": 1
+      },
+      "oid": 3802
+    },
+    {
+      "sql": "'[\"a\"]'::jsonb < '[\"b\"]'",
+      "value": true,
+      "oid": 16
+    },
+    {
+      "sql": "jsonb_extract_path('{\"x\":[1]}','x') = '[1]'",
+      "value": true,
+      "oid": 16
+    }
+  ]
+}

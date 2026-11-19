@@ -67,6 +67,7 @@ test "relational row query errors preserve exact remote reasons and HTTP classes
     try testing.expect(decode("unknown error") == null);
     try testing.expectEqual(@as(u16, 400), status(error.RelationalExpressionOverflow));
     try testing.expectEqual(@as(u16, 400), status(error.RelationalExpressionDivisionByZero));
+    try testing.expectEqual(@as(u16, 400), status(error.SqlInvalidPowerArgument));
     try testing.expectEqual(@as(u16, 400), status(error.RelationalExpressionBudgetExceeded));
     try testing.expectEqual(@as(u16, 409), status(error.GeneratedColumnRewriteRequired));
     try testing.expectEqual(@as(u16, 403), status(error.RowPolicyDenied));

@@ -74,10 +74,10 @@ test "SQL LATERAL applies parent scopes limits null extension materialization an
 test "SQL LATERAL rejects invalid sibling and right full correlation scopes before execution" {
     const Failure = struct { sql: []const u8, err: anyerror };
     for ([_]Failure{
-        .{ .sql = "SELECT l.x FROM (SELECT 1 AS n) p JOIN (SELECT p.n AS x) l ON true", .err = error.UndefinedColumn },
+        .{ .sql = "SELECT l.x FROM (SELECT 1 AS n) p JOIN (SELECT p.n AS x) l ON true", .err = error.UndefinedTable },
         .{ .sql = "SELECT l.x FROM (SELECT 1 AS n) p RIGHT JOIN LATERAL (SELECT p.n AS x) l ON true", .err = error.InvalidLateralReference },
         .{ .sql = "SELECT l.x FROM (SELECT 1 AS n) p FULL JOIN LATERAL (SELECT p.n AS x) l ON true", .err = error.InvalidLateralReference },
-        .{ .sql = "WITH c AS (SELECT p.n AS x) SELECT l.x FROM (SELECT 1 AS n) p CROSS JOIN LATERAL (SELECT x FROM c) l", .err = error.UndefinedColumn },
+        .{ .sql = "WITH c AS (SELECT p.n AS x) SELECT l.x FROM (SELECT 1 AS n) p CROSS JOIN LATERAL (SELECT x FROM c) l", .err = error.UndefinedTable },
     }) |case| {
         var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
         defer compiled.deinit();

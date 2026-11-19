@@ -33,11 +33,15 @@ fn key(command: topology.Command) [prefix.len + 2]u8 {
     var result: [prefix.len + 2]u8 = undefined;
     @memcpy(result[0..prefix.len], prefix);
     result[prefix.len] = @intCast(@backingInt(command.fence.role));
-    result[prefix.len + 1] = @intCast(@backingInt(command.action));
+    result[prefix.len + 1] = @as(u8, @intCast(@backingInt(command.action))) | @as(u8, if (command.action == .acknowledge_child_generation and command.child_reference_coverage_ready) 0x80 else 0);
     return result;
 }
 
 pub const Prepared = struct { receipt: position.Native, duplicate: bool };
+
+pub fn fkGeneration(command: topology.Command) bool {
+    return command.fence.role == .child_generation_source or command.fence.role == .child_generation_parent or command.fence.role == .child_generation_dual or command.fence.role == .document_retirement_source;
+}
 
 pub fn supports(command: topology.Command) bool {
     return switch (command.fence.role) {
@@ -46,6 +50,15 @@ pub fn supports(command: topology.Command) bool {
             else => false,
         },
         .rewrite_destination => command.action == .install_generation_handoff,
+        .child_generation_source => switch (command.action) {
+            .begin, .install_child_schema, .cancel_child_generation_source => true,
+            else => false,
+        },
+        .child_generation_parent, .child_generation_dual => switch (command.action) {
+            .begin, .stage_child_generation, .activate_child_generation, .acknowledge_child_generation, .cancel, .install_child_schema, .cancel_child_generation_source => true,
+            else => false,
+        },
+        .document_retirement_source => command.action == .begin,
         .truncate_parent => switch (command.action) {
             .begin, .cancel, .stage_parent_retirement, .activate_parent_retirement, .acknowledge_parent_retirement => true,
             else => false,
@@ -72,7 +85,23 @@ pub fn validateRequest(alloc: std.mem.Allocator, request: @import("types.zig").B
     if (!std.mem.eql(u8, actual_bytes, expected_bytes)) return error.InvalidBatchRequest;
 }
 
+pub fn commandDigest(alloc: std.mem.Allocator, command: topology.Command) ![32]u8 {
+    if (!supports(command)) return error.InvalidBatchRequest;
+    const serialized = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    defer alloc.free(serialized);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(serialized, &digest, .{});
+    return digest;
+}
+
 pub fn stage(alloc: std.mem.Allocator, txn: anytype, command: topology.Command, replay: ?position.Native) !Prepared {
+    return stageWithDigest(txn, command, try commandDigest(alloc, command), replay);
+}
+
+/// A process-local digest prepared from the owned command before serialized
+/// apply. The native authority, fence and replay position are still verified
+/// in this transaction; no wire-supplied hash is accepted as authorization.
+pub fn stageWithDigest(txn: anytype, command: topology.Command, digest: [32]u8, replay: ?position.Native) !Prepared {
     if (!supports(command)) return error.InvalidBatchRequest;
     const namespace = @import("online_source_contract.zig").namespaceBytes(command.fence.namespace);
     const owner = try authority.require(txn, .native, namespace);
@@ -80,10 +109,6 @@ pub fn stage(alloc: std.mem.Allocator, txn: anytype, command: topology.Command, 
         try value.validate();
         if (!value.namespace.eql(command.fence.namespace)) return error.IdentityNamespaceMismatch;
     }
-    const serialized = try std.json.Stringify.valueAlloc(alloc, command, .{});
-    defer alloc.free(serialized);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.Blake3.hash(serialized, &digest, .{});
     const slot = key(command);
     const previous = txn.get(&slot) catch |err| switch (err) {
         error.NotFound => null,

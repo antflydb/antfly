@@ -54,6 +54,18 @@
     {"sql":"overlay('abc' placing 'é' from 9)","value":"abcé"},
     {"sql":"overlay('abcdef' placing 'X' from 3 for -1)","value":"abXbcdef"},
     {"sql":"overlay('abc' placing 'X' from 0)","error":"22011"},
-    {"sql":"overlay('abc' placing NULL from 0)","value":null}
+    {"sql":"overlay('abc' placing NULL from 0)","value":null},
+    {"sql":"replace('aaaaa','aa','X')","value":"XXa","oid":25},
+    {"sql":"replace('ababa','aba','!')","value":"!ba","oid":25},
+    {"sql":"replace('hé🍎hé🍎','hé','ê')","value":"ê🍎ê🍎","oid":25},
+    {"sql":"replace('abcabc','b','XY')","value":"aXYcaXYc","oid":25},
+    {"sql":"replace('aaaa','a','')","value":"","oid":25},
+    {"sql":"replace('','','x')","value":"","oid":25},
+    {"sql":"replace('abc','','x')","value":"abc","oid":25},
+    {"sql":"replace('abc','missing','x')","value":"abc","oid":25},
+    {"sql":"replace('aaaaa','a','aa')","value":"aaaaaaaaaa","oid":25},
+    {"sql":"replace('abc',NULL,'x')","value":null,"oid":25},
+    {"sql":"replace('abc','b',NULL)","value":null,"oid":25},
+    {"sql":"replace(NULL,'b','x')","value":null,"oid":25}
   ]
 }

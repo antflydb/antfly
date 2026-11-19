@@ -22,6 +22,9 @@ const platform_time = @import("antfly_platform").time;
 const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
 const runtime_memory_abi = @import("runtime_memory_abi");
 
+const routine_mapping = @import("restore_routine_mapping.zig");
+pub const RoutineMapping = routine_mapping.Mapping;
+
 const immutable_inputs = @import("restore_job_inputs.zig");
 const key_prefix = "\x00\x00__api_restore_jobs__:";
 const restore_job_retention_ms: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -43,6 +46,29 @@ const max_cluster_failure_details: usize = 8;
 const max_cluster_failure_table_name_bytes: usize = 256;
 const max_cluster_failure_error_bytes: usize = 256;
 const restore_job_format_version: u32 = 4;
+
+// Temporary bounded Debug evidence: each exact guard reports once, without
+// request contents or identifiers. Storage/admission limits remain unchanged.
+fn diagnoseRestoreJobBound(comptime site: []const u8, bytes: usize, limit: usize) void {
+    if (comptime @import("builtin").mode == .debug) {
+        const Once = struct {
+            var seen: std.atomic.Value(bool) = .init(false);
+        };
+        if (Once.seen.swap(true, .monotonic)) return;
+        std.debug.print("restore job bound site={s} bytes={d} limit={d}\n", .{ site, bytes, limit });
+    }
+}
+
+fn diagnoseRestoreJobRequestShape(req: StartRequest) void {
+    if (comptime @import("builtin").mode == .debug) {
+        const Once = struct {
+            var seen: std.atomic.Value(bool) = .init(false);
+        };
+        if (Once.seen.swap(true, .monotonic)) return;
+        std.debug.print("restore job shape backup_bytes={d} location_bytes={d} connection_bytes={d} idempotency_namespace_bytes={d} authorization_fingerprint_bytes={d} authorization_principal_bytes={d} table_bytes={d}\n", .{ req.backup_id.len, req.location.len, req.connection.len, req.idempotency_namespace.len, req.destination_authorization_fingerprint.len, req.destination_authorization_principal.len, if (req.table_name) |name| name.len else 0 });
+    }
+}
+
 // Workers that only understand v4 must reject these rows instead of
 // checkpointing a job while dropping its source binding.
 pub const pinned_restore_job_format_version: u32 = 6;
@@ -74,7 +100,17 @@ fn restoreRetryDelayMs(job_id: u64, attempt_id: u64) u64 {
 }
 
 pub const Scope = enum { table, cluster };
-pub const SourceKind = enum { table_snapshot, cluster_cohort, schema_rewrite, empty_generation };
+pub const SourceKind = enum {
+    table_snapshot,
+    cluster_cohort,
+    schema_rewrite,
+    empty_generation,
+    query_population,
+
+    pub fn compoundStaging(self: SourceKind) bool {
+        return self == .schema_rewrite or self == .empty_generation or self == .query_population;
+    }
+};
 pub const Phase = enum { queued, running, succeeded, failed, cancelled };
 pub const AttemptState = enum { active, cancelled, fenced };
 pub const StagingResolution = enum { active, published, canceled };
@@ -126,6 +162,8 @@ pub const JobState = struct {
     connection: []const u8,
     restore_mode: []const u8 = "fail_if_exists",
     table_names: ?[]const []const u8 = null,
+    routine_mappings: ?[]const RoutineMapping = null,
+    routine_actor: ?routine_mapping.Actor = null,
     cluster_binding: ?ClusterRestoreBinding = null,
     cluster_binding_sha256: ?[]const u8 = null,
     active_table_index: ?u16 = null,
@@ -173,6 +211,8 @@ pub const StartRequest = struct {
     connection: []const u8,
     restore_mode: []const u8 = "fail_if_exists",
     table_names: ?[]const []const u8 = null,
+    routine_mappings: ?[]const RoutineMapping = null,
+    routine_actor: ?routine_mapping.Actor = null,
     cluster_binding: ?ClusterRestoreBinding = null,
     idempotency_namespace: []const u8,
     idempotency_key: ?[]const u8 = null,
@@ -344,6 +384,13 @@ pub const ReplicatedPersistence = extern struct {
             }
 
             fn fail(ptr: *anyopaque, comptime operation: LocalOperation, err: anyerror) runtime_error_abi.Status {
+                if (comptime @import("builtin").mode == .debug) {
+                    const Once = struct {
+                        var seen: std.atomic.Value(bool) = .init(false);
+                    };
+                    if (!Once.seen.swap(true, .monotonic))
+                        std.debug.print("restore persistence callback operation={s} err={s} stable={any}\n", .{ @tagName(operation), @errorName(err), runtime_error_abi.errorHasStableDetail(err) });
+                }
                 if (!runtime_error_abi.errorHasStableDetail(err)) {
                     if (local.report_failure) |report| {
                         report(ptr, .{ .operation = operation, .err = err });
@@ -643,7 +690,10 @@ pub const Store = struct {
             if (rows.len == 0) break;
             for (rows) |row| {
                 if (try self.captureInputRowLocked(row.key, row.value)) continue;
-                if (row.value.len > max_restore_job_record_bytes) return error.RestoreJobRecordTooLarge;
+                if (row.value.len > max_restore_job_record_bytes) {
+                    diagnoseRestoreJobBound("attach_file", row.value.len, max_restore_job_record_bytes);
+                    return error.RestoreJobRecordTooLarge;
+                }
                 var parsed = std.json.parseFromSlice(JobState, self.alloc, row.value, .{ .ignore_unknown_fields = true }) catch return error.CorruptRestoreJobStore;
                 defer parsed.deinit();
                 try validateProgressState(parsed.value);
@@ -677,6 +727,8 @@ pub const Store = struct {
                         .connection = parsed.value.connection,
                         .restore_mode = parsed.value.restore_mode,
                         .table_names = parsed.value.table_names,
+                        .routine_mappings = parsed.value.routine_mappings,
+                        .routine_actor = parsed.value.routine_actor,
                         .cluster_binding = parsed.value.cluster_binding,
                         .cluster_binding_sha256 = parsed.value.cluster_binding_sha256,
                         .active_table_index = parsed.value.active_table_index,
@@ -767,7 +819,10 @@ pub const Store = struct {
             while (entry) |row| : (entry = try cursor.next()) {
                 if (!std.mem.startsWith(u8, row.key, key_prefix)) break;
                 if (try self.captureInputRowLocked(row.key, row.value)) continue;
-                if (row.value.len > max_restore_job_record_bytes) return error.RestoreJobRecordTooLarge;
+                if (row.value.len > max_restore_job_record_bytes) {
+                    diagnoseRestoreJobBound("attach_runtime", row.value.len, max_restore_job_record_bytes);
+                    return error.RestoreJobRecordTooLarge;
+                }
                 if (rows.items.len >= max_retained_restore_jobs) return error.RestoreJobCapacityExceeded;
                 retained_bytes = std.math.add(usize, retained_bytes, row.value.len) catch return error.RestoreJobCapacityExceeded;
                 if (retained_bytes > max_retained_restore_job_bytes) return error.RestoreJobCapacityExceeded;
@@ -803,7 +858,10 @@ pub const Store = struct {
 
     fn attachReplicatedRowLocked(self: *Store, key: []const u8, value: []const u8) !void {
         if (try self.captureInputRowLocked(key, value)) return;
-        if (value.len > max_restore_job_record_bytes) return error.RestoreJobRecordTooLarge;
+        if (value.len > max_restore_job_record_bytes) {
+            diagnoseRestoreJobBound("attach_replicated", value.len, max_restore_job_record_bytes);
+            return error.RestoreJobRecordTooLarge;
+        }
         var parsed = std.json.parseFromSlice(JobState, self.alloc, value, .{ .ignore_unknown_fields = true }) catch return error.CorruptRestoreJobStore;
         defer parsed.deinit();
         try validateProgressState(parsed.value);
@@ -945,7 +1003,10 @@ pub const Store = struct {
     }
 
     fn replicatedRowExpired(alloc: std.mem.Allocator, value: []const u8) !bool {
-        if (value.len > max_restore_job_record_bytes) return error.RestoreJobRecordTooLarge;
+        if (value.len > max_restore_job_record_bytes) {
+            diagnoseRestoreJobBound("replicated_expiry", value.len, max_restore_job_record_bytes);
+            return error.RestoreJobRecordTooLarge;
+        }
         var parsed = std.json.parseFromSlice(JobState, alloc, value, .{ .ignore_unknown_fields = true }) catch
             return error.CorruptRestoreJobStore;
         defer parsed.deinit();
@@ -954,7 +1015,10 @@ pub const Store = struct {
     }
 
     fn attachRowLocked(self: *Store, key: []const u8, value: []const u8) !void {
-        if (value.len > max_restore_job_record_bytes) return error.RestoreJobRecordTooLarge;
+        if (value.len > max_restore_job_record_bytes) {
+            diagnoseRestoreJobBound("attach_row", value.len, max_restore_job_record_bytes);
+            return error.RestoreJobRecordTooLarge;
+        }
         var parsed = std.json.parseFromSlice(JobState, self.alloc, value, .{ .ignore_unknown_fields = true }) catch return error.CorruptRestoreJobStore;
         defer parsed.deinit();
         try validateProgressState(parsed.value);
@@ -986,6 +1050,8 @@ pub const Store = struct {
                 .connection = parsed.value.connection,
                 .restore_mode = parsed.value.restore_mode,
                 .table_names = parsed.value.table_names,
+                .routine_mappings = parsed.value.routine_mappings,
+                .routine_actor = parsed.value.routine_actor,
                 .cluster_binding = parsed.value.cluster_binding,
                 .cluster_binding_sha256 = parsed.value.cluster_binding_sha256,
                 .active_table_index = parsed.value.active_table_index,
@@ -1070,6 +1136,7 @@ pub const Store = struct {
             const hex = std.fmt.bytesToHex(nonce, .lower);
             req.idempotency_key = try std.fmt.bufPrint(&generated_key_buf, "auto:{s}", .{hex});
         }
+        try validateStartRequest(alloc, req);
         var publication_nonce: [32]u8 = undefined;
         if (req.cluster_binding) |*binding| {
             if (binding.publication_nonce == null) {
@@ -1146,7 +1213,7 @@ pub const Store = struct {
     }
 
     fn startObservedPrepared(self: *Store, alloc: std.mem.Allocator, req: StartRequest, allow_new: bool, submitted: ?*bool, prepared: ?*const immutable_inputs.Prepared, permit: ?*PreparationPermit) !Admission {
-        try validateStartRequest(req);
+        try validateStartRequest(alloc, req);
         _ = self.io orelse return error.AsyncRestoreUnavailable;
         const fingerprint = try requestFingerprintAlloc(alloc, req);
         defer alloc.free(fingerprint);
@@ -1164,7 +1231,7 @@ pub const Store = struct {
         defer self.mutex.unlock();
         if (permit) |value| value.consumeLocked();
         const now_for_prune = nowMillis();
-        if ((req.source_kind == .schema_rewrite or req.source_kind == .empty_generation) and self.replicated == null) return error.AsyncRestoreUnavailable;
+        if (req.source_kind.compoundStaging() and self.replicated == null) return error.AsyncRestoreUnavailable;
         if (now_for_prune >= self.next_prune_at_ms) {
             const more_expired = try self.pruneExpiredLocked(now_for_prune, restore_job_prune_batch_size);
             self.next_prune_at_ms = if (more_expired) now_for_prune else now_for_prune +| restore_job_prune_interval_ms;
@@ -1180,7 +1247,7 @@ pub const Store = struct {
                     try self.retireExpiredJobLocked(parsed.value, encoded);
                     break :existing;
                 }
-                const same_request = std.mem.eql(u8, parsed.value.request_fingerprint, fingerprint);
+                const same_request = try matchesFingerprint(alloc, parsed.value, req, fingerprint);
                 const reauthorize = destinationReauthorizationMatches(parsed.value, req);
                 if (!same_request and !reauthorize) return error.IdempotencyConflict;
                 if (submitted) |observed| observed.* = true;
@@ -1219,6 +1286,8 @@ pub const Store = struct {
                         .connection = parsed.value.connection,
                         .restore_mode = parsed.value.restore_mode,
                         .table_names = parsed.value.table_names,
+                        .routine_mappings = parsed.value.routine_mappings,
+                        .routine_actor = parsed.value.routine_actor,
                         .cluster_binding = parsed.value.cluster_binding,
                         .cluster_binding_sha256 = parsed.value.cluster_binding_sha256,
                         .active_table_index = parsed.value.active_table_index,
@@ -1237,8 +1306,10 @@ pub const Store = struct {
                         .expires_at_ms = std.math.maxInt(i64),
                     });
                     errdefer alloc.free(reauthorized);
-                    if (reauthorized.len > max_initial_restore_job_bytes)
+                    if (reauthorized.len > max_initial_restore_job_bytes) {
+                        diagnoseRestoreJobBound("reauthorize", reauthorized.len, max_initial_restore_job_bytes);
                         return error.RestoreJobRecordTooLarge;
+                    }
                     try self.storeLocked(job_id, reauthorized);
                     try self.insertPendingSortedLocked(.{
                         .job_id = job_id,
@@ -1271,8 +1342,8 @@ pub const Store = struct {
             .enqueue_sequence = enqueue_sequence,
             .dispatch_sequence = dispatch_sequence,
             .not_before_ms = now,
-            .attempt_id = if (req.source_kind == .schema_rewrite or req.source_kind == .empty_generation) 1 else 0,
-            .staging_attempt_id = if (req.source_kind == .schema_rewrite or req.source_kind == .empty_generation) 1 else 0,
+            .attempt_id = if (req.source_kind.compoundStaging()) 1 else 0,
+            .staging_attempt_id = if (req.source_kind.compoundStaging()) 1 else 0,
             .scope = req.scope,
             .source_kind = req.source_kind,
             .table_name = req.table_name,
@@ -1281,6 +1352,8 @@ pub const Store = struct {
             .connection = req.connection,
             .restore_mode = req.restore_mode,
             .table_names = req.table_names,
+            .routine_mappings = req.routine_mappings,
+            .routine_actor = req.routine_actor,
             .cluster_binding_sha256 = if (prepared) |value| &value.hash else null,
             .idempotency_namespace = req.idempotency_namespace,
             .idempotency_key = idempotency_key,
@@ -1368,7 +1441,7 @@ pub const Store = struct {
                     try self.reservePersistenceLocked(job_id, footprint);
                     continue;
                 }
-                if (!std.mem.eql(u8, state.value.request_fingerprint, fingerprint)) {
+                if (!try matchesFingerprint(alloc, state.value, req, fingerprint)) {
                     alloc.free(committed);
                     return error.IdempotencyConflict;
                 }
@@ -1601,7 +1674,7 @@ pub const Store = struct {
     }
 
     pub fn existingGenerationAdmission(self: *Store, alloc: std.mem.Allocator, req: StartRequest) !?[]u8 {
-        if (req.source_kind != .schema_rewrite and req.source_kind != .empty_generation) return error.InvalidRestoreJobScope;
+        if (!req.source_kind.compoundStaging()) return error.InvalidRestoreJobScope;
         const key = req.idempotency_key orelse return null;
         const id = try jobIdForIdempotency(alloc, req.idempotency_namespace, key);
         const encoded = (try self.load(alloc, id)) orelse return null;
@@ -1612,7 +1685,7 @@ pub const Store = struct {
         defer alloc.free(expected);
         if (!std.mem.eql(u8, parsed.value.idempotency_namespace, req.idempotency_namespace) or
             !std.mem.eql(u8, parsed.value.idempotency_key, key) or
-            !std.mem.eql(u8, parsed.value.request_fingerprint, expected)) return error.IdempotencyConflict;
+            !try matchesFingerprint(alloc, parsed.value, req, expected)) return error.IdempotencyConflict;
         return encoded;
     }
 
@@ -2305,6 +2378,8 @@ pub const Store = struct {
             .connection = current.connection,
             .restore_mode = current.restore_mode,
             .table_names = current.table_names,
+            .routine_mappings = current.routine_mappings,
+            .routine_actor = current.routine_actor,
             .cluster_binding = current.cluster_binding,
             .cluster_binding_sha256 = current.cluster_binding_sha256,
             .active_table_index = if (update.clear_active_table_index) null else update.active_table_index orelse current.active_table_index,
@@ -2320,7 +2395,10 @@ pub const Store = struct {
             .destination_authorization_fingerprint = current.destination_authorization_fingerprint,
             .destination_authorization_principal = current.destination_authorization_principal,
             .result_json = update.result_json orelse current.result_json,
-            .last_error = if (update.phase == .succeeded) null else update.last_error orelse current.last_error,
+            // Cleanup/retry wrappers must not replace an already durable
+            // staging cause by a generic transport/integrity failure. Read
+            // current state here, not the worker's potentially older snapshot.
+            .last_error = if (update.phase == .succeeded) null else if (update.phase == .failed and (update.staging_failure orelse current.staging_failure).len != 0) (update.staging_failure orelse current.staging_failure) else update.last_error orelse current.last_error,
             .created_at_ms = current.created_at_ms,
             .updated_at_ms = nowMillis(),
             .expires_at_ms = if (isTerminal(update.phase) and !isTerminal(current.phase))
@@ -2827,11 +2905,19 @@ pub const Store = struct {
     }
 };
 
-fn validateStartRequest(req: StartRequest) !void {
+fn validateStartRequest(alloc: std.mem.Allocator, req: StartRequest) !void {
     if (req.rewrite_plan_json != null and req.generation_plan_json != null) return error.InvalidRestoreJobScope;
-    if ((req.source_kind == .schema_rewrite or req.source_kind == .empty_generation) != (req.rewrite_plan_json != null or req.generation_plan_json != null)) return error.InvalidRestoreJobScope;
-    if (req.source_kind == .empty_generation and req.generation_plan_json == null) return error.InvalidRestoreJobScope;
-    if ((req.source_kind == .schema_rewrite or req.source_kind == .empty_generation) and (req.scope != .cluster or !std.mem.eql(u8, req.restore_mode, "overwrite"))) return error.InvalidRestoreJobScope;
+    if (req.source_kind.compoundStaging() != (req.rewrite_plan_json != null or req.generation_plan_json != null)) return error.InvalidRestoreJobScope;
+    if ((req.source_kind == .empty_generation or req.source_kind == .query_population) and req.generation_plan_json == null) return error.InvalidRestoreJobScope;
+    if (req.source_kind.compoundStaging()) {
+        if (req.scope != .cluster) return error.InvalidRestoreJobScope;
+        if (req.source_kind == .query_population and std.mem.eql(u8, req.restore_mode, "overwrite")) {
+            const parsed = try std.json.parseFromSlice(@import("../metadata/restore_staging.zig").Plan, alloc, req.generation_plan_json.?, .{});
+            defer parsed.deinit();
+            try parsed.value.validate(alloc);
+            for (parsed.value.targets) |target| if (target.population == null or target.materialized_view == null or target.materialized_view.?.refresh_identity == null or target.replace == null) return error.InvalidRestoreJobScope;
+        } else if (!std.mem.eql(u8, req.restore_mode, if (req.source_kind == .query_population) "fail_if_exists" else "overwrite")) return error.InvalidRestoreJobScope;
+    }
     if (req.backup_id.len == 0 or req.backup_id.len > max_restore_string_bytes or
         req.location.len == 0 or req.location.len > max_restore_string_bytes or
         req.connection.len == 0 or req.connection.len > max_restore_string_bytes or
@@ -2839,7 +2925,12 @@ fn validateStartRequest(req: StartRequest) !void {
         req.destination_authorization_fingerprint.len > 64 or
         req.destination_authorization_principal.len > 256 or
         (req.table_name != null and req.table_name.?.len > max_restore_string_bytes))
+    {
+        diagnoseRestoreJobRequestShape(req);
         return error.RestoreJobRecordTooLarge;
+    }
+    try routine_mapping.validate(req.routine_mappings orelse &.{});
+    if (req.routine_actor) |actor| try actor.validate();
     switch (req.scope) {
         .table => {
             if (req.table_name == null or req.table_name.?.len == 0 or req.table_names != null) return error.InvalidRestoreJobScope;
@@ -2850,7 +2941,10 @@ fn validateStartRequest(req: StartRequest) !void {
     if (req.table_names) |names| {
         if (names.len > max_explicit_tables_per_job) return error.TooManyRestoreTables;
         for (names, 0..) |name, i| {
-            if (name.len == 0 or name.len > max_restore_string_bytes) return error.RestoreJobRecordTooLarge;
+            if (name.len == 0 or name.len > max_restore_string_bytes) {
+                diagnoseRestoreJobBound("table_name", name.len, max_restore_string_bytes);
+                return error.RestoreJobRecordTooLarge;
+            }
             for (names[0..i]) |previous| {
                 if (std.mem.eql(u8, previous, name)) return error.DuplicateRestoreTableName;
             }
@@ -3000,6 +3094,50 @@ fn rangesContainRange(ranges: []const TableIndexRange, candidate: TableIndexRang
 
 pub fn stagingNeedsResolution(state: JobState) bool {
     return state.staging_attempt_id != 0 and state.staging_resolution == .active;
+}
+
+test "restore staging terminal failures preserve durable causes through cleanup and recovery" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |emergency| {
+        var persistence = TestReplicatedPersistence.init(alloc);
+        defer persistence.deinit();
+        var store = Store.initWithIo(alloc, std.testing.io);
+        defer store.deinit();
+        try store.attachReplicated(persistence.persistence());
+        const initial = try store.start(alloc, .{ .scope = .cluster, .backup_id = "daily", .location = "s3://archive/daily", .connection = "archive-reader", .idempotency_namespace = "principal:admin:cluster" });
+        defer alloc.free(initial);
+        var admitted = try std.json.parseFromSlice(JobState, alloc, initial, .{});
+        defer admitted.deinit();
+        const job_id = admitted.value.job_id;
+        const running = (try store.begin(alloc, job_id)).?;
+        defer alloc.free(running);
+        var worker = try std.json.parseFromSlice(JobState, alloc, running, .{});
+        defer worker.deinit();
+        const staging = try store.ensureStagingAttempt(alloc, job_id, worker.value.attempt_id);
+        defer alloc.free(staging);
+        const failure = try store.recordStagingFailure(alloc, job_id, worker.value.attempt_id, "ConstraintActivationFailed");
+        defer alloc.free(failure);
+        const cleanup = try store.recordStagingResolution(alloc, job_id, worker.value.attempt_id, worker.value.attempt_id, .canceled);
+        defer alloc.free(cleanup);
+        // The worker predates the failure checkpoint; both finalizers must
+        // consult the current durable cause rather than its wrapper error.
+        if (emergency) {
+            try std.testing.expect(try store.failRunningAttempt(alloc, job_id, worker.value.attempt_id, "BackupIntegrityFailure"));
+        } else {
+            const terminal = try store.fail(alloc, worker.value, "BackupIntegrityFailure");
+            alloc.free(terminal);
+        }
+        var reopened = Store.initWithIo(alloc, std.testing.io);
+        defer reopened.deinit();
+        try reopened.attachReplicated(persistence.persistence());
+        const bytes = (try reopened.load(alloc, job_id)).?;
+        defer alloc.free(bytes);
+        var result = try std.json.parseFromSlice(JobState, alloc, bytes, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(Phase.failed, result.value.phase);
+        try std.testing.expectEqualStrings("ConstraintActivationFailed", result.value.staging_failure);
+        try std.testing.expectEqualStrings("ConstraintActivationFailed", result.value.last_error.?);
+    }
 }
 
 test "restore admission recovers generated identity and immutable inputs from a compact late commit" {
@@ -3389,7 +3527,7 @@ fn encode(alloc: std.mem.Allocator, state: JobState) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, state, .{ .emit_null_optional_fields = false });
 }
 
-fn requestFingerprintAlloc(alloc: std.mem.Allocator, req: StartRequest) ![]u8 {
+pub fn requestFingerprintAlloc(alloc: std.mem.Allocator, req: StartRequest) ![]u8 {
     const canonical = try std.json.Stringify.valueAlloc(alloc, .{
         .scope = req.scope,
         .table_name = req.table_name,
@@ -3409,12 +3547,35 @@ fn requestFingerprintAlloc(alloc: std.mem.Allocator, req: StartRequest) ![]u8 {
     if (req.source_kind == .cluster_cohort) hash.update("antfly:restore:cluster-cohort:v1\x00");
     if (req.source_kind == .schema_rewrite) hash.update("antfly:restore:schema-rewrite:v1\x00");
     if (req.source_kind == .empty_generation) hash.update("antfly:restore:empty-generation:v1\x00");
+    if (req.source_kind == .query_population) hash.update("antfly:restore:query-population:v1\x00");
     hash.update(canonical);
+    if (req.routine_mappings) |mappings| if (mappings.len != 0) {
+        const encoded = try routine_mapping.canonicalAlloc(alloc, mappings);
+        defer alloc.free(encoded);
+        hash.update("antfly:restore:routine-mapping:v1\x00");
+        hash.update(encoded);
+    };
+    if (req.routine_actor) |actor| {
+        try actor.validate();
+        const encoded_actor = try std.json.Stringify.valueAlloc(alloc, actor, .{});
+        defer alloc.free(encoded_actor);
+        hash.update("antfly:restore:routine-actor:v1\x00");
+        hash.update(encoded_actor);
+    }
     hash.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
     return try alloc.dupe(u8, &hex);
 }
 
+fn matchesFingerprint(alloc: std.mem.Allocator, state: JobState, req: StartRequest, current: []const u8) !bool {
+    if (std.mem.eql(u8, state.request_fingerprint, current)) return true;
+    if (state.routine_actor != null or req.routine_actor == null) return false;
+    var legacy = req;
+    legacy.routine_actor = null;
+    const encoded = try requestFingerprintAlloc(alloc, legacy);
+    defer alloc.free(encoded);
+    return std.mem.eql(u8, state.request_fingerprint, encoded);
+}
 fn optionalBytesEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
     if (lhs == null or rhs == null) return lhs == null and rhs == null;
     return std.mem.eql(u8, lhs.?, rhs.?);
@@ -3444,6 +3605,8 @@ fn destinationReauthorizationMatches(current: JobState, req: StartRequest) bool 
         current.destination_authorization_principal,
         req.destination_authorization_principal,
     );
+    if (!routine_mapping.equalOptional(current.routine_mappings, req.routine_mappings)) return false;
+    if (current.routine_actor) |actor| if (req.routine_actor == null or !actor.eql(req.routine_actor.?)) return false;
     return current.phase == .failed and
         authorization_failure and
         req.destination_authorization_principal.len > 0 and
@@ -3711,7 +3874,7 @@ test "restore jobs compound staging persistence transports plan separately and f
 }
 
 test "restore jobs compound staging persistence schema rewrite admission survives lost reply and rejects changed requests" {
-    for ([_]SourceKind{ .schema_rewrite, .empty_generation }) |kind| {
+    for ([_]SourceKind{ .schema_rewrite, .empty_generation, .query_population }) |kind| {
         const alloc = std.testing.allocator;
         const Fixture = struct {
             fn create(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8, value: []const u8, plan: []const u8, term: u64) ![]u8 {
@@ -3737,12 +3900,12 @@ test "restore jobs compound staging persistence schema rewrite admission survive
             .backup_id = "schema-digest",
             .location = "metadata://schema-rewrite",
             .connection = "internal",
-            .restore_mode = "overwrite",
+            .restore_mode = if (kind == .query_population) "fail_if_exists" else "overwrite",
             .table_names = &.{"child"},
             .idempotency_namespace = "basic:operator:schema:child",
             .idempotency_key = "rewrite-1",
             .rewrite_plan_json = if (kind == .schema_rewrite) "separately-validated-staging-plan" else null,
-            .generation_plan_json = if (kind == .empty_generation) "separately-validated-staging-plan" else null,
+            .generation_plan_json = if (kind != .schema_rewrite) "separately-validated-staging-plan" else null,
         };
         var store = Store.initWithIo(alloc, std.testing.io);
         defer store.deinit();
@@ -5659,4 +5822,107 @@ test "restore admission recovers generated identity with explicit submission evi
     defer a.free(retried.accepted);
     try std.testing.expect(submitted and retried == .accepted);
     try std.testing.expectEqual(@as(usize, 1), persistence.rows.count());
+}
+
+test "restore routine mappings survive retries takeover and bind idempotency" {
+    const a = std.testing.allocator;
+    var persistence = TestReplicatedPersistence.init(a);
+    defer persistence.deinit();
+    var store = Store.initWithIo(a, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+    const first: RoutineMapping = .{ .source_metadata_incarnation = "11111111111111111111111111111111", .source_routine_id = "18446744073709551615", .destination_routine_id = "9007199254740993" };
+    const second: RoutineMapping = .{ .source_metadata_incarnation = "22222222222222222222222222222222", .source_routine_id = "9", .destination_routine_id = "10" };
+    var request: StartRequest = .{ .scope = .cluster, .backup_id = "daily", .location = "file:///archive", .connection = "archive-reader", .idempotency_namespace = "admin", .idempotency_key = "same-request", .routine_mappings = &.{ first, second } };
+    const original = try requestFingerprintAlloc(a, request);
+    defer a.free(original);
+    request.routine_mappings = &.{ second, first };
+    const reordered = try requestFingerprintAlloc(a, request);
+    defer a.free(reordered);
+    try std.testing.expectEqualStrings(original, reordered);
+    const created = try store.start(a, request);
+    defer a.free(created);
+    var parsed = try std.json.parseFromSlice(JobState, a, created, .{});
+    defer parsed.deinit();
+    const running = (try store.begin(a, parsed.value.job_id)).?;
+    defer a.free(running);
+    var started = try std.json.parseFromSlice(JobState, a, running, .{});
+    defer started.deinit();
+    const queued = try store.retryRunning(a, started.value, "NotLeader", 0);
+    defer a.free(queued);
+    var retry = try std.json.parseFromSlice(JobState, a, queued, .{});
+    defer retry.deinit();
+    try std.testing.expectEqual(@as(usize, 2), retry.value.routine_mappings.?.len);
+    try std.testing.expectEqualStrings(second.source_routine_id, retry.value.routine_mappings.?[0].source_routine_id);
+    var reopened = Store.initWithIo(a, std.testing.io);
+    defer reopened.deinit();
+    try reopened.attachReplicated(persistence.persistence());
+    const recovered = (try reopened.load(a, parsed.value.job_id)).?;
+    defer a.free(recovered);
+    var state = try std.json.parseFromSlice(JobState, a, recovered, .{});
+    defer state.deinit();
+    try std.testing.expectEqualStrings(first.destination_routine_id, state.value.routine_mappings.?[1].destination_routine_id);
+    var changed = first;
+    changed.destination_routine_id = "7";
+    request.routine_mappings = &.{ second, changed };
+    const altered = try requestFingerprintAlloc(a, request);
+    defer a.free(altered);
+    try std.testing.expect(!std.mem.eql(u8, original, altered));
+}
+
+test "restore trigger actor incarnation survives recovery and cannot change through idempotency or destination refresh" {
+    const a = std.testing.allocator;
+    var persistence = TestReplicatedPersistence.init(a);
+    defer persistence.deinit();
+    var store = Store.initWithIo(a, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+    const actor: routine_mapping.Actor = .{ .username = "restore-owner", .instance = @splat(1) };
+    var request: StartRequest = .{ .scope = .cluster, .backup_id = "daily", .location = "file:///archive", .connection = "archive-reader", .idempotency_namespace = "admin", .idempotency_key = "actor-request", .routine_actor = actor, .destination_authorization_principal = "basic:restore-owner" };
+    const created = try store.start(a, request);
+    defer a.free(created);
+    var state = try std.json.parseFromSlice(JobState, a, created, .{});
+    defer state.deinit();
+    try std.testing.expect(actor.eql(state.value.routine_actor.?));
+    var reopened = Store.initWithIo(a, std.testing.io);
+    defer reopened.deinit();
+    try reopened.attachReplicated(persistence.persistence());
+    const recovered = (try reopened.load(a, state.value.job_id)).?;
+    defer a.free(recovered);
+    var durable = try std.json.parseFromSlice(JobState, a, recovered, .{});
+    defer durable.deinit();
+    try std.testing.expect(actor.eql(durable.value.routine_actor.?));
+    const original = try requestFingerprintAlloc(a, request);
+    defer a.free(original);
+    request.routine_actor = .{ .username = "restore-owner", .instance = @splat(2) };
+    const replacement = try requestFingerprintAlloc(a, request);
+    defer a.free(replacement);
+    try std.testing.expect(!std.mem.eql(u8, original, replacement));
+    try std.testing.expect(!try matchesFingerprint(a, durable.value, request, replacement));
+    var failed = durable.value;
+    failed.phase = .failed;
+    failed.last_error = "StoredDestinationAuthorizationRevoked";
+    try std.testing.expect(!destinationReauthorizationMatches(failed, request));
+    request.routine_actor = actor;
+    try std.testing.expect(destinationReauthorizationMatches(failed, request));
+    request.routine_actor = null;
+    const ordinary = try requestFingerprintAlloc(a, request);
+    defer a.free(ordinary);
+    var legacy = durable.value;
+    legacy.routine_actor = null;
+    legacy.request_fingerprint = ordinary;
+    request.routine_actor = actor;
+    const current = try requestFingerprintAlloc(a, request);
+    defer a.free(current);
+    try std.testing.expect(try matchesFingerprint(a, legacy, request, current));
+    // An exact legacy retry observes its original state but does not acquire
+    // an executable actor through a read-only idempotency match.
+    try std.testing.expect(legacy.routine_actor == null);
+}
+
+/// The immutable generation Plan owns the notices. Durable compact job records
+/// retain only its exact reference; public observations may project the data.
+pub fn projectTruncatePreparationResultAlloc(a: std.mem.Allocator, base_result: ?[]const u8, prepared: @import("../metadata/restore_staging.zig").TruncatePreparation, digest: [32]u8, include_notices: bool, release_after: bool) ![]u8 {
+    if (prepared.format_version != 1 or prepared.vm_contract_version != @import("antfly_local_sources").sql_catalog.trigger_runtime.predecision_contract_version) return error.InvalidRestoreStaging;
+    return if (include_notices) prepared.projectResultAlloc(a, base_result, digest, release_after) else prepared.projectReferenceAlloc(a, base_result, digest);
 }

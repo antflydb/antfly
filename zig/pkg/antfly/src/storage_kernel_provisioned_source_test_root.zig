@@ -18,6 +18,8 @@ const provisioned_source = @import("storage/kernel_owner_provisioned_source_test
 test {
     _ = provisioned_source;
     _ = @import("api/kernel_owner_source.zig");
+    _ = @import("storage/kernel_owner_client.zig");
+    _ = @import("data/schema_apply_queue.zig");
     _ = antfly_sources.table_writes.consumer_tests;
 }
 

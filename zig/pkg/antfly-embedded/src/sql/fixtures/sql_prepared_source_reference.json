@@ -1,0 +1,532 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL exact SQL",
+  "entries": [
+    {
+      "id": "sql-0005",
+      "profile": "roots",
+      "prepared_name": "cte_insert_plan",
+      "sqlstate": null,
+      "command_tag": "INSERT",
+      "affected": 2,
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      },
+      "tables": [
+        {
+          "name": "usage_records",
+          "create": "CREATE TABLE usage_records(id text PRIMARY KEY,organization_id text,status text)",
+          "seed": "INSERT INTO usage_records(id,organization_id,status) VALUES ('root',NULL,'ready'),('child','absent','child')",
+          "read": "SELECT id,organization_id,status FROM usage_records ORDER BY id",
+          "final": {
+            "columns": [
+              "id",
+              "organization_id",
+              "status"
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "rows": [
+              [
+                "child",
+                "absent",
+                "child"
+              ],
+              [
+                "root",
+                null,
+                "ready"
+              ]
+            ]
+          }
+        },
+        {
+          "name": "archived_records",
+          "create": "CREATE TABLE archived_records(id text PRIMARY KEY)",
+          "seed": "INSERT INTO archived_records(id) VALUES ('retained')",
+          "read": "SELECT id FROM archived_records ORDER BY id",
+          "final": {
+            "columns": [
+              "id"
+            ],
+            "column_oids": [
+              25
+            ],
+            "rows": [
+              [
+                "child"
+              ],
+              [
+                "retained"
+              ],
+              [
+                "root"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0005",
+      "profile": "recursive_duplicate",
+      "prepared_name": "cte_insert_plan",
+      "sqlstate": null,
+      "command_tag": "INSERT",
+      "affected": 2,
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      },
+      "tables": [
+        {
+          "name": "usage_records",
+          "create": "CREATE TABLE usage_records(id text PRIMARY KEY,organization_id text,status text)",
+          "seed": "INSERT INTO usage_records(id,organization_id,status) VALUES ('root',NULL,'ready'),('child','root','child')",
+          "read": "SELECT id,organization_id,status FROM usage_records ORDER BY id",
+          "final": {
+            "columns": [
+              "id",
+              "organization_id",
+              "status"
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "rows": [
+              [
+                "child",
+                "root",
+                "child"
+              ],
+              [
+                "root",
+                null,
+                "ready"
+              ]
+            ]
+          }
+        },
+        {
+          "name": "archived_records",
+          "create": "CREATE TABLE archived_records(id text PRIMARY KEY)",
+          "seed": "INSERT INTO archived_records(id) VALUES ('retained')",
+          "read": "SELECT id FROM archived_records ORDER BY id",
+          "final": {
+            "columns": [
+              "id"
+            ],
+            "column_oids": [
+              25
+            ],
+            "rows": [
+              [
+                "child"
+              ],
+              [
+                "retained"
+              ],
+              [
+                "root"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0008",
+      "profile": "matched_and_unmatched",
+      "prepared_name": "cte_merge_plan",
+      "sqlstate": null,
+      "command_tag": "MERGE",
+      "affected": 2,
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      },
+      "tables": [
+        {
+          "name": "usage_records",
+          "create": "CREATE TABLE usage_records(id text PRIMARY KEY,status text DEFAULT 'queued',amount integer)",
+          "seed": "INSERT INTO usage_records(id,status,amount) VALUES ('u1','old',5),('u2','untouched',9)",
+          "read": "SELECT id,status,amount FROM usage_records ORDER BY id",
+          "final": {
+            "columns": [
+              "id",
+              "status",
+              "amount"
+            ],
+            "column_oids": [
+              25,
+              25,
+              23
+            ],
+            "rows": [
+              [
+                "u1",
+                "old",
+                5
+              ],
+              [
+                "u2",
+                "untouched",
+                9
+              ]
+            ]
+          }
+        },
+        {
+          "name": "archived_records",
+          "create": "CREATE TABLE archived_records(archive_id text PRIMARY KEY,id text,archive_status text,archive_amount integer)",
+          "seed": "INSERT INTO archived_records(archive_id,id,archive_status,archive_amount) VALUES ('u1','u1','archived',15),('u3','u3','inserted',30)",
+          "read": "SELECT archive_id,id,archive_status,archive_amount FROM archived_records ORDER BY archive_id",
+          "final": {
+            "columns": [
+              "archive_id",
+              "id",
+              "archive_status",
+              "archive_amount"
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              23
+            ],
+            "rows": [
+              [
+                "u1",
+                "u1",
+                "archived",
+                15
+              ],
+              [
+                "u3",
+                "u3",
+                "inserted",
+                30
+              ]
+            ]
+          }
+        },
+        {
+          "name": "source_records",
+          "create": "CREATE TABLE source_records(id text PRIMARY KEY,status text)",
+          "seed": "INSERT INTO source_records(id,status) VALUES ('u1','source_old'),('u3','source_new')",
+          "read": "SELECT id,status FROM source_records ORDER BY id",
+          "final": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              25,
+              25
+            ],
+            "rows": [
+              [
+                "u1",
+                "source_old"
+              ],
+              [
+                "u3",
+                "source_new"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0009",
+      "profile": "roots",
+      "prepared_name": "recursive_usage_read_plan",
+      "sqlstate": null,
+      "command_tag": "SELECT",
+      "affected": 0,
+      "output": {
+        "columns": [
+          "id"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "root"
+          ],
+          [
+            "child"
+          ]
+        ]
+      },
+      "tables": [
+        {
+          "name": "usage_records",
+          "create": "CREATE TABLE usage_records(id text PRIMARY KEY,organization_id text,status text)",
+          "seed": "INSERT INTO usage_records(id,organization_id,status) VALUES ('root',NULL,'ready'),('child','absent','child')",
+          "read": "SELECT id,organization_id,status FROM usage_records ORDER BY id",
+          "final": {
+            "columns": [
+              "id",
+              "organization_id",
+              "status"
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "rows": [
+              [
+                "child",
+                "absent",
+                "child"
+              ],
+              [
+                "root",
+                null,
+                "ready"
+              ]
+            ]
+          }
+        },
+        {
+          "name": "archived_records",
+          "create": "CREATE TABLE archived_records(id text PRIMARY KEY)",
+          "seed": "INSERT INTO archived_records(id) VALUES ('retained')",
+          "read": "SELECT id FROM archived_records ORDER BY id",
+          "final": {
+            "columns": [
+              "id"
+            ],
+            "column_oids": [
+              25
+            ],
+            "rows": [
+              [
+                "retained"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0009",
+      "profile": "recursive_duplicate",
+      "prepared_name": "recursive_usage_read_plan",
+      "sqlstate": null,
+      "command_tag": "SELECT",
+      "affected": 0,
+      "output": {
+        "columns": [
+          "id"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "root"
+          ],
+          [
+            "child"
+          ],
+          [
+            "child"
+          ]
+        ]
+      },
+      "tables": [
+        {
+          "name": "usage_records",
+          "create": "CREATE TABLE usage_records(id text PRIMARY KEY,organization_id text,status text)",
+          "seed": "INSERT INTO usage_records(id,organization_id,status) VALUES ('root',NULL,'ready'),('child','root','child')",
+          "read": "SELECT id,organization_id,status FROM usage_records ORDER BY id",
+          "final": {
+            "columns": [
+              "id",
+              "organization_id",
+              "status"
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "rows": [
+              [
+                "child",
+                "root",
+                "child"
+              ],
+              [
+                "root",
+                null,
+                "ready"
+              ]
+            ]
+          }
+        },
+        {
+          "name": "archived_records",
+          "create": "CREATE TABLE archived_records(id text PRIMARY KEY)",
+          "seed": "INSERT INTO archived_records(id) VALUES ('retained')",
+          "read": "SELECT id FROM archived_records ORDER BY id",
+          "final": {
+            "columns": [
+              "id"
+            ],
+            "column_oids": [
+              25
+            ],
+            "rows": [
+              [
+                "retained"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0010",
+      "profile": "roots",
+      "prepared_name": "recursive_usage_plan",
+      "sqlstate": null,
+      "command_tag": "UPDATE",
+      "affected": 2,
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      },
+      "tables": [
+        {
+          "name": "usage_records",
+          "create": "CREATE TABLE usage_records(id text PRIMARY KEY,organization_id text,status text)",
+          "seed": "INSERT INTO usage_records(id,organization_id,status) VALUES ('root',NULL,'ready'),('child','absent','child')",
+          "read": "SELECT id,organization_id,status FROM usage_records ORDER BY id",
+          "final": {
+            "columns": [
+              "id",
+              "organization_id",
+              "status"
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "rows": [
+              [
+                "child",
+                "absent",
+                "done"
+              ],
+              [
+                "root",
+                null,
+                "done"
+              ]
+            ]
+          }
+        },
+        {
+          "name": "archived_records",
+          "create": "CREATE TABLE archived_records(id text PRIMARY KEY)",
+          "seed": "INSERT INTO archived_records(id) VALUES ('retained')",
+          "read": "SELECT id FROM archived_records ORDER BY id",
+          "final": {
+            "columns": [
+              "id"
+            ],
+            "column_oids": [
+              25
+            ],
+            "rows": [
+              [
+                "retained"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0010",
+      "profile": "recursive_duplicate",
+      "prepared_name": "recursive_usage_plan",
+      "sqlstate": null,
+      "command_tag": "UPDATE",
+      "affected": 2,
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      },
+      "tables": [
+        {
+          "name": "usage_records",
+          "create": "CREATE TABLE usage_records(id text PRIMARY KEY,organization_id text,status text)",
+          "seed": "INSERT INTO usage_records(id,organization_id,status) VALUES ('root',NULL,'ready'),('child','root','child')",
+          "read": "SELECT id,organization_id,status FROM usage_records ORDER BY id",
+          "final": {
+            "columns": [
+              "id",
+              "organization_id",
+              "status"
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "rows": [
+              [
+                "child",
+                "root",
+                "done"
+              ],
+              [
+                "root",
+                null,
+                "done"
+              ]
+            ]
+          }
+        },
+        {
+          "name": "archived_records",
+          "create": "CREATE TABLE archived_records(id text PRIMARY KEY)",
+          "seed": "INSERT INTO archived_records(id) VALUES ('retained')",
+          "read": "SELECT id FROM archived_records ORDER BY id",
+          "final": {
+            "columns": [
+              "id"
+            ],
+            "column_oids": [
+              25
+            ],
+            "rows": [
+              [
+                "retained"
+              ]
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

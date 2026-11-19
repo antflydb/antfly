@@ -17,7 +17,33 @@
 const topology = @import("relational_integrity_topology_contract.zig");
 const handoff = @import("relational_integrity_handoff_contract.zig");
 
+pub const max_native_retirement_status_bytes = 16 * 1024;
+/// Private metadata observation on the exact already-fenced native image.
+/// No user keys, lookup options or serialized process-local authority bit.
+pub const NativeRetirementStatusRequest = struct {
+    fence: topology.Fence,
+    descriptor: @import("../../common/relation_persistence.zig").Descriptor,
+    pin: @import("../../common/relation_persistence.zig").PhysicalPin,
+    native_instance: [16]u8,
+
+    pub fn validate(self: @This()) !void {
+        const std = @import("std");
+        try self.descriptor.validate();
+        try self.pin.validate();
+        _ = try self.fence.encode();
+        switch (self.fence.role) {
+            .child_generation_source, .child_generation_dual, .document_retirement_source => {},
+            else => return error.InvalidIntegrityTopologyFence,
+        }
+        if (std.mem.allEqual(u8, &self.native_instance, 0) or self.pin.table_id != self.fence.namespace.table_id or
+            self.pin.shard_id != self.fence.namespace.shard_id or self.pin.range_id != self.fence.namespace.range_id or
+            self.pin.data_generation != self.descriptor.data_generation) return error.IdentityNamespaceMismatch;
+    }
+};
+
 pub const Request = union(enum) {
+    sql_relation_binding: void,
+    native_retirement_status: NativeRetirementStatusRequest,
     identity: void,
     status: void,
     manifest: struct {

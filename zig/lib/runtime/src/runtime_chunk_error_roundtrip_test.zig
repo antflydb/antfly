@@ -43,6 +43,7 @@ fn fail(index: u8) anyerror!u64 {
         13 => error.SystemFdQuotaExceeded,
         14 => error.PersistentDescriptorAdmissionExhausted,
         15 => error.StorageDescriptorPressure,
+        16 => error.RelationalCheckViolation,
         else => 42,
     };
 }
@@ -66,9 +67,11 @@ test "model-aware chunk failures cross independent native error domains" {
     const method: @FieldType(Methods, "fail") = @ptrCast(@alignCast(provider.fail));
     var distinct = false;
     for ([_][]const u8{
-        "StaleChunkContinuation",     "IncompleteChunkCoverage",   "SourceVersionChanged",         "MemoryBudgetExceeded",
-        "UnsupportedChunkMediaType",  "EmbeddingIdentityMismatch", "InvalidChunkPolicy",           "InvalidChunkReplay",
-        "DocumentTokenLimitExceeded", "ReadOutputTruncated",       "StorageOwnerAdmissionPending",
+        "StaleChunkContinuation",     "IncompleteChunkCoverage",   "SourceVersionChanged",                   "MemoryBudgetExceeded",
+        "UnsupportedChunkMediaType",  "EmbeddingIdentityMismatch", "InvalidChunkPolicy",                     "InvalidChunkReplay",
+        "DocumentTokenLimitExceeded", "ReadOutputTruncated",       "StorageOwnerAdmissionPending",           "InputOutput",
+        "ProcessFdQuotaExceeded",     "SystemFdQuotaExceeded",     "PersistentDescriptorAdmissionExhausted", "StorageDescriptorPressure",
+        "RelationalCheckViolation",
     }, 0..) |name, index| {
         const expected = @import("storage_engine_errors").fromName(name);
         const code: u8 = @intCast(index);

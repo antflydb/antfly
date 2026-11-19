@@ -1,0 +1,830 @@
+{
+  "format": 1,
+  "profiles": [
+    {
+      "name": "creation restart preserves a distinct declared start",
+      "create": "CREATE SEQUENCE probe START 100 RESTART WITH 7 CACHE 4",
+      "options": {
+        "start": 100,
+        "restart": {
+          "value": 7
+        },
+        "cache": 4
+      },
+      "initial": {
+        "integer": "int64",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 9223372036854775807,
+        "start": 100,
+        "cache": 4,
+        "cycle": false,
+        "last_value": 7,
+        "is_called": false
+      },
+      "steps": [
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int64",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "start": 100,
+            "cache": 4,
+            "cycle": false,
+            "last_value": 10,
+            "is_called": true
+          },
+          "lease": {
+            "first": 7,
+            "count": 4,
+            "last": 10
+          }
+        },
+        {
+          "sql": "ALTER SEQUENCE probe RESTART",
+          "action": {
+            "alter": {
+              "restart": {}
+            }
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int64",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "start": 100,
+            "cache": 4,
+            "cycle": false,
+            "last_value": 100,
+            "is_called": false
+          },
+          "lease": null
+        },
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int64",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "start": 100,
+            "cache": 4,
+            "cycle": false,
+            "last_value": 103,
+            "is_called": true
+          },
+          "lease": {
+            "first": 100,
+            "count": 4,
+            "last": 103
+          }
+        }
+      ]
+    },
+    {
+      "name": "cached ascending setval and restart",
+      "create": "CREATE SEQUENCE probe CACHE 32",
+      "options": {
+        "cache": 32
+      },
+      "initial": {
+        "integer": "int64",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 9223372036854775807,
+        "start": 1,
+        "cache": 32,
+        "cycle": false,
+        "last_value": 1,
+        "is_called": false
+      },
+      "steps": [
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int64",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "start": 1,
+            "cache": 32,
+            "cycle": false,
+            "last_value": 32,
+            "is_called": true
+          },
+          "lease": {
+            "first": 1,
+            "count": 32,
+            "last": 32
+          }
+        },
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int64",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "start": 1,
+            "cache": 32,
+            "cycle": false,
+            "last_value": 64,
+            "is_called": true
+          },
+          "lease": {
+            "first": 33,
+            "count": 32,
+            "last": 64
+          }
+        },
+        {
+          "sql": "SELECT setval('probe',100,false)",
+          "action": {
+            "set": {
+              "value": 100,
+              "called": false
+            }
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int64",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "start": 1,
+            "cache": 32,
+            "cycle": false,
+            "last_value": 100,
+            "is_called": false
+          },
+          "lease": null
+        },
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int64",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "start": 1,
+            "cache": 32,
+            "cycle": false,
+            "last_value": 131,
+            "is_called": true
+          },
+          "lease": {
+            "first": 100,
+            "count": 32,
+            "last": 131
+          }
+        },
+        {
+          "sql": "ALTER SEQUENCE probe START WITH 5",
+          "action": {
+            "alter": {
+              "start": 5
+            }
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int64",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "start": 5,
+            "cache": 32,
+            "cycle": false,
+            "last_value": 131,
+            "is_called": true
+          },
+          "lease": null
+        },
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int64",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "start": 5,
+            "cache": 32,
+            "cycle": false,
+            "last_value": 163,
+            "is_called": true
+          },
+          "lease": {
+            "first": 132,
+            "count": 32,
+            "last": 163
+          }
+        },
+        {
+          "sql": "ALTER SEQUENCE probe RESTART",
+          "action": {
+            "alter": {
+              "restart": {}
+            }
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int64",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "start": 5,
+            "cache": 32,
+            "cycle": false,
+            "last_value": 5,
+            "is_called": false
+          },
+          "lease": null
+        },
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int64",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "start": 5,
+            "cache": 32,
+            "cycle": false,
+            "last_value": 36,
+            "is_called": true
+          },
+          "lease": {
+            "first": 5,
+            "count": 32,
+            "last": 36
+          }
+        }
+      ]
+    },
+    {
+      "name": "descending bounded cycling cache",
+      "create": "CREATE SEQUENCE probe INCREMENT -3 MINVALUE 1 MAXVALUE 10 CACHE 32 CYCLE",
+      "options": {
+        "increment": -3,
+        "minimum": {
+          "value": 1
+        },
+        "maximum": {
+          "value": 10
+        },
+        "cache": 32,
+        "cycle": true
+      },
+      "initial": {
+        "integer": "int64",
+        "increment": -3,
+        "minimum": 1,
+        "maximum": 10,
+        "start": 10,
+        "cache": 32,
+        "cycle": true,
+        "last_value": 10,
+        "is_called": false
+      },
+      "steps": [
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int64",
+            "increment": -3,
+            "minimum": 1,
+            "maximum": 10,
+            "start": 10,
+            "cache": 32,
+            "cycle": true,
+            "last_value": 1,
+            "is_called": true
+          },
+          "lease": {
+            "first": 10,
+            "count": 4,
+            "last": 1
+          }
+        },
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int64",
+            "increment": -3,
+            "minimum": 1,
+            "maximum": 10,
+            "start": 10,
+            "cache": 32,
+            "cycle": true,
+            "last_value": 1,
+            "is_called": true
+          },
+          "lease": {
+            "first": 10,
+            "count": 4,
+            "last": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "full signed positive boundary",
+      "create": "CREATE SEQUENCE probe START 9223372036854775806 CACHE 4",
+      "options": {
+        "start": 9223372036854775806,
+        "cache": 4
+      },
+      "initial": {
+        "integer": "int64",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 9223372036854775807,
+        "start": 9223372036854775806,
+        "cache": 4,
+        "cycle": false,
+        "last_value": 9223372036854775806,
+        "is_called": false
+      },
+      "steps": [
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int64",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "start": 9223372036854775806,
+            "cache": 4,
+            "cycle": false,
+            "last_value": 9223372036854775807,
+            "is_called": true
+          },
+          "lease": {
+            "first": 9223372036854775806,
+            "count": 2,
+            "last": 9223372036854775807
+          }
+        },
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": "2200H",
+          "expected": {
+            "integer": "int64",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "start": 9223372036854775806,
+            "cache": 4,
+            "cycle": false,
+            "last_value": 9223372036854775807,
+            "is_called": true
+          },
+          "lease": null
+        }
+      ]
+    },
+    {
+      "name": "minimum signed increment and huge cache",
+      "create": "CREATE SEQUENCE probe INCREMENT -9223372036854775808 MINVALUE -9223372036854775808 MAXVALUE 9223372036854775807 START 9223372036854775807 CACHE 9223372036854775807",
+      "options": {
+        "increment": -9223372036854775808,
+        "minimum": {
+          "value": -9223372036854775808
+        },
+        "maximum": {
+          "value": 9223372036854775807
+        },
+        "start": 9223372036854775807,
+        "cache": 9223372036854775807
+      },
+      "initial": {
+        "integer": "int64",
+        "increment": -9223372036854775808,
+        "minimum": -9223372036854775808,
+        "maximum": 9223372036854775807,
+        "start": 9223372036854775807,
+        "cache": 9223372036854775807,
+        "cycle": false,
+        "last_value": 9223372036854775807,
+        "is_called": false
+      },
+      "steps": [
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int64",
+            "increment": -9223372036854775808,
+            "minimum": -9223372036854775808,
+            "maximum": 9223372036854775807,
+            "start": 9223372036854775807,
+            "cache": 9223372036854775807,
+            "cycle": false,
+            "last_value": -1,
+            "is_called": true
+          },
+          "lease": {
+            "first": 9223372036854775807,
+            "count": 2,
+            "last": -1
+          }
+        },
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": "2200H",
+          "expected": {
+            "integer": "int64",
+            "increment": -9223372036854775808,
+            "minimum": -9223372036854775808,
+            "maximum": 9223372036854775807,
+            "start": 9223372036854775807,
+            "cache": 9223372036854775807,
+            "cycle": false,
+            "last_value": -1,
+            "is_called": true
+          },
+          "lease": null
+        }
+      ]
+    },
+    {
+      "name": "narrowing allocated values and explicit restart",
+      "create": "CREATE SEQUENCE probe",
+      "options": {},
+      "initial": {
+        "integer": "int64",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 9223372036854775807,
+        "start": 1,
+        "cache": 1,
+        "cycle": false,
+        "last_value": 1,
+        "is_called": false
+      },
+      "steps": [
+        {
+          "sql": "SELECT setval('probe',60000,true)",
+          "action": {
+            "set": {
+              "value": 60000,
+              "called": true
+            }
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int64",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "start": 1,
+            "cache": 1,
+            "cycle": false,
+            "last_value": 60000,
+            "is_called": true
+          },
+          "lease": null
+        },
+        {
+          "sql": "ALTER SEQUENCE probe AS smallint",
+          "action": {
+            "alter": {
+              "integer": "int16"
+            }
+          },
+          "sqlstate": "22023",
+          "expected": {
+            "integer": "int64",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "start": 1,
+            "cache": 1,
+            "cycle": false,
+            "last_value": 60000,
+            "is_called": true
+          },
+          "lease": null
+        },
+        {
+          "sql": "ALTER SEQUENCE probe MAXVALUE 10",
+          "action": {
+            "alter": {
+              "maximum": {
+                "value": 10
+              }
+            }
+          },
+          "sqlstate": "22023",
+          "expected": {
+            "integer": "int64",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "start": 1,
+            "cache": 1,
+            "cycle": false,
+            "last_value": 60000,
+            "is_called": true
+          },
+          "lease": null
+        },
+        {
+          "sql": "ALTER SEQUENCE probe AS smallint RESTART WITH 1000",
+          "action": {
+            "alter": {
+              "integer": "int16",
+              "restart": {
+                "value": 1000
+              }
+            }
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int16",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 32767,
+            "start": 1,
+            "cache": 1,
+            "cycle": false,
+            "last_value": 1000,
+            "is_called": false
+          },
+          "lease": null
+        },
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int16",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 32767,
+            "start": 1,
+            "cache": 1,
+            "cycle": false,
+            "last_value": 1000,
+            "is_called": true
+          },
+          "lease": {
+            "first": 1000,
+            "count": 1,
+            "last": 1000
+          }
+        },
+        {
+          "sql": "SELECT setval('probe',32768,false)",
+          "action": {
+            "set": {
+              "value": 32768,
+              "called": false
+            }
+          },
+          "sqlstate": "22003",
+          "expected": {
+            "integer": "int16",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 32767,
+            "start": 1,
+            "cache": 1,
+            "cycle": false,
+            "last_value": 1000,
+            "is_called": true
+          },
+          "lease": null
+        },
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int16",
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 32767,
+            "start": 1,
+            "cache": 1,
+            "cycle": false,
+            "last_value": 1001,
+            "is_called": true
+          },
+          "lease": {
+            "first": 1001,
+            "count": 1,
+            "last": 1001
+          }
+        }
+      ]
+    },
+    {
+      "name": "descending default bounds follow integer width",
+      "create": "CREATE SEQUENCE probe AS smallint INCREMENT -1",
+      "options": {
+        "integer": "int16",
+        "increment": -1
+      },
+      "initial": {
+        "integer": "int16",
+        "increment": -1,
+        "minimum": -32768,
+        "maximum": -1,
+        "start": -1,
+        "cache": 1,
+        "cycle": false,
+        "last_value": -1,
+        "is_called": false
+      },
+      "steps": [
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int16",
+            "increment": -1,
+            "minimum": -32768,
+            "maximum": -1,
+            "start": -1,
+            "cache": 1,
+            "cycle": false,
+            "last_value": -1,
+            "is_called": true
+          },
+          "lease": {
+            "first": -1,
+            "count": 1,
+            "last": -1
+          }
+        },
+        {
+          "sql": "ALTER SEQUENCE probe AS integer",
+          "action": {
+            "alter": {
+              "integer": "int32"
+            }
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int32",
+            "increment": -1,
+            "minimum": -2147483648,
+            "maximum": -1,
+            "start": -1,
+            "cache": 1,
+            "cycle": false,
+            "last_value": -1,
+            "is_called": true
+          },
+          "lease": null
+        },
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int32",
+            "increment": -1,
+            "minimum": -2147483648,
+            "maximum": -1,
+            "start": -1,
+            "cache": 1,
+            "cycle": false,
+            "last_value": -2,
+            "is_called": true
+          },
+          "lease": {
+            "first": -2,
+            "count": 1,
+            "last": -2
+          }
+        },
+        {
+          "sql": "SELECT setval('probe',-2147483648,false)",
+          "action": {
+            "set": {
+              "value": -2147483648,
+              "called": false
+            }
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int32",
+            "increment": -1,
+            "minimum": -2147483648,
+            "maximum": -1,
+            "start": -1,
+            "cache": 1,
+            "cycle": false,
+            "last_value": -2147483648,
+            "is_called": false
+          },
+          "lease": null
+        },
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": null,
+          "expected": {
+            "integer": "int32",
+            "increment": -1,
+            "minimum": -2147483648,
+            "maximum": -1,
+            "start": -1,
+            "cache": 1,
+            "cycle": false,
+            "last_value": -2147483648,
+            "is_called": true
+          },
+          "lease": {
+            "first": -2147483648,
+            "count": 1,
+            "last": -2147483648
+          }
+        },
+        {
+          "sql": "SELECT nextval('probe')",
+          "action": {
+            "reserve": {}
+          },
+          "sqlstate": "2200H",
+          "expected": {
+            "integer": "int32",
+            "increment": -1,
+            "minimum": -2147483648,
+            "maximum": -1,
+            "start": -1,
+            "cache": 1,
+            "cycle": false,
+            "last_value": -2147483648,
+            "is_called": true
+          },
+          "lease": null
+        }
+      ]
+    }
+  ]
+}

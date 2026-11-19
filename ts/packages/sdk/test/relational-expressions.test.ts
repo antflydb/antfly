@@ -8,6 +8,170 @@ describe("relational expression structural admission", () => {
   const validate = (expression: unknown) =>
     validateRelationalExpression(expression, "expression", { nodes: 0, literalBytes: 0 });
 
+  it.each(["length", "octet_length", "bit_length"])("admits unary %s expressions", (op) => {
+    const arg = { op: "literal", type: "string", value: "🐜" };
+    const expression = { op, args: [arg] };
+    expect(() => validate(expression)).not.toThrow();
+    expect(() => validate({ ...expression, args: [] })).toThrow(TypeError);
+    expect(() => validate({ ...expression, args: [arg, arg] })).toThrow(TypeError);
+  });
+
+  it("requires exact schema-owned enum identities on literals and casts", () => {
+    const literal = { op: "literal", type: "enumeration", named_type_id: 17, value: "z" };
+    expect(() => validate(literal)).not.toThrow();
+    expect(() => validate({ ...literal, value: null })).not.toThrow();
+    expect(() =>
+      validate({
+        op: "cast",
+        type: "enumeration",
+        named_type_id: 17,
+        args: [{ op: "literal", type: "string", value: "z" }],
+      })
+    ).not.toThrow();
+    expect(() => validate({ op: "cast", type: "string", args: [literal] })).not.toThrow();
+    for (const named_type_id of [undefined, null, 0, -1, 1.5, "17", Number.MAX_SAFE_INTEGER + 1])
+      expect(() => validate({ ...literal, named_type_id })).toThrow(TypeError);
+    expect(() => validate({ ...literal, value: 1 })).toThrow(TypeError);
+    expect(() => validate({ ...integer, named_type_id: 17 })).toThrow(TypeError);
+  });
+
+  it("admits transaction clocks with native precision bounds", () => {
+    for (const precision of [undefined, 0, 3, 6])
+      expect(() =>
+        validate(
+          precision === undefined
+            ? { op: "transaction_timestamp" }
+            : { op: "transaction_timestamp", precision }
+        )
+      ).not.toThrow();
+    for (const precision of [null, "3", -1, 7, 1.5, Number.NaN])
+      expect(() => validate({ op: "transaction_timestamp", precision })).toThrow(TypeError);
+    expect(() => validate({ op: "transaction_timestamp", args: [] })).toThrow(TypeError);
+  });
+
+  it("admits generated range domains without interpreting their syntax locally", () => {
+    for (const type of ["numrange", "daterange", "tsrange", "tstzrange"])
+      expect(() => validate({ op: "literal", type, value: "empty" })).not.toThrow();
+  });
+
+  it("admits UUID default declarations without accepting irrelevant fields or arguments", () => {
+    for (const expression of [
+      { op: "uuidv4" },
+      { op: "uuidv7" },
+      { op: "uuidv7", shift: "1 mon 2 days 03:00:00" },
+    ])
+      expect(() => validate(expression)).not.toThrow();
+    for (const expression of [
+      { op: "uuidv4", shift: "1 day" },
+      { op: "uuidv7", shift: null },
+      { op: "uuidv7", shift: 1 },
+      { op: "uuidv7", shift: "" },
+      { op: "uuidv7", shift: "x".repeat(129) },
+      { op: "uuidv7", args: [] },
+      { op: "uuidv7", sql_type: "uuid" },
+    ])
+      expect(() => validate(expression)).toThrow(TypeError);
+  });
+
+  it("admits bounded JSON literals and retains explicit JSON null authority", () => {
+    for (const value of [null, true, 1.25, "é😀", { n: [1, null, true] }]) {
+      const budget = { nodes: 0, literalBytes: 0 };
+      validateRelationalExpression({ op: "literal", type: "json", value }, "json", budget);
+      expect(budget.literalBytes).toBe(new TextEncoder().encode(JSON.stringify(value)).length);
+    }
+    for (const expression of [
+      { op: "literal", type: "json", json_null: true },
+      { op: "literal", type: "json", value: null, json_null: true },
+      { op: "literal", type: "json", json_null: false },
+      { op: "literal", type: "json" },
+    ])
+      expect(() => validate(expression)).not.toThrow();
+    for (const expression of [
+      { op: "literal", type: "json", value: {}, json_null: true },
+      { op: "literal", type: "json", json_null: 1 },
+      { op: "literal", type: "integer", value: 1, json_null: false },
+      { op: "column", column: "j", json_null: true },
+    ])
+      expect(() => validate(expression)).toThrow(TypeError);
+  });
+
+  it("admits structural JSON consumers with native arity and no irrelevant fields", () => {
+    const root = { op: "column", column: "j" };
+    const key = { op: "literal", type: "string", value: "n" };
+    for (const op of ["jsonb_typeof", "jsonb_array_length"]) {
+      expect(() => validate({ op, args: [root] })).not.toThrow();
+      expect(() => validate({ op, args: [] })).toThrow(TypeError);
+      expect(() => validate({ op, args: [root, key] })).toThrow(TypeError);
+    }
+    for (const op of ["jsonb_extract_path", "jsonb_extract_path_text"]) {
+      expect(() => validate({ op, args: [root, key] })).not.toThrow();
+      expect(() => validate({ op, args: [root, ...Array(31).fill(key)] })).not.toThrow();
+      expect(() => validate({ op, args: [root] })).toThrow(TypeError);
+      expect(() => validate({ op, args: [root, ...Array(32).fill(key)] })).toThrow(TypeError);
+      expect(() => validate({ op, args: [root, key], sql_type: "jsonb" })).toThrow(TypeError);
+    }
+  });
+
+  it("bounds JSON cycles depth bytes and UTF-8 without serializing another tree", () => {
+    const cycle: unknown[] = [];
+    cycle.push(cycle);
+    let deep: unknown = null;
+    for (let i = 0; i < 66; i++) deep = [deep];
+    for (const value of [
+      cycle,
+      deep,
+      "x".repeat(1024 * 1024),
+      NaN,
+      Infinity,
+      "\u0000",
+      { "\u0000": 1 },
+      "\ud800",
+      new Date(),
+      { n: undefined },
+    ])
+      expect(() => validate({ op: "literal", type: "json", value })).toThrow(TypeError);
+    const value = { escaped: '\n\t"\\é😀', n: [true, false, null] };
+    const bytes = new TextEncoder().encode(JSON.stringify(value)).length;
+    const budget = { nodes: 0, literalBytes: 4 * 1024 * 1024 - bytes };
+    validateRelationalExpression({ op: "literal", type: "json", value }, "json", budget);
+    expect(budget.literalBytes).toBe(4 * 1024 * 1024);
+    const over = { nodes: 0, literalBytes: budget.literalBytes - bytes + 1 };
+    expect(() =>
+      validateRelationalExpression({ op: "literal", type: "json", value }, "json", over)
+    ).toThrow(/literal budget/);
+  });
+
+  it("admits generated numeric functions and typed scales with exact arity", () => {
+    const numeric = {
+      op: "literal",
+      type: "numeric",
+      sql_type: "numeric",
+      value: "9007199254740993.5",
+    };
+    for (const op of ["abs", "ceil", "floor", "round", "trunc", "sign", "sqrt"]) {
+      expect(() => validate({ op, sql_type: "numeric", args: [numeric] })).not.toThrow();
+      expect(() => validate({ op, args: [] })).toThrow(TypeError);
+      expect(() => validate({ op, args: [numeric, integer, integer] })).toThrow(TypeError);
+      if (op === "round" || op === "trunc")
+        expect(() => validate({ op, sql_type: "numeric", args: [numeric, integer] })).not.toThrow();
+      else expect(() => validate({ op, args: [numeric, integer] })).toThrow(TypeError);
+    }
+  });
+
+  it("admits generated text operations with exact arity and no irrelevant fields", () => {
+    const text = { op: "literal", type: "string", value: "a" };
+    expect(() => validate({ op: "replace", args: [text, text, text] })).not.toThrow();
+    expect(() => validate({ op: "md5", args: [text] })).not.toThrow();
+    for (const expression of [
+      { op: "replace", args: [text, text] },
+      { op: "replace", args: [text, text, text, text] },
+      { op: "md5", args: [] },
+      { op: "md5", args: [text, text] },
+      { op: "replace", args: [text, text, text], sql_type: "text" },
+    ])
+      expect(() => validate(expression)).toThrow(TypeError);
+  });
+
   const envelope = {
     dimensions: [{ length: 2, lower_bound: -4 }],
     values: ["9007199254740993", null],

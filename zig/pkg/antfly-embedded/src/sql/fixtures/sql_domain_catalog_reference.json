@@ -1,0 +1,2281 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL 18 named domains, validation, defaults, comments and dependent retirement; native activation remains unqualified",
+  "before": [
+    {
+      "sql": "CREATE DOMAIN null_provenance AS text NOT NULL",
+      "command_tag": "CREATE DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "CREATE TABLE null_provenance_rows(d null_provenance)",
+      "command_tag": "CREATE TABLE",
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO null_provenance_rows SELECT (SELECT d FROM null_provenance_rows WHERE false)",
+      "command_tag": "INSERT 0 1",
+      "notices": []
+    },
+    {
+      "sql": "SELECT d IS NULL AS admitted_typed_null FROM null_provenance_rows",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "admitted_typed_null"
+        ],
+        "column_oids": [
+          16
+        ],
+        "rows": [
+          [
+            true
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "DROP TABLE null_provenance_rows",
+      "command_tag": "DROP TABLE",
+      "notices": []
+    },
+    {
+      "sql": "DROP DOMAIN null_provenance",
+      "command_tag": "DROP DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "CREATE DOMAIN check_provenance AS text",
+      "command_tag": "CREATE DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "CREATE TABLE check_provenance_rows(d check_provenance)",
+      "command_tag": "CREATE TABLE",
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO check_provenance_rows VALUES ('old')",
+      "command_tag": "INSERT 0 1",
+      "notices": []
+    },
+    {
+      "sql": "ALTER DOMAIN check_provenance ADD CONSTRAINT current_state CHECK (VALUE='good') NOT VALID",
+      "command_tag": "ALTER DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO check_provenance_rows VALUES ('old')",
+      "sqlstate": "23514",
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO check_provenance_rows SELECT d FROM check_provenance_rows",
+      "command_tag": "INSERT 0 1",
+      "notices": []
+    },
+    {
+      "sql": "SELECT d FROM check_provenance_rows ORDER BY d",
+      "command_tag": "SELECT 2",
+      "output": {
+        "columns": [
+          "d"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "old"
+          ],
+          [
+            "old"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ],
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "DROP TABLE check_provenance_rows",
+      "command_tag": "DROP TABLE",
+      "notices": []
+    },
+    {
+      "sql": "DROP DOMAIN check_provenance",
+      "command_tag": "DROP DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "CREATE DOMAIN naming_probe AS text CHECK (VALUE IS NOT NULL) CONSTRAINT naming_probe_check CHECK (VALUE = 'queued')",
+      "sqlstate": "42710",
+      "notices": []
+    },
+    {
+      "sql": "CREATE DOMAIN naming_probe AS text CONSTRAINT naming_probe_check CHECK (VALUE = 'queued') CHECK (VALUE IS NOT NULL) CHECK (VALUE <> 'bad')",
+      "command_tag": "CREATE DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "SELECT conname FROM pg_constraint WHERE contypid='naming_probe'::regtype ORDER BY oid",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "conname"
+        ],
+        "column_oids": [
+          19
+        ],
+        "rows": [
+          [
+            "naming_probe_check"
+          ],
+          [
+            "naming_probe_check1"
+          ],
+          [
+            "naming_probe_check2"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ],
+          [
+            false
+          ],
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "DROP DOMAIN naming_probe",
+      "command_tag": "DROP DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "CREATE DOMAIN order_probe AS int CONSTRAINT z CHECK(VALUE>0) CONSTRAINT a CHECK(VALUE>0)",
+      "command_tag": "CREATE DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "SELECT (-1)::order_probe",
+      "sqlstate": "23514",
+      "notices": []
+    },
+    {
+      "sql": "DROP DOMAIN order_probe",
+      "command_tag": "DROP DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0)",
+      "id": "sql-0306",
+      "source_entry_sha256": "afbb3693f8239a52a2b12a826d06527fd31bd00518a9335dfcd7d7945e32ed0a",
+      "command_tag": "CREATE DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "\nSELECT t.typname,t.typtype::text,t.typnotnull,\n       pg_get_expr(t.typdefaultbin,0) AS default_expression,\n       obj_description(t.oid,'pg_type') AS comment,\n       (SELECT string_agg(c.conname || ':' || c.convalidated::text || ':' ||\n                           pg_get_constraintdef(c.oid), ';' ORDER BY c.conname)\n        FROM pg_constraint c WHERE c.contypid=t.oid) AS constraints\nFROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace\nWHERE n.nspname='public' AND t.typname IN\n ('positive_amount','status_text','usage_status','usage_status_enum')\nORDER BY t.typname\n",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "typname",
+          "typtype",
+          "typnotnull",
+          "default_expression",
+          "comment",
+          "constraints"
+        ],
+        "column_oids": [
+          19,
+          25,
+          16,
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "positive_amount",
+            "d",
+            false,
+            null,
+            null,
+            "positive_amount_check:true:CHECK ((VALUE > (0)::numeric))"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            true,
+            true,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE DOMAIN status_text AS text DEFAULT 'queued' NOT NULL",
+      "id": "sql-0307",
+      "source_entry_sha256": "ffb16883e391c276639eef127fc8826d88b7661f2229f88d15a050e716f54712",
+      "command_tag": "CREATE DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "\nSELECT t.typname,t.typtype::text,t.typnotnull,\n       pg_get_expr(t.typdefaultbin,0) AS default_expression,\n       obj_description(t.oid,'pg_type') AS comment,\n       (SELECT string_agg(c.conname || ':' || c.convalidated::text || ':' ||\n                           pg_get_constraintdef(c.oid), ';' ORDER BY c.conname)\n        FROM pg_constraint c WHERE c.contypid=t.oid) AS constraints\nFROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace\nWHERE n.nspname='public' AND t.typname IN\n ('positive_amount','status_text','usage_status','usage_status_enum')\nORDER BY t.typname\n",
+      "command_tag": "SELECT 2",
+      "output": {
+        "columns": [
+          "typname",
+          "typtype",
+          "typnotnull",
+          "default_expression",
+          "comment",
+          "constraints"
+        ],
+        "column_oids": [
+          19,
+          25,
+          16,
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "positive_amount",
+            "d",
+            false,
+            null,
+            null,
+            "positive_amount_check:true:CHECK ((VALUE > (0)::numeric))"
+          ],
+          [
+            "status_text",
+            "d",
+            true,
+            "'queued'::text",
+            null,
+            "status_text_not_null:true:NOT NULL"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            true,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            true,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE DOMAIN usage_status AS text CHECK (VALUE IN ('queued','done'))",
+      "command_tag": "CREATE DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "CREATE TYPE usage_status_enum AS ENUM ('queued','done')",
+      "command_tag": "CREATE TYPE",
+      "notices": []
+    },
+    {
+      "sql": "COMMENT ON TYPE usage_status_enum IS 'usage status enum';",
+      "id": "sql-0149",
+      "source_entry_sha256": "83b150a1f845db5a8ecdcf22ab07d3b4f2a76207f42d7cd0f582b398252ccd17",
+      "command_tag": "COMMENT",
+      "notices": []
+    },
+    {
+      "sql": "\nSELECT t.typname,t.typtype::text,t.typnotnull,\n       pg_get_expr(t.typdefaultbin,0) AS default_expression,\n       obj_description(t.oid,'pg_type') AS comment,\n       (SELECT string_agg(c.conname || ':' || c.convalidated::text || ':' ||\n                           pg_get_constraintdef(c.oid), ';' ORDER BY c.conname)\n        FROM pg_constraint c WHERE c.contypid=t.oid) AS constraints\nFROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace\nWHERE n.nspname='public' AND t.typname IN\n ('positive_amount','status_text','usage_status','usage_status_enum')\nORDER BY t.typname\n",
+      "command_tag": "SELECT 4",
+      "output": {
+        "columns": [
+          "typname",
+          "typtype",
+          "typnotnull",
+          "default_expression",
+          "comment",
+          "constraints"
+        ],
+        "column_oids": [
+          19,
+          25,
+          16,
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "positive_amount",
+            "d",
+            false,
+            null,
+            null,
+            "positive_amount_check:true:CHECK ((VALUE > (0)::numeric))"
+          ],
+          [
+            "status_text",
+            "d",
+            true,
+            "'queued'::text",
+            null,
+            "status_text_not_null:true:NOT NULL"
+          ],
+          [
+            "usage_status",
+            "d",
+            false,
+            null,
+            null,
+            "usage_status_check:true:CHECK ((VALUE = ANY (ARRAY['queued'::text, 'done'::text])))"
+          ],
+          [
+            "usage_status_enum",
+            "e",
+            false,
+            null,
+            "usage status enum",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            true,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "COMMENT ON DOMAIN usage_status IS 'status domain';",
+      "id": "sql-0150",
+      "source_entry_sha256": "5a5df5ed96d43035df2867b21ee71cff505c01fe769113b39522a5ef3b90af57",
+      "command_tag": "COMMENT",
+      "notices": []
+    },
+    {
+      "sql": "\nSELECT t.typname,t.typtype::text,t.typnotnull,\n       pg_get_expr(t.typdefaultbin,0) AS default_expression,\n       obj_description(t.oid,'pg_type') AS comment,\n       (SELECT string_agg(c.conname || ':' || c.convalidated::text || ':' ||\n                           pg_get_constraintdef(c.oid), ';' ORDER BY c.conname)\n        FROM pg_constraint c WHERE c.contypid=t.oid) AS constraints\nFROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace\nWHERE n.nspname='public' AND t.typname IN\n ('positive_amount','status_text','usage_status','usage_status_enum')\nORDER BY t.typname\n",
+      "command_tag": "SELECT 4",
+      "output": {
+        "columns": [
+          "typname",
+          "typtype",
+          "typnotnull",
+          "default_expression",
+          "comment",
+          "constraints"
+        ],
+        "column_oids": [
+          19,
+          25,
+          16,
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "positive_amount",
+            "d",
+            false,
+            null,
+            null,
+            "positive_amount_check:true:CHECK ((VALUE > (0)::numeric))"
+          ],
+          [
+            "status_text",
+            "d",
+            true,
+            "'queued'::text",
+            null,
+            "status_text_not_null:true:NOT NULL"
+          ],
+          [
+            "usage_status",
+            "d",
+            false,
+            null,
+            "status domain",
+            "usage_status_check:true:CHECK ((VALUE = ANY (ARRAY['queued'::text, 'done'::text])))"
+          ],
+          [
+            "usage_status_enum",
+            "e",
+            false,
+            null,
+            "usage status enum",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            true,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE TABLE domain_rows(id BIGINT PRIMARY KEY,amount positive_amount,status status_text)",
+      "command_tag": "CREATE TABLE",
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO domain_rows(id,amount) VALUES(1,10),(2,200),(3,NULL)",
+      "command_tag": "INSERT 0 3",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,amount::numeric,status::text FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "amount",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          1700,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "10",
+            "queued"
+          ],
+          [
+            2,
+            "200",
+            "queued"
+          ],
+          [
+            3,
+            null,
+            "queued"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            true,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO domain_rows(id,amount) VALUES(4,-1)",
+      "sqlstate": "23514",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,amount::numeric,status::text FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "amount",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          1700,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "10",
+            "queued"
+          ],
+          [
+            2,
+            "200",
+            "queued"
+          ],
+          [
+            3,
+            null,
+            "queued"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            true,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO domain_rows VALUES(4,1,NULL)",
+      "sqlstate": "23502",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,amount::numeric,status::text FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "amount",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          1700,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "10",
+            "queued"
+          ],
+          [
+            2,
+            "200",
+            "queued"
+          ],
+          [
+            3,
+            null,
+            "queued"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            true,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "ALTER DOMAIN positive_amount SET NOT NULL",
+      "sqlstate": "23502",
+      "notices": []
+    },
+    {
+      "sql": "\nSELECT t.typname,t.typtype::text,t.typnotnull,\n       pg_get_expr(t.typdefaultbin,0) AS default_expression,\n       obj_description(t.oid,'pg_type') AS comment,\n       (SELECT string_agg(c.conname || ':' || c.convalidated::text || ':' ||\n                           pg_get_constraintdef(c.oid), ';' ORDER BY c.conname)\n        FROM pg_constraint c WHERE c.contypid=t.oid) AS constraints\nFROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace\nWHERE n.nspname='public' AND t.typname IN\n ('positive_amount','status_text','usage_status','usage_status_enum')\nORDER BY t.typname\n",
+      "command_tag": "SELECT 4",
+      "output": {
+        "columns": [
+          "typname",
+          "typtype",
+          "typnotnull",
+          "default_expression",
+          "comment",
+          "constraints"
+        ],
+        "column_oids": [
+          19,
+          25,
+          16,
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "positive_amount",
+            "d",
+            false,
+            null,
+            null,
+            "positive_amount_check:true:CHECK ((VALUE > (0)::numeric))"
+          ],
+          [
+            "status_text",
+            "d",
+            true,
+            "'queued'::text",
+            null,
+            "status_text_not_null:true:NOT NULL"
+          ],
+          [
+            "usage_status",
+            "d",
+            false,
+            null,
+            "status domain",
+            "usage_status_check:true:CHECK ((VALUE = ANY (ARRAY['queued'::text, 'done'::text])))"
+          ],
+          [
+            "usage_status_enum",
+            "e",
+            false,
+            null,
+            "usage status enum",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            true,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,amount::numeric,status::text FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "amount",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          1700,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "10",
+            "queued"
+          ],
+          [
+            2,
+            "200",
+            "queued"
+          ],
+          [
+            3,
+            null,
+            "queued"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            true,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "DELETE FROM domain_rows WHERE id=3",
+      "command_tag": "DELETE 1",
+      "notices": []
+    },
+    {
+      "sql": "ALTER DOMAIN positive_amount SET NOT NULL",
+      "id": "sql-0308",
+      "source_entry_sha256": "0eec3c0dae514eb6203ed061ef2987d2bf4cf2db90be9195293e635a364ae7eb",
+      "command_tag": "ALTER DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "\nSELECT t.typname,t.typtype::text,t.typnotnull,\n       pg_get_expr(t.typdefaultbin,0) AS default_expression,\n       obj_description(t.oid,'pg_type') AS comment,\n       (SELECT string_agg(c.conname || ':' || c.convalidated::text || ':' ||\n                           pg_get_constraintdef(c.oid), ';' ORDER BY c.conname)\n        FROM pg_constraint c WHERE c.contypid=t.oid) AS constraints\nFROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace\nWHERE n.nspname='public' AND t.typname IN\n ('positive_amount','status_text','usage_status','usage_status_enum')\nORDER BY t.typname\n",
+      "command_tag": "SELECT 4",
+      "output": {
+        "columns": [
+          "typname",
+          "typtype",
+          "typnotnull",
+          "default_expression",
+          "comment",
+          "constraints"
+        ],
+        "column_oids": [
+          19,
+          25,
+          16,
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "positive_amount",
+            "d",
+            true,
+            null,
+            null,
+            "positive_amount_check:true:CHECK ((VALUE > (0)::numeric));positive_amount_not_null:true:NOT NULL"
+          ],
+          [
+            "status_text",
+            "d",
+            true,
+            "'queued'::text",
+            null,
+            "status_text_not_null:true:NOT NULL"
+          ],
+          [
+            "usage_status",
+            "d",
+            false,
+            null,
+            "status domain",
+            "usage_status_check:true:CHECK ((VALUE = ANY (ARRAY['queued'::text, 'done'::text])))"
+          ],
+          [
+            "usage_status_enum",
+            "e",
+            false,
+            null,
+            "usage status enum",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            true,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,amount::numeric,status::text FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 2",
+      "output": {
+        "columns": [
+          "id",
+          "amount",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          1700,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "10",
+            "queued"
+          ],
+          [
+            2,
+            "200",
+            "queued"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT NULL::positive_amount",
+      "sqlstate": "23502",
+      "notices": []
+    },
+    {
+      "sql": "SELECT r.id,r.amount IS NULL AS absent FROM (VALUES(99::bigint)) x(id) LEFT JOIN domain_rows r ON r.id=x.id",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "id",
+          "absent"
+        ],
+        "column_oids": [
+          20,
+          16
+        ],
+        "rows": [
+          [
+            null,
+            true
+          ]
+        ],
+        "sql_nulls": [
+          [
+            true,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "ALTER DOMAIN status_text SET DEFAULT 'done'",
+      "command_tag": "ALTER DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "\nSELECT t.typname,t.typtype::text,t.typnotnull,\n       pg_get_expr(t.typdefaultbin,0) AS default_expression,\n       obj_description(t.oid,'pg_type') AS comment,\n       (SELECT string_agg(c.conname || ':' || c.convalidated::text || ':' ||\n                           pg_get_constraintdef(c.oid), ';' ORDER BY c.conname)\n        FROM pg_constraint c WHERE c.contypid=t.oid) AS constraints\nFROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace\nWHERE n.nspname='public' AND t.typname IN\n ('positive_amount','status_text','usage_status','usage_status_enum')\nORDER BY t.typname\n",
+      "command_tag": "SELECT 4",
+      "output": {
+        "columns": [
+          "typname",
+          "typtype",
+          "typnotnull",
+          "default_expression",
+          "comment",
+          "constraints"
+        ],
+        "column_oids": [
+          19,
+          25,
+          16,
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "positive_amount",
+            "d",
+            true,
+            null,
+            null,
+            "positive_amount_check:true:CHECK ((VALUE > (0)::numeric));positive_amount_not_null:true:NOT NULL"
+          ],
+          [
+            "status_text",
+            "d",
+            true,
+            "'done'::text",
+            null,
+            "status_text_not_null:true:NOT NULL"
+          ],
+          [
+            "usage_status",
+            "d",
+            false,
+            null,
+            "status domain",
+            "usage_status_check:true:CHECK ((VALUE = ANY (ARRAY['queued'::text, 'done'::text])))"
+          ],
+          [
+            "usage_status_enum",
+            "e",
+            false,
+            null,
+            "usage status enum",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            true,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,amount::numeric,status::text FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 2",
+      "output": {
+        "columns": [
+          "id",
+          "amount",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          1700,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "10",
+            "queued"
+          ],
+          [
+            2,
+            "200",
+            "queued"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO domain_rows(id,amount) VALUES(4,5)",
+      "command_tag": "INSERT 0 1",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,amount::numeric,status::text FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "amount",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          1700,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "10",
+            "queued"
+          ],
+          [
+            2,
+            "200",
+            "queued"
+          ],
+          [
+            4,
+            "5",
+            "done"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "ALTER DOMAIN positive_amount ADD CONSTRAINT bounded CHECK (VALUE < 100) NOT VALID",
+      "command_tag": "ALTER DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "\nSELECT t.typname,t.typtype::text,t.typnotnull,\n       pg_get_expr(t.typdefaultbin,0) AS default_expression,\n       obj_description(t.oid,'pg_type') AS comment,\n       (SELECT string_agg(c.conname || ':' || c.convalidated::text || ':' ||\n                           pg_get_constraintdef(c.oid), ';' ORDER BY c.conname)\n        FROM pg_constraint c WHERE c.contypid=t.oid) AS constraints\nFROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace\nWHERE n.nspname='public' AND t.typname IN\n ('positive_amount','status_text','usage_status','usage_status_enum')\nORDER BY t.typname\n",
+      "command_tag": "SELECT 4",
+      "output": {
+        "columns": [
+          "typname",
+          "typtype",
+          "typnotnull",
+          "default_expression",
+          "comment",
+          "constraints"
+        ],
+        "column_oids": [
+          19,
+          25,
+          16,
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "positive_amount",
+            "d",
+            true,
+            null,
+            null,
+            "bounded:false:CHECK ((VALUE < (100)::numeric)) NOT VALID;positive_amount_check:true:CHECK ((VALUE > (0)::numeric));positive_amount_not_null:true:NOT NULL"
+          ],
+          [
+            "status_text",
+            "d",
+            true,
+            "'done'::text",
+            null,
+            "status_text_not_null:true:NOT NULL"
+          ],
+          [
+            "usage_status",
+            "d",
+            false,
+            null,
+            "status domain",
+            "usage_status_check:true:CHECK ((VALUE = ANY (ARRAY['queued'::text, 'done'::text])))"
+          ],
+          [
+            "usage_status_enum",
+            "e",
+            false,
+            null,
+            "usage status enum",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            true,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO domain_rows(id,amount) VALUES(5,300)",
+      "sqlstate": "23514",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,amount::numeric,status::text FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "amount",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          1700,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "10",
+            "queued"
+          ],
+          [
+            2,
+            "200",
+            "queued"
+          ],
+          [
+            4,
+            "5",
+            "done"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "ALTER DOMAIN positive_amount VALIDATE CONSTRAINT bounded",
+      "sqlstate": "23514",
+      "notices": []
+    },
+    {
+      "sql": "\nSELECT t.typname,t.typtype::text,t.typnotnull,\n       pg_get_expr(t.typdefaultbin,0) AS default_expression,\n       obj_description(t.oid,'pg_type') AS comment,\n       (SELECT string_agg(c.conname || ':' || c.convalidated::text || ':' ||\n                           pg_get_constraintdef(c.oid), ';' ORDER BY c.conname)\n        FROM pg_constraint c WHERE c.contypid=t.oid) AS constraints\nFROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace\nWHERE n.nspname='public' AND t.typname IN\n ('positive_amount','status_text','usage_status','usage_status_enum')\nORDER BY t.typname\n",
+      "command_tag": "SELECT 4",
+      "output": {
+        "columns": [
+          "typname",
+          "typtype",
+          "typnotnull",
+          "default_expression",
+          "comment",
+          "constraints"
+        ],
+        "column_oids": [
+          19,
+          25,
+          16,
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "positive_amount",
+            "d",
+            true,
+            null,
+            null,
+            "bounded:false:CHECK ((VALUE < (100)::numeric)) NOT VALID;positive_amount_check:true:CHECK ((VALUE > (0)::numeric));positive_amount_not_null:true:NOT NULL"
+          ],
+          [
+            "status_text",
+            "d",
+            true,
+            "'done'::text",
+            null,
+            "status_text_not_null:true:NOT NULL"
+          ],
+          [
+            "usage_status",
+            "d",
+            false,
+            null,
+            "status domain",
+            "usage_status_check:true:CHECK ((VALUE = ANY (ARRAY['queued'::text, 'done'::text])))"
+          ],
+          [
+            "usage_status_enum",
+            "e",
+            false,
+            null,
+            "usage status enum",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            true,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "UPDATE domain_rows SET amount=20 WHERE id=2",
+      "command_tag": "UPDATE 1",
+      "notices": []
+    },
+    {
+      "sql": "ALTER DOMAIN positive_amount VALIDATE CONSTRAINT bounded",
+      "command_tag": "ALTER DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "\nSELECT t.typname,t.typtype::text,t.typnotnull,\n       pg_get_expr(t.typdefaultbin,0) AS default_expression,\n       obj_description(t.oid,'pg_type') AS comment,\n       (SELECT string_agg(c.conname || ':' || c.convalidated::text || ':' ||\n                           pg_get_constraintdef(c.oid), ';' ORDER BY c.conname)\n        FROM pg_constraint c WHERE c.contypid=t.oid) AS constraints\nFROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace\nWHERE n.nspname='public' AND t.typname IN\n ('positive_amount','status_text','usage_status','usage_status_enum')\nORDER BY t.typname\n",
+      "command_tag": "SELECT 4",
+      "output": {
+        "columns": [
+          "typname",
+          "typtype",
+          "typnotnull",
+          "default_expression",
+          "comment",
+          "constraints"
+        ],
+        "column_oids": [
+          19,
+          25,
+          16,
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "positive_amount",
+            "d",
+            true,
+            null,
+            null,
+            "bounded:true:CHECK ((VALUE < (100)::numeric));positive_amount_check:true:CHECK ((VALUE > (0)::numeric));positive_amount_not_null:true:NOT NULL"
+          ],
+          [
+            "status_text",
+            "d",
+            true,
+            "'done'::text",
+            null,
+            "status_text_not_null:true:NOT NULL"
+          ],
+          [
+            "usage_status",
+            "d",
+            false,
+            null,
+            "status domain",
+            "usage_status_check:true:CHECK ((VALUE = ANY (ARRAY['queued'::text, 'done'::text])))"
+          ],
+          [
+            "usage_status_enum",
+            "e",
+            false,
+            null,
+            "usage status enum",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            true,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,amount::numeric,status::text FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "amount",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          1700,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "10",
+            "queued"
+          ],
+          [
+            2,
+            "20",
+            "queued"
+          ],
+          [
+            4,
+            "5",
+            "done"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "DROP DOMAIN positive_amount",
+      "sqlstate": "2BP01",
+      "notices": []
+    },
+    {
+      "sql": "\nSELECT t.typname,t.typtype::text,t.typnotnull,\n       pg_get_expr(t.typdefaultbin,0) AS default_expression,\n       obj_description(t.oid,'pg_type') AS comment,\n       (SELECT string_agg(c.conname || ':' || c.convalidated::text || ':' ||\n                           pg_get_constraintdef(c.oid), ';' ORDER BY c.conname)\n        FROM pg_constraint c WHERE c.contypid=t.oid) AS constraints\nFROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace\nWHERE n.nspname='public' AND t.typname IN\n ('positive_amount','status_text','usage_status','usage_status_enum')\nORDER BY t.typname\n",
+      "command_tag": "SELECT 4",
+      "output": {
+        "columns": [
+          "typname",
+          "typtype",
+          "typnotnull",
+          "default_expression",
+          "comment",
+          "constraints"
+        ],
+        "column_oids": [
+          19,
+          25,
+          16,
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "positive_amount",
+            "d",
+            true,
+            null,
+            null,
+            "bounded:true:CHECK ((VALUE < (100)::numeric));positive_amount_check:true:CHECK ((VALUE > (0)::numeric));positive_amount_not_null:true:NOT NULL"
+          ],
+          [
+            "status_text",
+            "d",
+            true,
+            "'done'::text",
+            null,
+            "status_text_not_null:true:NOT NULL"
+          ],
+          [
+            "usage_status",
+            "d",
+            false,
+            null,
+            "status domain",
+            "usage_status_check:true:CHECK ((VALUE = ANY (ARRAY['queued'::text, 'done'::text])))"
+          ],
+          [
+            "usage_status_enum",
+            "e",
+            false,
+            null,
+            "usage status enum",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            true,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,amount::numeric,status::text FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "amount",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          1700,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "10",
+            "queued"
+          ],
+          [
+            2,
+            "20",
+            "queued"
+          ],
+          [
+            4,
+            "5",
+            "done"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    }
+  ],
+  "cold": [
+    {
+      "sql": "\nSELECT t.typname,t.typtype::text,t.typnotnull,\n       pg_get_expr(t.typdefaultbin,0) AS default_expression,\n       obj_description(t.oid,'pg_type') AS comment,\n       (SELECT string_agg(c.conname || ':' || c.convalidated::text || ':' ||\n                           pg_get_constraintdef(c.oid), ';' ORDER BY c.conname)\n        FROM pg_constraint c WHERE c.contypid=t.oid) AS constraints\nFROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace\nWHERE n.nspname='public' AND t.typname IN\n ('positive_amount','status_text','usage_status','usage_status_enum')\nORDER BY t.typname\n",
+      "command_tag": "SELECT 4",
+      "output": {
+        "columns": [
+          "typname",
+          "typtype",
+          "typnotnull",
+          "default_expression",
+          "comment",
+          "constraints"
+        ],
+        "column_oids": [
+          19,
+          25,
+          16,
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "positive_amount",
+            "d",
+            true,
+            null,
+            null,
+            "bounded:true:CHECK ((VALUE < (100)::numeric));positive_amount_check:true:CHECK ((VALUE > (0)::numeric));positive_amount_not_null:true:NOT NULL"
+          ],
+          [
+            "status_text",
+            "d",
+            true,
+            "'done'::text",
+            null,
+            "status_text_not_null:true:NOT NULL"
+          ],
+          [
+            "usage_status",
+            "d",
+            false,
+            null,
+            "status domain",
+            "usage_status_check:true:CHECK ((VALUE = ANY (ARRAY['queued'::text, 'done'::text])))"
+          ],
+          [
+            "usage_status_enum",
+            "e",
+            false,
+            null,
+            "usage status enum",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            true,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,amount::numeric,status::text FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "amount",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          1700,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "10",
+            "queued"
+          ],
+          [
+            2,
+            "20",
+            "queued"
+          ],
+          [
+            4,
+            "5",
+            "done"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO domain_rows(id,amount) VALUES(5,NULL)",
+      "sqlstate": "23502",
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO domain_rows(id,amount) VALUES(5,100)",
+      "sqlstate": "23514",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,amount::numeric,status::text FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "amount",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          1700,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "10",
+            "queued"
+          ],
+          [
+            2,
+            "20",
+            "queued"
+          ],
+          [
+            4,
+            "5",
+            "done"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT ('done'::status_text)::text AS value,pg_typeof('done'::status_text)::text AS domain",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "value",
+          "domain"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "done",
+            "status_text"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    }
+  ],
+  "after": [
+    {
+      "sql": "DROP DOMAIN IF EXISTS positive_amount CASCADE",
+      "id": "sql-0310",
+      "source_entry_sha256": "61619eccb588ea721150176fc57fa72bff3301a15795377ebcc9df10d4accc80",
+      "command_tag": "DROP DOMAIN",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "drop cascades to column amount of table domain_rows"
+        }
+      ]
+    },
+    {
+      "sql": "\nSELECT t.typname,t.typtype::text,t.typnotnull,\n       pg_get_expr(t.typdefaultbin,0) AS default_expression,\n       obj_description(t.oid,'pg_type') AS comment,\n       (SELECT string_agg(c.conname || ':' || c.convalidated::text || ':' ||\n                           pg_get_constraintdef(c.oid), ';' ORDER BY c.conname)\n        FROM pg_constraint c WHERE c.contypid=t.oid) AS constraints\nFROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace\nWHERE n.nspname='public' AND t.typname IN\n ('positive_amount','status_text','usage_status','usage_status_enum')\nORDER BY t.typname\n",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "typname",
+          "typtype",
+          "typnotnull",
+          "default_expression",
+          "comment",
+          "constraints"
+        ],
+        "column_oids": [
+          19,
+          25,
+          16,
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "status_text",
+            "d",
+            true,
+            "'done'::text",
+            null,
+            "status_text_not_null:true:NOT NULL"
+          ],
+          [
+            "usage_status",
+            "d",
+            false,
+            null,
+            "status domain",
+            "usage_status_check:true:CHECK ((VALUE = ANY (ARRAY['queued'::text, 'done'::text])))"
+          ],
+          [
+            "usage_status_enum",
+            "e",
+            false,
+            null,
+            "usage status enum",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,status::text FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "queued"
+          ],
+          [
+            2,
+            "queued"
+          ],
+          [
+            4,
+            "done"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='domain_rows' ORDER BY ordinal_position",
+      "command_tag": "SELECT 2",
+      "output": {
+        "columns": [
+          "column_name"
+        ],
+        "column_oids": [
+          19
+        ],
+        "rows": [
+          [
+            "id"
+          ],
+          [
+            "status"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ],
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0)",
+      "command_tag": "CREATE DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "DROP DOMAIN positive_amount",
+      "id": "sql-0309",
+      "source_entry_sha256": "740ed270e3c48a7b21c8da57467bd80463a6dcff0c46393c640b3f518763cbfa",
+      "command_tag": "DROP DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "\nSELECT t.typname,t.typtype::text,t.typnotnull,\n       pg_get_expr(t.typdefaultbin,0) AS default_expression,\n       obj_description(t.oid,'pg_type') AS comment,\n       (SELECT string_agg(c.conname || ':' || c.convalidated::text || ':' ||\n                           pg_get_constraintdef(c.oid), ';' ORDER BY c.conname)\n        FROM pg_constraint c WHERE c.contypid=t.oid) AS constraints\nFROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace\nWHERE n.nspname='public' AND t.typname IN\n ('positive_amount','status_text','usage_status','usage_status_enum')\nORDER BY t.typname\n",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "typname",
+          "typtype",
+          "typnotnull",
+          "default_expression",
+          "comment",
+          "constraints"
+        ],
+        "column_oids": [
+          19,
+          25,
+          16,
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "status_text",
+            "d",
+            true,
+            "'done'::text",
+            null,
+            "status_text_not_null:true:NOT NULL"
+          ],
+          [
+            "usage_status",
+            "d",
+            false,
+            null,
+            "status domain",
+            "usage_status_check:true:CHECK ((VALUE = ANY (ARRAY['queued'::text, 'done'::text])))"
+          ],
+          [
+            "usage_status_enum",
+            "e",
+            false,
+            null,
+            "usage status enum",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            true,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true,
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "DROP DOMAIN IF EXISTS positive_amount CASCADE",
+      "command_tag": "DROP DOMAIN",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "type \"positive_amount\" does not exist, skipping"
+        }
+      ]
+    },
+    {
+      "sql": "DROP TABLE domain_rows",
+      "command_tag": "DROP TABLE",
+      "notices": []
+    },
+    {
+      "sql": "DROP DOMAIN status_text",
+      "command_tag": "DROP DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "DROP DOMAIN usage_status",
+      "command_tag": "DROP DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "DROP TYPE usage_status_enum",
+      "command_tag": "DROP TYPE",
+      "notices": []
+    },
+    {
+      "sql": "\nSELECT t.typname,t.typtype::text,t.typnotnull,\n       pg_get_expr(t.typdefaultbin,0) AS default_expression,\n       obj_description(t.oid,'pg_type') AS comment,\n       (SELECT string_agg(c.conname || ':' || c.convalidated::text || ':' ||\n                           pg_get_constraintdef(c.oid), ';' ORDER BY c.conname)\n        FROM pg_constraint c WHERE c.contypid=t.oid) AS constraints\nFROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace\nWHERE n.nspname='public' AND t.typname IN\n ('positive_amount','status_text','usage_status','usage_status_enum')\nORDER BY t.typname\n",
+      "command_tag": "SELECT 0",
+      "output": {
+        "columns": [
+          "typname",
+          "typtype",
+          "typnotnull",
+          "default_expression",
+          "comment",
+          "constraints"
+        ],
+        "column_oids": [
+          19,
+          25,
+          16,
+          25,
+          25,
+          25
+        ],
+        "rows": [],
+        "sql_nulls": []
+      },
+      "notices": []
+    }
+  ]
+}

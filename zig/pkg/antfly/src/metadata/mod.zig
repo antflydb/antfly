@@ -140,6 +140,7 @@ pub const TransitionStepResult = transition_driver.StepResult;
 pub const TransitionDriver = transition_driver.TransitionDriver;
 
 test "metadata module compiles" {
+    _ = @import("../system_catalog/views.zig");
     _ = @import("online_merge_driver.zig");
     _ = runtime_status_protocol;
     _ = storage;

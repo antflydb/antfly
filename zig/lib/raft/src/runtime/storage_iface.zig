@@ -20,6 +20,7 @@ const core = @import("../core/mod.zig");
 /// backing resource and must support concurrent cancellation-safe reads until
 /// `deinit` is called.
 pub const SnapshotArtifact = struct {
+    pub const max_application_manifest_bytes = 64 * 1024;
     ptr: *anyopaque,
     vtable: *const VTable,
 
@@ -27,6 +28,9 @@ pub const SnapshotArtifact = struct {
         len: *const fn (ptr: *anyopaque) u64,
         write_to: *const fn (ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void,
         read_all: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8,
+        /// Immutable application provenance, persisted with the payload. It
+        /// is not a callback, publication decision, or execution permission.
+        application_manifest: ?*const fn (ptr: *anyopaque) []const u8 = null,
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
@@ -40,6 +44,10 @@ pub const SnapshotArtifact = struct {
 
     pub fn readAll(self: SnapshotArtifact, alloc: std.mem.Allocator) ![]u8 {
         return try self.vtable.read_all(self.ptr, alloc);
+    }
+
+    pub fn applicationManifest(self: SnapshotArtifact) []const u8 {
+        return if (self.vtable.application_manifest) |get| get(self.ptr) else "";
     }
 
     pub fn deinit(self: SnapshotArtifact) void {

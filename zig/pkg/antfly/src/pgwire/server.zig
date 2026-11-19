@@ -60,7 +60,6 @@ const State = struct {
     tasks: std.Io.Group = .init,
     active: std.atomic.Value(u32) = .init(0),
     mutex: std.Io.Mutex = .init,
-    next_pid: u32 = 0,
     sessions: std.AutoHashMapUnmanaged(i32, *protocol.Session) = .empty,
 
     fn acceptLoop(self: *State) void {
@@ -94,18 +93,31 @@ const State = struct {
         try self.mutex.lock(self.config.io);
         defer self.mutex.unlock(self.config.io);
         if (self.sessions.count() >= self.config.max_connections) return error.TooManyConnections;
-        while (true) {
-            self.next_pid = (self.next_pid % std.math.maxInt(i32)) + 1;
-            const pid: i32 = @intCast(self.next_pid);
-            if (self.sessions.contains(pid)) continue;
+        const pid = try self.availablePid();
+        var secret_bytes: [4]u8 = undefined;
+        try self.config.io.randomSecure(&secret_bytes);
+        try self.sessions.put(self.alloc, pid, session);
+        session.backend_pid = pid;
+        session.cancel_key = std.mem.readInt(i32, &secret_bytes, .big);
+    }
+    fn availablePid(self: *State) !i32 {
+        for (0..128) |_| {
             var bytes: [4]u8 = undefined;
             try self.config.io.randomSecure(&bytes);
-            const secret = std.mem.readInt(i32, &bytes, .big);
-            try self.sessions.put(self.alloc, pid, session);
-            session.backend_pid = pid;
-            session.cancel_key = secret;
-            return;
+            const pid: i32 = @intCast(1 + std.mem.readInt(u32, &bytes, .big) % std.math.maxInt(i32));
+            if (!self.sessions.contains(pid)) return pid;
         }
+        return error.TooManyConnections;
+    }
+    fn rekey(raw: *anyopaque, session: *protocol.Session) !void {
+        const self: *State = @ptrCast(@alignCast(raw));
+        try self.mutex.lock(self.config.io);
+        defer self.mutex.unlock(self.config.io);
+        if (self.sessions.get(session.backend_pid) != session) return error.ProtocolViolation;
+        const next = try self.availablePid();
+        try self.sessions.put(self.alloc, next, session);
+        _ = self.sessions.remove(session.backend_pid);
+        session.backend_pid = next;
     }
 
     fn unregister(raw: *anyopaque, session: *protocol.Session) void {
@@ -168,7 +180,7 @@ fn serveConnection(state: *State, stream: std.Io.net.Stream) void {
         .reader = &reader.interface,
         .writer = &writer.interface,
         .limits = state.config.limits,
-        .hooks = .{ .context = state, .register = State.register, .unregister = State.unregister, .cancel = State.cancel },
+        .hooks = .{ .context = state, .register = State.register, .rekey = State.rekey, .unregister = State.unregister, .cancel = State.cancel },
     };
     // A gateway must never infer completion from EOF, timeout or cancellation.
     // Emit the private receipt only after structured cancellation has joined

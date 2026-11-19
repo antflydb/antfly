@@ -1,0 +1,116 @@
+{
+  "postgres_reference_sha256": "19aa430c42c334e6039a7df6658ae784f236d8e95f29e62239b746e0d775c7dd",
+  "scope": "configured controlled WASM package lifecycle; no upstream payload parity",
+  "entries": [
+    {
+      "id": "sql-0148",
+      "source_entry_sha256": "bf225a9c3ea25ddd9c66ee20105baf2a2d2617df431e06c9af1c0efb22086e43",
+      "name": "extension comment metadata ddl",
+      "family": "ddl",
+      "sql": "COMMENT ON EXTENSION vector IS 'vector search extension';",
+      "params": [],
+      "source_expectation": "requires_behavior_review",
+      "sql_sha256": "5d72bc5442f3f2eeb5cf0af1dc5db56c212d9c08505d2b214a301da59777f3b3"
+    },
+    {
+      "id": "sql-0754",
+      "source_entry_sha256": "e658a5594c1880601cbd6f6423c24ef6851c79cc38044632815975e7629f7f21",
+      "name": "idempotent pgcrypto extension catalog syntax",
+      "family": "ddl",
+      "sql": "CREATE EXTENSION IF NOT EXISTS pgcrypto;",
+      "params": [],
+      "source_expectation": "requires_behavior_review",
+      "sql_sha256": "8dc31f73d2de82376a3c01e942f2160323fa406ae4541637ee4a0e5a758a8c98"
+    },
+    {
+      "id": "sql-0755",
+      "source_entry_sha256": "09254bb4e742db6a63729d2610c7943e47658d6de76b79496c83d5ee5300dd71",
+      "name": "idempotent public pgcrypto extension catalog syntax",
+      "family": "ddl",
+      "sql": "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;",
+      "params": [],
+      "source_expectation": "requires_behavior_review",
+      "sql_sha256": "11d364976172fdbb6598b5e11885a8582a958097dd426efb87643adde8966e76"
+    },
+    {
+      "id": "sql-0756",
+      "source_entry_sha256": "9bdf59adc75ba855298081fd2c17e64bf49582ca32f07db751d3ed531dd726b6",
+      "name": "create extension catalog ddl",
+      "family": "ddl",
+      "sql": "CREATE EXTENSION postgis;",
+      "params": [],
+      "source_expectation": "requires_behavior_review",
+      "sql_sha256": "97f56e9c05e2de23b900e8e0f082d055ce9b0529de06c6a7c47fe796456f963a"
+    },
+    {
+      "id": "sql-0757",
+      "source_entry_sha256": "d79bb9ae19d0e33a5bbff7484d47f3a7af8acb03954871c9e497d77e97f94f37",
+      "name": "create versioned extension catalog ddl",
+      "family": "ddl",
+      "sql": "CREATE EXTENSION postgis VERSION '3.4.0';",
+      "params": [],
+      "source_expectation": "requires_behavior_review",
+      "sql_sha256": "65ee4a2cf4a4de78e456526f2ca0160ed44d9a7adbb75727136203426044c82b"
+    },
+    {
+      "id": "sql-0758",
+      "source_entry_sha256": "a36c57033c76545869e681063dc6bb67f9f4b86b421199d6579d0a1d7a91e92c",
+      "name": "create idempotent versioned extension catalog ddl",
+      "family": "ddl",
+      "sql": "CREATE EXTENSION IF NOT EXISTS postgis VERSION '3.4.0';",
+      "params": [],
+      "source_expectation": "requires_behavior_review",
+      "sql_sha256": "3ae6f41fa8fb64393e22943e4ca8008033324e0c9944aa2780862608df2f223c"
+    },
+    {
+      "id": "sql-0759",
+      "source_entry_sha256": "1ae6f583fd34487b0820e003631924bc861601da50bb335ffd340bf96deeaf85",
+      "name": "create quoted sql-name extension catalog ddl",
+      "family": "ddl",
+      "sql": "CREATE EXTENSION \"uuid-ossp\" VERSION '1.0.0';",
+      "params": [],
+      "source_expectation": "requires_behavior_review",
+      "sql_sha256": "0f4c8851233628ddbc8fd504f42b35af5d49557edb9bd3f5aae55b2fd473ff60"
+    },
+    {
+      "id": "sql-0760",
+      "source_entry_sha256": "5c9baefd9c6793002c831c7c19a0110edf5b4caa8645b9bb7a7e5a75c6fb76d0",
+      "name": "alter extension update catalog ddl",
+      "family": "ddl",
+      "sql": "ALTER EXTENSION postgis UPDATE TO '3.5.0';",
+      "params": [],
+      "source_expectation": "requires_behavior_review",
+      "sql_sha256": "a5f586daee0eb86d0fd6a59a3f37171a3013d9157cd4e2d1afa6397d236ffad0"
+    },
+    {
+      "id": "sql-0761",
+      "source_entry_sha256": "2aa7f0beec586a1a88b7c20dfb11c53d23aa1381b9ff50612c7cf1594370c815",
+      "name": "alter extension update latest catalog ddl",
+      "family": "ddl",
+      "sql": "ALTER EXTENSION postgis UPDATE;",
+      "params": [],
+      "source_expectation": "requires_behavior_review",
+      "sql_sha256": "ead07a6d470118af7f54474d6522fa79d6c1b55dff67f86a17bcc9b2182e5141"
+    },
+    {
+      "id": "sql-0762",
+      "source_entry_sha256": "3d6a5b8e9c4a4077762c80387a876746a3f90202bbc3b24fe3be0e6010f4cd8a",
+      "name": "drop extension catalog ddl",
+      "family": "ddl",
+      "sql": "DROP EXTENSION postgis;",
+      "params": [],
+      "source_expectation": "requires_behavior_review",
+      "sql_sha256": "f17a26dc2ac4089bfbd0c3c30685adc24ac15e973496b0f94b4012192d08b852"
+    },
+    {
+      "id": "sql-0763",
+      "source_entry_sha256": "eb35d488e27e2747697ee0b95004afd95e150399a6fdc63af35c7dad9a753a10",
+      "name": "drop extension cascade catalog ddl",
+      "family": "ddl",
+      "sql": "DROP EXTENSION IF EXISTS postgis CASCADE;",
+      "params": [],
+      "source_expectation": "requires_behavior_review",
+      "sql_sha256": "0ed92dd54dd89f10cfc3eeedd21b719062f45b0e3002f02cfe535da499fa1be2"
+    }
+  ]
+}

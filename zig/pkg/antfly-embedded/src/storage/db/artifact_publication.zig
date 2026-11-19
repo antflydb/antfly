@@ -942,7 +942,7 @@ pub fn validateRequest(alloc: std.mem.Allocator, request: anytype) !void {
         {
             if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
                 if (@field(request, reflected_name).len != 0) return error.InvalidBatchRequest;
-            } else if (!std.meta.eql(@field(request, reflected_name), @field(defaults, reflected_name))) return error.InvalidBatchRequest;
+            } else if (!@import("../control_field_defaults.zig").isolatedFieldMatchesDefault(reflected_name, @field(request, reflected_name), @field(defaults, reflected_name))) return error.InvalidBatchRequest;
         }
     }
 }

@@ -383,17 +383,22 @@ test "group source unit windows are arrival independent and append preserves com
     for (before, after[0..before.len]) |old, new| try std.testing.expectEqualSlices(u8, &old.fingerprint, &new.fingerprint);
 }
 
+// One discovery anchor is shared across consumer/implementation inventories;
+// named behavioral tests keep their explicit owners.
 test {
     _ = @import("group_prior_context.zig");
     _ = @import("group_prior_scan.zig");
-}
-
-test {
     _ = @import("group_source_index.zig");
-}
-
-test {
     _ = @import("group_source_state.zig");
+    _ = @import("group_source_snapshot.zig");
+    _ = @import("group_source_baseline.zig");
+    _ = @import("group_source_worker.zig");
+    _ = @import("group_source_retirement.zig");
+    _ = @import("group_source_propagation_test.zig");
+    _ = @import("group_source_lease_test.zig");
+    _ = @import("group_source_owner_identity.zig");
+    _ = @import("group_source_bytes.zig");
+    _ = @import("group_source_reads.zig");
 }
 
 test "group source configuration cloning unwinds every allocation and canonicalizes filter identity" {
@@ -414,10 +419,6 @@ test "group source configuration cloning unwinds every allocation and canonicali
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{config});
-}
-
-test {
-    _ = @import("group_source_snapshot.zig");
 }
 
 pub fn definitionDigest(name: []const u8, config: Config) Digest {
@@ -448,15 +449,6 @@ test "group scalar identity distinguishes integer string and reserved-prefix str
     try std.testing.expectEqualStrings(number, (try scalarMetadata(escaped)).string);
 }
 
-test {
-    _ = @import("group_source_baseline.zig");
-    _ = @import("group_source_worker.zig");
-    _ = @import("group_source_retirement.zig");
-    _ = @import("group_source_propagation_test.zig");
-    _ = @import("group_source_lease_test.zig");
-    _ = @import("group_source_owner_identity.zig");
-}
-
 test "group source admission excludes null membership and rejects oversized selected members" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -482,12 +474,4 @@ test "group sources normalize prepared relational integer lexemes without confla
     try std.testing.expect(!std.mem.eql(u8, try scalarKey(a, .{ .string = "1" }), selected.group));
     try std.testing.expectError(error.InvalidGroupedSourceMember, integerValue(.{ .number_string = "1.5" }));
     try std.testing.expectError(error.InvalidGroupedSourceMember, integerValue(.{ .number_string = "9223372036854775808" }));
-}
-
-test {
-    _ = @import("group_source_bytes.zig");
-}
-
-test {
-    _ = @import("group_source_reads.zig");
 }

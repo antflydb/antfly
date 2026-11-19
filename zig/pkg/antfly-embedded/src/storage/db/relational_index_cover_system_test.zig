@@ -24,11 +24,64 @@ const schema_json =
 ;
 
 fn ready(db: *db_mod.DB) !void {
+    return readyIndex(db, "by_id");
+}
+
+fn readyIndex(db: *db_mod.DB, name: []const u8) !void {
     for (0..1024) |_| {
-        if ((try db.relationalIndexBuildStatus("by_id")).state == .ready) return;
+        if ((try db.relationalIndexBuildStatus(name)).state == .ready) return;
         _ = try db.runRelationalIndexMaintenancePass();
     }
     return error.IndexBuildDidNotConverge;
+}
+
+test "relational index system covering constraint derives compact payloads and cold index-only reads" {
+    const declaration =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"covered","columns":["id"],"include_columns":["label","label","id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"label":{"type":"keyword"},"wide":{"type":"keyword"}},"additionalProperties":false}}}}
+    ;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("constraint-cover");
+    defer directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 } };
+    var db = try db_mod.DB.open(alloc, directory.path(), options);
+    var open = true;
+    defer if (open) db.close();
+    // Exercise physical build/hydration here, not a bypass of distributed
+    // constraint admission. Seed the unconstrained predecessor; public SQL's
+    // mounted campaign separately proves activation and future-write checks.
+    const predecessor =
+        \\{"version":0,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"label":{"type":"keyword"},"wide":{"type":"keyword"}},"additionalProperties":false}}}}
+    ;
+    try db.setSchemaJson(alloc, predecessor);
+    const wide: [16 * 1024]u8 = @splat('x');
+    const initial = try std.fmt.allocPrint(alloc, "{{\"id\":1,\"label\":\"before\",\"wide\":\"{s}\"}}", .{wide});
+    defer alloc.free(initial);
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = initial }} });
+    try db.setSchemaJson(alloc, declaration);
+    try readyIndex(&db, "covered");
+    {
+        var page = try scan(&db, .{ .index = "covered", .fields = &.{"label"} });
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
+        try std.testing.expectEqual(@as(usize, 1), page.index_only_rows);
+        try std.testing.expectEqualStrings("{\"label\":\"before\"}", page.rows[0].json);
+    }
+    db.close();
+    open = false;
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    open = true;
+    try readyIndex(&db, "covered");
+    {
+        var page = try scan(&db, .{ .index = "covered", .fields = &.{ "id", "label" } });
+        defer page.deinit();
+        var primary = try scan(&db, .{ .fields = &.{ "id", "label" } });
+        defer primary.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
+        try std.testing.expectEqual(@as(usize, 1), page.index_only_rows);
+        try std.testing.expectEqualStrings(primary.rows[0].json, page.rows[0].json);
+        try std.testing.expectEqualSlices(u8, &primary.rows[0].semantic_hash, &page.rows[0].semantic_hash);
+    }
 }
 
 fn scan(db: *db_mod.DB, request: rows.Request) !rows.Page {

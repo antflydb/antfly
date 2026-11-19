@@ -52,7 +52,7 @@ pub fn requireMutable(txn: anytype) !void {
 pub fn admitCommands(txn: anytype, commands: []const integrity.Command) !void {
     const progress = (try current(txn)) orelse return;
     for (commands) |command| if (progress.includes(command.address.generation)) switch (command.operation) {
-        .detach, .repair_detach, .release, .repair_release => {},
+        .detach, .repair_detach, .release, .repair_release, .release_interval => {},
         else => return error.ConstraintRetirementInProgress,
     };
 }

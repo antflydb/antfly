@@ -53,6 +53,7 @@ pub const Update = struct {
         if (self.version != 1 or self.sequence == 0 or self.report.reporter_incarnation == 0 or self.report.runtime_reference) return error.InvalidStoreReporterFence;
         if (self.report.store_id == 0) return error.InvalidNodeID;
         if (self.report.relational_topology_protocol_version > metadata.relational_topology_protocol_version) return error.InvalidStoreReporterFence;
+        if (!self.report.schema_reader.validForReporter(self.report.reporter_incarnation)) return error.InvalidStoreReporterFence;
         if (!metadata.reporterFenceValid(self.report.reporter_incarnation, self.report.status_generation) or
             !metadata.embeddingActivityReportValid(self.report.reporter_incarnation, self.report.embedding_activity_protocol_version, self.report.embedding_activity_sequence) or
             !metadata.embeddingActivitySamplesValid(self.report.embedding_activity_protocol_version, self.report.runtime_statuses) or

@@ -21,6 +21,7 @@ pub const FileSnapshotArtifact = struct {
     io: std.Io,
     path: []u8,
     size: u64,
+    application_manifest: []u8,
 
     pub fn create(
         alloc: std.mem.Allocator,
@@ -28,13 +29,21 @@ pub const FileSnapshotArtifact = struct {
         path: []const u8,
         size: u64,
     ) !raft_engine.runtime.storage_iface.SnapshotArtifact {
+        return createWithApplicationManifest(alloc, io, path, size, "");
+    }
+
+    pub fn createWithApplicationManifest(alloc: std.mem.Allocator, io: std.Io, path: []const u8, size: u64, manifest: []const u8) !raft_engine.runtime.storage_iface.SnapshotArtifact {
+        if (manifest.len > raft_engine.runtime.storage_iface.SnapshotArtifact.max_application_manifest_bytes) return error.SnapshotPayloadTooLarge;
         const self = try alloc.create(FileSnapshotArtifact);
         errdefer alloc.destroy(self);
+        const owned_path = try alloc.dupe(u8, path);
+        errdefer alloc.free(owned_path);
         self.* = .{
             .alloc = alloc,
             .io = io,
-            .path = try alloc.dupe(u8, path),
+            .path = owned_path,
             .size = size,
+            .application_manifest = try alloc.dupe(u8, manifest),
         };
         return .{
             .ptr = self,
@@ -42,9 +51,15 @@ pub const FileSnapshotArtifact = struct {
                 .len = len,
                 .write_to = writeTo,
                 .read_all = readAll,
+                .application_manifest = applicationManifest,
                 .deinit = deinit,
             },
         };
+    }
+
+    fn applicationManifest(ptr: *anyopaque) []const u8 {
+        const self: *FileSnapshotArtifact = @ptrCast(@alignCast(ptr));
+        return self.application_manifest;
     }
 
     fn len(ptr: *anyopaque) u64 {
@@ -83,6 +98,7 @@ pub const FileSnapshotArtifact = struct {
             else => std.log.warn("raft snapshot spool cleanup failed path={s} error={s}", .{ self.path, @errorName(err) }),
         };
         self.alloc.free(self.path);
+        self.alloc.free(self.application_manifest);
         const alloc = self.alloc;
         self.* = undefined;
         alloc.destroy(self);

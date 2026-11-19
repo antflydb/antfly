@@ -40,37 +40,67 @@ fn apply(target: *db_mod.DB, value: *const staging.PreparedPage, index: u64) !vo
 }
 
 test "relational index system rewrite shared staging preserves post-cut updates deletes partial frames and replay across reopen" {
-    try runRewrite(false, false);
+    try runRewrite(false, false, false, false, false);
 }
 
 test "relational index system rewrite unchanged document cohort preserves snapshot tail timestamps and recovery" {
-    try runRewrite(true, false);
+    try runRewrite(true, false, false, false, false);
+}
+
+test "SQL USING rewrite applies snapshot and post-cut tail exactly once across cancellation corruption and cold resume" {
+    try runRewrite(false, true, false, false, false);
+}
+
+test "SQL column rename replays old-name tail values exactly once through corruption cancellation and cold resume" {
+    try runRewrite(false, false, true, false, false);
+}
+
+test "SQL UUID defaults backfill once through snapshot tail replay corruption cancellation and cold resume" {
+    try runRewrite(false, false, false, true, false);
 }
 
 test "time series rewrite staging preserves signed snapshot and retained tail sources across restart" {
-    try runRewrite(true, true);
+    try runRewrite(true, false, false, false, true);
 }
 
-fn runRewrite(preserve_document: bool, time_series: bool) !void {
+fn runRewrite(preserve_document: bool, using: bool, rename: bool, uuid_defaults: bool, time_series: bool) !void {
+    var runtime = try @import("../background_runtime.zig").BackendRuntimeHandle.initManualWithOwnedIo(alloc);
+    defer runtime.deinit();
     const ordinary_document_schema = "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"}},\"required\":[\"x\"],\"additionalProperties\":false}}}}";
     const document_schema = if (time_series)
         \\{"version":1,"ttl_field":"at","ttl_duration_ns":9223372036854775807,"storage_mode":"document","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"x":{"type":"integer"},"at":{"type":"string","format":"date-time"}},"required":["x"],"additionalProperties":false}}}}
     else
         ordinary_document_schema;
     const from_schema = if (preserve_document) document_schema else source_schema;
-    const to_schema = if (preserve_document) document_schema else target_schema;
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
+    const uuid_target = if (uuid_defaults) schema: {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, target_schema, .{});
+        const defaults = try std.json.parseFromSliceLeaky(std.json.Value, a, "[{\"column\":\"id\",\"expression\":{\"op\":\"uuidv7\"}}]", .{});
+        try parsed.value.object.put(a, "column_defaults", defaults);
+        const properties = parsed.value.object.getPtr("document_schemas").?.object.getPtr("row").?.object.getPtr("schema").?.object.getPtr("properties").?;
+        try properties.object.put(a, "id", try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"type\":\"string\",\"format\":\"uuid\",\"x-antfly-sql-type\":\"uuid\"}", .{}));
+        break :schema try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    } else target_schema;
+    const to_schema = if (rename) try std.mem.replaceOwned(u8, a, target_schema, "\"x\"", "\"z\"") else if (preserve_document) document_schema else uuid_target;
     const source_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source", .{directory.sub_path});
     const target_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/target", .{directory.sub_path});
     // Routing group12 owns a pre-split logical identity112/113. Rewriting
     // preserves this source namespace instead of conflating it with routing.
     const source_options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 11, .shard_id = 112, .range_id = 113 }, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
-    const target_options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 21, .shard_id = 22, .range_id = 22 }, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
-    var programs = if (preserve_document) try rewrite.ProgramSet.initDocumentPreservation(alloc, document_schema) else try rewrite.ProgramSet.init(alloc, &.{from_schema}, to_schema, .{});
+    const target_options: db_mod.OpenOptions = .{ .backend_runtime = runtime.runtime, .identity_namespace = .{ .table_id = 21, .shard_id = 22, .range_id = 22 }, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
+    const policies: @import("relational_row_transform.zig").Policies = if (using) .{
+        .expression_schema = from_schema,
+        .column_transforms = &.{.{ .column = "x", .expression_json = "{\"op\":\"cast\",\"type\":\"integer\",\"sql_type\":\"int64\",\"args\":[{\"op\":\"add\",\"args\":[{\"op\":\"column\",\"column\":\"x\"},{\"op\":\"literal\",\"type\":\"integer\",\"value\":1}]}]}" }},
+    } else if (rename) .{
+        .dropped_columns = .allow,
+        .expression_schema = from_schema,
+        .column_transforms = &.{.{ .column = "z", .expression_json = "{\"op\":\"column\",\"column\":\"x\"}" }},
+    } else if (uuid_defaults) .{ .default_columns = &.{"id"} } else .{};
+    var programs = if (preserve_document) try rewrite.ProgramSet.initDocumentPreservation(alloc, document_schema) else try rewrite.ProgramSet.init(alloc, &.{from_schema}, to_schema, policies);
     defer programs.deinit();
     var source = try db_mod.DB.open(alloc, source_path, source_options);
     var source_open = true;
@@ -140,6 +170,11 @@ fn runRewrite(preserve_document: bool, time_series: bool) !void {
     try server_test_adapter.applyOrdered(&source, .{ .document_version_scheme = if (time_series) .revision_v1 else .legacy, .timestamp_ns = 202, .writes = &.{ .{ .key = "a", .value = if (time_series) "{\"x\":9,\"at\":\"1969-12-31T23:59:58Z\"}" else "{\"x\":9}" }, .{ .key = "c", .value = if (time_series) "{\"x\":5,\"at\":\"1970-01-01T00:00:00Z\"}" else "{\"x\":5}" } }, .deletes = &.{"b"} }, .{ .term = 1, .index = 4 });
     try apply(&target, &last, 3);
     try apply(&target, &last, 3); // Lost response, identical committed command.
+    const snapshot_uuid = if (uuid_defaults) uuid: {
+        const row_json = (try target.get(a, "a")).?;
+        const row = try std.json.parseFromSliceLeaky(std.json.Value, a, row_json, .{});
+        break :uuid try a.dupe(u8, row.object.get("id").?.string);
+    } else "";
     try std.testing.expectError(error.RestoreStagingProgressChanged, apply(&target, &first, 4));
     try server_test_adapter.applyOrdered(&source, .{ .relational_topology = .{ .fence = source_scope.fence, .action = .begin } }, .{ .term = 1, .index = 5 });
     try server_test_adapter.applyOrdered(&source, .{ .online_source = .{ .final_fence = .{ .scope = source_scope, .expected_sequence = start + 1 } } }, .{ .term = 1, .index = 6 });
@@ -243,12 +278,27 @@ fn runRewrite(preserve_document: bool, time_series: bool) !void {
     defer parsed_a.deinit();
     const parsed_c = try std.json.parseFromSlice(std.json.Value, alloc, c_json, .{});
     defer parsed_c.deinit();
+    if (uuid_defaults) {
+        const uuid = @import("../../common/uuid.zig");
+        const current = parsed_a.value.object.get("id").?.string;
+        const inserted = parsed_c.value.object.get("id").?.string;
+        try std.testing.expectEqualStrings(snapshot_uuid, current);
+        try std.testing.expectEqual(@as(?u4, 7), uuid.version(try uuid.parse(current)));
+        try std.testing.expectEqual(@as(?u4, 7), uuid.version(try uuid.parse(inserted)));
+        try std.testing.expect(!std.mem.eql(u8, current, inserted));
+    }
     if (preserve_document) {
         try std.testing.expectEqualStrings(if (time_series) "{\"x\":9,\"at\":\"1969-12-31T23:59:58Z\"}" else "{\"x\":9}", a_json);
         try std.testing.expectEqualStrings(if (time_series) "{\"x\":5,\"at\":\"1970-01-01T00:00:00Z\"}" else "{\"x\":5}", c_json);
     } else {
-        try std.testing.expectEqual(@as(i64, 27), parsed_a.value.object.get("g").?.integer);
-        try std.testing.expectEqual(@as(i64, 15), parsed_c.value.object.get("g").?.integer);
+        try std.testing.expectEqual(@as(i64, if (using) 30 else 27), parsed_a.value.object.get("g").?.integer);
+        try std.testing.expectEqual(@as(i64, if (using) 18 else 15), parsed_c.value.object.get("g").?.integer);
+        if (rename) {
+            try std.testing.expect(parsed_a.value.object.get("x") == null);
+            try std.testing.expect(parsed_c.value.object.get("x") == null);
+            try std.testing.expectEqual(@as(i64, 9), parsed_a.value.object.get("z").?.integer);
+            try std.testing.expectEqual(@as(i64, 5), parsed_c.value.object.get("z").?.integer);
+        }
     }
     try std.testing.expectEqual(@as(?[]u8, null), try target.get(alloc, "b"));
     try std.testing.expectEqual(@as(u64, 202), try target.getTimestamp(alloc, "a"));

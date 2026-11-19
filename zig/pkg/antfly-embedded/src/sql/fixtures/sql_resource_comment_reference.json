@@ -1,0 +1,67 @@
+{
+  "format": 1,
+  "cases": [
+    {
+      "id": "sql-0146",
+      "kind": "schema",
+      "name": "public",
+      "steps": [
+        {
+          "sql": "COMMENT ON SCHEMA public IS 'public schema';",
+          "description": "public schema"
+        },
+        {
+          "sql": "COMMENT ON SCHEMA public IS 'a ''quoted'' \u03a9'",
+          "description": "a 'quoted' \u03a9"
+        },
+        {
+          "sql": "COMMENT ON SCHEMA public IS NULL",
+          "description": null
+        },
+        {
+          "sql": "COMMENT ON SCHEMA public IS ''",
+          "description": null
+        },
+        {
+          "sql": "COMMENT ON SCHEMA public IS 'public schema';",
+          "description": "public schema"
+        }
+      ],
+      "denied_sqlstate": "42501",
+      "missing_sqlstate": "3F000",
+      "rename_preserves_identity": true,
+      "recreate_clears_description": true
+    },
+    {
+      "id": "sql-0147",
+      "kind": "database",
+      "name": "appdb",
+      "steps": [
+        {
+          "sql": "COMMENT ON DATABASE appdb IS 'application database';",
+          "description": "application database"
+        },
+        {
+          "sql": "COMMENT ON DATABASE appdb IS 'a ''quoted'' \u03a9'",
+          "description": "a 'quoted' \u03a9"
+        },
+        {
+          "sql": "COMMENT ON DATABASE appdb IS NULL",
+          "description": null
+        },
+        {
+          "sql": "COMMENT ON DATABASE appdb IS ''",
+          "description": null
+        },
+        {
+          "sql": "COMMENT ON DATABASE appdb IS 'application database';",
+          "description": "application database"
+        }
+      ],
+      "denied_sqlstate": "42501",
+      "missing_sqlstate": null,
+      "rename_preserves_identity": true,
+      "recreate_clears_description": true
+    }
+  ]
+}

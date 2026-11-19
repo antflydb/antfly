@@ -1069,6 +1069,20 @@ pub const BatchVisibilityCompletion = struct {
     }
 };
 
+pub const NativeAtomicEffects = struct {
+    writes: []const docstore_mod.KVPair = &.{},
+    deletes: []const []const u8 = &.{},
+};
+
+pub const CheckedNativeAtomic = struct {
+    snapshot_owner: *snapshot_admission_mod.SnapshotAdmission.MutationLease,
+    replication_owner: *?MutationBarrier.SharedLease,
+    schema_namespace_generation: u64,
+    // DB-owned attempt/finalizer; process-local and never supplied by JSON.
+    ptr: *anyopaque,
+    finalize_fn: *const fn (*anyopaque) anyerror!NativeAtomicEffects,
+};
+
 /// One synchronous prepared attempt's irreversible disposition. It is separate
 /// from the caller's cumulative progress marker: optimistic preparation may
 /// retry, while a committed attempt must propagate every later error unchanged.
@@ -1092,6 +1106,8 @@ pub const PreparationCapture = struct {
 };
 
 pub const BatchExecutionOptions = struct {
+    // Process-local checked plan, never serialized or derived from JSON.
+    checked_native_atomic: ?*const CheckedNativeAtomic = null,
     preparation_context: ?@import("antfly_inference_execution_context").RequestContext = null,
     preparation_capture: ?*PreparationCapture = null,
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
@@ -1133,6 +1149,7 @@ pub const BatchExecutionOptions = struct {
     /// writes the data-Raft watermark into a native source-authority root.
     native_initial_child_entry: ?OrderedApplyReceipt = null,
     native_fk_generation_entry: ?OrderedApplyReceipt = null,
+    native_fk_generation_control: bool = false,
     native_topology_position: ?@import("receipt_position.zig").Native = null,
     suppress_derived_replay_append: bool = false,
     extra_store_writes: []const docstore_mod.KVPair = &.{},
@@ -1142,6 +1159,7 @@ pub const BatchExecutionOptions = struct {
     extra_store_deletes: []const []const u8 = &.{},
     merge_chunk_expected_progress: ?[32]u8 = null,
     transaction_resolution: ?TransactionResolution = null,
+    prepared_graph_indexes: []const @import("prepared_graph_effects.zig").Index = &.{},
     durable_rows: ?*const std.StringHashMapUnmanaged([]const u8) = null,
     /// Borrowed by this synchronous call and consumed only after primary
     /// durability, while waiting for requested derived visibility.
@@ -1151,6 +1169,8 @@ pub const BatchExecutionOptions = struct {
 pub const OrderedApplyReceipt = types.OrderedApplyReceipt;
 
 pub const TransactionResolution = struct {
+    prepared_graph_effects_checked: bool = false,
+    external_decision_owner: ?transactions_mod.ExternalDecisionOwner = null,
     txn_id: transactions_mod.TxnId,
     status: transactions_mod.TxnStatus,
     commit_version: u64,
@@ -1211,6 +1231,8 @@ pub const LocalExecutionState = struct {
     row_policy_bundle: ?row_policy_bundle_mod.Installed = null,
     /// Borrowed from the opaque owner handle; Lite leaves these unset and
     /// therefore cannot turn a raw local read into an authenticated one.
+    sql_preparation_secret: ?[]const u8 = null,
+    sql_preparation_issuer: ?[]const u8 = null,
     row_policy_authority_secret: ?[]const u8 = null,
     row_policy_authority_issuer: ?[]const u8 = null,
     row_policy_table_name: ?[]const u8 = null,
@@ -1220,6 +1242,7 @@ pub const LocalExecutionState = struct {
     merge_artifact_layout: @import("merge_artifact_catalog.zig").Cache = .{},
     source_publication: @import("source_publication_job.zig").Job = .{},
     restore_staging_required: std.atomic.Value(bool) = .init(false),
+    materialized_view_read_only: std.atomic.Value(bool) = .init(false),
     initial_child_hidden: std.atomic.Value(bool) = .init(false),
     initial_child_bootstrap: ?@import("relational_initial_child_publication.zig").Bootstrap = null,
     vector_migration_reopen_required: std.atomic.Value(bool) = .init(false),

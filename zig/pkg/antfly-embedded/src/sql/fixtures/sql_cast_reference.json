@@ -1,0 +1,1029 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL 18 database casts and retained support identities",
+  "before": [
+    {
+      "sql": "CREATE TABLE cast_rows(id integer PRIMARY KEY,value jsonb,label text)",
+      "command_tag": "CREATE TABLE",
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO cast_rows VALUES(1,'{\"kind\":\"a\",\"n\":1}',NULL),(2,'null',NULL),(3,NULL,NULL)",
+      "command_tag": "INSERT 0 3",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,value::text AS converted FROM cast_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "converted"
+        ],
+        "column_oids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "{\"n\": 1, \"kind\": \"a\"}"
+          ],
+          [
+            2,
+            "null"
+          ],
+          [
+            3,
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE VIEW builtin_cast_view AS SELECT id,value::text AS converted FROM cast_rows",
+      "command_tag": "CREATE VIEW",
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION jsonb_to_text(jsonb) RETURNS text LANGUAGE sql AS $$SELECT CASE WHEN $1 IS NULL THEN 'sql-null' ELSE coalesce($1->>'kind','json-null') END$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT",
+      "id": "sql-0139",
+      "source_entry_sha256": "3e6e86d3ecb5edca26cfcfc810c0cdd611fa736f86cf0659f6667e38635db09c",
+      "command_tag": "CREATE CAST",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,value::text AS converted FROM cast_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "converted"
+        ],
+        "column_oids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "a"
+          ],
+          [
+            2,
+            "json-null"
+          ],
+          [
+            3,
+            "sql-null"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,converted FROM builtin_cast_view ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "converted"
+        ],
+        "column_oids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "{\"n\": 1, \"kind\": \"a\"}"
+          ],
+          [
+            2,
+            "null"
+          ],
+          [
+            3,
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "UPDATE cast_rows SET label=value RETURNING id,label",
+      "command_tag": "UPDATE 3",
+      "output": {
+        "columns": [
+          "id",
+          "label"
+        ],
+        "column_oids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "a"
+          ],
+          [
+            2,
+            "json-null"
+          ],
+          [
+            3,
+            "sql-null"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,label FROM cast_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "label"
+        ],
+        "column_oids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "a"
+          ],
+          [
+            2,
+            "json-null"
+          ],
+          [
+            3,
+            "sql-null"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT",
+      "sqlstate": "42710",
+      "notices": []
+    },
+    {
+      "sql": "CREATE SCHEMA cast_tools",
+      "command_tag": "CREATE SCHEMA",
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION cast_tools.flags(jsonb,integer,boolean) RETURNS text LANGUAGE sql AS $$SELECT concat($2::text,':',$3::text)$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "DROP CAST (jsonb AS text)",
+      "command_tag": "DROP CAST",
+      "notices": []
+    },
+    {
+      "sql": "CREATE CAST (jsonb AS text) WITH FUNCTION cast_tools.flags(jsonb,integer,boolean) AS ASSIGNMENT",
+      "command_tag": "CREATE CAST",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,value::text AS converted FROM cast_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "converted"
+        ],
+        "column_oids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "-1:true"
+          ],
+          [
+            2,
+            "-1:true"
+          ],
+          [
+            3,
+            "-1:true"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "UPDATE cast_rows SET label=value RETURNING id,label",
+      "command_tag": "UPDATE 3",
+      "output": {
+        "columns": [
+          "id",
+          "label"
+        ],
+        "column_oids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "-1:false"
+          ],
+          [
+            2,
+            "-1:false"
+          ],
+          [
+            3,
+            "-1:false"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "ALTER SCHEMA cast_tools RENAME TO cast_renamed",
+      "command_tag": "ALTER SCHEMA",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,value::text AS converted FROM cast_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "converted"
+        ],
+        "column_oids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "-1:true"
+          ],
+          [
+            2,
+            "-1:true"
+          ],
+          [
+            3,
+            "-1:true"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "DROP FUNCTION cast_renamed.flags(jsonb,integer,boolean)",
+      "sqlstate": "2BP01",
+      "notices": []
+    },
+    {
+      "sql": "CREATE CAST (integer AS numeric) WITH FUNCTION jsonb_to_text(jsonb)",
+      "sqlstate": "42P17",
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION cast_typmod(uuid,integer,boolean) RETURNS numeric LANGUAGE sql AS $$SELECT $2::numeric$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CREATE CAST (uuid AS numeric) WITH FUNCTION cast_typmod(uuid,integer,boolean) AS ASSIGNMENT",
+      "command_tag": "CREATE CAST",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::numeric(8,2) AS converted FROM cast_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "converted"
+        ],
+        "column_oids": [
+          23,
+          1700
+        ],
+        "rows": [
+          [
+            1,
+            "524294"
+          ],
+          [
+            2,
+            "524294"
+          ],
+          [
+            3,
+            "524294"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "DROP CAST (uuid AS numeric)",
+      "command_tag": "DROP CAST",
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION wrong_source(text) RETURNS text LANGUAGE sql AS $$SELECT $1$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CREATE CAST (text AS jsonb) WITH FUNCTION wrong_source(text)",
+      "sqlstate": "42P17",
+      "notices": []
+    }
+  ],
+  "cold": [
+    {
+      "sql": "SELECT id,value::text AS converted,label FROM cast_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "converted",
+          "label"
+        ],
+        "column_oids": [
+          23,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "-1:true",
+            "-1:false"
+          ],
+          [
+            2,
+            "-1:true",
+            "-1:false"
+          ],
+          [
+            3,
+            "-1:true",
+            "-1:false"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,converted FROM builtin_cast_view ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "converted"
+        ],
+        "column_oids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "{\"n\": 1, \"kind\": \"a\"}"
+          ],
+          [
+            2,
+            "null"
+          ],
+          [
+            3,
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    }
+  ],
+  "after": [
+    {
+      "sql": "DROP CAST (jsonb AS text)",
+      "id": "sql-0140",
+      "source_entry_sha256": "94e3196b187962dea2b263aee828c46c2cf28a7ba29480b4199dd62b6e7a072b",
+      "command_tag": "DROP CAST",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,value::text AS converted FROM cast_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "converted"
+        ],
+        "column_oids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "{\"n\": 1, \"kind\": \"a\"}"
+          ],
+          [
+            2,
+            "null"
+          ],
+          [
+            3,
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "DROP CAST IF EXISTS (jsonb AS text)",
+      "id": "sql-0141",
+      "source_entry_sha256": "7730651c7f2161bc11e457003cf0c61dd04e30dddf339847502b0c95ec17f070",
+      "command_tag": "DROP CAST",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "cast from type jsonb to type text does not exist, skipping"
+        }
+      ]
+    },
+    {
+      "sql": "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb)",
+      "command_tag": "CREATE CAST",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,value::text AS converted FROM cast_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "converted"
+        ],
+        "column_oids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "a"
+          ],
+          [
+            2,
+            "json-null"
+          ],
+          [
+            3,
+            "sql-null"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "UPDATE cast_rows SET label=value RETURNING id,label",
+      "sqlstate": "42804",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,label FROM cast_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "label"
+        ],
+        "column_oids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "-1:false"
+          ],
+          [
+            2,
+            "-1:false"
+          ],
+          [
+            3,
+            "-1:false"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "DROP CAST (jsonb AS text)",
+      "command_tag": "DROP CAST",
+      "notices": []
+    },
+    {
+      "sql": "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT",
+      "command_tag": "CREATE CAST",
+      "notices": []
+    },
+    {
+      "sql": "DROP FUNCTION jsonb_to_text(jsonb) CASCADE",
+      "command_tag": "DROP FUNCTION",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "drop cascades to cast from jsonb to text"
+        }
+      ]
+    },
+    {
+      "sql": "SELECT id,value::text AS converted FROM cast_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "converted"
+        ],
+        "column_oids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "{\"n\": 1, \"kind\": \"a\"}"
+          ],
+          [
+            2,
+            "null"
+          ],
+          [
+            3,
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION jsonb_to_text(jsonb) RETURNS text LANGUAGE sql AS $$SELECT 'fresh'$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,value::text AS converted FROM cast_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "converted"
+        ],
+        "column_oids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "{\"n\": 1, \"kind\": \"a\"}"
+          ],
+          [
+            2,
+            "null"
+          ],
+          [
+            3,
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT",
+      "command_tag": "CREATE CAST",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,value::text AS converted FROM cast_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "converted"
+        ],
+        "column_oids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "fresh"
+          ],
+          [
+            2,
+            "fresh"
+          ],
+          [
+            3,
+            "fresh"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "DROP CAST (jsonb AS text)",
+      "command_tag": "DROP CAST",
+      "notices": []
+    }
+  ],
+  "prepared": {
+    "setup": [
+      "CREATE TABLE prepared_cast_rows(id integer PRIMARY KEY,value jsonb)",
+      "INSERT INTO prepared_cast_rows VALUES(1,'{}'),(2,'null'),(3,NULL)",
+      "CREATE FUNCTION prepared_cast(jsonb) RETURNS text LANGUAGE sql AS $$SELECT 'prepared'$$"
+    ],
+    "statement": "SELECT id,value::text AS converted FROM prepared_cast_rows ORDER BY id",
+    "before": {
+      "columns": [
+        "id",
+        "converted"
+      ],
+      "column_oids": [
+        23,
+        25
+      ],
+      "rows": [
+        [
+          1,
+          "{}"
+        ],
+        [
+          2,
+          "null"
+        ],
+        [
+          3,
+          null
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          true
+        ]
+      ]
+    },
+    "create": "CREATE CAST (jsonb AS text) WITH FUNCTION prepared_cast(jsonb) AS ASSIGNMENT",
+    "after_create": {
+      "columns": [
+        "id",
+        "converted"
+      ],
+      "column_oids": [
+        23,
+        25
+      ],
+      "rows": [
+        [
+          1,
+          "prepared"
+        ],
+        [
+          2,
+          "prepared"
+        ],
+        [
+          3,
+          "prepared"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    "replace": "CREATE OR REPLACE FUNCTION prepared_cast(jsonb) RETURNS text LANGUAGE sql AS $$SELECT 'replaced'$$",
+    "after_replace": {
+      "columns": [
+        "id",
+        "converted"
+      ],
+      "column_oids": [
+        23,
+        25
+      ],
+      "rows": [
+        [
+          1,
+          "replaced"
+        ],
+        [
+          2,
+          "replaced"
+        ],
+        [
+          3,
+          "replaced"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ]
+    }
+  }
+}

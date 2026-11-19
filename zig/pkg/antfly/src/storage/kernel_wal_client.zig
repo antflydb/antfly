@@ -86,6 +86,10 @@ pub const WAL = struct {
         self.* = undefined;
     }
 
+    pub fn admitAppendBytes(self: *const WAL, data_len: usize) !void {
+        try statusToError(abi.antfly_storage_wal_admit_append_bytes(self.handle, abi.abi_version, @intCast(data_len)));
+    }
+
     pub fn append(self: *WAL, data: []const u8) !u64 {
         var result = abi.WalAppendResult{};
         try statusToError(abi.antfly_storage_wal_append(self.handle, &.{

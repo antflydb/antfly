@@ -59,6 +59,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "relational cumulative prepares",
         "relational preparation budget",
         "relational transform preparation releases",
+        "trigger prepared DOM owns one row authority",
+        "SQL trigger document candidates share native null provenance for OLD NEW and selected writes",
+        "SQL trigger AFTER row dispatcher admits one captured attachment for ordered FK interleaving",
+        "distributed txn trigger coordinator prepares generated FK rows once and runs empty child statements",
+        "SQL relation lifetime native participant records pin actual images across every decision mutation",
+        "SQL relation lifetime integrity preparation retains trusted lookup minter and rejects owner substitution",
+        "native local frozen cut proves actual sequence and owner without inventing raft positions",
+        "internal batch owner",
         "db transaction recovery",
     };
     const row_preparation_tests = b.addTest(.{
@@ -74,14 +82,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "producer readiness",
         "derived coverage outcome transitions are exclusive and idempotent",
         "graph projection preserves numeric literals in enrichment metadata and templates",
+        "db control-only publication preserves empty catalog while real user mutations remain conservative across cold reopen",
     };
     const producer_receipt_tests = b.addTest(.{
+        .name = "producer-receipt-tests",
         .root_module = antfly_test_mod,
         .filters = &producer_receipt_filters,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        // The curated native macOS Debug closure measured 7 GiB. Retain
+        // headroom without changing other host/profile claims.
+        .max_rss = if (b.graph.host.result.os.tag == .macos and antfly_test_mod.optimize == .debug) 9 * 1024 * 1024 * 1024 else 0,
     });
+    const producer_receipt_run = addCuratedTestRunArtifact(b, producer_receipt_tests, &producer_receipt_filters);
+    producer_receipt_run.addArg("--require-no-skips");
     b.step("antfly-storage-producer-receipts-test", "Run primary revision receipt and cached graph publication regressions")
-        .dependOn(&addCuratedTestRunArtifact(b, producer_receipt_tests, &producer_receipt_filters).step);
+        .dependOn(&producer_receipt_run.step);
     const relationship_identity_filters = [_][]const u8{
         "db graph endpoint cleanup pages",
         "db graph endpoint cleanup transaction graph effects",

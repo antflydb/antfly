@@ -1,0 +1,828 @@
+{
+  "format": 1,
+  "scope": "controlled local extension package lifecycle only; no GIS, crypto, UUID or vector function parity",
+  "originals_manifest_sha256": "5ae207b9e0a87d7f9fe89c0714a7520bf9329b4e35e4aa7a4beca109228f9e10",
+  "packages": {
+    "vector": {
+      "default": "1.0.0",
+      "versions": {
+        "1.0.0": 1
+      }
+    },
+    "pgcrypto": {
+      "default": "1.0.0",
+      "versions": {
+        "1.0.0": 1
+      }
+    },
+    "postgis": {
+      "default": "3.5.0",
+      "versions": {
+        "3.4.0": 340,
+        "3.4.5": 345,
+        "3.5.0": 350
+      }
+    },
+    "uuid-ossp": {
+      "default": "1.0.0",
+      "versions": {
+        "1.0.0": 100
+      }
+    },
+    "spatial_tools": {
+      "default": "1.0.0",
+      "versions": {
+        "1.0.0": 1
+      },
+      "requires": "postgis"
+    }
+  },
+  "entries": [
+    {
+      "id": "sql-0148",
+      "source_entry_sha256": "bf225a9c3ea25ddd9c66ee20105baf2a2d2617df431e06c9af1c0efb22086e43",
+      "sql": "COMMENT ON EXTENSION vector IS 'vector search extension';",
+      "sql_sha256": "5d72bc5442f3f2eeb5cf0af1dc5db56c212d9c08505d2b214a301da59777f3b3",
+      "before": {
+        "extensions": [
+          {
+            "name": "vector",
+            "version": "1.0.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "vector",
+            "name": "vector_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 11
+      },
+      "outcome": {
+        "sqlstate": null,
+        "stdout": "COMMENT",
+        "stderr": ""
+      },
+      "after": {
+        "extensions": [
+          {
+            "name": "vector",
+            "version": "1.0.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "vector search extension"
+          }
+        ],
+        "members": [
+          {
+            "extension": "vector",
+            "name": "vector_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 11
+      },
+      "cold": {
+        "extensions": [
+          {
+            "name": "vector",
+            "version": "1.0.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "vector search extension"
+          }
+        ],
+        "members": [
+          {
+            "extension": "vector",
+            "name": "vector_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 11
+      }
+    },
+    {
+      "id": "sql-0754",
+      "source_entry_sha256": "e658a5594c1880601cbd6f6423c24ef6851c79cc38044632815975e7629f7f21",
+      "sql": "CREATE EXTENSION IF NOT EXISTS pgcrypto;",
+      "sql_sha256": "8dc31f73d2de82376a3c01e942f2160323fa406ae4541637ee4a0e5a758a8c98",
+      "before": {
+        "extensions": [],
+        "members": [],
+        "extension_dependencies": []
+      },
+      "outcome": {
+        "sqlstate": null,
+        "stdout": "CREATE EXTENSION",
+        "stderr": ""
+      },
+      "after": {
+        "extensions": [
+          {
+            "name": "pgcrypto",
+            "version": "1.0.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "pgcrypto",
+            "name": "pgcrypto_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 11
+      },
+      "repeat": {
+        "sqlstate": null,
+        "stdout": "CREATE EXTENSION",
+        "stderr": "NOTICE:  42710: extension \"pgcrypto\" already exists, skipping\nLOCATION:  CreateExtension, extension.c:2120"
+      },
+      "cold": {
+        "extensions": [
+          {
+            "name": "pgcrypto",
+            "version": "1.0.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "pgcrypto",
+            "name": "pgcrypto_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 11
+      }
+    },
+    {
+      "id": "sql-0755",
+      "source_entry_sha256": "09254bb4e742db6a63729d2610c7943e47658d6de76b79496c83d5ee5300dd71",
+      "sql": "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;",
+      "sql_sha256": "11d364976172fdbb6598b5e11885a8582a958097dd426efb87643adde8966e76",
+      "before": {
+        "extensions": [],
+        "members": [],
+        "extension_dependencies": []
+      },
+      "outcome": {
+        "sqlstate": null,
+        "stdout": "CREATE EXTENSION",
+        "stderr": ""
+      },
+      "after": {
+        "extensions": [
+          {
+            "name": "pgcrypto",
+            "version": "1.0.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "pgcrypto",
+            "name": "pgcrypto_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 11
+      },
+      "repeat": {
+        "sqlstate": null,
+        "stdout": "CREATE EXTENSION",
+        "stderr": "NOTICE:  42710: extension \"pgcrypto\" already exists, skipping\nLOCATION:  CreateExtension, extension.c:2120"
+      },
+      "cold": {
+        "extensions": [
+          {
+            "name": "pgcrypto",
+            "version": "1.0.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "pgcrypto",
+            "name": "pgcrypto_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 11
+      }
+    },
+    {
+      "id": "sql-0756",
+      "source_entry_sha256": "9bdf59adc75ba855298081fd2c17e64bf49582ca32f07db751d3ed531dd726b6",
+      "sql": "CREATE EXTENSION postgis;",
+      "sql_sha256": "97f56e9c05e2de23b900e8e0f082d055ce9b0529de06c6a7c47fe796456f963a",
+      "before": {
+        "extensions": [],
+        "members": [],
+        "extension_dependencies": []
+      },
+      "outcome": {
+        "sqlstate": null,
+        "stdout": "CREATE EXTENSION",
+        "stderr": ""
+      },
+      "after": {
+        "extensions": [
+          {
+            "name": "postgis",
+            "version": "3.5.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "postgis",
+            "name": "postgis_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 360
+      },
+      "cold": {
+        "extensions": [
+          {
+            "name": "postgis",
+            "version": "3.5.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "postgis",
+            "name": "postgis_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 360
+      }
+    },
+    {
+      "id": "sql-0757",
+      "source_entry_sha256": "d79bb9ae19d0e33a5bbff7484d47f3a7af8acb03954871c9e497d77e97f94f37",
+      "sql": "CREATE EXTENSION postgis VERSION '3.4.0';",
+      "sql_sha256": "65ee4a2cf4a4de78e456526f2ca0160ed44d9a7adbb75727136203426044c82b",
+      "before": {
+        "extensions": [],
+        "members": [],
+        "extension_dependencies": []
+      },
+      "outcome": {
+        "sqlstate": null,
+        "stdout": "CREATE EXTENSION",
+        "stderr": ""
+      },
+      "after": {
+        "extensions": [
+          {
+            "name": "postgis",
+            "version": "3.4.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "postgis",
+            "name": "postgis_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 350
+      },
+      "cold": {
+        "extensions": [
+          {
+            "name": "postgis",
+            "version": "3.4.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "postgis",
+            "name": "postgis_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 350
+      }
+    },
+    {
+      "id": "sql-0758",
+      "source_entry_sha256": "a36c57033c76545869e681063dc6bb67f9f4b86b421199d6579d0a1d7a91e92c",
+      "sql": "CREATE EXTENSION IF NOT EXISTS postgis VERSION '3.4.0';",
+      "sql_sha256": "3ae6f41fa8fb64393e22943e4ca8008033324e0c9944aa2780862608df2f223c",
+      "before": {
+        "extensions": [
+          {
+            "name": "postgis",
+            "version": "3.5.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "postgis",
+            "name": "postgis_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 360
+      },
+      "outcome": {
+        "sqlstate": null,
+        "stdout": "CREATE EXTENSION",
+        "stderr": "NOTICE:  42710: extension \"postgis\" already exists, skipping\nLOCATION:  CreateExtension, extension.c:2120"
+      },
+      "after": {
+        "extensions": [
+          {
+            "name": "postgis",
+            "version": "3.5.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "postgis",
+            "name": "postgis_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 360
+      },
+      "existing_extension_unknown_requested_version": {
+        "sqlstate": null,
+        "stdout": "CREATE EXTENSION",
+        "stderr": "NOTICE:  42710: extension \"postgis\" already exists, skipping\nLOCATION:  CreateExtension, extension.c:2120"
+      },
+      "cold": {
+        "extensions": [
+          {
+            "name": "postgis",
+            "version": "3.5.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "postgis",
+            "name": "postgis_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 360
+      }
+    },
+    {
+      "id": "sql-0759",
+      "source_entry_sha256": "1ae6f583fd34487b0820e003631924bc861601da50bb335ffd340bf96deeaf85",
+      "sql": "CREATE EXTENSION \"uuid-ossp\" VERSION '1.0.0';",
+      "sql_sha256": "0f4c8851233628ddbc8fd504f42b35af5d49557edb9bd3f5aae55b2fd473ff60",
+      "before": {
+        "extensions": [],
+        "members": [],
+        "extension_dependencies": []
+      },
+      "outcome": {
+        "sqlstate": null,
+        "stdout": "CREATE EXTENSION",
+        "stderr": ""
+      },
+      "after": {
+        "extensions": [
+          {
+            "name": "uuid-ossp",
+            "version": "1.0.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "uuid-ossp",
+            "name": "uuid_ossp_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 110
+      },
+      "cold": {
+        "extensions": [
+          {
+            "name": "uuid-ossp",
+            "version": "1.0.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "uuid-ossp",
+            "name": "uuid_ossp_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 110
+      }
+    },
+    {
+      "id": "sql-0760",
+      "source_entry_sha256": "5c9baefd9c6793002c831c7c19a0110edf5b4caa8645b9bb7a7e5a75c6fb76d0",
+      "sql": "ALTER EXTENSION postgis UPDATE TO '3.5.0';",
+      "sql_sha256": "a5f586daee0eb86d0fd6a59a3f37171a3013d9157cd4e2d1afa6397d236ffad0",
+      "before": {
+        "extensions": [
+          {
+            "name": "postgis",
+            "version": "3.4.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "postgis",
+            "name": "postgis_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 350
+      },
+      "outcome": {
+        "sqlstate": null,
+        "stdout": "ALTER EXTENSION",
+        "stderr": ""
+      },
+      "after": {
+        "extensions": [
+          {
+            "name": "postgis",
+            "version": "3.5.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "postgis",
+            "name": "postgis_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 360
+      },
+      "declared_update_path": "3.4.0--3.4.5--3.5.0",
+      "cold": {
+        "extensions": [
+          {
+            "name": "postgis",
+            "version": "3.5.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "postgis",
+            "name": "postgis_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 360
+      }
+    },
+    {
+      "id": "sql-0761",
+      "source_entry_sha256": "2aa7f0beec586a1a88b7c20dfb11c53d23aa1381b9ff50612c7cf1594370c815",
+      "sql": "ALTER EXTENSION postgis UPDATE;",
+      "sql_sha256": "ead07a6d470118af7f54474d6522fa79d6c1b55dff67f86a17bcc9b2182e5141",
+      "before": {
+        "extensions": [
+          {
+            "name": "postgis",
+            "version": "3.4.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "postgis",
+            "name": "postgis_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 350
+      },
+      "outcome": {
+        "sqlstate": null,
+        "stdout": "ALTER EXTENSION",
+        "stderr": ""
+      },
+      "after": {
+        "extensions": [
+          {
+            "name": "postgis",
+            "version": "3.5.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "postgis",
+            "name": "postgis_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 360
+      },
+      "declared_update_path": "3.4.0--3.4.5--3.5.0",
+      "cold": {
+        "extensions": [
+          {
+            "name": "postgis",
+            "version": "3.5.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "postgis",
+            "name": "postgis_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 360
+      }
+    },
+    {
+      "id": "sql-0762",
+      "source_entry_sha256": "3d6a5b8e9c4a4077762c80387a876746a3f90202bbc3b24fe3be0e6010f4cd8a",
+      "sql": "DROP EXTENSION postgis;",
+      "sql_sha256": "f17a26dc2ac4089bfbd0c3c30685adc24ac15e973496b0f94b4012192d08b852",
+      "before": {
+        "extensions": [
+          {
+            "name": "postgis",
+            "version": "3.4.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "postgis",
+            "name": "postgis_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [],
+        "marker_at_10": 350
+      },
+      "outcome": {
+        "sqlstate": null,
+        "stdout": "DROP EXTENSION",
+        "stderr": ""
+      },
+      "after": {
+        "extensions": [],
+        "members": [],
+        "extension_dependencies": []
+      },
+      "cold": {
+        "extensions": [],
+        "members": [],
+        "extension_dependencies": []
+      }
+    },
+    {
+      "id": "sql-0763",
+      "source_entry_sha256": "eb35d488e27e2747697ee0b95004afd95e150399a6fdc63af35c7dad9a753a10",
+      "sql": "DROP EXTENSION IF EXISTS postgis CASCADE;",
+      "sql_sha256": "0ed92dd54dd89f10cfc3eeedd21b719062f45b0e3002f02cfe535da499fa1be2",
+      "before": {
+        "extensions": [
+          {
+            "name": "postgis",
+            "version": "3.4.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          },
+          {
+            "name": "spatial_tools",
+            "version": "1.0.0",
+            "owner": "fixture_owner",
+            "schema": "public",
+            "comment": "Controlled lifecycle fixture, not the upstream implementation"
+          }
+        ],
+        "members": [
+          {
+            "extension": "postgis",
+            "name": "postgis_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          },
+          {
+            "extension": "spatial_tools",
+            "name": "spatial_tools_version_marker",
+            "owner": "fixture_owner",
+            "signature": "bigint",
+            "dependency": "e"
+          }
+        ],
+        "extension_dependencies": [
+          {
+            "from": "spatial_tools",
+            "to": "postgis",
+            "dependency": "n"
+          }
+        ],
+        "marker_at_10": 350
+      },
+      "outcome": {
+        "sqlstate": null,
+        "stdout": "DROP EXTENSION",
+        "stderr": "NOTICE:  00000: drop cascades to 2 other objects\nDETAIL:  drop cascades to view external_marker_view\ndrop cascades to extension spatial_tools\nLOCATION:  reportDependentObjects, dependency.c:1171"
+      },
+      "after": {
+        "extensions": [],
+        "members": [],
+        "extension_dependencies": []
+      },
+      "cold": {
+        "extensions": [],
+        "members": [],
+        "extension_dependencies": []
+      }
+    }
+  ],
+  "assertions": [
+    {
+      "sql": "COMMENT ON EXTENSION vector IS 'wrong owner';",
+      "sqlstate": "42501"
+    },
+    {
+      "sql": "CREATE EXTENSION postgis VERSION '9.9.9';",
+      "sqlstate": "22023"
+    },
+    {
+      "sql": "CREATE EXTENSION postgis;",
+      "sqlstate": "42710"
+    },
+    {
+      "sql": "DROP FUNCTION public.postgis_version_marker(bigint);",
+      "sqlstate": "2BP01"
+    },
+    {
+      "sql": "ALTER EXTENSION postgis UPDATE TO '9.9.9';",
+      "sqlstate": "22023"
+    },
+    {
+      "sql": "DROP EXTENSION postgis;",
+      "sqlstate": "42501"
+    },
+    {
+      "sql": "DROP EXTENSION postgis;",
+      "sqlstate": "2BP01"
+    }
+  ],
+  "package_files_sha256": {
+    "pgcrypto--1.0.0.sql": "b6ea1575e0ea4d0ee73ee51dc059d840935f16c1ac2ba391e7200bd2728ae41b",
+    "pgcrypto.control": "c6f3425890f79029a218a937f70b6032479d189801f3fe96d8ec1d517be7ed83",
+    "postgis--3.4.0--3.4.5.sql": "2cc53a064d67c8264645a120b02e692c33b223cbe160f42ab439bad171a1dcbb",
+    "postgis--3.4.0.sql": "922df958a01adceff6bc2fc0ca97f2b2742e5e2e6679259ad11bfba06f063ac1",
+    "postgis--3.4.5--3.5.0.sql": "d8df645c4a14f40ec131d11177d2b50cf104fa4612ec069804b4fc8731c5a16a",
+    "postgis--3.4.5.sql": "f8207cd0c265b9404bd391879e9d7c74f6094a1e042cca1296e7e2ef26d2f38a",
+    "postgis--3.5.0.sql": "70ce777962eed1c5b1b91ebebcfb3acfa3328c32a56afc3d87a5354feb71f439",
+    "postgis.control": "db3ded8a5dc3aff0a146ba1e3389803bdc889cc9337f68b223a9dc28fb247f5f",
+    "spatial_tools--1.0.0.sql": "c2293dafc1649605c2cce781426cf0634eae37dbb10eac169dd75d67cb62ceb6",
+    "spatial_tools.control": "dd702ba0b18529f29cc0722de71a6fd32c85e4adbd5c11042fc2553e10b93f5d",
+    "uuid-ossp--1.0.0.sql": "db779b84ba5c2b8409650a0ad2aaf037afe6efac3919f1bca36132b009b89d3b",
+    "uuid-ossp.control": "c6f3425890f79029a218a937f70b6032479d189801f3fe96d8ec1d517be7ed83",
+    "vector--1.0.0.sql": "45c28a1e719c62c6ba5c2f5475114c9d353e6ef621aefd19f8a1c67814f6e00d",
+    "vector.control": "c6f3425890f79029a218a937f70b6032479d189801f3fe96d8ec1d517be7ed83"
+  },
+  "postgres_version": "18.6 (Homebrew)",
+  "server_binary": "/opt/homebrew/opt/postgresql@18/bin/postgres",
+  "private_extension_control_path_verified": true,
+  "tcp_disabled_verified": true,
+  "comment_null_removal_cold": true,
+  "clean_cold_reopen_equivalence": true,
+  "result": "PASS",
+  "owned_cluster_stopped": true,
+  "owned_temporary_cluster_removed": true
+}

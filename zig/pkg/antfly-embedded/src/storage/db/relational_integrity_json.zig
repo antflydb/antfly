@@ -37,9 +37,13 @@ fn writeMode(value: anytype, stream: anytype, comptime compact: bool) @TypeOf(st
     if (comptime T == std.json.Value) return stream.write(value);
     switch (@typeInfo(T)) {
         .@"struct" => |info| {
+            if (@hasDecl(T, "nativeJsonStringify")) return value.nativeJsonStringify(stream);
             if (@hasDecl(T, "nativeJsonProjection")) return writeMode(value.nativeJsonProjection(), stream, compact);
             try stream.beginObject();
             inline for (info.field_names) |reflected_name| {
+                if (comptime @hasDecl(T, "nativeJsonSkipFieldComptime")) {
+                    if (comptime T.nativeJsonSkipFieldComptime(reflected_name)) continue;
+                }
                 if (!@hasDecl(T, "nativeJsonSkipField") or !value.nativeJsonSkipField(reflected_name)) {
                     try stream.objectField(reflected_name);
                     try writeMode(@field(value, reflected_name), stream, compact);
@@ -100,4 +104,32 @@ test "privacy compact metadata transport preserves binary bytes without expandin
     var canonical: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
     try write(input, &canonical);
     try std.testing.expect(std.mem.startsWith(u8, output.written(), "{\"text\":[115,99,97,110"));
+}
+
+test "native batch write projection serializes prepared domain values rather than addresses" {
+    const a = std.testing.allocator;
+    const mutation = @import("mutation_values.zig");
+    const Contract = @import("../../schema/prepared_row_contract.zig").PreparedContract;
+    const first: Contract = .{ .schema_version = 7, .domain_digest = @splat(3) };
+    const second = first;
+    const unprepared: mutation.BatchWrite = .{ .key = "row", .value = "{}" };
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+    try write(unprepared, &stream);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "prepared_domain") == null);
+    output.clearRetainingCapacity();
+    var prepared = unprepared;
+    prepared.prepared_domain = &first;
+    stream = .{ .writer = &output.writer, .options = .{} };
+    try write(prepared, &stream);
+    const encoded = try a.dupe(u8, output.written());
+    defer a.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"schema_version\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"domain_digest\":[3,3,") != null);
+    output.clearRetainingCapacity();
+    prepared.prepared_domain = &second;
+    stream = .{ .writer = &output.writer, .options = .{} };
+    try write(prepared, &stream);
+    try std.testing.expectEqualStrings(encoded, output.written());
 }

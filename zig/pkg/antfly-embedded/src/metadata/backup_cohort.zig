@@ -67,7 +67,11 @@ pub const State = struct {
     owners: []const Owner,
 
     pub fn validate(self: State) !void {
-        if (self.format_version != 1 or self.owners.len == 0 or self.owners.len > 4096 or self.cursor >= self.owners.len)
+        if (self.owners.len == 0) {
+            if (self.format_version != 1 or self.cursor != 0 or (self.phase != .exporting and self.phase != .publishing and self.phase != .reclaiming and self.phase != .completed and self.phase != .cancelling and self.phase != .cancel_reclaiming and self.phase != .cancelled)) return error.InvalidBackupCohort;
+            return;
+        }
+        if (self.format_version != 1 or self.owners.len > 4096 or self.cursor >= self.owners.len)
             return error.InvalidBackupCohort;
         if ((self.phase == .publishing or self.phase == .completed or self.phase == .cancelled) and self.cursor != 0)
             return error.InvalidBackupCohort;
@@ -102,10 +106,25 @@ pub const State = struct {
 pub const Observation = struct { fence: ?topology.Fence, drained: bool };
 
 pub const TableProof = struct {
+    schema_only: bool = false,
     table_id: u64,
     name: []const u8,
     definition: [32]u8,
     manifest_definition: ?[32]u8 = null,
+    /// Metadata verifies this against its actual source directory at admission.
+    /// Immutable backups cannot remap trigger dependencies by forged ordinals.
+    trigger_source_columns_digest: ?[32]u8 = null,
+    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
+        return (std.mem.eql(u8, name, "schema_only") and !self.schema_only) or (std.mem.eql(u8, name, "trigger_source_columns_digest") and self.trigger_source_columns_digest == null);
+    }
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (comptime std.meta.fieldNames(@This())) |name| if (!self.nativeJsonSkipField(name)) {
+            try writer.objectField(name);
+            try writer.write(@field(self, name));
+        };
+        try writer.endObject();
+    }
 };
 
 /// Bind precisely the schema/configuration carried by a table artifact. The
@@ -154,17 +173,18 @@ pub const Job = struct {
         try self.state.validate();
         if (self.id == 0 or self.revision == 0 or self.backup_id.len == 0 or self.backup_id.len > 128 or
             self.location.len == 0 or self.location.len > 4096 or self.connection.len == 0 or self.connection.len > 4096 or
-            self.tables.len == 0 or self.tables.len > 4096 or self.state.owners[0].fence.transition_id != self.id)
+            self.tables.len == 0 or self.tables.len > 4096 or (self.state.owners.len != 0 and self.state.owners[0].fence.transition_id != self.id))
             return error.InvalidBackupCohort;
         var owner_index: usize = 0;
         for (self.tables, 0..) |table, i| {
             if (table.table_id == 0 or table.name.len == 0 or table.name.len > 4096 or
                 (i != 0 and std.mem.order(u8, self.tables[i - 1].name, table.name) != .lt)) return error.InvalidBackupCohort;
+            if (table.trigger_source_columns_digest) |digest| if (std.mem.allEqual(u8, &digest, 0)) return error.InvalidBackupCohort;
             const start = owner_index;
             while (owner_index < self.state.owners.len and std.mem.eql(u8, self.state.owners[owner_index].table_name, table.name)) : (owner_index += 1) {
                 if (self.state.owners[owner_index].fence.namespace.table_id != table.table_id) return error.InvalidBackupCohort;
             }
-            if (owner_index == start) return error.IncompleteBackupCohort;
+            if ((owner_index == start) != table.schema_only) return error.IncompleteBackupCohort;
         }
         if (owner_index != self.state.owners.len) return error.IncompleteBackupCohort;
         if ((self.state.phase == .reclaiming or self.state.phase == .completed) and self.manifest_sha256 == null)
@@ -207,7 +227,7 @@ pub const Progress = struct {
     }
 
     pub fn applyTo(self: Progress, job: *Job) !void {
-        if (self.owner_count != job.state.owners.len or self.cursor >= self.owner_count) return error.InvalidBackupCohort;
+        if (self.owner_count != job.state.owners.len or (if (self.owner_count == 0) self.cursor != 0 else self.cursor >= self.owner_count)) return error.InvalidBackupCohort;
         job.revision = self.revision;
         job.state.phase = self.phase;
         job.state.cursor = self.cursor;
@@ -220,7 +240,7 @@ pub const Progress = struct {
 
     pub fn validateNext(old: Progress, replacement: Progress) !void {
         if (old.terminal() or old.revision == std.math.maxInt(u64) or replacement.revision != old.revision + 1 or
-            replacement.owner_count != old.owner_count or replacement.owner_count == 0 or replacement.cursor >= replacement.owner_count or
+            replacement.owner_count != old.owner_count or (if (replacement.owner_count == 0) replacement.cursor != 0 else replacement.cursor >= replacement.owner_count) or
             !std.mem.eql(u8, &replacement.plan_digest, &old.plan_digest)) return error.BackupCohortChanged;
         if ((replacement.phase == .reclaiming or replacement.phase == .completed) and replacement.manifest_sha256 == null)
             return error.BackupCohortChanged;
@@ -242,7 +262,9 @@ pub const Progress = struct {
             .cancel_reclaiming => .cancelled,
             .completed, .cancelled => return error.BackupCohortChanged,
         };
-        if (old.phase == .publishing) {
+        if (old.owner_count == 0) {
+            if (replacement.phase != next_phase or replacement.cursor != 0) return error.BackupCohortChanged;
+        } else if (old.phase == .publishing) {
             if (replacement.phase != .reclaiming or replacement.cursor != 0) return error.BackupCohortChanged;
         } else if (old.cursor + 1 == old.owner_count) {
             if (replacement.phase != next_phase or replacement.cursor != 0) return error.BackupCohortChanged;
@@ -253,7 +275,7 @@ pub const Progress = struct {
 pub fn validateReplacement(alloc: std.mem.Allocator, previous: ?Job, replacement: Job) !void {
     try replacement.validate();
     const old = previous orelse {
-        if (replacement.revision != 1 or replacement.state.phase != .freezing or replacement.state.cursor != 0 or replacement.manifest_sha256 != null)
+        if (replacement.revision != 1 or replacement.state.phase != (if (replacement.state.owners.len == 0) Phase.exporting else .freezing) or replacement.state.cursor != 0 or replacement.manifest_sha256 != null)
             return error.BackupCohortChanged;
         return;
     };
@@ -278,7 +300,9 @@ pub fn validateReplacement(alloc: std.mem.Allocator, previous: ?Job, replacement
         .cancel_reclaiming => .cancelled,
         .completed, .cancelled => return error.BackupCohortChanged,
     };
-    if (a.phase == .publishing) {
+    if (a.owners.len == 0) {
+        if (b.phase != next_phase or b.cursor != 0) return error.BackupCohortChanged;
+    } else if (a.phase == .publishing) {
         if (b.phase != .reclaiming or b.cursor != 0 or replacement.manifest_sha256 == null) return error.BackupCohortChanged;
     } else if (a.cursor + 1 == a.owners.len) {
         if (b.phase != next_phase or b.cursor != 0) return error.BackupCohortChanged;
@@ -331,7 +355,24 @@ pub fn cancel(state: *State, driver: anytype) !void {
 pub fn step(state: *State, driver: anytype) !Result {
     // Do not rewalk every owner on every scheduling slice (quadratic total
     // work). Immutable plan coverage is validated at admission/recovery.
-    if (state.owners.len == 0 or state.cursor >= state.owners.len or state.format_version != 1)
+    if (state.owners.len == 0) {
+        try state.validate();
+        switch (state.phase) {
+            .exporting => try checkpoint(state, driver, .publishing, 0),
+            .publishing => {
+                try driver.publish(state.*);
+                try checkpoint(state, driver, .reclaiming, 0);
+            },
+            .reclaiming => try checkpoint(state, driver, .completed, 0),
+            .cancelling => try checkpoint(state, driver, .cancel_reclaiming, 0),
+            .cancel_reclaiming => try checkpoint(state, driver, .cancelled, 0),
+            .completed => return .completed,
+            .cancelled => return .cancelled,
+            else => return error.InvalidBackupCohort,
+        }
+        return if (state.phase == .completed) .completed else if (state.phase == .cancelled) .cancelled else .advanced;
+    }
+    if (state.cursor >= state.owners.len or state.format_version != 1)
         return error.InvalidBackupCohort;
     switch (state.phase) {
         .freezing => {
@@ -474,10 +515,11 @@ fn consumerTests() type {
                 if (self.pin_unavailable) return error.BackupPinSourceUnavailable;
                 self.pins[owner.fence.owner_group_id - 301] = false;
             }
-            fn publish(self: *@This(), _: State) !void {
+            fn publish(self: *@This(), state: State) !void {
                 if (self.cancelled) return error.BackupCohortCancelled;
-                try std.testing.expectEqual(@as(usize, 2), self.captures);
-                try std.testing.expectEqual(@as(usize, 2), self.exports);
+                const physical_owners = state.owners.len;
+                try std.testing.expectEqual(physical_owners, self.captures);
+                try std.testing.expectEqual(physical_owners, self.exports);
                 try std.testing.expect(self.fences[0] == null and self.fences[1] == null);
                 self.published = true;
                 if (self.lose_publication_reply) return error.ConnectionLost;
@@ -487,6 +529,37 @@ fn consumerTests() type {
                 return self.published;
             }
         };
+
+        test "UNLOGGED schema only backup cohort has no fabricated owner and survives checkpoint publication and cancellation faults" {
+            var state: State = .{ .phase = .exporting, .metadata_digest = @splat(3), .owners = &.{} };
+            try state.validate();
+            var driver: TestDriver = .{ .fail_checkpoint = true };
+            try std.testing.expectError(error.PersistenceUnavailable, step(&state, &driver));
+            try std.testing.expectEqual(Phase.exporting, state.phase);
+            driver.fail_checkpoint = false;
+            _ = try step(&state, &driver);
+            driver.lose_publication_reply = true;
+            try std.testing.expectError(error.ConnectionLost, step(&state, &driver));
+            try std.testing.expectEqual(Phase.publishing, state.phase);
+            try std.testing.expect(driver.published);
+            driver.lose_publication_reply = false;
+            while (try step(&state, &driver) != .completed) {}
+            try std.testing.expectEqual(@as(usize, 0), driver.captures);
+            try std.testing.expectEqual(@as(usize, 0), driver.exports);
+            try std.testing.expectEqual([2]bool{ false, false }, driver.pins);
+            var canceled: State = .{ .phase = .exporting, .metadata_digest = @splat(3), .owners = &.{} };
+            var canceled_driver: TestDriver = .{};
+            try cancel(&canceled, &canceled_driver);
+            while (try step(&canceled, &canceled_driver) != .cancelled) {}
+            try std.testing.expectEqual(@as(usize, 0), canceled_driver.cancellations);
+            try std.testing.expect(!canceled_driver.published);
+            var proof = TableProof{ .schema_only = true, .table_id = 9, .name = "rows", .definition = @splat(4) };
+            var job: Job = .{ .id = 700, .revision = 1, .backup_id = "daily", .location = "file:///archive", .connection = "reader", .tables = &.{proof}, .state = .{ .phase = .exporting, .metadata_digest = @splat(3), .owners = &.{} } };
+            try job.validate();
+            proof.schema_only = false;
+            job.tables = &.{proof};
+            try std.testing.expectError(error.IncompleteBackupCohort, job.validate());
+        }
 
         test "relational backup cohort cancellation releases every write fence before unavailable pin cleanup" {
             const owners = [_]Owner{ testOwner(301, "", "k"), testOwner(302, "k", "") };

@@ -1,0 +1,74 @@
+{
+  "format": 1,
+  "postgres_major": 18,
+  "owner_uncommitted": [
+    [
+      "atomic_child",
+      "r"
+    ],
+    [
+      "atomic_child_id_seq",
+      "S"
+    ],
+    [
+      "atomic_child_serial_id_seq",
+      "S"
+    ]
+  ],
+  "observer_uncommitted": [],
+  "first_row": [
+    42,
+    1,
+    1
+  ],
+  "observer_committed": [
+    [
+      "atomic_child",
+      "r"
+    ],
+    [
+      "atomic_child_id_seq",
+      "S"
+    ],
+    [
+      "atomic_child_serial_id_seq",
+      "S"
+    ]
+  ],
+  "observer_rows": [
+    [
+      42,
+      1,
+      1
+    ]
+  ],
+  "constraints": [
+    [
+      "f",
+      false,
+      false
+    ],
+    [
+      "n",
+      false,
+      false
+    ],
+    [
+      "n",
+      false,
+      false
+    ],
+    [
+      "p",
+      false,
+      false
+    ],
+    [
+      "u",
+      true,
+      true
+    ]
+  ],
+  "cancellation_hidden": [],
+  "cancellation_complete": []
+}

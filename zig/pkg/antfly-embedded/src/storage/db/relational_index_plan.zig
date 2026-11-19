@@ -223,6 +223,10 @@ const HistoricalProjection = struct {
             alloc.free(indexes);
         }
         for (plan.boundIndexes(), indexes) |bound, *projected| {
+            if (bound.predicate) |predicate| if (predicate.always_false) {
+                projected.predicate = try predicate.projectSource(alloc, source.tableSchema().*, source.physicalLayout());
+                continue;
+            };
             projected.tuple = try bound.tuple.projectSource(alloc, source.tableSchema().*, source.physicalLayout());
             if (bound.cover) |cover| projected.cover = try cover.projectSource(alloc, source.tableSchema().*, source.physicalLayout());
             if (bound.predicate) |predicate| projected.predicate = try predicate.projectSource(alloc, source.tableSchema().*, source.physicalLayout());
@@ -378,6 +382,122 @@ const test_columns = [_]schema.RelationalColumn{
     .{ .name = "label", .path = "label", .column_type = .string, .allows_null = true },
 };
 const test_schema = schema.TableSchema{ .version = 7, .storage_mode = .relational, .relational_columns = &test_columns };
+
+test "relational index system SQL immutable index keys and membership match PostgreSQL typed rows" {
+    const a = std.testing.allocator;
+    const fixture = try std.json.parseFromSlice(struct {
+        base_sql: []const u8,
+        inputs: []const std.json.Value,
+        entries: []const struct { kind: []const u8, sql: []const u8, sqlstate: ?[]const u8, rows: ?[]const ?[]const u8 = null },
+    }, a, @embedFile("../../sql/fixtures/sql_index_planning_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 24), fixture.value.entries.len);
+    var base = try @import("../../sql/compiler.zig").compile(a, fixture.value.base_sql, .{});
+    defer base.deinit();
+    const bytes = try @import("../../sql/ddl_runtime.zig").createSchemaAlloc(a, base.statement.create_table);
+    defer a.free(bytes);
+    for (fixture.value.entries) |entry| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        var public_schema = try std.json.parseFromSliceLeaky(std.json.Value, owned, bytes, .{ .parse_numbers = false });
+        var compiled = try @import("../../sql/compiler.zig").compile(a, entry.sql, .{});
+        defer compiled.deinit();
+        _ = @import("../../sql/schema_ddl.zig").apply(owned, &public_schema, compiled.statement.catalog_ddl) catch |err| {
+            if (entry.sqlstate) |state| {
+                try std.testing.expectEqualStrings(state, @import("../../sql/errors.zig").describe(err).code);
+                continue;
+            }
+            std.debug.print("index planning unexpectedly rejected {s}: {s}\n", .{ entry.sql, @errorName(err) });
+            return err;
+        };
+        try std.testing.expect(entry.sqlstate == null);
+        // The generated public wire contract must accept persisted variants.
+        const encoded = try std.json.Stringify.valueAlloc(owned, public_schema, .{});
+        var parsed = try @import("../../schema/mod.zig").parseValidatedTableSchema(a, encoded);
+        defer parsed.deinit(a);
+        const definitions = (try parsed.relationalIndexDefinitions(owned)).?;
+        try std.testing.expectEqual(@as(usize, 1), definitions.len);
+        const storage_schema = @import("../schema.zig");
+        const runtime = try @import("../../schema/mod.zig").deriveRuntimeTableSchema(a, parsed);
+        defer storage_schema.freeSchema(a, runtime);
+        var constant_membership = false;
+        for (definitions[0].where) |condition| constant_membership = constant_membership or condition.constant != null;
+        try std.testing.expectEqual(constant_membership, runtime.requires_constant_index_predicates);
+        const text_expression = std.mem.indexOf(u8, entry.sql, "md5(") != null or std.mem.indexOf(u8, entry.sql, "replace(") != null;
+        try std.testing.expectEqual(text_expression, runtime.requires_text_expressions);
+        const registry_mod = @import("schema_registry.zig");
+        var registry = try registry_mod.Registry.initCloned(a, std.testing.io, runtime);
+        defer registry.deinit();
+        var pinned = registry.acquire().?;
+        defer pinned.release();
+        const definition = definitions[0];
+        var plan = try View.init(a, pinned, &.{.{ .name = definition.name, .generation = 1, .keys = definition.keys, .where = definition.where }});
+        defer plan.release();
+        var batch = Batch.init(a, plan);
+        defer batch.deinit();
+        var expected_bytes: std.ArrayList(u8) = .empty;
+        defer expected_bytes.deinit(a);
+        var members: usize = 0;
+        for (fixture.value.inputs, 0..) |input, row_number| {
+            const document = try std.json.Stringify.valueAlloc(owned, input, .{});
+            var prepared = try mapper.PreparedRelationalWrite.init(a, "probe", document, null, pinned.tableSchema().*, pinned.physicalLayout());
+            defer prepared.deinit(a);
+            const position = try batch.appendPrepared(&prepared);
+            const key = try batch.key(position, 0);
+            const is_expression = std.mem.eql(u8, entry.kind, "key");
+            const n = input.object.get("n").?;
+            var member = is_expression;
+            if (!is_expression) for (entry.rows.?) |expected| {
+                if (if (expected) |text| n == .integer and n.integer == try std.fmt.parseInt(i64, text, 10) else n == .null) member = true;
+            };
+            try std.testing.expectEqual(member, key.member);
+            if (!member) continue;
+            members += 1;
+            const value: tuples.Value = if (is_expression)
+                (if (entry.rows.?[row_number]) |text| .{ .string = text } else .null)
+            else if (n == .null) .null else .{ .integer = n.integer };
+            expected_bytes.clearRetainingCapacity();
+            const has_null = try plan.boundIndexes()[0].tuple.appendValues(a, &expected_bytes, &.{value});
+            try std.testing.expectEqual(has_null, key.has_null);
+            try std.testing.expectEqualSlices(u8, expected_bytes.items, key.bytes);
+        }
+        try std.testing.expectEqual(entry.rows.?.len, members);
+    }
+}
+
+test "relational index system SQL immutable index empty membership skips write keys covering payloads and cold projections" {
+    const a = std.testing.allocator;
+    var registry = try schema_registry.Registry.initCloned(a, std.testing.io, test_schema);
+    defer registry.deinit();
+    var current = registry.acquire().?;
+    defer current.release();
+    var plan = try View.init(a, current, &.{.{ .name = "empty", .generation = 1, .keys = &.{.{ .column = "id" }}, .include_columns = &.{"label"}, .where = &.{.{ .constant = false }} }});
+    defer plan.release();
+    var batch = Batch.init(a, plan);
+    defer batch.deinit();
+    try batch.reserve(1024, 0);
+    for (0..1024) |i| {
+        // Epoch/layout identity is real; payload is deliberately unavailable.
+        // Membership must decide before any key or covering-column access.
+        _ = try batch.append(.{ .parsed = undefined, .table_schema = current.tableSchema().*, .layout = current.physicalLayout() });
+        const key = try batch.key(i, 0);
+        try std.testing.expect(!key.member);
+        try std.testing.expectEqual(@as(usize, 0), key.bytes.len);
+        try std.testing.expectEqual(@as(usize, 0), key.payload.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), batch.bytes.capacity);
+    try std.testing.expectEqual(@as(usize, 0), batch.predicate_scratch.capacity);
+    var old_registry = try schema_registry.Registry.initCloned(a, std.testing.io, .{ .version = 6, .storage_mode = .relational, .relational_columns = &.{.{ .name = "old", .path = "old", .column_type = .string }} });
+    defer old_registry.deinit();
+    var old = old_registry.acquire().?;
+    defer old.release();
+    var projected = try HistoricalProjection.init(a, plan, old);
+    defer projected.deinit();
+    try std.testing.expect(projected.indexes[0].tuple == null);
+    try std.testing.expect(projected.indexes[0].cover == null);
+    try std.testing.expect(projected.indexes[0].predicate.?.always_false);
+}
 const test_definitions = [_]Definition{
     .{ .name = "z_label", .generation = 4, .keys = &.{.{ .column = "label", .collation = "ci" }} },
     .{ .name = "a_composite", .generation = 2, .keys = &.{ .{ .column = "id" }, .{ .column = "label", .direction = .desc } } },

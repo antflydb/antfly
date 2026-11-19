@@ -368,7 +368,11 @@ test "relational index system rewrite program cache owns validates and budgets i
             lease.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Failure.attempt, .{ scope, intent });
+    // Backing-allocator in-place growth depends on prior heap addresses.
+    // Force the allocation path so the exhaustive fault indices are stable;
+    // retain the full sweep and every cache/lifetime assertion.
+    var deterministic = std.testing.FailingAllocator.init(alloc, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(deterministic.allocator(), Failure.attempt, .{ scope, intent });
     // Contending RPCs share one compile; no std.Thread lifecycle or spin waits.
     var runtime = std.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();

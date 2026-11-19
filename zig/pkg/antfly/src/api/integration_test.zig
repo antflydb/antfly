@@ -714,9 +714,10 @@ const FakeAntflyProvider = struct {
     }
 };
 
-// Keep query response/JSON temporaries out of the schema-owner phase. Debug
-// reserves their stack slots for the entire function, including nested DB opens.
-noinline fn assertPublicSmokeQueries(client: *http_client.ApiHttpClient, base_uri: []const u8) !void {
+// Keep query response parsing in a separate frame from schema inspection.
+// In Debug, the full smoke test otherwise retains megabytes of temporaries
+// while status-only DB.open needs its own nested storage initialization frame.
+noinline fn expectSmokeDocumentQueries(client: *http_client.ApiHttpClient, base_uri: []const u8, io: std.Io) !void {
     const batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
         \\{"inserts":{"doc:a":{"title":"alpha","body":"hello full text world","status":"published","score":10,"created_at":"2026-03-01T00:00:00Z"},"doc:b":{"title":"beta","body":"secondary document","status":"draft","score":3,"created_at":"2026-03-10T00:00:00Z"},"doc:c":{"title":"gamma","body":"hello filtered world","status":"published","score":8,"created_at":"2026-03-20T00:00:00Z"}}}
     );
@@ -754,7 +755,7 @@ noinline fn assertPublicSmokeQueries(client: *http_client.ApiHttpClient, base_ur
     // an unloaded scheduler makes the first query see the new generation.
     var query = try fetchQueryUntilTotal(
         client,
-        std.testing.io,
+        io,
         base_uri,
         "docs",
         query_body,
@@ -1369,10 +1370,13 @@ test "public api smoke integration creates table inserts and queries documents" 
     // has published its durable generation. Wait on that owner's activity
     // contract instead of assuming a fixed number of metadata rounds is
     // enough on a loaded CI runner.
+    // Sequential waits share one runtime and retire it with this fixture.
+    var wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer wait_io.deinit();
     var structural_wait_attempts: usize = 0;
     while (structural_wait_attempts < 120_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (structural_wait_attempts += 1) {
         try svc.runRound();
-        std.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
 
@@ -1446,7 +1450,7 @@ test "public api smoke integration creates table inserts and queries documents" 
     var owner_wait_attempts: usize = 0;
     while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (owner_wait_attempts += 1) {
         try svc.runRound();
-        std.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
 
@@ -1499,7 +1503,7 @@ test "public api smoke integration creates table inserts and queries documents" 
     try std.testing.expect(parsed_stable_table_detail.value.indexes.map.get("full_text_index_v0") == null);
     try std.testing.expect(parsed_stable_table_detail.value.indexes.map.get("full_text_index_v1") != null);
 
-    try assertPublicSmokeQueries(&client, base_uri);
+    try expectSmokeDocumentQueries(&client, base_uri, wait_io.io());
 
     const delete_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"deletes\":[\"doc:a\",\"doc:c\"]}");
     defer std.testing.allocator.free(delete_body);
@@ -1529,7 +1533,7 @@ test "public api smoke integration creates table inserts and queries documents" 
     owner_wait_attempts = 0;
     while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (owner_wait_attempts += 1) {
         try svc.runRound();
-        std.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
 
@@ -3886,6 +3890,13 @@ test "public api integration recreates managed embeddings index after corrupt ar
     try svc.campaignMetadataGroup();
     try svc.runRound();
 
+    // This integration test issues real embedding validation requests. Give
+    // it the same dedicated executor ownership as production so unrelated
+    // parallel tests cannot exhaust the process-global fallback executor.
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    // The write source borrows this runtime through quiesce/deinit, including
+    // listener-start failure cleanup. Its owner must outlive the source.
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
@@ -3896,11 +3907,6 @@ test "public api integration recreates managed embeddings index after corrupt ar
         table_catalog.CatalogSource.fromMetadataService(&svc),
     );
     defer provisioned_write_source.deinit();
-    // This integration test issues real embedding validation requests. Give
-    // it the same dedicated executor ownership as production so unrelated
-    // parallel tests cannot exhaust the process-global fallback executor.
-    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
-    defer backend_runtime.deinit();
     provisioned_write_source.backend_runtime = backend_runtime.ptr();
     const probe_retry_io = backend_runtime.ptr().controlIo() orelse return error.BackendRuntimeUnavailable;
     const DirectWriterOwner = struct {

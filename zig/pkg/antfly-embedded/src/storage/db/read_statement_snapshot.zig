@@ -15,7 +15,16 @@
 
 //! Owner-local retained visibility cut. It never crosses the native boundary.
 const Source = @import("read_session_source_types").types;
+pub const Graph = struct {
+    read: Source.graph_types.GraphIndex.RetainedEdgeRead,
+    proof: @import("read_session_types").types.graph_snapshot.Proof,
+};
 pub const Implementation = struct {
+    read_at_ns: u64 = 0,
+    graphs: []Graph = &.{},
+    graph_allocator: ?@import("std").mem.Allocator = null,
+    /// Optional immutable index authority captured with the primary cut.
+    /// Legacy delayed SQL readers deliberately retain only the primary path.
     index_catalog_captured: bool = false,
     indexes: ?Source.index_catalog.WriteSnapshot = null,
     row_policy_lease: ?Source.row_policy_gate.Gate.Lease = null,
@@ -24,9 +33,13 @@ pub const Implementation = struct {
     row_policy_catalog_epoch: u64 = 0,
     read: Source.store.DocStore.Txn,
     schema_version: u32,
+    document: bool = false,
+
     pub fn deinit(self: *@This()) void {
         if (self.indexes) |*indexes| indexes.deinit();
         self.read.abort();
+        for (self.graphs) |*graph| graph.read.deinit();
+        if (self.graph_allocator) |alloc| alloc.free(self.graphs);
         if (self.row_policy_lease) |*lease| lease.release();
         self.* = undefined;
     }

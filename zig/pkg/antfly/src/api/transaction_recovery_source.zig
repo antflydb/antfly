@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const db_types = @import("antfly_local_sources").storage_db_types;
+const ExternalOwner = @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner;
 
 pub const Options = struct {
     enabled: bool = false,
@@ -57,6 +58,7 @@ pub const Source = struct {
             cutoff_timestamp: u64,
             retained_cutoff_timestamp: u64,
         ) anyerror!void,
+        resolve_external: ?*const fn (*anyopaque, db_types.TxnId, []const u8, db_types.TxnStatus, u64, ExternalOwner) anyerror!void = null,
     };
 
     pub fn options(self: Source) Options {
@@ -75,6 +77,12 @@ pub const Source = struct {
         commit_version: u64,
     ) !void {
         return self.vtable.resolve(self.ptr, txn_id, participant, status, commit_version);
+    }
+
+    pub fn resolveExternal(self: Source, txn: db_types.TxnId, participant: []const u8, status: db_types.TxnStatus, version: u64, owner: ExternalOwner) !void {
+        const callback = self.vtable.resolve_external orelse return error.ExternalTransactionDecisionRequired;
+        try owner.validate();
+        return callback(self.ptr, txn, participant, status, version, owner);
     }
 
     pub fn acknowledge(

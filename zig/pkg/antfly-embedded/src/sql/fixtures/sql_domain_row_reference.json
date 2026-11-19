@@ -1,0 +1,345 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL 18 domain rows, defaults, checks and typed NULL provenance",
+  "before": [
+    {
+      "sql": "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0)",
+      "id": "sql-0306",
+      "source_entry_sha256": "afbb3693f8239a52a2b12a826d06527fd31bd00518a9335dfcd7d7945e32ed0a",
+      "command_tag": "CREATE DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "CREATE DOMAIN status_text AS text DEFAULT 'queued' NOT NULL",
+      "id": "sql-0307",
+      "source_entry_sha256": "ffb16883e391c276639eef127fc8826d88b7661f2229f88d15a050e716f54712",
+      "command_tag": "CREATE DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "CREATE TABLE domain_rows(id BIGINT PRIMARY KEY,amount positive_amount,status status_text)",
+      "command_tag": "CREATE TABLE",
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO domain_rows(id,amount) VALUES(1,1)",
+      "command_tag": "INSERT 0 1",
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO domain_rows(id,amount) VALUES(3,0)",
+      "sqlstate": "23514",
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO domain_rows(id,amount,status) VALUES(3,3,NULL)",
+      "sqlstate": "23502",
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO domain_rows(id,amount,status) SELECT 2,2,r.status FROM (VALUES(1)) AS seed(id) LEFT JOIN domain_rows r ON r.id=999",
+      "command_tag": "INSERT 0 1",
+      "notices": []
+    },
+    {
+      "sql": "UPDATE domain_rows SET amount=3 WHERE id=2",
+      "command_tag": "UPDATE 1",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,amount::text AS amount,status::text AS status FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 2",
+      "output": {
+        "columns": [
+          "id",
+          "amount",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "1",
+            "queued"
+          ],
+          [
+            2,
+            "3",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO domain_rows(id,amount) VALUES(4,NULL)",
+      "command_tag": "INSERT 0 1",
+      "notices": []
+    },
+    {
+      "sql": "ALTER DOMAIN positive_amount SET NOT NULL",
+      "sqlstate": "23502",
+      "notices": []
+    },
+    {
+      "sql": "DELETE FROM domain_rows WHERE id=4",
+      "command_tag": "DELETE 1",
+      "notices": []
+    },
+    {
+      "sql": "ALTER DOMAIN positive_amount SET NOT NULL",
+      "id": "sql-0308",
+      "source_entry_sha256": "0eec3c0dae514eb6203ed061ef2987d2bf4cf2db90be9195293e635a364ae7eb",
+      "command_tag": "ALTER DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO domain_rows(id,amount) VALUES(4,NULL)",
+      "sqlstate": "23502",
+      "notices": []
+    }
+  ],
+  "cold": [
+    {
+      "sql": "SELECT id,amount::text AS amount,status::text AS status FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 2",
+      "output": {
+        "columns": [
+          "id",
+          "amount",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "1",
+            "queued"
+          ],
+          [
+            2,
+            "3",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "UPDATE domain_rows SET amount=4 WHERE id=2",
+      "command_tag": "UPDATE 1",
+      "notices": []
+    },
+    {
+      "sql": "UPDATE domain_rows SET amount=-1 WHERE id=1",
+      "sqlstate": "23514",
+      "notices": []
+    },
+    {
+      "sql": "UPDATE domain_rows SET status=NULL WHERE id=1",
+      "sqlstate": "23502",
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO domain_rows(id,amount) VALUES(3,5)",
+      "command_tag": "INSERT 0 1",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,amount::text AS amount,status::text AS status FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "amount",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "1",
+            "queued"
+          ],
+          [
+            2,
+            "4",
+            null
+          ],
+          [
+            3,
+            "5",
+            "queued"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true
+          ],
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    }
+  ],
+  "after": [
+    {
+      "sql": "DROP DOMAIN IF EXISTS positive_amount CASCADE",
+      "id": "sql-0310",
+      "source_entry_sha256": "61619eccb588ea721150176fc57fa72bff3301a15795377ebcc9df10d4accc80",
+      "command_tag": "DROP DOMAIN",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "drop cascades to column amount of table domain_rows"
+        }
+      ]
+    },
+    {
+      "sql": "SELECT id,status::text AS status FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "queued"
+          ],
+          [
+            2,
+            null
+          ],
+          [
+            3,
+            "queued"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            true
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO domain_rows(id) VALUES(4)",
+      "command_tag": "INSERT 0 1",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,status::text AS status FROM domain_rows ORDER BY id",
+      "command_tag": "SELECT 4",
+      "output": {
+        "columns": [
+          "id",
+          "status"
+        ],
+        "column_oids": [
+          20,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "queued"
+          ],
+          [
+            2,
+            null
+          ],
+          [
+            3,
+            "queued"
+          ],
+          [
+            4,
+            "queued"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            true
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    }
+  ]
+}

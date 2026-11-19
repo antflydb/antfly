@@ -40,6 +40,7 @@ pub const sql_mutation_images = @import("antfly_local_sources").sql_mutation_ima
 pub const sql_execution_batch = @import("antfly_local_sources").sql_execution_batch;
 pub const sql_scalar = @import("antfly_local_sources").sql_scalar;
 pub const sql_document_row = @import("antfly_local_sources").sql_document_row;
+pub const sql_search_cursor = @import("antfly_local_sources").sql_search_cursor;
 pub const storage_row_identity = @import("antfly_local_sources").storage_row_identity;
 pub const storage_range_protection = @import("antfly_local_sources").storage_range_protection;
 pub const storage_coordinated_ttl = @import("antfly_local_sources").storage_coordinated_ttl;

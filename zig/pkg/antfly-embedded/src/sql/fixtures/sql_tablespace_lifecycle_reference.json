@@ -1,0 +1,57 @@
+{
+  "format": 1,
+  "entries": [
+    {
+      "id": "sql-0111",
+      "setup": [
+        "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace'"
+      ],
+      "kind": "tablespace",
+      "name": "fastspace_archive",
+      "present": true,
+      "command_tag": "ALTER TABLESPACE",
+      "witness": {
+        "in_use_sqlstate": "55000",
+        "preserved_binding": true,
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "retained"
+          ]
+        ]
+      },
+      "prior_name": "fastspace"
+    },
+    {
+      "id": "sql-0112",
+      "setup": [
+        "CREATE TABLESPACE fastspace_archive LOCATION '/var/lib/antfly/fastspace'"
+      ],
+      "kind": "tablespace",
+      "name": "fastspace_archive",
+      "present": false,
+      "command_tag": "DROP TABLESPACE",
+      "witness": {
+        "in_use_sqlstate": "55000",
+        "preserved_binding": true,
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "retained"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-0113",
+      "setup": [],
+      "kind": "tablespace",
+      "name": "fastspace_archive",
+      "present": false,
+      "command_tag": "DROP TABLESPACE",
+      "witness": null,
+      "unchanged": true,
+      "repeat_noop": true
+    }
+  ]
+}

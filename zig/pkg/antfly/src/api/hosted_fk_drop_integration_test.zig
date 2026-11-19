@@ -198,18 +198,29 @@ fn awaitPublication(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_ru
         defer status.deinit();
         last_phase = status.value.phase;
         try status.value.validateState(alloc);
-        if (status.value.phase == .publishing_child or status.value.phase == .installing_child or status.value.phase == .published) {
-            try std.testing.expectEqual(@as(usize, 1), status.value.parent_acknowledged.len);
-        } else {
-            // The child declaration stays unchanged while the parent has not
-            // acknowledged its exact accepted generation.
+        // The two reads may straddle publication. Compare complete declared
+        // pre/postimages, then read ACK evidence AFTER observing a successor.
+        // An earlier phase cannot classify a later independent table snapshot.
+        {
             var snapshot = try metadata.server.svc.adminSnapshot();
             defer metadata.server.svc.freeAdminSnapshot(&snapshot);
             const current = for (snapshot.tables) |entry| {
                 if (entry.table_id == child_id) break entry;
             } else return error.ChildTableMissing;
-            const contains_fk = std.mem.indexOf(u8, current.schema_json, "child_parent") != null;
-            try std.testing.expectEqual(!expect_fk, contains_fk);
+            const before = std.mem.eql(u8, current.schema_json, status.value.plan.child_before.schema_json);
+            const after = std.mem.eql(u8, current.schema_json, status.value.plan.child_after.schema_json);
+            try std.testing.expect(before or after);
+            if (after) {
+                try std.testing.expectEqual(expect_fk, std.mem.indexOf(u8, current.schema_json, "child_parent") != null);
+                const proof_bytes = try source.systemCatalog(alloc, .{ .deadline_ns = deadline, .fk_generation_publication_authority = true }, .{ .fk_generation_publication_status = child_id });
+                defer alloc.free(proof_bytes);
+                var proof = try std.json.parseFromSlice(publication.Publication, alloc, proof_bytes, .{});
+                defer proof.deinit();
+                try proof.value.validateState(alloc);
+                try std.testing.expectEqualSlices(u8, &status.value.plan.id, &proof.value.plan.id);
+                try std.testing.expectEqual(@as(usize, 1), proof.value.parent_acknowledged.len);
+                try std.testing.expect(proof.value.phase == .installing_child or proof.value.phase == .acknowledging_reference_coverage or proof.value.phase == .published);
+            }
         }
         if (status.value.phase == .published) {
             try std.testing.expectEqual(@as(usize, 1), status.value.parent_staged.len);
@@ -469,13 +480,20 @@ fn mountedHostedExternalParent(mode: MountedMode) !void {
 
     for ([_][]const u8{
         "CREATE TABLE parents (id BIGINT PRIMARY KEY)",
-        "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT)",
-    }) |statement| {
+        "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT, CONSTRAINT positive_child CHECK (id > 0))",
+    }, [_][]const u8{ "parents", "children" }) |statement, name| {
+        recovery_fixture.awaitAbsentRelation(alloc, io, &metadata, .{ .name = name }) catch |err| {
+            try meta_raft.checkFailure();
+            try meta_control.checkFailure();
+            try data_raft.checkFailure();
+            try data_control.checkFailure();
+            return err;
+        };
         var response = try sql(alloc, transport, &headers, base, statement);
         defer response.deinit(alloc);
         // CREATE may acknowledge catalog admission before owner readiness.
         // The authoritative table barriers below must still complete.
-        if (response.status != 200 and response.status != 202) std.debug.print("hosted FK create status={d}\n", .{response.status});
+        if (response.status != 200 and response.status != 202) std.debug.print("hosted FK create status={d} statement={s} body={s}\n", .{ response.status, statement, response.body[0..@min(response.body.len, 2048)] });
         try std.testing.expect(response.status == 200 or response.status == 202);
     }
     const parent_id = try awaitTable(alloc, io, transport, &headers, base, "parents");

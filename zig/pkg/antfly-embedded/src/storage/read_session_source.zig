@@ -18,6 +18,7 @@
 pub const Relational = @import("db/relational_read_session.zig").Implementation;
 pub const Document = @import("db/document_rows.zig").Implementation;
 pub const Statement = @import("db/read_statement_snapshot.zig").Implementation;
+pub const GraphStatementSnapshot = @import("db/read_statement_snapshot.zig").Graph;
 pub const RelationalRows = @import("db/relational_rows.zig");
 
 pub const QueryReadLease = @import("db/query_read_lease.zig").For;

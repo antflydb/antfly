@@ -1,0 +1,1371 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL field-scoped text witness and SQL residuals",
+  "profile": {
+    "description": "Exact unranked text candidates with independently evaluated PostgreSQL residuals",
+    "schema": {
+      "version": 1,
+      "storage_mode": "document",
+      "default_type": "doc",
+      "document_schemas": {
+        "doc": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "keyword"
+              },
+              "status": {
+                "type": "keyword"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "metrics": {
+                "type": "object"
+              },
+              "flags": {
+                "type": "object"
+              },
+              "tags": {
+                "type": "array",
+                "nullable": true
+              },
+              "note": {
+                "type": "keyword",
+                "nullable": true
+              },
+              "body": {
+                "type": "text"
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "rows": [
+      {
+        "key": "doc:a",
+        "value": {
+          "title": "alpha",
+          "status": "active",
+          "metadata": {
+            "plan": "pro",
+            "region": "west",
+            "billing": {},
+            "flags": []
+          },
+          "metrics": {
+            "score": 60
+          },
+          "flags": {
+            "published": true
+          },
+          "tags": [
+            "urgent",
+            null,
+            "vip"
+          ],
+          "note": "first",
+          "body": "alpha public"
+        }
+      },
+      {
+        "key": "doc:b",
+        "value": {
+          "title": "beta",
+          "status": "active",
+          "metadata": {
+            "plan": "pro",
+            "region": "west-coast"
+          },
+          "metrics": {
+            "score": 20
+          },
+          "flags": {
+            "published": false
+          },
+          "tags": [
+            "vip",
+            "stale"
+          ],
+          "note": "second",
+          "body": "beta other"
+        }
+      },
+      {
+        "key": "doc:c",
+        "value": {
+          "title": "gamma",
+          "status": "active",
+          "metadata": {
+            "plan": "free",
+            "region": "east"
+          },
+          "metrics": {
+            "score": 15
+          },
+          "flags": {
+            "published": true
+          },
+          "tags": [],
+          "note": null,
+          "body": "beta other"
+        }
+      },
+      {
+        "key": "doc:d",
+        "value": {
+          "title": "delta",
+          "status": "draft",
+          "metadata": {
+            "plan": "team",
+            "region": null
+          },
+          "metrics": {
+            "score": 10
+          },
+          "flags": {
+            "published": false
+          },
+          "tags": null,
+          "note": null,
+          "body": "alpha public"
+        }
+      },
+      {
+        "key": "doc:e",
+        "value": {
+          "title": "epsilon",
+          "status": "active",
+          "metadata": {},
+          "metrics": {},
+          "flags": {
+            "published": false
+          },
+          "tags": [
+            "archived"
+          ],
+          "note": "other",
+          "body": "beta other"
+        }
+      },
+      {
+        "key": "doc:f",
+        "value": {
+          "title": "zeta",
+          "status": "active",
+          "metadata": {
+            "plan": "pro",
+            "region": "internal"
+          },
+          "metrics": {},
+          "flags": {
+            "published": true
+          },
+          "tags": [
+            "urgent"
+          ],
+          "note": "last",
+          "body": "alpha public"
+        }
+      }
+    ],
+    "view_sql": "CREATE VIEW support_view AS SELECT d._id,r.title AS title_text,r.status,r.metadata->>'plan' AS plan,r.metadata->>'region' AS region,(r.metrics->>'score')::numeric AS score,(r.flags->>'published')::boolean AS published,r.tags AS tag_list,r.metadata,r.note FROM docs d CROSS JOIN LATERAL jsonb_to_record(d._doc) AS r(title TEXT,status TEXT,metadata JSONB,metrics JSONB,flags JSONB,tags TEXT[],note TEXT)"
+  },
+  "entries": [
+    {
+      "id": "sql-0801",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ],
+        [
+          "doc:b",
+          "pro"
+        ],
+        [
+          "doc:f",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND status = 'active' LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND status = 'active' LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a",
+            "doc:b",
+            "doc:f"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0814",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM support_view AS d JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE full_text_search('title:alpha') AND tag = 'urgent' AND status = 'active' LIMIT 10",
+      "reference_sql": "SELECT d._id, tag FROM support_view AS d JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{title}','')) @@ plainto_tsquery('simple','alpha')) AND tag = 'urgent' AND status = 'active' LIMIT 10",
+      "text_witnesses": [
+        {
+          "field": "title",
+          "term": "alpha",
+          "candidate_ids": [
+            "doc:a"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0858",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ],
+        [
+          "doc:b",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND region ILIKE 'west%' LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND region ILIKE 'west%' LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a",
+            "doc:b",
+            "doc:f"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0860",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ],
+        [
+          "doc:b",
+          "pro"
+        ],
+        [
+          "doc:f",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND plan ~ '^pro' LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND plan ~ '^pro' LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a",
+            "doc:b",
+            "doc:f"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0861",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ],
+        [
+          "doc:b",
+          "pro"
+        ],
+        [
+          "doc:f",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND plan !~* 'internal' LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND plan !~* 'internal' LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a",
+            "doc:b",
+            "doc:f"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0862",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ],
+        [
+          "doc:b",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND NOT (region = 'internal') LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND NOT (region = 'internal') LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a",
+            "doc:b",
+            "doc:f"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0863",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ],
+        [
+          "doc:b",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND region NOT IN ('internal', 'legacy') LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND region NOT IN ('internal', 'legacy') LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a",
+            "doc:b",
+            "doc:f"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0864",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ],
+        [
+          "doc:b",
+          "pro"
+        ],
+        [
+          "doc:f",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND (plan = 'pro' OR region = 'west') LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND (plan = 'pro' OR region = 'west') LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a",
+            "doc:b",
+            "doc:f"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0865",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ],
+        [
+          "doc:b",
+          "pro"
+        ],
+        [
+          "doc:f",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND length(plan) = 3 LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND length(plan) = 3 LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a",
+            "doc:b",
+            "doc:f"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0867",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND metadata ? 'billing' LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND metadata ? 'billing' LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a",
+            "doc:b",
+            "doc:f"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0868",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND metadata ?| ARRAY['billing', 'flags'] LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND metadata ?| ARRAY['billing', 'flags'] LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a",
+            "doc:b",
+            "doc:f"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0869",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND metadata ?& ARRAY['billing', 'flags'] LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND metadata ?& ARRAY['billing', 'flags'] LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a",
+            "doc:b",
+            "doc:f"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0870",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ],
+        [
+          "doc:b",
+          "pro"
+        ],
+        [
+          "doc:f",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND tag_list && ARRAY['urgent', 'vip'] LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND tag_list && ARRAY['urgent', 'vip'] LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a",
+            "doc:b",
+            "doc:f"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0871",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND tag_list @> ARRAY['urgent', 'vip'] LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND tag_list @> ARRAY['urgent', 'vip'] LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a",
+            "doc:b",
+            "doc:f"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-1579",
+      "columns": [
+        "row_count"
+      ],
+      "rows": [
+        [
+          2
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        20
+      ],
+      "affected": 0,
+      "sql": "SELECT count(*) AS row_count FROM docs WHERE full_text_search('body:alpha') AND status = 'active'",
+      "reference_sql": "SELECT count(*) AS row_count FROM docs WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{body}','')) @@ plainto_tsquery('simple','alpha')) AND status = 'active'",
+      "text_witnesses": [
+        {
+          "field": "body",
+          "term": "alpha",
+          "candidate_ids": [
+            "doc:a",
+            "doc:d",
+            "doc:f"
+          ]
+        }
+      ]
+    }
+  ],
+  "filtered_entries": [
+    {
+      "id": "sql-0801",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND status = 'active' LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND status = 'active' LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0814",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM support_view AS d JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE full_text_search('title:alpha') AND tag = 'urgent' AND status = 'active' LIMIT 10",
+      "reference_sql": "SELECT d._id, tag FROM support_view AS d JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{title}','')) @@ plainto_tsquery('simple','alpha')) AND tag = 'urgent' AND status = 'active' LIMIT 10",
+      "text_witnesses": [
+        {
+          "field": "title",
+          "term": "alpha",
+          "candidate_ids": [
+            "doc:a"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0858",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND region ILIKE 'west%' LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND region ILIKE 'west%' LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0860",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND plan ~ '^pro' LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND plan ~ '^pro' LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0861",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND plan !~* 'internal' LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND plan !~* 'internal' LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0862",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND NOT (region = 'internal') LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND NOT (region = 'internal') LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0863",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND region NOT IN ('internal', 'legacy') LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND region NOT IN ('internal', 'legacy') LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0864",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND (plan = 'pro' OR region = 'west') LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND (plan = 'pro' OR region = 'west') LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0865",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND length(plan) = 3 LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND length(plan) = 3 LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0867",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND metadata ? 'billing' LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND metadata ? 'billing' LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0868",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND metadata ?| ARRAY['billing', 'flags'] LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND metadata ?| ARRAY['billing', 'flags'] LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0869",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND metadata ?& ARRAY['billing', 'flags'] LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND metadata ?& ARRAY['billing', 'flags'] LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0870",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND tag_list && ARRAY['urgent', 'vip'] LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND tag_list && ARRAY['urgent', 'vip'] LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0871",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND tag_list @> ARRAY['urgent', 'vip'] LIMIT 5",
+      "reference_sql": "SELECT _id, plan FROM support_view WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{metadata,plan}','')) @@ plainto_tsquery('simple','pro')) AND tag_list @> ARRAY['urgent', 'vip'] LIMIT 5",
+      "text_witnesses": [
+        {
+          "field": "metadata.plan",
+          "term": "pro",
+          "candidate_ids": [
+            "doc:a"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-1579",
+      "columns": [
+        "row_count"
+      ],
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        20
+      ],
+      "affected": 0,
+      "sql": "SELECT count(*) AS row_count FROM docs WHERE full_text_search('body:alpha') AND status = 'active'",
+      "reference_sql": "SELECT count(*) AS row_count FROM docs WHERE _id IN (SELECT candidate._id FROM docs candidate WHERE to_tsvector('simple',coalesce(candidate._doc #>> '{body}','')) @@ plainto_tsquery('simple','alpha')) AND status = 'active'",
+      "text_witnesses": [
+        {
+          "field": "body",
+          "term": "alpha",
+          "candidate_ids": [
+            "doc:a"
+          ]
+        }
+      ]
+    }
+  ]
+}

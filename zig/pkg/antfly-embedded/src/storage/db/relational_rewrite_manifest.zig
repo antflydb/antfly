@@ -88,9 +88,9 @@ pub fn read(alloc: std.mem.Allocator, txn: anytype, cancel: Cancel) ![]const []c
     while (row) |kv| : (row = try cursor.next()) {
         try cancel.check();
         if (!std.mem.startsWith(u8, kv.key, runtime_prefix)) break;
+        const version = (native.schemaVersionFromKey(kv.key) catch return error.RestoreStagingScopeChanged) orelse continue;
         runtime_count += 1;
         if (runtime_count > contract.max_source_schemas or kv.value.len > contract.max_schema_bytes) return error.RelationalRewriteBudgetExceeded;
-        const version = std.fmt.parseInt(u32, kv.key[runtime_prefix.len..], 10) catch return error.RestoreStagingScopeChanged;
         const key = try native.schemaVersionKeyAlloc(alloc, version);
         defer alloc.free(key);
         if (!std.mem.eql(u8, key, kv.key)) return error.RestoreStagingScopeChanged;

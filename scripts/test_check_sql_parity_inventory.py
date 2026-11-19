@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import contextlib
+import copy
 import io
 import json
 import unittest
@@ -218,12 +218,25 @@ class ParityInventoryTest(unittest.TestCase):
     def test_unresolved_partial_evidence_is_checked_and_runs_without_release_credit(
         self,
     ):
-        _, entries, gate_ids = validate(self.inventory, self.ledger)
+        # The live case may legitimately graduate. Exercise partial evidence
+        # using a controlled disposition, not a permanently unresolved case.
+        ledger = copy.deepcopy(self.ledger)
+        next(entry for entry in ledger["entries"] if entry["id"] == "sql-0008")[
+            "status"
+        ] = "unresolved"
+        _, entries, gate_ids = validate(self.inventory, ledger)
         partial = next(entry for entry in entries if entry["id"] == "sql-0008")
         self.assertEqual("unresolved", partial["status"])
+        self.assertIn(partial, release_blockers(entries))
         self.assertIn("sql-original-prepared-cte-runtime", gate_ids)
         self.assertIn("pgwire-original-prepared-cte", gate_ids)
-        ledger = copy.deepcopy(self.ledger)
+        with patch("check_sql_parity_inventory.subprocess.run") as run:
+            run_evidence(
+                sorted({proof["gate"] for proof in partial["evidence"]}),
+                ledger["gates"],
+            )
+        self.assertTrue(run.called)
+        self.assertEqual("unresolved", partial["status"])
         partial = next(
             entry for entry in ledger["entries"] if entry["id"] == "sql-0008"
         )
@@ -237,7 +250,7 @@ class ParityInventoryTest(unittest.TestCase):
             "pgwire original prepared CTE INSERT defers mutation until execute"
         )
         partial["evidence"][2]["test"] = (
-            "SQL document reads reject the relational stateless fallback before transport"
+            "SQL stateless fallback rejects JSON scans before transport"
         )
         with self.assertRaisesRegex(ValueError, "at least one cited evidence test"):
             validate(self.inventory, ledger)
@@ -358,6 +371,31 @@ class ParityInventoryTest(unittest.TestCase):
         self.assertEqual(10, runs[0]["timeout_seconds"])
         self.assertEqual(["c"], runs[1]["gate_ids"])
         self.assertEqual(["d"], runs[2]["gate_ids"])
+
+    def test_compile_and_runtime_filter_groups_never_share_an_argv(self):
+        prefix = ["zig", "build", "sql-test", "-Doptimize=Debug", "-j1"]
+        for compile_first in (True, False):
+            gates = {
+                "compile": {
+                    "command": prefix + ["-Dtest-filter=alpha"],
+                    "cwd": "zig",
+                    "timeout_seconds": 5,
+                },
+                "runtime": {
+                    "command": prefix + ["--", "--test-filter", "beta"],
+                    "cwd": "zig",
+                    "timeout_seconds": 7,
+                },
+            }
+            ids = ["compile", "runtime"] if compile_first else ["runtime", "compile"]
+            runs = evidence_runs(ids, gates)
+            self.assertEqual(2, len(runs))
+            for run, gate_id in zip(runs, ids, strict=True):
+                self.assertEqual([gate_id], run["gate_ids"])
+                self.assertEqual(gates[gate_id]["command"], run["command"])
+                self.assertEqual(
+                    gates[gate_id]["timeout_seconds"], run["timeout_seconds"]
+                )
 
 
 if __name__ == "__main__":

@@ -119,7 +119,7 @@ pub const Index = struct {
         var parent: usize = 0;
         for (values) |value| {
             try self.step();
-            if (value.patterns != null) return error.SqlTypeMismatch;
+            if (value.patterns() != null) return error.SqlTypeMismatch;
             const hash = try scalar.semanticHashDatum(value);
             var child = try self.find(parent, value, hash);
             if (child == none) {
@@ -152,7 +152,7 @@ pub const Index = struct {
         var all_nonnull = true;
         for (values, hashes[0..self.arity]) |value, *hash| {
             try self.step();
-            if (value.patterns != null) return error.SqlTypeMismatch;
+            if (value.patterns() != null) return error.SqlTypeMismatch;
             hash.* = try scalar.semanticHashDatum(value);
             all_nonnull = all_nonnull and !value.sql_null;
         }

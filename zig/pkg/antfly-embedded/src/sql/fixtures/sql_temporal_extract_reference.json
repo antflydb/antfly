@@ -1,0 +1,887 @@
+{
+  "reference": "PostgreSQL 18 exact UTC extraction",
+  "entries": [
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "epoch",
+      "coefficient": "-1",
+      "scale": 6,
+      "floating": -1e-06
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "microseconds",
+      "coefficient": "59999999",
+      "scale": 0,
+      "floating": 59999999.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "milliseconds",
+      "coefficient": "59999999",
+      "scale": 3,
+      "floating": 59999.999
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "second",
+      "coefficient": "59999999",
+      "scale": 6,
+      "floating": 59.999999
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "minute",
+      "coefficient": "59",
+      "scale": 0,
+      "floating": 59.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "hour",
+      "coefficient": "23",
+      "scale": 0,
+      "floating": 23.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "day",
+      "coefficient": "31",
+      "scale": 0,
+      "floating": 31.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "month",
+      "coefficient": "12",
+      "scale": 0,
+      "floating": 12.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "quarter",
+      "coefficient": "4",
+      "scale": 0,
+      "floating": 4.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "year",
+      "coefficient": "1969",
+      "scale": 0,
+      "floating": 1969.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "decade",
+      "coefficient": "196",
+      "scale": 0,
+      "floating": 196.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "century",
+      "coefficient": "20",
+      "scale": 0,
+      "floating": 20.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "millennium",
+      "coefficient": "2",
+      "scale": 0,
+      "floating": 2.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "dow",
+      "coefficient": "3",
+      "scale": 0,
+      "floating": 3.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "isodow",
+      "coefficient": "3",
+      "scale": 0,
+      "floating": 3.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "doy",
+      "coefficient": "365",
+      "scale": 0,
+      "floating": 365.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "week",
+      "coefficient": "1",
+      "scale": 0,
+      "floating": 1.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "isoyear",
+      "coefficient": "1970",
+      "scale": 0,
+      "floating": 1970.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "timezone",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "timezone_hour",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "fffca2fec4c81fff",
+      "unit": "timezone_minute",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "epoch",
+      "coefficient": "946684800000000",
+      "scale": 6,
+      "floating": 946684800.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "microseconds",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "milliseconds",
+      "coefficient": "0",
+      "scale": 3,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "second",
+      "coefficient": "0",
+      "scale": 6,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "minute",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "hour",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "day",
+      "coefficient": "1",
+      "scale": 0,
+      "floating": 1.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "month",
+      "coefficient": "1",
+      "scale": 0,
+      "floating": 1.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "quarter",
+      "coefficient": "1",
+      "scale": 0,
+      "floating": 1.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "year",
+      "coefficient": "2000",
+      "scale": 0,
+      "floating": 2000.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "decade",
+      "coefficient": "200",
+      "scale": 0,
+      "floating": 200.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "century",
+      "coefficient": "20",
+      "scale": 0,
+      "floating": 20.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "millennium",
+      "coefficient": "2",
+      "scale": 0,
+      "floating": 2.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "dow",
+      "coefficient": "6",
+      "scale": 0,
+      "floating": 6.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "isodow",
+      "coefficient": "6",
+      "scale": 0,
+      "floating": 6.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "doy",
+      "coefficient": "1",
+      "scale": 0,
+      "floating": 1.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "week",
+      "coefficient": "52",
+      "scale": 0,
+      "floating": 52.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "isoyear",
+      "coefficient": "1999",
+      "scale": 0,
+      "floating": 1999.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "timezone",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "timezone_hour",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "0000000000000000",
+      "unit": "timezone_minute",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "epoch",
+      "coefficient": "1451690055123456",
+      "scale": 6,
+      "floating": 1451690055.123456
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "microseconds",
+      "coefficient": "15123456",
+      "scale": 0,
+      "floating": 15123456.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "milliseconds",
+      "coefficient": "15123456",
+      "scale": 3,
+      "floating": 15123.456
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "second",
+      "coefficient": "15123456",
+      "scale": 6,
+      "floating": 15.123456
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "minute",
+      "coefficient": "14",
+      "scale": 0,
+      "floating": 14.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "hour",
+      "coefficient": "23",
+      "scale": 0,
+      "floating": 23.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "day",
+      "coefficient": "1",
+      "scale": 0,
+      "floating": 1.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "month",
+      "coefficient": "1",
+      "scale": 0,
+      "floating": 1.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "quarter",
+      "coefficient": "1",
+      "scale": 0,
+      "floating": 1.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "year",
+      "coefficient": "2016",
+      "scale": 0,
+      "floating": 2016.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "decade",
+      "coefficient": "201",
+      "scale": 0,
+      "floating": 201.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "century",
+      "coefficient": "21",
+      "scale": 0,
+      "floating": 21.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "millennium",
+      "coefficient": "3",
+      "scale": 0,
+      "floating": 3.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "dow",
+      "coefficient": "5",
+      "scale": 0,
+      "floating": 5.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "isodow",
+      "coefficient": "5",
+      "scale": 0,
+      "floating": 5.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "doy",
+      "coefficient": "1",
+      "scale": 0,
+      "floating": 1.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "week",
+      "coefficient": "53",
+      "scale": 0,
+      "floating": 53.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "isoyear",
+      "coefficient": "2015",
+      "scale": 0,
+      "floating": 2015.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "timezone",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "timezone_hour",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "0001cb4cb2d76200",
+      "unit": "timezone_minute",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "epoch",
+      "coefficient": "1798761599000001",
+      "scale": 6,
+      "floating": 1798761599.000001
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "microseconds",
+      "coefficient": "59000001",
+      "scale": 0,
+      "floating": 59000001.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "milliseconds",
+      "coefficient": "59000001",
+      "scale": 3,
+      "floating": 59000.001
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "second",
+      "coefficient": "59000001",
+      "scale": 6,
+      "floating": 59.000001
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "minute",
+      "coefficient": "59",
+      "scale": 0,
+      "floating": 59.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "hour",
+      "coefficient": "23",
+      "scale": 0,
+      "floating": 23.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "day",
+      "coefficient": "31",
+      "scale": 0,
+      "floating": 31.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "month",
+      "coefficient": "12",
+      "scale": 0,
+      "floating": 12.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "quarter",
+      "coefficient": "4",
+      "scale": 0,
+      "floating": 4.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "year",
+      "coefficient": "2026",
+      "scale": 0,
+      "floating": 2026.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "decade",
+      "coefficient": "202",
+      "scale": 0,
+      "floating": 202.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "century",
+      "coefficient": "21",
+      "scale": 0,
+      "floating": 21.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "millennium",
+      "coefficient": "3",
+      "scale": 0,
+      "floating": 3.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "dow",
+      "coefficient": "4",
+      "scale": 0,
+      "floating": 4.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "isodow",
+      "coefficient": "4",
+      "scale": 0,
+      "floating": 4.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "doy",
+      "coefficient": "365",
+      "scale": 0,
+      "floating": 365.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "week",
+      "coefficient": "53",
+      "scale": 0,
+      "floating": 53.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "isoyear",
+      "coefficient": "2026",
+      "scale": 0,
+      "floating": 2026.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "timezone",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "timezone_hour",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "000306f596ecfdc1",
+      "unit": "timezone_minute",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "epoch",
+      "coefficient": "-62167219200000000",
+      "scale": 6,
+      "floating": -62167219200.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "microseconds",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "milliseconds",
+      "coefficient": "0",
+      "scale": 3,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "second",
+      "coefficient": "0",
+      "scale": 6,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "minute",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "hour",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "day",
+      "coefficient": "1",
+      "scale": 0,
+      "floating": 1.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "month",
+      "coefficient": "1",
+      "scale": 0,
+      "floating": 1.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "quarter",
+      "coefficient": "1",
+      "scale": 0,
+      "floating": 1.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "year",
+      "coefficient": "-1",
+      "scale": 0,
+      "floating": -1.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "decade",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "century",
+      "coefficient": "-1",
+      "scale": 0,
+      "floating": -1.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "millennium",
+      "coefficient": "-1",
+      "scale": 0,
+      "floating": -1.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "dow",
+      "coefficient": "6",
+      "scale": 0,
+      "floating": 6.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "isodow",
+      "coefficient": "6",
+      "scale": 0,
+      "floating": 6.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "doy",
+      "coefficient": "1",
+      "scale": 0,
+      "floating": 1.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "week",
+      "coefficient": "52",
+      "scale": 0,
+      "floating": 52.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "isoyear",
+      "coefficient": "-2",
+      "scale": 0,
+      "floating": -2.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "timezone",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "timezone_hour",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "ff1fc63d1bb12000",
+      "unit": "timezone_minute",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "epoch",
+      "coefficient": "-65317834554999994",
+      "scale": 6,
+      "floating": -65317834554.99999
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "microseconds",
+      "coefficient": "5000006",
+      "scale": 0,
+      "floating": 5000006.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "milliseconds",
+      "coefficient": "5000006",
+      "scale": 3,
+      "floating": 5000.006
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "second",
+      "coefficient": "5000006",
+      "scale": 6,
+      "floating": 5.000006
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "minute",
+      "coefficient": "4",
+      "scale": 0,
+      "floating": 4.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "hour",
+      "coefficient": "13",
+      "scale": 0,
+      "floating": 13.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "day",
+      "coefficient": "28",
+      "scale": 0,
+      "floating": 28.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "month",
+      "coefficient": "2",
+      "scale": 0,
+      "floating": 2.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "quarter",
+      "coefficient": "1",
+      "scale": 0,
+      "floating": 1.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "year",
+      "coefficient": "-101",
+      "scale": 0,
+      "floating": -101.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "decade",
+      "coefficient": "-10",
+      "scale": 0,
+      "floating": -10.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "century",
+      "coefficient": "-2",
+      "scale": 0,
+      "floating": -2.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "millennium",
+      "coefficient": "-1",
+      "scale": 0,
+      "floating": -1.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "dow",
+      "coefficient": "3",
+      "scale": 0,
+      "floating": 3.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "isodow",
+      "coefficient": "3",
+      "scale": 0,
+      "floating": 3.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "doy",
+      "coefficient": "59",
+      "scale": 0,
+      "floating": 59.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "week",
+      "coefficient": "9",
+      "scale": 0,
+      "floating": 9.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "isoyear",
+      "coefficient": "-101",
+      "scale": 0,
+      "floating": -101.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "timezone",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "timezone_hour",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    },
+    {
+      "timestamp": "ff1494c54ea21b46",
+      "unit": "timezone_minute",
+      "coefficient": "0",
+      "scale": 0,
+      "floating": 0.0
+    }
+  ]
+}

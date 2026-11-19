@@ -21,20 +21,16 @@ const arrays = @import("array_value.zig");
 const uuid = @import("../common/uuid.zig");
 const MemoryBudget = @import("memory_budget.zig");
 const A = std.mem.Allocator;
-pub const Options = struct { compact: bool = false, values: arrays.Limits = .{}, wire_bytes: usize = 8 * 1024 * 1024 };
+const output = @import("array_output.zig");
+pub const Options = struct { compact: bool = false, values: arrays.Limits = .{}, wire_bytes: usize = 8 * 1024 * 1024, context: ?*@import("numeric_value.zig").Context = null };
 
-fn jsonSize(value: std.json.Value) !usize {
-    var counter: std.Io.Writer.Discarding = .init(&.{});
-    try std.json.Stringify.value(value, .{}, &counter.writer);
-    return std.math.cast(usize, counter.count) orelse error.SqlProgramLimitExceeded;
-}
-
-fn elementSize(kind: arrays.ElementType, element: arrays.Element) !usize {
+fn elementSize(kind: arrays.ElementType, element: arrays.Element, index: usize, prepared: *output.Prepared, work: *arrays.Budget) !usize {
     if (element.sql_null) return 0;
     return switch (kind) {
         .numeric => blk: {
-            var none = std.heap.FixedBufferAllocator.init(&.{});
-            var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator() };
+            var ctx = work.numericContext(A.failing);
+            const before = ctx.remaining;
+            defer work.remaining -|= @intCast(before - ctx.remaining);
             break :blk try @import("numeric_binary.zig").encodedSize(&ctx, element.numeric.?.*);
         },
         .text => element.value.string.len,
@@ -43,41 +39,60 @@ fn elementSize(kind: arrays.ElementType, element: arrays.Element) !usize {
         .int64, .float64 => 8,
         .boolean => 1,
         .uuid => 16,
-        .jsonb => std.math.add(usize, 1, try jsonSize(element.value)) catch error.SqlProgramLimitExceeded,
+        .jsonb => std.math.add(usize, 1, prepared.cells[index].bytes) catch error.SqlProgramLimitExceeded,
     };
 }
 
 /// Validate and size before writing any bytes. Primitive and text cells stream
 /// directly; JSONB uses a counting pass for its required length prefix, not a
 /// per-element temporary allocation. Writer failure remains a writer failure.
-pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
-    return encodeInternal(value, writer, options, true);
+pub fn encode(alloc: A, value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
+    return encodeInner(alloc, value, writer, options, true) catch |err| return sharedFailure(options, err);
 }
 
-/// Scalar codec for adapters without native views and a byte-for-byte oracle
-/// for the native emitter. Both paths share admission and wire-size preflight.
-pub fn encodeGeneric(value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
-    return encodeInternal(value, writer, options, false);
+pub fn encodeGeneric(alloc: A, value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
+    return encodeInner(alloc, value, writer, options, false) catch |err| return sharedFailure(options, err);
 }
 
-fn encodeInternal(value: arrays.Value, writer: *std.Io.Writer, options: Options, comptime native_blocks: bool) !void {
-    const validated = try value.validate(options.values);
+fn sharedFailure(options: Options, err: anyerror) anyerror {
+    return if (err == error.SqlProgramLimitExceeded and options.context != null) options.context.?.limit() else err;
+}
+
+fn encodeInner(alloc: A, value: arrays.Value, writer: *std.Io.Writer, options: Options, comptime native_blocks: bool) !void {
+    var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
+    try work.consume(0);
+    const validated = try value.validateWithBudget(options.values, &work);
     if (validated.dimensions.len != value.dimensions.len) return error.InvalidSqlArrayShape;
     for (value.dimensions) |dimension| if (dimension.length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
+    var prepared: output.Prepared = undefined;
+    prepared.init(alloc, value, options.values.bytes, options.wire_bytes, &work) catch |err| return prepared.failure(err);
+    defer prepared.deinit();
     var size: usize = 12 + value.dimensions.len * 8;
     var has_null = false;
+    const before = work.remaining;
     if (if (value.stored) |view| view.validation else null) |proof| {
         size = proof.binary_wire_bytes;
         has_null = proof.non_null != value.cardinality();
-    } else for (0..value.cardinality()) |array_cell_0| {
-        const element = value.flatCell(array_cell_0);
+    } else for (0..value.cardinality()) |i| {
+        const element = value.flatCell(i);
+        try work.consume(1);
         has_null = has_null or element.sql_null;
-        const length = try elementSize(value.element_type, element);
+        const length = try elementSize(value.element_type, element, i, &prepared, &work);
         if (length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
         size = std.math.add(usize, size, 4 + length) catch return error.SqlProgramLimitExceeded;
         if (size > options.wire_bytes) return error.SqlProgramLimitExceeded;
     }
     if (size > options.wire_bytes) return error.SqlProgramLimitExceeded;
+    const formatting = std.math.add(usize, prepared.format_cost, before - work.remaining) catch return error.SqlProgramLimitExceeded;
+    var emission: output.Emission = undefined;
+    try emission.init(&work, try output.emissionCost(formatting, size));
+    var destination: output.Writer = undefined;
+    destination.init(writer, &emission.work);
+    emit(value, &destination.writer, options, &prepared, &emission.work, has_null, native_blocks) catch |err| return destination.failure orelse err;
+    destination.writer.flush() catch |err| return destination.failure orelse err;
+}
+
+fn emit(value: arrays.Value, writer: *std.Io.Writer, options: Options, prepared: *output.Prepared, work: *arrays.Budget, has_null: bool, comptime native_blocks: bool) !void {
     try writer.writeInt(i32, @intCast(value.dimensions.len), .big);
     try writer.writeInt(i32, @intFromBool(has_null), .big);
     try writer.writeInt(u32, value.element_type.oid(), .big);
@@ -94,17 +109,19 @@ fn encodeInternal(value: arrays.Value, writer: *std.Io.Writer, options: Options,
             else => {},
         }
     };
-    for (0..value.cardinality()) |array_cell_0| {
-        const element = value.flatCell(array_cell_0);
+    for (0..value.cardinality()) |i| {
+        const element = value.flatCell(i);
+        try work.consume(1);
         if (element.sql_null) {
             try writer.writeInt(i32, -1, .big);
             continue;
         }
-        try writer.writeInt(i32, @intCast(try elementSize(value.element_type, element)), .big);
+        try writer.writeInt(i32, @intCast(try elementSize(value.element_type, element, i, prepared, work)), .big);
         switch (value.element_type) {
             .numeric => {
-                var none = std.heap.FixedBufferAllocator.init(&.{});
-                var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator() };
+                var ctx = work.numericContext(A.failing);
+                const before = ctx.remaining;
+                defer work.remaining -|= @intCast(before - ctx.remaining);
                 try @import("numeric_binary.zig").encode(&ctx, element.numeric.?.*, writer);
             },
             .text => try writer.writeAll(element.value.string),
@@ -120,7 +137,7 @@ fn encodeInternal(value: arrays.Value, writer: *std.Io.Writer, options: Options,
             .uuid => try writer.writeAll(&try uuid.parse(element.value.string)),
             .jsonb => {
                 try writer.writeByte(1);
-                try std.json.Stringify.value(element.value, .{}, writer);
+                try prepared.writeJson(element.value, writer, options.wire_bytes, work);
             },
         }
     }
@@ -200,11 +217,9 @@ pub fn decodeElementLeaky(a: A, kind: arrays.ElementType, bytes: []const u8, wor
         .boolean => .{ .bool = bytes[0] != 0 },
         .uuid => .{ .string = try a.dupe(u8, &uuid.format(bytes[0..16].*)) },
         .jsonb => blk: {
-            if (bytes.len < 2 or bytes[0] != 1) return error.InvalidSqlBinaryRepresentation;
-            break :blk @import("json_order.zig").parseTextLeaky(a, bytes[1..], work) catch |err| return switch (err) {
-                error.OutOfMemory, error.SqlProgramLimitExceeded => err,
-                else => error.InvalidSqlBinaryRepresentation,
-            };
+            if (bytes.len == 0) return error.SqlProtocolViolation;
+            if (bytes[0] != 1) return error.SqlJsonbUnsupportedVersion;
+            break :blk try @import("json_order.zig").parseTextLeaky(a, bytes[1..], work);
         },
     });
 }
@@ -213,6 +228,11 @@ pub fn decodeElementLeaky(a: A, kind: arrays.ElementType, bytes: []const u8, wor
 /// failures unwind the entire unpublished arena; quota exhaustion is distinct
 /// from an injected or genuine backing-allocator failure.
 pub fn decode(backing: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !arrays.Owned {
+    return decodeInner(backing, expected, bytes, options) catch |err| return sharedFailure(options, err);
+}
+
+fn decodeInner(backing: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !arrays.Owned {
+    if (options.context) |context| try context.charge(0);
     const budget = try backing.create(MemoryBudget);
     errdefer backing.destroy(budget);
     budget.* = .{ .backing = backing, .limit = options.values.bytes };
@@ -231,12 +251,12 @@ pub const Decoded = struct { value: arrays.Value, work: usize };
 /// retained managed JSON arrays as well as the flat typed cells.
 pub fn decodeLeaky(backing: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !Decoded {
     var budget: MemoryBudget = .{ .backing = backing, .limit = options.values.bytes };
-    return decodeAdmitted(budget.allocator(), backing, expected, bytes, options) catch |err| return quotaError(&budget, err);
+    return decodeAdmitted(budget.allocator(), backing, expected, bytes, options) catch |err| return sharedFailure(options, quotaError(&budget, err));
 }
 
 fn decodeAdmitted(a: A, owner: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !Decoded {
     if (bytes.len > options.wire_bytes) return error.SqlProgramLimitExceeded;
-    var work: arrays.Budget = .{ .remaining = options.values.work };
+    var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
     try work.consume(bytes.len);
     var reader: Reader = .{ .bytes = bytes };
     const rank = try reader.int(i32);
@@ -292,6 +312,7 @@ fn decodeAdmitted(a: A, owner: A, expected: arrays.ElementType, bytes: []const u
     }
     const cells = try a.alloc(arrays.Element, count);
     for (cells) |*cell| {
+        try work.consume(1);
         const length = try reader.int(i32);
         if (length == -1) {
             cell.* = .{};
@@ -314,7 +335,7 @@ fn quotaError(budget: *MemoryBudget, err: anyerror) anyerror {
 }
 
 test "SQL PostgreSQL array binary roundtrips exact server wire fixtures for every supported element codec" {
-    const Entry = struct { sql: []const u8, element_type: arrays.ElementType, array_oid: u32, binary: []const u8, native_binary: ?[]const u8 = null };
+    const Entry = struct { sql: []const u8, element_type: arrays.ElementType, array_oid: u32, binary: []const u8 };
     const Fixture = struct { reference: []const u8, scope: []const u8, entries: []const Entry };
     const Faults = struct {
         fn run(backing: A, kind: arrays.ElementType, bytes: []const u8) !void {
@@ -343,8 +364,8 @@ test "SQL PostgreSQL array binary roundtrips exact server wire fixtures for ever
         try std.testing.expectEqual(entry.array_oid, owned.value.element_type.arrayOid());
         var writer: std.Io.Writer.Allocating = .init(a);
         defer writer.deinit();
-        try encode(owned.value, &writer.writer, .{});
-        const expected = entry.native_binary orelse entry.binary;
+        try encode(a, owned.value, &writer.writer, .{});
+        const expected = entry.binary;
         const encoded = try a.alloc(u8, expected.len / 2);
         defer a.free(encoded);
         _ = try std.fmt.hexToBytes(encoded, expected);
@@ -365,7 +386,7 @@ test "SQL PostgreSQL array binary primitive ownership quotas and truncation faul
             defer writer.deinit();
             // Allocating's only WriteFailed cause is backing allocation
             // failure; preserve that fact for the allocation-fault harness.
-            encode(value, &writer.writer, .{}) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+            encode(a, value, &writer.writer, .{}) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
             const wire = try a.dupe(u8, writer.written());
             defer a.free(wire);
             var owned = try decode(a, .text, wire, .{});
@@ -389,9 +410,9 @@ test "SQL PostgreSQL array binary primitive ownership quotas and truncation faul
     const empty = try arrays.Value.init(.text, &.{}, &.{}, .{});
     var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer writer.deinit();
-    try std.testing.expectError(error.SqlProgramLimitExceeded, encode(empty, &writer.writer, .{ .wire_bytes = 11 }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, encode(std.testing.allocator, empty, &writer.writer, .{ .wire_bytes = 11 }));
     try std.testing.expectEqual(@as(usize, 0), writer.written().len);
-    try encode(empty, &writer.writer, .{});
+    try encode(std.testing.allocator, empty, &writer.writer, .{});
     try std.testing.expectError(error.SqlBinaryTypeMismatch, decode(std.testing.allocator, .int32, writer.written(), .{}));
     try std.testing.expectError(error.SqlProgramLimitExceeded, decode(std.testing.allocator, .text, writer.written(), .{ .wire_bytes = 11 }));
 }
@@ -427,7 +448,7 @@ test "SQL PostgreSQL array binary boundaries match receive normalization and dia
     try std.testing.expectError(error.SqlProgramLimitExceeded, decode(a, .boolean, &bool_bytes, .{ .values = .{ .bytes = 1 } }));
     var short: [4]u8 = undefined;
     var writer = std.Io.Writer.fixed(&short);
-    try std.testing.expectError(error.WriteFailed, encode(boolean.value, &writer, .{}));
+    try std.testing.expectError(error.WriteFailed, encode(a, boolean.value, &writer, .{}));
 }
 
 test "SQL native binary array blocks preserve scalar bytes null slots and writer failures" {
@@ -466,20 +487,20 @@ test "SQL native binary array blocks preserve scalar bytes null slots and writer
                 defer native.deinit();
                 var scalar: std.Io.Writer.Allocating = .init(a);
                 defer scalar.deinit();
-                try encode(compact, &native.writer, .{});
-                try encodeGeneric(compact, &scalar.writer, .{});
+                try encode(std.testing.allocator, compact, &native.writer, .{});
+                try encodeGeneric(std.testing.allocator, compact, &scalar.writer, .{});
                 try std.testing.expectEqualSlices(u8, scalar.written(), native.written());
                 const decoded = try decodeLeaky(aa, kind, native.written(), .{ .compact = true });
                 var work: arrays.Budget = .{};
                 try std.testing.expectEqual(std.math.Order.eq, try compact.compare(decoded.value, &work));
                 const out = try aa.alloc(u8, native.written().len);
                 var exact: std.Io.Writer = .fixed(out);
-                try encode(compact, &exact, .{});
+                try encode(std.testing.allocator, compact, &exact, .{});
                 try std.testing.expectEqualSlices(u8, native.written(), out);
                 var short: std.Io.Writer = .fixed(out[0 .. out.len - 1]);
-                try std.testing.expectError(error.WriteFailed, encode(compact, &short, .{}));
+                try std.testing.expectError(error.WriteFailed, encode(std.testing.allocator, compact, &short, .{}));
                 var preflight: std.Io.Writer = .fixed(out);
-                try std.testing.expectError(error.SqlProgramLimitExceeded, encode(compact, &preflight, .{ .wire_bytes = out.len - 1 }));
+                try std.testing.expectError(error.SqlProgramLimitExceeded, encode(std.testing.allocator, compact, &preflight, .{ .wire_bytes = out.len - 1 }));
                 try std.testing.expectEqual(@as(usize, 0), preflight.end);
             }
         }

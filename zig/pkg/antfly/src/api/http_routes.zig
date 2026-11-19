@@ -16,6 +16,7 @@
 const std = @import("std");
 
 pub const sql_max_request_body_bytes: usize = 4 << 20;
+pub const internal_lookup_control_max_body_bytes: usize = 16 << 20;
 
 /// Transport admission shared by native and linked-kernel registrars. Resolve
 /// before buffering so a SQL request cannot consume the much larger batch cap.
@@ -23,7 +24,9 @@ pub fn publicPostBodyLimit(path: []const u8) ?usize {
     if (isInternalDocumentReadPath(path)) return @import("antfly_public_limits").max_document_read_body_bytes;
     if (isPrivacyFindingsPath(path)) return @import("antfly_public_limits").max_privacy_findings_body_bytes;
     if (privacyMutationBodyLimit(path)) |limit| return limit;
-    return if (std.mem.eql(u8, path, "/db/v1/sql") or std.mem.startsWith(u8, path, "/db/v1/sql/prepared")) sql_max_request_body_bytes else null;
+    if (std.mem.eql(u8, path, "/db/v1/sql") or std.mem.startsWith(u8, path, "/db/v1/sql/prepared")) return sql_max_request_body_bytes;
+    if (Routes.matchGroupLookup(path) != null) return internal_lookup_control_max_body_bytes;
+    return null;
 }
 
 /// Metadata's ordinary listener cap is smaller than document admission. Keep
@@ -48,13 +51,28 @@ pub const DocumentReadRequest = struct {
     query: []const u8 = "",
     artifact_name: []const u8 = "",
 
+    pub fn requireShape(self: @This()) !void {
+        const limits = @import("antfly_public_limits");
+        if (self.query.len > limits.max_document_read_query_bytes) return error.InvalidArgument;
+        switch (self.operation) {
+            .lookup => if (self.artifact_name.len != 0) return error.InvalidArgument,
+            .manifest => if (self.query.len != 0) return error.InvalidArgument,
+            .manifests => if (self.query.len != 0 or self.artifact_name.len != 0) return error.InvalidArgument,
+        }
+    }
+
     pub fn encode(a: std.mem.Allocator, op: Operation, key: []const u8, query: []const u8, artifact: []const u8) ![]u8 {
-        if (key.len > @import("antfly_public_limits").max_internal_document_key_bytes) return error.InvalidArgument;
+        const limits = @import("antfly_public_limits");
+        if (key.len > limits.max_internal_document_key_bytes or query.len > limits.max_document_read_query_bytes) return error.InvalidArgument;
+        try (@This(){ .operation = op, .key_base64 = "", .query = query, .artifact_name = artifact }).requireShape();
         const encoder = std.base64.url_safe_no_pad.Encoder;
         const encoded = try a.alloc(u8, encoder.calcSize(key.len));
         defer a.free(encoded);
         _ = encoder.encode(encoded, key);
-        return std.json.Stringify.valueAlloc(a, @This(){ .operation = op, .key_base64 = encoded, .query = query, .artifact_name = artifact }, .{});
+        const body = try std.json.Stringify.valueAlloc(a, @This(){ .operation = op, .key_base64 = encoded, .query = query, .artifact_name = artifact }, .{});
+        errdefer a.free(body);
+        if (body.len > limits.max_document_read_body_bytes) return error.InvalidArgument;
+        return body;
     }
     pub fn decodeKey(self: @This(), a: std.mem.Allocator) ![]u8 {
         const maximum = @import("antfly_public_limits").max_internal_document_key_bytes;
@@ -206,6 +224,9 @@ pub const Routes = struct {
     pub const fk_generation_parent_suffix = "/fk-generation-parent";
     pub const fk_generation_source_suffix = "/fk-generation-source";
     pub const fk_initial_child_suffix = "/fk-initial-child";
+    pub const relational_index_claims_suffix = "/relational-index-claims";
+    pub const relational_index_control_suffix = "/relational-index-control";
+    pub const schema_validation_prepare_suffix = "/schema-validation-prepare";
     pub const row_policy_install_suffix = "/row-policy-install";
     pub const restore_suffix = "/restore";
     pub const destination_authorization_suffix = "/destination-authorization";
@@ -223,6 +244,7 @@ pub const Routes = struct {
     pub const graph_edges_suffix = "/graph-edges";
     pub const graph_edges_batch_suffix = "/graph-edges-batch";
     pub const resolver_operation_suffix = "/resolver-operation";
+    pub const sql_maintenance_suffix = "/sql-maintenance";
     pub const graph_metric_maintenance_suffix = "/graph-metric-maintenance";
     pub const vector_worker_suffix = "/vector-worker";
     pub const txn_begin_suffix = "/txn-begin";
@@ -1082,6 +1104,15 @@ pub const Routes = struct {
         return .{ .name = name };
     }
 
+    pub fn matchExtensionSqlControl(path: []const u8) ?ExtensionPackage {
+        const suffix = "/sql-control";
+        if (path.len <= extensions_v1_packages_prefix.len + suffix.len or
+            !std.mem.startsWith(u8, path, extensions_v1_packages_prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+        const name = path[extensions_v1_packages_prefix.len .. path.len - suffix.len];
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        return .{ .name = name };
+    }
+
     pub fn matchExtensionPackageVersion(path: []const u8) ?ExtensionPackageVersion {
         if (!std.mem.startsWith(u8, path, extensions_v1_packages_prefix)) return null;
         const rest = path[extensions_v1_packages_prefix.len..];
@@ -1728,6 +1759,11 @@ test "public api routes compile" {
     const extension_package = Routes.matchExtensionPackage("/extensions/v1/packages/memoryaf").?;
     try std.testing.expectEqualStrings("memoryaf", extension_package.name);
     try std.testing.expect(Routes.matchExtensionPackage("/extensions/v1/packages/memoryaf/versions/1.0.0") == null);
+    const control = Routes.matchExtensionSqlControl("/extensions/v1/packages/memoryaf/sql-control").?;
+    try std.testing.expectEqualStrings("memoryaf", control.name);
+    try std.testing.expect(Routes.matchExtensionSqlControl("/extensions/v1/packages//sql-control") == null);
+    try std.testing.expect(Routes.matchExtensionSqlControl("/extensions/v1/packages/sql-control") == null);
+    try std.testing.expect(Routes.matchExtensionSqlControl("/extensions/v1/packages/memoryaf/versions/sql-control") == null);
     const extension_package_version = Routes.matchExtensionPackageVersion("/extensions/v1/packages/memoryaf/versions/1.0.0").?;
     try std.testing.expectEqualStrings("memoryaf", extension_package_version.name);
     try std.testing.expectEqualStrings("1.0.0", extension_package_version.version);
@@ -1853,4 +1889,26 @@ test "privacy internal key codec rejects malformed base64 before dispatch" {
         const request = DocumentReadRequest{ .operation = .lookup, .key_base64 = bad };
         try std.testing.expectError(error.InvalidArgument, request.decodeKey(a));
     }
+}
+
+test "privacy document read combined envelope preserves key controls and rejects mixed selectors" {
+    const a = std.testing.allocator;
+    const limits = @import("antfly_public_limits");
+    // Binary key plus percent-expanded control JSON travels in one body, not
+    // an oversized request line or a conflicting second POST body.
+    const query = "relational_integrity_jobs=%7B%22kind%22%3A%22observations%22%7D";
+    const body = try DocumentReadRequest.encode(a, .lookup, "a\x00b", query, "");
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(DocumentReadRequest, a, body, .{});
+    defer parsed.deinit();
+    try parsed.value.requireShape();
+    const key = try parsed.value.decodeKey(a);
+    defer a.free(key);
+    try std.testing.expectEqualStrings("a\x00b", key);
+    try std.testing.expectEqualStrings(query, parsed.value.query);
+    try std.testing.expectError(error.InvalidArgument, DocumentReadRequest.encode(a, .manifest, "a", query, "artifact"));
+    try std.testing.expectError(error.InvalidArgument, DocumentReadRequest.encode(a, .manifests, "a", "", "artifact"));
+    try std.testing.expectError(error.InvalidArgument, DocumentReadRequest.encode(a, .lookup, "a", "", "artifact"));
+    try std.testing.expect(limits.max_document_read_query_bytes >= 3 * @import("antfly_local_sources").storage_db_relational_integrity_contract.max_preparation_bytes + 8192);
+    try std.testing.expect(limits.max_document_read_body_bytes >= std.base64.url_safe_no_pad.Encoder.calcSize(limits.max_internal_document_key_bytes) + 3 * @import("antfly_local_sources").storage_db_relational_integrity_contract.max_preparation_bytes + 8192);
 }

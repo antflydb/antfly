@@ -1,0 +1,316 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL 18 views and generated identity envelope",
+  "view": {
+    "select": "SELECT id,DATE '2000-01-01' AS d,TIME '01:02:03' AS t,TIMETZ '01:02:03+02' AS z,TIMESTAMP '2000-01-01' AS s,TIMESTAMPTZ '2000-01-01' AS u,INTERVAL '1 day' AS i FROM usage_records",
+    "read": "SELECT * FROM outer_view ORDER BY id",
+    "before": {
+      "columns": [
+        "id",
+        "d",
+        "t",
+        "z",
+        "s",
+        "u",
+        "i"
+      ],
+      "column_oids": [
+        25,
+        1082,
+        1083,
+        1266,
+        1114,
+        1184,
+        1186
+      ],
+      "rows": [
+        [
+          "a",
+          "2000-01-01",
+          "01:02:03",
+          "01:02:03+02",
+          "2000-01-01 00:00:00",
+          "2000-01-01 00:00:00+00",
+          "1 day"
+        ],
+        [
+          "b",
+          "2000-01-01",
+          "01:02:03",
+          "01:02:03+02",
+          "2000-01-01 00:00:00",
+          "2000-01-01 00:00:00+00",
+          "1 day"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      ]
+    },
+    "incompatible": "CREATE OR REPLACE VIEW inner_view AS SELECT id,TIMESTAMP '2000-01-01' AS d,TIME '01:02:03' AS t,TIMETZ '01:02:03+02' AS z,TIMESTAMP '2000-01-01' AS s,TIMESTAMPTZ '2000-01-01' AS u,INTERVAL '1 day' AS i FROM usage_records",
+    "replacement": "CREATE OR REPLACE VIEW inner_view AS SELECT id,DATE '2001-02-03' AS d,TIME '01:02:03' AS t,TIMETZ '01:02:03+02' AS z,TIMESTAMP '2000-01-01' AS s,TIMESTAMPTZ '2000-01-01' AS u,INTERVAL '1 day' AS i FROM usage_records",
+    "after": {
+      "columns": [
+        "id",
+        "d",
+        "t",
+        "z",
+        "s",
+        "u",
+        "i"
+      ],
+      "column_oids": [
+        25,
+        1082,
+        1083,
+        1266,
+        1114,
+        1184,
+        1186
+      ],
+      "rows": [
+        [
+          "a",
+          "2001-02-03",
+          "01:02:03",
+          "01:02:03+02",
+          "2000-01-01 00:00:00",
+          "2000-01-01 00:00:00+00",
+          "1 day"
+        ],
+        [
+          "b",
+          "2001-02-03",
+          "01:02:03",
+          "01:02:03+02",
+          "2000-01-01 00:00:00",
+          "2000-01-01 00:00:00+00",
+          "1 day"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      ]
+    },
+    "cold": {
+      "columns": [
+        "id",
+        "d",
+        "t",
+        "z",
+        "s",
+        "u",
+        "i"
+      ],
+      "column_oids": [
+        25,
+        1082,
+        1083,
+        1266,
+        1114,
+        1184,
+        1186
+      ],
+      "rows": [
+        [
+          "b",
+          "2001-02-03",
+          "01:02:03",
+          "01:02:03+02",
+          "2000-01-01 00:00:00",
+          "2000-01-01 00:00:00+00",
+          "1 day"
+        ],
+        [
+          "cold",
+          "2001-02-03",
+          "01:02:03",
+          "01:02:03+02",
+          "2000-01-01 00:00:00",
+          "2000-01-01 00:00:00+00",
+          "1 day"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      ]
+    }
+  },
+  "document": {
+    "id": "sql-1073",
+    "sql": "UPDATE docs SET _id = source.title FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'",
+    "schema": {
+      "version": 1,
+      "storage_mode": "document",
+      "default_type": "doc",
+      "document_schemas": {
+        "doc": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "text"
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "seeds": [
+      {
+        "key": "doc:a",
+        "value": {
+          "title": "Alpha",
+          "unknown": {
+            "retained": [
+              1,
+              2
+            ]
+          }
+        }
+      },
+      {
+        "key": "doc:b",
+        "value": {
+          "title": "Beta",
+          "unknown": null
+        }
+      }
+    ],
+    "before": {
+      "columns": [
+        "_id",
+        "_doc"
+      ],
+      "column_oids": [
+        25,
+        3802
+      ],
+      "rows": [
+        [
+          "doc:a",
+          {
+            "title": "Alpha",
+            "unknown": {
+              "retained": [
+                1,
+                2
+              ]
+            }
+          }
+        ],
+        [
+          "doc:b",
+          {
+            "title": "Beta",
+            "unknown": null
+          }
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    "mutation": "UPDATE docs SET _doc=jsonb_set(_doc,'{title}','\"Cold\"'::jsonb) WHERE _id='doc:a'",
+    "after": {
+      "columns": [
+        "_id",
+        "_doc"
+      ],
+      "column_oids": [
+        25,
+        3802
+      ],
+      "rows": [
+        [
+          "doc:a",
+          {
+            "title": "Cold",
+            "unknown": {
+              "retained": [
+                1,
+                2
+              ]
+            }
+          }
+        ],
+        [
+          "doc:b",
+          {
+            "title": "Beta",
+            "unknown": null
+          }
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ]
+    }
+  }
+}

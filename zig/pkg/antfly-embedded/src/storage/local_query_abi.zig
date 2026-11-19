@@ -112,6 +112,7 @@ pub const LocalQueryOperation = enum(u32) {
     preflight = 23,
     graph_metric_maintenance = 24,
     scan_stream = 25,
+    sql_maintenance = 26,
 };
 
 pub const LocalQueryReturnMode = enum(u32) {
@@ -261,3 +262,10 @@ pub extern fn antfly_storage_owner_query_json(
 pub extern fn antfly_storage_owner_buffer_destroy(
     buffer: *OwnedBytes,
 ) callconv(.c) void;
+
+test "local query diagnostics append SQL maintenance without changing issued execution contract" {
+    const std = @import("std");
+    try std.testing.expectEqual(@as(u32, 25), @backingInt(LocalQueryOperation.scan_stream));
+    try std.testing.expectEqual(@as(u32, 26), @backingInt(LocalQueryOperation.sql_maintenance));
+    try std.testing.expectEqual(failure_abi.abi_version, abi_version);
+}

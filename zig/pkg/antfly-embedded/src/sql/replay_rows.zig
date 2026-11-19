@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Immutable statement-local replay. Small inputs stay in admitted memory;
+//! Statement-local replay. Small inputs stay in admitted memory;
 //! larger inputs spill to typed sequential blocks, without a per-row directory.
 //! Independent readers reuse one captured input, never reopen live storage.
 const std = @import("std");
@@ -30,6 +30,7 @@ pub const Replay = struct {
     width: usize,
     memory: Budget,
     arena: std.heap.ArenaAllocator,
+    producer_scratch: std.heap.ArenaAllocator,
     rows: std.ArrayList([]const Datum) = .empty,
     weights: std.ArrayList(Count) = .empty,
     manager: ?*spill.Manager,
@@ -38,18 +39,77 @@ pub const Replay = struct {
     readers: usize = 0,
     finished: bool = false,
     failed: bool = false,
+    streaming: bool = false,
+    failure: ?anyerror = null,
+    producer: ?Producer = null,
+    row_limit: usize = std.math.maxInt(usize),
     weighted: bool = false,
+
+    pub const Producer = struct {
+        ptr: *anyopaque,
+        pull: ?*const fn (*anyopaque, A) anyerror!?[]const Datum = null,
+        pull_weighted: ?*const fn (*anyopaque, A) anyerror!?Weighted = null,
+        close: *const fn (*anyopaque) void,
+        pub const Weighted = struct { values: []const Datum, count: Count };
+    };
+
+    pub fn attachProducer(self: *Replay, producer: Producer, row_limit: usize) !void {
+        if ((producer.pull == null) == (producer.pull_weighted == null)) return error.InvalidSqlBackendResponse;
+        if (self.count != 0 or self.finished or self.failed or self.producer != null or self.readers != 0) return error.InvalidSqlBackendResponse;
+        self.streaming = true;
+        self.producer = producer;
+        self.row_limit = row_limit;
+    }
+
+    pub fn closeProducer(self: *Replay) void {
+        if (self.producer) |producer| {
+            self.producer = null;
+            producer.close(producer.ptr);
+        }
+    }
+
+    fn advance(self: *Replay) !void {
+        if (self.failure) |err| return err;
+        const producer = self.producer orelse {
+            if (!self.finished) return error.InvalidSqlBackendResponse;
+            return;
+        };
+        self.advanceProducer(producer) catch |err| {
+            self.failure = err;
+            self.closeProducer();
+            return err;
+        };
+    }
+    fn advanceProducer(self: *Replay, producer: Producer) !void {
+        _ = self.producer_scratch.reset(.{ .retain_with_limit = 16 * 1024 });
+        if (producer.pull_weighted) |pull| {
+            const row = (try pull(producer.ptr, self.producer_scratch.allocator())) orelse {
+                try self.finish();
+                return;
+            };
+            if (self.count >= self.row_limit) return error.SqlProgramLimitExceeded;
+            return self.appendCount(row.values, row.count);
+        }
+        const row = (try producer.pull.?(producer.ptr, self.producer_scratch.allocator())) orelse {
+            try self.finish();
+            return;
+        };
+        if (self.count >= self.row_limit) return error.SqlProgramLimitExceeded;
+        try self.append(row);
+    }
 
     pub fn create(a: A, width: usize, memory_bytes: usize, manager: ?*spill.Manager) !*Replay {
         if (width > 1024) return error.SqlProgramLimitExceeded;
         const self = try a.create(Replay);
-        self.* = .{ .a = a, .width = width, .memory = .{ .backing = a, .limit = memory_bytes }, .arena = undefined, .manager = manager };
+        self.* = .{ .a = a, .width = width, .memory = .{ .backing = a, .limit = memory_bytes }, .arena = undefined, .producer_scratch = .init(a), .manager = manager };
         self.arena = .init(self.memory.allocator());
         return self;
     }
 
     pub fn deinit(self: *Replay) void {
         std.debug.assert(self.readers == 0);
+        self.closeProducer();
+        self.producer_scratch.deinit();
         if (self.disk) |*run| run.close();
         self.rows.deinit(self.memory.allocator());
         self.weights.deinit(self.memory.allocator());
@@ -91,7 +151,8 @@ pub const Replay = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const keys: []const Datum = if (weight.exact() == null) &.{Datum.json(.{ .string = try weight.text(arena.allocator()) })} else &.{};
-        _ = try self.disk.?.append(.{ .values = values, .keys = keys, .ordinal = weight.exact() orelse 0 }, spill.none);
+        const row: operators.Row = .{ .values = values, .keys = keys, .ordinal = weight.exact() orelse 0 };
+        _ = if (self.streaming) try self.disk.?.appendPrefix(row, spill.none) else try self.disk.?.append(row, spill.none);
     }
     pub fn appendCount(self: *Replay, values: []const Datum, weight: Count) !void {
         if (weight.cap(1) == 0) return error.InvalidSqlBackendResponse;
@@ -112,13 +173,15 @@ pub const Replay = struct {
         errdefer self.failed = true;
         if (self.disk) |*run| try run.seal();
         self.finished = true;
+        self.closeProducer();
     }
 
     pub fn openReader(self: *Replay) !*Reader {
-        if (!self.finished or self.failed) return error.InvalidSqlBackendResponse;
+        if (self.failed) return self.failure orelse error.InvalidSqlBackendResponse;
+        if ((!self.finished or self.failed) and !self.streaming) return error.InvalidSqlBackendResponse;
         const reader = try self.a.create(Reader);
         errdefer self.a.destroy(reader);
-        reader.* = .{ .owner = self, .count_arena = .init(self.a), .disk = if (self.disk) |*run| try run.openReader() else null };
+        reader.* = .{ .owner = self, .arena = .init(self.a), .count_arena = .init(self.a), .disk = if (self.disk) |*run| (if (self.streaming) try run.openPrefixReader() else try run.openReader()) else null };
         self.readers += 1;
         return reader;
     }
@@ -126,6 +189,7 @@ pub const Replay = struct {
     pub const Reader = struct {
         owner: *Replay,
         disk: ?spill.Sequential.ReplayReader,
+        arena: std.heap.ArenaAllocator,
         index: usize = 0,
         remaining: Count = Count.init(0),
         count_arena: std.heap.ArenaAllocator,
@@ -135,11 +199,19 @@ pub const Replay = struct {
         pub const Weighted = struct { values: []const Datum, weight: u64, count: Count };
         pub fn nextWeighted(self: *Reader) !?Weighted {
             if (self.remaining.cap(1) != 0) return error.InvalidSqlBackendResponse;
+            if (self.owner.failed) return self.owner.failure orelse error.InvalidSqlBackendResponse;
+            if (self.index == self.owner.count and self.owner.streaming) try self.owner.advance();
             if (self.index == self.owner.count) return null;
+            if (self.owner.streaming) {
+                if (!self.arena.reset(.retain_capacity)) return error.OutOfMemory;
+                if (self.disk == null) if (self.owner.disk) |*run| {
+                    self.disk = try run.openPrefixReader();
+                };
+            }
             _ = self.count_arena.reset(.retain_capacity);
             self.remaining_owned = false;
-            const result: Weighted = if (self.disk) |*run| blk: {
-                const record = (try run.readCurrent(self.index)).row;
+            var result: Weighted = if (self.disk) |*run| blk: {
+                const record = (if (self.owner.streaming) try run.readPrefixBorrowed(self.index) else try run.readCurrent(self.index)).row;
                 const count = if (record.ordinal != 0 and record.keys.len == 0) Count.init(record.ordinal) else blk_count: {
                     if (record.ordinal != 0 or record.keys.len != 1 or record.keys[0].sql_null or record.keys[0].value != .string) return error.InvalidSqlSpill;
                     break :blk_count try Count.parse(self.count_arena.allocator(), record.keys[0].value.string);
@@ -147,6 +219,12 @@ pub const Replay = struct {
                 break :blk .{ .values = record.values, .weight = count.cap(std.math.maxInt(u64)), .count = count };
             } else .{ .values = self.owner.rows.items[self.index], .weight = self.owner.weights.items[self.index].cap(std.math.maxInt(u64)), .count = self.owner.weights.items[self.index] };
             if (result.weight == 0 or result.values.len != self.owner.width) return error.InvalidSqlBackendResponse;
+            if (self.owner.streaming) {
+                const values = try self.arena.allocator().alloc(Datum, result.values.len);
+                for (result.values, values) |cell, *out| out.* = try operators.cloneDatum(self.arena.allocator(), cell);
+                result.values = values;
+                result.count = try result.count.clone(self.count_arena.allocator());
+            }
             self.index += 1;
             return result;
         }
@@ -154,6 +232,7 @@ pub const Replay = struct {
         /// A borrowed row survives other readers, but not this reader's next
         /// read or close. Retaining operators copy at their boundary.
         pub fn next(self: *Reader) !?[]const Datum {
+            if (self.owner.streaming) return self.nextStreaming();
             if (self.remaining.cap(1) == 0) {
                 const bag = try self.nextWeighted() orelse return null;
                 self.current = bag.values;
@@ -186,9 +265,32 @@ pub const Replay = struct {
             } else |_| {}
         }
 
+        fn nextStreaming(self: *Reader) !?[]const Datum {
+            if (self.remaining.cap(1) == 0) {
+                const bag = try self.nextWeighted() orelse return null;
+                self.current = bag.values;
+                self.remaining = bag.count;
+            }
+            try self.consume(1);
+            return self.current;
+        }
+
         /// Borrow native columns until this reader loads its next block.
         pub fn nextBatch(self: *Reader, a: A, maximum: usize) !@import("execution_batch.zig").Batch {
             if (maximum == 0) return error.InvalidSqlLimit;
+            if (self.owner.streaming) {
+                // Demand one producer row at a time. Advancing may promote the
+                // replay to spill or retire its pending tail, so delivered
+                // batches must own each row before the next producer pull.
+                var rows: std.ArrayList([]const Datum) = .empty;
+                while (rows.items.len < maximum) {
+                    const row = try self.next() orelse break;
+                    const owned = try a.alloc(Datum, row.len);
+                    for (row, owned) |cell, *out| out.* = try operators.cloneDatum(a, cell);
+                    try rows.append(a, owned);
+                }
+                return .{ .rows = try rows.toOwnedSlice(a) };
+            }
             if (self.owner.weighted) {
                 // Plain batch consumers observe logical rows. Clone once per
                 // physical bag before another read can replace its block, then
@@ -228,6 +330,7 @@ pub const Replay = struct {
 
         pub fn close(self: *Reader) void {
             if (self.disk) |*run| run.deinit();
+            self.arena.deinit();
             self.count_arena.deinit();
             self.owner.readers -= 1;
             const a = self.owner.a;
@@ -235,6 +338,149 @@ pub const Replay = struct {
         }
     };
 };
+
+test "SQL prefix replay advances one producer and preserves readers through pending spill tails" {
+    const Source = struct {
+        index: usize = 0,
+        closed: usize = 0,
+        fn pull(raw: *anyopaque, a: A) !?[]const Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.index == 600) return null;
+            const row = try a.alloc(Datum, 1);
+            row[0] = Datum.json(.{ .integer = @intCast(self.index) });
+            self.index += 1;
+            return row;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed += 1;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var source: Source = .{};
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &source, .checkpoint = Source.checkpoint, .compression = .none, .async_writes = false, .buffer_bytes = 1024 };
+    defer manager.deinit();
+    const replay = try Replay.create(a, 1, 1024, &manager);
+    defer replay.deinit();
+    try replay.attachProducer(.{ .ptr = &source, .pull = Source.pull, .close = Source.close }, 600);
+    const first = try replay.openReader();
+    defer first.close();
+    const second = try replay.openReader();
+    defer second.close();
+    const borrowed = (try first.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), source.index);
+    for (0..600) |index| {
+        try std.testing.expectEqual(@as(i64, @intCast(index)), (try second.next()).?[0].value.integer);
+        // Advancing another reader can promote memory and flush writer blocks,
+        // but cannot invalidate the first reader's delivered row.
+        try std.testing.expectEqual(@as(i64, 0), borrowed[0].value.integer);
+    }
+    try std.testing.expect((try second.next()) == null);
+    try std.testing.expectEqual(@as(usize, 600), source.index);
+    try std.testing.expectEqual(@as(usize, 1), source.closed);
+    try std.testing.expect(replay.disk != null);
+    for (1..600) |index| try std.testing.expectEqual(@as(i64, @intCast(index)), (try first.next()).?[0].value.integer);
+    first.rewind();
+    try std.testing.expectEqual(@as(i64, 0), (try first.next()).?[0].value.integer);
+    try std.testing.expectEqual(@as(usize, 1), manager.files);
+}
+
+test "SQL prefix replay retains failure at its frontier and closes unused producers once" {
+    const Source = struct {
+        pulls: usize = 0,
+        closed: usize = 0,
+        fn pull(raw: *anyopaque, a: A) !?[]const Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pulls += 1;
+            if (self.pulls == 2) return error.SqlDivisionByZero;
+            const row = try a.alloc(Datum, 1);
+            row[0] = Datum.json(.{ .integer = 9 });
+            return row;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed += 1;
+        }
+    };
+    var source: Source = .{};
+    const replay = try Replay.create(std.testing.allocator, 1, 4096, null);
+    defer replay.deinit();
+    try replay.attachProducer(.{ .ptr = &source, .pull = Source.pull, .close = Source.close }, 10);
+    const first = try replay.openReader();
+    defer first.close();
+    _ = try first.next();
+    try std.testing.expectError(error.SqlDivisionByZero, first.next());
+    const second = try replay.openReader();
+    defer second.close();
+    try std.testing.expectEqual(@as(i64, 9), (try second.next()).?[0].value.integer);
+    try std.testing.expectError(error.SqlDivisionByZero, second.next());
+    try std.testing.expectEqual(@as(usize, 2), source.pulls);
+    try std.testing.expectEqual(@as(usize, 1), source.closed);
+    replay.closeProducer();
+    try std.testing.expectEqual(@as(usize, 1), source.closed);
+    var unused: Source = .{};
+    const abandoned = try Replay.create(std.testing.allocator, 1, 4096, null);
+    try abandoned.attachProducer(.{ .ptr = &unused, .pull = Source.pull, .close = Source.close }, 10);
+    abandoned.deinit();
+    try std.testing.expectEqual(@as(usize, 0), unused.pulls);
+    try std.testing.expectEqual(@as(usize, 1), unused.closed);
+}
+
+test "SQL prefix replay admission and allocation faults release every producer reader and spill file" {
+    const Source = struct {
+        index: usize = 0,
+        closed: bool = false,
+        fn pull(raw: *anyopaque, a: A) !?[]const Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.index == 3) return null;
+            const row = try a.alloc(Datum, 1);
+            row[0] = Datum.json(.{ .string = try a.dupe(u8, "owned across producer scratch resets") });
+            self.index += 1;
+            return row;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.closed);
+            self.closed = true;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn expectLimit(reader: *Replay.Reader) !void {
+            if (reader.next()) |_| return error.TestUnexpectedResult else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.SqlProgramLimitExceeded, err);
+            }
+        }
+        fn run(a: A, disk: bool) !void {
+            var source: @This() = .{};
+            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &source, .checkpoint = checkpoint, .compression = .none, .async_writes = false };
+            defer manager.deinit();
+            {
+                const replay = try Replay.create(a, 1, if (disk) 0 else 4096, if (disk) &manager else null);
+                defer replay.deinit();
+                try replay.attachProducer(.{ .ptr = &source, .pull = pull, .close = close }, 2);
+                const first = try replay.openReader();
+                defer first.close();
+                const second = try replay.openReader();
+                defer second.close();
+                const row = (try second.next()).?;
+                _ = try first.next();
+                _ = try first.next();
+                try expectLimit(first);
+                try std.testing.expectEqualStrings("owned across producer scratch resets", row[0].value.string);
+                second.rewind();
+                _ = try second.next();
+                _ = try second.next();
+                try expectLimit(second);
+                try std.testing.expect(source.closed);
+            }
+            try std.testing.expectEqual(@as(usize, 0), manager.files);
+            try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Source.run, .{false});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Source.run, .{true});
+}
 
 test "SQL replay rows bound resident capacity and independently replay typed blocks" {
     const a = std.testing.allocator;
@@ -428,4 +674,37 @@ test "SQL weighted replay preserves exact bags across spill and independent expa
         try std.testing.expect((try more.cell(page.allocator(), 1, 0)).sql_null);
         try std.testing.expectEqual(@as(i64, 7), (try batch.cell(page.allocator(), 0, 0)).value.integer);
     }
+}
+
+test "SQL prefix replay retains compressed weights without demanding discarded error tails" {
+    const Producer = struct {
+        calls: usize = 0,
+        closed: usize = 0,
+        fn pull(raw: *anyopaque, a: A) !?Replay.Producer.Weighted {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls != 1) return error.SqlNumericOutOfRange;
+            const row = try a.alloc(Datum, 1);
+            row[0] = Datum.json(.{ .integer = 9 });
+            return .{ .values = row, .count = Count.init(3) };
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed += 1;
+        }
+    };
+    var producer: Producer = .{};
+    const replay = try Replay.create(std.testing.allocator, 1, 4096, null);
+    defer replay.deinit();
+    try replay.attachProducer(.{ .ptr = &producer, .pull_weighted = Producer.pull, .close = Producer.close }, 10);
+    const first = try replay.openReader();
+    defer first.close();
+    const second = try replay.openReader();
+    defer second.close();
+    try std.testing.expectEqual(@as(i64, 9), (try first.next()).?[0].value.integer);
+    for (0..3) |_| try std.testing.expectEqual(@as(i64, 9), (try second.next()).?[0].value.integer);
+    for (0..2) |_| try std.testing.expectEqual(@as(i64, 9), (try first.next()).?[0].value.integer);
+    try std.testing.expectEqual(@as(usize, 1), producer.calls);
+    try std.testing.expectError(error.SqlNumericOutOfRange, first.next());
+    try std.testing.expectEqual(@as(usize, 1), producer.closed);
 }

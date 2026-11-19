@@ -77,7 +77,16 @@ test "public batch commit requirements preserve omitted versus explicit none" {
 pub fn parseBatchValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedBatchRequest {
     if (value != .object) return error.InvalidBatchRequest;
     const root = value.object;
-    for (private_fields) |field| if (root.get(field) != null) return error.InvalidBatchRequest;
+    for (private_fields) |field| {
+        if (root.contains(field)) return error.InvalidBatchRequest;
+        // Private wire names also reserve their storage-facing spelling. An
+        // unknown-field policy must not silently turn an owner command into a
+        // successful empty public write. These two graph names are explicitly
+        // public; their underscored forms carry private normalized effects.
+        if (field[0] == '_' and !std.mem.eql(u8, field[1..], "graph_writes") and
+            !std.mem.eql(u8, field[1..], "graph_deletes") and root.contains(field[1..]))
+            return error.InvalidBatchRequest;
+    }
     var owned: OwnedBatchRequest = .{};
     errdefer owned.deinit(alloc);
     if (root.get("inserts")) |item| if (item != .null) {
@@ -167,6 +176,15 @@ const private_fields = [_][]const u8{
     "_split_transition",
     "_timestamp_ns",
     "_transaction",
+    "_graph_preparation",
+    "_prepared_domain_rows",
+    "_relational_index_owner_control",
+    "_sql_lock",
+    "_trigger_preparation_admitted_at_seconds",
+    "_trigger_preparation_command_digest",
+    "_trigger_preparation_group_id",
+    "_trigger_preparation_proof",
+    "_trigger_receipts",
 };
 fn parseInternalU64(value: std.json.Value) !u64 {
     return switch (value) {
@@ -541,8 +559,13 @@ test "public batch rejects every privileged command field and preserves null def
         const body = try std.fmt.allocPrint(a, "{{\"{s}\":null}}", .{field});
         defer a.free(body);
         try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, body));
+        if (field[0] == '_' and !std.mem.eql(u8, field[1..], "graph_writes") and !std.mem.eql(u8, field[1..], "graph_deletes")) {
+            const alias = try std.fmt.allocPrint(a, "{{\"{s}\":null}}", .{field[1..]});
+            defer a.free(alias);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, alias));
+        }
     }
-    var empty = try parseBatchRequest(a, "{\"inserts\":null,\"deletes\":null,\"transforms\":null,\"sync_level\":null}");
+    var empty = try parseBatchRequest(a, "{\"inserts\":null,\"deletes\":null,\"transforms\":null,\"graph_writes\":null,\"graph_deletes\":null,\"sync_level\":null}");
     defer empty.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), empty.req.writes.len);
     try std.testing.expectEqual(mutation.SyncLevel.propose, empty.req.sync_level);

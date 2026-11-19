@@ -23,3 +23,6 @@ pkg/inference/onnxruntime/
 
 # Local qualification build caches and model benchmark outputs
 .benchmark-results/
+
+# Local standalone research-job state
+/api-research-jobs/

@@ -143,7 +143,7 @@ pub fn validateRequest(req: anytype) !void {
         if (comptime !std.mem.eql(u8, reflected_name, "merge_proof_adoption") and !std.mem.eql(u8, reflected_name, "sync_level")) {
             if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
                 if (@field(req, reflected_name).len != 0) return error.InvalidBatchRequest;
-            } else if (!std.meta.eql(@field(req, reflected_name), @field(empty, reflected_name))) return error.InvalidBatchRequest;
+            } else if (!@import("../control_field_defaults.zig").isolatedFieldMatchesDefault(reflected_name, @field(req, reflected_name), @field(empty, reflected_name))) return error.InvalidBatchRequest;
         }
     }
 }

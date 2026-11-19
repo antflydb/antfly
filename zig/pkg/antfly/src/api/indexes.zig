@@ -86,6 +86,8 @@ pub fn addIndexToTableIndexesJsonWithIo(
     // endpoint; migration creates B, waits for completeness, then swaps A's alias.
     const privacy = @import("antfly_local_sources").privacy_catalog;
     try privacy.validateUserConfiguration(alloc, index_json);
+    if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name) or
+        !@import("antfly_local_sources").api_index_metadata.isValidIndexName(index_name)) return error.InvalidCreateIndexRequest;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
     if (current.value != .object) return error.InvalidTableIndexMetadata;
@@ -914,7 +916,7 @@ pub fn encodeLakeIndexListWithProof(alloc: std.mem.Allocator, table: metadata_ta
         defer columns.deinit();
         if (schema.relational_indexes) |definitions| for (definitions.value) |definition| {
             if (configs.object.contains(definition.name)) return error.InvalidTableIndexMetadata;
-            const json = try @import("relational_index_mutation.zig").configForDefinition(a, definition, &columns);
+            const json = try @import("relational_index/mutation.zig").configForDefinition(a, definition, &columns);
             try configs.object.put(a, definition.name, try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{}));
         };
     }

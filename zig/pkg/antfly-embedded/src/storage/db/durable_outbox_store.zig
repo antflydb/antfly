@@ -68,6 +68,20 @@ pub fn clearPublished(store: *docstore.DocStore, key: []const u8) !void {
     try store.putBatch(&.{}, &.{key});
 }
 
+/// Inspect obligations in the SAME snapshot as the effect being certified.
+/// A flush followed by a separate snapshot alone races a newly committed effect.
+/// Point-presence probes and one prefix seek avoid copying any outbox payload.
+pub fn hasPendingTxn(txn: anytype) !bool {
+    for ([_][]const u8{ outbox.replication_batch_outbox_key, outbox.replication_replay_outbox_key, outbox.replication_schema_outbox_key }) |key| {
+        const value = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (value != null) return true;
+    }
+    return txn.hasPrefix(outbox.replication_outbox_v2_prefix);
+}
+
 fn readOptional(alloc: Allocator, store: *docstore.DocStore, key: []const u8) !?[]u8 {
     return store.get(alloc, key) catch |err| switch (err) {
         error.NotFound => null,

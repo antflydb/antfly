@@ -1,0 +1,27 @@
+{
+  "format": 1,
+  "id": "sql-0143",
+  "steps": [
+    {
+      "sql": "COMMENT ON COLUMN usage_records.status IS 'application state';",
+      "description": "application state"
+    },
+    {
+      "sql": "COMMENT ON COLUMN usage_records.status IS 'a ''quoted'' \u03a9'",
+      "description": "a 'quoted' \u03a9"
+    },
+    {
+      "sql": "COMMENT ON COLUMN usage_records.status IS NULL",
+      "description": null
+    },
+    {
+      "sql": "COMMENT ON COLUMN usage_records.status IS ''",
+      "description": null
+    },
+    {
+      "sql": "COMMENT ON COLUMN usage_records.status IS 'application state';",
+      "description": "application state"
+    }
+  ],
+  "denied_sqlstate": "42501"
+}

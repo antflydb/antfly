@@ -354,6 +354,31 @@ pub const IndexBackendOptions = struct {
     graph_reverse_lsm_options: lsm_backend_mod.Options = graph_reverse_lsm_options_default,
 };
 
+/// Derive every native row/index backend from the catalog-owned lifetime.
+/// This disables WAL records rather than fsync, and preserves durable run
+/// publication so a successful clean shutdown can retain UNLOGGED contents.
+pub fn applyRelationPersistence(primary: *PrimaryBackend, indexes: *IndexBackendOptions, descriptor: @import("../../common/relation_persistence.zig").Descriptor) !void {
+    try descriptor.validate();
+    switch (primary.*) {
+        .mem, .lsm_memory => if (descriptor.kind == .unlogged) return error.InvalidSqlRelationPersistence,
+        .lsm => |*options| {
+            options.wal_enabled = false;
+            options.backend.durability = .full;
+        },
+    }
+    indexes.text_main_lsm_options.wal_enabled = false;
+    indexes.text_wal_lsm_options.wal_enabled = false;
+    indexes.dense_lsm_options.wal_enabled = false;
+    indexes.sparse_lsm_options.wal_enabled = false;
+    indexes.graph_reverse_lsm_options.wal_enabled = false;
+    indexes.text_main_lsm_options.backend.durability = .full;
+    indexes.text_wal_lsm_options.backend.durability = .full;
+    indexes.dense_lsm_options.backend.durability = .full;
+    indexes.sparse_lsm_options.backend.durability = .full;
+    indexes.graph_reverse_lsm_options.backend.durability = .full;
+    indexes.leann_replication = false;
+}
+
 pub const CoreOpenOptions = struct {
     map_size: usize = 256 * 1024 * 1024,
     no_sync: bool = false,
@@ -754,4 +779,21 @@ test "index lsm profiles inherit shared cache root generation and overrides" {
     try std.testing.expectEqual(@as(u64, 9), resolved.dense_lsm_options.root_generation);
     try std.testing.expectEqual(@as(u64, 9), resolved.sparse_lsm_options.root_generation);
     try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), resolved.dense_lsm_options.obsolete_retention_ns);
+}
+
+test "SQL relation persistence disables primary and every index WAL without weakening clean run durability" {
+    var primary: PrimaryBackend = .{ .lsm = primary_lsm_options_default };
+    var indexes: IndexBackendOptions = .{ .leann_replication = true };
+    const descriptor: @import("../../common/relation_persistence.zig").Descriptor = .{ .kind = .unlogged, .owner_node_id = 7, .owner_store_id = 11, .generation_instance = @splat(1), .data_generation = 1 };
+    try applyRelationPersistence(&primary, &indexes, descriptor);
+    try std.testing.expect(!primary.lsm.wal_enabled);
+    try std.testing.expectEqual(@as(@TypeOf(primary.lsm.backend.durability), .full), primary.lsm.backend.durability);
+    try std.testing.expect(!indexes.text_main_lsm_options.wal_enabled);
+    try std.testing.expect(!indexes.text_wal_lsm_options.wal_enabled);
+    try std.testing.expect(!indexes.dense_lsm_options.wal_enabled);
+    try std.testing.expect(!indexes.sparse_lsm_options.wal_enabled);
+    try std.testing.expect(!indexes.graph_reverse_lsm_options.wal_enabled);
+    try std.testing.expect(!indexes.leann_replication);
+    primary = .{ .mem = .{} };
+    try std.testing.expectError(error.InvalidSqlRelationPersistence, applyRelationPersistence(&primary, &indexes, descriptor));
 }

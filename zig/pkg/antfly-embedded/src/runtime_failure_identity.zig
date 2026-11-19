@@ -25,10 +25,33 @@ const std = @import("std");
 const abi = @import("runtime_failure_abi");
 pub const Status = abi.Status;
 
+test "merged runtime failure ABI preserves published reader and GCS status numbers" {
+    try std.testing.expectEqual(@as(u32, 841), @backingInt(abi.Status.hierarchy_cursor_stale));
+    try std.testing.expectEqual(@as(u32, 842), @backingInt(abi.Status.read_transient_failure));
+    try std.testing.expectEqual(@as(u32, 843), @backingInt(abi.Status.read_request_failed));
+    try std.testing.expectEqual(@as(u32, 844), @backingInt(abi.Status.invalid_gcs_url));
+    try std.testing.expectEqual(@as(u32, 845), @backingInt(abi.Status.gcs_connection_not_found_or_out_of_scope));
+    try std.testing.expectEqual(@as(u32, 846), @backingInt(abi.Status.ambiguous_gcs_connection));
+    try std.testing.expectEqual(@as(u32, 847), @backingInt(abi.Status.invalid_connection_credentials));
+    try std.testing.expect(@backingInt(abi.Status.catalog_occupancy_not_ready) > 847);
+}
+
 const Mapping = struct {
     status: abi.Status,
     err: anyerror,
 };
+
+test "SQL relation persistence native failures preserve every stable boundary identity" {
+    const errors = [_]anyerror{ error.InvalidSqlRelationPersistence, error.SqlRelationOwnerChanged, error.SqlTemporaryRelationNotOwned, error.InvalidSqlTemporaryNamespace, error.SqlRelationPersistenceForeignKeyMismatch, error.SqlRelationRecoveryIncomplete, error.SqlRelationOwnerUnavailable };
+    const expected = [_]u32{ 1045, 1046, 1047, 1048, 1049, 1050, 1051 };
+    for (errors, expected) |err, number| {
+        const status = statusFromError(err);
+        try std.testing.expectEqual(@as(u32, @intCast(number)), @backingInt(status));
+        try std.testing.expectError(err, statusToError(status));
+        const failure = failureFromError(err, .storage_owner, abi.abi_version, 17);
+        try validateFailureEnvelope(status, &failure, abi.abi_version);
+    }
+}
 
 const mappings = [_]Mapping{
     .{ .status = .replay_document_not_visible, .err = error.ReplayDocumentNotVisible },
@@ -190,7 +213,6 @@ const mappings = [_]Mapping{
     .{ .status = .tablespace_not_found, .err = error.TablespaceNotFound },
     .{ .status = .ha_seed_snapshot_runtime_busy, .err = error.HASeedSnapshotRuntimeBusy },
     .{ .status = .ha_seed_capture_already_in_progress, .err = error.HASeedCaptureAlreadyInProgress },
-
     .{ .status = .relational_expression_overflow, .err = error.RelationalExpressionOverflow },
     .{ .status = .sql_feature_not_supported, .err = error.SqlFeatureNotSupported },
     .{ .status = .catalog_publication_proof_pending, .err = error.CatalogPublicationProofPending },
@@ -435,9 +457,6 @@ const mappings = [_]Mapping{
     .{ .status = .wal_lsn_mismatch, .err = error.WalLsnMismatch },
     .{ .status = .read_only_transaction, .err = error.ReadOnlyTransaction },
     .{ .status = .arithmetic_overflow, .err = error.Overflow },
-    // Expected operating-system and physical-WAL failures are domain-visible
-    // too.  Do not collapse them into `.internal`: callers use these exact
-    // identities for retry, read-only failover, and operator diagnostics.
     .{ .status = .access_denied, .err = error.AccessDenied },
     .{ .status = .disk_quota, .err = error.DiskQuota },
     .{ .status = .file_too_big, .err = error.FileTooBig },
@@ -533,8 +552,6 @@ const mappings = [_]Mapping{
     .{ .status = .table_transition_count_exhausted, .err = error.TableTransitionCountExhausted },
     .{ .status = .table_transition_generation_exhausted, .err = error.TableTransitionGenerationExhausted },
     .{ .status = .unexpected_metadata_snapshot_artifact, .err = error.UnexpectedMetadataSnapshotArtifact },
-    // HA seed operations are coarse storage-owner calls, but their expected
-    // lifecycle failures remain exact semantic identities at the consumer.
     .{ .status = .activation_binding_mismatch, .err = error.ActivationBindingMismatch },
     .{ .status = .activation_binding_missing, .err = error.ActivationBindingMissing },
     .{ .status = .activation_receipt_mismatch, .err = error.ActivationReceiptMismatch },
@@ -888,9 +905,177 @@ const mappings = [_]Mapping{
     .{ .status = .cypher_variable_conflict, .err = error.CypherVariableConflict },
     .{ .status = .cypher_variable_type_conflict, .err = error.CypherVariableTypeConflict },
     .{ .status = .cypher_write_union_unsupported, .err = error.CypherWriteUnionUnsupported },
+    .{ .status = .duplicate_shape_name, .err = error.DuplicateShapeName },
+    .{ .status = .generated_artifact_shape_required, .err = error.GeneratedArtifactShapeRequired },
+    .{ .status = .no_supported_scopes, .err = error.NoSupportedScopes },
+    .{ .status = .scope_must_not_name_table, .err = error.ScopeMustNotNameTable },
+    .{ .status = .unknown_shape_reference, .err = error.UnknownShapeReference },
+    .{ .status = .unsupported_manifest_api_version, .err = error.UnsupportedManifestApiVersion },
+    .{ .status = .unsupported_package_kind, .err = error.UnsupportedPackageKind },
+    .{ .status = .catalog_revision_exhausted, .err = error.CatalogRevisionExhausted },
+    .{ .status = .duplicate_sql_extension_export, .err = error.DuplicateSqlExtensionExport },
+    .{ .status = .duplicate_sql_extension_version, .err = error.DuplicateSqlExtensionVersion },
+    .{ .status = .inconsistent_sql_extension_control, .err = error.InconsistentSqlExtensionControl },
+    .{ .status = .invalid_package_digest, .err = error.InvalidPackageDigest },
+    .{ .status = .invalid_sql_extension_artifact, .err = error.InvalidSqlExtensionArtifact },
+    .{ .status = .invalid_sql_extension_control, .err = error.InvalidSqlExtensionControl },
+    .{ .status = .invalid_sql_extension_dependency, .err = error.InvalidSqlExtensionDependency },
+    .{ .status = .invalid_sql_extension_record, .err = error.InvalidSqlExtensionRecord },
+    .{ .status = .invalid_sql_extension_runtime, .err = error.InvalidSqlExtensionRuntime },
+    .{ .status = .invalid_sql_extension_package_mutation, .err = error.InvalidSqlExtensionPackageMutation },
+    .{ .status = .duplicate_sql_extension_control, .err = error.DuplicateSqlExtensionControl },
+    .{ .status = .sql_dependent_extension_object, .err = error.SqlDependentExtensionObject },
+    .{ .status = .sql_duplicate_extension, .err = error.SqlDuplicateExtension },
+    .{ .status = .sql_duplicate_function, .err = error.SqlDuplicateFunction },
+    .{ .status = .sql_extension_control_conflict, .err = error.SqlExtensionControlConflict },
+    .{ .status = .sql_extension_dependency_cycle, .err = error.SqlExtensionDependencyCycle },
+    .{ .status = .sql_extension_promotion_nonce_conflict, .err = error.SqlExtensionPromotionNonceConflict },
+    .{ .status = .sql_extension_schema_mismatch, .err = error.SqlExtensionSchemaMismatch },
+    .{ .status = .sql_extension_unavailable, .err = error.SqlExtensionUnavailable },
+    .{ .status = .sql_extension_update_path_unavailable, .err = error.SqlExtensionUpdatePathUnavailable },
+    .{ .status = .sql_extension_version_unavailable, .err = error.SqlExtensionVersionUnavailable },
+    .{ .status = .sql_function_return_type_changed, .err = error.SqlFunctionReturnTypeChanged },
+    .{ .status = .sql_required_extension_not_installed, .err = error.SqlRequiredExtensionNotInstalled },
+    .{ .status = .sql_undefined_extension, .err = error.SqlUndefinedExtension },
+    .{ .status = .unsupported_sql_extension_object, .err = error.UnsupportedSqlExtensionObject },
+    .{ .status = .sql_extension_owned_object, .err = error.SqlExtensionOwnedObject },
+    .{ .status = .invalid_sql_relation_persistence, .err = error.InvalidSqlRelationPersistence },
+    .{ .status = .sql_relation_owner_changed, .err = error.SqlRelationOwnerChanged },
+    .{ .status = .sql_temporary_relation_not_owned, .err = error.SqlTemporaryRelationNotOwned },
+    .{ .status = .invalid_sql_temporary_namespace, .err = error.InvalidSqlTemporaryNamespace },
+    .{ .status = .sql_relation_persistence_foreign_key_mismatch, .err = error.SqlRelationPersistenceForeignKeyMismatch },
+    .{ .status = .sql_relation_recovery_incomplete, .err = error.SqlRelationRecoveryIncomplete },
+    .{ .status = .sql_relation_owner_unavailable, .err = error.SqlRelationOwnerUnavailable },
+    .{ .status = .invalid_sql_trigger_definition, .err = error.InvalidSqlTriggerDefinition },
+    .{ .status = .invalid_sql_trigger_manifest, .err = error.InvalidSqlTriggerManifest },
+    .{ .status = .sql_trigger_context_required, .err = error.SqlTriggerContextRequired },
+    .{ .status = .sql_trigger_returned_no_value, .err = error.SqlTriggerReturnedNoValue },
+    .{ .status = .sql_trigger_return_value_required, .err = error.SqlTriggerReturnValueRequired },
+    .{ .status = .sql_trigger_declared_arguments, .err = error.SqlTriggerDeclaredArguments },
+    .{ .status = .sql_trigger_sql_language, .err = error.SqlTriggerSqlLanguage },
+    .{ .status = .sql_trigger_coordination_required, .err = error.SqlTriggerCoordinationRequired },
+    .{ .status = .sql_prepared_durability_unavailable, .err = error.SqlPreparedDurabilityUnavailable },
+    .{ .status = .invalid_prepared_graph_effects, .err = error.InvalidPreparedGraphEffects },
+    .{ .status = .commit_decision_unknown, .err = error.CommitDecisionUnknown },
+    .{ .status = .invalid_participant, .err = error.InvalidParticipant },
+    .{ .status = .invalid_lock_class, .err = error.InvalidLockClass },
+    .{ .status = .invalid_lock_effect, .err = error.InvalidLockEffect },
+    .{ .status = .invalid_lock_owner, .err = error.InvalidLockOwner },
+    .{ .status = .invalid_lock_record, .err = error.InvalidLockRecord },
+    .{ .status = .invalid_lock_resource, .err = error.InvalidLockResource },
+    .{ .status = .invalid_lock_scope, .err = error.InvalidLockScope },
+    .{ .status = .lock_effect_changed, .err = error.LockEffectChanged },
+    .{ .status = .lock_effect_expired, .err = error.LockEffectExpired },
+    .{ .status = .lock_effect_out_of_order, .err = error.LockEffectOutOfOrder },
+    .{ .status = .lock_limit_exceeded, .err = error.LockLimitExceeded },
+    .{ .status = .lock_owner_busy, .err = error.LockOwnerBusy },
+    .{ .status = .lock_owner_changed, .err = error.LockOwnerChanged },
+    .{ .status = .lock_owner_not_registered, .err = error.LockOwnerNotRegistered },
+    .{ .status = .lock_plan_limit_exceeded, .err = error.LockPlanLimitExceeded },
+    .{ .status = .sql_index_already_exists, .err = error.SqlIndexAlreadyExists },
+    .{ .status = .sql_constraint_already_exists, .err = error.SqlConstraintAlreadyExists },
+    .{ .status = .sql_index_not_found, .err = error.SqlIndexNotFound },
+    .{ .status = .sql_constraint_not_found, .err = error.SqlConstraintNotFound },
+    .{ .status = .catalog_generation_exhausted, .err = error.CatalogGenerationExhausted },
+    .{ .status = .invalid_sequence_default_references, .err = error.InvalidSequenceDefaultReferences },
+    .{ .status = .invalid_sequence_outcome, .err = error.InvalidSequenceOutcome },
+    .{ .status = .invalid_sequence_state, .err = error.InvalidSequenceState },
+    .{ .status = .invalid_sequence_definition, .err = error.InvalidSequenceDefinition },
+    .{ .status = .maintenance_busy, .err = error.MaintenanceBusy },
+    .{ .status = .invalid_sql_backend_response, .err = error.InvalidSqlBackendResponse },
+    .{ .status = .invalid_sql_parameters, .err = error.InvalidSqlParameters },
+    .{ .status = .unknown_sql_column, .err = error.UnknownSqlColumn },
+    .{ .status = .duplicate_sql_column, .err = error.DuplicateSqlColumn },
+    .{ .status = .unsupported_sql_execution, .err = error.UnsupportedSqlExecution },
+    .{ .status = .invalid_relation_population, .err = error.InvalidRelationPopulation },
+    .{ .status = .relation_population_page_too_large, .err = error.RelationPopulationPageTooLarge },
+    .{ .status = .relation_population_changed, .err = error.RelationPopulationChanged },
+    .{ .status = .materialized_view_read_only, .err = error.MaterializedViewReadOnly },
+    .{ .status = .foreign_key_validation_required, .err = error.ForeignKeyValidationRequired },
+    .{ .status = .undefined_column, .err = error.UndefinedColumn },
+    .{ .status = .conflicting_data_apply_batch, .err = error.ConflictingDataApplyBatch },
+    .{ .status = .invalid_data_apply_batch, .err = error.InvalidDataApplyBatch },
+    .{ .status = .split_source_projection_not_ready, .err = error.SplitSourceProjectionNotReady },
+    .{ .status = .apply_store_group_retired, .err = error.ApplyStoreGroupRetired },
+    .{ .status = .apply_store_shutting_down, .err = error.ApplyStoreShuttingDown },
+    .{ .status = .schema_validation_command_rejected, .err = error.SchemaValidationCommandRejected },
+    .{ .status = .schema_validation_preparation_changed, .err = error.SchemaValidationPreparationChanged },
+    .{ .status = .corrupt_schema_apply_outcome, .err = error.CorruptSchemaApplyOutcome },
+    .{ .status = .relational_check_violation, .err = error.RelationalCheckViolation },
+    .{ .status = .foreign_key_match_full_violation, .err = error.ForeignKeyMatchFullViolation },
+    .{ .status = .invalid_sql_view_record, .err = error.InvalidSqlViewRecord },
+    .{ .status = .sql_view_cycle, .err = error.SqlViewCycle },
+    .{ .status = .sql_view_column_rename, .err = error.SqlViewColumnRename },
+    .{ .status = .sql_view_column_type_changed, .err = error.SqlViewColumnTypeChanged },
+    .{ .status = .sql_view_column_dropped, .err = error.SqlViewColumnDropped },
+    .{ .status = .sql_dependent_objects_exist, .err = error.SqlDependentObjectsExist },
+    .{ .status = .sql_program_limit_exceeded, .err = error.SqlProgramLimitExceeded },
+    .{ .status = .invalid_schema_reader_requirements, .err = error.InvalidSchemaReaderRequirements },
+    .{ .status = .sql_invalid_power_argument, .err = error.SqlInvalidPowerArgument },
+    .{ .status = .immutable_relational_index_definition_conflict, .err = error.ImmutableRelationalIndexDefinitionConflict },
+    .{ .status = .invalid_index_publication_candidate, .err = error.InvalidIndexPublicationCandidate },
+    .{ .status = .invalid_private_index_cancellation, .err = error.InvalidPrivateIndexCancellation },
+    .{ .status = .invalid_private_index_claim_inventory, .err = error.InvalidPrivateIndexClaimInventory },
+    .{ .status = .invalid_private_index_claim_receipt, .err = error.InvalidPrivateIndexClaimReceipt },
+    .{ .status = .index_owner_receipt_changed, .err = error.IndexOwnerReceiptChanged },
+    .{ .status = .invalid_private_index_inputs, .err = error.InvalidPrivateIndexInputs },
+    .{ .status = .invalid_private_index_native_receipt, .err = error.InvalidPrivateIndexNativeReceipt },
+    .{ .status = .invalid_private_index_owner_job, .err = error.InvalidPrivateIndexOwnerJob },
+    .{ .status = .invalid_relational_index_progress, .err = error.InvalidRelationalIndexProgress },
+    .{ .status = .missing_relational_index_definitions, .err = error.MissingRelationalIndexDefinitions },
+    .{ .status = .private_index_cancellation_pending, .err = error.PrivateIndexCancellationPending },
+    .{ .status = .private_index_cancellation_required, .err = error.PrivateIndexCancellationRequired },
+    .{ .status = .private_index_job_required, .err = error.PrivateIndexJobRequired },
+    .{ .status = .private_index_owner_job_changed, .err = error.PrivateIndexOwnerJobChanged },
+    .{ .status = .private_index_root_recovery_required, .err = error.PrivateIndexRootRecoveryRequired },
+    .{ .status = .invalid_schema_validation_job, .err = error.InvalidSchemaValidationJob },
+    .{ .status = .schema_validation_job_changed, .err = error.SchemaValidationJobChanged },
+    .{ .status = .schema_validation_job_required, .err = error.SchemaValidationJobRequired },
+    .{ .status = .schema_validation_runtime_recovery_required, .err = error.SchemaValidationRuntimeRecoveryRequired },
+    .{ .status = .invalid_schema_owner_control, .err = error.InvalidSchemaOwnerControl },
+    .{ .status = .invalid_schema_validation_page_command, .err = error.InvalidSchemaValidationPageCommand },
+    .{ .status = .invalid_nullability_replay, .err = error.InvalidNullabilityReplay },
+    .{ .status = .schema_validation_canceled, .err = error.SchemaValidationCanceled },
+    .{ .status = .schema_validation_not_ready, .err = error.SchemaValidationNotReady },
+    .{ .status = .schema_validation_publication_required, .err = error.SchemaValidationPublicationRequired },
+    .{ .status = .schema_validation_cancellation_required, .err = error.SchemaValidationCancellationRequired },
+    .{ .status = .invalid_ordered_apply_receipt, .err = error.InvalidOrderedApplyReceipt },
+    .{ .status = .conflicting_ordered_apply_receipt, .err = error.ConflictingOrderedApplyReceipt },
+    .{ .status = .invalid_relational_index_budget, .err = error.InvalidRelationalIndexBudget },
+    .{ .status = .private_index_claim_backlog_full, .err = error.PrivateIndexClaimBacklogFull },
+    .{ .status = .private_index_publication_canceled, .err = error.PrivateIndexPublicationCanceled },
+    .{ .status = .private_index_publication_required, .err = error.PrivateIndexPublicationRequired },
+    .{ .status = .relational_index_catalog_schema_mismatch, .err = error.RelationalIndexCatalogSchemaMismatch },
+    .{ .status = .catalog_occupancy_not_ready, .err = error.CatalogOccupancyNotReady },
+    .{ .status = .sequence_catalog_state_required, .err = error.SequenceCatalogStateRequired },
+    .{ .status = .sql_database_in_use, .err = error.SqlDatabaseInUse },
+    .{ .status = .scope_retirement_changed, .err = error.ScopeRetirementChanged },
+    .{ .status = .invalid_scope_retirement, .err = error.InvalidScopeRetirement },
+    .{ .status = .sequence_admission_conflict, .err = error.SequenceAdmissionConflict },
+    .{ .status = .invalid_table_retirement_manifest, .err = error.InvalidTableRetirementManifest },
+    .{ .status = .extension_owned_object, .err = error.ExtensionOwnedObject },
+    .{ .status = .invalid_native_backup_origin, .err = error.InvalidNativeBackupOrigin },
+    .{ .status = .native_backup_origin_mismatch, .err = error.NativeBackupOriginMismatch },
+    .{ .status = .table_transition_active, .err = error.TableTransitionActive },
+    .{ .status = .invalid_external_decision_owner, .err = error.InvalidExternalDecisionOwner },
+    .{ .status = .external_transaction_decision_required, .err = error.ExternalTransactionDecisionRequired },
+    .{ .status = .external_transaction_decision_changed, .err = error.ExternalTransactionDecisionChanged },
+    .{ .status = .external_transaction_role_required, .err = error.ExternalTransactionRoleRequired },
+    .{ .status = .external_transaction_commit_not_activated, .err = error.ExternalTransactionCommitNotActivated },
+    .{ .status = .external_transaction_admission_expired, .err = error.ExternalTransactionAdmissionExpired },
+    .{ .status = .invalid_prepared_transaction_id, .err = error.InvalidPreparedTransactionId },
+    .{ .status = .invalid_prepared_transaction_phase, .err = error.InvalidPreparedTransactionPhase },
+    .{ .status = .sql_prepared_transaction_already_exists, .err = error.SqlPreparedTransactionAlreadyExists },
+    .{ .status = .sql_prepared_transaction_not_found, .err = error.SqlPreparedTransactionNotFound },
+    .{ .status = .sql_prepared_transaction_wrong_database, .err = error.SqlPreparedTransactionWrongDatabase },
+    .{ .status = .sql_prepared_transaction_capacity_exceeded, .err = error.SqlPreparedTransactionCapacityExceeded },
+    .{ .status = .unsupported_native_index_owner, .err = error.UnsupportedNativeIndexOwner },
+    .{ .status = .temporal_overlap_violation, .err = error.TemporalOverlapViolation },
+    .{ .status = .temporal_empty_range, .err = error.TemporalEmptyRange },
 };
 
 pub fn statusFromError(err: anyerror) abi.Status {
+    @setEvalBranchQuota(100000);
     inline for (mappings) |mapping| {
         if (err == mapping.err) return mapping.status;
     }
@@ -898,6 +1083,7 @@ pub fn statusFromError(err: anyerror) abi.Status {
 }
 
 pub fn statusToError(status: abi.Status) !void {
+    @setEvalBranchQuota(100000);
     if (status == .ok) return;
     // ABI 27 used this broad status for all backup-integrity failures. Keep it
     // readable for mixed-version diagnostics; ABI 28 providers emit the exact
@@ -1009,6 +1195,7 @@ pub const CallbackErrorRelay = struct {
 };
 
 fn hasRegisteredIdentity(status: abi.Status) bool {
+    @setEvalBranchQuota(100000);
     inline for (mappings) |mapping| {
         if (status == mapping.status) return true;
     }
@@ -1126,12 +1313,83 @@ pub fn validateForTest() !void {
     try std.testing.expectError(error.CallbackReadOnly, relay.finish(.ha_read_only_standby));
 }
 
+test "native private index control errors retain distinct compiled identities" {
+    const errors = [_]anyerror{
+        error.ImmutableRelationalIndexDefinitionConflict,
+        error.InvalidIndexPublicationCandidate,
+        error.InvalidPrivateIndexCancellation,
+        error.InvalidPrivateIndexClaimInventory,
+        error.InvalidPrivateIndexClaimReceipt,
+        error.IndexOwnerReceiptChanged,
+        error.InvalidPrivateIndexInputs,
+        error.InvalidPrivateIndexNativeReceipt,
+        error.InvalidPrivateIndexOwnerJob,
+        error.InvalidRelationalIndexProgress,
+        error.MissingRelationalIndexDefinitions,
+        error.PrivateIndexCancellationPending,
+        error.PrivateIndexCancellationRequired,
+        error.PrivateIndexJobRequired,
+        error.PrivateIndexOwnerJobChanged,
+        error.PrivateIndexRootRecoveryRequired,
+        error.InvalidRelationalIndexBudget,
+        error.PrivateIndexClaimBacklogFull,
+        error.PrivateIndexPublicationCanceled,
+        error.PrivateIndexPublicationRequired,
+        error.RelationalIndexCatalogSchemaMismatch,
+    };
+    for (errors) |expected| {
+        const status = statusFromError(expected);
+        try std.testing.expect(status != .internal);
+        try std.testing.expectError(expected, statusToError(status));
+        const failure = failureFromError(expected, .storage_owner, abi.abi_version, 14);
+        try validateFailureEnvelope(status, &failure, abi.abi_version);
+        try std.testing.expectEqualStrings(@errorName(expected), failure.errorName());
+    }
+}
+
+test "index publication unsupported owner stays definite across compiled runtime boundaries" {
+    const status = statusFromError(error.UnsupportedNativeIndexOwner);
+    try std.testing.expectEqual(abi.Status.unsupported_native_index_owner, status);
+    try std.testing.expectError(error.UnsupportedNativeIndexOwner, statusToError(status));
+    const failure = failureFromError(error.UnsupportedNativeIndexOwner, .storage_owner, abi.abi_version, 23);
+    try validateFailureEnvelope(status, &failure, abi.abi_version);
+    try std.testing.expectEqualStrings("UnsupportedNativeIndexOwner", failure.errorName());
+}
+
+test "sequence catalog native checkpoint requirement is not an opaque provider failure" {
+    const failure = failureFromError(error.SequenceCatalogStateRequired, .storage_owner, abi.abi_version, 23);
+    try std.testing.expectEqual(abi.Status.sequence_catalog_state_required, failure.status);
+    try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+    try std.testing.expectError(error.SequenceCatalogStateRequired, statusToError(failure.status));
+    try std.testing.expectEqualStrings("SequenceCatalogStateRequired", failure.errorName());
+}
+
 test "seed replica policy mismatch survives compiled runtime boundaries" {
     try std.testing.expectEqual(abi.Status.seed_replica_policy_mismatch, statusFromError(error.SeedReplicaPolicyMismatch));
     try std.testing.expectError(error.SeedReplicaPolicyMismatch, statusToError(.seed_replica_policy_mismatch));
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {
+    for ([_]anyerror{ error.InvalidDocumentCheckpoint, error.TooManyActiveJobs, error.SqlDatabaseInUse, error.ScopeRetirementChanged, error.InvalidScopeRetirement, error.SequenceAdmissionConflict, error.InvalidTableRetirementManifest, error.ExtensionOwnedObject }) |err| {
+        const failure = failureFromError(err, .storage_owner, abi.abi_version, 23);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(err, statusToError(failure.status));
+    }
+    // Catalog admission must retain its definite pre-proposal lifecycle
+    // conflict across the compiled owner, rather than report an internal
+    // failure or invite replay of an allegedly ambiguous mutation.
+    const transition = failureFromError(error.TableTransitionActive, .storage_owner, abi.abi_version, 23);
+    try std.testing.expectEqual(abi.Status.table_transition_active, transition.status);
+    try validateFailureEnvelope(transition.status, &transition, abi.abi_version);
+    try std.testing.expectError(error.TableTransitionActive, statusToError(transition.status));
+    try std.testing.expectEqual(abi.Status.sql_invalid_power_argument, statusFromError(error.SqlInvalidPowerArgument));
+    try std.testing.expectError(error.SqlInvalidPowerArgument, statusToError(.sql_invalid_power_argument));
+    // Typed occupancy is a publication precondition, not an undeclared
+    // provider defect or proof of an uncertain admitted mutation.
+    const occupancy = failureFromError(error.CatalogOccupancyNotReady, .storage_owner, abi.abi_version, 23);
+    try std.testing.expectEqual(abi.Status.catalog_occupancy_not_ready, occupancy.status);
+    try validateFailureEnvelope(occupancy.status, &occupancy, abi.abi_version);
+    try std.testing.expectError(error.CatalogOccupancyNotReady, statusToError(occupancy.status));
     // A stale FK attachment must remain a semantic rejection across the
     // storage-owner ABI. Collapsing it to StorageKernelFailure can poison a
     // replicated apply entry and stall every later proposal on that owner.
@@ -1150,6 +1408,8 @@ test "registered storage-kernel errors are unique and round trip without losing 
     // restore validation as its exact error, not generic kernel pressure.
     try std.testing.expectEqual(abi.Status.invalid_relational_row, statusFromError(error.InvalidRelationalRow));
     try std.testing.expectError(error.InvalidRelationalRow, statusToError(.invalid_relational_row));
+    try std.testing.expectEqual(abi.Status.relational_check_violation, statusFromError(error.RelationalCheckViolation));
+    try std.testing.expectError(error.RelationalCheckViolation, statusToError(.relational_check_violation));
     try validateForTest();
 }
 
@@ -1193,6 +1453,32 @@ test "committed visibility outcomes survive the storage owner boundary" {
     }
 }
 
+test "schema owner observation preserves exact conflict and runtime recovery failures" {
+    for ([_]anyerror{
+        error.InvalidSchemaOwnerControl,
+        error.InvalidSchemaValidationPageCommand,
+        error.InvalidNullabilityReplay,
+        error.SchemaValidationCanceled,
+        error.SchemaValidationNotReady,
+        error.SchemaValidationPublicationRequired,
+        error.SchemaValidationCancellationRequired,
+        error.InvalidOrderedApplyReceipt,
+        error.ConflictingOrderedApplyReceipt,
+        error.InvalidSchemaValidationJob,
+        error.SchemaValidationJobChanged,
+        error.SchemaValidationJobRequired,
+        error.SchemaValidationRuntimeRecoveryRequired,
+        error.InvalidNativeBackupOrigin,
+        error.NativeBackupOriginMismatch,
+    }) |err| {
+        const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
+        try std.testing.expect(failure.status != .internal);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(err, statusToError(failure.status));
+        try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+    }
+}
+
 test "external lake evaluation limits survive the compiled query owner boundary" {
     const failure = failureFromError(error.DecisionLimitExceeded, .local_query, abi.abi_version, 4);
     try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
@@ -1224,17 +1510,19 @@ test "logical value exact sort rejection survives both compiled query boundaries
     }
 }
 
-test "document job failures retain distinct semantic identities at the compiled boundary" {
-    // Later boundary revisions retain these released error identities.
-    try std.testing.expect(abi.abi_version >= 68);
-    try std.testing.expectEqual(@as(u32, 839), @backingInt(statusFromError(error.InvalidDocumentCheckpoint)));
-    try std.testing.expectEqual(@as(u32, 840), @backingInt(statusFromError(error.TooManyActiveJobs)));
-    try std.testing.expectEqual(@as(u32, 842), @backingInt(statusFromError(error.ReadTransientFailure)));
-    try std.testing.expectEqual(@as(u32, 847), @backingInt(statusFromError(error.InvalidConnectionCredentials)));
-    try std.testing.expectEqual(@as(u32, 848), @backingInt(statusFromError(error.RaftApplyWriterUnavailable)));
-    try std.testing.expectEqual(@as(u32, 849), @backingInt(statusFromError(error.CypherAggregateScope)));
-    try std.testing.expectError(error.InvalidDocumentCheckpoint, statusToError(.invalid_document_checkpoint));
-    try std.testing.expectError(error.TooManyActiveJobs, statusToError(.too_many_active_jobs));
+test "materialized view write rejection survives the compiled storage owner boundary" {
+    try std.testing.expectEqual(abi.Status.materialized_view_read_only, statusFromError(error.MaterializedViewReadOnly));
+    try std.testing.expectError(error.MaterializedViewReadOnly, statusToError(.materialized_view_read_only));
+}
+
+test "catalog object annotation namespace diagnostics retain exact identity across compiled boundaries" {
+    for ([_]anyerror{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.SqlIndexNotFound, error.SqlConstraintNotFound, error.CatalogGenerationExhausted }) |err| {
+        const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expect(failure.status != .internal);
+        try std.testing.expectError(err, statusToError(failure.status));
+        try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+    }
 }
 
 test "reader failures and scoped GCS failures retain exact storage boundary identity" {
@@ -1244,6 +1532,38 @@ test "reader failures and scoped GCS failures retain exact storage boundary iden
         try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
         try std.testing.expectError(expected, statusToError(failure.status));
     }
+}
+
+test "native locking control failures preserve exact stable identities" {
+    inline for (.{ error.RaftApplyWriterUnavailable, error.InvalidLockClass, error.InvalidLockEffect, error.InvalidLockOwner, error.InvalidLockRecord, error.InvalidLockResource, error.InvalidLockScope, error.LockEffectChanged, error.LockEffectExpired, error.LockEffectOutOfOrder, error.LockLimitExceeded, error.LockOwnerBusy, error.LockOwnerChanged, error.LockOwnerNotRegistered, error.LockPlanLimitExceeded }) |err| {
+        const transported = statusFromError(err);
+        try std.testing.expect(transported != .internal);
+        try std.testing.expectError(err, statusToError(transported));
+    }
+}
+
+test "SQL prepared durability refusal retains its semantic runtime identity" {
+    const encoded = statusFromError(error.SqlPreparedDurabilityUnavailable);
+    try std.testing.expectEqual(abi.Status.sql_prepared_durability_unavailable, encoded);
+    try std.testing.expectError(error.SqlPreparedDurabilityUnavailable, statusToError(encoded));
+}
+
+test "graph preparation errors retain semantic wire identity across compiled receivers" {
+    const status = statusFromError(error.InvalidPreparedGraphEffects);
+    try std.testing.expectEqual(abi.Status.invalid_prepared_graph_effects, status);
+    try std.testing.expectError(error.InvalidPreparedGraphEffects, statusToError(status));
+}
+
+test "native decision uncertainty retains its exact shared runtime identity" {
+    const status = statusFromError(error.CommitDecisionUnknown);
+    try std.testing.expectEqual(abi.Status.commit_decision_unknown, status);
+    try std.testing.expectEqual(@as(u32, 1044), @backingInt(status));
+    try std.testing.expectError(error.CommitDecisionUnknown, statusToError(status));
+    var failure = failureFromError(error.CommitDecisionUnknown, .storage_owner, abi.abi_version, 1);
+    try validateFailureEnvelope(status, &failure, abi.abi_version);
+    try std.testing.expectEqualStrings("CommitDecisionUnknown", failure.errorName());
+    failure.boundary_version = 89;
+    try std.testing.expectError(error.InvalidBoundaryFailureIdentity, validateFailureEnvelope(status, &failure, abi.abi_version));
 }
 
 test "privacy committed Raft contention survives the active storage owner ABI" {
@@ -1257,6 +1577,40 @@ test "privacy committed Raft contention survives the active storage owner ABI" {
     }
     try std.testing.expect(statusFromError(error.WriterLocked) != statusFromError(error.RaftApplyWriterUnavailable));
     try std.testing.expectEqual(@as(u32, 848), @backingInt(statusFromError(error.RaftApplyWriterUnavailable)));
+}
+
+// Invalid membership remains a protocol refusal across the owner boundary.
+test "external terminal ACK preserves invalid participant failure identity" {
+    const value = statusFromError(error.InvalidParticipant);
+    try std.testing.expectEqual(abi.Status.invalid_participant, value);
+    try std.testing.expectEqual(@as(u32, 1056), @backingInt(value));
+    try std.testing.expectError(error.InvalidParticipant, statusToError(value));
+    var failure = failureFromError(error.InvalidParticipant, .storage_owner, abi.abi_version, 1);
+    try validateFailureEnvelope(value, &failure, abi.abi_version);
+    try std.testing.expectEqualStrings("InvalidParticipant", failure.errorName());
+    failure.boundary_version = abi.abi_version - 1;
+    try std.testing.expectError(error.InvalidBoundaryFailureIdentity, validateFailureEnvelope(value, &failure, abi.abi_version));
+}
+
+test "SQL extension lifecycle boundary identities retain exact rejections" {
+    const errors = [_]anyerror{ error.CatalogRevisionExhausted, error.DuplicateSqlExtensionExport, error.DuplicateSqlExtensionVersion, error.InconsistentSqlExtensionControl, error.InvalidPackageDigest, error.InvalidSqlExtensionArtifact, error.InvalidSqlExtensionControl, error.InvalidSqlExtensionDependency, error.InvalidSqlExtensionRecord, error.InvalidSqlExtensionRuntime, error.InvalidSqlExtensionPackageMutation, error.DuplicateSqlExtensionControl, error.SqlDependentExtensionObject, error.SqlDuplicateExtension, error.SqlDuplicateFunction, error.SqlExtensionControlConflict, error.SqlExtensionDependencyCycle, error.SqlExtensionPromotionNonceConflict, error.SqlExtensionSchemaMismatch, error.SqlExtensionUnavailable, error.SqlExtensionUpdatePathUnavailable, error.SqlExtensionVersionUnavailable, error.SqlFunctionReturnTypeChanged, error.SqlRequiredExtensionNotInstalled, error.SqlUndefinedExtension, error.UnsupportedSqlExtensionObject, error.SqlExtensionOwnedObject, error.DuplicateShapeName, error.GeneratedArtifactShapeRequired, error.NoSupportedScopes, error.ScopeMustNotNameTable, error.UnknownShapeReference, error.UnsupportedManifestApiVersion, error.UnsupportedPackageKind };
+    const expected = [_]u32{ 1057, 1058, 1059, 1060, 1061, 1062, 1063, 1064, 1065, 1066, 1067, 1068, 1069, 1070, 1071, 1072, 1073, 1074, 1075, 1076, 1077, 1078, 1079, 1080, 1081, 1082, 1083, 1084, 1085, 1086, 1087, 1088, 1089, 1090 };
+    for (errors, expected) |err, ordinal| {
+        const status = statusFromError(err);
+        try std.testing.expectEqual(@as(u32, @intCast(ordinal)), @backingInt(status));
+        try std.testing.expectError(err, statusToError(status));
+    }
+}
+
+test "document job failures retain distinct semantic identities at the compiled boundary" {
+    try std.testing.expectEqual(@as(u32, 94), abi.abi_version);
+    try std.testing.expectEqual(@as(u32, 839), @backingInt(statusFromError(error.InvalidDocumentCheckpoint)));
+    try std.testing.expectEqual(@as(u32, 840), @backingInt(statusFromError(error.TooManyActiveJobs)));
+    try std.testing.expectEqual(@as(u32, 842), @backingInt(statusFromError(error.ReadTransientFailure)));
+    try std.testing.expectEqual(@as(u32, 847), @backingInt(statusFromError(error.InvalidConnectionCredentials)));
+    try std.testing.expectEqual(@as(u32, 849), @backingInt(statusFromError(error.CypherAggregateScope)));
+    try std.testing.expectError(error.InvalidDocumentCheckpoint, statusToError(.invalid_document_checkpoint));
+    try std.testing.expectError(error.TooManyActiveJobs, statusToError(.too_many_active_jobs));
 }
 
 test "storage owner lease admission retains its independent stable identity" {

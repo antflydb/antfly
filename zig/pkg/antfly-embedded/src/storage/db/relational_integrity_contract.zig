@@ -63,7 +63,7 @@ pub const max_commands = 4096;
 
 pub const max_preparation_bytes = 16 * 1024 * 1024;
 
-pub const Kind = enum(u8) { claim = 1, reference = 2, job = 3 };
+pub const Kind = enum(u8) { claim = 1, reference = 2, job = 3, interval = 4, interval_guard = 5 };
 
 /// Apply-fenced point probes plus a current cursor avoid cloning the mutable
 /// LSM memtable just to validate one claim or the first remaining reference.
@@ -145,9 +145,13 @@ pub fn parseKey(key: []const u8) !ParsedKey {
         1 => .claim,
         2 => .reference,
         3 => .job,
+        4 => .interval,
+        5 => .interval_guard,
         else => return error.InvalidIntegrityKey,
     };
-    if (key.len != key_len + @as(usize, if (kind == .reference) 32 else 0)) return error.InvalidIntegrityKey;
+    if (kind == .interval) {
+        if (key.len < key_len + 34 or key.len > @import("temporal_integrity_contract.zig").max_key_bytes) return error.InvalidIntegrityKey;
+    } else if (key.len != key_len + @as(usize, if (kind == .reference) 32 else 0)) return error.InvalidIntegrityKey;
     const generation = key[namespace.len + 33 ..][0..16].*;
     if (std.mem.allEqual(u8, &generation, 0)) return error.InvalidIntegrityKey;
     const address = Address.fromDigest(generation, key[namespace.len + 49 ..][0..32].*);
@@ -168,6 +172,8 @@ pub fn validateTransferRecord(key: []const u8, value: []const u8) !Address {
         .claim => _ = try Claim.decode(key, value),
         .reference => _ = try Reference.decode(key, value),
         .job => _ = try Job.decode(key, value),
+        .interval => _ = try @import("temporal_integrity_contract.zig").Claim.decode(key, value),
+        .interval_guard => return error.InvalidIntegrityRecord, // Intent-only gap fence; never persisted.
     }
     return parsed.address;
 }
@@ -186,7 +192,7 @@ pub fn appendField(alloc: Allocator, out: *std.ArrayList(u8), value: []const u8)
 pub const Decoder = struct {
     bytes: []const u8,
     offset: usize = 0,
-    fn field(self: *Decoder) ![]const u8 {
+    pub fn field(self: *Decoder) ![]const u8 {
         if (self.bytes.len - self.offset < 4) return error.InvalidIntegrityRecord;
         const length = std.mem.readInt(u32, self.bytes[self.offset..][0..4], .little);
         self.offset += 4;
@@ -195,7 +201,7 @@ pub const Decoder = struct {
         self.offset += length;
         return result;
     }
-    fn finish(self: Decoder) !void {
+    pub fn finish(self: Decoder) !void {
         if (self.offset != self.bytes.len) return error.InvalidIntegrityRecord;
     }
 };
@@ -219,6 +225,25 @@ pub fn recordBody(key: []const u8, value: []const u8, magic: []const u8) ![]cons
 pub const Action = enum(u8) { restrict = 0, parent_delete = 1, parent_update = 2 };
 
 pub const Claim = struct {
+    /// Encoding-independent member identity shared by source contributions
+    /// and physical target inventory scans.
+    pub fn memberDigest(self: Claim) Digest {
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("antfly/private-unique-live-claim/v1");
+        state.update(&hash(self.tuple));
+        var version: [4]u8 = undefined;
+        std.mem.writeInt(u32, &version, self.schema_version, .little);
+        state.update(&version);
+        for ([_][]const u8{ self.parent_table, self.parent_key }) |field| {
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, field.len, .little);
+            state.update(&length);
+            state.update(field);
+        }
+        var result: Digest = undefined;
+        state.final(&result);
+        return result;
+    }
     tuple: []const u8,
     parent_table: []const u8,
     parent_key: []const u8,
@@ -285,10 +310,20 @@ pub const Claim = struct {
 };
 
 pub const Reference = struct {
+    historical_unvalidated: bool = false,
+
     child_table: []const u8,
     child_key: []const u8,
     constraint_name: []const u8,
     constraint_generation: Generation,
+
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "historical_unvalidated") and !self.historical_unvalidated;
+    }
+
+    pub fn jsonStringify(self: @This(), writer: anytype) @TypeOf(writer.*).Error!void {
+        return @import("relational_integrity_json.zig").write(self, writer);
+    }
 
     pub fn key(self: Reference, address: Address) ![key_len + 32]u8 {
         if (self.child_table.len == 0 or self.child_key.len == 0 or self.constraint_name.len == 0 or std.mem.allEqual(u8, &self.constraint_generation, 0)) return error.InvalidIntegrityRecord;
@@ -310,7 +345,7 @@ pub const Reference = struct {
         const physical = try self.key(address);
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(alloc);
-        try out.appendSlice(alloc, "AFR1");
+        try out.appendSlice(alloc, if (self.historical_unvalidated) "AFR2" else "AFR1");
         try out.appendSlice(alloc, &self.constraint_generation);
         for ([_][]const u8{ self.child_table, self.child_key, self.constraint_name }) |field| try appendField(alloc, &out, field);
         return finishRecord(alloc, &out, &physical);
@@ -319,10 +354,11 @@ pub const Reference = struct {
     pub fn decode(key_bytes: []const u8, value: []const u8) !Reference {
         const parsed = try parseKey(key_bytes);
         if (parsed.kind != .reference) return error.InvalidIntegrityKey;
-        const body = try recordBody(key_bytes, value, "AFR1");
+        const historical = std.mem.startsWith(u8, value, "AFR2");
+        const body = try recordBody(key_bytes, value, if (historical) "AFR2" else "AFR1");
         if (body.len < 16) return error.InvalidIntegrityRecord;
         var reader: Decoder = .{ .bytes = body[16..] };
-        const result: Reference = .{ .constraint_generation = body[0..16].*, .child_table = try reader.field(), .child_key = try reader.field(), .constraint_name = try reader.field() };
+        const result: Reference = .{ .historical_unvalidated = historical, .constraint_generation = body[0..16].*, .child_table = try reader.field(), .child_key = try reader.field(), .constraint_name = try reader.field() };
         try reader.finish();
         if (!std.mem.eql(u8, key_bytes, &(try result.key(parsed.address)))) return error.IntegrityAddressMismatch;
         return result;
@@ -338,8 +374,15 @@ pub const Command = struct {
         /// unlike check_owner this also fences schema/action/tuple state.
         compare_claim: ?Claim,
         establish: Claim,
+        establish_interval: @import("temporal_integrity_contract.zig").Claim,
+        check_interval: @import("temporal_integrity_contract.zig").Claim,
+        release_interval: struct { claim: @import("temporal_integrity_contract.zig").Claim, repair: bool = false },
         check_owner: ClaimOwner,
         attach: Reference,
+        /// Coordinator-owned historical coverage for a NOT VALID declaration.
+        /// Guard claim absence as well as presence; retain the reverse reference
+        /// so a later parent creation cannot escape ON DELETE/UPDATE actions.
+        attach_historical: Reference,
         detach: Reference,
         repair_detach: Reference,
         release: ClaimOwner,
@@ -350,6 +393,13 @@ pub const Command = struct {
         retry_action: Generation,
         cancel_action: Generation,
     },
+
+    pub fn isTemporal(self: Command) bool {
+        return switch (self.operation) {
+            .establish_interval, .release_interval, .check_interval => true,
+            else => false,
+        };
+    }
 
     pub fn jsonStringify(self: Command, stream: anytype) @TypeOf(stream.*).Error!void {
         return @import("relational_integrity_json.zig").write(self, stream);
@@ -370,7 +420,13 @@ pub fn commandAdmissionBytes(command: Command) !usize {
         .establish => |claim| for ([_][]const u8{ claim.tuple, claim.parent_table, claim.parent_key }) |field| {
             bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
         },
-        .attach, .detach, .repair_detach => |reference| for ([_][]const u8{ reference.child_table, reference.child_key, reference.constraint_name }) |field| {
+        .establish_interval, .check_interval => |claim| for ([_][]const u8{ claim.tuple, claim.parent_table, claim.parent_key, claim.period.bytes }) |field| {
+            bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
+        },
+        .release_interval => |release| for ([_][]const u8{ release.claim.tuple, release.claim.parent_table, release.claim.parent_key, release.claim.period.bytes }) |field| {
+            bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
+        },
+        .attach, .attach_historical, .detach, .repair_detach => |reference| for ([_][]const u8{ reference.child_table, reference.child_key, reference.constraint_name }) |field| {
             bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
         },
         .check_owner => |owner| {
@@ -460,8 +516,11 @@ pub const Job = struct {
 pub fn validateOperation(op: Operation) !void {
     const parsed = try parseKey(op.key);
     if (!std.mem.eql(u8, op.routing_key, &parsed.address.routing) or (op.kind != .put and op.value != null)) return error.InvalidIntegrityOperation;
+    if (parsed.kind == .interval_guard and (op.kind != .delete or op.expected_value != null)) return error.InvalidIntegrityOperation;
     for ([_]?[]const u8{ op.expected_value, op.value }) |maybe| if (maybe) |raw| switch (parsed.kind) {
         .claim => _ = try Claim.decode(op.key, raw),
+        .interval => _ = try @import("temporal_integrity_contract.zig").Claim.decode(op.key, raw),
+        .interval_guard => return error.InvalidIntegrityOperation,
         .reference => _ = try Reference.decode(op.key, raw),
         .job => {
             _ = try Job.decode(op.key, raw);

@@ -1,0 +1,416 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL 18",
+  "entries": [
+    {
+      "id": "sql-1102",
+      "sql": "TRUNCATE docs, docs_archive",
+      "selected": [
+        "docs",
+        "docs_archive"
+      ],
+      "before": {
+        "docs": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": [
+            [
+              "doc:a",
+              "docs:before"
+            ]
+          ]
+        },
+        "docs_archive": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": [
+            [
+              "doc:a",
+              "docs_archive:before"
+            ]
+          ]
+        },
+        "untouched": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": [
+            [
+              "doc:a",
+              "untouched:before"
+            ]
+          ]
+        }
+      },
+      "failure": {
+        "sql": "TRUNCATE docs,missing",
+        "sqlstate": "42P01",
+        "after": {
+          "docs": {
+            "columns": [
+              "_id",
+              "title"
+            ],
+            "column_oids": [
+              25,
+              25
+            ],
+            "rows": [
+              [
+                "doc:a",
+                "docs:before"
+              ]
+            ]
+          },
+          "docs_archive": {
+            "columns": [
+              "_id",
+              "title"
+            ],
+            "column_oids": [
+              25,
+              25
+            ],
+            "rows": [
+              [
+                "doc:a",
+                "docs_archive:before"
+              ]
+            ]
+          },
+          "untouched": {
+            "columns": [
+              "_id",
+              "title"
+            ],
+            "column_oids": [
+              25,
+              25
+            ],
+            "rows": [
+              [
+                "doc:a",
+                "untouched:before"
+              ]
+            ]
+          }
+        }
+      },
+      "tag": "TRUNCATE TABLE",
+      "empty": {
+        "docs": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": []
+        },
+        "docs_archive": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": []
+        },
+        "untouched": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": [
+            [
+              "doc:a",
+              "untouched:before"
+            ]
+          ]
+        }
+      },
+      "final": {
+        "docs": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": [
+            [
+              "doc:a",
+              "docs:after"
+            ]
+          ]
+        },
+        "docs_archive": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": [
+            [
+              "doc:a",
+              "docs_archive:after"
+            ]
+          ]
+        },
+        "untouched": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": [
+            [
+              "doc:a",
+              "untouched:before"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1104",
+      "sql": "TRUNCATE docs CASCADE",
+      "selected": [
+        "docs"
+      ],
+      "before": {
+        "docs": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": [
+            [
+              "doc:a",
+              "docs:before"
+            ]
+          ]
+        },
+        "docs_archive": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": [
+            [
+              "doc:a",
+              "docs_archive:before"
+            ]
+          ]
+        },
+        "untouched": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": [
+            [
+              "doc:a",
+              "untouched:before"
+            ]
+          ]
+        }
+      },
+      "failure": {
+        "sql": "TRUNCATE docs,missing",
+        "sqlstate": "42P01",
+        "after": {
+          "docs": {
+            "columns": [
+              "_id",
+              "title"
+            ],
+            "column_oids": [
+              25,
+              25
+            ],
+            "rows": [
+              [
+                "doc:a",
+                "docs:before"
+              ]
+            ]
+          },
+          "docs_archive": {
+            "columns": [
+              "_id",
+              "title"
+            ],
+            "column_oids": [
+              25,
+              25
+            ],
+            "rows": [
+              [
+                "doc:a",
+                "docs_archive:before"
+              ]
+            ]
+          },
+          "untouched": {
+            "columns": [
+              "_id",
+              "title"
+            ],
+            "column_oids": [
+              25,
+              25
+            ],
+            "rows": [
+              [
+                "doc:a",
+                "untouched:before"
+              ]
+            ]
+          }
+        }
+      },
+      "tag": "TRUNCATE TABLE",
+      "empty": {
+        "docs": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": []
+        },
+        "docs_archive": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": [
+            [
+              "doc:a",
+              "docs_archive:before"
+            ]
+          ]
+        },
+        "untouched": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": [
+            [
+              "doc:a",
+              "untouched:before"
+            ]
+          ]
+        }
+      },
+      "final": {
+        "docs": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": [
+            [
+              "doc:a",
+              "docs:after"
+            ]
+          ]
+        },
+        "docs_archive": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": [
+            [
+              "doc:a",
+              "docs_archive:before"
+            ]
+          ]
+        },
+        "untouched": {
+          "columns": [
+            "_id",
+            "title"
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "rows": [
+            [
+              "doc:a",
+              "untouched:before"
+            ]
+          ]
+        }
+      }
+    }
+  ]
+}

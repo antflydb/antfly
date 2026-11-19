@@ -1,0 +1,598 @@
+{
+  "source_commit": "79644dfa1605e8da0f486d021d1c1393577d6265",
+  "source_sha256": "52b61411fa93be84b523c109eb6f79ea9e2f8a83d4e3639a831f4b8a697892c6",
+  "entries": [
+    {
+      "id": "sql-1403",
+      "source_entry_sha256": "e456536f5c908710624c0f384174e630376de4e82d1878d30832be0c8f8c0545",
+      "namespace": "domain_1403",
+      "setup": [
+        {
+          "sql": "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, updated_at_ns numeric);",
+          "sqlstate": null
+        },
+        {
+          "sql": "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
+          "sqlstate": null
+        },
+        {
+          "sql": "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;",
+          "sqlstate": "42704"
+        }
+      ],
+      "sql": "INSERT INTO usage_records (id, email, updated_at_ns) VALUES ('u2', 'a@example.test', 10) ON CONFLICT (email) DO UPDATE SET updated_at_ns = updated_at_ns + INTERVAL '1 second' RETURNING id, updated_at_ns",
+      "sqlstate": "22P02",
+      "seed": "INSERT INTO usage_records(id,email,updated_at_ns) VALUES ('00000000-0000-4000-8000-000000000001','a@example.test',10)",
+      "read": "SELECT id,email,updated_at_ns FROM usage_records ORDER BY id",
+      "before": {
+        "columns": [
+          "id",
+          "email",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          2950,
+          25,
+          1700
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "a@example.test",
+            10
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "control": "INSERT INTO usage_records(id,email,updated_at_ns) VALUES ('00000000-0000-4000-8000-000000000002','a@example.test',11) ON CONFLICT(email) DO UPDATE SET updated_at_ns=excluded.updated_at_ns RETURNING id,email,updated_at_ns",
+      "returned": {
+        "columns": [
+          "id",
+          "email",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          2950,
+          25,
+          1700
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "a@example.test",
+            11
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "after": {
+        "columns": [
+          "id",
+          "email",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          2950,
+          25,
+          1700
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "a@example.test",
+            11
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "cold_control": "INSERT INTO usage_records(id,email,updated_at_ns) VALUES ('00000000-0000-4000-8000-000000000002','a@example.test',12) ON CONFLICT(email) DO UPDATE SET updated_at_ns=excluded.updated_at_ns RETURNING id,email,updated_at_ns",
+      "cold_returned": {
+        "columns": [
+          "id",
+          "email",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          2950,
+          25,
+          1700
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "a@example.test",
+            12
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "cold_after": {
+        "columns": [
+          "id",
+          "email",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          2950,
+          25,
+          1700
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "a@example.test",
+            12
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-1468",
+      "source_entry_sha256": "3c20818d0d05ee0f35ec8bb1194f99cb197173e7d042a01bce77e77ae9df0e5b",
+      "namespace": "domain_1468",
+      "setup": [
+        {
+          "sql": "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, updated_at_ns timestamptz);",
+          "sqlstate": null
+        },
+        {
+          "sql": "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
+          "sqlstate": null
+        },
+        {
+          "sql": "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;",
+          "sqlstate": "42704"
+        }
+      ],
+      "sql": "INSERT INTO usage_records (id, email, updated_at_ns) VALUES ('u2', 'a@example.test', 3700000000000) ON CONFLICT (email) DO UPDATE SET updated_at_ns = date_bin(INTERVAL '1 hour', excluded.updated_at_ns, 0) RETURNING updated_at_ns",
+      "sqlstate": "22P02",
+      "seed": "INSERT INTO usage_records(id,email,updated_at_ns) VALUES ('00000000-0000-4000-8000-000000000001','a@example.test',TIMESTAMPTZ '2025-01-01T00:00:00Z')",
+      "read": "SELECT id,email,updated_at_ns FROM usage_records ORDER BY id",
+      "before": {
+        "columns": [
+          "id",
+          "email",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          2950,
+          25,
+          1184
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "a@example.test",
+            "2025-01-01T00:00:00+00:00"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "control": "INSERT INTO usage_records(id,email,updated_at_ns) VALUES ('00000000-0000-4000-8000-000000000002','a@example.test',TIMESTAMPTZ '2025-01-01T01:00:00Z') ON CONFLICT(email) DO UPDATE SET updated_at_ns=excluded.updated_at_ns RETURNING id,email,updated_at_ns",
+      "returned": {
+        "columns": [
+          "id",
+          "email",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          2950,
+          25,
+          1184
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "a@example.test",
+            "2025-01-01T01:00:00+00:00"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "after": {
+        "columns": [
+          "id",
+          "email",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          2950,
+          25,
+          1184
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "a@example.test",
+            "2025-01-01T01:00:00+00:00"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "cold_control": "INSERT INTO usage_records(id,email,updated_at_ns) VALUES ('00000000-0000-4000-8000-000000000002','a@example.test',TIMESTAMPTZ '2025-01-01T02:00:00Z') ON CONFLICT(email) DO UPDATE SET updated_at_ns=excluded.updated_at_ns RETURNING id,email,updated_at_ns",
+      "cold_returned": {
+        "columns": [
+          "id",
+          "email",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          2950,
+          25,
+          1184
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "a@example.test",
+            "2025-01-01T02:00:00+00:00"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "cold_after": {
+        "columns": [
+          "id",
+          "email",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          2950,
+          25,
+          1184
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "a@example.test",
+            "2025-01-01T02:00:00+00:00"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-1469",
+      "source_entry_sha256": "57cfe53d46f5fbe108300e9d574453b8f64485e2e120df01d8eb8aab01faf180",
+      "namespace": "domain_1469",
+      "setup": [
+        {
+          "sql": "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, updated_at_ns timestamptz);",
+          "sqlstate": null
+        },
+        {
+          "sql": "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
+          "sqlstate": null
+        },
+        {
+          "sql": "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;",
+          "sqlstate": "42704"
+        }
+      ],
+      "sql": "INSERT INTO usage_records (id, email, updated_at_ns) VALUES ('u2', 'a@example.test', 3700000000000) ON CONFLICT (email) DO UPDATE SET updated_at_ns = TIMESTAMPTZ '2025-01-01T01:30:00+01:30' RETURNING updated_at_ns",
+      "sqlstate": "22P02",
+      "seed": "INSERT INTO usage_records(id,email,updated_at_ns) VALUES ('00000000-0000-4000-8000-000000000001','a@example.test',TIMESTAMPTZ '2025-01-01T00:00:00Z')",
+      "read": "SELECT id,email,updated_at_ns FROM usage_records ORDER BY id",
+      "before": {
+        "columns": [
+          "id",
+          "email",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          2950,
+          25,
+          1184
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "a@example.test",
+            "2025-01-01T00:00:00+00:00"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "control": "INSERT INTO usage_records(id,email,updated_at_ns) VALUES ('00000000-0000-4000-8000-000000000002','a@example.test',TIMESTAMPTZ '2025-01-01T01:00:00Z') ON CONFLICT(email) DO UPDATE SET updated_at_ns=excluded.updated_at_ns RETURNING id,email,updated_at_ns",
+      "returned": {
+        "columns": [
+          "id",
+          "email",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          2950,
+          25,
+          1184
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "a@example.test",
+            "2025-01-01T01:00:00+00:00"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "after": {
+        "columns": [
+          "id",
+          "email",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          2950,
+          25,
+          1184
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "a@example.test",
+            "2025-01-01T01:00:00+00:00"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "cold_control": "INSERT INTO usage_records(id,email,updated_at_ns) VALUES ('00000000-0000-4000-8000-000000000002','a@example.test',TIMESTAMPTZ '2025-01-01T02:00:00Z') ON CONFLICT(email) DO UPDATE SET updated_at_ns=excluded.updated_at_ns RETURNING id,email,updated_at_ns",
+      "cold_returned": {
+        "columns": [
+          "id",
+          "email",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          2950,
+          25,
+          1184
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "a@example.test",
+            "2025-01-01T02:00:00+00:00"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "cold_after": {
+        "columns": [
+          "id",
+          "email",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          2950,
+          25,
+          1184
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "a@example.test",
+            "2025-01-01T02:00:00+00:00"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-1476",
+      "source_entry_sha256": "965af99f4b9d8e0f6631990180254cea7a141b8e4cb37f0c099d8079a27c1172",
+      "namespace": "domain_1476",
+      "setup": [
+        {
+          "sql": "CREATE TABLE usage_records (id uuid PRIMARY KEY, request_id text);",
+          "sqlstate": null
+        }
+      ],
+      "sql": "INSERT INTO usage_records (id, request_id) VALUES ('u1', 'proposed') ON CONFLICT (id) DO UPDATE SET request_id = uuid_generate_v4() RETURNING id, request_id",
+      "sqlstate": "22P02",
+      "seed": "INSERT INTO usage_records(id,request_id) VALUES ('00000000-0000-4000-8000-000000000001','before')",
+      "read": "SELECT id,request_id FROM usage_records ORDER BY id",
+      "before": {
+        "columns": [
+          "id",
+          "request_id"
+        ],
+        "column_oids": [
+          2950,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "before"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "control": "INSERT INTO usage_records(id,request_id) VALUES ('00000000-0000-4000-8000-000000000001','proposed') ON CONFLICT(id) DO UPDATE SET request_id='control-warm' RETURNING id,request_id",
+      "returned": {
+        "columns": [
+          "id",
+          "request_id"
+        ],
+        "column_oids": [
+          2950,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "control-warm"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "after": {
+        "columns": [
+          "id",
+          "request_id"
+        ],
+        "column_oids": [
+          2950,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "control-warm"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "cold_control": "INSERT INTO usage_records(id,request_id) VALUES ('00000000-0000-4000-8000-000000000001','proposed') ON CONFLICT(id) DO UPDATE SET request_id='control-cold' RETURNING id,request_id",
+      "cold_returned": {
+        "columns": [
+          "id",
+          "request_id"
+        ],
+        "column_oids": [
+          2950,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "control-cold"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "cold_after": {
+        "columns": [
+          "id",
+          "request_id"
+        ],
+        "column_oids": [
+          2950,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-4000-8000-000000000001",
+            "control-cold"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ]
+      }
+    }
+  ]
+}

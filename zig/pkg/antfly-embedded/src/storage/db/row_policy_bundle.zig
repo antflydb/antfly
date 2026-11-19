@@ -37,6 +37,38 @@ pub const pending_key = "\x00\x00__metadata__:row_policy_pending";
 pub const max_bytes: usize = policies.max_install_snapshot_bytes;
 pub const receipt_encoded_len: usize = 112;
 
+/// One bounded index per commit, not a per-row linear search through its
+/// predicates. Nondefault requirements need a signed SQL intent capability.
+pub const MutationRequirements = struct {
+    values: std.StringHashMapUnmanaged(role_authority.MutationRequirement) = .empty,
+    sql: bool,
+
+    pub fn init(alloc: std.mem.Allocator, predicates: anytype, principal: *const role_authority.Payload) !MutationRequirements {
+        var result: MutationRequirements = .{ .sql = principal.purpose == .sql_write };
+        errdefer result.deinit(alloc);
+        for (predicates) |predicate| {
+            const requirement = predicate.row_policy_requirement;
+            if (requirement == .native) continue;
+            if (!result.sql) return error.RowPolicyAuthenticationRequired;
+            const entry = try result.values.getOrPut(alloc, predicate.key);
+            if (entry.found_existing) return error.RowPolicyAuthenticationRequired;
+            entry.value_ptr.* = requirement;
+        }
+        return result;
+    }
+    pub fn deinit(self: *MutationRequirements, alloc: std.mem.Allocator) void {
+        self.values.deinit(alloc);
+    }
+    pub fn needsSelect(self: *const MutationRequirements) bool {
+        var values = self.values.valueIterator();
+        while (values.next()) |value| if (value.requiresSelect()) return true;
+        return false;
+    }
+    pub fn forKey(self: *const MutationRequirements, key_bytes: []const u8) !role_authority.MutationRequirement {
+        return self.values.get(key_bytes) orelse if (self.sql) error.RowPolicyAuthenticationRequired else .native;
+    }
+};
+
 /// Exact owner-local durable evidence returned only after the bundle,
 /// catalog phase and Raft applied marker have committed in one transaction.
 pub const Receipt = struct {
@@ -91,14 +123,42 @@ pub const Receipt = struct {
 /// One immutable, cursor-owned evaluation state. The owner admission lease
 /// outlives it, keeping the source bundle alive while these predicate pointers
 /// are used. Row scratch is retained and reset rather than allocated per row.
+/// One genuine historical schema lease per old-image decode. The caller's
+/// pinned logical view and the AROW's physical header remain distinct.
+pub const PhysicalRow = struct {
+    retained: ?@import("schema_registry.zig").SchemaView,
+    row: @import("algebraic/relational_row_codec.zig").OrdinalRowView,
+
+    pub fn init(core: anytype, logical: @import("schema_registry.zig").SchemaView, bytes: []const u8) !PhysicalRow {
+        const codec = @import("algebraic/relational_row_codec.zig");
+        const version = try codec.rowSchemaVersion(bytes);
+        var retained: ?@import("schema_registry.zig").SchemaView = if (version == logical.version()) null else (try core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
+        errdefer if (retained) |*view| view.release();
+        const physical = retained orelse logical;
+        const row = if (core.store.valuesAreAuthenticated())
+            try codec.ordinalRowViewTrusted(bytes, physical.tableSchema().*, physical.physicalLayout())
+        else
+            try codec.ordinalRowViewSelective(bytes, physical.tableSchema().*, physical.physicalLayout());
+        return .{ .retained = retained, .row = row };
+    }
+
+    pub fn deinit(self: *PhysicalRow) void {
+        if (self.retained) |*view| view.release();
+        self.* = undefined;
+    }
+};
+
 pub const ReadEvaluation = struct {
     alloc: std.mem.Allocator,
+    identity_projection: gate.IdentityProjection,
     setting_view: setting_catalog.View,
     policy_view: policies.View,
     evaluator: policies.Evaluator,
     scratch: gate.EvaluationScratch,
+    conjunction: ?*ReadEvaluation = null,
 
     pub fn deinit(self: *@This()) void {
+        if (self.conjunction) |other| other.deinit();
         self.scratch.deinit();
         self.evaluator.deinit();
         self.policy_view.deinit();
@@ -107,7 +167,8 @@ pub const ReadEvaluation = struct {
     }
 
     pub fn permits(self: *@This(), row: @import("algebraic/relational_row_codec.zig").OrdinalRowView) !bool {
-        return self.scratch.permits(row);
+        if (!try self.scratch.permitsProjected(row, &self.identity_projection)) return false;
+        return if (self.conjunction) |other| other.permits(row) else true;
     }
 };
 
@@ -129,24 +190,11 @@ pub const Installed = struct {
         std.crypto.hash.Blake3.hash(encoded, &digest, .{});
         if (!std.mem.eql(u8, &digest, &bundle.schema_digest)) return error.RowPolicyCatalogChanged;
 
-        // The SQL binder supports exactly these logical column kinds. Reject
-        // an unsupported schema at install, not halfway through a scan.
-        const columns = try alloc.alloc(sql_catalog.Column, schema.relational_columns.len);
-        defer alloc.free(columns);
-        for (schema.relational_columns, columns) |column, *out| out.* = .{
-            .name = column.name,
-            .path = column.path,
-            .nullable = !column.required or column.allows_null,
-            .type = switch (column.column_type) {
-                .string => .string,
-                .integer => .integer,
-                .number => .number,
-                .boolean => .boolean,
-                .datetime => .datetime,
-                .json => .json,
-                else => return error.UnsupportedSqlExecution,
-            },
-        };
+        // Use the query binder's complete native domain, not a second coarse
+        // type mapping that rejects tables containing arrays/exact numerics.
+        var column_region = std.heap.ArenaAllocator.init(alloc);
+        defer column_region.deinit();
+        const columns = try sql_catalog.relationalColumnsLeaky(column_region.allocator(), schema);
         const table: sql_catalog.Table = .{ .id = table_id, .physical_name = "", .schema_version = schema.version, .columns = columns };
         const SettingOwner = struct {
             fn load(ptr: *anyopaque, arena: std.mem.Allocator, scope: settings.Scope) !settings.Snapshot {
@@ -185,6 +233,17 @@ pub const Installed = struct {
     }
 
     pub fn captureEvaluation(self: *const Installed, alloc: std.mem.Allocator, schema: schema_mod.TableSchema, principal: *const role_authority.Payload, action: policies.Evaluator.Action) !*ReadEvaluation {
+        var layout = try @import("algebraic/relational_row_codec.zig").PhysicalLayout.init(alloc, schema);
+        defer layout.deinit();
+        return self.captureEvaluationUsingLayout(alloc, schema, &layout, principal, action);
+    }
+
+    pub fn captureEvaluationAtSchemaView(self: *const Installed, alloc: std.mem.Allocator, logical: @import("schema_registry.zig").SchemaView, principal: *const role_authority.Payload, action: policies.Evaluator.Action) !*ReadEvaluation {
+        return self.captureEvaluationUsingLayout(alloc, logical.tableSchema().*, logical.physicalLayout(), principal, action);
+    }
+
+    fn captureEvaluationUsingLayout(self: *const Installed, alloc: std.mem.Allocator, schema: schema_mod.TableSchema, layout: *const @import("algebraic/relational_row_codec.zig").PhysicalLayout, principal: *const role_authority.Payload, action: policies.Evaluator.Action) !*ReadEvaluation {
+        if (principal.policy_principal != null and (principal.access != .read or action != .select)) return error.RowPolicyAuthenticationRequired;
         const bundle = self.parsed.value;
         if ((bundle.phase != .serving_install and bundle.phase != .active) or bundle.table_id != principal.table_id or
             bundle.policy_generation != principal.policy_generation or bundle.catalog_epoch != principal.catalog_epoch or
@@ -192,6 +251,8 @@ pub const Installed = struct {
         const result = try alloc.create(ReadEvaluation);
         errdefer alloc.destroy(result);
         result.alloc = alloc;
+        result.identity_projection = try gate.IdentityProjection.fromLayout(schema.version, schema.relational_columns.len, layout, bundle.schema_version, bundle.schema_digest);
+        result.conjunction = null;
         const SettingOwner = struct {
             fn load(ptr: *anyopaque, arena: std.mem.Allocator, scope: settings.Scope) !settings.Snapshot {
                 const installed: *const Installed = @ptrCast(@alignCast(ptr));
@@ -200,24 +261,12 @@ pub const Installed = struct {
                 return .{ .scope = scope, .epoch = installed.parsed.value.catalog_epoch, .definitions = definitions };
             }
         };
-        result.setting_view = try setting_catalog.View.capture(alloc, .{ .ptr = @constCast(self), .load = SettingOwner.load }, .{ .principal = principal.principal, .database = principal.database }, &.{});
+        result.setting_view = try setting_catalog.View.capture(alloc, .{ .ptr = @constCast(self), .load = SettingOwner.load }, .{ .principal = principal.setting_principal orelse principal.principal, .database = principal.database }, &.{});
         errdefer result.setting_view.deinit();
-        const columns = try alloc.alloc(sql_catalog.Column, schema.relational_columns.len);
-        defer alloc.free(columns);
-        for (schema.relational_columns, columns) |column, *out| out.* = .{
-            .name = column.name,
-            .path = column.path,
-            .nullable = !column.required or column.allows_null,
-            .type = switch (column.column_type) {
-                .string => .string,
-                .integer => .integer,
-                .number => .number,
-                .boolean => .boolean,
-                .datetime => .datetime,
-                .json => .json,
-                else => return error.UnsupportedSqlExecution,
-            },
-        };
+        try result.setting_view.pinSqlUser(principal.principal);
+        var column_region = std.heap.ArenaAllocator.init(alloc);
+        defer column_region.deinit();
+        const columns = try sql_catalog.relationalColumnsLeaky(column_region.allocator(), schema);
         const PolicyOwner = struct {
             fn load(ptr: *anyopaque, _: std.mem.Allocator, table_id: u64, principal_name: []const u8, database: []const u8) !policies.Snapshot {
                 const installed: *const Installed = @ptrCast(@alignCast(ptr));
@@ -238,15 +287,35 @@ pub const Installed = struct {
         const table: sql_catalog.Table = .{ .id = bundle.table_id, .physical_name = "", .schema_version = schema.version, .columns = columns };
         result.policy_view = try policies.View.capture(alloc, .{ .ptr = @constCast(self), .load = PolicyOwner.load }, table, bundle.schema_digest, &result.setting_view);
         errdefer result.policy_view.deinit();
-        result.evaluator = try policies.Evaluator.initForAuthenticatedRoles(alloc, &result.policy_view, &result.setting_view, action, principal.roles);
+        result.evaluator = try policies.Evaluator.initForAuthenticatedPrincipal(alloc, &result.policy_view, &result.setting_view, action, principal.policy_principal orelse principal.principal, principal.roles);
         errdefer result.evaluator.deinit();
         result.scratch = try gate.EvaluationScratch.init(alloc, &result.evaluator);
         return result;
     }
 
     pub fn captureReadEvaluation(self: *const Installed, alloc: std.mem.Allocator, schema: schema_mod.TableSchema, principal: *const role_authority.Payload) !*ReadEvaluation {
+        var layout = try @import("algebraic/relational_row_codec.zig").PhysicalLayout.init(alloc, schema);
+        defer layout.deinit();
+        return self.captureReadEvaluationUsingLayout(alloc, schema, &layout, principal);
+    }
+
+    pub fn captureReadEvaluationAtSchemaView(self: *const Installed, alloc: std.mem.Allocator, logical: @import("schema_registry.zig").SchemaView, principal: *const role_authority.Payload) !*ReadEvaluation {
+        return self.captureReadEvaluationUsingLayout(alloc, logical.tableSchema().*, logical.physicalLayout(), principal);
+    }
+
+    fn captureReadEvaluationUsingLayout(self: *const Installed, alloc: std.mem.Allocator, schema: schema_mod.TableSchema, layout: *const @import("algebraic/relational_row_codec.zig").PhysicalLayout, principal: *const role_authority.Payload) !*ReadEvaluation {
         if (principal.access != .read) return error.RowPolicyAuthenticationRequired;
-        return self.captureEvaluation(alloc, schema, principal, .select);
+        const action: policies.Evaluator.Action = switch (principal.purpose) {
+            .ordinary, .normalize_select => .select,
+            .update, .update_select => .update_old,
+            .delete, .delete_select => .delete,
+            .normalize, .integrity, .sql_write => return error.RowPolicyAuthenticationRequired,
+        };
+        const evaluation = try self.captureEvaluationUsingLayout(alloc, schema, layout, principal, action);
+        errdefer evaluation.deinit();
+        if (principal.purpose == .update_select or principal.purpose == .delete_select)
+            evaluation.conjunction = try self.captureEvaluationUsingLayout(alloc, schema, layout, principal, .select);
+        return evaluation;
     }
 };
 
@@ -311,6 +380,110 @@ test "row-policy receipt preserves exact Raft and bundle identity" {
     try std.testing.expectError(error.InvalidRowPolicyReceipt, Receipt.decode(&corrupt));
 }
 
+test "installed view policy selects owner roles but evaluates caller settings" {
+    const a = std.testing.allocator;
+    const schema: schema_mod.TableSchema = .{ .version = 2, .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "amount", .path = "amount", .column_type = .numeric, .sql_element_type = .numeric },
+        .{ .name = "tags", .path = "tags", .column_type = .sql_array, .sql_element_type = .text },
+    } };
+    const row = [_]@import("../../sql/scalar.zig").Datum{ .{}, .{} };
+    const schema_bytes = try schema_mod.serializeSchema(a, schema);
+    defer a.free(schema_bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(schema_bytes, &digest, .{});
+    const using: policies.Predicate = .{ .instructions = &.{
+        .{ .type = .{ .kind = .string }, .operation = .{ .call = .{ .function = .current_setting, .args = &.{}, .setting_identity = .{ .id = 1, .generation = 1 } } } },
+        .{ .type = .{ .kind = .string }, .operation = .{ .literal = .{ .string = "allow" } } },
+        .{ .type = .{ .kind = .boolean }, .operation = .{ .binary = .{ .op = .eq, .left = 0, .right = 1 } } },
+        .{ .type = .{ .kind = .string }, .operation = .{ .call = .{ .function = .@"$current_user", .args = &.{} } } },
+        .{ .type = .{ .kind = .string }, .operation = .{ .literal = .{ .string = "caller" } } },
+        .{ .type = .{ .kind = .boolean }, .operation = .{ .binary = .{ .op = .eq, .left = 3, .right = 4 } } },
+        .{ .type = .{ .kind = .boolean }, .operation = .{ .binary = .{ .op = .@"and", .left = 2, .right = 5 } } },
+    }, .root = 6 };
+    const bytes = try std.json.Stringify.valueAlloc(a, policies.InstallSnapshot{
+        .table_id = 7,
+        .schema_version = 2,
+        .schema_digest = digest,
+        .policy_generation = 3,
+        .catalog_epoch = 5,
+        .phase = .active,
+        .records = &.{.{
+            .id = 1,
+            .generation = 1,
+            .table_id = 7,
+            .schema_version = 2,
+            .schema_digest = digest,
+            .name = "view_owner_policy",
+            .commands = .{ .select = true },
+            .roles = &.{"owner"},
+            .using = using,
+        }},
+        .settings = &.{.{
+            .identity = .{ .id = 1, .generation = 1 },
+            .name = "app.visibility",
+            .kind = .string,
+            .policy_sensitive = true,
+            .default = .{ .string = "deny" },
+            .role_defaults = &.{
+                .{ .database = "main", .principal = "caller", .value = .{ .string = "allow" } },
+                .{ .database = "main", .principal = "api-key:allowed", .value = .{ .string = "allow" } },
+                .{ .database = "main", .principal = "api-key:denied", .value = .{ .string = "deny" } },
+            },
+        }},
+    }, .{});
+    defer a.free(bytes);
+    var installed = try Installed.init(a, bytes, 7, schema);
+    defer installed.deinit();
+    var principal: role_authority.Payload = .{
+        .principal = "caller",
+        .policy_principal = "owner",
+        .roles = &.{},
+        .auth_revision = 1,
+        .table_id = 7,
+        .table = "rows",
+        .database = "main",
+        .policy_generation = 3,
+        .catalog_epoch = 5,
+        .access = .read,
+        .expires = 100,
+    };
+    {
+        var evaluation = try installed.captureReadEvaluation(a, schema, &principal);
+        defer evaluation.deinit();
+        try std.testing.expect(try evaluation.evaluator.permits(a, &row));
+        try std.testing.expectEqualStrings("caller", evaluation.setting_view.scope.principal);
+    }
+    principal.setting_principal = "api-key:allowed";
+    {
+        var evaluation = try installed.captureReadEvaluation(a, schema, &principal);
+        defer evaluation.deinit();
+        try std.testing.expect(try evaluation.evaluator.permits(a, &row));
+        try std.testing.expectEqualStrings("api-key:allowed", evaluation.setting_view.scope.principal);
+        try std.testing.expectEqualStrings("caller", evaluation.setting_view.sql_user.?);
+    }
+    principal.setting_principal = "api-key:denied";
+    {
+        var evaluation = try installed.captureReadEvaluation(a, schema, &principal);
+        defer evaluation.deinit();
+        try std.testing.expect(!try evaluation.evaluator.permits(a, &row));
+    }
+    principal.setting_principal = null;
+    principal.policy_principal = null;
+    {
+        var evaluation = try installed.captureReadEvaluation(a, schema, &principal);
+        defer evaluation.deinit();
+        try std.testing.expect(!try evaluation.evaluator.permits(a, &row));
+    }
+    principal.policy_principal = "owner";
+    principal.principal = "owner";
+    {
+        var evaluation = try installed.captureReadEvaluation(a, schema, &principal);
+        defer evaluation.deinit();
+        try std.testing.expect(!try evaluation.evaluator.permits(a, &row));
+    }
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, installed.captureEvaluation(a, schema, &principal, .insert));
+}
+
 test "installed row policy applies USING to old images and WITH CHECK to new images" {
     const alloc = std.testing.allocator;
     const schema: schema_mod.TableSchema = .{ .version = 2, .storage_mode = .relational };
@@ -372,4 +545,67 @@ test "installed row policy applies USING to old images and WITH CHECK to new ima
         defer evaluation.deinit();
         try std.testing.expectEqual(case.permitted, try evaluation.evaluator.permits(alloc, &.{}));
     }
+}
+
+test "row-policy coupled schema identity projection preserves headers and rejects warmed same-version layout aliases" {
+    const a = std.testing.allocator;
+    const codec = @import("algebraic/relational_row_codec.zig");
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "id", .path = "id", .column_type = .string },
+        .{ .name = "n", .path = "n", .column_type = .integer },
+    };
+    const physical: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var logical = physical;
+    logical.version = 2;
+    var old_layout = try codec.PhysicalLayout.init(a, physical);
+    defer old_layout.deinit();
+    var logical_layout = try codec.PhysicalLayout.init(a, logical);
+    defer logical_layout.deinit();
+    try std.testing.expectEqualSlices(u8, &old_layout.identity_layout_digest, &logical_layout.identity_layout_digest);
+    try std.testing.expect(!std.mem.eql(u8, &old_layout.schema_digest, &logical_layout.schema_digest));
+    const bundle = try std.json.Stringify.valueAlloc(a, policies.InstallSnapshot{ .table_id = 7, .schema_version = 2, .schema_digest = logical_layout.schema_digest, .policy_generation = 2, .catalog_epoch = 3, .phase = .active, .records = &.{}, .settings = &.{} }, .{});
+    defer a.free(bundle);
+    var installed = try Installed.init(a, bundle, 7, logical);
+    defer installed.deinit();
+    const principal: role_authority.Payload = .{ .principal = "alice", .roles = &.{"PUBLIC"}, .auth_revision = 1, .table_id = 7, .table = "rows", .database = "main", .policy_generation = 2, .catalog_epoch = 3, .access = .read, .expires = 100 };
+    var evaluation = try installed.captureReadEvaluation(a, logical, &principal);
+    defer evaluation.deinit();
+    const values = [_]codec.Cell{
+        .{ .ordinal = 0, .path = "id", .value_type = .bytes_val, .value = .{ .bytes_val = "visible" } },
+        .{ .ordinal = 1, .path = "n", .value_type = .i64_val, .value = .{ .i64_val = 9 } },
+    };
+    const bytes = try codec.serializeOrdinal(a, 1, &columns, &values, @splat(0));
+    defer a.free(bytes);
+    const original = try a.dupe(u8, bytes);
+    defer a.free(original);
+    const row = try codec.ordinalRowViewTrusted(bytes, physical, &old_layout);
+    // Default deny still denies. The explicit identity proof authorizes only
+    // decoding/evaluation; it cannot turn an absent policy into row access.
+    try std.testing.expect(!try evaluation.permits(row));
+    try std.testing.expectError(error.RowPolicyCatalogChanged, evaluation.scratch.permits(row));
+    try std.testing.expectEqual(@as(u32, 1), try codec.rowSchemaVersion(bytes));
+    try std.testing.expectEqualSlices(u8, original, bytes);
+    inline for (.{ false, true }) |reorder| {
+        const changed = if (reorder)
+            [_]schema_mod.RelationalColumn{ columns[1], columns[0] }
+        else
+            [_]schema_mod.RelationalColumn{ .{ .name = "id", .path = "id", .column_type = .integer }, columns[1] };
+        var wrong = physical;
+        wrong.relational_columns = &changed;
+        var wrong_layout = try codec.PhysicalLayout.init(a, wrong);
+        defer wrong_layout.deinit();
+        const wrong_cells = if (reorder)
+            [_]codec.Cell{ .{ .ordinal = 0, .path = "n", .value_type = .i64_val, .value = .{ .i64_val = 9 } }, .{ .ordinal = 1, .path = "id", .value_type = .bytes_val, .value = .{ .bytes_val = "visible" } } }
+        else
+            [_]codec.Cell{ .{ .ordinal = 0, .path = "id", .value_type = .i64_val, .value = .{ .i64_val = 7 } }, values[1] };
+        const bad = try codec.serializeOrdinal(a, 1, &changed, &wrong_cells, @splat(0));
+        defer a.free(bad);
+        const wrong_row = try codec.ordinalRowViewTrusted(bad, wrong, &wrong_layout);
+        try std.testing.expectError(error.RowPolicyCatalogChanged, evaluation.permits(wrong_row));
+        wrong.version = 2;
+        try std.testing.expectError(error.RowPolicyCatalogChanged, installed.captureReadEvaluation(a, wrong, &principal));
+    }
+    var future = logical;
+    future.version = 3;
+    try std.testing.expectError(error.RowPolicyCatalogChanged, installed.captureReadEvaluation(a, future, &principal));
 }

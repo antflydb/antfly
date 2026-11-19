@@ -12,7 +12,8 @@ Original plan fingerprints, endpoint behavior, authorization, diagnostics and
 deliberate rejections must be distinguished. Blocking dispositions describe
 missing case-by-case evidence, not missing implementations.
 
-The SQL design is in [SQL extraction](extraction.md); regex qualification is in
+The SQL design is in [SQL extraction](extraction.md); native callable ownership
+and recovery are in [SQL routines](routines.md). Regex qualification is in
 [the regex parity design](regex-parity.md). Batch-by-batch campaign narratives,
 per-case evidence prose and component measurements are in
 [history](history/parity-inventory-batches.md).
@@ -120,10 +121,62 @@ expression-index cases run against those declared owners (with duplicate
 `23505`, named-index-alias `42704` and wrong-inference-target `42P10` probes),
 not against an unconstrained baseline.
 
-The restructuring plan excludes graph and lake SQL integration. Any corpus cases
-belonging to those integrations still need explicit scope review. Deferred cases
-continue to block this strict original-corpus gate; a publication scope exception
-must be reviewed as a change to gate policy, not hidden as a passing test.
+The historical restructuring plan excluded graph and lake SQL integration. That
+exclusion does not waive their original corpus contracts. Deferred cases continue
+to block this strict original-corpus gate; a publication scope exception must be
+reviewed as a change to gate policy, not hidden as a passing test.
+
+### Integration scope confirmed 2026-10-19
+
+The remaining-case implementation includes SQL publications and subscriptions,
+outbound publication of Antfly changes, PostgreSQL-style management of WASM
+extensions, and qualification of existing tablespace SQL behavior. These are
+implementation obligations, not completed capabilities or inventory waivers.
+
+- Subscriptions must reuse existing PostgreSQL CDC ingestion, backfill,
+  checkpoints and ordinary mutation enforcement. SQL subscription objects need
+  durable database-scoped ownership and publication membership; an upstream
+  publication created by a replication source is not an Antfly SQL publication.
+- Publications must publish committed Antfly changes through shared durable
+  mutation/replication machinery. Consistent snapshot-to-stream handoff,
+  transaction ordering, consumer acknowledgements, bounded retention and
+  owner-failover recovery require end-to-end evidence. A catalog entry or parser
+  node alone does not activate outbound logical replication.
+- Extension DDL must adapt the existing package/lifecycle catalog and WASM
+  runtime, with database-scoped installation, schema-qualified typed exports,
+  ownership, dependencies and durable recovery. PostgreSQL SQL compatibility
+  does not imply loading PostgreSQL C extensions. Compatibility-name no-ops do
+  not establish that an extension or its functions are installed.
+- Tablespaces already have shared catalog and SQL lowering. Qualify lifecycle,
+  inherited placement and the actual placement/rebalance consumer rather than
+  creating a second tablespace subsystem or claiming relocation from metadata
+  assignment alone.
+
+Each integration retains the same PostgreSQL oracle, native public execution,
+complete-postimage and recovery requirements as other cohorts. Unsupported
+responses and successful metadata-only operations do not close positive runtime
+contracts. This scope confirmation does not change the pinned corpus, its
+checksums or any case disposition.
+
+### Graph statement cuts
+
+Standalone canonical `MATCH` can reuse the existing native graph query cut and
+return typed binding keys, depth and distance directly to SQL. SQL still owns
+projection, ordering and limit; a truncated native binding set is an error,
+not a sortable SQL prefix. Table lock admission and native credential filters
+remain shared. This does not activate delegated-view or SQL-only grant/RLS graph
+reads; those require a principal bridge into graph anchor and node reads.
+
+Joined and CTE graph sources additionally require one retained graph/row cut.
+Capture the primary transaction, an index publication lifetime lease and the
+outgoing/reverse edge contexts under the same short owner fence. Attest applied
+watermarks, identity generation, graph generations and ownership fingerprints
+before returning a cursor. Extend retained-read handles with paged graph
+expansion and hydration using those captured contexts. Calling ordinary `/query`
+while holding that fence can deadlock on the read-index apply it blocks and does
+not prove a shared cut. Transactional graph reads also need range/source proofs.
+Concurrent mutation, index drop/rebuild, topology moves, cancellation and cold
+restore must exercise that common provider before mixed-source cases close.
 
 ## Commands and acceptance policy
 
@@ -271,10 +324,12 @@ from current SQL extraction is not repaired by naming this inventory check a ful
   removes its paired uniqueness rule. Unqualified PostgreSQL DROP INDEX still
   needs catalog owner resolution (see
   [namespace relation ownership](../../../zig/SYSTEM_CATALOG.md#namespace-relation-ownership)).
-- TRUNCATE (`sql-0160`–`sql-0165`, `sql-1101`) maps to the durable
-  empty-generation barrier; SQL-owned sequence counters remain outside the
-  current catalog model, and the promoted-standby and asynchronous-artifact
-  online-transfer fault matrices are not established.
+- TRUNCATE (`sql-0160`–`sql-0165`, `sql-1101`, `sql-1103`) uses the durable
+  empty-generation barrier. The document RESTART IDENTITY original has public
+  admission, completed publication, future-write and cold-owner evidence.
+  Owned sequence counters now exist; their transactional generation/reset
+  handoff remains unfinished, as do the promoted-standby and asynchronous-artifact
+  online-transfer fault matrices.
 - Prepared CTE/recursive/MERGE cases (`sql-0005`, `sql-0008`–`sql-0010`) have
   hosted single-owner evidence but stay unresolved pending multi-owner and
   distributed fault evidence.

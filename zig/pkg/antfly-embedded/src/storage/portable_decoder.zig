@@ -19,7 +19,7 @@ const engine = @import("engine_dispatch.zig").implementation;
 const portable = @import("portable_backup.zig");
 const store_mod = @import("docstore.zig");
 const cancellation_mod = @import("antfly_cancellation");
-pub const Proof = union(enum) { cohort: portable.CohortProof, source_copy: portable.SourceCopyProof };
+pub const Proof = union(enum) { repository_snapshot: portable.RepositorySnapshotProof, cohort: portable.CohortProof, source_copy: portable.SourceCopyProof };
 pub const Plan = struct {
     proof: Proof,
     artifact_size: u64,
@@ -47,6 +47,7 @@ pub fn step(alloc: std.mem.Allocator, io: std.Io, artifact: std.Io.File, plan: P
     while (pages < 16) : (pages += 1) {
         try cancellation.check();
         complete = switch (plan.proof) {
+            .repository_snapshot => |proof| try portable.importRepositorySnapshotFilePage(alloc, &store, io, artifact, plan.artifact_size, proof, plan.scope, 128, cancellation),
             .cohort => |proof| try portable.importCohortFilePage(alloc, &store, io, artifact, plan.artifact_size, proof, plan.scope, 128, cancellation),
             .source_copy => |proof| try portable.importSourceCopyFilePage(alloc, &store, io, artifact, plan.artifact_size, proof, plan.scope, 128, cancellation),
         };

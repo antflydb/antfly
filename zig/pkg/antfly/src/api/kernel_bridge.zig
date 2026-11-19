@@ -154,6 +154,22 @@ const OpaqueApiHttpServer = struct {
         try callError(self.functions.attach_replicated_restore_store(abi.abi_version, self.opaque_handle, &input));
     }
 
+    pub fn authorizeSqlLock(self: *OpaqueApiHttpServer, value: @import("sql_data_locks.zig").AuthorizationInput) !@import("antfly_local_sources").storage_pessimistic_lock_control.Command {
+        const Input = @import("sql_data_locks.zig").AuthorizationInput;
+        const Output = @import("antfly_local_sources").storage_pessimistic_lock_control.Command;
+        var result: Output = undefined;
+        try callFallible(Input, Output, self.functions.authorize_sql_lock, self.opaque_handle, &value, &result);
+        return result;
+    }
+
+    pub fn executeQueryPopulationJob(self: *OpaqueApiHttpServer, alloc: std.mem.Allocator, context: @import("antfly_local_sources").api_operation.RequestContext, request: @import("../metadata/query_population_job.zig").Request) ![]u8 {
+        const Input = @import("../metadata/query_population_job.zig").Input;
+        const value: Input = .{ .alloc = alloc, .context = context, .request = request };
+        var result: []u8 = undefined;
+        try callFallible(Input, []u8, self.functions.query_population_job, self.opaque_handle, &value, &result);
+        return result;
+    }
+
     pub fn resumeRestoreJobsOnce(self: *OpaqueApiHttpServer) !void {
         try callFallible(void, void, self.functions.resume_restore_jobs, self.opaque_handle, null, null);
     }
@@ -165,6 +181,10 @@ const OpaqueApiHttpServer = struct {
     pub fn prepareRestoreLeadership(self: *OpaqueApiHttpServer, term: u64) !void {
         var input = term;
         try callFallible(u64, void, self.functions.prepare_restore_leadership, self.opaque_handle, &input, null);
+    }
+
+    pub fn drainSqlConnections(self: *OpaqueApiHttpServer, deadline: @import("../common/runtime_lifecycle.zig").ShutdownDeadline) !void {
+        try callFallible(@import("../common/runtime_lifecycle.zig").ShutdownDeadline, void, self.functions.drain_sql_connections, self.opaque_handle, &deadline, null);
     }
 
     pub fn scheduleSessionMaintenance(self: *OpaqueApiHttpServer) !void {
@@ -282,9 +302,9 @@ fn callFallible(
     try callError(function(&.{
         .abi_version = abi.abi_version,
         .handle = handle,
-        .input = input,
+        .input = if (input) |value| @ptrCast(value) else null,
         .input_contract = .of(Input),
-        .output = output,
+        .output = if (output) |value| @ptrCast(value) else null,
         .output_contract = .of(Output),
     }));
 }

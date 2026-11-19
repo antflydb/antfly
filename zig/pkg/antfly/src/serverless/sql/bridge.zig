@@ -70,7 +70,10 @@ pub const Bridge = struct {
             left_keys[index] = std.math.cast(u16, left_key.directOutputColumn() orelse return null) orelse return null;
             right_keys[index] = std.math.cast(u16, right_key.directOutputColumn() orelse return null) orelse return null;
         }
-        const condition: ?expression.Program = if (join.condition) |program| try expression.Program.fromBound(scratch, &program, parameters) else null;
+        const condition: ?expression.Program = if (join.condition) |program| expression.Program.fromBound(scratch, &program, parameters) catch |err| switch (err) {
+            error.SqlDistributedJoinUnsupported => return null,
+            else => return err,
+        } else null;
         if (condition) |value| value.validate(join.left.columns.len + join.right.columns.len) catch return null;
         const left_filter = conditions(scratch, scans[left.index], left.source_columns) catch |err| switch (err) {
             error.SqlDistributedJoinUnsupported => return null,
@@ -158,7 +161,12 @@ pub const Bridge = struct {
                 try instructions.append(a, .{ .type = boolean, .operation = .{ .unary = .{ .op = if (condition.op == .is_null) .is_null else .is_not_null, .operand = before } } });
             } else {
                 const value = condition.datum();
-                if (value.numeric != null or value.array != null or value.patterns != null) return error.SqlDistributedJoinUnsupported;
+                // This fragment carries plain JSON literals only. Tagged
+                // extension payloads (including lazy pattern sets) must stay
+                // on the local typed evaluator; their JSON placeholder is not
+                // the operand. Preserve SQL NULL versus logical JSON null too.
+                if (value.numeric != null or value.array != null or value.extension_kind != .none or value.extension != null or
+                    value.missing or value.sql_null != (value.value == .null)) return error.SqlDistributedJoinUnsupported;
                 try instructions.append(a, .{ .type = type_, .operation = .{ .literal = value.value } });
                 try instructions.append(a, .{ .type = boolean, .operation = .{ .binary = .{ .op = std.meta.stringToEnum(local.sql_ast.Scalar.Binary, @tagName(condition.op)) orelse return error.SqlDistributedJoinUnsupported, .left = before, .right = before + 1 } } });
             }
@@ -519,4 +527,58 @@ test "distributed SQL result bridge forwards wide JSON with bounded pull allocat
     for (peak_bytes[0], peak_bytes[1]) |legacy, typed| try std.testing.expect(typed < legacy);
     try std.testing.expect(pull_bytes[0] > 8 * 1024 * 1024);
     try std.testing.expect(pull_bytes[1] < 16 * 1024);
+}
+
+test "distributed SQL scan conditions preserve plain literals and refuse typed or lazy payload loss" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "rows", .schema_version = 1, .columns = &.{.{ .name = "v", .path = "v", .type = .integer }} };
+    var condition: catalog.Condition = .{ .column = "v", .op = .eq, .value = .{ .integer = 7 } };
+    var scan: catalog.StatementScan = .{ .table = table, .request = .{ .fields = &.{"v"}, .limit = 128, .conditions = &.{condition} } };
+    const ordinary = (try Bridge.conditions(a, scan, &.{"v"})).?;
+    try ordinary.validate(1);
+    try std.testing.expect(try ordinary.matches(a, &.{scalar.Datum.fromJson(.{ .integer = 7 })}));
+    try std.testing.expect(!try ordinary.matches(a, &.{scalar.Datum.fromJson(.{ .integer = 8 })}));
+    condition.value = .null;
+    scan.request.conditions = &.{condition};
+    const null_equality = (try Bridge.conditions(a, scan, &.{"v"})).?;
+    try std.testing.expect(!try null_equality.matches(a, &.{.{}}));
+    condition.op = .is_null;
+    scan.request.conditions = &.{condition};
+    const null_test = (try Bridge.conditions(a, scan, &.{"v"})).?;
+    try std.testing.expect(try null_test.matches(a, &.{.{}}));
+    try std.testing.expect(!try null_test.matches(a, &.{scalar.Datum.fromJson(.{ .integer = 7 })}));
+
+    var numeric: local.sql_numeric_value.Context = .{ .alloc = a };
+    const number = try local.sql_numeric_value.parse(&numeric, "9007199254740993.1200");
+    const array = try local.sql_array_value.Value.init(.int64, &.{.{ .length = 1, .lower = 1 }}, &.{scalar.Datum.fromJson(.{ .integer = 7 })}, .{});
+    const PatternProbe = struct {
+        fn next(raw: *anyopaque, _: A, _: *u64) !?scalar.Datum {
+            const calls: *usize = @ptrCast(@alignCast(raw));
+            calls.* += 1;
+            return error.TestUnexpectedPatternDemand;
+        }
+        fn close(raw: *anyopaque) void {
+            const calls: *usize = @ptrCast(@alignCast(raw));
+            calls.* += 1;
+        }
+    };
+    var pattern_calls: usize = 0;
+    var patterns: scalar.PatternSet = .{ .ptr = &pattern_calls, .count = 1, .next = PatternProbe.next, .close = PatternProbe.close };
+    for ([_]scalar.Datum{
+        scalar.Datum.typedNumeric(&number.value),
+        scalar.Datum.typedArray(&array),
+        scalar.Datum.fromParts(.{ .string = "pattern" }, false, &patterns),
+        scalar.Datum.voidValue(),
+        scalar.Datum.json(.null),
+        .{ .value = .{ .integer = 7 }, .sql_null = false, .missing = true },
+    }) |operand| {
+        condition = .{ .column = "v", .op = .eq, .operand = operand };
+        scan.request.conditions = &.{condition};
+        try std.testing.expectError(error.SqlDistributedJoinUnsupported, Bridge.conditions(a, scan, &.{"v"}));
+    }
+    try std.testing.expectEqual(@as(usize, 0), pattern_calls);
+    scan.request.conditions = &.{};
+    try std.testing.expect((try Bridge.conditions(a, scan, &.{"v"})) == null);
 }

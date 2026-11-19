@@ -87,7 +87,9 @@ pub const Session = struct {
         const before = self.entries.items.len;
         errdefer self.entries.items.len = before;
         const a = self.arena.allocator();
+        var domain_owner: ?*@import("../schema/domain_handoff.zig").Contract = null;
         for (mutations) |mutation| {
+            if (mutation.domain_admission != null and mutation.prepared_domain == null) return error.UnsupportedSqlExecution;
             // Reclaim the serialization builder's excess capacity, retaining
             // only the exact postimage shared by the overlay and commit path.
             const bytes = if (mutation.row) |row| try std.json.Stringify.valueAlloc(self.budget.allocator(), row, .{}) else "";
@@ -95,6 +97,17 @@ pub const Session = struct {
             self.bytes +|= bytes.len +| mutation.key.len +| 256;
             if (self.bytes > sql.runtime.resource_limits.default_memory_bytes or self.entries.items.len >= 4096) return error.SqlProgramLimitExceeded;
             var copy = mutation;
+            copy.domain_admission = null;
+            if (mutation.prepared_domain) |prepared| {
+                try prepared.validate();
+                if (domain_owner) |prior| {
+                    if (!prior.eql(prepared.*)) return error.CatalogGenerationChanged;
+                } else {
+                    domain_owner = try a.create(@import("../schema/domain_handoff.zig").Contract);
+                    domain_owner.?.* = prepared.*;
+                }
+                copy.prepared_domain = domain_owner;
+            }
             copy.key = try a.dupe(u8, mutation.key);
             const encoded = if (mutation.row != null) try a.dupe(u8, bytes) else null;
             copy.row = null;
@@ -141,6 +154,11 @@ pub const Session = struct {
                 };
                 if (original) |bytes| if (std.mem.eql(u8, bytes, write.value)) continue;
                 var mutation: catalog.Mutation = .{ .expected_version = 0, .key = try owned.dupe(u8, write.key), .row = null };
+                if (write.prepared_domain) |domain_descriptor| {
+                    const pointer = try owned.create(@import("../schema/domain_handoff.zig").Contract);
+                    pointer.* = domain_descriptor.*;
+                    mutation.prepared_domain = pointer;
+                }
                 mutation.json_null_fields = try owned.alloc([]const u8, write.json_null_fields.len);
                 for (write.json_null_fields, @constCast(mutation.json_null_fields)) |field, *out| out.* = try owned.dupe(u8, field);
                 for (request.predicates) |predicate| if (std.mem.eql(u8, predicate.key, write.key)) {
@@ -224,7 +242,7 @@ pub const Session = struct {
             if (entry.encoded_row != null or m.row != null) {
                 const json = if (entry.encoded_row) |bytes| try a.dupe(u8, bytes) else try std.json.Stringify.valueAlloc(a, m.row.?, .{});
                 errdefer a.free(json);
-                try group.writes.append(a, .{ .key = m.key, .value = json, .json_null_fields = m.json_null_fields });
+                try group.writes.append(a, .{ .key = m.key, .value = json, .json_null_fields = m.json_null_fields, .prepared_domain = m.prepared_domain });
             } else try group.deletes.append(a, m.key);
         }
         const requests = try a.alloc(d.api_distributed_txn_contract.TableCommitRequest, groups.items.len);

@@ -24,6 +24,7 @@ const codecs = @import("antfly_local_sources").storage_db_replication_effects;
 const Allocator = std.mem.Allocator;
 const change_journal = @import("antfly_local_sources").storage_db_derived_change_journal;
 pub const primary_effect = codecs.primary_effect;
+pub const schema_owner_control = codecs.schema_owner_control;
 const db_types = @import("antfly_local_sources").storage_db_types;
 const primary_mod = @import("primary.zig");
 const replication_record = @import("antfly_local_sources").storage_db_replication_record;
@@ -134,9 +135,17 @@ pub fn appendEncodedSchemaMetadataMutation(
     payload: []const u8,
     options: AppendMetadataMutationOptions,
 ) !u64 {
+    const owner_control = codecs.schema_owner_control;
+    const binary_control = payload.len >= 4 and std.mem.eql(u8, payload[0..4], "ASVC");
+    if (binary_control) {
+        const frame = try owner_control.Frame.decode(payload);
+        if ((options.table_id orelse primary.identity.table_id) != frame.position.namespace.table_id or
+            (options.shard_id orelse primary.identity.shard_id) != frame.position.namespace.shard_id)
+            return error.IdentityNamespaceMismatch;
+    }
     return try primary.append(.{
         .kind = .metadata_mutation,
-        .payload_codec = .json,
+        .payload_codec = if (binary_control) .binary else .json,
         .shard_id = options.shard_id,
         .table_id = options.table_id,
         .commit_timestamp_ns = options.commit_timestamp_ns,

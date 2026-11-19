@@ -18,6 +18,7 @@ const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const schema_mod = @import("antfly_local_sources").schema_mod;
 
 pub const wasmtime_runtime = @import("wasmtime_runtime.zig");
+pub const sql_package = @import("sql_package.zig");
 
 pub const manifest_api_version_v1 = "extensions/v1";
 pub const package_manifest_filename = "extension.json";
@@ -267,6 +268,8 @@ pub const PackageManifest = struct {
     dependencies: []const PackageDependency = &.{},
     artifacts: []const PackageArtifact = &.{},
     install: InstallManifest,
+    /// Optional SQL control metadata, backed by typed WASM exports.
+    sql: ?sql_package.Control = null,
     updates: []const UpdateManifestRef = &.{},
 
     pub fn validate(self: PackageManifest) !void {
@@ -280,6 +283,21 @@ pub const PackageManifest = struct {
         for (self.artifacts) |artifact| try artifact.validate();
         try self.install.validate();
         for (self.updates) |update| try update.validate();
+        if (self.sql) |control| try control.validate(self);
+    }
+
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "sql") and self.sql == null;
+    }
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (!self.nativeJsonSkipField(field)) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
     }
 
     pub fn deinitOwned(self: *PackageManifest, alloc: std.mem.Allocator) void {
@@ -327,6 +345,57 @@ pub fn scanPackageStoreAlloc(alloc: std.mem.Allocator, io: std.Io, root_path: []
     }
 
     return try out.toOwnedSlice(alloc);
+}
+
+pub const max_sql_control_file_bytes = 1024 * 1024;
+
+/// Explicit operator requests live beside, never inside, the immutable store.
+/// Startup replay retains the old outcome; package artifacts are not commands.
+pub fn scanSqlControlPromotionsAlloc(alloc: std.mem.Allocator, io: std.Io, root_path: []const u8) ![]sql_package.Promotion {
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(cwd);
+    const normalized = try std.fs.path.resolveAlloc(alloc, &.{ cwd, root_path });
+    defer alloc.free(normalized);
+    const path = try std.fmt.allocPrint(alloc, "{s}.sql-controls.json", .{normalized});
+    defer alloc.free(path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_sql_control_file_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return &.{},
+        error.StreamTooLong => return error.SqlProgramLimitExceeded,
+        else => return err,
+    };
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice([]const sql_package.Promotion, alloc, bytes, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    if (parsed.value.len > sql_package.max_versions) return error.SqlProgramLimitExceeded;
+    const requests = try alloc.alloc(sql_package.Promotion, parsed.value.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (requests[0..initialized]) |request| {
+            alloc.free(request.name);
+            alloc.free(request.version);
+        }
+        alloc.free(requests);
+    }
+    for (parsed.value, 0..) |request, i| {
+        try request.validate();
+        for (parsed.value[0..i]) |prior| if (std.mem.eql(u8, prior.name, request.name)) return error.DuplicateSqlExtensionControl;
+        const name = try alloc.dupe(u8, request.name);
+        errdefer alloc.free(name);
+        const version = try alloc.dupe(u8, request.version);
+        errdefer alloc.free(version);
+        requests[i] = request;
+        requests[i].name = name;
+        requests[i].version = version;
+        initialized += 1;
+    }
+    return requests;
+}
+pub fn freeSqlControlPromotions(alloc: std.mem.Allocator, requests: []sql_package.Promotion) void {
+    for (requests) |request| {
+        alloc.free(request.name);
+        alloc.free(request.version);
+    }
+    if (requests.len > 0) alloc.free(requests);
 }
 
 pub fn freePackageStoreEntries(alloc: std.mem.Allocator, entries: []PackageStoreEntry) void {
@@ -523,6 +592,7 @@ pub fn extensionDependenciesEqual(lhs: ExtensionDependency, rhs: ExtensionDepend
 pub const ExtensionCatalog = struct {
     alloc: std.mem.Allocator,
     packages: std.ArrayListUnmanaged(PackageManifest) = .empty,
+    sql_controls: std.ArrayListUnmanaged(sql_package.PackageControl) = .empty,
     installed: std.ArrayListUnmanaged(InstalledExtension) = .empty,
     members: std.ArrayListUnmanaged(ExtensionMember) = .empty,
     data_shapes_by_table: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
@@ -565,6 +635,8 @@ pub const ExtensionCatalog = struct {
         self.data_shapes_by_table.deinit(self.alloc);
         for (self.packages.items) |package| freePackageManifest(self.alloc, package);
         self.packages.deinit(self.alloc);
+        for (self.sql_controls.items) |*control| control.deinitOwned(self.alloc);
+        self.sql_controls.deinit(self.alloc);
         for (self.installed.items) |extension| freeInstalledExtension(self.alloc, extension);
         self.installed.deinit(self.alloc);
         for (self.members.items) |member| freeExtensionMember(self.alloc, member);
@@ -576,14 +648,99 @@ pub const ExtensionCatalog = struct {
 
     pub fn registerPackage(self: *ExtensionCatalog, package: PackageManifest) !void {
         try package.validate();
-        const owned = try clonePackageManifest(self.alloc, package);
-        errdefer freePackageManifest(self.alloc, owned);
         if (self.findPackageIndex(package.name, package.version)) |idx| {
-            freePackageManifest(self.alloc, self.packages.items[idx]);
+            const prior = self.packages.items[idx];
+            if (prior.sql != null or package.sql != null) {
+                const before = try std.json.Stringify.valueAlloc(self.alloc, prior, .{});
+                defer self.alloc.free(before);
+                const after = try std.json.Stringify.valueAlloc(self.alloc, package, .{});
+                defer self.alloc.free(after);
+                if (prior.sql == null or package.sql == null or !std.mem.eql(u8, before, after)) return error.InvalidSqlExtensionPackageMutation;
+                return;
+            }
+            const owned = try clonePackageManifest(self.alloc, package);
+            freePackageManifest(self.alloc, prior);
             self.packages.items[idx] = owned;
             return;
         }
-        try self.packages.append(self.alloc, owned);
+        if (package.sql != null) for (self.packages.items) |prior| {
+            if (prior.sql == null or !std.mem.eql(u8, prior.name, package.name)) continue;
+            const left = prior.sql.?.schema;
+            const right = package.sql.?.schema;
+            const schema_equal = if (left != null and right != null) std.mem.eql(u8, left.?, right.?) else left == null and right == null;
+            if (!schema_equal or prior.trusted != package.trusted or prior.relocatable != package.relocatable) return error.InconsistentSqlExtensionControl;
+        };
+        const owned = try clonePackageManifest(self.alloc, package);
+        errdefer freePackageManifest(self.alloc, owned);
+        try self.packages.ensureUnusedCapacity(self.alloc, 1);
+        if (package.sql) |intent| {
+            var current: ?usize = null;
+            for (self.sql_controls.items, 0..) |control, i| if (std.mem.eql(u8, control.name, package.name)) {
+                current = i;
+                break;
+            };
+            var control: sql_package.PackageControl = if (current) |idx| self.sql_controls.items[idx] else .{ .name = package.name, .identity = sql_package.controlIdentity(package.name), .generation = 1, .default_version = intent.default_version };
+            if (control.default_digest == null and std.mem.eql(u8, control.default_version, package.version)) {
+                control.default_digest = try sql_package.digest(package.digest);
+                if (current != null) control.generation = std.math.add(u64, control.generation, 1) catch return error.SqlProgramLimitExceeded;
+            }
+            // No lexical ordering and no later version's default declaration
+            // can override a published package-level control.
+            const next = try control.cloneOwned(self.alloc);
+            errdefer {
+                var temp = next;
+                temp.deinitOwned(self.alloc);
+            }
+            try self.sql_controls.ensureUnusedCapacity(self.alloc, if (current == null) 1 else 0);
+            if (current) |idx| {
+                self.sql_controls.items[idx].deinitOwned(self.alloc);
+                self.sql_controls.items[idx] = next;
+            } else self.sql_controls.appendAssumeCapacity(next);
+        }
+        self.packages.appendAssumeCapacity(owned);
+    }
+    pub fn listSqlControls(self: *ExtensionCatalog, a: std.mem.Allocator) ![]sql_package.PackageControl {
+        const result = try a.alloc(sql_package.PackageControl, self.sql_controls.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |*control| control.deinitOwned(a);
+            a.free(result);
+        }
+        for (self.sql_controls.items, 0..) |control, i| {
+            result[i] = try control.cloneOwned(a);
+            initialized += 1;
+        }
+        return result;
+    }
+    pub fn freeSqlControls(_: *ExtensionCatalog, a: std.mem.Allocator, controls: []sql_package.PackageControl) void {
+        for (controls) |*control| control.deinitOwned(a);
+        if (controls.len > 0) a.free(controls);
+    }
+    pub fn loadSqlControls(self: *ExtensionCatalog, controls: []const sql_package.PackageControl) !void {
+        try (sql_package.Registry{ .packages = self.packages.items, .controls = controls }).validateControls();
+        var next: std.ArrayListUnmanaged(sql_package.PackageControl) = .empty;
+        errdefer {
+            for (next.items) |*control| control.deinitOwned(self.alloc);
+            next.deinit(self.alloc);
+        }
+        try next.ensureTotalCapacity(self.alloc, controls.len);
+        for (controls) |control| next.appendAssumeCapacity(try control.cloneOwned(self.alloc));
+        for (self.sql_controls.items) |*control| control.deinitOwned(self.alloc);
+        self.sql_controls.deinit(self.alloc);
+        self.sql_controls = next;
+    }
+    pub fn promoteSqlDefault(self: *ExtensionCatalog, request: sql_package.Promotion) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const registry: sql_package.Registry = .{ .packages = self.packages.items, .controls = self.sql_controls.items };
+        for (self.sql_controls.items, 0..) |current, i| if (std.mem.eql(u8, current.name, request.name)) {
+            const next = (try sql_package.promoteControl(arena.allocator(), registry, current, request)) orelse return;
+            const owned = try next.cloneOwned(self.alloc);
+            self.sql_controls.items[i].deinitOwned(self.alloc);
+            self.sql_controls.items[i] = owned;
+            return;
+        };
+        return error.SqlExtensionUnavailable;
     }
 
     pub fn upsertInstalled(self: *ExtensionCatalog, extension: InstalledExtension) !void {
@@ -1395,6 +1552,8 @@ fn clonePackageManifest(alloc: std.mem.Allocator, package: PackageManifest) !Pac
     errdefer freePackageArtifacts(alloc, artifacts);
     const install = try cloneInstallManifest(alloc, package.install);
     errdefer freeInstallManifest(alloc, install);
+    const sql = if (package.sql) |control| try control.clone(alloc) else null;
+    errdefer if (sql) |control| control.deinitOwned(alloc);
     const updates = try cloneUpdateManifestRefs(alloc, package.updates);
     errdefer freeUpdateManifestRefs(alloc, updates);
     return .{
@@ -1413,6 +1572,7 @@ fn clonePackageManifest(alloc: std.mem.Allocator, package: PackageManifest) !Pac
         .artifacts = artifacts,
         .install = install,
         .updates = updates,
+        .sql = sql,
     };
 }
 
@@ -1429,6 +1589,7 @@ fn freePackageManifest(alloc: std.mem.Allocator, package: PackageManifest) void 
     freePackageArtifacts(alloc, package.artifacts);
     freeInstallManifest(alloc, package.install);
     freeUpdateManifestRefs(alloc, package.updates);
+    if (package.sql) |control| control.deinitOwned(alloc);
 }
 
 fn clonePackageDependencies(alloc: std.mem.Allocator, dependencies: []const PackageDependency) ![]PackageDependency {
@@ -2489,4 +2650,77 @@ test "extension lifecycle bound members retain public scope without accepting pa
         .object_name = "search",
         .table_name = "other",
     }).validate());
+}
+
+test "SQL extension operator controls remain outside immutable package artifacts" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const store = try std.fs.path.join(a, &.{ root, "extensions" });
+    defer a.free(store);
+    try tmp.dir.createDirPath(io, "extensions/opaque");
+    const manifest: PackageManifest = .{ .name = "opaque", .version = "1", .digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111", .install = .{ .scopes_supported = &.{.cluster} }, .artifacts = &.{.{ .kind = .asset, .path = "sql-control.json" }} };
+    try manifest.validate();
+    const manifest_bytes = try std.json.Stringify.valueAlloc(a, manifest, .{});
+    defer a.free(manifest_bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "extensions/opaque/extension.json", .data = manifest_bytes });
+    const ordinary_asset = "ordinary non-JSON package artifact, never operator intent";
+    try tmp.dir.writeFile(io, .{ .sub_path = "extensions/opaque/sql-control.json", .data = ordinary_asset });
+    const absent = try scanSqlControlPromotionsAlloc(a, io, store);
+    defer freeSqlControlPromotions(a, absent);
+    try std.testing.expectEqual(@as(usize, 0), absent.len);
+    const before = try scanPackageStoreAlloc(a, io, store);
+    defer freePackageStoreEntries(a, before);
+    try std.testing.expectEqual(@as(usize, 1), before.len);
+    const request: sql_package.Promotion = .{ .name = "vector", .identity = sql_package.controlIdentity("vector"), .expected_generation = 1, .version = "2", .package_digest = @splat(1), .nonce = @splat(2) };
+    const bytes = try std.json.Stringify.valueAlloc(a, [_]sql_package.Promotion{request}, .{});
+    defer a.free(bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "extensions.sql-controls.json", .data = bytes });
+    const dotted = try std.fmt.allocPrint(a, "{s}/./", .{store});
+    defer a.free(dotted);
+    const loaded = try scanSqlControlPromotionsAlloc(a, io, dotted);
+    defer freeSqlControlPromotions(a, loaded);
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualDeep(request, loaded[0]);
+    const after = try scanPackageStoreAlloc(a, io, store);
+    defer freePackageStoreEntries(a, after);
+    try std.testing.expectEqual(@as(usize, 1), after.len);
+    try std.testing.expectEqualStrings(before[0].manifest.name, after[0].manifest.name);
+    try std.testing.expectEqualStrings(before[0].manifest.artifacts[0].path, after[0].manifest.artifacts[0].path);
+    const untouched = try tmp.dir.readFileAlloc(io, "extensions/opaque/sql-control.json", a, .limited(1024));
+    defer a.free(untouched);
+    try std.testing.expectEqualStrings(ordinary_asset, untouched);
+    var package_dir = try tmp.dir.openDir(io, "extensions", .{ .iterate = true });
+    defer package_dir.close(io);
+    var walker = try package_dir.walk(a);
+    defer walker.deinit();
+    var files: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind == .directory) continue;
+        try std.testing.expect(entry.kind == .file);
+        try std.testing.expect(std.mem.eql(u8, entry.path, "opaque/extension.json") or std.mem.eql(u8, entry.path, "opaque/sql-control.json"));
+        files += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), files);
+    const duplicate = try std.json.Stringify.valueAlloc(a, [_]sql_package.Promotion{ request, request }, .{});
+    defer a.free(duplicate);
+    try tmp.dir.writeFile(io, .{ .sub_path = "extensions.sql-controls.json", .data = duplicate });
+    try std.testing.expectError(error.DuplicateSqlExtensionControl, scanSqlControlPromotionsAlloc(a, io, store));
+    const too_many: [sql_package.max_versions + 1]sql_package.Promotion = @splat(request);
+    const count_bytes = try std.json.Stringify.valueAlloc(a, too_many, .{});
+    defer a.free(count_bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "extensions.sql-controls.json", .data = count_bytes });
+    try std.testing.expectError(error.SqlProgramLimitExceeded, scanSqlControlPromotionsAlloc(a, io, store));
+    const oversized = try a.alloc(u8, max_sql_control_file_bytes + 1);
+    defer a.free(oversized);
+    @memset(oversized, ' ');
+    try tmp.dir.writeFile(io, .{ .sub_path = "extensions.sql-controls.json", .data = oversized });
+    try std.testing.expectError(error.SqlProgramLimitExceeded, scanSqlControlPromotionsAlloc(a, io, store));
+    try tmp.dir.writeFile(io, .{ .sub_path = "extensions.sql-controls.json", .data = "[]" });
+    const empty = try scanSqlControlPromotionsAlloc(a, io, store);
+    defer freeSqlControlPromotions(a, empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }

@@ -1,0 +1,230 @@
+{
+  "postgres_version": "18.6 (Homebrew)",
+  "source_commit": "79644dfa1605e8da0f486d021d1c1393577d6265",
+  "function_setup": "Explicit ordinary PL/pgSQL declaration, not source-corpus native update-policy fallback",
+  "cases": {
+    "sql-0751": {
+      "sql": "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');",
+      "statement_level": true,
+      "trigger_present": true,
+      "trigger_arguments": 1,
+      "replacement_kept_identity": false,
+      "notices": [
+        "trigger fired"
+      ],
+      "rows": [
+        [
+          11
+        ],
+        [
+          12
+        ]
+      ]
+    },
+    "sql-0752": {
+      "sql": "CREATE OR REPLACE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');",
+      "statement_level": true,
+      "trigger_present": true,
+      "trigger_arguments": 1,
+      "replacement_kept_identity": true,
+      "notices": [
+        "trigger fired"
+      ],
+      "rows": [
+        [
+          21
+        ],
+        [
+          22
+        ]
+      ]
+    },
+    "sql-0753": {
+      "sql": "DROP TRIGGER IF EXISTS update_timestamp ON usage_records;",
+      "statement_level": false,
+      "trigger_present": false,
+      "trigger_arguments": null,
+      "replacement_kept_identity": false,
+      "notices": [],
+      "rows": [
+        [
+          31
+        ],
+        [
+          32
+        ]
+      ]
+    }
+  },
+  "statement_when": {
+    "true": {
+      "accepted": true
+    },
+    "false": {
+      "accepted": true
+    },
+    "TG_OP = 'INSERT'": {
+      "accepted": false,
+      "sqlstate": "42703",
+      "message": "column \"tg_op\" does not exist"
+    },
+    "NEW.updated_at_ns > 0": {
+      "accepted": false,
+      "sqlstate": "42P17",
+      "message": "statement trigger's WHEN condition cannot reference column values"
+    }
+  },
+  "statement_scope": {
+    "same_event_ctes": {
+      "sql": "WITH x AS (UPDATE trigger_scope_rows SET n=n+1 WHERE id=1 RETURNING *) UPDATE trigger_scope_rows SET n=n+1 WHERE id=2",
+      "notices": [
+        "BEFORE UPDATE",
+        "AFTER UPDATE"
+      ],
+      "rows": [
+        [
+          1,
+          2,
+          1
+        ],
+        [
+          2,
+          3,
+          2
+        ]
+      ]
+    },
+    "zero_row_ctes": {
+      "sql": "WITH x AS (UPDATE trigger_scope_rows SET n=n+1 WHERE id=99 RETURNING *) UPDATE trigger_scope_rows SET n=n+1 WHERE id=98",
+      "notices": [
+        "BEFORE UPDATE",
+        "AFTER UPDATE"
+      ],
+      "rows": [
+        [
+          1,
+          2,
+          1
+        ],
+        [
+          2,
+          3,
+          2
+        ]
+      ]
+    },
+    "mixed_events": {
+      "sql": "WITH x AS (UPDATE trigger_scope_rows SET n=n+1 WHERE id=1 RETURNING *) INSERT INTO trigger_scope_rows VALUES (3,3,3)",
+      "notices": [
+        "BEFORE INSERT",
+        "BEFORE UPDATE",
+        "AFTER INSERT",
+        "AFTER UPDATE"
+      ],
+      "rows": [
+        [
+          1,
+          3,
+          1
+        ],
+        [
+          2,
+          3,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ]
+      ]
+    },
+    "dependent_events": {
+      "sql": "WITH x AS (UPDATE trigger_scope_rows SET n=n+1 WHERE id=1 RETURNING n) INSERT INTO trigger_scope_rows SELECT 4,n,4 FROM x",
+      "notices": [
+        "BEFORE INSERT",
+        "BEFORE UPDATE",
+        "AFTER UPDATE",
+        "AFTER INSERT"
+      ],
+      "rows": [
+        [
+          1,
+          4,
+          1
+        ],
+        [
+          2,
+          3,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          4,
+          4,
+          4
+        ]
+      ]
+    },
+    "update_of_last_only": {
+      "sql": "WITH x AS (UPDATE trigger_scope_rows SET n=n+1 WHERE id=1 RETURNING *) UPDATE trigger_scope_rows SET m=m+1 WHERE id=2",
+      "notices": [
+        "AFTER UPDATE"
+      ],
+      "rows": [
+        [
+          1,
+          5,
+          1
+        ],
+        [
+          2,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          4,
+          4,
+          4
+        ]
+      ]
+    },
+    "update_of_first_only": {
+      "sql": "WITH x AS (UPDATE trigger_scope_rows SET m=m+1 WHERE id=1 RETURNING *) UPDATE trigger_scope_rows SET n=n+1 WHERE id=2",
+      "notices": [
+        "BEFORE UPDATE"
+      ],
+      "rows": [
+        [
+          1,
+          5,
+          2
+        ],
+        [
+          2,
+          4,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          4,
+          4,
+          4
+        ]
+      ]
+    }
+  }
+}

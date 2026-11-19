@@ -257,11 +257,12 @@ pub const ReplicationSourceActionHint = struct {
     reseed_exact_cutover_path: []u8,
 };
 
-/// Internal admission result. A successful response means the current
-/// metadata membership has durably activated the store-root UUID decoder.
-pub const StoreRootReadiness = struct {
+/// Internal admission result for an exact durable metadata decoder activation.
+/// The requesting route defines the required decoder profile.
+pub const StoreDecoderReadiness = struct {
     activated_version: u16,
 };
+pub const StoreRootReadiness = StoreDecoderReadiness;
 
 pub const AdminSnapshot = struct {
     /// Compact observational peer view. Never substitutes for a catalog view.
@@ -282,6 +283,7 @@ pub const AdminSnapshot = struct {
     replication_source_statuses: []table_manager.ReplicationSourceStatusRecord = &.{},
     replication_source_action_hints: []ReplicationSourceActionHint = &.{},
     extension_packages: []extension_domain.PackageManifest = &.{},
+    sql_extension_controls: []extension_domain.sql_package.PackageControl = &.{},
     installed_extensions: []extension_domain.InstalledExtension = &.{},
     extension_members: []extension_domain.ExtensionMember = &.{},
     extension_dependencies: []extension_domain.ExtensionDependency = &.{},
@@ -986,6 +988,9 @@ pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot
     if (@hasDecl(SourceDeclType, "listProjectedExtensionPackages")) {
         snapshot.extension_packages = try source.listProjectedExtensionPackages(alloc);
     }
+    if (@hasDecl(SourceDeclType, "listProjectedSqlExtensionControls")) {
+        snapshot.sql_extension_controls = try source.listProjectedSqlExtensionControls(alloc);
+    }
     if (@hasDecl(SourceDeclType, "listProjectedInstalledExtensions")) {
         snapshot.installed_extensions = try source.listProjectedInstalledExtensions(alloc);
     }
@@ -1053,6 +1058,9 @@ pub fn freeSnapshot(alloc: std.mem.Allocator, source: anytype, snapshot: *AdminS
     }
     if (@hasDecl(SourceDeclType, "freeProjectedExtensionPackages") and snapshot.extension_packages.len > 0) {
         source.freeProjectedExtensionPackages(alloc, snapshot.extension_packages);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedSqlExtensionControls") and snapshot.sql_extension_controls.len > 0) {
+        source.freeProjectedSqlExtensionControls(alloc, snapshot.sql_extension_controls);
     }
     if (@hasDecl(SourceDeclType, "freeProjectedInstalledExtensions") and snapshot.installed_extensions.len > 0) {
         source.freeProjectedInstalledExtensions(alloc, snapshot.installed_extensions);
@@ -1665,4 +1673,17 @@ test "metadata admin snapshot derives replication source action hints for reseed
     try std.testing.expectEqualStrings("existing_slot_non_exact_cutover", snapshot.replication_source_action_hints[0].reason);
     try std.testing.expectEqualStrings("docs", snapshot.replication_source_action_hints[0].table_name);
     try std.testing.expect(std.mem.indexOf(u8, snapshot.replication_source_action_hints[0].reseed_exact_cutover_path, "/internal/v1/tables/docs/replication-sources/0/reseed-exact-cutover") != null);
+}
+
+/// Delivery hint for admitted native control. Exact physical store and node;
+/// health/drain do not revoke an already-admitted cleanup authority.
+pub fn nativeOwnerDataUri(alloc: std.mem.Allocator, stores: []const table_manager.StoreRecord, node_id: u64, store_id: u64) !?[]u8 {
+    if (node_id == 0 or store_id == 0) return error.InvalidCatalogRecord;
+    var selected: ?[]const u8 = null;
+    for (stores) |store| {
+        if (store.store_id != store_id) continue;
+        if (selected != null or store.node_id != node_id or !table_manager.storeServesTableData(store.role) or store.api_url.len == 0) return null;
+        selected = store.api_url;
+    }
+    return try alloc.dupe(u8, selected orelse return null);
 }

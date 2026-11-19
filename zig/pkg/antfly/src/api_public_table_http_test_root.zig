@@ -25,8 +25,8 @@ test {
     _ = @import("api/fk_initial_create_coordinator.zig");
     _ = @import("api/sql_truncate.zig");
     _ = @import("api/relational_row_merge.zig");
-    _ = @import("api/relational_index_mutation.zig");
-    _ = @import("api/relational_index_maintenance.zig");
+    _ = @import("api/relational_index/mutation.zig");
+    _ = @import("api/relational_index/maintenance.zig");
     _ = @import("antfly_local_sources").api_internal_batch;
     _ = @import("api/distributed_txn.zig");
     _ = @import("api/http_route_helpers.zig");
@@ -35,7 +35,7 @@ test {
     _ = @import("antfly_local_sources").schema_relational_expression;
     _ = @import("api/table_reads.zig");
     _ = @import("api/relational_constraint_status.zig");
-    _ = @import("api/relational_index_status.zig");
+    _ = @import("api/relational_index/status.zig");
     _ = @import("storage/hot_standby/mutation_inventory.zig");
     _ = @import("serverless/catalog/storage_capabilities.zig");
 }

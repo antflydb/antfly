@@ -1,0 +1,105 @@
+{
+  "format": 1,
+  "entries": [
+    {
+      "id": "sql-0343",
+      "sql": "ALTER ROLE app_writer SET app.tenant_id = 'acme'",
+      "command_tag": "ALTER ROLE",
+      "sqlstate": null,
+      "before": [],
+      "after": [
+        [
+          "",
+          "app.tenant_id=acme"
+        ]
+      ],
+      "old_login_value": "",
+      "new_login_value": "acme"
+    },
+    {
+      "id": "sql-0344",
+      "sql": "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = 'acme'",
+      "command_tag": "ALTER ROLE",
+      "sqlstate": null,
+      "before": [],
+      "after": [
+        [
+          "appdb",
+          "app.tenant_id=acme"
+        ]
+      ],
+      "old_login_value": "",
+      "new_login_value": "acme"
+    },
+    {
+      "id": "sql-0345",
+      "sql": "ALTER ROLE app_writer RESET app.tenant_id",
+      "command_tag": "ALTER ROLE",
+      "sqlstate": null,
+      "before": [
+        [
+          "",
+          "app.tenant_id=acme"
+        ]
+      ],
+      "after": [],
+      "old_login_value": "acme",
+      "new_login_value": ""
+    },
+    {
+      "id": "sql-0346",
+      "sql": "ALTER ROLE app_writer SET statement_timeout = '1ms'",
+      "command_tag": "ALTER ROLE",
+      "sqlstate": null,
+      "before": [],
+      "after": [
+        [
+          "",
+          "statement_timeout=1ms"
+        ]
+      ],
+      "old_login_value": "0",
+      "new_login_value": "1ms"
+    },
+    {
+      "id": "sql-0347",
+      "sql": "ALTER ROLE app_writer IN DATABASE appdb SET statement_timeout = '1ms'",
+      "command_tag": "ALTER ROLE",
+      "sqlstate": null,
+      "before": [],
+      "after": [
+        [
+          "appdb",
+          "statement_timeout=1ms"
+        ]
+      ],
+      "old_login_value": "0",
+      "new_login_value": "1ms"
+    },
+    {
+      "id": "sql-0348",
+      "sql": "ALTER ROLE app_writer RESET statement_timeout",
+      "command_tag": "ALTER ROLE",
+      "sqlstate": null,
+      "before": [
+        [
+          "",
+          "statement_timeout=1ms"
+        ]
+      ],
+      "after": [],
+      "old_login_value": "1ms",
+      "new_login_value": "0"
+    },
+    {
+      "id": "sql-0349",
+      "sql": "ALTER ROLE app_writer SET app.tenant_id = current_setting('app.tenant_id')",
+      "command_tag": null,
+      "sqlstate": "42601",
+      "before": [],
+      "after": [],
+      "old_login_value": "",
+      "new_login_value": ""
+    }
+  ]
+}

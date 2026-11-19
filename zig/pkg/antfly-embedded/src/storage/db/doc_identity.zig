@@ -406,9 +406,9 @@ pub fn canonicalDocIdForNamespace(namespace: Namespace, doc_id: []const u8) u64 
 
 pub fn loadNamespaceTxn(txn: anytype) !?Namespace {
     const mutable_txn = txn;
-    const raw = mutable_txn.get(internal_keys.identity_namespace_key[0..]) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
+    const raw = mutable_txn.get(internal_keys.identity_namespace_key[0..]) catch |err| {
+        if (err == error.NotFound) return null;
+        return err;
     };
     // A point-read backend may reuse borrowed value storage on the next get.
     const namespace = try decodeNamespace(raw);
@@ -420,9 +420,9 @@ pub fn loadNamespaceTxn(txn: anytype) !?Namespace {
 /// an apparently empty primary population. New owners publish this marker in
 /// the same transaction as their namespace and directory mutations.
 pub fn requireLiveDirectoryTxn(txn: anytype) !void {
-    const raw = txn.get(&internal_keys.identity_live_directory_manifest_key) catch |err| switch (err) {
-        error.NotFound => return error.InvalidDocIdentity,
-        else => return err,
+    const raw = txn.get(&internal_keys.identity_live_directory_manifest_key) catch |err| {
+        if (err == error.NotFound) return error.InvalidDocIdentity;
+        return err;
     };
     if (!std.mem.eql(u8, raw, internal_keys.identity_live_directory_manifest_value)) return error.InvalidDocIdentity;
 }

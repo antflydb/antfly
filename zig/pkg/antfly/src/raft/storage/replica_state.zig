@@ -32,7 +32,7 @@ const max_state_body_bytes = max_state_bytes - state_checksum_len;
 const max_conf_state_nodes: usize = 1024;
 var state_publish_nonce = std.atomic.Value(u64).init(1);
 
-const SnapshotIdentity = struct { index: u64, term: u64 };
+const SnapshotIdentity = snapshot_payload_store.SnapshotIdentity;
 
 fn snapshotIdentity(metadata: raft_engine.core.types.SnapshotMetadata) SnapshotIdentity {
     return .{ .index = metadata.index, .term = metadata.term };
@@ -51,6 +51,11 @@ pub const PersistentReplicaState = struct {
     // Unlike applied_index, receiving/persisting a snapshot never advances this
     // cursor. Only the shared state-machine completion sink may do so.
     completed_applied_index: raft_engine.core.types.Index = 0,
+    // MemoryStorage can advance before a checkpoint write fails. Only successful
+    // checkpoint publication (or validated cold recovery) advances this identity.
+    durable_snapshot: snapshot_payload_store.SnapshotIdentity = .{},
+    durable_snapshot_receipt: ?snapshot_payload_store.PayloadReceipt = null,
+    prepared_snapshot_receipt: ?snapshot_payload_store.PayloadReceipt = null,
     persist_buffer: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn init(
@@ -89,6 +94,8 @@ pub const PersistentReplicaState = struct {
         try self.load();
         try self.store.validate();
         try self.validateDurableSnapshotPayload();
+        self.durable_snapshot = snapshotIdentity(self.store.snapshot_state.metadata);
+        self.durable_snapshot_receipt = self.prepared_snapshot_receipt;
         self.cleanupOrphanSnapshotPayloads();
         return self;
     }
@@ -155,6 +162,32 @@ pub const PersistentReplicaState = struct {
         return self.completed_applied_index;
     }
 
+    pub fn retainPublishedSnapshot(self: *PersistentReplicaState, expected: snapshot_payload_store.SnapshotIdentity, reference: [32]u8) !snapshot_payload_store.RetainedSnapshot {
+        return self.retainPublishedSnapshotAlloc(self.alloc, expected, reference);
+    }
+
+    /// Caller serializes checkpoint publication; this is a small owned value,
+    /// never a reference into a provider that may retire after unlock.
+    pub fn publishedSnapshotReceipt(self: *PersistentReplicaState, expected: snapshot_payload_store.SnapshotIdentity) !snapshot_payload_store.PayloadReceipt {
+        if (expected.index == 0 or expected.index != self.durable_snapshot.index or expected.term != self.durable_snapshot.term) return error.SnapshotNotPublished;
+        const receipt = self.durable_snapshot_receipt orelse return error.SnapshotNotPublished;
+        if (!std.meta.eql(receipt.identity, expected)) return error.SnapshotNotPublished;
+        return receipt;
+    }
+
+    pub fn requireSnapshotMetadata(self: *PersistentReplicaState, group: u64, expected: snapshot_payload_store.SnapshotIdentity, digest: ?[32]u8) !void {
+        _ = try self.publishedSnapshotReceipt(expected);
+        if (digest) |value| {
+            const metadata = self.store.snapshot_state.metadata;
+            if (metadata.index != expected.index or metadata.term != expected.term or
+                !std.mem.eql(u8, &value, &try @import("snapshot_metadata.zig").digest(group, metadata))) return error.SnapshotPayloadIdentityConflict;
+        }
+    }
+
+    pub fn retainPublishedSnapshotAlloc(self: *PersistentReplicaState, alloc: std.mem.Allocator, expected: snapshot_payload_store.SnapshotIdentity, reference: [32]u8) !snapshot_payload_store.RetainedSnapshot {
+        return snapshot_payload_store.retainPublished(alloc, self.io_impl.io(), self.layout.snapshot_dir, try self.publishedSnapshotReceipt(expected), reference);
+    }
+
     pub fn setAppliedIndex(self: *PersistentReplicaState, index: raft_engine.core.types.Index) !void {
         const previous_completed = self.completed_applied_index;
         errdefer self.completed_applied_index = previous_completed;
@@ -204,7 +237,7 @@ pub const PersistentReplicaState = struct {
         const self: *PersistentReplicaState = @ptrCast(@alignCast(ptr));
         try validateConfState(metadata.conf_state);
         const previous = snapshotIdentity(self.store.snapshot_state.metadata);
-        try snapshot_payload_store.writeArtifactAtomically(
+        self.prepared_snapshot_receipt = try snapshot_payload_store.writeArtifactWithReceipt(
             self.alloc,
             self.io_impl.io(),
             self.layout.snapshot_dir,
@@ -218,7 +251,7 @@ pub const PersistentReplicaState = struct {
     }
 
     fn publishSnapshotPayload(self: *PersistentReplicaState, snapshot: raft_engine.core.types.Snapshot) !void {
-        try snapshot_payload_store.writeAtomically(
+        self.prepared_snapshot_receipt = try snapshot_payload_store.writeWithReceipt(
             self.alloc,
             self.io_impl.io(),
             self.layout.snapshot_dir,
@@ -254,7 +287,7 @@ pub const PersistentReplicaState = struct {
             return;
         }
         if (snapshot.data.len != 0) return error.InvalidReplicaState;
-        try snapshot_payload_store.validate(
+        self.prepared_snapshot_receipt = try snapshot_payload_store.validateWithReceipt(
             self.alloc,
             self.io_impl.io(),
             self.layout.snapshot_dir,
@@ -419,6 +452,10 @@ pub const PersistentReplicaState = struct {
         }
         try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, self.io());
         try fs_paths.syncDirPortable(self.io(), self.layout.log_dir);
+        self.durable_snapshot = snapshotIdentity(snapshot.metadata);
+        if (self.prepared_snapshot_receipt) |receipt| {
+            if (std.meta.eql(receipt.identity, self.durable_snapshot)) self.durable_snapshot_receipt = receipt;
+        }
     }
 
     fn statePath(self: *const PersistentReplicaState) ![]u8 {
@@ -1022,11 +1059,12 @@ test "persistent replica state publishes an artifact snapshot and reopens it" {
         const spool_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/snapshot-spool", .{layout.root_dir});
         defer std.testing.allocator.free(spool_path);
         try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = spool_path, .data = "artifact-state" });
-        const artifact = try file_snapshot_artifact.FileSnapshotArtifact.create(
+        const artifact = try file_snapshot_artifact.FileSnapshotArtifact.createWithApplicationManifest(
             std.testing.allocator,
             std.testing.io,
             spool_path,
             "artifact-state".len,
+            "native-stream-receipt",
         );
         defer artifact.deinit();
         try state.groupStorage().compactSnapshotArtifact(std.testing.allocator, 90, .{
@@ -1041,9 +1079,62 @@ test "persistent replica state publishes an artifact snapshot and reopens it" {
     defer snapshot.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 4), snapshot.metadata.index);
     try std.testing.expectEqualStrings("artifact-state", snapshot.data);
+    const manifest = try snapshot_payload_store.readApplicationManifest(std.testing.allocator, std.testing.io, layout.snapshot_dir, snapshot.metadata.index, snapshot.metadata.term);
+    defer std.testing.allocator.free(manifest);
+    try std.testing.expectEqualStrings("native-stream-receipt", manifest);
     try std.testing.expectEqual(@as(u64, 3), try reopened.storage().firstIndex());
     try std.testing.expectEqual(@as(u64, 4), try reopened.storage().lastIndex());
     try std.testing.expectEqual(@as(u64, 3), try reopened.storage().term(2));
+}
+
+test "persistent replica snapshot retention requires checkpoint publication and survives supersession" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/persistent-retained", .{tmp.sub_path});
+    defer alloc.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(alloc, root, 93, 4);
+    defer layout.deinit(alloc);
+    const old: SnapshotIdentity = .{ .index = 5, .term = 2 };
+    const next: SnapshotIdentity = .{ .index = 6, .term = 3 };
+    const reference: [32]u8 = @splat(7);
+    {
+        var state = try PersistentReplicaState.init(alloc, layout);
+        defer state.deinit();
+        try std.testing.expectError(error.SnapshotNotPublished, state.retainPublishedSnapshot(old, reference));
+        try state.groupStorage().persistReady(93, .{ .snapshot = .{ .metadata = .{ .index = old.index, .term = old.term }, .data = @constCast("old") } });
+        // Precisely the failure window: payload and MemoryStorage have advanced,
+        // but no checkpoint names the new identity. File existence is no proof.
+        state.prepared_snapshot_receipt = try snapshot_payload_store.writeWithReceipt(alloc, std.testing.io, layout.snapshot_dir, next.index, next.term, "next");
+        try state.store.applySnapshot(.{ .metadata = .{ .index = next.index, .term = next.term } });
+        {
+            var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+            state.alloc = failing.allocator();
+            defer state.alloc = alloc;
+            try std.testing.expectError(error.OutOfMemory, state.persist());
+        }
+        try std.testing.expectError(error.SnapshotNotPublished, state.retainPublishedSnapshot(next, @splat(8)));
+        var retained = try state.retainPublishedSnapshot(old, reference);
+        defer retained.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 3), retained.payload_len);
+        try state.persist();
+        try std.testing.expectError(error.SnapshotNotPublished, state.retainPublishedSnapshot(old, @splat(9)));
+        try std.testing.expectError(error.SnapshotPayloadIdentityMismatch, state.retainPublishedSnapshot(next, reference));
+        snapshot_payload_store.delete(alloc, std.testing.io, layout.snapshot_dir, old.index, old.term);
+    }
+    var reopened = try PersistentReplicaState.init(alloc, layout);
+    defer reopened.deinit();
+    var current = try reopened.retainPublishedSnapshot(next, @splat(8));
+    defer current.deinit(alloc);
+    var recovered = try snapshot_payload_store.readRetained(alloc, std.testing.io, layout.snapshot_dir, reference, old);
+    defer recovered.deinit(alloc);
+    var wrong = recovered;
+    wrong.digest[0] ^= 1;
+    try std.testing.expectError(error.SnapshotPayloadIdentityConflict, snapshot_payload_store.releaseRetained(alloc, std.testing.io, layout.snapshot_dir, wrong));
+    try snapshot_payload_store.releaseRetained(alloc, std.testing.io, layout.snapshot_dir, recovered);
+    try snapshot_payload_store.releaseRetained(alloc, std.testing.io, layout.snapshot_dir, recovered);
+    try std.testing.expectError(error.FileNotFound, snapshot_payload_store.readRetained(alloc, std.testing.io, layout.snapshot_dir, reference, old));
+    try snapshot_payload_store.releaseRetained(alloc, std.testing.io, layout.snapshot_dir, current);
 }
 
 test "persistent replica state recovers both snapshot publication crash windows" {

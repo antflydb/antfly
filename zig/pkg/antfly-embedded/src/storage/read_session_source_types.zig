@@ -57,3 +57,13 @@ pub const streamed_projection = @import("db/query/streamed_projection.zig");
 pub const relational_checks = @import("../schema/relational_checks.zig");
 
 pub const cypher = @import("cypher");
+
+pub const foreign_validation = @import("read_session_types").types.reader_values.foreign_validation;
+pub const nullability = @import("read_session_types").types.reader_values.nullability;
+pub const relational_expression = @import("../schema/relational_expression.zig");
+pub const domain_row = @import("read_session_types").types.reader_values.domain_row;
+pub const domain_handoff = @import("read_session_types").types.reader_values.domain_handoff;
+pub const transactions = @import("transactions.zig");
+pub const text_rows = @import("db/text_rows.zig");
+
+pub const graph_types = @import("../graph/graph.zig");

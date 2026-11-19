@@ -297,6 +297,50 @@ test "SQL plan cache leases survive churn, scope partitions and idle LRU is boun
     try std.testing.expectEqual(@as(usize, 0), stats.leases);
 }
 
+test "SQL plan cache owns callable bodies after request storage and lexer scratch are released" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var cache = Cache.init(a, .{});
+    defer cache.deinit(io);
+    const cases = [_]struct { statement: []const u8, body: []const u8 }{
+        .{ .statement = "CREATE OR REPLACE FUNCTION f() RETURNS text LANGUAGE sql AS $$SELECT 'owned'$$", .body = "SELECT 'owned'" },
+        .{ .statement = "CREATE FUNCTION quoted() RETURNS text LANGUAGE sql AS 'SELECT ''quoted Ω'''", .body = "SELECT 'quoted Ω'" },
+        .{ .statement = "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'owned'; END$$", .body = "BEGIN RAISE NOTICE 'owned'; END" },
+    };
+    var diagnostic: compiler.Diagnostic = .{};
+    for (cases) |entry| {
+        const request = try a.dupe(u8, entry.statement);
+        defer a.free(request);
+        var lease = try cache.acquire(io, .{ .statement = request }, &diagnostic);
+        // HTTP releases request storage while immutable cached plans survive.
+        @memset(request, 'x');
+        try std.testing.expectEqualStrings(entry.body, lease.compiled().statement.catalog_ddl.routine.?.body);
+        lease.release(io);
+        var hit = try cache.acquire(io, .{ .statement = entry.statement }, &diagnostic);
+        defer hit.release(io);
+        try std.testing.expectEqualStrings(entry.body, hit.compiled().statement.catalog_ddl.routine.?.body);
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        const native = @import("antfly_local_sources").sql_catalog.routines;
+        const ddl = hit.compiled().statement.catalog_ddl;
+        const definition = try native.definition(arena.allocator(), ddl.routine.?, .auth_disabled);
+        try native.validateBody(arena.allocator(), .{ .kind = if (ddl.kind == .procedure) .procedure else .function, .id = 1, .generation = 1, .definition = definition });
+    }
+    try std.testing.expectEqual(@as(u64, cases.len), cache.stats(io).hits);
+}
+
+test "SQL plan cache callable body ownership releases partial allocations" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(a: std.mem.Allocator) !void {
+            var cache = Cache.init(a, .{});
+            defer cache.deinit(std.testing.io);
+            var diagnostic: compiler.Diagnostic = .{};
+            var lease = try cache.acquire(std.testing.io, .{ .statement = "CREATE FUNCTION f() RETURNS text LANGUAGE sql AS 'SELECT ''owned'''" }, &diagnostic);
+            lease.release(std.testing.io);
+        }
+    }.check, .{});
+}
+
 test "SQL plan cache failures preserve diagnostics and reclaim all admission" {
     const io = std.testing.io;
     var cache = Cache.init(std.testing.allocator, .{ .max_compile_bytes = 128 });
@@ -307,10 +351,41 @@ test "SQL plan cache failures preserve diagnostics and reclaim all admission" {
     try std.testing.expectEqual(@as(usize, 0), cache.stats(io).compiling);
     var normal = Cache.init(std.testing.allocator, .{});
     defer normal.deinit(io);
-    try std.testing.expectError(error.UnsupportedSqlShape, normal.acquire(io, .{ .statement = "SELECT * FROM t FOR UPDATE" }, &diagnostic));
+    try std.testing.expectError(error.UnsupportedSqlShape, normal.acquire(io, .{ .statement = "SELECT id name extra FROM t" }, &diagnostic));
     try std.testing.expect(diagnostic.start > 0);
     try std.testing.expectEqual(@as(usize, 0), normal.stats(io).entries);
     try std.testing.expectEqual(@as(usize, 0), normal.stats(io).compiling);
+}
+
+test "SQL plan cache retains row-lock write admission across cache hits and allocation failures" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const io = std.testing.io;
+            var cache = Cache.init(a, .{});
+            defer cache.deinit(io);
+            const statements = [_][]const u8{
+                "SELECT * FROM t FOR UPDATE",
+                "SELECT * FROM t FOR NO KEY UPDATE NOWAIT",
+                "SELECT * FROM t FOR SHARE",
+                "SELECT * FROM t FOR KEY SHARE SKIP LOCKED",
+            };
+            var diagnostic: compiler.Diagnostic = .{};
+            for (statements) |statement| {
+                var original = try cache.acquire(io, .{ .statement = statement }, &diagnostic);
+                defer original.release(io);
+                var hit = try cache.acquire(io, .{ .statement = statement }, &diagnostic);
+                defer hit.release(io);
+                try std.testing.expect(original.compiled() == hit.compiled());
+                try std.testing.expect(hit.compiled().uses_row_locks);
+                try std.testing.expect(hit.compiled().requiresWriteAdmission());
+            }
+            try std.testing.expectEqual(@as(u64, statements.len), cache.stats(io).hits);
+            try std.testing.expectEqual(@as(usize, 0), cache.stats(io).leases);
+            try std.testing.expectEqual(@as(usize, 0), cache.stats(io).compiling);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 test "SQL plan cache bounds actual live allocation through byte-driven eviction" {

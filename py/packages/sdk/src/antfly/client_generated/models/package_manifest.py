@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from ..models.install_manifest import InstallManifest
     from ..models.package_artifact import PackageArtifact
     from ..models.package_dependency import PackageDependency
+    from ..models.sql_package_control import SQLPackageControl
     from ..models.update_manifest_ref import UpdateManifestRef
 
 
@@ -39,6 +40,9 @@ class PackageManifest:
         capabilities_requested (list[Capability] | Unset):
         dependencies (list[PackageDependency] | Unset):
         artifacts (list[PackageArtifact] | Unset):
+        sql (SQLPackageControl | Unset): Database-scoped SQL installation over the existing owned package registry.
+            Requires embedded_db scope, SHA256-bound core WASM artifacts, no other install objects/shapes and no host
+            capabilities. Familiar package names imply no upstream extension payload.
         updates (list[UpdateManifestRef] | Unset):
     """
 
@@ -56,6 +60,7 @@ class PackageManifest:
     capabilities_requested: list[Capability] | Unset = UNSET
     dependencies: list[PackageDependency] | Unset = UNSET
     artifacts: list[PackageArtifact] | Unset = UNSET
+    sql: SQLPackageControl | Unset = UNSET
     updates: list[UpdateManifestRef] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -103,6 +108,10 @@ class PackageManifest:
                 artifacts_item = artifacts_item_data.to_dict()
                 artifacts.append(artifacts_item)
 
+        sql: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.sql, Unset):
+            sql = self.sql.to_dict()
+
         updates: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.updates, Unset):
             updates = []
@@ -138,6 +147,8 @@ class PackageManifest:
             field_dict["dependencies"] = dependencies
         if artifacts is not UNSET:
             field_dict["artifacts"] = artifacts
+        if sql is not UNSET:
+            field_dict["sql"] = sql
         if updates is not UNSET:
             field_dict["updates"] = updates
 
@@ -149,6 +160,7 @@ class PackageManifest:
         from ..models.install_manifest import InstallManifest
         from ..models.package_artifact import PackageArtifact
         from ..models.package_dependency import PackageDependency
+        from ..models.sql_package_control import SQLPackageControl
         from ..models.update_manifest_ref import UpdateManifestRef
 
         d = dict(src_dict)
@@ -201,6 +213,13 @@ class PackageManifest:
 
                 artifacts.append(artifacts_item)
 
+        _sql = d.pop("sql", UNSET)
+        sql: SQLPackageControl | Unset
+        if isinstance(_sql, Unset):
+            sql = UNSET
+        else:
+            sql = SQLPackageControl.from_dict(_sql)
+
         _updates = d.pop("updates", UNSET)
         updates: list[UpdateManifestRef] | Unset = UNSET
         if _updates is not UNSET:
@@ -225,6 +244,7 @@ class PackageManifest:
             capabilities_requested=capabilities_requested,
             dependencies=dependencies,
             artifacts=artifacts,
+            sql=sql,
             updates=updates,
         )
 

@@ -171,7 +171,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (writes) |write| try plan.establish(alloc, write.key);
             for (deletes) |key| try plan.establish(alloc, key);
             for (transforms) |transform| try plan.transform(alloc, transform.key);
-            if (plan.durable_bases.items.len == 0) return .{};
 
             // Only request-key collection depends on the write/receiver type.
             // Share MVCC reads and row reconstruction across DB, recovery and
@@ -197,10 +196,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer read_txn.abort();
             var schema_view = S.ownerField(self, "core").*.acquireSchemaView();
             defer if (schema_view) |*view| view.release();
+            if (schema_view) |view| {
+                var columns: std.ArrayList([]const u8) = .empty;
+                errdefer {
+                    for (columns.items) |name| alloc.free(name);
+                    columns.deinit(alloc);
+                }
+                for (view.tableSchema().relational_columns) |column| if (column.column_type == .json) {
+                    const name = try alloc.dupe(u8, column.name);
+                    errdefer alloc.free(name);
+                    try columns.append(alloc, name);
+                };
+                result.json_columns = try columns.toOwnedSlice(alloc);
+            }
             const entries = try alloc.alloc(TransformReadSnapshot.Entry, keys.len);
             var initialized: usize = 0;
             errdefer {
-                for (entries[0..initialized]) |entry| if (entry.value) |value| alloc.free(value);
+                for (entries[0..initialized]) |entry| {
+                    if (entry.value) |value| alloc.free(value);
+                    for (entry.json_null_fields) |name| alloc.free(name);
+                    if (entry.json_null_fields.len != 0) alloc.free(entry.json_null_fields);
+                }
                 alloc.free(entries);
             }
             try result.positions.ensureTotalCapacity(alloc, std.math.cast(u32, keys.len) orelse
@@ -212,6 +228,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     error.NotFound => null,
                     else => return err,
                 };
+                var json_null_fields: []const []const u8 = &.{};
+                errdefer {
+                    for (json_null_fields) |name| alloc.free(name);
+                    if (json_null_fields.len != 0) alloc.free(json_null_fields);
+                }
                 const value = if (raw) |stored| blk: {
                     if (!internal_keys.isRelationalRowKey(store_key))
                         break :blk try alloc.dupe(u8, stored);
@@ -229,6 +250,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 view.tableSchema().*,
                                 view.physicalLayout(),
                             );
+                        json_null_fields = try row.jsonNullFieldsAlloc(alloc);
                         break :blk try row.reconstructValueAlloc(alloc);
                     };
                     var historical = (try S.ownerField(self, "core").*.acquireSchemaVersionView(version)) orelse
@@ -246,6 +268,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             historical.tableSchema().*,
                             historical.physicalLayout(),
                         );
+                    json_null_fields = try row.jsonNullFieldsAlloc(alloc);
                     break :blk try row.reconstructValueAlloc(alloc);
                 } else null;
                 errdefer if (value) |owned| alloc.free(owned);
@@ -267,6 +290,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .key = key,
                     .value = value,
                     .expected_version = expected_version,
+                    .json_null_fields = json_null_fields,
                 };
                 initialized += 1;
                 result.positions.putAssumeCapacity(key, index);
@@ -2151,9 +2175,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     while (!ctx.failed.load(.acquire)) {
                         const index = ctx.next.fetchAdd(1, .monotonic);
                         if (index >= ctx.writes.len) return;
-                        var prepared = (if (ctx.writes[index].json_null_fields.len != 0)
-                            mapper.PreparedRelationalWrite.initTypedInSharedRegion(region, scratch_arena.allocator(), ctx.retain_text_roots, ctx.writes[index].key, ctx.writes[index].value, ctx.validator, ctx.table_schema, ctx.physical_layout, ctx.writes[index].json_null_fields, ctx.preserve_logical_values)
-                        else if (ctx.preserve_logical_values)
+                        const preserve = @import("../../schema/domain_handoff.zig").preserveFor(ctx.validator, ctx.writes[index].prepared_domain, ctx.preserve_logical_values) catch |err| {
+                            ctx.fail(err);
+                            return;
+                        };
+                        var prepared = (if (ctx.writes[index].json_null_fields.len != 0 or ctx.writes[index].prepared_domain != null)
+                            mapper.PreparedRelationalWrite.initTypedInSharedRegion(region, scratch_arena.allocator(), ctx.retain_text_roots, ctx.writes[index].key, ctx.writes[index].value, ctx.validator, ctx.table_schema, ctx.physical_layout, ctx.writes[index].json_null_fields, preserve)
+                        else if (preserve)
                             mapper.PreparedRelationalWrite.initInSharedRegionPreserved(region, scratch_arena.allocator(), ctx.retain_text_roots, ctx.writes[index].key, ctx.writes[index].value, ctx.validator, ctx.table_schema, ctx.physical_layout)
                         else
                             mapper.PreparedRelationalWrite.initInSharedRegionFromIntent(
@@ -2301,7 +2329,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .alloc = allocator_guard.allocator(),
                 .scratch_child = allocator_guard.allocator(),
                 .writes = writes,
-                .validator = validator,
+                .validator = if (validator) |compiled| (if (!preserve_logical_values and io != null) compiled.forPreparation(try (@import("../../schema/relational_expression.zig").PreparationRuntime{ .io = io.? }).withClock(table_schema.requires_clock_defaults)) else compiled) else null,
                 .table_schema = table_schema,
                 .physical_layout = physical_layout,
                 .db = db,

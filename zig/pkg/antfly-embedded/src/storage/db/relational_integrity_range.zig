@@ -36,11 +36,12 @@ fn namespacePrefix(kind: integrity.Kind) [integrity.namespace.len + 1]u8 {
 fn walk(alloc: Allocator, io: ?std.Io, source: *docstore.DocStore, destination: *docstore.DocStore, lower: []const u8, upper: []const u8, remove: bool, budget: Budget) !void {
     if (budget.records == 0 or budget.records > 4096 or budget.bytes == 0 or budget.bytes > 16 * 1024 * 1024 or budget.time_ns == 0 or budget.time_ns > std.time.ns_per_s) return error.InvalidIntegrityBudget;
     if (upper.len != 0 and std.mem.order(u8, lower, upper) != .lt) return error.InvalidRange;
-    inline for (.{ integrity.Kind.claim, integrity.Kind.reference, integrity.Kind.job }) |kind| {
+    inline for (.{ integrity.Kind.claim, integrity.Kind.reference, integrity.Kind.job, integrity.Kind.interval }) |kind| {
         const prefix = namespacePrefix(kind);
         const first = try std.mem.concat(alloc, u8, &.{ &prefix, lower });
         defer alloc.free(first);
-        var continuation: [integrity.key_len + 32]u8 = undefined;
+        var continuation: std.ArrayList(u8) = .empty;
+        defer continuation.deinit(alloc);
         var continuation_len: usize = 0;
         var complete = false;
         while (!complete) {
@@ -58,8 +59,8 @@ fn walk(alloc: Allocator, io: ?std.Io, source: *docstore.DocStore, destination: 
                 defer scan.abort();
                 var cursor = try scan.openCursor();
                 defer cursor.close();
-                var entry = try cursor.seekAtOrAfter(if (continuation_len != 0) continuation[0..continuation_len] else first);
-                if (entry) |item| if (continuation_len != 0 and std.mem.eql(u8, item.key, continuation[0..continuation_len])) {
+                var entry = try cursor.seekAtOrAfter(if (continuation_len != 0) continuation.items[0..continuation_len] else first);
+                if (entry) |item| if (continuation_len != 0 and std.mem.eql(u8, item.key, continuation.items[0..continuation_len])) {
                     entry = try cursor.next();
                 };
                 complete = true;
@@ -77,7 +78,8 @@ fn walk(alloc: Allocator, io: ?std.Io, source: *docstore.DocStore, destination: 
                     }
                     const key = try owned.dupe(u8, item.key);
                     if (remove) try deletes.append(owned, key) else try writes.append(owned, .{ .key = key, .value = try owned.dupe(u8, item.value) });
-                    @memcpy(continuation[0..key.len], key);
+                    try continuation.resize(alloc, key.len);
+                    @memcpy(continuation.items, key);
                     continuation_len = key.len;
                     inspected += 1;
                     retained_bytes += bytes;
@@ -159,4 +161,69 @@ test "relational integrity range transfer follows logical claim routing and pres
     defer source_read.abort();
     _ = try source_read.get(&excluded.claimKey());
     try std.testing.expectError(error.NotFound, source_read.get(&kept.claimKey()));
+}
+
+test "SQL range temporal claims transfer long ordered keys with one record pages and logical pruning" {
+    const a = std.testing.allocator;
+    const temporal = @import("temporal_integrity_contract.zig");
+    const ranges = @import("../../sql/range_value.zig");
+    const lsm = @import("../lsm_backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var source_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const source_path = try std.fmt.bufPrint(&source_path_buf, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});
+    var destination_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const destination_path = try std.fmt.bufPrint(&destination_path_buf, ".zig-cache/tmp/{s}/destination", .{tmp.sub_path});
+    var source_backend = try lsm.Backend.open(a, source_path, .{});
+    defer source_backend.close();
+    var source = try docstore.DocStore.openRuntime(a, try source_backend.runtimeStore(a, .{}));
+    defer source.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const groups = [_][]const u8{ "first", "second" };
+    const addresses = [_]integrity.Address{ try integrity.Address.init(@splat(44), groups[0]), try integrity.Address.init(@splat(44), groups[1]) };
+    const kept_index: usize = if (std.mem.order(u8, &addresses[0].routing, &addresses[1].routing) == .lt) 1 else 0;
+    const lower = addresses[kept_index].routing;
+    var context: ranges.Context = .{ .alloc = scratch };
+    var keys: [2][2][]const u8 = undefined;
+    for (addresses, groups, 0..) |address, tuple, group_index| {
+        for (0..2) |row_index| {
+            var low: [200]u8 = undefined;
+            var high: [200]u8 = undefined;
+            @memset(&low, @as(u8, '1') + @as(u8, @intCast(row_index * 2)));
+            @memset(&high, @as(u8, '2') + @as(u8, @intCast(row_index * 2)));
+            const input = try std.fmt.allocPrint(scratch, "[0.{s},0.{s})", .{ low, high });
+            const claim: temporal.Claim = .{ .tuple = tuple, .parent_table = "products", .parent_key = try std.fmt.allocPrint(scratch, "row:{d}", .{row_index}), .schema_version = 1, .period = .{ .kind = .numrange, .bytes = try ranges.encodeLeaky(&context, try ranges.parseLeaky(&context, .numrange, input)) } };
+            const key = try claim.keyAlloc(scratch, address);
+            try std.testing.expect(key.len > integrity.key_len + 32);
+            keys[group_index][row_index] = key;
+            try source.put(key, try claim.encode(scratch, address));
+        }
+    }
+    {
+        var destination_backend = try lsm.Backend.open(a, destination_path, .{});
+        defer destination_backend.close();
+        var destination = try docstore.DocStore.openRuntime(a, try destination_backend.runtimeStore(a, .{}));
+        defer destination.close();
+        // Force continuation after every variable-length ordered key.
+        try walk(a, null, &source, &destination, &lower, "", false, .{ .records = 1 });
+        try copyToUnpublished(a, null, &source, &destination, &lower, "");
+    }
+    {
+        var destination_backend = try lsm.Backend.open(a, destination_path, .{});
+        defer destination_backend.close();
+        var destination = try docstore.DocStore.openRuntime(a, try destination_backend.runtimeStore(a, .{}));
+        defer destination.close();
+        var read = try integrity.CurrentView.init(&destination);
+        defer read.deinit();
+        for (keys[kept_index]) |key| try integrity.validateTransferredCompanionsWithScratch(a, &read, key, try read.get(key), .{});
+        for (keys[1 - kept_index]) |key| try std.testing.expectError(error.NotFound, read.get(key));
+        try std.testing.expectError(error.NotFound, read.get(&temporal.guardKey(addresses[kept_index])));
+    }
+    try pruneOutside(a, null, &source, "", &lower);
+    var read = try integrity.CurrentView.init(&source);
+    defer read.deinit();
+    for (keys[kept_index]) |key| try std.testing.expectError(error.NotFound, read.get(key));
+    for (keys[1 - kept_index]) |key| _ = try read.get(key);
 }

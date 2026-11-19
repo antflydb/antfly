@@ -14,6 +14,7 @@
 // limitations under the License.
 
 test {
+    _ = @import("antfly_local_sources").storage_db_relational_integrity_integration_test;
     _ = @import("antfly_local_sources").storage_db_authority_invalidation;
     _ = @import("antfly_local_sources").storage_db_schema_registry;
     _ = @import("antfly_local_sources").storage_db_row_policy_gate;

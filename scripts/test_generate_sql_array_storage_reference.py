@@ -22,6 +22,7 @@ exact binary64-to-decimal interpretation used by the native fixture.
 """
 
 from decimal import Decimal
+import json
 import re
 import unittest
 
@@ -29,10 +30,40 @@ from generate_sql_postgres_reference import FIXTURES, postgres
 
 
 class ArrayStorageReferenceTest(unittest.TestCase):
+    def test_jsonb_array_persistence_goldens(self):
+        fixture = json.loads(
+            (FIXTURES / "sql_jsonb_array_storage_reference.json").read_text()
+        )
+        self.assertEqual(5, len(fixture["entries"]))
+        with postgres() as db:
+            for entry in fixture["entries"]:
+                with self.subTest(sql=entry["sql"]):
+                    binary, text = db.execute(
+                        "SELECT encode(array_send(v),'hex'),v::text FROM (SELECT "
+                        + entry["sql"]
+                        + " AS v) s"
+                    ).fetchone()
+                    elements = [
+                        row[0]
+                        for row in db.execute(
+                            "SELECT v::text FROM unnest(" + entry["sql"] + ") AS v"
+                        )
+                    ]
+                    self.assertEqual(entry["binary"], binary)
+                    self.assertEqual(entry["text"], text)
+                    self.assertEqual(entry["elements"], elements)
+            self.assertEqual(
+                (True, True),
+                db.execute(
+                    "SELECT ARRAY['1.20'::jsonb] = ARRAY['1.2'::jsonb], "
+                    "ARRAY['null'::jsonb] IS DISTINCT FROM ARRAY[NULL::jsonb]"
+                ).fetchone(),
+            )
+
     def test_owned_json_numeric_fixture_preserves_exact_values(self):
         source = (FIXTURES.parent / "array_storage.zig").read_text()
         section = source.split(
-            'test "SQL flat JSONB stored arrays canonicalize in-memory and parsed numeric values identically" {',
+            'test "SQL flat JSONB stored arrays preserve scale but hash logical numeric values identically" {',
             1,
         )[1].split('\ntest "', 1)[0]
         pairs = re.findall(

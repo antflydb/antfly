@@ -41,8 +41,8 @@ pub fn tryFence(db: anytype, allow_unresolved: bool) !?contract.Handle {
             const database: *@TypeOf(db.*) = @ptrCast(@alignCast(held.db));
             const retained = try database.alloc.create(StatementOwner);
             errdefer database.alloc.destroy(retained);
-            retained.* = .{ .alloc = database.alloc, .value = try database.captureRelationalStatementSnapshotAtFence(&held.value) };
-            return .{ .handle = issue(.statement, retained), .schema_version = retained.value.schema_version };
+            retained.* = .{ .alloc = database.alloc, .db = database, .value = try database.captureRelationalStatementSnapshotAtFence(&held.value) };
+            return .{ .handle = issue(.statement, retained), .schema_version = retained.value.schema_version, .document = retained.value.document };
         }
     };
     owner.* = .{ .alloc = db.alloc, .value = value, .db = db, .capture = Capture.run };
@@ -59,12 +59,34 @@ pub fn closeFence(handle: contract.Handle) !void {
     owner.value.release();
     alloc.destroy(owner);
 }
-const StatementOwner = struct { alloc: A, value: Backend.Statement };
+const StatementOwner = struct { alloc: A, value: Backend.Statement, db: *const anyopaque };
 pub fn capture(db: anytype) !contract.Statement {
     const retained = try db.alloc.create(StatementOwner);
     errdefer db.alloc.destroy(retained);
-    retained.* = .{ .alloc = db.alloc, .value = try db.captureRelationalStatementSnapshot() };
-    return .{ .handle = issue(.statement, retained), .schema_version = retained.value.schema_version };
+    retained.* = .{ .alloc = db.alloc, .db = db, .value = try db.captureRelationalStatementSnapshot() };
+    return .{ .handle = issue(.statement, retained), .schema_version = retained.value.schema_version, .document = retained.value.document };
+}
+pub fn captureWithGraphs(db: anytype, names: []const []const u8) !contract.Statement {
+    const retained = try db.alloc.create(StatementOwner);
+    errdefer db.alloc.destroy(retained);
+    retained.* = .{ .alloc = db.alloc, .db = db, .value = try db.captureRelationalStatementSnapshotWithGraphs(names) };
+    return .{ .handle = issue(.statement, retained), .schema_version = retained.value.schema_version, .document = retained.value.document };
+}
+pub fn graphSnapshotPage(db: anytype, handle: contract.Handle, a: A, request: @import("graph_read_snapshot.zig").Request) !@import("graph_read_snapshot.zig").Page {
+    const owner = try handle.resolve(.statement, StatementOwner);
+    if (owner.db != @as(*const anyopaque, db)) return error.InvalidArgument;
+    return db.relationalGraphSnapshotPage(&owner.value, a, request);
+}
+pub fn fenceSequence(db: anytype, handle: contract.Handle) !u64 {
+    return db.statementFenceSequence(try resolveFence(handle, db));
+}
+pub fn openDocumentAtSnapshot(db: anytype, alloc: A, from: []const u8, to: []const u8, opts: types.ScanOptions, snapshot: ?contract.Handle) !contract.Handle {
+    const cut = if (snapshot) |handle| blk: {
+        const owner = try handle.resolve(.statement, StatementOwner);
+        if (owner.db != @as(*const anyopaque, db)) return error.InvalidArgument;
+        break :blk &owner.value;
+    } else null;
+    return issue(.document, try db.openDocumentReadSessionAtSnapshot(alloc, from, to, opts, cut));
 }
 pub fn closeStatement(handle: contract.Handle) !void {
     const owner = try handle.resolve(.statement, StatementOwner);
@@ -73,7 +95,11 @@ pub fn closeStatement(handle: contract.Handle) !void {
     alloc.destroy(owner);
 }
 pub fn openRelational(db: anytype, alloc: A, from: []const u8, to: []const u8, opts: types.ScanOptions, snapshot: ?contract.Handle) !contract.Handle {
-    const cut = if (snapshot) |handle| &(try handle.resolve(.statement, StatementOwner)).value else null;
+    const cut = if (snapshot) |handle| blk: {
+        const owner = try handle.resolve(.statement, StatementOwner);
+        if (owner.db != @as(*const anyopaque, db)) return error.InvalidArgument;
+        break :blk &owner.value;
+    } else null;
     return issue(.relational, try db.openRelationalReadSessionAtSnapshot(alloc, from, to, opts, cut));
 }
 pub fn openDocument(db: anytype, alloc: A, from: []const u8, to: []const u8, opts: types.ScanOptions) !contract.Handle {
@@ -113,9 +139,9 @@ pub fn validateExportedRow(row: anytype) !void {
     if (row.typed_cells) |cells| {
         if (cells.columnar != null) return error.UnsupportedVersion;
         for (cells.values) |datum| {
-            if (datum.patterns != null) return error.UnsupportedVersion;
+            if (datum.extension_kind == .patterns) return error.UnsupportedVersion;
             if (datum.array) |array| for (array.elements) |element| {
-                if (element.patterns != null or element.array != null) return error.UnsupportedVersion;
+                if (element.extension_kind == .patterns or element.array != null) return error.UnsupportedVersion;
             };
         }
     }
@@ -221,11 +247,69 @@ fn issue(comptime kind: contract.Kind, value: anytype) contract.Handle {
 }
 const Outcome = @import("read_session_types").types.contract.NativeOutcome;
 const statement_ops: contract.Operations = .{ .close = Adapters.closeStatement };
-const relational_ops: contract.Operations = .{ .metadata = Adapters.metadata, .set_read_time = Adapters.setReadTime, .next_page = Adapters.relationalNextPage, .seek_prefix = Adapters.seekPrefix, .visit_cypher = Adapters.visitCypher, .close = Adapters.closeRelational, .checkpoint = Adapters.checkpoint, .range_proofs = Adapters.relationalProofs, .normalize = Adapters.normalizeRelational, .next_typed = Adapters.nextTyped, .next_view = Adapters.nextView };
-const reader_ops: contract.Operations = .{ .reader_seek_prefix = Adapters.readerSeekPrefix, .close = Adapters.closeReader, .next_page = Adapters.readerNextPage, .next_typed = Adapters.readerNextTyped, .lookup_batch = Adapters.readerLookupBatch, .lookup_one = Adapters.readerLookupOne };
-const document_ops: contract.Operations = .{ .close = Adapters.closeDocument, .range_proofs = Adapters.documentProofs, .normalize = Adapters.normalizeDocument, .next_view = Adapters.nextDocument };
+const relational_ops: contract.Operations = .{ .normalize_domains = Adapters.normalizeDomains, .metadata = Adapters.metadata, .set_read_time = Adapters.setReadTime, .next_page = Adapters.relationalNextPage, .seek_prefix = Adapters.seekPrefix, .visit_cypher = Adapters.visitCypher, .close = Adapters.closeRelational, .checkpoint = Adapters.checkpoint, .range_proofs = Adapters.relationalProofs, .normalize = Adapters.normalizeRelational, .next_typed = Adapters.nextTyped, .next_view = Adapters.nextView };
+const reader_ops: contract.Operations = .{ .nullability_page = Adapters.nullability_page, .nullability_replay = Adapters.nullability_replay, .foreign_validation_page = Adapters.foreign_validation_page, .foreign_validation_replay = Adapters.foreign_validation_replay, .resume_nullability = Adapters.resume_nullability, .resume_foreign_validation = Adapters.resume_foreign_validation, .reader_seek_prefix = Adapters.readerSeekPrefix, .close = Adapters.closeReader, .next_page = Adapters.readerNextPage, .next_typed = Adapters.readerNextTyped, .lookup_batch = Adapters.readerLookupBatch, .lookup_one = Adapters.readerLookupOne };
+const document_ops: contract.Operations = .{ .document_metadata = Adapters.documentMetadata, .close = Adapters.closeDocument, .range_proofs = Adapters.documentProofs, .normalize = Adapters.normalizeDocument, .next_view = Adapters.nextDocument };
 const provider = @This();
 const Adapters = struct {
+    fn documentMetadata(h: contract.Handle) Outcome(contract.DocumentMetadata) {
+        const owner = h.resolve(.document, Document) catch |err| return failure(contract.DocumentMetadata, err);
+        return .{ .value = .{ .text_filter_digest = if (owner.text) |text| text.query_digest else null } };
+    }
+
+    fn nullability_page(h: contract.Handle, a: std.mem.Allocator, io: ?contract.IoBorrow, budget: Rows.Budget, plan: *const ReaderValues.nullability.Plan, control: ReaderValues.nullability.Control) Outcome(ReaderValues.NullabilityPage) {
+        var receiver: ?contract.IoReceiver = if (io) |borrow| borrow.receive() catch |err| return failure(ReaderValues.NullabilityPage, err) else null;
+        const reader = h.resolve(.reader, ReaderOwner) catch |err| return failure(ReaderValues.NullabilityPage, err);
+        var result_value = reader.value.nextNullabilityPage(a, if (receiver) |*held| held.io() else null, budget, plan, control) catch |err| return failure(ReaderValues.NullabilityPage, err);
+        result_value.page = ownPage(result_value.page, a) catch |err| {
+            result_value.deinit();
+            return failure(ReaderValues.NullabilityPage, err);
+        };
+        return .{ .value = result_value };
+    }
+    fn nullability_replay(h: contract.Handle, a: std.mem.Allocator, io: ?contract.IoBorrow, expected: ReaderValues.NullabilityReplayBoundary, plan: *const ReaderValues.nullability.Plan, control: ReaderValues.nullability.Control) Outcome(ReaderValues.NullabilityPage) {
+        var receiver: ?contract.IoReceiver = if (io) |borrow| borrow.receive() catch |err| return failure(ReaderValues.NullabilityPage, err) else null;
+        const reader = h.resolve(.reader, ReaderOwner) catch |err| return failure(ReaderValues.NullabilityPage, err);
+        var result_value = reader.value.nextNullabilityReplayPage(a, if (receiver) |*held| held.io() else null, expected, plan, control) catch |err| return failure(ReaderValues.NullabilityPage, err);
+        result_value.page = ownPage(result_value.page, a) catch |err| {
+            result_value.deinit();
+            return failure(ReaderValues.NullabilityPage, err);
+        };
+        return .{ .value = result_value };
+    }
+    fn foreign_validation_page(h: contract.Handle, a: std.mem.Allocator, io: ?contract.IoBorrow, budget: Rows.Budget, plan: *ReaderValues.foreign_validation.ChildPlan, control: ReaderValues.nullability.Control) Outcome(ReaderValues.ForeignKeyValidationPage) {
+        var receiver: ?contract.IoReceiver = if (io) |borrow| borrow.receive() catch |err| return failure(ReaderValues.ForeignKeyValidationPage, err) else null;
+        const reader = h.resolve(.reader, ReaderOwner) catch |err| return failure(ReaderValues.ForeignKeyValidationPage, err);
+        var result_value = reader.value.nextForeignKeyValidationPage(a, if (receiver) |*held| held.io() else null, budget, plan, control) catch |err| return failure(ReaderValues.ForeignKeyValidationPage, err);
+        result_value.scan.page = ownPage(result_value.scan.page, a) catch |err| {
+            result_value.deinit();
+            return failure(ReaderValues.ForeignKeyValidationPage, err);
+        };
+        return .{ .value = result_value };
+    }
+    fn foreign_validation_replay(h: contract.Handle, a: std.mem.Allocator, io: ?contract.IoBorrow, expected: ReaderValues.ForeignKeyReplayBoundary, plan: *ReaderValues.foreign_validation.ChildPlan, control: ReaderValues.nullability.Control) Outcome(ReaderValues.ForeignKeyValidationPage) {
+        var receiver: ?contract.IoReceiver = if (io) |borrow| borrow.receive() catch |err| return failure(ReaderValues.ForeignKeyValidationPage, err) else null;
+        const reader = h.resolve(.reader, ReaderOwner) catch |err| return failure(ReaderValues.ForeignKeyValidationPage, err);
+        var result_value = reader.value.nextForeignKeyValidationReplayPage(a, if (receiver) |*held| held.io() else null, expected, plan, control) catch |err| return failure(ReaderValues.ForeignKeyValidationPage, err);
+        result_value.scan.page = ownPage(result_value.scan.page, a) catch |err| {
+            result_value.deinit();
+            return failure(ReaderValues.ForeignKeyValidationPage, err);
+        };
+        return .{ .value = result_value };
+    }
+    fn resume_nullability(h: contract.Handle, plan: *const ReaderValues.nullability.Plan, continuation: ReaderValues.NullabilityResume, control: ReaderValues.nullability.Control) Outcome(void) {
+        const reader = h.resolve(.reader, ReaderOwner) catch |err| return failure(void, err);
+        return .{ .value = reader.value.resumeNullabilityScan(plan, continuation, control) catch |err| return failure(void, err) };
+    }
+    fn resume_foreign_validation(h: contract.Handle, plan: *const ReaderValues.foreign_validation.ChildPlan, continuation: ReaderValues.NullabilityResume, control: ReaderValues.nullability.Control) Outcome(void) {
+        const reader = h.resolve(.reader, ReaderOwner) catch |err| return failure(void, err);
+        return .{ .value = reader.value.resumeForeignKeyValidationScan(plan, continuation, control) catch |err| return failure(void, err) };
+    }
+    fn normalizeDomains(h: contract.Handle, a: A, writes: []const types.BatchWrite, admissions: []const ?ReaderValues.domain_row.Admission, output: *ReaderValues.domain_handoff.Contract) Outcome([]types.BatchWrite) {
+        const owner = h.resolve(.relational, Relational) catch |err| return failure([]types.BatchWrite, err);
+        return .{ .value = owner.normalizeDomainRows(a, writes, admissions, output) catch |err| return failure([]types.BatchWrite, err) };
+    }
+
     fn metadata(h: contract.Handle) Outcome(Rows.RelationalMetadata) {
         const session = h.resolve(.relational, Relational) catch |err| return failure(Rows.RelationalMetadata, err);
         return .{ .value = session.readMetadata() };

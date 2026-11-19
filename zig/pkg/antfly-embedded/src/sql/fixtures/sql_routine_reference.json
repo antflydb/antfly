@@ -1,0 +1,288 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL 18 SQL-language routines",
+  "entries": [
+    {
+      "id": "sql-0397",
+      "source_entry_sha256": "43dda4d6c8101c3c58d2e55d1014e176c0712b8c8820cce0ea5fdb12038ba076",
+      "sql": "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql IMMUTABLE AS $$SELECT lower($1)$$",
+      "command_tag": "CREATE FUNCTION",
+      "query": "SELECT normalize_status('ReAdY') AS value, normalize_status(NULL) AS absent",
+      "output": {
+        "columns": [
+          "value",
+          "absent"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "ready",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-0398",
+      "source_entry_sha256": "2cd520f5537b60abde33b00b2cf07e67c9e16eef97157162b285228771771db5",
+      "sql": "CREATE FUNCTION second_status(text, text) RETURNS text LANGUAGE sql AS $$SELECT upper($2)$$",
+      "command_tag": "CREATE FUNCTION",
+      "query": "SELECT second_status('ignored','Ready') AS value, second_status('ignored',NULL) AS absent",
+      "output": {
+        "columns": [
+          "value",
+          "absent"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "READY",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-0399",
+      "source_entry_sha256": "2ed5fb5c783a09f72c5e5752843f7d280c88003e81780af1b8ba81e7fc9cd784",
+      "sql": "CREATE FUNCTION status_label(text, text) RETURNS text LANGUAGE sql AS $$SELECT concat_ws(' ', $1, $2)$$",
+      "command_tag": "CREATE FUNCTION",
+      "query": "SELECT status_label('Ready','Now') AS value, status_label(NULL,NULL) AS absent",
+      "output": {
+        "columns": [
+          "value",
+          "absent"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "Ready Now",
+            ""
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-0400",
+      "source_entry_sha256": "fc1393651b1bd5a4c17936b62d8deb938d68071f894e6df4e726ae886f04b745",
+      "sql": "CREATE FUNCTION status_label_nested(text, text) RETURNS text LANGUAGE sql AS $$SELECT concat_ws(':', lower($1), coalesce($2, 'missing'))$$",
+      "command_tag": "CREATE FUNCTION",
+      "query": "SELECT status_label_nested('ReAdY',NULL) AS value, status_label_nested(NULL,'Now') AS absent",
+      "output": {
+        "columns": [
+          "value",
+          "absent"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "ready:missing",
+            "Now"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-0401",
+      "source_entry_sha256": "639d5fb9e560b6bd248fa1f2ee88ae5143069a1bb5fd1bce822a7fc09f85136b",
+      "sql": "CREATE FUNCTION clamp_amount(numeric, numeric, numeric) RETURNS numeric LANGUAGE sql AS $$SELECT least(greatest($1, $2), $3)$$",
+      "command_tag": "CREATE FUNCTION",
+      "query": "SELECT clamp_amount(10.25,0.5,5.75)::text AS value, clamp_amount(NULL,0.5,5.75)::text AS absent",
+      "output": {
+        "columns": [
+          "value",
+          "absent"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "5.75",
+            "0.5"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-0402",
+      "source_entry_sha256": "7fdb17f70a2132c21ebdfeeb5745cc5dbbd10549d6155e5766f012b0b80dad0e",
+      "sql": "CREATE FUNCTION add_amounts(numeric, numeric) RETURNS numeric LANGUAGE sql AS $$SELECT $1+$2$$",
+      "command_tag": "CREATE FUNCTION",
+      "query": "SELECT add_amounts(9007199254740993.0001,0.0002)::text AS value, add_amounts(NULL,1)::text AS absent",
+      "output": {
+        "columns": [
+          "value",
+          "absent"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "9007199254740993.0003",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-0403",
+      "source_entry_sha256": "cabce1ce679fdf11ff6ac0b18b93d89848efbb6b063182c4ec0c13c5d172b181",
+      "sql": "CREATE FUNCTION shift_amount(numeric) RETURNS numeric LANGUAGE sql AS $$SELECT 1 + arg1$$",
+      "sqlstate": "42703"
+    },
+    {
+      "id": "sql-0404",
+      "source_entry_sha256": "c41bf95cc379f0fcc90276e5bcd3a7fb7c8e98b515858960265873049e78ca63",
+      "sql": "CREATE FUNCTION normalize_named_status(status_text text) RETURNS text LANGUAGE sql AS $$SELECT lower(status_text)$$",
+      "command_tag": "CREATE FUNCTION",
+      "query": "SELECT normalize_named_status('ReAdY') AS value, normalize_named_status(NULL) AS absent",
+      "output": {
+        "columns": [
+          "value",
+          "absent"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "ready",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            true
+          ]
+        ]
+      }
+    }
+  ],
+  "probes": [
+    {
+      "sql": "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql AS $$SELECT lower($1)$$",
+      "sqlstate": "42723"
+    },
+    {
+      "sql": "CREATE OR REPLACE FUNCTION normalize_status(text) RETURNS integer LANGUAGE sql AS $$SELECT 1$$",
+      "sqlstate": "42P13"
+    },
+    {
+      "sql": "CREATE OR REPLACE FUNCTION normalize_named_status(other_name text) RETURNS text LANGUAGE sql AS $$SELECT lower(other_name)$$",
+      "sqlstate": "42P13"
+    },
+    {
+      "sql": "CREATE FUNCTION missing_argument(text) RETURNS text LANGUAGE sql AS $$SELECT $2$$",
+      "sqlstate": "42P02"
+    },
+    {
+      "sql": "SELECT normalize_status()",
+      "sqlstate": "42883"
+    },
+    {
+      "sql": "SELECT shift_amount(1)",
+      "sqlstate": "42883"
+    }
+  ],
+  "overload": {
+    "sql": "SELECT normalize_status('ReAdY') AS value, normalize_status(2.25)::text AS amount",
+    "output": {
+      "columns": [
+        "value",
+        "amount"
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "rows": [
+        [
+          "ready",
+          "3.25"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ]
+    }
+  },
+  "replaced": {
+    "columns": [
+      "value",
+      "absent"
+    ],
+    "column_oids": [
+      25,
+      25
+    ],
+    "rows": [
+      [
+        "READY",
+        null
+      ]
+    ],
+    "sql_nulls": [
+      [
+        false,
+        true
+      ]
+    ]
+  }
+}

@@ -47,26 +47,41 @@ pub fn runPage(
     ranges: []const records.RangeRecord,
     owner: records.RangeRecord,
 ) !bool {
+    return runPageMode(alloc, reader, writer, tables, ranges, owner, null, .{});
+}
+
+pub fn runForeignKeyValidationPage(alloc: Allocator, reader: reads.TableReadSource, writer: writes.TableWriteSource, tables: []const records.TableRecord, ranges: []const records.RangeRecord, owner: records.RangeRecord, id: [16]u8) !bool {
+    return runPageMode(alloc, reader, writer, tables, ranges, owner, id, .{});
+}
+
+pub fn runForeignKeyValidationPageControlled(alloc: Allocator, reader: reads.TableReadSource, writer: writes.TableWriteSource, tables: []const records.TableRecord, ranges: []const records.RangeRecord, owner: records.RangeRecord, id: [16]u8, request: RequestContext) !bool {
+    return runPageMode(alloc, reader, writer, tables, ranges, owner, id, request);
+}
+
+fn runPageMode(alloc: Allocator, reader: reads.TableReadSource, writer: writes.TableWriteSource, tables: []const records.TableRecord, ranges: []const records.RangeRecord, owner: records.RangeRecord, validation_id: ?[16]u8, request: RequestContext) !bool {
+    var control = try request.platformDeadline();
+    try control.ensureActive();
     const table = for (tables) |table| {
         if (table.table_id == owner.table_id) break table;
     } else return false;
     if (owner.restore_backup_id.len != 0 or !try planner.requiresActivation(alloc, table.schema_json)) return false;
-    const deadline = time.monotonicNs() +| 5 * std.time.ns_per_s;
-    const control: RequestContext = .{
-        .deadline_ns = deadline,
-        .cancellation = .{ .ptr = &deadline, .is_cancelled_fn = struct {
-            fn expired(ptr: *const anyopaque) bool {
-                const value: *const u64 = @ptrCast(@alignCast(ptr));
-                return time.monotonicNs() >= value.*;
-            }
-        }.expired },
+    const Deadline = struct {
+        parent: CancellationToken,
+        at: u64,
+        fn expired(ptr: *const anyopaque) bool {
+            const value: *const @This() = @ptrCast(@alignCast(ptr));
+            return value.parent.isCancelled() or time.monotonicNs() >= value.at;
+        }
     };
+    const deadline: Deadline = .{ .parent = control.cancellation, .at = @min(control.deadline_ns orelse std.math.maxInt(u64), time.monotonicNs() +| 5 * std.time.ns_per_s) };
+    control.deadline_ns = deadline.at;
+    control.cancellation = .{ .ptr = &deadline, .is_cancelled_fn = Deadline.expired };
     var budget: AdaptiveBudget = .{};
     // At most seven reductions reach a one-row page. Every attempt retains
     // the same absolute deadline; no cursor advances until its complete 2PC.
     for (0..8) |_| {
         try control.ensureActive();
-        switch (try runAttempt(alloc, reader, writer, tables, ranges, table.name, owner.start_key, &budget, control)) {
+        switch (try runAttempt(alloc, reader, writer, tables, ranges, table.name, owner.start_key, &budget, validation_id, control)) {
             .idle => return false,
             .progressed => return true,
             .shrink => continue,
@@ -78,6 +93,8 @@ pub fn runPage(
 fn deterministicValidationFailure(err: anyerror) bool {
     return switch (err) {
         error.UniqueConstraintViolation,
+        error.TemporalOverlapViolation,
+        error.TemporalEmptyRange,
         error.ForeignKeyParentMissing,
         error.ForeignKeyMatchFullViolation,
         error.RelationalCheckViolation,
@@ -91,8 +108,8 @@ fn deterministicValidationFailure(err: anyerror) bool {
     };
 }
 
-fn runAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: writes.TableWriteSource, tables: []const records.TableRecord, ranges: []const records.RangeRecord, table_name: []const u8, range_key: []const u8, budget: *AdaptiveBudget, control: RequestContext) !Attempt {
-    const request_json = try std.json.Stringify.valueAlloc(alloc, .{ .mode = "page", .max_rows = budget.rows }, .{});
+fn runAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: writes.TableWriteSource, tables: []const records.TableRecord, ranges: []const records.RangeRecord, table_name: []const u8, range_key: []const u8, budget: *AdaptiveBudget, validation_id: ?[16]u8, control: RequestContext) !Attempt {
+    const request_json = try std.json.Stringify.valueAlloc(alloc, .{ .mode = if (validation_id != null) "validation_page" else "page", .max_rows = budget.rows, .validation_id = validation_id }, .{ .emit_null_optional_fields = false });
     defer alloc.free(request_json);
     var response = (try reader.lookup(alloc, table_name, range_key, .{ .relational_activation_json = request_json, .execution_deadline_ns = control.deadline_ns, .cancellation = control.cancellation }, .read_index)) orelse return .idle;
     defer response.deinit(alloc);
@@ -100,9 +117,14 @@ fn runAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: writes.Ta
         rows: []planner.BackfillRow,
         command: activation.Command,
         phase: activation.Phase,
+        constraints: []const []const u8 = &.{},
     }, alloc, response.json, .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    const progress = try activation.Progress.decode(parsed.value.command.next);
+    if (validation_id) |id| {
+        const scope = parsed.value.command.validation orelse return error.SchemaValidationJobChanged;
+        if (!std.mem.eql(u8, &scope.binding.id, &id) or scope.action != .page or parsed.value.constraints.len != scope.binding.columns) return error.SchemaValidationJobChanged;
+    } else if (parsed.value.command.validation != null) return error.SchemaValidationJobChanged;
+    const progress = try activation.commandProgress(parsed.value.command, parsed.value.command.next);
     if (progress.state == .invalid) {
         // The native reader may diagnose an individually oversized source
         // row before projecting it. Its failure envelope retains the exact
@@ -115,11 +137,20 @@ fn runAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: writes.Ta
         .foreign_key => .foreign_key,
         .check => .check,
     };
-    var prepared = planner.prepareBackfillWithCoverageControlled(alloc, reader, tables, ranges, table_name, parsed.value.rows, phase, control) catch |err| {
+    var prepared = (if (validation_id != null)
+        planner.prepareForeignKeyValidationPage(alloc, reader, tables, ranges, table_name, parsed.value.rows, parsed.value.constraints, control)
+    else
+        planner.prepareBackfillWithCoverageControlled(alloc, reader, tables, ranges, table_name, parsed.value.rows, phase, control)) catch |err| {
         // Parent UNIQUE coverage is a dependency, not a failed child row.
         // Yield without advancing this checkpoint so parent repair/validation
         // can run before a later supervisor tick retries this page.
         if (err == error.ConstraintActivationPending) return .idle;
+        // Page-local expression admission is shared across rows. Retry a
+        // smaller page, but never persist quota exhaustion as an invalid row.
+        if (err == error.RelationalExpressionBudgetExceeded) {
+            if (budget.shrink(parsed.value.rows.len)) return .shrink;
+            return err;
+        }
         // A repeated absence diagnostic is not progress. The next supervisor
         // tick (or embedded call) rechecks it, while admitting guarded repairs.
         if (err == error.ForeignKeyParentMissing and progress.state == .validating and std.mem.eql(u8, progress.failure, "ForeignKeyParentMissing")) return .idle;
@@ -143,10 +174,10 @@ fn runAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: writes.Ta
         // Keep all physical source observations in this same transaction.
         // Concurrent repair (even with an unchanged timestamp) cannot publish
         // a stale failed CHECK, and no rejected page advances coverage.
-        var failed = try activation.Progress.decode(parsed.value.command.expected orelse return error.ConstraintActivationChanged);
+        var failed = try activation.commandProgress(parsed.value.command, parsed.value.command.expected orelse return error.ConstraintActivationChanged);
         failed.state = .invalid;
         failed.failure = failure;
-        source.relational_activation.?.next = try failed.encode(prepared.arena.allocator());
+        source.relational_activation.?.next = try activation.encodeCommandProgress(prepared.arena.allocator(), parsed.value.command, failed);
     }
     try control.ensureActive();
     const outcome = writer.commitBatchWithCancellation(alloc, requests, .write, control.cancellation) catch |err| {
@@ -186,13 +217,14 @@ pub fn recordFailure(alloc: Allocator, reader: reads.TableReadSource, writer: wr
     // MATCH PARTIAL absence comes from an index-range read, not an exact
     // claim. Without a durable negative predicate it is a retryable diagnostic,
     // never evidence for terminal INVALID. A later parent insert can resolve it.
-    var progress = try activation.Progress.decode(command.expected orelse return error.ConstraintActivationChanged);
+    var progress = try activation.commandProgress(command, command.expected orelse return error.ConstraintActivationChanged);
     // Rechecks remain bounded by the supervisor, but an unchanged diagnostic
     // must not generate another distributed transaction / Raft log record.
     if (diagnostic and std.mem.eql(u8, progress.failure, "ForeignKeyParentMissing")) return;
     progress.state = if (diagnostic) .validating else .invalid;
     progress.failure = if (diagnostic) "ForeignKeyParentMissing" else failure;
-    const encoded = try progress.encode(alloc);
+    if (command.validation != null and diagnostic) return error.ConstraintActivationChanged;
+    const encoded = try activation.encodeCommandProgress(alloc, command, progress);
     defer alloc.free(encoded);
     var failed = command;
     failed.next = encoded;

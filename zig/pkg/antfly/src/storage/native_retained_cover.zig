@@ -45,7 +45,7 @@ pub const Owner = struct {
         const dbs = try a.alloc(?db_mod.DB, cut.cover.len);
         @memset(dbs, null);
         for (ranges, cut.cover) |*range, origin| range.* = .{ .table_id = cut.table_id, .group_id = origin.group_id, .range_id = origin.namespace.range_id, .doc_identity_shard_id = origin.namespace.shard_id, .doc_identity_range_id = origin.namespace.range_id, .start_key = origin.start_key, .end_key = origin.end_key };
-        return .{ .alloc = a, .carrier = carrier, .cut = cut, .table = .{.{ .table_id = cut.table_id, .name = table_name, .schema_json = recipe.schema_json, .read_schema_json = recipe.read_schema_json, .indexes_json = recipe.indexes_json }}, .ranges = ranges, .dbs = dbs, .cancellation = cancellation };
+        return .{ .alloc = a, .carrier = carrier, .cut = cut, .table = .{.{ .full_text_read_index = recipe.full_text_read_index, .table_id = cut.table_id, .name = table_name, .schema_json = recipe.schema_json, .read_schema_json = recipe.read_schema_json, .indexes_json = recipe.indexes_json }}, .ranges = ranges, .dbs = dbs, .cancellation = cancellation };
     }
     pub fn deinit(self: *Owner) void {
         for (self.dbs) |*db| if (db.*) |*opened| opened.close();
