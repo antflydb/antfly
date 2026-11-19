@@ -1523,14 +1523,11 @@
   ],
   "status": {
     "all_modality_performance_target_achieved": false,
-    "pr_ready": false,
-    "remaining": [
-      "Complete repeated matched comparison and report median and p95 without requiring every case to beat llama.cpp",
-      "Finish final diff and applicable CI review",
-      "Document explicit qualified L4 profile and keep PR performance claims scoped to measured workers and inputs"
-    ],
+    "pr_ready": true,
+    "remaining": [],
     "pr_scope": "Qualified opt-in L4 improvements and approximate llama.cpp latency parity; broader all-modality superiority remains a separate performance goal",
-    "clear_win_guardrail": "At least5% lower median latency and no p95 regression is the threshold for a clear-win claim, not a prerequisite for landing qualified improvements"
+    "clear_win_guardrail": "At least5% lower median latency and no p95 regression is the threshold for a clear-win claim, not a prerequisite for landing qualified improvements",
+    "pr_readiness_scope": "Ready for review as qualified opt-in L4 correctness/performance improvements and approximate llama.cpp parity; broader all-modality superiority remains unmet"
   },
   "ple_differential": {
     "tensor": "blk.0.inp_gate.weight",
@@ -5083,8 +5080,9 @@
     "worker_sha256": "ae83452925cb4d67e50df926445a1050c1db5c1dc40e33fe88f979cc4bcb6b6a",
     "model_qualified": true,
     "all_modality_speed_target_achieved": false,
-    "scope": "Integrated small-tile source worker; 8/8 numerical and585 decisions; new FFN/PLE host launch submissions on every measured request; final performance qualification pending",
-    "sha256": "09c1b1ac1f01a23e18ae119ff2dc9ec684a3fe2bc203214d2e0872f0fa6642de"
+    "scope": "Explicit L4 profile:8/8 numerical gates,585 official decisions checked in every timed native row; completed3-round comparison shows approximate llama.cpp parity and a video win",
+    "sha256": "09c1b1ac1f01a23e18ae119ff2dc9ec684a3fe2bc203214d2e0872f0fa6642de",
+    "comparison_qualified": true
   },
   "short_prefill_rejected": {
     "label": "short-hmma",
@@ -8201,5 +8199,759 @@
       "equivalence_proof_sha256": "ac472f7c55dda4ca95382116c37faffcd79e1c4bd89577ce7a52d107997544b5",
       "result": "Already the model default; all8 full vectors and768 tokens match V12; no source change, promotion, or speed claim"
     }
+  },
+  "final_performance_qualification": {
+    "scope": "Completed matched comparison of the explicit qualified L4 profile; three rotated engine-order rounds, two timed calls/case/engine per round; fixed budgets and correctness gates unchanged",
+    "source": "evidence/speed-small-decode-final-comparison/summary.json",
+    "source_sha256": "fcab6c7fa6d55636eb3967290de65f5820cb60c48f2ba10e282f15b5fc777d34",
+    "worker_sha256": "ae83452925cb4d67e50df926445a1050c1db5c1dc40e33fe88f979cc4bcb6b6a",
+    "runtime_source_checkpoint": "5a7d9f7e29",
+    "profile_sha256": "09c1b1ac1f01a23e18ae119ff2dc9ec684a3fe2bc203214d2e0872f0fa6642de",
+    "measurement_valid": true,
+    "rounds": 3,
+    "timed_samples_per_case_engine": 6,
+    "native_measured_rows": 48,
+    "numerical_gates_pass": 8,
+    "unique_transformers_decisions": 585,
+    "transformers_prefix_comparisons": 3510,
+    "all_native_repeated_sequences_stable": true,
+    "raw_results_sha256": {
+      "evidence/speed-small-decode-final-comparison/r0-native/result.json": "f3ddd56967e8755b147df31a7363772234e1b3f5d4cbdef6a3b291ff9d1da78c",
+      "evidence/speed-small-decode-final-comparison/r0-llama/run/result.json": "d5d91d3853c60a774c4f3faf30ba1d1ee6161657aeddfba9da845fd315ac11bf",
+      "evidence/speed-small-decode-final-comparison/r0-pjrt/result.json": "a9f6f120911210f4193747c7a1aa6fbaeb90a3c9511103319712ac8fa908e1da",
+      "evidence/speed-small-decode-final-comparison/r1-native/result.json": "eff4dd84c2503b802be474c4f8164e736234687157574dd11cb8812555098b52",
+      "evidence/speed-small-decode-final-comparison/r1-llama/run/result.json": "0c55b59a6c0f9b68662500e6b094e25b285ba2c41a86c76f382d6f161fa87ae1",
+      "evidence/speed-small-decode-final-comparison/r1-pjrt/result.json": "b3edd202a6117ee4ebac1a2abb35f06501438cc312b72fdcf01cb254d71fc905",
+      "evidence/speed-small-decode-final-comparison/r2-native/result.json": "30c3a85ac3b96be8c0bb46ec7b175507bdef75ed968c6791deed5ee59208dfcf",
+      "evidence/speed-small-decode-final-comparison/r2-llama/run/result.json": "0b69d52dc3f548907b71f31d28fe10452899efa8df218f366332c69294930de8",
+      "evidence/speed-small-decode-final-comparison/r2-pjrt/result.json": "c9b5480702bbf5ff226b7c267fd9c73f336186ea6d5f42de3296deeb74fa5259"
+    },
+    "acceptance": {
+      "gpu": "NVIDIA L4, 580.159.03, 8.9, 23034 MiB",
+      "rounds": 3,
+      "iterations": 2,
+      "warmups": 1,
+      "common_case_ids": [
+        "text_short_256",
+        "page_summary_128",
+        "long2k_summary_64",
+        "image_64",
+        "audio_1s_64",
+        "audio_12s_64",
+        "audio_30s_64",
+        "video_6s_64"
+      ],
+      "orders": [
+        [
+          "native",
+          "pjrt",
+          "llama"
+        ],
+        [
+          "llama",
+          "pjrt",
+          "native"
+        ],
+        [
+          "pjrt",
+          "native",
+          "llama"
+        ]
+      ],
+      "native_environment": {
+        "ANTFLY_INFERENCE_CUDA_GEMMA4_IMAGE_BICUBIC": "1",
+        "ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_SWSCALE_RGB": "1",
+        "ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_COMPACT": "1",
+        "ANTFLY_INFERENCE_CUDA_GEMMA4_VISION_F16": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_PLE_GATE_FUSION": "0",
+        "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+        "ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL": "1",
+        "ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL_TERMS": "2",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL": "1",
+        "ANTFLY_INFERENCE_CUDA_GEMMA4_AUDIO_RESIDENT_LAYOUTS": "1",
+        "ANTFLY_INFERENCE_CUDA_RMS_Q8_1_MIRROR": "1",
+        "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "32",
+        "ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_LOSSLESS_F16": "1",
+        "ANTFLY_INFERENCE_CUDA_GEMMA4_SMALL_DECODE_TILES": "1"
+      },
+      "harness_sha256": {
+        "compare_gemma4.py": "6fda160f5521fd41de028e08ce6b4b329444f823723a69c3716d32736b0a2135",
+        "benchmark_gemma4.py": "a3939740c3ef539205ae5c397d8bffe12267c351c5f8a7feabbc9c00ebefe273",
+        "gemma4_inputs.py": "27a3faa0c5f0e55596371352724ed767958419554bae71c2a7c4b60b5e8911cb",
+        "validate_gemma4.py": "47883782db8df53cef04e6ddf46f143dff18c380ad78742a08dfb32e274a1d64",
+        "memory.py": "e4ff4888161711f15759a50793fa6789f5d9392beed67fde91c014478b4614bc"
+      },
+      "native_draft_model": null,
+      "required_native_speculation": false,
+      "cpu_vector_sha256": {
+        "text_short_256": "da2d68f0028f8740ea42d131c50c38c8f8c175dc5fcfaa7a9d351af4ca79250e",
+        "page_summary_128": "ce9c8cec091ab9f25951aa4273cbfa7383b6eb2f8669ec0a3ca95e06e3b4e65b",
+        "long2k_summary_64": "ae2bff9b3ce57d4db59577dd0b0a43045bf90e83dea54b67ad108a6315e41911",
+        "image_64": "f2f0ebdecd267b70799ea85730a01be2a3776068361501df4833e875c937e631",
+        "audio_1s_64": "1ec0842cc7f9be8cc6a4cb463c26e362e7eebf2ea22c5a9b52a0667c5998cb30",
+        "audio_12s_64": "283397a3a2269194bf4f1fe1c10d5eb89167f7510e4641e671696a906c961faa",
+        "audio_30s_64": "449e2855134c16bf45f09d6580e7fc1e81cd389e4703394857c198e4aa1f40c6",
+        "video_6s_64": "19c687477c5ff706d17f58e6fc158ae2e5c3e4658cdec6b0b1d3379b114ca779"
+      },
+      "cpu_qualification_sha256": "958bed931a876697db87f0c8540d53424c3f71c757acfffc74103f5b24a062e6",
+      "native_baseline": null,
+      "ambient_runtime_environment": {
+        "LD_LIBRARY_PATH": "/home/timkaye/tim/antfly/.worktrees/perf-gemma4-pjrt-cuda/../perf-gemma4-cuda/.venv-xla-current/lib/python3.11/site-packages/nvidia/cudnn/lib:/home/timkaye/tim/antfly/.worktrees/perf-gemma4-pjrt-cuda/.tools/llama-runtime/cuda12/cudart-llama-b11669-bin-ubuntu-cuda-12.8-x64:/usr/local/cuda/lib64"
+      },
+      "required_native_stats": [
+        "rms_norm_q8_1_mirror_hits",
+        "bf16_mirror_weight_count",
+        "gemma4_projector_f16_weight_count"
+      ],
+      "required_native_media_stats": [
+        "gemma4_projector_residual_calls",
+        "gemma4_projector_f16_calls"
+      ],
+      "required_native_kind_stats": [
+        "audio=gemma4_audio_resident_layout_calls",
+        "text=gemma4_small_ffn_calls",
+        "text=gemma4_small_ple_calls",
+        "image=gemma4_small_ffn_calls",
+        "image=gemma4_small_ple_calls",
+        "audio=gemma4_small_ffn_calls",
+        "audio=gemma4_small_ple_calls",
+        "video=gemma4_small_ffn_calls",
+        "video=gemma4_small_ple_calls"
+      ],
+      "native_decisions_reference_sha256": "f5036cf0790fd6ffa6c7cd66343eced1ca5cbd96a4f0aeeea26526b982a56d1a",
+      "files": {
+        "native": "ae83452925cb4d67e50df926445a1050c1db5c1dc40e33fe88f979cc4bcb6b6a",
+        "runner": "5ade51842111c13b7b19471738be6e980442b103f04bbb00346c72b185cd1864",
+        "plugin": "bb8f2dbb4eed2c5d3a128d919f651069f803dac809719c7cda8254aba20bfdce",
+        "gguf": "676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee",
+        "mmproj": "7498a37cb619e55f2fcf87eb931f56e99389ed6d432e4c5c66110694c0d65578",
+        "tokenizer": "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4",
+        "template": "0a2c8073c878ab1da004bee933a998606537bbb62016310352c7285c3f01c5b5",
+        "suite": "f9ab14d24d5bec4544ae87e127e24aa07dbab45ff46d7a71e2c1fa6d580c333c",
+        "manifest": "141baae2b997960ffb351151b0e240d0babbb0bc785eec698378ec2d530c5ec7",
+        "llama_runner": "e2d9fff3166ecbf038eaf9619a86844d805e9f8c6e016de4df21f483c5252778"
+      },
+      "llama_libraries": {
+        "libggml-cpu-piledriver.so": "52a0e384a96e22f6df735dc0fe964c397a5ddb5507208662086cd0f07fbfb5b5",
+        "libggml-cpu-cannonlake.so": "7ac66c6c694407e2813a92046857b439d96f42c4a8b7e8b95fd7424d9e6247c0",
+        "libllama.so": "896bc373c1aaa3769f8bea2c7f88b85250882825f4546419d2f27e866c8b1d1b",
+        "libggml-cpu-sapphirerapids.so": "6918c87f54ad0c4503a2abc7ee4a7861e155853201fd2bcd4b7978b5cdc2ba17",
+        "libggml-cpu-haswell.so": "00796a07ce18e0b094b6f6ad1512503cd8d78960f4024afb0c6d8e10b10e4aae",
+        "libllama-batched-bench-impl.so": "1467686502325a63d803ced2326b061660c0f4d40babaa9f540fac0e45310567",
+        "libggml-rpc.so": "8614d89848753f595d4f71c0c35c74607f2bfdae822e44b3e6b18f70b39e043b",
+        "libggml-cpu-icelake.so": "2ec38afdee451f0979973615d8652adb030cd92625d63f1fa93b26b97d7f334c",
+        "libllama-common.so": "89de0d1c3f3f54257bbf5fa09945645fa79ba2dd2886d17f9eefd2000eb86d9e",
+        "libllama-bench-impl.so": "4320461e1f14be3e7731253da535c12cc0e9ba62b5b81127eda8d9d35c07fbf8",
+        "libmtmd.so": "9038f1304eea23d24ca939f4c02c1eae3d912843278c11202176a7d391e83a61",
+        "libggml-cpu-alderlake.so": "f70508ef7eabd2831b42402ab5e980fede2b2165a5bc1b21181629c854db9aa6",
+        "libllama-completion-impl.so": "d08d113cc531f58af5c3cc02a90c6d873cda8deebcd28e52b6ea6f7b3d6a5794",
+        "libggml-cpu-sandybridge.so": "66594b06eadfccbaa8daa3c671494eb052f6b04a3f7a629cfe24734228907e10",
+        "libggml-cuda.so": "c1b8241d86115cbd47f0fa2961132571b3cea299e98884962f90b054b6488a36",
+        "libggml-cpu-sse42.so": "4ac3b148ce03ac3f1ce70249041890e1270620e3f7c7472ad35d924dd8ae61c8",
+        "libllama-cli-impl.so": "fd37cf77959f371e6b84484ca0d782ac4c5ba4b45c4e91136a694bd521c11158",
+        "libllama-quantize-impl.so": "e165409b432cacd4c61c4e2c1031a220b5f0207a2710731c5a15a6061901cc38",
+        "libllama-perplexity-impl.so": "a6aee68e6f337b4add73bfbfefa8880a0103e737eef966a3c9b7b98a0af3019e",
+        "libggml-base.so": "c0417023aac430d52636de7a7465cab1963406799377252975794d519ce04020",
+        "libggml-cpu-ivybridge.so": "ba20a8d511f30856206acf2742e4094fc55dcec0fa70d0201c32091809f1cae9",
+        "libggml.so": "543a065a12a6bfa7a99e0d98ea35fe68c7944c404e1f3d1849292e7b29812db7",
+        "libggml-cpu-cooperlake.so": "b85a940fdc229b136dd63ffa4cab2d37d01cd05f0acf2ebe3c8c60a8102c713d",
+        "libllama-server-impl.so": "a0827af4e84293112feff67d204ee83689ca70e09c5c324c2be021f468d44c59",
+        "libggml-cpu-cascadelake.so": "ed038cdb8ee7a8373fbc13efe8a6e66eeb7db03978e0011fdb3b7a8768a10ff4",
+        "libggml-cpu-x64.so": "61fa17b323b388593f7dd5b5fa19eeab1e4adf325ee2983b12d6dda64c549559",
+        "libllama-fit-params-impl.so": "a1f72a9a48d59cbb4a30231a9410f03fa347bce175a7d376c5a5d7436c16af99",
+        "libggml-cpu-skylakex.so": "2bfa916a2b4dd04a7bb50ece30035929dcd5a25f493b1315b6a961a0490a7cdf",
+        "libggml-cpu-zen4.so": "41f7b1d991f62c7f065261f733911ee881f47e8b5ffa55053debbcac1be5d80f"
+      },
+      "configured_runtime_libraries_sha256": {
+        "/home/timkaye/tim/antfly/.worktrees/perf-gemma4-pjrt-cuda/.tools/llama-runtime/cuda12/cudart-llama-b11669-bin-ubuntu-cuda-12.8-x64/libcublas.so.12": "18a5df540d156e9aff0363776fefab7884b614f122847b51c3eb1da772048e5c",
+        "/home/timkaye/tim/antfly/.worktrees/perf-gemma4-pjrt-cuda/.tools/llama-runtime/cuda12/cudart-llama-b11669-bin-ubuntu-cuda-12.8-x64/libcublasLt.so.12": "974927b9af78cadc0412ea3ab296da791af02c2dd0de5a35b5f0fbb8dc5d0a4d",
+        "/home/timkaye/tim/antfly/.worktrees/perf-gemma4-pjrt-cuda/.tools/llama-runtime/cuda12/cudart-llama-b11669-bin-ubuntu-cuda-12.8-x64/libcudart.so.12": "c3a75b33af334a3486d197dbd1584a2985183ba4688d237a2be5f2f679329920",
+        "/home/timkaye/tim/antfly/.worktrees/perf-gemma4-pjrt-cuda/.tools/llama-runtime/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2": "c8438e4fde1934e61c88311633f00949ff645d5c04cdb8671fa3d78164d2f307",
+        "/home/timkaye/tim/antfly/.worktrees/perf-gemma4-pjrt-cuda/.tools/llama-runtime/usr/lib/x86_64-linux-gnu/libc.so.6": "9792e3cbb541c8f44c7acf5f14f4022ea62998ecc787d326bed4d8b6547dfd92",
+        "/home/timkaye/tim/antfly/.worktrees/perf-gemma4-pjrt-cuda/.tools/llama-runtime/usr/lib/x86_64-linux-gnu/libgcc_s.so.1": "30c61ab012a4241bed033725a09b61f5fdd3bb7df95ee852d0b096520524c7af",
+        "/home/timkaye/tim/antfly/.worktrees/perf-gemma4-pjrt-cuda/.tools/llama-runtime/usr/lib/x86_64-linux-gnu/libgomp.so.1.0.0": "6456b504ac347bd50c419667440b691f6966ad8aff5309d2f06c977fe2f9debe",
+        "/home/timkaye/tim/antfly/.worktrees/perf-gemma4-pjrt-cuda/.tools/llama-runtime/usr/lib/x86_64-linux-gnu/libm.so.6": "6d567d53e895273ca14a1f9dc164fc6c8d39aed2f60aa46a733c2784228915f3",
+        "/home/timkaye/tim/antfly/.worktrees/perf-gemma4-pjrt-cuda/.tools/llama-runtime/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33": "972bb2a18b71140dab0240f8a1f68ab3fb1d56bcd4c4f824a91b70888faf5a00",
+        "/usr/local/cuda-13.2/targets/x86_64-linux/lib/libcublas.so.13.4.0.1": "5589b43e2aae4790ccb2abd22733eae0b6d4fe9503dcc4dbfe219fd857ddac41",
+        "/usr/local/cuda-13.2/targets/x86_64-linux/lib/libcublasLt.so.13.4.0.1": "ac76bbb85d74313bba0d71029c71389616205f4018c8ff31d57c38f6e61100bd",
+        "/usr/local/cuda-13.2/targets/x86_64-linux/lib/libcudart.so.13.2.75": "c7eaa64c99c20484b7401352aff99a8c5ab947abaab3a9bbb70142312da1fe18"
+      },
+      "llama_inputs": {
+        "video_6s_64.prompt": "64c3fe96f3efb59250b3d836065250e252aacee9696dc240d715f27a3b1bbc61",
+        "audio_1s_64.prompt": "adb7be8b7b440439ed1b04f0aeae89eba717a4706b0d6efd4376279a9ab97c32",
+        "cases.tsv": "d33c32e72bfcc8715263e9e6fb272a041e9978bce87ef5ceac70c44420663f03",
+        "long2k_summary_64.prompt": "8e98f456155b7edf7dc99ac3f9c22bbe18b8b425b2648913201e9ec2cd4a0cf3",
+        "image_64.prompt": "2a13351338a85383ba82f58c0ffdffa94e44adef8c2c14908f475b72cd2d49a4",
+        "audio_30s_64.prompt": "adb7be8b7b440439ed1b04f0aeae89eba717a4706b0d6efd4376279a9ab97c32",
+        "text_short_256.prompt": "e83505a03d3d5151d860fe055eb84fa2aac620ba78765855b98c782a3adf1b5a",
+        "page_summary_128.prompt": "0a461f6684240c0986955c91d7cf495ec8ff0c36844b6947872579de4f37aa1f",
+        "audio_12s_64.prompt": "adb7be8b7b440439ed1b04f0aeae89eba717a4706b0d6efd4376279a9ab97c32"
+      },
+      "reference_identities": [
+        {
+          "version": "5.23.0",
+          "modeling_sha256": "c951ebdc3eaa071c715df656614936884b5ef06717680e7acfff56bc2d6adb0f",
+          "forward_module": "transformers.models.gemma4.modeling_gemma4"
+        },
+        {
+          "version": "5.23.0",
+          "modeling_sha256": "c951ebdc3eaa071c715df656614936884b5ef06717680e7acfff56bc2d6adb0f",
+          "forward_module": "transformers.models.gemma4.modeling_gemma4"
+        }
+      ],
+      "scope_difference": "llama starts with a pre-rendered prompt and excludes output text decoding; native includes both; no HTTP or cold load/compile in either timing",
+      "winner_guardrail": "native median <=0.95 * competitor median and native p95 <= competitor p95; accuracy reported separately"
+    },
+    "results": [
+      {
+        "id": "text_short_256",
+        "samples_ms": {
+          "native": [
+            3593.766019,
+            3595.137956,
+            3617.20758,
+            3620.202254,
+            3615.221138,
+            3617.892471
+          ],
+          "llama": [
+            3638.214467,
+            3635.586055,
+            3625.779686,
+            3628.883038,
+            3630.645207,
+            3628.186083
+          ],
+          "pjrt": [
+            11646.511682018172,
+            11654.450902016833,
+            11936.93532794714,
+            11854.401663003955,
+            11601.759761979338,
+            11577.393765968736
+          ]
+        },
+        "median_ms": {
+          "native": 3616.2143589999996,
+          "llama": 3629.7641224999998,
+          "pjrt": 11650.481292017503
+        },
+        "p95_ms": {
+          "native": 3619.6248082499997,
+          "llama": 3637.557364,
+          "pjrt": 11916.301911711344
+        },
+        "native_speedup": {
+          "llama": 1.0037469469878846,
+          "pjrt": 3.2217341494211746
+        },
+        "native_latency_win": {
+          "llama": false,
+          "pjrt": true
+        }
+      },
+      {
+        "id": "page_summary_128",
+        "samples_ms": {
+          "native": [
+            1868.969765,
+            1870.472635,
+            1882.755809,
+            1876.507904,
+            1882.264651,
+            1880.638041
+          ],
+          "llama": [
+            1898.781431,
+            1897.347722,
+            1891.352649,
+            1895.427125,
+            1897.405703,
+            1897.652304
+          ],
+          "pjrt": [
+            5984.968242002651,
+            5952.602232981008,
+            6019.826977048069,
+            6012.388497998472,
+            5880.745047994424,
+            5950.650462997146
+          ]
+        },
+        "median_ms": {
+          "native": 1878.5729725,
+          "llama": 1897.3767125,
+          "pjrt": 5968.785237491829
+        },
+        "p95_ms": {
+          "native": 1882.6330195,
+          "llama": 1898.49914925,
+          "pjrt": 6017.96735728567
+        },
+        "native_speedup": {
+          "llama": 1.0100095872107517,
+          "pjrt": 3.1772975151178637
+        },
+        "native_latency_win": {
+          "llama": false,
+          "pjrt": true
+        }
+      },
+      {
+        "id": "long2k_summary_64",
+        "samples_ms": {
+          "native": [
+            1177.716411,
+            1175.656402,
+            1202.46798,
+            1182.786006,
+            1185.592136,
+            1183.674277
+          ],
+          "llama": [
+            1200.627793,
+            1199.256481,
+            1201.829405,
+            1199.068648,
+            1198.554486,
+            1205.059058
+          ],
+          "pjrt": [
+            3143.35230801953,
+            3149.8893940006383,
+            3181.0029160114937,
+            3186.132139991969,
+            3077.166570001282,
+            3112.148115003947
+          ]
+        },
+        "median_ms": {
+          "native": 1183.2301415000002,
+          "llama": 1199.942137,
+          "pjrt": 3146.620851010084
+        },
+        "p95_ms": {
+          "native": 1198.2490189999999,
+          "llama": 1204.25164475,
+          "pjrt": 3184.84983399685
+        },
+        "native_speedup": {
+          "llama": 1.0141240447769644,
+          "pjrt": 2.6593481188884027
+        },
+        "native_latency_win": {
+          "llama": false,
+          "pjrt": true
+        }
+      },
+      {
+        "id": "image_64",
+        "samples_ms": {
+          "native": [
+            1055.989571,
+            1055.360661,
+            1064.49931,
+            1063.995322,
+            1063.21269,
+            1063.472037
+          ],
+          "llama": [
+            1050.201199,
+            1048.180399,
+            1051.385449,
+            1049.034773,
+            1051.025143,
+            1049.707249
+          ],
+          "pjrt": [
+            3049.008482019417,
+            3065.7535240170546,
+            3088.4027350111865,
+            3070.8110770210624,
+            2993.468346016016,
+            3023.5720860073343
+          ]
+        },
+        "median_ms": {
+          "native": 1063.3423635,
+          "llama": 1049.954224,
+          "pjrt": 3057.381003018236
+        },
+        "p95_ms": {
+          "native": 1064.373313,
+          "llama": 1051.2953725000002,
+          "pjrt": 3084.0048205136554
+        },
+        "native_speedup": {
+          "llama": 0.9874093801210622,
+          "pjrt": 2.8752555225532834
+        },
+        "native_latency_win": {
+          "llama": false,
+          "pjrt": true
+        }
+      },
+      {
+        "id": "audio_1s_64",
+        "samples_ms": {
+          "native": [
+            967.785354,
+            959.402618,
+            970.717389,
+            963.171262,
+            964.300249,
+            961.92115
+          ],
+          "llama": [
+            949.779549,
+            944.060546,
+            948.090852,
+            943.134625,
+            948.865866,
+            943.705011
+          ],
+          "pjrt": [
+            2902.1141149569303,
+            2902.741394005716,
+            2966.878134990111,
+            2941.824075009208,
+            2860.1864560041577,
+            2858.927960973233
+          ]
+        },
+        "median_ms": {
+          "native": 963.7357555,
+          "llama": 946.075699,
+          "pjrt": 2902.427754481323
+        },
+        "p95_ms": {
+          "native": 969.98438025,
+          "llama": 949.5511282499999,
+          "pjrt": 2960.6146199948853
+        },
+        "native_speedup": {
+          "llama": 0.9816754163169574,
+          "pjrt": 3.011642701764761
+        },
+        "native_latency_win": {
+          "llama": false,
+          "pjrt": true
+        }
+      },
+      {
+        "id": "audio_12s_64",
+        "samples_ms": {
+          "native": [
+            1002.924205,
+            1004.412194,
+            1004.920262,
+            1004.072899,
+            1002.865017,
+            1003.417294
+          ],
+          "llama": [
+            1003.735619,
+            1001.70009,
+            1005.147489,
+            1004.571637,
+            1004.679185,
+            1005.277773
+          ],
+          "pjrt": [
+            2978.502459009178,
+            2956.7141030565836,
+            2988.3242800133303,
+            2971.2918929872103,
+            2944.531157030724,
+            2924.427530961111
+          ]
+        },
+        "median_ms": {
+          "native": 1003.7450965,
+          "llama": 1004.625411,
+          "pjrt": 2964.002998021897
+        },
+        "p95_ms": {
+          "native": 1004.793245,
+          "llama": 1005.2452020000001,
+          "pjrt": 2985.868824762292
+        },
+        "native_speedup": {
+          "llama": 1.000877029938248,
+          "pjrt": 2.9529439380149407
+        },
+        "native_latency_win": {
+          "llama": false,
+          "pjrt": true
+        }
+      },
+      {
+        "id": "audio_30s_64",
+        "samples_ms": {
+          "native": [
+            1102.00556,
+            1097.349541,
+            1102.085971,
+            1105.462499,
+            1098.639335,
+            1098.468399
+          ],
+          "llama": [
+            1118.289262,
+            1115.562308,
+            1122.958402,
+            1116.593551,
+            1124.46387,
+            1122.634929
+          ],
+          "pjrt": [
+            3004.1872750152834,
+            3016.3232409977354,
+            3060.83380401833,
+            3063.3375509642065,
+            3002.386296982877,
+            2990.024155995343
+          ]
+        },
+        "median_ms": {
+          "native": 1100.3224475000002,
+          "llama": 1120.4620955,
+          "pjrt": 3010.2552580065094
+        },
+        "p95_ms": {
+          "native": 1104.618367,
+          "llama": 1124.087503,
+          "pjrt": 3062.7116142277373
+        },
+        "native_speedup": {
+          "llama": 1.0183034055569422,
+          "pjrt": 2.7357937346874937
+        },
+        "native_latency_win": {
+          "llama": false,
+          "pjrt": true
+        }
+      },
+      {
+        "id": "video_6s_64",
+        "samples_ms": {
+          "native": [
+            1086.000193,
+            1096.321555,
+            1085.686185,
+            1095.368841,
+            1085.495588,
+            1096.031338
+          ],
+          "llama": [
+            1296.788282,
+            1274.798834,
+            1278.7733,
+            1318.84046,
+            1292.640679,
+            1284.77642
+          ],
+          "pjrt": [
+            3152.3111870046705,
+            3161.8988849804737,
+            3178.0310529866256,
+            3153.541593987029,
+            3147.0830300240777,
+            3130.707288044505
+          ]
+        },
+        "median_ms": {
+          "native": 1090.6845170000001,
+          "llama": 1288.7085495000001,
+          "pjrt": 3152.92639049585
+        },
+        "p95_ms": {
+          "native": 1096.24900075,
+          "llama": 1313.3274155,
+          "pjrt": 3173.9980109850876
+        },
+        "native_speedup": {
+          "llama": 1.1815594055049743,
+          "pjrt": 2.8907776184154352
+        },
+        "native_latency_win": {
+          "llama": true,
+          "pjrt": true
+        }
+      }
+    ],
+    "memory": {
+      "native": {
+        "rounds": [
+          {
+            "peak_rss_bytes": 2058035200,
+            "peak_gpu_bytes": 16125149184,
+            "peak_pss_bytes": 2049545216,
+            "peak_footprint_bytes": 18155504640,
+            "samples": 380,
+            "errors": [],
+            "valid": true,
+            "method": "process-tree smaps_rollup PSS plus NVML; 0.2s polling"
+          },
+          {
+            "peak_rss_bytes": 2033819648,
+            "peak_gpu_bytes": 16125149184,
+            "peak_pss_bytes": 2026122240,
+            "peak_footprint_bytes": 18132507648,
+            "samples": 384,
+            "errors": [],
+            "valid": true,
+            "method": "process-tree smaps_rollup PSS plus NVML; 0.2s polling"
+          },
+          {
+            "peak_rss_bytes": 2072158208,
+            "peak_gpu_bytes": 16125149184,
+            "peak_pss_bytes": 2064548864,
+            "peak_footprint_bytes": 18170504192,
+            "samples": 376,
+            "errors": [],
+            "valid": true,
+            "method": "process-tree smaps_rollup PSS plus NVML; 0.2s polling"
+          }
+        ],
+        "max_gpu_gib": 15.017715454101562,
+        "max_simultaneous_pss_plus_gpu_gib": 16.922600746154785
+      },
+      "llama": {
+        "rounds": [
+          {
+            "peak_rss_bytes": 6512050176,
+            "peak_gpu_bytes": 7077888000,
+            "peak_pss_bytes": 6505406464,
+            "peak_footprint_bytes": 11959669760,
+            "samples": 219,
+            "errors": [],
+            "valid": true,
+            "method": "process-tree smaps_rollup PSS plus NVML; 0.2s polling"
+          },
+          {
+            "peak_rss_bytes": 6509961216,
+            "peak_gpu_bytes": 7077888000,
+            "peak_pss_bytes": 6503317504,
+            "peak_footprint_bytes": 11958350848,
+            "samples": 215,
+            "errors": [],
+            "valid": true,
+            "method": "process-tree smaps_rollup PSS plus NVML; 0.2s polling"
+          },
+          {
+            "peak_rss_bytes": 6474141696,
+            "peak_gpu_bytes": 7077888000,
+            "peak_pss_bytes": 6468306944,
+            "peak_footprint_bytes": 11934810112,
+            "samples": 361,
+            "errors": [],
+            "valid": true,
+            "method": "process-tree smaps_rollup PSS plus NVML; 0.2s polling"
+          }
+        ],
+        "max_gpu_gib": 6.591796875,
+        "max_simultaneous_pss_plus_gpu_gib": 11.138310432434082
+      },
+      "pjrt": {
+        "rounds": [
+          {
+            "peak_rss_bytes": 10248798208,
+            "peak_gpu_bytes": 20927479808,
+            "peak_pss_bytes": 10238106624,
+            "peak_footprint_bytes": 25725299712,
+            "samples": 1193,
+            "errors": [],
+            "valid": true,
+            "method": "process-tree smaps_rollup PSS plus NVML; 0.2s polling"
+          },
+          {
+            "peak_rss_bytes": 9780555776,
+            "peak_gpu_bytes": 20927479808,
+            "peak_pss_bytes": 9770518528,
+            "peak_footprint_bytes": 25640933376,
+            "samples": 1147,
+            "errors": [],
+            "valid": true,
+            "method": "process-tree smaps_rollup PSS plus NVML; 0.2s polling"
+          },
+          {
+            "peak_rss_bytes": 9931485184,
+            "peak_gpu_bytes": 20927479808,
+            "peak_pss_bytes": 9922111488,
+            "peak_footprint_bytes": 25688422400,
+            "samples": 1200,
+            "errors": [],
+            "valid": true,
+            "method": "process-tree smaps_rollup PSS plus NVML; 0.2s polling"
+          }
+        ],
+        "max_gpu_gib": 19.490234375,
+        "max_simultaneous_pss_plus_gpu_gib": 23.958552360534668
+      }
+    },
+    "limitations": [
+      "Qualified opt-in profile, not bare process defaults",
+      "Native core timing excludes HTTP; not a rerun of the published Circus corpus",
+      "PJRT result is the BF16 artifact runner, not PR1404 unified runtime",
+      "Native uses more GPU memory than llama.cpp; peaks include all modalities resident",
+      "No universal5% win over llama.cpp; image and1s audio remain slightly slower"
+    ]
+  },
+  "final_local_review": {
+    "scope": "Final local PR review of qualified opt-in E4B/L4 profile; PR creation and push left to user",
+    "review_base": "9254fed1b2810d2d727b4929a3f93493f76c5c48",
+    "review_head": "c53968f83e08cd537fb11e825c36181fec6070a6",
+    "merge_tree_exit": 0,
+    "overlapping_incoming_files": 0,
+    "runtime_unchanged_since_qualified_checkpoint": "5a7d9f7e29",
+    "blocking_findings": [],
+    "checks": {
+      "cuda_regressions": {
+        "passed": 142,
+        "skipped": 0,
+        "log_sha256": "b65276e40419280c8184c87dd70c77b7baa526dc73d6fad52a4cd86109e076a5"
+      },
+      "python_harness": {
+        "passed": 41,
+        "log_sha256": "81291c70dec1248c8edde92a85f2b73ecf908e56c1d4bcf044442db76e56061e"
+      },
+      "ple_cpu": {
+        "passed": 69,
+        "scope": "one selected PLE regression plus support suites",
+        "log_sha256": "6f3fc44e6a3d3d74e87c0ddd1d02de5213f9451d27b3358a9b2a599bb6327786"
+      },
+      "projector_lossless_predicate": {
+        "encodings": 65536,
+        "passed": true,
+        "log_sha256": "d3851a96162dd183adeb6d9aea68230a204986056f0126d9487e033a18473fef"
+      },
+      "format_lint_whitespace": "all changed Python/Zig and branch diff pass",
+      "license_boundary": {
+        "passed": true,
+        "log_sha256": "c7800cd9c2e99b9445dfb30ab7d2523a560e56897c8bbcc55427627143929164"
+      }
+    },
+    "reviewed_areas": [
+      "PLE epsilon consistency across direct/graph/fused/prepared paths",
+      "projector exact-conversion eligibility and residual/fallback ownership",
+      "E4B/SM89 shape and inference dispatch guards",
+      "CUDA media RGB/resizing guards and fallback paths",
+      "fixed-budget benchmark and independent reference gates",
+      "profile isolation and per-request activity validation",
+      "completed matched comparison and memory sampling"
+    ],
+    "limitations": [
+      "explicit profile only; bare defaults not promoted",
+      "higher native VRAM than llama.cpp",
+      "no exact Circus HTTP reproduction or unified PR1404 timing claim",
+      "Metal/other GPU hardware not exercised locally"
+    ],
+    "supplemental_test_note": "Initial CPU invocation used runtime-only filtering and was stopped before completion; replaced with compile-time -Dtest-filter and all69 selected/support tests passed. Incomplete invocation is excluded from pass counts.",
+    "fixed_handoff_findings": [
+      "zig-out benchmark worker still referenced a rejected Debug experiment; replaced it with an independent executable copy of the qualified ReleaseFast worker so future installs cannot overwrite the archived worker. Experimental binaries and evidence remain preserved."
+    ],
+    "installed_worker_sha256": "ae83452925cb4d67e50df926445a1050c1db5c1dc40e33fe88f979cc4bcb6b6a",
+    "cache_gc": "Completed after final tests;11.1GiB free; recent caches retained"
   }
 }

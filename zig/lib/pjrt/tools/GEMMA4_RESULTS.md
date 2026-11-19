@@ -20,33 +20,46 @@ The clean all-artifact freshness rerun passes: PTX, all seven SASS architectures
 in the fatbin, and standalone SM89 match regeneration from source; all 325
 required symbols are present.
 
-A fresh one-round, two-call comparison gives these medians. All numerical gates,
-reference prefixes, fixed budgets and per-request activity checks pass. No
-compiler or competing GPU job ran during the measurements. This is a preliminary
-screen, not multi-round performance qualification.
+A completed three-round comparison rotates engine order and retains six timed
+calls per case and engine. All eight numerical/argmax gates pass, and every
+native measured row matches its official CPU prefix (585 unique decisions,
+3,510 comparisons). Fixed output budgets, prompt-token counts, per-request
+optimization activity, stable greedy sequences and memory sampling all pass.
+No compiler or competing GPU job ran during these measurements.
 
 | Workload | Small-tile native ms | llama.cpp ms | BF16 PJRT ms |
 |---|---:|---:|---:|
-| text_short_256 | 3590.48 | 3582.80 | 11289.80 |
-| page_summary_128 | 1869.72 | 1871.20 | 5718.46 |
-| long2k_summary_64 | 1175.23 | 1182.67 | 3033.53 |
-| image_64 | 1056.89 | 1035.21 | 2944.89 |
-| audio_1s_64 | 956.50 | 933.71 | 2799.90 |
-| audio_12s_64 | 994.40 | 989.79 | 2864.53 |
-| audio_30s_64 | 1095.48 | 1104.63 | 2954.16 |
-| video_6s_64 | 1083.81 | 1262.93 | 3060.96 |
+| text_short_256 | 3616.21 | 3629.76 | 11650.48 |
+| page_summary_128 | 1878.57 | 1897.38 | 5968.79 |
+| long2k_summary_64 | 1183.23 | 1199.94 | 3146.62 |
+| image_64 | 1063.34 | 1049.95 | 3057.38 |
+| audio_1s_64 | 963.74 | 946.08 | 2902.43 |
+| audio_12s_64 | 1003.75 | 1004.63 | 2964.00 |
+| audio_30s_64 | 1100.32 | 1120.46 | 3010.26 |
+| video_6s_64 | 1090.68 | 1288.71 | 3152.93 |
 
-Short text, image, 1-second audio and 12-second audio remain 0.2–2.4% slower than
-llama.cpp. Page summary, long text and 30-second audio are within 1% faster;
-video latency is about 14% lower. Only video meets the 5% median improvement
-and no-p95-regression criterion in this screen. Native is 2.6–3.1 times faster
-than this BF16 PJRT artifact; this does not reproduce PR #1404's exact unified
-runtime. Seven cases are within 2.5% of llama.cpp in this preliminary screen.
-The 5% guardrail defines a clear-win claim; it is not a prerequisite for a PR
-scoped to qualified improvements and approximate latency parity. That scope
-still needs a completed repeated comparison, final diff/CI review, and explicit
-documentation of the qualified L4 profile. The broader all-modality superiority
-goal remains open.
+Native median latency is 0.1–1.8% lower than llama.cpp on text and the two
+longer audio cases. Image is 1.3% higher and 1-second audio is 1.9% higher;
+video is 15.4% lower. Native p95 is lower on six cases; image and 1-second
+audio retain p95 regressions of about 1.2% and 2.2%. Only video meets the
+5% median improvement plus no-p95-regression clear-win criterion.
+All seven non-video cases are within 1.9% of llama.cpp: this supports
+approximate latency parity, not universal superiority. Native is 2.7–3.2 times
+faster than the measured BF16 PJRT artifact runner, with lower p95 on every
+case. This does not reproduce PR #1404's exact unified runtime.
+
+The accuracy/performance profile trades additional GPU memory for these results.
+Across the three rounds, native GPU peaks are about 15.0 GiB, versus 6.6 GiB
+for llama.cpp; maximum simultaneous process-tree PSS plus GPU usage is 16.9 GiB
+versus 11.1 GiB. Every requested modality is primed before native timing.
+Memory superiority is not claimed.
+
+The completed comparison is a suitable PR basis for qualified opt-in L4
+improvements and approximate llama.cpp latency parity. The 5% guardrail defines
+a clear-win claim, rather than a prerequisite for landing these improvements.
+The broader all-modality superiority goal remains open. The raw summary and
+hashes are retained in `final_performance_qualification` in the qualification
+record; the earlier one-round screen remains as historical evidence.
 
 CUDA probes using the matching official Gemma4 QAT assistant passed all eight
 first-step gates and all 585 reference decisions with ordinary and deferred
@@ -75,11 +88,11 @@ request and records the assistant model hash. One-token logit validation remains
 separate from the measured speculation checks.
 
 
-## L4 speed follow-up in progress
+## Earlier L4 speed experiments
 
-The [speed qualification record](gemma4-l4-speed-qualification.json) retains
-the new opt-in experiments separately from the previous comparison below.
-No all-modality llama.cpp speed win or PR readiness is claimed yet.
+The records below describe earlier workers and campaigns. The current qualified
+profile and completed comparison are summarized above. Historical values and
+source/binary hashes are retained without promoting rejected experiments.
 
 The rebuilt worker `79468d00046d0ced3714150cd215c1301d94ed218c56fb96e85f60de9e88fae9`
 passes 8/8 numerical/argmax gates and all 585 official decisions with both the
