@@ -49344,9 +49344,11 @@ pub const DB = struct {
         var input = GraphPredicateFrontier{ .db = self, .req = req, .keys = keys orelse &.{}, .include = &filter.include, .exclude = &filter.exclude };
         const frontier: ?db_query_search.GraphPredicateFrontier = if (keys != null) .{ .ptr = &input, .collect = GraphPredicateFrontier.collect } else null;
         const budget = native.graph_memory.?.tracked.budget.?;
+        // Indexed exclusions can narrow policy work. Residual exclusions
+        // read stored values only after authorization and the user filter.
         var residual_exclusion = false;
         if (req.exclusion_query_json.len > 0) {
-            filter.exclude = db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json, null, budget, &native.frontier_scoped, clause_cache) catch |err| switch (err) {
+            filter.exclude = db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json, frontier, budget, &native.frontier_scoped, clause_cache, .indexed_only) catch |err| switch (err) {
                 error.GraphResidualFrontierRequired => pending: {
                     residual_exclusion = true;
                     break :pending .none;
@@ -49355,19 +49357,19 @@ pub const DB = struct {
             };
         }
         if (req.authorization_filter_query_json.len > 0) {
-            filter.include = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.authorization_filter_query_json, frontier, budget, &native.frontier_scoped, clause_cache);
+            filter.include = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.authorization_filter_query_json, frontier, budget, &native.frontier_scoped, clause_cache, .allow_residual);
         }
         const stripped = try db_query_search.stripInjectedPolicyAlloc(a, req.filter_query_json, req.authorization_filter_query_json);
         defer if (stripped) |json| if (json.len != 0) a.free(json);
         const user_filter = stripped orelse req.filter_query_json;
         if (user_filter.len > 0) {
-            var user = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, user_filter, frontier, budget, &native.frontier_scoped, clause_cache);
+            var user = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, user_filter, frontier, budget, &native.frontier_scoped, clause_cache, .allow_residual);
             defer user.deinit(a);
             const include = (try doc_set.intersectAlloc(a, &filter.include, &user)) orelse return error.UnsupportedQueryRequest;
             filter.include.deinit(a);
             filter.include = include;
         }
-        if (residual_exclusion) filter.exclude = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json, frontier, budget, &native.frontier_scoped, clause_cache);
+        if (residual_exclusion) filter.exclude = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json, frontier, budget, &native.frontier_scoped, clause_cache, .allow_residual);
         if (req.resolved_doc_filter) |raw| {
             const prior: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(raw));
             var prior_include = if (prior.include == .doc_keys) try self.graphPriorKeyOrdinalsAlloc(a, prior.include.doc_keys, req.identity_read_generation) else null;
@@ -122301,6 +122303,20 @@ test "db graph indexed admission reuses compressed membership and honors cancell
     defer identity.deinit(a);
     const ordinal = identity.ordinals[0];
     try std.testing.expect(before.resolved_doc_filter.?.include.containsOrdinal(ordinal));
+    var frontier_budget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 32 * 1024 });
+    var frontier_req = req;
+    frontier_req.graph_work_budget = &frontier_budget;
+    {
+        var scoped = try db.graphRequestWithIndexedFilterForKeysAlloc(frontier_req, &.{"b"}, null);
+        defer scoped.deinit();
+        try std.testing.expect(scoped.frontier_scoped);
+        try std.testing.expect(!scoped.resolved_doc_filter.?.include.containsOrdinal(ordinal));
+    }
+    frontier_req.exclusion_query_json = req.filter_query_json;
+    const excluded = try db.filterGraphKeysAlloc(a, frontier_req, &.{"b"});
+    defer a.free(excluded);
+    try std.testing.expect(!excluded[0]);
+    try std.testing.expectEqual(@as(usize, 0), frontier_budget.retained_state_bytes);
     try db.batch(.{ .deletes = &.{"a"}, .sync_level = .full_index });
     var after = try db.graphRequestWithIndexedFilterAlloc(req);
     defer after.deinit();

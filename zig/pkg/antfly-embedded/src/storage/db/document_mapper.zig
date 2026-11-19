@@ -3255,9 +3255,20 @@ const NumericCoverageNode = struct {
 
 fn numericSourceMatchesProjection(raw: std.json.Value, observed: ??typed_dv.NumericValue) bool {
     if (raw == .null) return observed == null;
-    const expected = typed_dv.exactNumericValueFromJson(raw) orelse return false;
     const emitted = (observed orelse return false) orelse return false;
-    return typed_dv.compareNumericValues(emitted, expected) == .eq;
+    if (typed_dv.exactNumericValueFromJson(raw)) |expected| {
+        return typed_dv.compareNumericValues(emitted, expected) == .eq;
+    }
+    if (raw != .number_string or std.mem.indexOfAny(u8, raw.number_string, ".eE") == null) return false;
+    // Compare the preserved decimal token with the exact binary value.
+    // A rounded projection cannot certify the source for standard ranges.
+    var work: @import("../../sql/json_order.zig").Budget = .{};
+    const projected: std.json.Value = switch (emitted) {
+        .f64_val => |v| .{ .float = v },
+        .i64_val => |v| .{ .integer = v },
+        .u64_val => return false,
+    };
+    return (@import("../../sql/json_order.zig").compare(raw, projected, &work, 0) catch return false) == .eq;
 }
 
 const IndexSortProjection = struct { values: []const introducer_mod.NamedSortValue = &.{}, valid: bool = true };

@@ -1080,6 +1080,10 @@ pub const GraphPredicateCache = struct {
     }
 
     pub fn getScoped(self: *@This(), a: Allocator, key: []const u8, control: query_mod.ExecutionControl, scope: ?*const roaring.RoaringBitmap) !?roaring.RoaringBitmap {
+        return self.getWithinLimit(a, key, control, scope, std.math.maxInt(usize));
+    }
+
+    pub fn getWithinLimit(self: *@This(), a: Allocator, key: []const u8, control: query_mod.ExecutionControl, scope: ?*const roaring.RoaringBitmap, clone_limit: usize) !?roaring.RoaringBitmap {
         try control.check();
         while (!self.mutex.tryLock()) {
             try control.check();
@@ -1110,6 +1114,7 @@ pub const GraphPredicateCache = struct {
             }
             return rows;
         }
+        if (entry.rows.cloneStorageBound() > clone_limit) return error.GraphCacheCloneTooLarge;
         var rows = try entry.rows.cloneExact(a);
         errdefer rows.deinit();
         try control.check();
@@ -2315,6 +2320,20 @@ pub const IndexSnapshot = struct {
                 try docs.add(navigation.entries[low].doc, key.*);
             }
         }
+    }
+
+    pub fn graphOrdinalScanCost(self: *IndexSnapshot) u64 {
+        if (self.graph_predicates.acquireOrdinalNavigation()) |navigation| {
+            navigation.release();
+            return 0;
+        }
+        var count: u64 = 0;
+        for (self.segments) |*segment| {
+            if (segment.liveDocCount() == 0 or segment.reader.hasSection(segment_mod.doc_ordinals_field, .synonym)) continue;
+            const weight: u64 = if (segment.reader.hasSection(segment_mod.doc_ordinals_field, .doc_ordinals)) 1 else 4;
+            count +|= @as(u64, segment.reader.doc_count) * weight;
+        }
+        return count;
     }
 
     pub fn graphFrontierDocNumsAlloc(self: *IndexSnapshot, alloc: Allocator, frontier: anytype, control: query_mod.ExecutionControl) !GraphFrontierDocs {
