@@ -611,6 +611,58 @@ def test_runtime_full_text_index_keeps_overwrites_through_background_merges(tmp_
         assert wrong == []
 
 
+def test_unrelated_busy_index_does_not_starve_maintenance(tmp_path: Path) -> None:
+    # Maintenance fences publications per index: inline writes to one table's
+    # index must not keep rejecting another index's merges.
+    def text_merge(stats):
+        if isinstance(stats, dict):
+            if "text_merge" in stats:
+                return stats["text_merge"]
+            for value in stats.values():
+                found = text_merge(value)
+                if found is not None:
+                    return found
+        return None
+
+    path = tmp_path / "busy.aflite"
+    stop = threading.Event()
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=30.0) as db:
+        assert db.delete_index("full_text_index_v0")
+        db.add_index({"name": "quiet_text", "type": "full_text", "config_json": {"field": "b"}})
+        db.create_table("busy", {})
+        busy = db.open_table("busy")
+        busy.add_index({"name": "busy_text", "type": "full_text", "config_json": {"field": "a"}})
+        for i in range(30):
+            db.batch_json({"inserts": {f"b{i}": {"b": f"quietdoc{i} " + "w " * 200}}, "sync_level": "full_index"})
+        assert text_merge(db.stats())["active_segments"] == 30
+        writes = [0]
+
+        def write_busy() -> None:
+            while not stop.is_set():
+                busy.batch_json(
+                    {
+                        "inserts": {f"a{writes[0] % 4}": {"a": f"busydoc{writes[0]} " + "filler " * 120}},
+                        "sync_level": "full_index",
+                    }
+                )
+                writes[0] += 1
+
+        writer = threading.Thread(target=write_busy)
+        writer.start()
+        try:
+            deadline = time.monotonic() + 30
+            merged = text_merge(db.stats())
+            while time.monotonic() < deadline and merged["active_segments"] > 4:
+                time.sleep(0.1)
+                merged = text_merge(db.stats())
+            still_busy = writer.is_alive()
+        finally:
+            stop.set()
+            writer.join()
+    assert still_busy
+    assert merged["active_segments"] <= 4, (merged, writes[0])
+
+
 def test_cross_process_overwrites_keep_full_text_deletes(tmp_path: Path) -> None:
     # Regression: overwrites from several processes, each waiting for
     # full-text visibility, lost earlier deletes. A writer rewrote a

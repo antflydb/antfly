@@ -3213,6 +3213,16 @@ pub const Store = struct {
     /// instance on this inode. The snapshot's own file never begins a
     /// transaction.
     write_target: ?WriteTarget = null,
+    /// A maintenance snapshot's index fence (`submitIndexMutationForScope`):
+    /// the commit sequence its index catalogs were loaded at, and the last
+    /// commit it made under each index scope since. Guarded by
+    /// `index_fence_mutex`; keys are owned.
+    index_load_sequence: u64 = 0,
+    index_scope_commits: std.StringHashMapUnmanaged(u64) = .empty,
+    index_fence_mutex: std.Io.Mutex = .init,
+    /// Set when the fence refused a publication: this snapshot's catalogs
+    /// are stale and its owner must reopen it.
+    index_fence_refused: std.atomic.Value(bool) = .init(false),
     /// How long `maybeCheckpointRedoLogOnIdleTurn`'s opportunistic fold
     /// (no byte-capacity pressure, `threshold_due` false) waits for
     /// genuine quiet before running, separate from `ride_along_idle_ns`
@@ -3770,6 +3780,9 @@ pub const Store = struct {
         // may be lost silently just because it never got a foreground
         // group to ride.
         self.forceDrainDurable();
+        var scopes = self.index_scope_commits.keyIterator();
+        while (scopes.next()) |scope| self.allocator.free(scope.*);
+        self.index_scope_commits.deinit(self.allocator);
         self.stopRideAlongFlush();
         if (self.artifact_registry) |registry| registry.detach();
         self.stopMaintenance();
@@ -6352,6 +6365,50 @@ pub const Store = struct {
         return self.submitScopedMutation(context, apply, true, false, true);
     }
 
+    /// `submitIndexMutation` for one native-catalog index scope. Through a
+    /// forwarding store (a maintenance snapshot), its in-memory catalogs for
+    /// that index were loaded at `index_load_sequence`; any commit under the
+    /// scope since, other than its own, is missing from them, and publishing
+    /// would overwrite it (deletion bitmaps and segment lists are rewritten
+    /// whole). Checked under the writer admission, which excludes every
+    /// other writer until this commit lands.
+    pub fn submitIndexMutationForScope(self: *Store, scope: []const u8, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
+        if (self.write_target == null) return self.submitIndexMutation(context, apply, durable);
+        const admission = self.writer_admission orelse return self.submitIndexMutation(context, apply, durable);
+        try admission.enter(admission.ptr, .index);
+        defer admission.leave(admission.ptr);
+        const io = self.file.runtime();
+        const shared = if (self.file.redo) |*redo| redo.shared else return self.submitIndexMutation(context, apply, durable);
+        if (shared.scopeLatestSequence(io, scope) > self.indexScopeFence(scope)) {
+            self.index_fence_refused.store(true, .release);
+            return error.EnrichmentWaitCanceled;
+        }
+        try self.submitIndexMutation(context, apply, durable);
+        try self.noteIndexScopeCommit(scope, shared.scopeLatestSequence(io, scope));
+    }
+
+    fn indexScopeFence(self: *Store, scope: []const u8) u64 {
+        const io = self.file.runtime();
+        self.index_fence_mutex.lockUncancelable(io);
+        defer self.index_fence_mutex.unlock(io);
+        return @max(self.index_load_sequence, self.index_scope_commits.get(scope) orelse 0);
+    }
+
+    fn noteIndexScopeCommit(self: *Store, scope: []const u8, sequence: u64) !void {
+        const io = self.file.runtime();
+        self.index_fence_mutex.lockUncancelable(io);
+        defer self.index_fence_mutex.unlock(io);
+        const gop = try self.index_scope_commits.getOrPut(self.allocator, scope);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, scope) catch |err| {
+                self.index_scope_commits.removeByPtr(gop.key_ptr);
+                return err;
+            };
+            gop.value_ptr.* = 0;
+        }
+        gop.value_ptr.* = @max(gop.value_ptr.*, sequence);
+    }
+
     fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool) !void {
         // A forwarded request commits in the writer store's group, which
         // enters that store's admission, not this one's. The detached work
@@ -6359,7 +6416,10 @@ pub const Store = struct {
         // store's publication checks, as its own direct commit would:
         // otherwise it lands while another process holds the lease, built
         // from state that process has since changed.
-        const forwarded_admission = if (self.forwardedWriter() != null) self.writer_admission else null;
+        // The configured target, not `forwardedWriter()`: resolving the
+        // current writer reads the owner's serving root, which only the
+        // admission below may do.
+        const forwarded_admission = if (self.write_target != null) self.writer_admission else null;
         if (forwarded_admission) |admission| try admission.enter(admission.ptr, if (artifact_lease) .artifact_lease else if (index_only) .index else .primary);
         defer if (forwarded_admission) |admission| admission.leave(admission.ptr);
         const ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
