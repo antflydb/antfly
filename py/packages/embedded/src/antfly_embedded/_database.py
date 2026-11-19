@@ -491,13 +491,14 @@ class Database:
         same JSON batch result as `batch_json`.
 
         An OutcomeUnknownError carries the write's `outcome_receipt`."""
+        native_call = getattr(self._lib, "antfly_db_batch_wire", None)
+        if native_call is None:
+            raise errors.UnsupportedError(message="This native library does not expose the binary batch format")
         handle = self._acquire()
         try:
             sl, _keep = _ffi.make_slice(bytes(payload))
             out = _ffi.AntflyBuffer()
-            errors.raise_for_outcome_code(
-                self._lib.antfly_db_batch_wire(ctypes.c_void_p(handle), sl, ctypes.byref(out))
-            )
+            errors.raise_for_outcome_code(native_call(ctypes.c_void_p(handle), sl, ctypes.byref(out)))
             data = _ffi.take_buffer(out)
         finally:
             self._release()

@@ -117,6 +117,8 @@ pub const StorageStatus = struct {
     page_size: ?u32 = null,
     active_checkpoint: ?u8 = null,
     checkpoint_sequence: ?u64 = null,
+    /// Last commit a redo-log fold published into the checkpoint tree.
+    redo_folded_through: ?u64 = null,
     page_count: ?u64 = null,
     fsync: ?bool = null,
 };
@@ -644,6 +646,7 @@ pub const Handle = struct {
                     .page_size = file.header.page_size,
                     .active_checkpoint = file.header.active_checkpoint,
                     .checkpoint_sequence = checkpoint.commit_sequence,
+                    .redo_folded_through = checkpoint.redo_folded_through,
                     .page_count = checkpoint.page_count,
                     .fsync = !file.no_sync,
                 };
