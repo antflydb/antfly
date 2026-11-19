@@ -671,6 +671,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "remote backup metadata reads are size bounded",
             "remote backup key joins canonicalize only the prefix boundary",
             "cluster backup list uses top-level remote manifests without recursing into payloads",
+            "cluster backup selectors resolve raw and display collisions without CLI delimiters",
             "incomplete cluster backup attempts do not hide committed backups",
             "cluster backup list defers artifact validation to restore admission",
             "cluster backup list canonicalizes trailing prefix through s3 protocol",
@@ -707,6 +708,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "legacy quarantine equivalence rejects a borrowed marker digest",
             "stale cluster backup attempt preserves aggregate referenced artifacts",
             "filesystem backup listing is bounded and cursor stable",
+            "legacy cluster restore pins child manifests under an unchanged aggregate",
             "native backup directory copy preserves nested files",
             "native artifact verification consistently rejects empty directories",
             "native verification receipt rejects membership changes after exact pass",
@@ -2498,6 +2500,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = api_backup_restore_test_mod,
         .filters = &.{
             "public api standalone-like integration backs up drops and restores a table",
+            "api http server cluster restore rehydrates extension metadata",
             "public table backup handler exposes non-retryable fenced outcomes",
             "api restore rollback preserves a concurrently replaced table definition",
             "api http server cluster overwrite restores from read-only repository without dropping live table",

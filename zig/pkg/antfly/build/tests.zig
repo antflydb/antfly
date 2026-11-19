@@ -3867,6 +3867,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lsm_backend_test_step = b.step("lsm-backend-test", "Run LSM backend unit tests only");
     lsm_backend_test_step.dependOn(&run_lsm_backend_tests.step);
 
+    if (target.result.os.tag == .linux or (antfly_imports.platform_link_libc and target.result.os.tag == .macos)) {
+        var modules: [2]*std.Build.Module = undefined;
+        for (&modules) |*module| {
+            module.* = b.createModule(.{
+                .root_source_file = b.path("pkg/antfly-embedded/src/storage_fd_cache_link_test.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = antfly_imports.platform_link_libc,
+            });
+            module.*.addImport("antfly_platform", platform_mod);
+            module.*.addImport("antfly_hash", hash_mod);
+            antfly_imports.configureRuntimeContracts(module.*);
+        }
+        const provider = b.addLibrary(.{ .name = "descriptor-admission-test-provider", .root_module = modules[0] });
+        modules[1].linkLibrary(provider);
+        const linked = b.addTest(.{
+            .name = "descriptor-admission-link-tests",
+            .root_module = modules[1],
+            .filters = &.{"native fd admission is visible across separately compiled archives"},
+        });
+        const run = b.addRunArtifact(linked);
+        b.step("storage-fd-admission-link-test", "Verify native descriptor accounting across archives").dependOn(&run.step);
+        lsm_backend_test_step.dependOn(&run.step);
+    }
+
     const lsm_checkpoint_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "lsm native checkpoint waits", "lsm journal checkpoints bound replay", "lsm backend deferred immutable backpressure waits" },

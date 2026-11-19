@@ -15,6 +15,7 @@
 
 const hot_standby_write_gate_adapter = @import("../../storage/hot_standby/write_gate.zig");
 const hot_standby_publisher_adapter = @import("../../storage/hot_standby/db_commit.zig");
+const restore_inputs = @import("../../api/restore_job_inputs.zig");
 const std = @import("std");
 const store_report_baseline = @import("../store_report_baseline.zig");
 const secret_store = @import("../secret_store.zig");
@@ -6455,6 +6456,43 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
     }
 }
 
+test "metadata raft apply store round trips admission ownership and retains it through completion" {
+    const alloc = std.testing.allocator;
+    const witness: [32]u8 = @splat(0x5a);
+    const encoded = try encodeRangeRecord(alloc, .{
+        .group_id = 901,
+        .table_id = 903,
+        .start_key = "",
+        .restore_backup_id = "daily",
+        .restore_artifact_backup_id = "artifact",
+        .restore_location = "s3://archive/daily",
+        .restore_admission_fingerprint = witness,
+    });
+    defer alloc.free(encoded);
+    var decoded = try decodeRangeRecord(alloc, encoded);
+    defer metadata_table_manager.freeRange(alloc, decoded);
+    try std.testing.expectEqual(witness, decoded.restore_admission_fingerprint);
+    try metadata_table_manager.clearOwnedRangeRestoreIntent(alloc, &decoded);
+    const completed = try encodeRangeRecord(alloc, decoded);
+    defer alloc.free(completed);
+    const reloaded = try decodeRangeRecord(alloc, completed);
+    defer metadata_table_manager.freeRange(alloc, reloaded);
+    try std.testing.expectEqual(witness, reloaded.restore_admission_fingerprint);
+    try std.testing.expect(metadata_table_manager.rangeRestoreCompletionMatches(reloaded, "daily", "artifact", "s3://archive/daily"));
+    const cloned = try metadata_table_manager.cloneRange(alloc, reloaded);
+    defer metadata_table_manager.freeRange(alloc, cloned);
+    try std.testing.expectEqual(witness, cloned.restore_admission_fingerprint);
+    var expected = decoded;
+    expected.restore_backup_id = "daily";
+    expected.restore_artifact_backup_id = "artifact";
+    expected.restore_location = "s3://archive/daily";
+    try std.testing.expect(metadata_table_manager.rangeMatchesRestorePublication(reloaded, expected));
+    expected.restore_admission_fingerprint = @splat(0x5b);
+    try std.testing.expect(!metadata_table_manager.rangeMatchesRestorePublication(reloaded, expected));
+    try std.testing.expectEqual(topology_protocol.pinned_restore_job_version, topology_protocol.restoreAdmissionDecoderVersion(&[_]metadata.RangeRecord{reloaded}, topology_protocol.atomic_table_topology_version));
+    try std.testing.expectEqual(topology_protocol.atomic_table_topology_version, topology_protocol.restoreAdmissionDecoderVersion(&[_]metadata.RangeRecord{.{ .group_id = 1, .table_id = 2, .start_key = "" }}, topology_protocol.atomic_table_topology_version));
+}
+
 test "metadata raft apply store decodes range values before split attempt epochs" {
     const encoded = try encodeRangeRecord(std.testing.allocator, .{
         .group_id = 901,
@@ -9324,6 +9362,63 @@ test "metadata transition decoders reject unknown enum values" {
     );
 }
 
+test "metadata raft apply store replicates restore job records with immutable inputs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/immutable-restore", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const logical = restore_job_logical_prefix ++ "000000000000002a";
+    const padding = try alloc.alloc(u8, 4 * 1024 * 1024);
+    defer alloc.free(padding);
+    @memset(padding, 'a');
+    const initial = try std.json.Stringify.valueAlloc(alloc, .{
+        .format_version = restore_inputs.version,
+        .job_id = 42,
+        .phase = "queued",
+        .cluster_binding = .{ .child_pins = "immutable-source-witness", .manifest_json = padding },
+    }, .{});
+    defer alloc.free(initial);
+    const proposal = try restore_inputs.packAdmission(alloc, initial);
+    defer alloc.free(proposal);
+    try std.testing.expect(proposal.len < topology_protocol.max_transition_command_bytes);
+    try store.applyStandaloneCommand(group, .{ .create_restore_job = .{ .key = logical, .value = proposal } });
+    const raw = (try store.getRestoreJobRecord(alloc, group, logical)).?;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "immutable-source-witness") == null);
+    const full = (try store.getRestoreJobValue(alloc, group, logical)).?;
+    defer alloc.free(full);
+    try std.testing.expect(std.mem.indexOf(u8, full, "immutable-source-witness") != null);
+    var tree = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer tree.deinit();
+    try tree.value.object.put(tree.arena.allocator(), "phase", .{ .string = "running" });
+    const progress = try std.json.Stringify.valueAlloc(alloc, tree.value, .{});
+    defer alloc.free(progress);
+    try store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical, .value = progress } });
+    const rows = try store.listRestoreJobRows(alloc, group);
+    defer store.freeRestoreJobRows(alloc, rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expect(std.mem.indexOf(u8, rows[0].value, "immutable-source-witness") != null);
+    var key_buf: [256]u8 = undefined;
+    const physical = try restoreJobKeyForGroup(&key_buf, group, logical);
+    const input_key = try std.fmt.allocPrint(alloc, "{s}{s}", .{ physical, restore_inputs.suffix });
+    defer alloc.free(input_key);
+    const saved_inputs = try store.store.get(alloc, input_key);
+    defer alloc.free(saved_inputs);
+    try std.testing.expect(saved_inputs.len > padding.len);
+    const newer = (try store.getRestoreJobRecord(alloc, group, logical)).?;
+    defer alloc.free(newer);
+    const hash = restore_inputs.digest(newer);
+    var raw_hash: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&raw_hash, &hash);
+    try store.applyStandaloneCommand(group, .{ .remove_restore_job_if_matches = .{ .key = logical, .value_hash = &raw_hash } });
+    try std.testing.expectEqual(@as(?[]u8, null), try store.getRestoreJobValue(alloc, group, logical));
+    try std.testing.expectError(error.NotFound, store.store.get(alloc, input_key));
+}
+
 test "metadata raft apply store replicates restore job records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -11322,12 +11417,20 @@ pub const RaftApplyStore = struct {
         defer if (!committed) txn.abort();
         if (try stagingGet(&txn, marker) != null) return;
         for (rows) |row| {
+            if (std.mem.endsWith(u8, row.key, restore_inputs.suffix)) continue;
+            const input_key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ row.key, restore_inputs.suffix });
+            defer self.alloc.free(input_key);
+            const inputs = for (rows) |candidate| {
+                if (std.mem.eql(u8, candidate.key, input_key)) break candidate.value;
+            } else null;
+            const full = try restore_inputs.hydrate(self.alloc, row.value, inputs);
+            defer self.alloc.free(full);
             const group_id = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
             var key_buf: [256]u8 = undefined;
             const key = try restoreJobKeyForGroup(&key_buf, group_id, row.key);
             if (try stagingGet(&txn, key)) |existing| {
                 if (!std.mem.eql(u8, existing, row.value)) return error.RestoreJobMigrationConflict;
-            } else try self.applyTransitionCommandTxn(&txn, group_id, .{ .create_restore_job = .{ .key = row.key, .value = row.value } });
+            } else try self.applyTransitionCommandTxn(&txn, group_id, .{ .create_restore_job = .{ .key = row.key, .value = full } });
         }
         try txn.put(marker, "1");
         try advanceStandaloneRevision(&txn);
@@ -18057,6 +18160,8 @@ pub const RaftApplyStore = struct {
     pub fn listRestoreJobRows(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]RestoreJobRow {
         var prefix_buf: [192]u8 = undefined;
         const prefix = try restoreJobPrefixForGroup(&prefix_buf, group_id);
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
         var rows = std.ArrayListUnmanaged(RestoreJobRow).empty;
         errdefer {
             for (rows.items) |row| {
@@ -18065,18 +18170,24 @@ pub const RaftApplyStore = struct {
             }
             rows.deinit(alloc);
         }
+        const upper = try std.fmt.allocPrint(alloc, "{s}\xff", .{prefix});
+        defer alloc.free(upper);
         var after_key: ?[]u8 = null;
         defer if (after_key) |key| alloc.free(key);
         while (true) {
-            const page = try self.store.scanPrefixPage(alloc, prefix, after_key, 512);
-            defer docstore.DocStore.freeResults(alloc, page);
-            if (page.len == 0) break;
-            for (page) |row| try rows.append(alloc, .{
-                .key = try alloc.dupe(u8, row.key[prefix.len..]),
-                .value = try alloc.dupe(u8, row.value),
-            });
-            if (page.len < 512) break;
-            const next = try alloc.dupe(u8, page[page.len - 1].key);
+            var page = try self.store.scanReadTxnPage(alloc, &txn, after_key orelse prefix, after_key != null, upper, 512, 64 * 1024 * 1024);
+            defer page.deinit(alloc);
+            if (page.items.len == 0) break;
+            for (page.items) |row| {
+                if (std.mem.endsWith(u8, row.key, restore_inputs.suffix)) continue;
+                const value = try self.hydrateRestoreJobTxn(alloc, &txn, row.key, row.value);
+                errdefer alloc.free(value);
+                try rows.append(alloc, .{
+                    .key = try alloc.dupe(u8, row.key[prefix.len..]),
+                    .value = value,
+                });
+            }
+            const next = try alloc.dupe(u8, page.items[page.items.len - 1].key);
             if (after_key) |key| alloc.free(key);
             after_key = next;
         }
@@ -18319,13 +18430,28 @@ pub const RaftApplyStore = struct {
         return std.json.Stringify.valueAlloc(a, contract.Page{ .rows = rows.items, .next = next }, .{});
     }
 
-    pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
+    pub fn getRestoreJobRecord(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
         var key_buf: [256]u8 = undefined;
-        const key = try restoreJobKeyForGroup(&key_buf, group_id, logical_key);
-        return self.store.get(alloc, key) catch |err| switch (err) {
+        return self.store.get(alloc, try restoreJobKeyForGroup(&key_buf, group_id, logical_key)) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
+    }
+
+    pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [256]u8 = undefined;
+        const key = try restoreJobKeyForGroup(&key_buf, group_id, logical_key);
+        const encoded = (try stagingGet(&txn, key)) orelse return null;
+        return try self.hydrateRestoreJobTxn(alloc, &txn, key, encoded);
+    }
+
+    fn hydrateRestoreJobTxn(self: *RaftApplyStore, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, key: []const u8, encoded: []const u8) ![]u8 {
+        _ = self;
+        const input_key = try std.fmt.allocPrint(alloc, "{s}{s}", .{ key, restore_inputs.suffix });
+        defer alloc.free(input_key);
+        return try restore_inputs.hydrate(alloc, encoded, try stagingGet(txn, input_key));
     }
 
     pub fn getBackupCohort(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, job_id: u64) !?[]u8 {
@@ -21728,7 +21854,7 @@ pub const RaftApplyStore = struct {
                     };
                     if (existing != null) return;
                 }
-                try txn.put(key, record.value);
+                try self.putRestoreJobTxn(txn, key, record.value);
                 // Only consumers add this work to ordinary restore writes.
                 // The persistence API accepts opaque legacy values; neither
                 // validation nor JSON scanning changes for unreferenced jobs.
@@ -21761,6 +21887,7 @@ pub const RaftApplyStore = struct {
                 var digest: [32]u8 = undefined;
                 std.crypto.hash.sha2.Sha256.hash(existing, &digest, .{});
                 if (!std.mem.eql(u8, &digest, record.value_hash)) return;
+                try self.deleteRestoreInputsTxn(txn, key);
                 try txn.delete(key);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{ .kind = .restore_job, .metadata_group_id = group_id });
@@ -21768,6 +21895,7 @@ pub const RaftApplyStore = struct {
             .remove_restore_job => |record| {
                 var key_buf: [256]u8 = undefined;
                 const key = try restoreJobKeyForGroup(&key_buf, group_id, record.key);
+                try self.deleteRestoreInputsTxn(txn, key);
                 txn.delete(key) catch |err| switch (err) {
                     error.NotFound => {},
                     else => return err,
@@ -21782,6 +21910,7 @@ pub const RaftApplyStore = struct {
                 for (record.keys) |logical_key| {
                     var key_buf: [256]u8 = undefined;
                     const key = try restoreJobKeyForGroup(&key_buf, group_id, logical_key);
+                    try self.deleteRestoreInputsTxn(txn, key);
                     txn.delete(key) catch |err| switch (err) {
                         error.NotFound => {},
                         else => return err,
@@ -22266,6 +22395,7 @@ pub const RaftApplyStore = struct {
                     // never the ordinary backup_restore bootstrap shortcut.
                     try metadata_table_manager.clearOwnedRangeRestoreIntent(alloc, &owned_range);
                     owned_range.completed_restore_fingerprint = metadata_table_manager.empty_restore_completion_fingerprint;
+                    owned_range.restore_admission_fingerprint = metadata_table_manager.empty_restore_completion_fingerprint;
                     ranges.appendAssumeCapacity(owned_range);
                 }
             }
@@ -22543,6 +22673,27 @@ pub const RaftApplyStore = struct {
         return membership.finish(parent.table.table_id).eql(transition.membership(parent.table.table_id));
     }
 
+    fn putRestoreJobTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, key: []const u8, encoded: []const u8) !void {
+        const parts = try restore_inputs.split(self.alloc, encoded);
+        defer parts.deinit(self.alloc);
+        const input_key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ key, restore_inputs.suffix });
+        defer self.alloc.free(input_key);
+        if (parts.inputs) |bytes| {
+            if (try stagingGet(txn, input_key)) |existing| {
+                if (!std.mem.eql(u8, bytes, existing)) return error.InvalidRestoreJobRecord;
+            } else try txn.put(input_key, bytes);
+        } else {
+            try restore_inputs.validateReference(self.alloc, parts.record, try stagingGet(txn, key));
+        }
+        try txn.put(key, parts.record);
+    }
+
+    fn deleteRestoreInputsTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, key: []const u8) !void {
+        const input_key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ key, restore_inputs.suffix });
+        defer self.alloc.free(input_key);
+        if (try stagingGet(txn, input_key) != null) try txn.delete(input_key);
+    }
+
     fn applyRestoreJobWithStagingTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, record: RestoreJobWithStaging) !void {
         var logical_key_buf: [256]u8 = undefined;
         const logical_key = try restoreJobKeyForGroup(&logical_key_buf, group_id, record.key);
@@ -22585,7 +22736,7 @@ pub const RaftApplyStore = struct {
         // incoming dependency closure and every identity collision first.
         try self.applyRestoreStagingTxn(txn, group_id, bytes);
         if (try stagingGet(txn, plan_key) == null) return;
-        try txn.put(logical_key, record.value);
+        try self.putRestoreJobTxn(txn, logical_key, record.value);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = logical_key });
         self.notifyProjectionListeners(.{ .kind = .restore_job, .metadata_group_id = group_id });
     }
@@ -31605,10 +31756,14 @@ fn appendRangeRecord(
     try appendInt(alloc, out, u32, @intCast(record.restore_artifact_backup_id.len));
     try out.appendSlice(alloc, record.restore_artifact_backup_id);
     try out.appendSlice(alloc, &record.completed_restore_fingerprint);
-    if (record.restore_native_manifest_size_bytes != 0 or record.restore_native_manifest_sha256.len != 0) {
+    if (record.restore_native_manifest_size_bytes != 0 or record.restore_native_manifest_sha256.len != 0 or
+        !std.mem.eql(u8, &record.restore_admission_fingerprint, &metadata_table_manager.empty_restore_completion_fingerprint))
+    {
         try appendInt(alloc, out, u64, record.restore_native_manifest_size_bytes);
         try appendInt(alloc, out, u32, @intCast(record.restore_native_manifest_sha256.len));
         try out.appendSlice(alloc, record.restore_native_manifest_sha256);
+        if (!std.mem.eql(u8, &record.restore_admission_fingerprint, &metadata_table_manager.empty_restore_completion_fingerprint))
+            try out.appendSlice(alloc, &record.restore_admission_fingerprint);
     }
 }
 
@@ -32325,6 +32480,12 @@ fn readRangeRecord(
     else
         try alloc.dupe(u8, "");
     errdefer alloc.free(restore_native_manifest_sha256);
+    var restore_admission_fingerprint = metadata_table_manager.empty_restore_completion_fingerprint;
+    if (pos.* < encoded.len) {
+        if (encoded.len - pos.* != 32) return error.InvalidMetadataTransitionEncoding;
+        @memcpy(&restore_admission_fingerprint, encoded[pos.*..][0..32]);
+        pos.* += 32;
+    }
     return .{
         .group_id = group_id,
         .range_id = if (range_id == 0) group_id else range_id,
@@ -32344,6 +32505,7 @@ fn readRangeRecord(
         .restore_native_manifest_size_bytes = restore_native_manifest_size_bytes,
         .restore_native_manifest_sha256 = restore_native_manifest_sha256,
         .completed_restore_fingerprint = completed_restore_fingerprint,
+        .restore_admission_fingerprint = restore_admission_fingerprint,
     };
 }
 
@@ -39865,7 +40027,7 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
 }
 const restore_job_logical_prefix = "\x00\x00__api_restore_jobs__:";
 const max_restore_job_logical_key_bytes: usize = 128;
-const max_restore_job_value_bytes: usize = 64 * 1024;
+const max_restore_job_value_bytes: usize = restore_inputs.max_bytes;
 
 fn applySystemCatalogTestCommand(store: *RaftApplyStore, index: u64, command: SystemCatalogCommand) !void {
     const alloc = std.testing.allocator;

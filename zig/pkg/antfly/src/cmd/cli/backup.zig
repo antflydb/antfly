@@ -539,7 +539,9 @@ pub fn prepareInputRestorePlan(
     connection: []const u8,
 ) !InputRestorePlan {
     const staged = lite_restore_staging.stageInputRestoreBackup(allocator, input_path, table_name, backup_id orelse "", location) catch |err| {
-        if (err == error.UnsupportedEmbeddedLiteIndex) {
+        if (err == error.UnsupportedBackupMigrationState) {
+            std.log.err("the backup contains an active schema migration; finish the migration on the source server and take a new backup", .{});
+        } else if (err == error.UnsupportedEmbeddedLiteIndex) {
             std.log.err("the backup contains an index without a server catalog equivalent; restore to Lite, or for a server backup use its original repository manifest with --backup-id", .{});
         }
         return err;

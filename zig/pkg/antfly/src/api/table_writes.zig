@@ -16620,6 +16620,7 @@ pub const ProvisionedTableWriteSource = struct {
             stats.fd_persistent_descriptors = @max(stats.fd_persistent_descriptors, entry_stats.fd_persistent_descriptors);
             stats.fd_admission_capacity = @max(stats.fd_admission_capacity, entry_stats.fd_admission_capacity);
             stats.fd_persistent_reserve = @max(stats.fd_persistent_reserve, entry_stats.fd_persistent_reserve);
+            stats.fd_mapping_reserve = @max(stats.fd_mapping_reserve, entry_stats.fd_mapping_reserve);
             stats.fd_admission_waiters = @max(stats.fd_admission_waiters, entry_stats.fd_admission_waiters);
             stats.fd_admission_waits = @max(stats.fd_admission_waits, entry_stats.fd_admission_waits);
             stats.fd_persistent_admission_failures = @max(stats.fd_persistent_admission_failures, entry_stats.fd_persistent_admission_failures);
@@ -22061,10 +22062,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (!try db_mod.generation_lifecycle.hasPublishedGenerationRead(path)) {
             all_groups_already_admitted = false;
         } else {
-            const validation = if (plan.reconcile_only)
-                backup_restore.validateCommittedRestoreIdentityWithIo(alloc, restore_io, path, group_id, restore_source)
-            else
-                backup_restore.validateImportedRestoreIdentityWithIo(alloc, restore_io, path, group_id, restore_source);
+            const validation = backup_restore.validateImportedRestoreIdentityWithIo(alloc, restore_io, path, group_id, restore_source);
             validation catch |err| switch (err) {
                 error.RestoreIdentityMismatch => {
                     admitted_identity_mismatch = true;
@@ -22074,7 +22072,6 @@ pub const ProvisionedTableWriteSource = struct {
             };
         }
         if (all_groups_already_admitted and plan.publication_hook == null) {
-            if (plan.reconcile_only) return;
             try self.repairPublishedRestoreRuntimeStateUntilComplete(
                 alloc,
                 path,
@@ -22254,6 +22251,9 @@ pub const ProvisionedTableWriteSource = struct {
             var transition = try self.beginLocalTableGenerationTransitionFromPreparation(table_name);
             errdefer transition.abort();
             defer transition.deinit();
+            // Validate the exact imported generation and finish any repair
+            // interrupted after publication before certifying completion.
+            try snapshot_source.repairPublishedRestore(request);
             var publication = try snapshot_source.beginPublication(.{
                 .io = restore_io,
                 .group_id = group_id,

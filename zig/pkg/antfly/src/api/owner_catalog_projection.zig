@@ -51,6 +51,17 @@ pub const Cache = struct {
     pub const Lease = struct {
         entry: ?*Entry = null,
         bytes: []const u8,
+        pub fn pin(self: Lease) ?Lease {
+            const entry = self.entry orelse return null;
+            entry.retain();
+            return self;
+        }
+
+        pub fn matchesRaw(self: Lease, raw: []const u8) bool {
+            const entry = self.entry orelse return false;
+            return std.mem.eql(u8, entry.raw, raw) or std.mem.eql(u8, self.bytes, raw);
+        }
+
         pub fn deinit(self: *Lease) void {
             if (self.entry) |entry| entry.release();
             self.* = undefined;
@@ -75,17 +86,27 @@ pub const Cache = struct {
 
     fn findLocked(self: *Cache, group: u64, raw: []const u8) ?*Entry {
         const entry = self.entries.get(group) orelse return null;
-        return if (std.mem.eql(u8, entry.raw, raw)) entry else null;
+        if (std.mem.eql(u8, entry.raw, raw)) return entry;
+        // Warm restore descriptors carry the admitted physical catalog.
+        // Reuse its exact bytes without replacing the original cache key.
+        if (entry.physical) |physical| {
+            if (std.mem.eql(u8, physical, raw)) return entry;
+        }
+        return null;
+    }
+
+    /// Try to borrow an admitted projection without allocating on a miss.
+    pub fn lookup(self: *Cache, group: u64, raw: []const u8) !?Lease {
+        if (!aliases.mayContainOwnerControls(raw)) return .{ .bytes = raw };
+        if (!self.mutex.tryLock()) return error.CatalogProjectionBusy;
+        defer self.mutex.unlock();
+        const cached = self.findLocked(group, raw) orelse return null;
+        cached.retain();
+        return cached.lease();
     }
 
     pub fn acquire(self: *Cache, alloc: std.mem.Allocator, group: u64, raw: []const u8) !Lease {
-        if (!aliases.mayContainOwnerControls(raw)) return .{ .bytes = raw };
-        // Raft apply never waits for projection construction or cache admission.
-        if (!self.mutex.tryLock()) return error.CatalogProjectionBusy;
-        const cached = self.findLocked(group, raw);
-        if (cached) |entry| entry.retain();
-        self.mutex.unlock();
-        if (cached) |entry| return entry.lease();
+        if (try self.lookup(group, raw)) |lease| return lease;
         const raw_copy = try alloc.dupe(u8, raw);
         errdefer alloc.free(raw_copy);
         const physical = try aliases.physicalProjectionIfNeeded(alloc, raw_copy);

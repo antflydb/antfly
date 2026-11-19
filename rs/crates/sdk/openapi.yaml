@@ -32966,6 +32966,10 @@ components:
               selector:
                 type: string
                 description: Opaque identifier accepted by restore for this backup.
+        table_details_omitted:
+          type: boolean
+          description: True when the listing returned only backup metadata because table details exceeded
+            the page size.
         location:
           type: string
           description: Storage location of the backup
