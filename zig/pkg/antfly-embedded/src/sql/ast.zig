@@ -212,6 +212,7 @@ pub const Relation = union(enum) {
         left: *const Relation,
         right: *const Relation,
         condition: ?*const Scalar = null,
+        using_columns: []const []const u8 = &.{},
         /// Compiler-only left-domain demand. A masked LEFT LATERAL producer
         /// is not opened or evaluated for an undemanded row.
         demand: ?*const Scalar = null,

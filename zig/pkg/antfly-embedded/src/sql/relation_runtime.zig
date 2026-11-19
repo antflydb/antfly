@@ -736,6 +736,28 @@ test "SQL generate_series accepts expression bounds and alias columns" {
     try std.testing.expectError(error.SqlZeroSeriesStep, @import("runtime.zig").execute(allocator, backend.backend(), &zero, &.{}, .{}));
 }
 
+test "SQL JOIN USING merges shared keys and preserves qualified inputs" {
+    const allocator = std.testing.allocator;
+    var backend: SetTestBackend = .{};
+    const Case = struct { sql: []const u8, rows: []const u8 };
+    for ([_]Case{
+        .{ .sql = "SELECT * FROM (VALUES (1,'left'),(2,'match')) l(k,a) FULL JOIN (VALUES (2,'exact'),(3,'right')) r(k,b) USING (k) ORDER BY k", .rows = "[[\"1\",\"left\",null],[\"2\",\"match\",\"exact\"],[\"3\",null,\"right\"]]" },
+        .{ .sql = "SELECT k,l.*,r.* FROM (VALUES (1,'left')) l(k,a) RIGHT JOIN (VALUES (2,'right')) r(k,b) USING (k)", .rows = "[[\"2\",null,null,\"2\",\"right\"]]" },
+        .{ .sql = "SELECT k, a FROM (VALUES (1,'keep'),(2,'drop')) l(k,a) JOIN (VALUES (1),(2)) r(k) USING (k) JOIN (VALUES (1),(3)) t(k) USING (k)", .rows = "[[\"1\",\"keep\"]]" },
+        .{ .sql = "SELECT * FROM (VALUES (1,2,'left')) l(a,b,x) JOIN (VALUES (1,2,'right'),(1,3,'drop')) r(a,b,y) USING (b,a)", .rows = "[[\"2\",\"1\",\"left\",\"right\"]]" },
+        .{ .sql = "SELECT count(*) FROM (VALUES (NULL::integer)) l(k) JOIN (VALUES (NULL::integer)) r(k) USING (k)", .rows = "[[\"0\"]]" },
+    }) |case| {
+        errdefer std.debug.print("JOIN USING SQL failed: {s}\n", .{case.sql});
+        var compiled = try @import("compiler.zig").compile(allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(allocator, backend.backend(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        const rows = try std.json.Stringify.valueAlloc(allocator, result.output.rows, .{});
+        defer allocator.free(rows);
+        try std.testing.expectEqualStrings(case.rows, rows);
+    }
+}
+
 test "SQL set operations preserve multiplicities precedence and output ordering" {
     const runtime = @import("runtime.zig");
     const compiler = @import("compiler.zig");

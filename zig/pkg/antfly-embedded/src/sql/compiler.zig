@@ -1543,11 +1543,26 @@ const Parser = struct {
             depth += 1;
             if (depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL join nesting limit exceeded");
             const right = try self.relationAtom();
+            var using_columns: std.ArrayList([]const u8) = .empty;
             const condition = if (kind == .cross) null else blk: {
+                if (self.keyword(.using)) {
+                    try self.expect(.lparen);
+                    var seen: std.StringHashMapUnmanaged(void) = .empty;
+                    while (true) {
+                        try self.node();
+                        const column = try self.identifier();
+                        const entry = try seen.getOrPut(self.alloc, column);
+                        if (entry.found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate JOIN USING column");
+                        try using_columns.append(self.alloc, column);
+                        if (!self.take(.comma)) break;
+                    }
+                    try self.expect(.rparen);
+                    break :blk null;
+                }
                 try self.expectKeyword(.on);
                 break :blk try self.scalar(0, 0);
             };
-            left = try self.relationNode(.{ .join = .{ .kind = kind, .left = left, .right = right, .condition = condition } });
+            left = try self.relationNode(.{ .join = .{ .kind = kind, .left = left, .right = right, .condition = condition, .using_columns = try using_columns.toOwnedSlice(self.alloc) } });
         }
         return left;
     }

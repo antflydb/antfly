@@ -35,6 +35,8 @@ pub const Column = struct {
     numeric_modifier: ?scalar.NumericModifier = null,
     nullable: bool,
     visible: bool = true,
+    /// A JOIN USING input remains available under its source qualifier.
+    qualified_only: bool = false,
     untyped_null: bool = false,
     /// Symbolic lineage exists only during the pre-emission constraint pass.
     origin: ?*const ast.Scalar = null,
@@ -88,7 +90,7 @@ pub fn expandWildcards(alloc: Allocator, columns: []const Column, projections: [
 
 fn wildcardMatches(columns: []const Column, column: Column, projection: ast.Projection, default_qualifier: ?[]const u8) bool {
     if (!column.visible) return false;
-    const qualifier = if (projection.field.len != 0) projection.field else default_qualifier orelse return column.outer_level == 0;
+    const qualifier = if (projection.field.len != 0) projection.field else default_qualifier orelse return column.outer_level == 0 and !column.qualified_only;
     for (columns) |other| if (other.outer_level < column.outer_level and qualifierMatches(other, qualifier)) return false;
     return qualifierMatches(column, qualifier);
 }
@@ -773,7 +775,9 @@ const Builder = struct {
             // Compiler-owned mutation metadata names themselves begin with
             // NUL. Match the complete bound column suffix before splitting
             // qualification; splitting at the last NUL would lose provenance.
-            if (!std.mem.eql(u8, column.name, name)) {
+            if (std.mem.eql(u8, column.name, name)) {
+                if (column.qualified_only) continue;
+            } else {
                 if (name.len <= column.name.len or !std.mem.endsWith(u8, name, column.name)) continue;
                 const separator = name.len - column.name.len - 1;
                 if (name[separator] != 0 or !qualifierMatches(column, name[0..separator])) continue;
@@ -1516,6 +1520,7 @@ const Builder = struct {
                             column.qualifier = source_column.qualifier;
                             column.scope = source_column.scope;
                             column.visible = source_column.visible;
+                            column.qualified_only = source_column.qualified_only;
                         } else column.visible = false;
                     }
                     if (result.columns.len != 0) @constCast(result.columns)[0].grouped_scope = grouped_scope;
@@ -1553,9 +1558,23 @@ const Builder = struct {
                     if (join.kind != .left or join.condition != null or join.demand != null or lateral) return error.InvalidSqlBackendResponse;
                     break :blk try self.membershipNode(left, right, membership.probes, membership.correlations, membership.alias);
                 }
-                for (left.columns) |a| for (right.columns) |b| if (std.mem.eql(u8, a.qualifier, b.qualifier)) return error.AmbiguousSqlColumn;
+                for (left.columns) |a| for (right.columns) |b| if (a.qualifier.len != 0 and std.mem.eql(u8, a.qualifier, b.qualifier)) return error.AmbiguousSqlColumn;
                 const columns = try self.joinColumns(left, right, join.kind);
-                const expression_ = if (join.condition) |condition| try self.expression(columns, condition, &.{}) else null;
+                const keys = try self.alloc.alloc(UsingKey, join.using_columns.len);
+                for (keys, join.using_columns) |*key, name| key.* = .{
+                    .name = name,
+                    .left = (try field(left.columns, name)).internal,
+                    .right = (try field(right.columns, name)).internal,
+                };
+                var expression_ = if (join.condition) |condition| try self.expression(columns, condition, &.{}) else null;
+                for (keys) |key| {
+                    const equality = try self.scalarNode(.{ .binary = .{
+                        .op = .eq,
+                        .left = try self.scalarNode(.{ .column = key.left }),
+                        .right = try self.scalarNode(.{ .column = key.right }),
+                    } });
+                    expression_ = if (expression_) |prior| try self.scalarNode(.{ .binary = .{ .op = .@"and", .left = prior, .right = equality } }) else equality;
+                }
                 var demand: ?scalar.Program = null;
                 if (join.demand) |mask| {
                     if (!lateral or join.kind != .left or apply_id == null) return error.InvalidSqlBackendResponse;
@@ -1574,10 +1593,50 @@ const Builder = struct {
                     if (!self.shape_only) @constCast(result).operation.apply.single_row = true;
                 }
                 if (!self.shape_only and demand != null) @constCast(result).operation.apply.demand = demand;
-                break :blk result;
+                break :blk if (keys.len == 0) result else try self.projectUsing(result, keys);
             },
         };
     }
+    const UsingKey = struct { name: []const u8, left: []const u8, right: []const u8 };
+
+    fn projectUsing(self: *Builder, source: *const Node, keys: []const UsingKey) !*const Node {
+        const columns = try self.alloc.alloc(Column, keys.len + source.columns.len);
+        const projections = try self.alloc.alloc(ast.Projection, columns.len);
+        @memcpy(columns[keys.len..], source.columns);
+        for (keys, columns[0..keys.len], projections[0..keys.len]) |key, *column, *projection| {
+            for (columns[keys.len..]) |*original| {
+                if (std.mem.eql(u8, original.internal, key.left) or std.mem.eql(u8, original.internal, key.right)) original.qualified_only = true;
+            }
+            const args = try self.alloc.dupe(*const ast.Scalar, &.{
+                try self.scalarNode(.{ .column = key.left }),
+                try self.scalarNode(.{ .column = key.right }),
+            });
+            const merged = try self.scalarNode(.{ .call = .{ .name = "coalesce", .args = args } });
+            column.* = .{ .name = key.name, .internal = try self.internal(), .qualifier = "", .type = .string, .nullable = true };
+            projection.* = .{ .expression = merged, .alias = column.internal };
+            if (self.shape_only) {
+                const origin = try self.inferenceExpression(merged, source.columns);
+                const kind = try scalar.inferOutputWithInvocation(self.alloc, origin, self.shape_columns.items, self.parameters, self.backend.parameter_invocation);
+                column.origin = origin;
+                column.type = kind.kind orelse .string;
+                column.element_type = kind.element_type;
+                column.numeric_modifier = kind.numeric_modifier;
+            }
+        }
+        if (self.shape_only) return self.node(columns, .singleton);
+        for (columns[keys.len..], projections[keys.len..]) |column, *projection| projection.* = .{ .field = column.internal, .alias = column.internal };
+        const statement: ast.Select = .{ .table = .{ .table = "$sql_relation" }, .columns = projections, .internal_projection = true };
+        var adapter: ResolveAdapter = .{ .backend = self.backend, .table = try self.virtualTable(source.columns) };
+        const compiled: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = statement }, .parameter_count = @intCast(self.parameters.len) };
+        const bound = try describe.bindInternal(self.alloc, adapter.iface(), &compiled, self.parameters);
+        for (columns[0..keys.len], bound.columns[0..keys.len]) |*column, kind| {
+            column.type = kind.type;
+            column.element_type = kind.element_type;
+            column.numeric_modifier = kind.numeric_modifier;
+        }
+        return self.node(columns, .{ .query = .{ .source = source, .statement = statement, .binding = bound, .preserve_scope = true } });
+    }
+
     fn joinColumns(self: *Builder, left: *const Node, right: *const Node, kind: ast.JoinKind) ![]Column {
         const columns = try self.alloc.alloc(Column, left.columns.len + right.columns.len);
         @memcpy(columns[0..left.columns.len], left.columns);

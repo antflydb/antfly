@@ -158,6 +158,14 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             "SELECT oid, typname, typelem, typarray, typinput = 'array_in'::regproc "
             "FROM pg_catalog.pg_type WHERE oid IN (23, 1007) ORDER BY oid"
         )
+        type_search_path_query = (
+            "SELECT DISTINCT ON (typname) typname, typinput = 'array_in'::regproc, typtype, sp.r, pg_type.oid "
+            "FROM pg_catalog.pg_type LEFT JOIN "
+            "(SELECT ns.oid AS nspoid, ns.nspname, r.r FROM pg_namespace ns JOIN "
+            "(SELECT s.r, (ARRAY['pg_catalog', 'public'])[s.r] AS nspname "
+            "FROM generate_series(1, array_upper(ARRAY['pg_catalog', 'public'], 1)) s(r)) r USING (nspname)) sp "
+            "ON sp.nspoid = typnamespace WHERE pg_type.oid IN (23, 1007) ORDER BY typname, sp.r, pg_type.oid"
+        )
         discovery = subprocess.check_output(
             [
                 psql,
@@ -201,6 +209,7 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                     membership_query,
                     namespace_query,
                     type_query,
+                    type_search_path_query,
                     "SELECT (ARRAY['pg_catalog', 'public'])[oid - 2198] "
                     "FROM pg_catalog.pg_namespace WHERE oid = 2200",
                     "SELECT (ARRAY['public', 'app'])[s.r] "
@@ -217,6 +226,8 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             discovery[6],
             "11|pg_catalog|int4",
             *discovery[2:4],
+            "_int4|t|b|1|1007",
+            "int4|f|b|1|23",
             "public",
             "public",
             "app",
