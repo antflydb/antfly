@@ -295,16 +295,18 @@ pub fn run(svc: anytype, registry: anytype, clock: u64, metadata_path: []const u
     };
     var concurrent: Concurrent = .{ .service = svc };
     try owner.feedback(&concurrent, &host, a, .{ .written = 104, .flushed = 104, .applied = 104 }, Request{});
-    try std.testing.expectEqual(@as(usize, 2), concurrent.attempts);
+    try std.testing.expectEqual(@as(usize, 0), concurrent.attempts);
     {
         var partial = try svc.load(a);
         defer partial.deinit();
         try std.testing.expectEqual(@as(u64, 1), partial.value.slot.?.confirmed_lsn);
     }
-    svc.lose_ack = true;
-    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, owner.feedback(svc, &host, a, .{ .written = 105, .flushed = 105, .applied = 105 }, Request{}));
-    svc.lose_ack = false;
-    try owner.feedback(svc, &host, a, .{ .written = 105, .flushed = 105, .applied = 105 }, Request{});
+    svc.lose_ack_at = svc.proposals + 2;
+    try owner.feedback(&concurrent, &host, a, .{ .written = 105, .flushed = 105, .applied = 105 }, Request{});
+    try std.testing.expectEqual(@as(usize, 2), concurrent.attempts);
+    svc.lose_ack_at = null;
+    try owner.feedback(&concurrent, &host, a, .{ .written = 105, .flushed = 105, .applied = 105 }, Request{});
+    try std.testing.expectEqual(@as(usize, 2), concurrent.attempts);
     try owner.release(svc, &host, a, Request{});
     var confirmed = try svc.load(a);
     defer confirmed.deinit();

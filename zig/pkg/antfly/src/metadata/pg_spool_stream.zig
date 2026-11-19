@@ -192,19 +192,42 @@ pub const Owner = struct {
     }
     pub fn feedback(self: *Owner, svc: anytype, policy: anytype, a: A, positions: Positions, request: anytype) !void {
         if (positions.written > self.ceiling or positions.flushed > self.ceiling or positions.applied > self.ceiling) return error.ChangefeedConflict;
+        var unknown: ?struct { confirmed_lsn: u64, expires_at: u64 } = null;
         var rejected_revision: ?u64 = null;
         for (0..4) |_| {
             var before = try load(svc, a, self.id, request);
             defer before.deinit();
             const now = try self.check(policy, before.value, request);
-            // Only a provable pre-admission conflict and a newer state warrant
-            // rebuilding the feedback CAS. Unknown outcomes go to reconnect.
-            if (rejected_revision) |revision| if (before.value.revision <= revision) return error.ChangefeedConflict;
             const slot = before.value.slot.?;
-            const expires = @max(slot.session_expires_at, @min(before.value.expires_at, now +| self.config.lease_seconds));
+            if (unknown) |effect| {
+                // Compare the durable effect under the same live owner. A
+                // concurrent publication may advance the metadata revision
+                // after an acknowledged transaction has already committed.
+                if (slot.confirmed_lsn >= effect.confirmed_lsn and slot.session_expires_at >= effect.expires_at) {
+                    self.end_lsn = slot.next_lsn;
+                    return;
+                }
+            }
+            if (rejected_revision) |revision| if (before.value.revision <= revision) return error.ChangefeedConflict;
+            var confirm = slot.confirmed_lsn;
+            for (slot.entries) |entry| {
+                if (entry.end_lsn > positions.flushed) break;
+                confirm = entry.end_lsn;
+            }
+            const renew = slot.session_expires_at - now <= @max(1, self.config.lease_seconds / 2);
+            const expires = if (renew) @min(before.value.expires_at, now +| self.config.lease_seconds) else slot.session_expires_at;
+            if (confirm == slot.confirmed_lsn and expires <= slot.session_expires_at) {
+                self.end_lsn = slot.next_lsn;
+                return;
+            }
             mutate(svc, a, before.value, .{ .feedback = .{ .session = self.session, .now = now, .expires = expires, .flushed = positions.flushed } }, request) catch |err| switch (err) {
                 error.ChangefeedConflict => {
                     rejected_revision = before.value.revision;
+                    continue;
+                },
+                error.MetadataMutationOutcomeUnknown => {
+                    unknown = .{ .confirmed_lsn = confirm, .expires_at = expires };
+                    rejected_revision = null;
                     continue;
                 },
                 else => return err,
@@ -215,7 +238,7 @@ pub const Owner = struct {
             self.end_lsn = observed.value.slot.?.next_lsn;
             return;
         }
-        return error.ChangefeedConflict;
+        return if (unknown != null) error.MetadataMutationOutcomeUnknown else error.ChangefeedConflict;
     }
     /// Internal close context must be independent of a canceled client request.
     /// It releases only this connection's lease and never acknowledges history.
