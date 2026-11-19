@@ -27,6 +27,7 @@ pub const history_consumer = @import("../storage/history_consumer.zig");
 pub const history_grant_wire = @import("../storage/history_grant_wire.zig");
 pub const history_resolution_wire = @import("../storage/history_resolution_wire.zig");
 pub const history_ordered = @import("../storage/history_ordered.zig");
+pub const history_bootstrap_wire = @import("../storage/history_bootstrap_wire.zig");
 pub const history_page = @import("../storage/history_page.zig");
 pub const history_page_wire = @import("../storage/history_page_wire.zig");
 pub const changefeed_projection = @import("../common/changefeed_projection.zig");

@@ -69,6 +69,72 @@ pub const Page = struct {
         self.* = undefined;
     }
 };
+pub const BootstrapRequest = struct {
+    reference: control.Reference,
+    digest: control.Digest,
+    now_seconds: u64,
+    after_rows: u32 = 0,
+    max_rows: u32 = 256,
+    max_bytes: u32 = 1024 * 1024,
+
+    pub fn validate(self: BootstrapRequest) !void {
+        try self.reference.validate();
+        if (self.now_seconds == 0 or std.mem.allEqual(u8, &self.digest, 0) or
+            self.max_rows == 0 or self.max_rows > 1024 or self.after_rows > control.max_bootstrap_examined_keys or
+            self.max_bytes == 0 or self.max_bytes > control.max_bootstrap_bytes) return error.InvalidHistoryAdmission;
+    }
+};
+
+pub const BootstrapPage = struct {
+    arena: std.heap.ArenaAllocator,
+    schema: []const u8,
+    rows: []const control.BootstrapImage.Row,
+    next_row: u32,
+    done: bool,
+
+    pub fn deinit(self: *BootstrapPage) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// The position is the number of physical rows consumed from this exact pin.
+/// Page buffers own the selected rows and schema across transaction teardown.
+pub fn readBootstrap(a: std.mem.Allocator, txn: anytype, request: BootstrapRequest) !BootstrapPage {
+    try request.validate();
+    const raw = try control.readBootstrap(txn, request.reference, request.digest, request.now_seconds);
+    var image = try control.BootstrapImage.decode(raw);
+    if (request.after_rows > image.rows.count) return error.HistoryCheckpointConflict;
+    if (image.schema.len > request.max_bytes) return error.HistoryTooLarge;
+    for (0..request.after_rows) |_| _ = (try image.rows.next()) orelse return error.HistoryCorrupt;
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    errdefer arena.deinit();
+    const page_alloc = arena.allocator();
+    var rows: std.ArrayList(control.BootstrapImage.Row) = .empty;
+    var bytes = image.schema.len;
+    while (rows.items.len < request.max_rows and image.rows.count != 0) {
+        const candidate = image.rows;
+        const row = (try image.rows.next()).?;
+        const size = 8 + row.key.len + row.value.len;
+        if (size > request.max_bytes - bytes) {
+            if (rows.items.len == 0) return error.HistoryTooLarge;
+            image.rows = candidate;
+            break;
+        }
+        try rows.append(page_alloc, .{ .key = try page_alloc.dupe(u8, row.key), .value = try page_alloc.dupe(u8, row.value) });
+        bytes += size;
+    }
+    if (image.rows.count == 0) _ = try image.rows.next();
+    return .{
+        .arena = arena,
+        .schema = try page_alloc.dupe(u8, image.schema),
+        .rows = rows.items,
+        .next_row = request.after_rows + @as(u32, @intCast(rows.items.len)),
+        .done = image.rows.count == 0,
+    };
+}
+
 /// The caller supplies a stable read transaction. All returned byte slices are
 /// page-owned, so neither transaction teardown nor backend scratch reuse can
 /// invalidate them. Descriptor and chunk buffers have independent ownership.

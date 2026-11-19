@@ -579,6 +579,7 @@ pub const VTable = struct {
     nativeHistoryPage: *const fn (self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").Request) Outcome(@import("history_page.zig").Page),
     provisionNativeHistoryAuthority: *const fn (self: *DB, expected_namespace: [24]u8) Outcome(void),
     applyOrderedHistoryConsumerControl: *const fn (*DB, @import("history_consumer.zig").Command, types.OrderedApplyReceipt, bool) Outcome(@import("history_ordered.zig").Outcome),
+    historyBootstrapPage: *const fn (*DB, std.mem.Allocator, @import("history_page.zig").BootstrapRequest, ?u64) Outcome(@import("history_page.zig").BootstrapPage),
     orderedHistoryPage: *const fn (*DB, std.mem.Allocator, @import("history_page.zig").Request, u64) Outcome(@import("history_page.zig").Page),
     orderedHistoryOutcome: *const fn (*DB, std.mem.Allocator, @import("history_ordered.zig").Lookup) Outcome(@import("history_ordered.zig").Outcome),
     nativeHistoryGrant: *const fn (*DB, @import("history_consumer.zig").GrantIdentity) Outcome(@import("history_consumer.zig").GrantObservation),
@@ -626,7 +627,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 67 adds original terminal legacy resolution under physical closure.
 /// Version 68 returns atomically retained legacy resolution outcomes.
 /// Version 69 adds snapshot-bound read-only legacy recovery outcomes.
-pub const descriptor_version: u32 = 72;
+pub const descriptor_version: u32 = 73;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

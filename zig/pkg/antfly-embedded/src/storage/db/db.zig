@@ -26682,6 +26682,22 @@ pub const DB = struct {
         return @import("../history_page.zig").readWithCompletion(allocator, &txn, request, if (kind == .raft) self.core.root_generation else null);
     }
 
+    /// With a positive ReadIndex, verify the Raft cut inside the same read
+    /// transaction as the pin. A null cut is reserved for standalone roots.
+    pub fn historyBootstrapPage(self: *DB, allocator: std.mem.Allocator, request: @import("../history_page.zig").BootstrapRequest, minimum_applied_index: ?u64) !@import("../history_page.zig").BootstrapPage {
+        if (comptime storage_engine.enabled) return storage_engine.call("historyBootstrapPage", .{ self, allocator, request, minimum_applied_index });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (minimum_applied_index == 0) return error.InvalidHistoryAdmission;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &request.reference.namespace)) return error.HistoryResynchronizationRequired;
+        _ = try @import("../source_authority.zig").require(&txn, if (minimum_applied_index == null) .native else .raft, namespace);
+        if (minimum_applied_index) |index| _ = try orderedHistoryReadCut(&txn, index);
+        return @import("../history_page.zig").readBootstrap(allocator, &txn, request);
+    }
+
     pub fn nativeHistoryGrant(self: *DB, requested: @import("../history_consumer.zig").GrantIdentity) !@import("../history_consumer.zig").GrantObservation {
         if (comptime storage_engine.enabled) return storage_engine.call("nativeHistoryGrant", .{ self, requested });
         return self.historyGrantForAuthority(requested, .native, 0);

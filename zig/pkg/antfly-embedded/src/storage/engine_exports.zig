@@ -1268,6 +1268,9 @@ fn orderedHistoryGrant(self: *DB, requested: @import("history_consumer.zig").Gra
 fn orderedHistoryOutcome(self: *DB, allocator: std.mem.Allocator, recovery: @import("history_ordered.zig").Lookup) engine.Outcome(@import("history_ordered.zig").Outcome) {
     return .{ .value = self.orderedHistoryOutcome(allocator, recovery) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn historyBootstrapPage(self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").BootstrapRequest, minimum_applied_index: ?u64) engine.Outcome(@import("history_page.zig").BootstrapPage) {
+    return .{ .value = self.historyBootstrapPage(allocator, request, minimum_applied_index) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn orderedHistoryPage(self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").Request, minimum_applied_index: u64) engine.Outcome(@import("history_page.zig").Page) {
     return .{ .value = self.orderedHistoryPage(allocator, request, minimum_applied_index) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
