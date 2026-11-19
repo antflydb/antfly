@@ -45181,8 +45181,10 @@ fn implementationTests() type {
                 const retry = try history.captureBootstrap(a, &txn, grant, 500);
                 try std.testing.expectEqualDeep(pin, retry);
                 const image = try history.readBootstrap(&txn, ref, pin.digest, 101);
-                try std.testing.expect(std.mem.indexOf(u8, image, "before-bootstrap") != null);
-                try std.testing.expect(std.mem.indexOf(u8, image, "after-bootstrap") == null);
+                var decoded = try history.BootstrapImage.decode(image);
+                const row = (try decoded.rows.next()).?;
+                try std.testing.expectEqualStrings("{\"value\":\"before-bootstrap\"}", row.value);
+                try std.testing.expectEqual(@as(?history.BootstrapImage.Row, null), try decoded.rows.next());
                 try std.testing.expectError(error.HistoryResynchronizationRequired, history.readBootstrap(&txn, ref, pin.digest, 500));
                 var wrong_digest = pin.digest;
                 wrong_digest[0] ^= 1;

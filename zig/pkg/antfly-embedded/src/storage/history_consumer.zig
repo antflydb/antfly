@@ -335,6 +335,46 @@ pub fn captureBootstrap(a: std.mem.Allocator, txn: anytype, grant: Grant, expire
     return pin;
 }
 
+pub const BootstrapImage = struct {
+    schema: []const u8,
+    rows: Rows,
+
+    pub const Row = struct { key: []const u8, value: []const u8 };
+    pub const Rows = struct {
+        remaining: []const u8,
+        count: u32,
+
+        pub fn next(self: *Rows) !?Row {
+            if (self.count == 0) {
+                if (self.remaining.len != 0) return error.HistoryCorrupt;
+                return null;
+            }
+            if (self.remaining.len < 8) return error.HistoryCorrupt;
+            const key_size = std.mem.readInt(u32, self.remaining[0..4], .little);
+            const value_size = std.mem.readInt(u32, self.remaining[4..8], .little);
+            const payload = self.remaining[8..];
+            if (key_size > payload.len or value_size > payload.len - key_size) return error.HistoryCorrupt;
+            const row_key = payload[0..key_size];
+            if (!keys.isStoredDocumentRowKey(row_key)) return error.HistoryCorrupt;
+            const end = @as(usize, key_size) + value_size;
+            self.remaining = payload[end..];
+            self.count -= 1;
+            return .{ .key = row_key, .value = payload[key_size..end] };
+        }
+    };
+
+    pub fn decode(raw: []const u8) !BootstrapImage {
+        if (raw.len < bootstrap_header_size or raw.len > max_bootstrap_bytes or !std.mem.eql(u8, raw[0..4], "HBS1"))
+            return error.HistoryCorrupt;
+        const schema_size = std.mem.readInt(u32, raw[28..32], .little);
+        const row_count = std.mem.readInt(u32, raw[32..36], .little);
+        const payload = raw[bootstrap_header_size..];
+        if (schema_size > history.frame.max_schema_bytes or schema_size > payload.len or row_count > max_bootstrap_examined_keys)
+            return error.HistoryCorrupt;
+        return .{ .schema = payload[0..schema_size], .rows = .{ .count = row_count, .remaining = payload[schema_size..] } };
+    }
+};
+
 /// Borrow an immutable physical snapshot from the authorized root transaction.
 pub fn readBootstrap(txn: anytype, ref: Reference, digest: Digest, now: u64) ![]const u8 {
     const consumer = try inspect(txn, ref);
