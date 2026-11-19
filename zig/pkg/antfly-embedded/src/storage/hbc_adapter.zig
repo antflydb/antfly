@@ -6400,7 +6400,7 @@ pub const HBCIndex = struct {
         var segment_index = opened.segments.len;
         while (segment_index > 0) {
             segment_index -= 1;
-            const segment = try vectorindex_posting_segment.Reader.init(opened.segments[segment_index].bytes());
+            const segment = try opened.segments[segment_index].validatedReader();
             if (try segment.getValue(0, .index_metadata)) |value_bytes| {
                 current = value_bytes;
                 break;
@@ -12693,7 +12693,7 @@ pub const HBCIndex = struct {
             alloc.free(segments);
         };
         for (opened.segments, 0..) |retained, index| {
-            segments[index] = try vectorindex_posting_segment.VerifiedReader.init(alloc, retained.bytes());
+            segments[index] = try vectorindex_posting_segment.VerifiedReader.initFromReader(alloc, try retained.validatedReader());
             segment_count += 1;
         }
         var encoded_metadata: ?[]const u8 = null;
