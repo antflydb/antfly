@@ -41100,7 +41100,23 @@ fn implementationTests() type {
             try std.testing.expectEqualDeep(applied, try db.applyOrderedHistoryConsumerControl(capture, .{ .term = 1, .index = 2 }, false));
             try std.testing.expectEqualDeep(applied, try db.applyOrderedHistoryConsumerControl(capture, .{ .term = 1, .index = 4 }, false));
             const ref: history.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = enrolled.epoch, .grant = grant.sequence, .definition = grant.definition };
-            var tail = try db.orderedHistoryPage(a, .{ .reference = ref, .after = .{ .sequence = enrolled.start }, .now_seconds = 100 }, 4);
+            var identity = history.GrantIdentity.fromGrant(grant);
+            try std.testing.expect((try db.orderedHistoryGrant(identity, 4)).active.bootstrap == null);
+            identity.include_bootstrap = true;
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.orderedHistoryGrant(identity, 5));
+            const pin = (try db.orderedHistoryGrant(identity, 4)).active.bootstrap.?;
+            try std.testing.expectEqual(@as(u64, 500), pin.expires_at_seconds);
+            {
+                var txn = try db.core.store.beginReadTxn();
+                defer txn.abort();
+                const image = try history.readBootstrap(&txn, ref, pin.digest, 100);
+                var decoded = try history.BootstrapImage.decode(image);
+                try std.testing.expectEqualStrings("{\"v\":1}", (try decoded.rows.next()).?.value);
+            }
+            const release: history.Command = .{ .release_bootstrap = .{ .reference = ref, .digest = pin.digest } };
+            _ = (try db.applyOrderedHistoryConsumerControl(release, .{ .term = 1, .index = 5 }, false)).applied;
+            try std.testing.expect((try db.orderedHistoryGrant(identity, 5)).active.bootstrap == null);
+            var tail = try db.orderedHistoryPage(a, .{ .reference = ref, .after = .{ .sequence = enrolled.start }, .now_seconds = 100 }, 5);
             defer tail.deinit();
             try std.testing.expectEqualStrings("{\"v\":2}", tail.events[0].after.?);
         }

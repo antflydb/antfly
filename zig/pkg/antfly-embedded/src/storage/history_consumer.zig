@@ -164,7 +164,8 @@ pub fn enroll(txn: anytype, grant: Grant) !history.Consumer {
     return consumer;
 }
 /// Read-only admission identity. This observes a lease; it does not certify
-/// the payload/outcome of an enrollment, its requested quota, or its expiry.
+/// the payload or outcome of an enrollment. An opted-in observation can also
+/// prove the current immutable bootstrap pin for this exact grant.
 pub const GrantIdentity = struct {
     namespace: Namespace,
     authority: Digest,
@@ -172,6 +173,21 @@ pub const GrantIdentity = struct {
     definition: Digest,
     sequence: u64,
     policy_revision: u64,
+    include_bootstrap: bool = false,
+
+    pub fn jsonStringify(self: GrantIdentity, jw: anytype) !void {
+        try jw.beginObject();
+        inline for (.{ "namespace", "authority", "consumer", "definition", "sequence", "policy_revision" }) |field| {
+            try jw.objectField(field);
+            try jw.write(@field(self, field));
+        }
+        if (self.include_bootstrap) {
+            try jw.objectField("include_bootstrap");
+            try jw.write(true);
+        }
+        try jw.endObject();
+    }
+
     pub fn fromGrant(value: Grant) GrantIdentity {
         return .{ .namespace = value.namespace, .authority = value.authority, .consumer = value.consumer, .definition = value.definition, .sequence = value.sequence, .policy_revision = value.policy_revision };
     }
@@ -190,7 +206,26 @@ pub const GrantObservation = union(enum) {
     /// Same immutable consumer/definition, but a different grant is current.
     /// Never treat this as confirmation of the requested grant.
     other_grant: Active,
-    pub const Active = struct { grant: u64, consumer: history.Consumer, limit: u64 };
+    pub const Active = struct {
+        grant: u64,
+        consumer: history.Consumer,
+        limit: u64,
+        bootstrap: ?BootstrapObservation = null,
+
+        pub fn jsonStringify(self: Active, jw: anytype) !void {
+            try jw.beginObject();
+            inline for (.{ "grant", "consumer", "limit" }) |field| {
+                try jw.objectField(field);
+                try jw.write(@field(self, field));
+            }
+            if (self.bootstrap) |pin| {
+                try jw.objectField("bootstrap");
+                try jw.write(pin);
+            }
+            try jw.endObject();
+        }
+    };
+    pub const BootstrapObservation = struct { digest: Digest, expires_at_seconds: u64 };
 };
 /// Observe authority, retirement floor and lease in one stable transaction.
 /// This never writes a receipt, enrolls, renews, acknowledges or binds authority.
@@ -210,8 +245,15 @@ pub fn observeGrant(txn: anytype, requested: GrantIdentity) !GrantObservation {
         const physical = if (native) |*value| value else return error.HistoryCorrupt;
         const consumer = (physical.findConsumer(lease.id, lease.epoch) catch return error.HistoryCorrupt).*;
         if (consumer.policy_revision != requested.policy_revision) return error.HistoryConsumerConflict;
-        const result: GrantObservation.Active = .{ .grant = lease.grant, .consumer = consumer, .limit = physical.limit };
-        return if (lease.grant == requested.sequence) .{ .active = result } else .{ .other_grant = result };
+        var result: GrantObservation.Active = .{ .grant = lease.grant, .consumer = consumer, .limit = physical.limit };
+        if (lease.grant != requested.sequence) return .{ .other_grant = result };
+        if (requested.include_bootstrap) {
+            if (try readBootstrapBlob(txn, requested.consumer)) |raw| {
+                const pin = try bootstrapPin(requested.namespace, consumer, raw);
+                result.bootstrap = .{ .digest = pin.digest, .expires_at_seconds = pin.expires_at_seconds };
+            }
+        }
+        return .{ .active = result };
     }
     if (native) |value| for (value.consumers) |consumer| {
         if (consumer.epoch != 0 and same(consumer.id, requested.consumer)) return error.HistoryConsumerConflict;

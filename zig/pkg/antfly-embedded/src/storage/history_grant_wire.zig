@@ -40,6 +40,7 @@ pub const Request = struct {
             std.mem.writeInt(u64, &bytes, value, .little);
             hash.update(&bytes);
         }
+        if (self.identity.include_bootstrap) hash.update("\x01");
         return hash.finalResult();
     }
 };
@@ -64,6 +65,10 @@ pub const Reply = struct {
                 if (!std.mem.eql(u8, &consumer.id, &request.identity.consumer) or consumer.epoch == 0 or consumer.expires_at_seconds == 0 or
                     consumer.policy_revision != request.identity.policy_revision or consumer.acknowledged < consumer.start or value.limit == 0 or value.grant == 0) return error.HistoryCorrupt;
                 if ((value.grant == request.identity.sequence) != (self.observation == .active)) return error.HistoryCorrupt;
+                if (value.bootstrap) |pin| {
+                    if (!request.identity.include_bootstrap or self.observation != .active or pin.expires_at_seconds == 0 or
+                        pin.expires_at_seconds > consumer.expires_at_seconds or std.mem.allEqual(u8, &pin.digest, 0)) return error.HistoryCorrupt;
+                }
             },
         }
     }
