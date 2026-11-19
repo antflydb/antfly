@@ -185,6 +185,8 @@ pub const BackfillSummary = struct {
     snapshot_complete: bool = false,
 };
 
+const iceberg_snapshot_publish_pending = "iceberg_snapshot_publish_pending";
+
 pub const SnapshotBackfillRunner = struct {
     alloc: Allocator,
     io: std.Io = std.Options.debug_io,
@@ -257,6 +259,7 @@ pub const SnapshotBackfillRunner = struct {
         // Retain every original resume field until the entire run returns.
         const existing_status: ?metadata_table_manager.ReplicationSourceStatusRecord = if (existing_status_input) |status| try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, status) else null;
         defer if (existing_status) |status| metadata_table_manager.freeReplicationSourceStatus(self.alloc, status);
+        var lake_publish_pending = if (existing_status) |status| std.mem.eql(u8, status.phase, iceberg_snapshot_publish_pending) else false;
         var progress_offset = start_offset;
         var progress_snapshot_checkpoint = std.ArrayListUnmanaged(u8).empty;
         defer progress_snapshot_checkpoint.deinit(self.alloc);
@@ -302,6 +305,7 @@ pub const SnapshotBackfillRunner = struct {
             source_ordinal,
             start_offset,
             existing_status,
+            &lake_publish_pending,
             &progress_offset,
             &progress_snapshot_checkpoint,
             &progress_cutover_mode,
@@ -335,7 +339,7 @@ pub const SnapshotBackfillRunner = struct {
                     progress_publication_name.items
                 else
                     parsed.publication_name,
-                .phase = "failed",
+                .phase = if (lake_publish_pending) iceberg_snapshot_publish_pending else "failed",
                 .checkpoint = if (progress_snapshot_checkpoint.items.len > 0)
                     progress_snapshot_checkpoint.items
                 else
@@ -375,6 +379,7 @@ pub const SnapshotBackfillRunner = struct {
         source_ordinal: u32,
         start_offset: usize,
         existing_status: ?metadata_table_manager.ReplicationSourceStatusRecord,
+        lake_publish_pending: *bool,
         progress_offset: *usize,
         progress_snapshot_checkpoint: *std.ArrayListUnmanaged(u8),
         progress_cutover_mode: *std.ArrayListUnmanaged(u8),
@@ -395,11 +400,13 @@ pub const SnapshotBackfillRunner = struct {
         defer parsed.deinit(self.alloc);
         var external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json);
         defer if (external) |*binding| binding.deinit(self.alloc);
-        if (external) |binding| {
+        const lake_owner = if (external) |binding| blk: {
             if (binding.binding.format != .iceberg or binding.binding.write_policy != .iceberg_writer or
                 parsed.routes.len != 0 or parsed.on_update_json != null or parsed.on_delete_json != null) return error.UnsupportedReplicationRoute;
             const owner = self.external_destination orelse return error.UnsupportedReplicationRoute;
             const observed = owner.bootstrap_committed orelse return error.UnsupportedReplicationRoute;
+            parsed.require_exact_cutover = true;
+            if (!lake_publish_pending.*) break :blk owner;
             var status = existing_status orelse return error.UnsupportedReplicationRoute;
             if (status.table_id != table.table_id or status.source_ordinal != source_ordinal or
                 !exactCutoverIntentOwnsConfig(status, parsed, exactCutoverConfigFingerprint(table.table_id, source_ordinal, parsed)) or
@@ -425,7 +432,7 @@ pub const SnapshotBackfillRunner = struct {
             status.updated_at_ms = status.last_success_at_ms;
             try callUpsertStatus(status_sink, status);
             return .{ .final_offset = @intCast(status.snapshot_offset), .snapshot_complete = true };
-        }
+        } else null;
 
         var resolved_dsn = try secrets.resolveReferenceWithGenerationOwned(self.alloc, self.secret_store, parsed.dsn);
         defer resolved_dsn.deinit(self.alloc);
@@ -934,7 +941,14 @@ pub const SnapshotBackfillRunner = struct {
 
         var bulk_ingest_tables: std.ArrayListUnmanaged([]const u8) = .empty;
         defer bulk_ingest_tables.deinit(self.alloc);
-        try beginBackfillBulkIngestWindow(self.alloc, self.write_source, table.name, parsed, &bulk_ingest_tables);
+        if (lake_owner == null) try beginBackfillBulkIngestWindow(self.alloc, self.write_source, table.name, parsed, &bulk_ingest_tables);
+        if (lake_owner != null and (prepared_snapshot == null or effective_start_offset != 0 or snapshot_order_fields.len == 0)) return error.ReplicationExactCutoverRequired;
+        var lake_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer lake_arena.deinit();
+        const lake_alloc = lake_arena.allocator();
+        var lake_rows: std.ArrayList(std.json.Value) = .empty;
+        var lake_bytes: usize = 0;
+        const lake_catalog = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog;
         errdefer abortBackfillBulkIngestWindow(self.write_source, bulk_ingest_tables.items);
 
         var quantum_exhausted = false;
@@ -1018,7 +1032,16 @@ pub const SnapshotBackfillRunner = struct {
                 );
             }
 
-            if (parsed.has_update_transforms or parsed.has_routes) {
+            if (lake_owner != null) {
+                if (result.rows.len > lake_catalog.parquet_writer.max_rows - lake_rows.items.len) return error.LakeWriteTooLarge;
+                for (result.rows) |row| {
+                    const encoded = try std.json.Stringify.valueAlloc(self.alloc, row, .{});
+                    defer self.alloc.free(encoded);
+                    if (encoded.len > lake_catalog.types.max_commit_bytes - lake_bytes) return error.LakeWriteTooLarge;
+                    lake_bytes += encoded.len;
+                    try lake_rows.append(lake_alloc, try cloneJsonValueAllocLocal(lake_alloc, row));
+                }
+            } else if (parsed.has_update_transforms or parsed.has_routes) {
                 for (result.rows) |row| {
                     try self.checkpointWork();
                     try checkProgressCutoverAuthority(
@@ -1084,7 +1107,7 @@ pub const SnapshotBackfillRunner = struct {
             summary.rows_applied += result.rows.len;
             summary.batches_applied += 1;
             summary.final_offset += result.rows.len;
-            progress_offset.* = summary.final_offset;
+            if (lake_owner == null) progress_offset.* = summary.final_offset;
             if (next_snapshot_checkpoint) |checkpoint| {
                 try replaceProgressSlice(
                     self.alloc,
@@ -1108,41 +1131,43 @@ pub const SnapshotBackfillRunner = struct {
                 );
             }
 
-            try callUpsertStatus(status_sink, .{
-                .table_id = table.table_id,
-                .source_ordinal = source_ordinal,
-                .source_kind = parsed.type_name,
-                .external_table = parsed.postgres_table,
-                .cutover_mode = cutover_mode,
-                .slot_name = effective_slot_name,
-                .publication_name = effective_publication_name,
-                .phase = phase_snapshot,
-                .checkpoint = progress_snapshot_checkpoint.items,
-                .snapshot_offset = @intCast(summary.final_offset),
-                .prepared_checkpoint = prepared_checkpoint,
-                .stream_checkpoint = "",
-                .last_error = "",
-                .failure_class = "",
-                .lag_records = 0,
-                .lag_millis = 0,
-                .consecutive_failures = 0,
-                .last_source_commit_at_ms = 0,
-                .last_success_at_ms = ioNowMillis(self.io),
-                .last_change_applied_at_ms = ioNowMillis(self.io),
-                .cutover_intent_id = progress_cutover_intent_id.*,
-                .cutover_authority_id = progress_cutover_authority_id.*,
-                .cutover_config_fingerprint = progress_cutover_config_fingerprint.*,
-                .cutover_provider_identity = progress_cutover_provider_identity.*,
-                .updated_at_ms = ioNowMillis(self.io),
-            });
-            try self.reachLifecycle(
-                .snapshot_checkpoint_persisted,
-                table.table_id,
-                source_ordinal,
-                @intCast(summary.final_offset),
-                progress_cutover_authority_id.*,
-                progress_snapshot_checkpoint.items,
-            );
+            if (lake_owner == null) {
+                try callUpsertStatus(status_sink, .{
+                    .table_id = table.table_id,
+                    .source_ordinal = source_ordinal,
+                    .source_kind = parsed.type_name,
+                    .external_table = parsed.postgres_table,
+                    .cutover_mode = cutover_mode,
+                    .slot_name = effective_slot_name,
+                    .publication_name = effective_publication_name,
+                    .phase = phase_snapshot,
+                    .checkpoint = progress_snapshot_checkpoint.items,
+                    .snapshot_offset = @intCast(summary.final_offset),
+                    .prepared_checkpoint = prepared_checkpoint,
+                    .stream_checkpoint = "",
+                    .last_error = "",
+                    .failure_class = "",
+                    .lag_records = 0,
+                    .lag_millis = 0,
+                    .consecutive_failures = 0,
+                    .last_source_commit_at_ms = 0,
+                    .last_success_at_ms = ioNowMillis(self.io),
+                    .last_change_applied_at_ms = ioNowMillis(self.io),
+                    .cutover_intent_id = progress_cutover_intent_id.*,
+                    .cutover_authority_id = progress_cutover_authority_id.*,
+                    .cutover_config_fingerprint = progress_cutover_config_fingerprint.*,
+                    .cutover_provider_identity = progress_cutover_provider_identity.*,
+                    .updated_at_ms = ioNowMillis(self.io),
+                });
+                try self.reachLifecycle(
+                    .snapshot_checkpoint_persisted,
+                    table.table_id,
+                    source_ordinal,
+                    @intCast(summary.final_offset),
+                    progress_cutover_authority_id.*,
+                    progress_snapshot_checkpoint.items,
+                );
+            }
             try self.checkpointWork();
 
             if (result.rows.len < self.batch_size) break;
@@ -1187,6 +1212,43 @@ pub const SnapshotBackfillRunner = struct {
         );
         bulk_ingest_tables.clearRetainingCapacity();
         if (quantum_exhausted) return summary;
+
+        if (lake_owner) |owner| {
+            const pending: metadata_table_manager.ReplicationSourceStatusRecord = .{
+                .table_id = table.table_id,
+                .source_ordinal = source_ordinal,
+                .source_kind = parsed.type_name,
+                .external_table = parsed.postgres_table,
+                .cutover_mode = cutover_mode,
+                .slot_name = effective_slot_name,
+                .publication_name = effective_publication_name,
+                .phase = iceberg_snapshot_publish_pending,
+                .checkpoint = progress_snapshot_checkpoint.items,
+                .snapshot_offset = @intCast(summary.final_offset),
+                .prepared_checkpoint = prepared_checkpoint,
+                .cutover_intent_id = progress_cutover_intent_id.*,
+                .cutover_authority_id = progress_cutover_authority_id.*,
+                .cutover_config_fingerprint = progress_cutover_config_fingerprint.*,
+                .cutover_provider_identity = progress_cutover_provider_identity.*,
+                .updated_at_ms = ioNowMillis(self.io),
+            };
+            try callUpsertStatus(status_sink, pending);
+            progress_offset.* = summary.final_offset;
+            lake_publish_pending.* = true;
+            const outcome = try owner.apply(owner.ptr, self.alloc, .{
+                .table = table,
+                .cutover = pending,
+                .previous_checkpoint = null,
+                .checkpoint = prepared_checkpoint,
+                .changes = &.{},
+                .snapshot_rows = lake_rows.items,
+                .deadline_ns = try self.workDeadlineNs(),
+            });
+            if (outcome != .committed) return error.SourceOutcomeUnresolved;
+            try self.checkpointWork();
+            try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
+            try callCheckCutoverAuthority(status_sink, table.replication_sources_json, pending);
+        }
 
         try callUpsertStatus(status_sink, .{
             .table_id = table.table_id,
@@ -4682,6 +4744,34 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
     ));
     try std.testing.expect(final_status.slot_name.len <= postgres_identifier_max_len);
     try std.testing.expect(std.mem.indexOf(u8, final_status.slot_name, "_af_") != null);
+
+    const Lake = struct {
+        fn apply(raw: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) !ExternalStreamDestination.Outcome {
+            const sink: *StatusSink = @ptrCast(@alignCast(raw));
+            const pending = sink.records.items[sink.records.items.len - 1];
+            try std.testing.expectEqualStrings(iceberg_snapshot_publish_pending, pending.phase);
+            try std.testing.expectEqualStrings("lsn:exact", request.checkpoint);
+            try std.testing.expectEqual(@as(usize, 2), request.snapshot_rows.?.len);
+            try std.testing.expectEqualStrings("doc:1", request.snapshot_rows.?[0].object.get("id").?.string);
+            try std.testing.expectEqualStrings("doc:2", request.snapshot_rows.?[1].object.get("id").?.string);
+            return .committed;
+        }
+        fn observe(_: *anyopaque, _: Allocator, _: ExternalStreamDestination.Request) !bool {
+            return error.UnexpectedBootstrapRecovery;
+        }
+    };
+    runner.external_destination = .{ .ptr = &status_sink, .apply = Lake.apply, .bootstrap_committed = Lake.observe };
+    const captured = try runner.runTableSource(&status_sink, .{
+        .table_id = 12,
+        .name = "lake",
+        .schema_json =
+        \\{"base_source":{"kind":"external","table_id":"lake","uri":"file:///lake","format":"iceberg","write_policy":"iceberg_writer","catalog":{"type":"managed"},"row_identity":{"key_columns":["id"]}}}
+        ,
+        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\"}]",
+    }, 0);
+    try std.testing.expect(captured.snapshot_complete);
+    try std.testing.expectEqual(@as(usize, 2), captured.rows_applied);
+    try std.testing.expectEqualStrings("cutover_prepared", status_sink.records.items[status_sink.records.items.len - 1].phase);
 }
 
 test "metadata replication backfill applies configured update transforms" {
@@ -7486,7 +7576,7 @@ test "metadata replication stream resumes complete durable transactions while de
     var publication: [postgres_identifier_max_len]u8 = undefined;
     status.cutover_intent_id = 8;
     status.cutover_mode = cutover_mode_exported_snapshot;
-    status.phase = "snapshot";
+    status.phase = iceberg_snapshot_publish_pending;
     status.external_table = config.postgres_table;
     status.slot_name = exactCutoverPhysicalResourceName(&slot, config.slot_name, 8, 9);
     status.publication_name = exactCutoverPhysicalResourceName(&publication, config.publication_name, 8, 9);
