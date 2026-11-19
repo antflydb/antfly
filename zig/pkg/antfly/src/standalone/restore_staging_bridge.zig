@@ -36,6 +36,7 @@ pub const Status = struct {
     pub const failed: c_int = 3;
     pub const unsupported_index: c_int = 4;
     pub const unsupported_schema: c_int = 5;
+    pub const unsupported_migration: c_int = 6;
 };
 
 pub const Result = extern struct {
@@ -146,6 +147,7 @@ pub fn stageInputRestoreBackup(
         Status.invalid_arguments => return error.InvalidArguments,
         Status.unsupported_index => return error.UnsupportedEmbeddedLiteIndex,
         Status.unsupported_schema => return error.UnsupportedEmbeddedLiteSchema,
+        Status.unsupported_migration => return error.UnsupportedBackupMigrationState,
         else => return error.RestoreStagingFailed,
     }
     return .{

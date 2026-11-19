@@ -29,6 +29,8 @@ class BackupInfo:
         table_selectors (list[BackupInfoTableSelectorsItem] | Unset): Exact restore selectors paired with display names,
             in the same order as tables. Use selector in ClusterRestoreRequest.table_names to disambiguate identical display
             names.
+        table_details_omitted (bool | Unset): True when the listing returned only backup metadata because table details
+            exceeded the page size.
         antfly_version (str | Unset): Antfly version that created the backup Example: v1.0.0.
         format_ (BackupInfoFormat | Unset): Backup format used Example: portable.
     """
@@ -38,6 +40,7 @@ class BackupInfo:
     tables: list[str]
     location: str
     table_selectors: list[BackupInfoTableSelectorsItem] | Unset = UNSET
+    table_details_omitted: bool | Unset = UNSET
     antfly_version: str | Unset = UNSET
     format_: BackupInfoFormat | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -58,6 +61,8 @@ class BackupInfo:
                 table_selectors_item = table_selectors_item_data.to_dict()
                 table_selectors.append(table_selectors_item)
 
+        table_details_omitted = self.table_details_omitted
+
         antfly_version = self.antfly_version
 
         format_: str | Unset = UNSET
@@ -76,6 +81,8 @@ class BackupInfo:
         )
         if table_selectors is not UNSET:
             field_dict["table_selectors"] = table_selectors
+        if table_details_omitted is not UNSET:
+            field_dict["table_details_omitted"] = table_details_omitted
         if antfly_version is not UNSET:
             field_dict["antfly_version"] = antfly_version
         if format_ is not UNSET:
@@ -105,6 +112,8 @@ class BackupInfo:
 
                 table_selectors.append(table_selectors_item)
 
+        table_details_omitted = d.pop("table_details_omitted", UNSET)
+
         antfly_version = d.pop("antfly_version", UNSET)
 
         _format_ = d.pop("format", UNSET)
@@ -120,6 +129,7 @@ class BackupInfo:
             tables=tables,
             location=location,
             table_selectors=table_selectors,
+            table_details_omitted=table_details_omitted,
             antfly_version=antfly_version,
             format_=format_,
         )

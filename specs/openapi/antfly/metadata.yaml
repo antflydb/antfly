@@ -3841,6 +3841,7 @@ components:
           description: What to do next.
     TableRepairJobStartRequest:
       type: object
+      x-go-type: RepairJobStartOptions
       description: Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair.
       properties:
         target:
@@ -3868,7 +3869,7 @@ components:
         advance:
           type: boolean
           default: true
-          description: When true, the server immediately attempts the first bounded repair pass before returning the job.
+          description: When true, the server starts the job and continues bounded passes automatically, including after restart. When false, each pass requires an explicit advance request.
     TableRepairControlJobStartRequest:
       type: object
       description: Starts a durable named-index control traversal. The server advances every bounded pass, including after restart. Use the repair job status and cancellation endpoints to inspect or stop the traversal.
@@ -7507,6 +7508,9 @@ components:
               selector:
                 type: string
                 description: Opaque identifier accepted by restore for this backup.
+        table_details_omitted:
+          type: boolean
+          description: True when the listing returned only backup metadata because table details exceeded the page size.
         location:
           type: string
           description: Storage location of the backup

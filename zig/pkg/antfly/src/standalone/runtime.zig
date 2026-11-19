@@ -1496,7 +1496,7 @@ const LocalStandaloneMetadata = struct {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        return (self.lifecycle_store orelse return error.UnsupportedOperation).getRestoreJobValue(alloc, group_ids.main_metadata_group_id, key);
+        return (self.lifecycle_store orelse return error.UnsupportedOperation).getRestoreJobRecord(alloc, group_ids.main_metadata_group_id, key);
     }
     fn applyJobCommandLocked(self: *LocalStandaloneMetadata, command: @import("../metadata/storage/raft_apply_store.zig").TransitionCommand) !void {
         const store = self.lifecycle_store orelse return error.UnsupportedOperation;
@@ -1533,17 +1533,28 @@ const LocalStandaloneMetadata = struct {
         defer locked.deinit();
         try self.requireRestoreJobTermLocked(term);
         try self.applyJobCommandLocked(.{ .upsert_restore_job = .{ .key = key, .value = value } });
-        const actual = (try self.lifecycle_store.?.getRestoreJobValue(self.alloc, group_ids.main_metadata_group_id, key)) orelse return error.RestoreJobCommitNotApplied;
+        const actual = (try self.lifecycle_store.?.getRestoreJobRecord(self.alloc, group_ids.main_metadata_group_id, key)) orelse return error.RestoreJobCommitNotApplied;
         defer self.alloc.free(actual);
         if (!std.mem.eql(u8, actual, value)) return error.RestoreJobCommitNotApplied;
+    }
+    fn requireStandbyRestoreJobFormatLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, value: []const u8) !void {
+        const server = self.hot_standby_catalog_server orelse return;
+        const jobs = antfly.public_api.restore_jobs;
+        if (!try jobs.requiresPinnedRestoreWorker(alloc, value)) return;
+        lockAtomic(&server.hot_standby_state_mutex);
+        defer server.hot_standby_state_mutex.unlock();
+        const primary = server.hot_standby_cfg.internal_primary orelse return error.NotLeader;
+        if (!primary.slots.supportsRestoreJobFormat(primary.identity.timeline_id, jobs.pinned_restore_job_format_version))
+            return error.TableTopologyProtocolUpgradeRequired;
     }
     fn restoreJobsCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, term: u64) ![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         var locked = try self.lockMutation();
         defer locked.deinit();
         try self.requireRestoreJobTermLocked(term);
+        try self.requireStandbyRestoreJobFormatLocked(alloc, value);
         try self.applyJobCommandLocked(.{ .create_restore_job = .{ .key = key, .value = value } });
-        return (try self.lifecycle_store.?.getRestoreJobValue(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
+        return (try self.lifecycle_store.?.getRestoreJobRecord(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
     }
     fn restoreJobsCreateWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan_json: []const u8, term: u64) ![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
@@ -1551,8 +1562,9 @@ const LocalStandaloneMetadata = struct {
         defer locked.deinit();
         if (!self.coordinated_lifecycle_allowed) return error.CoordinatedStandaloneHAMetadataRequired;
         try self.requireRestoreJobTermLocked(term);
+        try self.requireStandbyRestoreJobFormatLocked(alloc, value);
         try self.applyJobCommandLocked(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan_json } });
-        return (try self.lifecycle_store.?.getRestoreJobValue(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
+        return (try self.lifecycle_store.?.getRestoreJobRecord(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
     }
     fn restoreJobsDelete(ptr: *anyopaque, key: []const u8, term: u64) !void {
         return restoreJobsDeleteMany(ptr, &.{key}, term);
@@ -6048,6 +6060,21 @@ pub fn runFromIterator(
         )
     else
         null;
+    const repair_job_namespace = "system/api-repair-jobs";
+    var kernel_repair_job_backend: ?antfly.storage_backend_erased.Store = null;
+    defer if (kernel_repair_job_backend) |*store| store.deinit();
+    const lite_repair_job_store = if (lite_path == null) null else if (comptime control_only_storage_sources) blk: {
+        kernel_repair_job_backend = try storage_kernel_context.systemStore(alloc, repair_job_namespace);
+        break :blk &kernel_repair_job_backend.?;
+    } else if (lite_backend) |*backend|
+        try backend.runtimeStoreForNamespace(repair_job_namespace)
+    else
+        null;
+    const repair_job_root = if (lite_path == null)
+        try std.fmt.allocPrint(alloc, "{s}/api-repair-jobs", .{resolved.replica_root_dir})
+    else
+        null;
+    defer if (repair_job_root) |path| alloc.free(path);
     const synced_extension_packages = if (hot_standby_role_requested)
         0
     else
@@ -6247,6 +6274,8 @@ pub fn runFromIterator(
             .session_store = if (lite_session_store) |*store| store else if (native_sessions) |*store| store else null,
             .restore_job_store = if (local_metadata.lifecycle_store == null) restore_job_store else null,
             .research_job_store = if (research_job_store) |*store| store else null,
+            .repair_job_store = lite_repair_job_store,
+            .repair_job_store_path = repair_job_root,
             .incoming_graph_route_store = incoming_graph_route_store,
             .session_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.ttl_seconds * std.time.ns_per_s else standalone_session_ttl_ns,
             .session_cleanup_interval_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_interval_seconds * std.time.ns_per_s else standalone_session_cleanup_interval_ns,

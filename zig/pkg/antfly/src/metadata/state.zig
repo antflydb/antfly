@@ -81,6 +81,7 @@ pub const MetadataState = struct {
     /// Exact hidden initial-FK groups from the durable provisioning cut. They
     /// participate in placement without entering the public desired catalog.
     initial_fk_owner_group_ids: []u64 = &.{},
+    admission_reader_group_ids: []u64 = &.{},
     projected_store_topology_present: bool = false,
     committed_nodes: std.ArrayListUnmanaged(metadata_table_manager.NodeRecord) = .empty,
     committed_stores: std.ArrayListUnmanaged(metadata_table_manager.StoreRecord) = .empty,
@@ -107,6 +108,7 @@ pub const MetadataState = struct {
         if (self.projected_node_ids.len > 0) self.alloc.free(self.projected_node_ids);
         if (self.projected_store_node_ids.len > 0) self.alloc.free(self.projected_store_node_ids);
         if (self.initial_fk_owner_group_ids.len > 0) self.alloc.free(self.initial_fk_owner_group_ids);
+        if (self.admission_reader_group_ids.len > 0) self.alloc.free(self.admission_reader_group_ids);
         if (self.projected_store_candidates.len > 0) {
             for (self.projected_store_candidates) |candidate| {
                 self.alloc.free(candidate.role);
@@ -178,6 +180,9 @@ pub const MetadataState = struct {
         } else &.{};
         var initial_fk_groups_owned = true;
         errdefer if (initial_fk_groups_owned and initial_fk_groups.len > 0) self.alloc.free(initial_fk_groups);
+        const admission_groups = if (provisioning) |projection| try @import("restore_staging.zig").admissionReaderGroups(self.alloc, projection) else try self.alloc.alloc(u64, 0);
+        var admission_groups_owned = true;
+        errdefer if (admission_groups_owned) self.alloc.free(admission_groups);
         const projected_nodes = try listProjectedNodes(self, service);
         defer freeProjectedNodes(self, service, projected_nodes);
         const projected_stores = try listProjectedStores(self, service);
@@ -191,6 +196,9 @@ pub const MetadataState = struct {
         if (self.initial_fk_owner_group_ids.len > 0) self.alloc.free(self.initial_fk_owner_group_ids);
         self.initial_fk_owner_group_ids = initial_fk_groups;
         initial_fk_groups_owned = false;
+        if (self.admission_reader_group_ids.len > 0) self.alloc.free(self.admission_reader_group_ids);
+        self.admission_reader_group_ids = admission_groups;
+        admission_groups_owned = false;
         self.clearCommitted();
         self.clearCommittedNodes();
         self.clearCommittedStores();
@@ -311,6 +319,7 @@ pub const MetadataState = struct {
                 .tables = tables,
                 .ranges = ranges,
                 .initial_fk_owner_group_ids = self.initial_fk_owner_group_ids,
+                .admission_reader_group_ids = self.admission_reader_group_ids,
                 .stores = self.committed_stores.items,
                 .merged_group_statuses = merged_group_statuses,
                 .restore_progresses = restore_progresses,

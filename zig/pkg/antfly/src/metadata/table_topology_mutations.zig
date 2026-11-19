@@ -248,7 +248,7 @@ pub fn restore(
     }
     const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(
         request,
-        topology_protocol.atomic_table_topology_version,
+        topology_protocol.restoreAdmissionDecoderVersion(ranges, topology_protocol.atomic_table_topology_version),
     );
     lockTableCatalogMutation(svc, table.name);
     var catalog_locked = true;
