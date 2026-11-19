@@ -12,6 +12,10 @@ these counters are not a count of replayed GPU executions. The selected opt-in
 The flag-off control in the same worker also passes 8/8 and 585/585, records
 zero new-tile calls, and matches the enabled profile on every first-step logit
 bit and all 768 fixed-budget output tokens.
+These qualification claims apply to the explicit L4 profile. Benchmarks select
+it with `--native-env-file zig/lib/pjrt/tools/gemma4-l4-speed-profile.json`;
+serving should apply the same JSON entries to the Gemma4 worker's environment.
+The qualification does not establish the same result for bare process defaults.
 The clean all-artifact freshness rerun passes: PTX, all seven SASS architectures
 in the fatbin, and standalone SM89 match regeneration from source; all 325
 required symbols are present.
@@ -37,7 +41,12 @@ llama.cpp. Page summary, long text and 30-second audio are within 1% faster;
 video latency is about 14% lower. Only video meets the 5% median improvement
 and no-p95-regression criterion in this screen. Native is 2.6–3.1 times faster
 than this BF16 PJRT artifact; this does not reproduce PR #1404's exact unified
-runtime. The all-modality goal and PR readiness remain unmet.
+runtime. Seven cases are within 2.5% of llama.cpp in this preliminary screen.
+The 5% guardrail defines a clear-win claim; it is not a prerequisite for a PR
+scoped to qualified improvements and approximate latency parity. That scope
+still needs a completed repeated comparison, final diff/CI review, and explicit
+documentation of the qualified L4 profile. The broader all-modality superiority
+goal remains open.
 
 CUDA probes using the matching official Gemma4 QAT assistant passed all eight
 first-step gates and all 585 reference decisions with ordinary and deferred

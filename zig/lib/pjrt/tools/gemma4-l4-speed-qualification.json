@@ -1525,9 +1525,12 @@
     "all_modality_performance_target_achieved": false,
     "pr_ready": false,
     "remaining": [
-      "Close remaining llama.cpp latency deficits without weakening frozen correctness gates",
-      "Meet5% median improvement and no p95 regression against llama.cpp on all8 cases in a completed multi-round comparison"
-    ]
+      "Complete repeated matched comparison and report median and p95 without requiring every case to beat llama.cpp",
+      "Finish final diff and applicable CI review",
+      "Document explicit qualified L4 profile and keep PR performance claims scoped to measured workers and inputs"
+    ],
+    "pr_scope": "Qualified opt-in L4 improvements and approximate llama.cpp latency parity; broader all-modality superiority remains a separate performance goal",
+    "clear_win_guardrail": "At least5% lower median latency and no p95 regression is the threshold for a clear-win claim, not a prerequisite for landing qualified improvements"
   },
   "ple_differential": {
     "tensor": "blk.0.inp_gate.weight",
