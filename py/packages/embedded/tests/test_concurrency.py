@@ -663,6 +663,64 @@ def test_unrelated_busy_index_does_not_starve_maintenance(tmp_path: Path) -> Non
     assert merged["active_segments"] <= 4, (merged, writes[0])
 
 
+def test_busy_index_in_another_process_does_not_starve_maintenance(tmp_path: Path) -> None:
+    # Another process's index commits reach this one by replay, and its large
+    # values fill the redo log, so its folds move the header and maintenance
+    # admission rebases. Replay of
+    # an unrelated index must not keep rejecting this index's merges.
+    def text_merge(stats):
+        if isinstance(stats, dict):
+            if "text_merge" in stats:
+                return stats["text_merge"]
+            for value in stats.values():
+                found = text_merge(value)
+                if found is not None:
+                    return found
+        return None
+
+    path = tmp_path / "busy-peer.aflite"
+    stop = tmp_path / "stop"
+    progress = tmp_path / "progress"
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=30.0) as db:
+        assert db.delete_index("full_text_index_v0")
+        db.add_index({"name": "quiet_text", "type": "full_text", "config_json": {"field": "b"}})
+        db.create_table("busy", {})
+        db.open_table("busy").add_index({"name": "busy_text", "type": "full_text", "config_json": {"field": "a"}})
+        script = (
+            "import antfly_embedded, os, sys; "
+            "db = antfly_embedded.open(sys.argv[1], no_sync=True, busy_timeout=30.0); busy = db.open_table('busy'); n = 0\n"
+            "while not os.path.exists(sys.argv[2]):\n"
+            "    busy.batch_json({'inserts': {f'a{n % 4}': {'a': f'busydoc{n} ' + 'filler ' * 120}}, 'sync_level': 'full_index'}); n += 1\n"
+            "    open(sys.argv[3], 'w').write(str(n))\n"
+            "db.close(); print(n)"
+        )
+        peer = subprocess.Popen(
+            [sys.executable, "-c", script, str(path), str(stop), str(progress)],
+            env=_child_environment(),
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            started = time.monotonic() + 60
+            while time.monotonic() < started and int((progress.read_text() if progress.exists() else "") or 0) < 20:
+                time.sleep(0.05)
+            for i in range(120):
+                db.batch_json({"inserts": {f"b{i}": {"b": f"quietdoc{i} " + "w " * 200}}, "sync_level": "full_index"})
+            deadline = time.monotonic() + 30
+            merged = text_merge(db.stats())
+            while time.monotonic() < deadline and merged["active_segments"] > 4:
+                time.sleep(0.1)
+                merged = text_merge(db.stats())
+            still_busy = peer.poll() is None
+            writes_during = int(progress.read_text())
+        finally:
+            stop.touch()
+            output, _ = peer.communicate(timeout=60)
+    assert peer.returncode == 0
+    assert still_busy and writes_during >= 20 and int(output.strip()) > writes_during
+    assert merged["active_segments"] <= 4, merged
+
+
 def test_cross_process_overwrites_keep_full_text_deletes(tmp_path: Path) -> None:
     # Regression: overwrites from several processes, each waiting for
     # full-text visibility, lost earlier deletes. A writer rewrote a

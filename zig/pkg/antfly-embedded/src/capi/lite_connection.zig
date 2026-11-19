@@ -293,7 +293,6 @@ pub const PreparedPublication = struct {
             const captured_stat = snapshot.file.file.stat(snapshot.file.runtime()) catch null;
             const same_inode = live_stat != null and captured_stat != null and live_stat.?.inode == captured_stat.?.inode;
             if (same_inode) {
-                if (snapshot.file.indexCatalogChangedAfter(snapshot.file.activeCheckpoint().commit_sequence)) self.index_inputs_changed = true;
                 if (snapshot.file.activeCheckpoint().index_catalog_root_page != file.activeCheckpoint().index_catalog_root_page) {
                     const unchanged = self.indexInputsUnchanged(&snapshot.file, file) catch false;
                     if (!unchanged) self.index_inputs_changed = true;
@@ -3313,15 +3312,10 @@ pub const Owner = struct {
             var latest = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             defer latest.close();
             if ((try latest.file.stat(latest.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
-            // A redo commit's index content leaves the index catalog root in
-            // place; this turn's indexes cached the content as captured.
-            if (file.indexCatalogChangedAfter(file.activeCheckpoint().commit_sequence)) {
-                publication.index_inputs_changed = true;
-                if (scope == .index) {
-                    self.publication_stats.index_input_refusals +|= 1;
-                    return error.EnrichmentWaitCanceled;
-                }
-            }
+            // Replayed redo commits leave the index catalog root in place.
+            // The catalog sink fences those per index
+            // (`Store.submitIndexMutationForScope`); refusing here on any
+            // index's replay would starve every other index.
             if (file.activeCheckpoint().index_catalog_root_page != latest.activeCheckpoint().index_catalog_root_page) {
                 if (!try publication.indexInputsUnchanged(file, &latest)) {
                     publication.index_inputs_changed = true;

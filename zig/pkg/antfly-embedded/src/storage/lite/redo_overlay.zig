@@ -270,6 +270,9 @@ pub const SharedRedoOverlay = struct {
     /// Highest sequence of any index-catalog version per index scope (the
     /// native catalog sink's key scope), under `mutex`. Keys are owned.
     scope_latest: std.StringHashMapUnmanaged(u64) = .empty,
+    /// Sequences whose scope could not be recorded (allocation failure).
+    /// Every scope reads at least this, so a fence fails closed.
+    scope_untracked: u64 = 0,
     /// Every log record at or below this sequence is in the overlay (or in
     /// the tree, below a fold). Own appends advance it under the writer
     /// lease, and a writer replays other processes' records before its own
@@ -513,10 +516,14 @@ pub const SharedRedoOverlay = struct {
         if (root != index_root or !std.mem.startsWith(u8, key, catalog_key_prefix)) return;
         const rest = key[catalog_key_prefix.len..];
         const scope = rest[0 .. std.mem.indexOfScalar(u8, rest, 0) orelse return];
-        const gop = self.scope_latest.getOrPut(owned_allocator, scope) catch return;
+        const gop = self.scope_latest.getOrPut(owned_allocator, scope) catch {
+            self.scope_untracked = @max(self.scope_untracked, sequence);
+            return;
+        };
         if (!gop.found_existing) {
             gop.key_ptr.* = owned_allocator.dupe(u8, scope) catch {
                 self.scope_latest.removeByPtr(gop.key_ptr);
+                self.scope_untracked = @max(self.scope_untracked, sequence);
                 return;
             };
             gop.value_ptr.* = 0;
@@ -529,7 +536,7 @@ pub const SharedRedoOverlay = struct {
     pub fn scopeLatestSequence(self: *SharedRedoOverlay, io: std.Io, scope: []const u8) u64 {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        return self.scope_latest.get(scope) orelse 0;
+        return @max(self.scope_latest.get(scope) orelse 0, self.scope_untracked);
     }
 
     pub fn replayedSequence(self: *const SharedRedoOverlay, root: u8) u64 {
