@@ -69,7 +69,7 @@ fn validateRequestWithCeiling(a: std.mem.Allocator, state: control.State, namesp
     switch (input.command) {
         .configure_policy, .inspect_policy, .release_bootstrap => return error.ChangefeedCapabilityUnsupported,
         .capture_bootstrap => |v| {
-            if (state.phase != .enrolling or state.definition.?.start != .snapshot_then_changes or item.consumer_epoch != 0 or v.expires_at_seconds != state.bootstrap_expires_at)
+            if ((state.phase != .enrolling and state.phase != .closing and state.phase != .reset_required) or state.definition.?.start != .snapshot_then_changes or item.consumer_epoch != 0 or v.expires_at_seconds != state.bootstrap_expires_at)
                 return error.ChangefeedConflict;
             const grant = v.grant;
             try grant.validate();

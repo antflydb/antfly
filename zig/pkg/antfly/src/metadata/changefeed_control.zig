@@ -242,6 +242,9 @@ pub const State = struct {
     pub fn needsMaintenance(self: State, now: u64) bool {
         return switch (self.phase) {
             .closing => true,
+            .streaming => for (self.roots) |root| {
+                if (root.snapshot != null and !root.snapshot_released) break true;
+            } else self.expiryDue(now),
             .reset_required => for (self.roots) |root| {
                 if (!root.released or (root.snapshot != null and !root.snapshot_released)) break true;
             } else if (self.slot) |slot| slot.spool.records.len != 0 else false,

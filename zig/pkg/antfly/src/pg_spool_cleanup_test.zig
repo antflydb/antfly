@@ -39,8 +39,9 @@ pub const Service = struct {
     proposals: u64 = 0,
     lose_ack: bool = false,
     lose_ack_at: ?u64 = null,
-    pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: anytype, version: u16) !void {
-        try std.testing.expectEqual(control.protocol_version, version);
+    max_topology_protocol: u16 = control.protocol_version,
+    pub fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: anytype, version: u16) !void {
+        try std.testing.expect(version >= control.protocol_version and version <= self.max_topology_protocol);
     }
     pub fn ensureLinearizableReadWithContext(_: *@This(), _: anytype) !void {}
     pub fn projectedStore(self: *@This()) ?*Store {

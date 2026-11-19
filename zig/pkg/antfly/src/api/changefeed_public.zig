@@ -203,7 +203,20 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
     var confirmed = try delivery.acknowledge(&client, &provider, a, selection.id, selection.after, internal);
     defer confirmed.deinit();
     var driver_policy: RootPolicy(Policy) = .{ .access = policy, .io = api.inferenceIo(), .source = source, .allocator = a };
-    _ = try source_api.flushAcknowledged(&client, &driver_policy, a, confirmed.value, captured.roots[0], internal);
+    var active = confirmed.value;
+    var cutover: ?control.Parsed = null;
+    defer if (cutover) |*parsed| parsed.deinit();
+    if (active.phase == .bootstrap) {
+        if (!active.roots[0].snapshot_acknowledged.done)
+            return .{ .acknowledged = active.acknowledged_cursor };
+        try change(&client, a, active, .{ .finish_verified_bootstrap = .{ .proof = try active.bootstrapCompletionProof() } }, internal);
+        cutover = try load(&client, a, selection.id, internal);
+        active = cutover.?.value;
+        if (active.phase != .streaming or active.epoch != confirmed.value.epoch or !same(active.acknowledged_cursor, selection.after))
+            return error.MetadataMutationOutcomeUnknown;
+    }
+    try releaseStreamingSnapshot(&client, &driver_policy, a, active, captured.roots[0], internal);
+    _ = try source_api.flushAcknowledged(&client, &driver_policy, a, active, captured.roots[0], internal);
     return .{ .acknowledged = confirmed.value.acknowledged_cursor };
 }
 
@@ -300,7 +313,7 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
     try public.ensureActive();
     if (key.len == 0 or key.len > 128 or input.lease_seconds == 0 or input.lease_seconds > control.max_lease_seconds)
         return error.InvalidChangefeed;
-    if (input.tables.len != 1 or input.start != .now or input.events.len != 1)
+    if (input.tables.len != 1 or input.events.len != 1)
         return error.ChangefeedCapabilityUnsupported;
     const requested = input.tables[0];
     if (requested.len == 0 or requested.len > 1024) return error.InvalidChangefeed;
@@ -310,6 +323,7 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
     if (!try http.tablePermissionCurrentlyAllowed(identity, requested, .replicate)) return error.Forbidden;
     const meta = api.source.changefeeds orelse return error.ChangefeedCapabilityUnsupported;
     const source = api.cfg.native_history_roots orelse return error.ChangefeedCapabilityUnsupported;
+    if (input.start == .snapshot_then_changes and source.bootstrap_pages == null) return error.ChangefeedCapabilityUnsupported;
     const internal: Context = .{
         .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" },
         .deadline_ns = public.deadline_ns,
@@ -342,6 +356,7 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
         .authorization = authorization(identity, tables, table_name, permission_name, filter),
         .tables = tables,
         .projection = input.include,
+        .start = input.start,
     };
     var captured = try source.capture(a, definition, internal);
     defer captured.deinit();
@@ -374,15 +389,15 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
                 .authorization = definition.authorization,
                 .expected_revision = 0,
                 .expected_epoch = 0,
-                .mutation = .{ .create = .{ .id = id, .definition = definition, .now = now, .expires_at = now + input.lease_seconds } },
+                .mutation = .{ .create = .{ .id = id, .definition = definition, .now = now, .expires_at = now + input.lease_seconds, .bootstrap_expires_at = if (input.start == .snapshot_then_changes) now + @min(input.lease_seconds, control.max_bootstrap_seconds) else 0 } },
             }, internal);
             continue;
         }
         if (!same(definition.identity(), state.definition.?.identity()) or !same(authority, state.authority))
             return error.ChangefeedConflict;
         try policy.access.authorize(state, internal);
-        if (now >= state.expires_at) return error.ChangefeedLeaseExpired;
-        if (state.phase == .streaming) {
+        if (state.expiryDue(now)) return error.ChangefeedLeaseExpired;
+        if (state.phase == .streaming or state.phase == .bootstrap) {
             var active = try roots.Routed.init(source, &captured);
             _ = try active.validateScope(state);
             return .{ .id = id, .cursor = state.acknowledged_cursor, .expires_at = state.expires_at };
@@ -397,7 +412,7 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
         const item = state.roots[0];
         if (item.consumer_epoch != 0) {
             try policy.validateRoot(state, root.namespace, root.fence, root.table_name, internal);
-            const cut = control.hash(.{
+            const ordinary_cut = control.hash(.{
                 .domain = "antfly:public-changefeed-start:v1",
                 .authority = authority,
                 .definition = definition.identity(),
@@ -405,6 +420,10 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
                 .epoch = item.consumer_epoch,
                 .start = item.start,
             });
+            const cut = if (item.snapshot) |pin|
+                control.hash(.{ .domain = "antfly:public-changefeed-bootstrap:v1", .continuation = ordinary_cut, .pin = pin })
+            else
+                ordinary_cut;
             try change(&client, a, state, .{ .seal = .{ .cut = cut } }, internal);
             continue;
         }
@@ -434,7 +453,7 @@ pub fn close(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReque
         const state = parsed.value;
         const definition = state.definition orelse return error.Forbidden;
         try requireOwner(identity, definition);
-        if (state.slot != null or definition.start != .now) return error.ChangefeedCapabilityUnsupported;
+        if (state.slot != null) return error.ChangefeedCapabilityUnsupported;
         if (state.phase == .deleted) return;
         if (state.phase != .closing) {
             try change(&client, a, state, .close, internal);
@@ -464,8 +483,19 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
     var parsed = try load(&client, a, id, request);
     defer parsed.deinit();
     const state = parsed.value;
-    if ((state.phase != .closing and state.phase != .reset_required) or state.definition.?.start != .now)
+    if (state.phase == .streaming) {
+        for (state.roots) |item| {
+            if (item.snapshot == null or item.snapshot_released) continue;
+            const principal = request.principal orelse return error.Forbidden;
+            if (principal.kind != .internal or !std.mem.eql(u8, principal.subject, "changefeed-maintenance")) return error.Forbidden;
+            var captured = try source.capture(a, state.definition.?, request);
+            defer captured.deinit();
+            var policy: RootPolicy(void) = .{ .access = {}, .io = io, .source = source, .allocator = a };
+            return releaseStreamingSnapshot(&client, &policy, a, state, try captured.find(item.namespace), request);
+        }
         return;
+    }
+    if (state.phase != .closing and state.phase != .reset_required) return;
     var policy: RootPolicy(void) = .{ .access = {}, .io = io, .source = source, .allocator = a, .closing = true };
     if (try retireOne(&client, &policy, a, state, request)) return;
     if (spool_registry) |storage| if (state.slot) |slot| {
@@ -477,8 +507,65 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
     };
 }
 
+fn releaseStreamingSnapshot(client: *config.Client, policy: anytype, a: A, state: control.State, selected: source_api.Root, request: Context) !void {
+    const item = state.roots[try state.rootIndex(selected.namespace)];
+    const pin = item.snapshot orelse return;
+    if (item.snapshot_released) return;
+    if (state.phase != .streaming or !item.snapshot_acknowledged.done or item.released) return error.ChangefeedConflict;
+    const Access = @FieldType(@typeInfo(@TypeOf(policy)).pointer.child, "access");
+    if (comptime Access != void) try policy.authorizeRoot(state, item.namespace, request);
+    try policy.validateRoot(state, item.namespace, selected.fence, selected.table_name, request);
+    const definition = state.definition.?;
+    const table = for (definition.tables) |candidate| {
+        if (candidate.table_id == selected.fence.table_id) break candidate;
+    } else return error.ChangefeedResynchronizationRequired;
+    const ref = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Reference{
+        .namespace = item.namespace,
+        .authority = state.authority,
+        .consumer = state.consumerId(),
+        .epoch = item.consumer_epoch,
+        .grant = item.grant_sequence,
+        .definition = definition.identity(),
+    };
+    const observed = try policy.source.grants.read(a, selected.fence, selected.table_name, .{
+        .version = 1,
+        .identity = .{ .namespace = ref.namespace, .authority = ref.authority, .consumer = ref.consumer, .definition = ref.definition, .sequence = ref.grant, .policy_revision = table.policy_revision, .include_bootstrap = true },
+    }, request);
+    if (observed != .active or observed.active.consumer.epoch != ref.epoch or observed.active.consumer.start != item.start)
+        return error.ChangefeedResynchronizationRequired;
+    if (observed.active.bootstrap) |observed_pin| {
+        if (!same(observed_pin.digest, pin.digest) or observed_pin.expires_at_seconds != pin.expires_at) return error.ChangefeedResynchronizationRequired;
+        const command: @import("history_control_operations.zig").wire.Request = .{
+            .version = 1,
+            .operation = .submit,
+            .command = .{ .release_bootstrap = .{ .reference = ref, .digest = pin.digest } },
+        };
+        const result = try policy.source.controls.execute(a, selected.fence, selected.table_name, command, request);
+        try result.validate(command);
+        if (!result.confirmed()) return error.MetadataMutationOutcomeUnknown;
+        if (result.outcome.? == .rejected) return result.outcome.?.rejected.asError();
+    }
+    try change(client, a, state, .{ .release_snapshot = .{
+        .namespace = item.namespace,
+        .snapshot_id = pin.id,
+        .proof = control.hash(.{ .domain = "antfly:snapshot-release:v1", .feed = state.id, .epoch = state.epoch, .reference = ref, .digest = pin.digest }),
+    } }, request);
+}
+
 fn retireOne(client: *config.Client, policy: anytype, a: A, state: control.State, request: Context) !bool {
     const definition = state.definition.?;
+    for (state.roots) |root| {
+        if (!root.released or root.snapshot_released) continue;
+        const pin = root.snapshot orelse continue;
+        if (!std.mem.eql(u8, &pin.id, &state.consumerId())) return error.ChangefeedConflict;
+        try policy.authorizeRoot(state, root.namespace, request);
+        try change(client, a, state, .{ .release_snapshot = .{
+            .namespace = root.namespace,
+            .snapshot_id = pin.id,
+            .proof = control.hash(.{ .domain = "antfly:snapshot-retirement:v1", .feed = state.id, .epoch = state.epoch, .namespace = root.namespace, .pin = pin.digest }),
+        } }, request);
+        return true;
+    }
     const item = for (state.roots) |candidate| {
         if (!candidate.released) break candidate;
     } else {

@@ -54,6 +54,7 @@ pub fn resolve(a: std.mem.Allocator, state: control.State, namespace: control.Na
         switch (command) {
             .configure_policy, .inspect_policy, .release_bootstrap => return error.ChangefeedCapabilityUnsupported,
             .capture_bootstrap => |capture| {
+                if (state.phase != .enrolling) return null;
                 const pin = observed.active.bootstrap orelse return null;
                 if (pin.expires_at_seconds != capture.expires_at_seconds or observed.active.limit != capture.grant.limit or current.acknowledged != current.start)
                     return error.ChangefeedConflict;

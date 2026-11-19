@@ -45468,7 +45468,7 @@ fn consumerTests() type {
                             else => return error.TestUnexpectedResult,
                         }
                     }
-                    noinline fn run(allocator: std.mem.Allocator, svc: *feed_fixture.Service, source: @import("../api/history_roots.zig").Source, table: Table, node: *DataServer, fence: antfly.metadata_api.CatalogRouteFence) !void {
+                    noinline fn run(allocator: std.mem.Allocator, svc: *feed_fixture.Service, source: @import("../api/history_roots.zig").Source, table: Table, node: *DataServer, fence: antfly.metadata_api.CatalogRouteFence, snapshot_only: bool) !void {
                         var auth_storage = antfly.lsm_backend.Backend.init(allocator, .{ .flush_threshold = 1 });
                         defer auth_storage.close();
                         var store = try auth_storage.runtimeNamespaceStore(allocator);
@@ -45491,6 +45491,45 @@ fn consumerTests() type {
                         }, null, null);
                         defer http_api.deinit();
                         const credential: Http.AuthenticatedRequest = .{ .authorization = "Basic YWxpY2U6dGVzdC1wYXNzd29yZA==" };
+                        if (snapshot_only) {
+                            const definition: api.Create = .{ .tables = &.{feed_catalog.logical_name}, .start = .snapshot_then_changes, .include = .rows };
+                            try node.proposeRaftBatchGroupWithLeaderWait(allocator, fence.route.group_id, table.name, .{
+                                .writes = &.{.{ .key = "public-bootstrap-probe", .value = "{\"snapshot_probe\":\"before-cut\"}" }},
+                            }, .{ .discovery = .cached, .allow_remote_forward = false, .write_route_fence = fence }, 5 * std.time.ns_per_s);
+                            const created = try api.create(http_api, allocator, credential, "snapshot-feed", definition, .{});
+                            try std.testing.expectEqualDeep(created, try api.create(http_api, allocator, credential, "snapshot-feed", definition, .{}));
+                            try node.proposeRaftBatchGroupWithLeaderWait(allocator, fence.route.group_id, table.name, .{
+                                .writes = &.{.{ .key = "public-bootstrap-probe", .value = "{\"snapshot_probe\":\"after-cut\"}" }},
+                            }, .{ .discovery = .cached, .allow_remote_forward = false, .write_route_fence = fence }, 5 * std.time.ns_per_s);
+                            var snapshot = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = created.cursor }, .{}, .{});
+                            defer snapshot.deinit();
+                            try std.testing.expect(std.mem.indexOf(u8, snapshot.page.body, "before-cut") != null);
+                            try std.testing.expect(std.mem.indexOf(u8, snapshot.page.body, "after-cut") == null);
+                            try std.testing.expect(std.mem.indexOf(u8, snapshot.page.body, "\"complete\":true") != null);
+                            const LostRelease = struct {
+                                fn reach(_: *anyopaque, event: DataRequestLifecycleEvent) !void {
+                                    if (event.phase == .proposal_accepted) return error.InjectedSnapshotReleaseReplyLoss;
+                                }
+                            };
+                            {
+                                node.data_request_lifecycle_hook = .{ .ptr = node, .reach_fn = LostRelease.reach };
+                                defer node.data_request_lifecycle_hook = null;
+                                try std.testing.expectError(error.MetadataMutationOutcomeUnknown, api.execute(http_api, allocator, credential, .{ .id = created.id, .after = snapshot.page.cursor }, null, .{}));
+                            }
+                            var ack = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = snapshot.page.cursor }, null, .{});
+                            defer ack.deinit();
+                            const bytes = try svc.store.getChangefeedControl(allocator, svc.metadata_group_id, created.id);
+                            defer allocator.free(bytes);
+                            var active = try feed_control.parse(allocator, bytes);
+                            defer active.deinit();
+                            try std.testing.expectEqual(feed_control.Phase.streaming, active.value.phase);
+                            try std.testing.expect(active.value.roots[0].snapshot_released);
+                            var tail = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = ack.acknowledged }, .{}, .{});
+                            defer tail.deinit();
+                            try std.testing.expect(std.mem.indexOf(u8, tail.page.body, "after-cut") != null);
+                            try api.close(http_api, allocator, credential, created.id, .{});
+                            return;
+                        }
                         const definition: api.Create = .{ .tables = &.{feed_catalog.logical_name} };
                         const created = try api.create(http_api, allocator, credential, "live-feed", definition, .{});
                         const repeated = try api.create(http_api, allocator, credential, "live-feed", definition, .{});
@@ -45620,7 +45659,7 @@ fn consumerTests() type {
                 {
                     const Worker = struct {
                         fn run(result: *anyerror!void, allocator: std.mem.Allocator, svc: *feed_fixture.Service, source: @import("../api/history_roots.zig").Source, table: antfly.metadata.table_manager.TableRecord, node: *DataServer, fence: antfly.metadata_api.CatalogRouteFence) void {
-                            result.* = PublicFeedHarness.run(allocator, svc, source, table, node, fence);
+                            result.* = PublicFeedHarness.run(allocator, svc, source, table, node, fence, false);
                         }
                     };
                     // This fixture supplies one immutable peer generation and
@@ -45635,6 +45674,21 @@ fn consumerTests() type {
                     var pinned = try origin.historyPagePort().read(a, route.fence().?, "docs", .{ .version = 1, .request = .{ .reference = ref, .after = .{}, .now_seconds = 100 } }, .{});
                     defer pinned.deinit();
                     try std.testing.expectEqualStrings("{\"v\":1}", pinned.events[0].after.?);
+                }
+
+                {
+                    const Worker = struct {
+                        fn run(result: *anyerror!void, allocator: std.mem.Allocator, svc: *feed_fixture.Service, source: @import("../api/history_roots.zig").Source, table: antfly.metadata.table_manager.TableRecord, node: *DataServer, fence: antfly.metadata_api.CatalogRouteFence) void {
+                            result.* = PublicFeedHarness.run(allocator, svc, source, table, node, fence, true);
+                        }
+                    };
+                    feed_svc.max_topology_protocol = feed_control.qualified_bootstrap_protocol_version;
+                    metadata_source.control_read_generation_at_ms = std.math.maxInt(u64);
+                    defer metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                    var outcome: anyerror!void = undefined;
+                    const thread = try std.Thread.spawn(.{ .stack_size = 32 * 1024 * 1024 }, Worker.run, .{ &outcome, a, &feed_svc, origin.historyRootsSource(), feed_table, server, route.fence().? });
+                    thread.join();
+                    try outcome;
                 }
                 // Closing must dispatch retirement cleanup rather than cancel
                 // every prepared command solely because the feed is closed.
@@ -45747,7 +45801,7 @@ fn consumerTests() type {
                 const current_owner = frozen.participants[0].owner;
                 producer_closure_owner = current_owner;
                 const txn_id = plan.transaction_id;
-                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_legacy_producer_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
 
                 const positive_input: resolution_operations.Request = .{ .version = 1, .authority = .raft, .namespace = namespace, .transaction_id = txn_id, .owner_fence = current_owner.digest(), .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 };
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
@@ -45852,10 +45906,10 @@ fn consumerTests() type {
                 try std.testing.expectEqual(.complete, try recovery.run(a, current_owner, route.fence().?, "docs", txn_id, .{}));
                 try server.completionParticipantPort().submit(a, &frozen, 0, route.fence().?, .{ .publish = certificate_bytes }, .{});
                 try remote_participant.submit(a, &frozen, 0, route.fence().?, .{ .publish = certificate_bytes }, .{});
-                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_legacy_producer_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
                 // An idle root must remain readable after an ordered protocol
                 // barrier, without requiring another document mutation.
-                const idle_barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", @import("../common/data_raft_protocol.zig").batch_legacy_producer_protocol_version);
+                const idle_barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", @import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version);
                 defer a.free(idle_barrier);
                 const idle_barrier_index = blk: {
                     lockAtomic(&server.data_raft_mutex);
@@ -46189,7 +46243,7 @@ fn consumerTests() type {
             try std.testing.expect(policy_applied.outcome.?.applied.consumer == null);
             const policy_observed = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect_policy = .{ .namespace = namespace, .authority = ref.authority } });
             try std.testing.expectEqualDeep(policy_applied.outcome.?.applied.policy, policy_observed.outcome.?.applied.policy);
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_legacy_producer_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
             const ClosureHarness = struct {
                 pub fn inventoryRpc(alloc: std.mem.Allocator, node: *DataServer, captured: antfly.metadata_api.CatalogRouteFence, input: @import("source_legacy_inventory_http_wire.zig").Request) !@import("source_legacy_inventory_http_wire.zig").Reply {
                     return @import("source_legacy_inventory_http_native_test.zig").read(alloc, node, captured, input);
@@ -46214,9 +46268,9 @@ fn consumerTests() type {
                 }
             };
             try @import("source_producer_closure_proposal_native_test.zig").run(a, server, route.fence().?, producer_closure_owner orelse return error.TestExpectedProducerOwner, DataRequestLifecycleEvent, ClosureHarness);
-            try std.testing.expectEqual(@import("source_producer_closure_entry.zig").required_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
             try @import("source_legacy_terminal_proposal_native_test.zig").run(a, server, route.fence().?, producer_closure_owner orelse return error.TestExpectedProducerOwner, DataRequestLifecycleEvent, ClosureHarness);
-            try std.testing.expectEqual(@import("source_legacy_terminal_entry.zig").required_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
 
             const ClockHarness = struct {
                 noinline fn run(allocator: std.mem.Allocator, node: *DataServer, kernel: *antfly.public_api.ProvisionedKernelOwnerSource, captured: antfly.metadata_api.CatalogRouteFence, consumer: control.Reference) !void {
@@ -46239,7 +46293,7 @@ fn consumerTests() type {
                 }
             };
             try ClockHarness.run(a, server, &owner, route.fence().?, ref);
-            try std.testing.expectEqual(@import("history_clock_entry.zig").required_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
         }
 
         test "data raft ordered history table producer capability refuses lossy fallback" {
