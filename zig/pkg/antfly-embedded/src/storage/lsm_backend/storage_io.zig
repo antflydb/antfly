@@ -593,6 +593,8 @@ pub const Storage = struct {
         map_immutable_artifact: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").MappedArtifact = null,
         /// Mapping pins the existing backing file without copying it to scratch.
         direct_immutable_mapping: bool = false,
+        /// Bypasses cached descriptors and resolves the current pathname.
+        map_fresh_immutable_artifact: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").MappedArtifact = null,
         open_immutable_source: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").Source = null,
         /// Artifact-specific reclamation lease with provider-independent
         /// descriptor/runtime ownership. Persistent readers use this capability.
@@ -733,6 +735,11 @@ pub const Storage = struct {
     pub fn mapDirectImmutableArtifact(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").MappedArtifact {
         if (!self.vtable.direct_immutable_mapping) return error.MappedArtifactUnsupported;
         return self.mapImmutableArtifact(allocator, path);
+    }
+
+    pub fn mapFreshImmutableArtifact(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").MappedArtifact {
+        const map = self.vtable.map_fresh_immutable_artifact orelse return error.MappedArtifactUnsupported;
+        return BoundaryAbi.call("map_fresh_immutable_artifact", self.boundary_dispatch, map, .{ self.ptr, allocator, path });
     }
 
     pub fn openLeasedImmutableSource(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").Source {
@@ -1595,6 +1602,12 @@ else
             entry.last_access = self.nextAccessLocked();
             self.touchEntryLocked(shard, entry);
             return entry;
+        }
+
+        fn mappingEpoch(shard: *Shard) u64 {
+            const locked = lockAtomic(&shard.mutex);
+            defer if (locked) shard.mutex.unlock();
+            return shard.invalidation_epoch;
         }
 
         fn mappingEpochMatches(shard: *Shard, epoch: u64) bool {
@@ -2808,6 +2821,7 @@ const ThreadedNativeStorage = struct {
         .acquire_lease = acquireErasedLease,
         .map_immutable_artifact = if (supports_posix_fd_cache) NativeMappedArtifact.create else null,
         .direct_immutable_mapping = supports_posix_fd_cache,
+        .map_fresh_immutable_artifact = if (supports_posix_fd_cache) NativeMappedArtifact.createFresh else null,
         .create_dir_path = createDirPath,
         .read_file_alloc = readFileAlloc,
         .read_file_range_alloc = readFileRangeAlloc,
@@ -3531,10 +3545,19 @@ const NativeMappedArtifact = struct {
     identity: NativeFileIdentity,
 
     fn create(raw: *anyopaque, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").MappedArtifact {
+        return createWithCache(raw, allocator, path, true);
+    }
+
+    fn createFresh(raw: *anyopaque, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").MappedArtifact {
+        return createWithCache(raw, allocator, path, false);
+    }
+
+    fn createWithCache(raw: *anyopaque, allocator: Allocator, path: []const u8, comptime use_cache: bool) !@import("../../segment_source.zig").MappedArtifact {
         if (comptime !supports_posix_fd_cache) return error.MappedArtifactUnsupported;
         const state: *NativeStorageState = @ptrCast(@alignCast(raw));
         const retained = try state.acquireLease();
         errdefer retained.release();
+        if (!use_cache) state.invalidatePath(path);
         const io = state.threaded.io();
         const cache = state.fdCache();
         const namespace = state.cache_namespace;
@@ -3542,9 +3565,13 @@ const NativeMappedArtifact = struct {
         const shard = cache.shardForHash(path_hash);
         while (true) {
             var epoch: u64 = undefined;
-            if (cache.retainCached(shard, namespace, path_hash, path, &epoch)) |entry| {
-                defer cache.release(io, entry);
-                return mapFd(retained, allocator, path, entry.fd, entry.identity);
+            if (use_cache) {
+                if (cache.retainCached(shard, namespace, path_hash, path, &epoch)) |entry| {
+                    defer cache.release(io, entry);
+                    return mapFd(retained, allocator, path, entry.fd, entry.identity);
+                }
+            } else {
+                epoch = FdCache.mappingEpoch(shard);
             }
 
             // The mapping owns the inode after mmap. A cold mapping does

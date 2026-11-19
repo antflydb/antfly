@@ -12693,7 +12693,7 @@ pub const HBCIndex = struct {
             alloc.free(segments);
         };
         for (opened.segments, 0..) |retained, index| {
-            segments[index] = try vectorindex_posting_segment.VerifiedReader.initFromReader(alloc, try retained.validatedReader());
+            segments[index] = try retained.verifiedReader(alloc);
             segment_count += 1;
         }
         var encoded_metadata: ?[]const u8 = null;

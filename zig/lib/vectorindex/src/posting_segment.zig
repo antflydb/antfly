@@ -644,6 +644,7 @@ pub const VerifiedReader = struct {
     alloc: Allocator,
     reader: Reader,
     verification: []Verification,
+    owns_verification: bool = true,
 
     pub fn init(alloc: Allocator, data: []const u8) !VerifiedReader {
         return initFromReader(alloc, try Reader.init(data));
@@ -656,8 +657,15 @@ pub const VerifiedReader = struct {
         return .{ .alloc = alloc, .reader = reader, .verification = verification };
     }
 
+    /// The owner must outlive every borrowed reader.
+    pub fn borrow(self: VerifiedReader) VerifiedReader {
+        var borrowed = self;
+        borrowed.owns_verification = false;
+        return borrowed;
+    }
+
     pub fn deinit(self: *VerifiedReader) void {
-        self.alloc.free(self.verification);
+        if (self.owns_verification) self.alloc.free(self.verification);
         self.* = undefined;
     }
 

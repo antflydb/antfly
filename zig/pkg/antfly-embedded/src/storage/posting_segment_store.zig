@@ -65,6 +65,7 @@ pub const RetainedSegment = union(enum) {
         descriptor: posting_wal.Checkpoint.Segment,
         payload: RetainedSegment,
         reader: ?posting_segment.Reader,
+        verified_reader: std.atomic.Value(?*posting_segment.VerifiedReader) = .init(null),
         retirement_storage: ?lsm_backend.Storage.Lease = null,
         retired: std.atomic.Value(bool) = .init(false),
     };
@@ -81,6 +82,22 @@ pub const RetainedSegment = union(enum) {
     pub fn validatedReader(self: RetainedSegment) !posting_segment.Reader {
         if (self == .shared) if (self.shared.reader) |reader| return reader;
         return posting_segment.Reader.init(self.bytes());
+    }
+
+    /// The caller keeps this retained segment alive for the returned view.
+    pub fn verifiedReader(self: RetainedSegment, alloc: Allocator) !posting_segment.VerifiedReader {
+        if (self != .shared) return posting_segment.VerifiedReader.initFromReader(alloc, try self.validatedReader());
+        const shared = self.shared;
+        if (shared.verified_reader.load(.acquire)) |reader| return reader.borrow();
+        const candidate = try shared.alloc.create(posting_segment.VerifiedReader);
+        errdefer shared.alloc.destroy(candidate);
+        candidate.* = try posting_segment.VerifiedReader.initFromReader(shared.alloc, try self.validatedReader());
+        if (shared.verified_reader.cmpxchgStrong(null, candidate, .acq_rel, .acquire)) |winner| {
+            candidate.deinit();
+            shared.alloc.destroy(candidate);
+            return winner.?.borrow();
+        }
+        return candidate.borrow();
     }
 
     pub fn matchesIdentity(self: RetainedSegment, namespace: []const u8, descriptor: posting_wal.Checkpoint.Segment) bool {
@@ -149,6 +166,10 @@ pub const RetainedSegment = union(enum) {
             .shared => |value| {
                 if (value.refs.fetchSub(1, .acq_rel) == 1) {
                     const owner = value.alloc;
+                    if (value.verified_reader.load(.acquire)) |reader| {
+                        reader.deinit();
+                        owner.destroy(reader);
+                    }
                     value.payload.deinit(owner);
                     if (value.retired.load(.acquire)) if (value.retirement_storage) |*lease| {
                         defer lease.deinit();
@@ -1441,13 +1462,31 @@ pub const Store = struct {
     fn readSegmentRetainedFor(self: *Store, descriptor: posting_wal.Checkpoint.Segment) !RetainedSegment {
         const path = try self.segmentPathAlloc(descriptor.generation);
         defer self.alloc.free(path);
-        var payload: RetainedSegment = if (self.storage.mapDirectImmutableArtifact(self.alloc, path)) |artifact|
-            .{ .mapped = artifact }
-        else |_|
-            .{ .heap = try self.readSegmentBytes(path) };
+        if (self.storage.mapDirectImmutableArtifact(self.alloc, path)) |artifact| {
+            var mapped = artifact;
+            if (validateSegment(mapped.bytes, descriptor)) |reader| {
+                errdefer mapped.deinit();
+                return RetainedSegment.share(self.alloc, .{ .mapped = mapped }, self.root_dir, descriptor, reader);
+            } else |_| {
+                mapped.deinit();
+            }
+            // Another storage view can replace the cached pathname. Resolve
+            // the live inode once before treating the segment as corrupt.
+            if (self.storage.mapFreshImmutableArtifact(self.alloc, path)) |fresh| {
+                var replacement = fresh;
+                errdefer replacement.deinit();
+                const reader = try validateSegment(replacement.bytes, descriptor);
+                return RetainedSegment.share(self.alloc, .{ .mapped = replacement }, self.root_dir, descriptor, reader);
+            } else |err| switch (err) {
+                error.MappedArtifactUnsupported, error.MappedArtifactUnavailable => {},
+                error.FileNotFound => return error.MissingPostingSegment,
+                else => return err,
+            }
+        } else |_| {}
+        var payload = RetainedSegment{ .heap = try self.readSegmentBytes(path) };
         errdefer payload.deinit(self.alloc);
         const reader = try validateSegment(payload.bytes(), descriptor);
-        return try RetainedSegment.share(self.alloc, payload, self.root_dir, descriptor, reader);
+        return RetainedSegment.share(self.alloc, payload, self.root_dir, descriptor, reader);
     }
 
     fn replaceWal(self: *Store, contents: []const u8) !void {
@@ -1781,6 +1820,65 @@ test "storage.posting WAL committed prefix copy unwinds allocation failures" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "storage.posting admission remaps a stale descriptor from another storage view" {
+    if (builtin.os.tag != .linux and (builtin.os.tag != .macos or !builtin.link_libc)) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("posting-remap");
+    defer directory.cleanup();
+    const root = directory.path();
+    var reader_storage = try lsm_backend.NativeStorage.init(alloc, .threaded);
+    defer reader_storage.deinit();
+    var writer_storage = try lsm_backend.NativeStorage.init(alloc, .threaded);
+    defer writer_storage.deinit();
+
+    var store = try Store.open(alloc, writer_storage.storage(), root);
+    defer store.deinit();
+    const path = try checkpointSegmentPathAlloc(alloc, root, 1);
+    defer alloc.free(path);
+    try writer_storage.storage().writeFileAbsolute(path, "stale");
+    _ = try reader_storage.storage().fileSize(path);
+
+    var segment_writer = posting_segment.Writer.init(alloc);
+    defer segment_writer.deinit();
+    try segment_writer.appendBaseAt(3, 1, "new segment");
+    const segment = try segment_writer.build();
+    defer alloc.free(segment);
+    try store.publishCheckpoint(1, 1, segment);
+
+    var opened = try Store.openWithSegmentAlloc(alloc, reader_storage.storage(), root);
+    defer opened.deinit();
+    try std.testing.expect(opened.segments[0].isMapped());
+    const reader = try opened.segments[0].validatedReader();
+    try std.testing.expectEqualStrings("new segment", (try reader.getBase(3)).?);
+}
+
+test "storage.posting retained generations share payload verification" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const root = "/posting-verification";
+    var store = try Store.open(alloc, memory.storage(), root);
+    defer store.deinit();
+    var segment_writer = posting_segment.Writer.init(alloc);
+    defer segment_writer.deinit();
+    try segment_writer.appendBaseAt(3, 1, "shared segment");
+    const segment = try segment_writer.build();
+    defer alloc.free(segment);
+    try store.publishCheckpoint(1, 1, segment);
+
+    var opened = try Store.openWithSegmentAlloc(alloc, memory.storage(), root);
+    defer opened.deinit();
+    var successor = opened.segments[0].retainMatching(root, opened.store.checkpoint.?.segment(0)).?;
+    defer successor.deinit(alloc);
+    var original = try opened.segments[0].verifiedReader(alloc);
+    defer original.deinit();
+    try std.testing.expectEqualStrings("shared segment", (try original.getBase(3)).?);
+    var reused = try successor.verifiedReader(alloc);
+    defer reused.deinit();
+    try std.testing.expectEqual(original.verification.ptr, reused.verification.ptr);
+    try std.testing.expectEqualStrings("shared segment", (try reused.getBase(3)).?);
 }
 
 test "storage.posting validation skips materializing mappings" {
