@@ -415,6 +415,39 @@ pub const CatalogReplicationSlots = struct {
         return observed;
     }
 
+    /// Read the existing SQL transaction and qualified replication cut before
+    /// the importer installs a read provider. No transaction is created here.
+    pub fn qualifyTransactionSnapshot(self: CatalogReplicationSlots, a: std.mem.Allocator, identity: wire.Identity, request: wire.Request, name: []const u8) !control.SlotSnapshot {
+        try request.check();
+        if (self.identity.context != identity.context or self.identity.read != &Adapter.replicationIdentity) return error.Forbidden;
+        const credential: *Credential = @ptrCast(@alignCast(identity.context));
+        try credential.validate();
+        const encoded = request.session_id orelse return error.NoActiveSqlTransaction;
+        const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return error.SqlTransactionNotActive;
+        if (try self.server.txn_sessions.principalAccess(a, id, credential.sessionPrincipal()) != .allowed)
+            return error.SqlTransactionNotActive;
+        var transaction = (try self.server.txn_sessions.getSqlState(a, id)) orelse return error.SqlTransactionNotActive;
+        defer transaction.deinit(a);
+        try validateSnapshotTransaction(transaction, self.database_name, request.session_namespace orelse request.namespace orelse "public");
+        if (!std.mem.eql(u8, self.database_name, request.database orelse "default")) return error.SqlTransactionNotActive;
+        const snapshot = try control.SlotSnapshot.parse(name);
+        var qualified = try self.qualifySnapshot(a, snapshot, try @import("../pgwire/retained_stream.zig").metadataContext(request));
+        qualified.deinit();
+        try request.check();
+        return snapshot;
+    }
+
+    fn validateSnapshotTransaction(transaction: @import("transactions.zig").SessionRegistry.SqlState, database: []const u8, namespace: []const u8) !void {
+        const metadata = transaction.metadata;
+        if (transaction.terminal != null or transaction.terminal_abort or
+            !std.mem.eql(u8, metadata.database, database) or !std.mem.eql(u8, metadata.namespace, namespace))
+            return error.SqlTransactionNotActive;
+        if (metadata.failed) return error.InFailedSqlTransaction;
+        if (transaction.execution_started or transaction.savepoints != 0) return error.ActiveSqlTransaction;
+        if (metadata.mode != .read_only or metadata.isolation == .read_committed or metadata.accepted_lake_reads)
+            return error.UnsupportedSqlExecution;
+    }
+
     /// Qualified raw rows for a SQL snapshot importer. The importer still
     /// owns transaction lifetime and conversion to authorized SQL tuples.
     pub fn readExportedSnapshot(self: CatalogReplicationSlots, a: std.mem.Allocator, name: []const u8, namespace: control.Namespace, after: u32, rows: u32, bytes: u32, context: operation.RequestContext) !@import("history_page_operations.zig").pages.BootstrapPage {
@@ -3868,6 +3901,19 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
         var qualified = try slots.qualifySnapshot(alloc, token, .{});
         defer qualified.deinit();
         try std.testing.expectEqual(@as(u64, 10), qualified.value.roots[0].start);
+        try std.testing.expectError(error.NoActiveSqlTransaction, slots.qualifyTransactionSnapshot(alloc, .{ .context = credential, .release = Credential.release }, authority.request, &token.name()));
+        var txn: @import("transactions.zig").SessionRegistry.SqlState = .{ .metadata = .{ .database = "default", .namespace = "public", .isolation = .repeatable_read, .mode = .read_only }, .owner_node_id = 1, .execution_started = false, .terminal = null, .savepoints = 0 };
+        try CatalogReplicationSlots.validateSnapshotTransaction(txn, "default", "public");
+        try std.testing.expectError(error.SqlTransactionNotActive, CatalogReplicationSlots.validateSnapshotTransaction(txn, "other", "public"));
+        txn.metadata.mode = .read_write;
+        try std.testing.expectError(error.UnsupportedSqlExecution, CatalogReplicationSlots.validateSnapshotTransaction(txn, "default", "public"));
+        txn.metadata.mode = .read_only;
+        txn.metadata.isolation = .read_committed;
+        try std.testing.expectError(error.UnsupportedSqlExecution, CatalogReplicationSlots.validateSnapshotTransaction(txn, "default", "public"));
+        txn.metadata.isolation = .repeatable_read;
+        txn.execution_started = true;
+        try std.testing.expectError(error.ActiveSqlTransaction, CatalogReplicationSlots.validateSnapshotTransaction(txn, "default", "public"));
+
         try std.testing.expectError(error.InvalidReplicationSnapshot, slots.readExportedSnapshot(alloc, "invalid", namespace, 0, 1, 4096, .{}));
         try std.testing.expectError(error.ChangefeedCapabilityUnsupported, slots.readExportedSnapshotRows(alloc, &token.name(), namespace, 0, 1, 4096, .{}));
     }
