@@ -4720,11 +4720,18 @@ fn openInternalWithState(
     }
     if (wal_bytes.len != wal.committed_bytes) {
         const committed = try alloc.dupe(u8, wal_bytes[0..wal.committed_bytes]);
+        errdefer alloc.free(committed);
+        var replacement = try vector_wal.Replay.parse(alloc, committed);
+        errdefer replacement.deinit();
+        if (!read_only) try atomicReplace(alloc, storage, wal_path, committed[sealed_bytes..]);
+        wal.deinit();
         alloc.free(wal_bytes);
         wal_bytes = committed;
-        if (!read_only) try atomicReplace(alloc, storage, wal_path, wal_bytes[sealed_bytes..]);
-        wal.deinit();
-        wal = try vector_wal.Replay.parse(alloc, wal_bytes);
+        wal = replacement;
+    } else if (prepared == null and !read_only and wal.committed_bytes > sealed_bytes) {
+        // A complete frame may still be in the page cache after failed sync.
+        // Establish durability before a writable owner can reuse that payload.
+        try storage.syncFileContentsAbsolute(wal_path);
     }
     store.wal_committed_bytes = wal.committed_bytes;
     store.last_committed_batch = wal.last_committed_batch;
@@ -5812,6 +5819,36 @@ test "sealed vector WAL recovers multiple extents and trims only active torn suf
     try std.testing.expectEqual(store.manifest.?.sealed_wals.items[0].committed_bytes, try memory.storage().fileSize(sealed_path));
     try memory.storage().appendFileAbsolute(alloc, sealed_path, "torn", false);
     try std.testing.expectError(error.InvalidVectorWalExtent, Store.openWithBlocks(alloc, memory.storage(), root));
+}
+
+test "vector WAL tail repair unwinds allocation failures" {
+    const Fixture = struct {
+        fn run(recovery_alloc: Allocator) !void {
+            const alloc = std.testing.allocator;
+            const root = "/vector-repair-allocation";
+            var memory = lsm_backend.MemoryStorage.init(alloc);
+            defer memory.deinit();
+            var store = try Store.open(alloc, memory.storage(), root);
+            defer store.deinit();
+            try store.publishEmptyBase(1, 0, .{ .shard_count = 1 });
+            try store.appendBatch(try store.nextBatchId(), &.{.{
+                .kind = .upsert,
+                .key = "a",
+                .source_sequence = 1,
+                .revision = 1,
+                .vector = &.{2.0},
+            }}, 1, .{});
+            const path = try store.walPathAlloc(store.wal_generation);
+            defer alloc.free(path);
+            try memory.storage().appendFileAbsolute(alloc, path, "torn", false);
+
+            var recovered = try Store.openWithBlocks(recovery_alloc, memory.storage(), root);
+            defer recovered.deinit();
+            try std.testing.expectEqual(store.wal_committed_bytes, try memory.storage().fileSize(path));
+            try std.testing.expectEqualSlices(f32, &.{2.0}, (try recovered.get("a", 1, 1)).vector.vectorView().?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 test "sealed vector WAL poisons ambiguous append-target publication" {
