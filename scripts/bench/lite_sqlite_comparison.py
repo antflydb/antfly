@@ -276,14 +276,27 @@ END;
             db.run_until_idle()
 
 
-# After its timed window, each full-text worker makes this many more writes
-# and searches each on its own handle as soon as it is acknowledged:
-# full_index must already make it visible, before any later write, drain or
-# close could. Untimed, so the throughput comparison is not perturbed.
+# Once every worker's timed window has ended and the timed state is verified,
+# each full-text worker makes this many more writes and searches each on its
+# own handle as soon as it is acknowledged: full_index must already make it
+# visible, before any later write, drain or close could. Behind a barrier, so
+# probes neither contend with timed writes nor enter their sync count.
 VISIBILITY_PROBES = 8
 
 
-def worker_main(config, worker, ready, start, begin, stop, results, release, closes):
+def worker_main(
+    config,
+    worker,
+    ready,
+    start,
+    begin,
+    stop,
+    results,
+    probe_start,
+    probes_done,
+    release,
+    closes,
+):
     db = None
     result = {
         "worker": worker,
@@ -291,8 +304,6 @@ def worker_main(config, worker, ready, start, begin, stop, results, release, clo
         "busy_calls": 0,
         "latencies_ns": [],
         "error": None,
-        "visibility_samples": 0,
-        "visibility_failures": [],
     }
     syncs = sync_counter(config)
     try:
@@ -399,25 +410,34 @@ def worker_main(config, worker, ready, start, begin, stop, results, release, clo
         result["ended"] = time.monotonic()
         if syncs:
             result["syncs_ended"] = syncs()
-        probes = 0
-        while config["indexed"] and not stop.is_set() and probes < VISIBILITY_PROBES:
-            document_key, document, request = build(sequence)
-            try:
-                write(document_key, document, request)
-            except busy as error:
-                if config["engine"] == "sqlite" and getattr(
-                    error, "sqlite_errorcode", None
-                ) not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
-                    raise
-                continue  # Other workers may still be finishing their window.
-            token = f"matchedworker{worker}sequence{sequence}"
-            found = search_keys(token)
-            result["visibility_samples"] += 1
-            if found != [document_key]:
-                result["visibility_failures"].append({"token": token, "found": found})
-            probes += 1
-            sequence += 1
         result["successful_calls"] = sequence
+
+        def probe(sequence):
+            done = {
+                "worker": worker,
+                "visibility_samples": 0,
+                "visibility_failures": [],
+                "probe_writes": 0,
+                "error": None,
+            }
+            while done["probe_writes"] < VISIBILITY_PROBES and not stop.is_set():
+                document_key, document, request = build(sequence)
+                try:
+                    write(document_key, document, request)
+                except busy as error:
+                    if config["engine"] == "sqlite" and getattr(
+                        error, "sqlite_errorcode", None
+                    ) not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                        raise
+                    continue  # Another worker's probe holds the writer.
+                token = f"matchedworker{worker}sequence{sequence}"
+                found = search_keys(token)
+                done["visibility_samples"] += 1
+                if found != [document_key]:
+                    done["visibility_failures"].append({"token": token, "found": found})
+                done["probe_writes"] += 1
+                sequence += 1
+            return done
     except BaseException:
         result["error"] = traceback.format_exc()
         stop.set()
@@ -426,6 +446,23 @@ def worker_main(config, worker, ready, start, begin, stop, results, release, clo
         # Verification runs while this handle stays open: closing first could
         # sync or drain a visibility failure away before it is checked.
         results.put(result)
+        probed = {
+            "worker": worker,
+            "visibility_samples": 0,
+            "visibility_failures": [],
+            "probe_writes": 0,
+            "error": None,
+        }
+        # Probes start once every timed write has ended and the timed state
+        # has been verified.
+        probe_start.wait(TIMEOUT + 600)
+        if config["indexed"] and result["error"] is None and not stop.is_set():
+            try:
+                probed = probe(result["successful_calls"])
+            except BaseException:
+                probed["error"] = traceback.format_exc()
+                stop.set()
+        probes_done.put(probed)
         release.wait(TIMEOUT + 600)
         closing = time.monotonic()
         closed = {"worker": worker, "close_error": None}
@@ -439,14 +476,36 @@ def worker_main(config, worker, ready, start, begin, stop, results, release, clo
 
 
 def thread_group_main(
-    config, workers, ready, start, begin, stop, results, release, closes
+    config,
+    workers,
+    ready,
+    start,
+    begin,
+    stop,
+    results,
+    probe_start,
+    probes_done,
+    release,
+    closes,
 ):
     """Runs every worker as a thread of one process, each with its own
     connection, so they share the engine's in-process group commit."""
     threads = [
         threading.Thread(
             target=worker_main,
-            args=(config, worker, ready, start, begin, stop, results, release, closes),
+            args=(
+                config,
+                worker,
+                ready,
+                start,
+                begin,
+                stop,
+                results,
+                probe_start,
+                probes_done,
+                release,
+                closes,
+            ),
         )
         for worker in workers
     ]
@@ -657,7 +716,13 @@ def run_case(config):
         config["workers"],
     )
     ctx = mp.get_context("spawn")
-    ready, results, closes = ctx.Queue(), ctx.Queue(), ctx.Queue()
+    ready, results, probes_done, closes = (
+        ctx.Queue(),
+        ctx.Queue(),
+        ctx.Queue(),
+        ctx.Queue(),
+    )
+    probe_start = ctx.Event()
     start, stop, begin, release = (
         ctx.Event(),
         ctx.Event(),
@@ -676,6 +741,8 @@ def run_case(config):
                     begin,
                     stop,
                     results,
+                    probe_start,
+                    probes_done,
                     release,
                     closes,
                 ),
@@ -693,6 +760,8 @@ def run_case(config):
                     begin,
                     stop,
                     results,
+                    probe_start,
+                    probes_done,
                     release,
                     closes,
                 ),
@@ -747,6 +816,19 @@ def run_case(config):
             rows,
             final=False,
         )
+        # Every timed write has ended and its state is verified: probes now
+        # neither contend with timed writes nor overwrite unverified keys.
+        probe_start.set()
+        probed = []
+        while len(probed) < config["workers"]:
+            assert time.monotonic() < deadline + TIMEOUT + 60, "Worker probe watchdog"
+            probed.append(probes_done.get(timeout=TIMEOUT + 60))
+        assert all(not row["error"] for row in probed), probed
+        for row in rows:
+            done = next(p for p in probed if p["worker"] == row["worker"])
+            row["visibility_samples"] = done["visibility_samples"]
+            row["visibility_failures"] = done["visibility_failures"]
+            row["successful_calls"] += done["probe_writes"]
         release.set()
         while len(closed) < config["workers"]:
             assert time.monotonic() < deadline + TIMEOUT + 60, "Worker close watchdog"
@@ -757,6 +839,7 @@ def run_case(config):
     finally:
         stop.set()
         start.set()
+        probe_start.set()
         release.set()
         for process in processes:
             if process.is_alive():
