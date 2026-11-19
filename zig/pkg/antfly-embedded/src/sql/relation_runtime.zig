@@ -712,6 +712,23 @@ test "SQL materialized relation replay spills once and shares a single statement
     }
 }
 
+test "SQL _pg_expandarray expands a shared projection in key order" {
+    const a = std.testing.allocator;
+    var fixture: SetTestBackend = .{};
+    const sql = "SELECT r.id, r.n, (r.keys).x AS x FROM " ++
+        "(SELECT s.id, (information_schema._pg_expandarray(s.a)).n AS n, " ++
+        "information_schema._pg_expandarray(s.a) AS keys " ++
+        "FROM (VALUES (1,'[0:1]={2,1}'::smallint[]),(2,ARRAY[7]::smallint[]),(3,ARRAY[]::smallint[])) s(id,a) " ++
+        "WHERE s.id <> 2) r ORDER BY r.id,r.n";
+    var compiled = try @import("compiler.zig").compile(a, sql, .{});
+    defer compiled.deinit();
+    var result = try @import("runtime.zig").execute(a, fixture.backend(), &compiled, &.{}, .{ .page_rows = 1 });
+    defer result.deinit();
+    const actual = try std.json.Stringify.valueAlloc(a, result.output.rows, .{});
+    defer a.free(actual);
+    try std.testing.expectEqualStrings("[[\"1\",\"1\",\"2\"],[\"1\",\"2\",\"1\"]]", actual);
+}
+
 test "SQL generate_series accepts expression bounds and alias columns" {
     const allocator = std.testing.allocator;
     var backend: SetTestBackend = .{};

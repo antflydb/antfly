@@ -529,6 +529,7 @@ const Parser = struct {
                 return if (t.owned) std.mem.eql(u8, t.text, expected) else std.ascii.eqlIgnoreCase(t.text, expected);
             }
         }.name;
+        if (matches(schema, "information_schema")) return matches(function, "_pg_expandarray");
         return matches(schema, "pg_catalog") and (matches(function, "current_schemas") or matches(function, "pg_is_in_recovery") or matches(function, "pg_current_wal_lsn") or matches(function, "pg_last_wal_receive_lsn") or matches(function, "pg_current_xact_id") or matches(function, "pg_get_expr"));
     }
 
@@ -702,7 +703,7 @@ const Parser = struct {
             const row = !function.owned and std.mem.eql(u8, name_value, "row");
             if (row and (distinct or star or filter != null or window_spec != null or within_group != null)) return self.fail(error.InvalidSqlSyntax, "ROW constructor does not accept aggregate modifiers");
             if (row and args.items.len > 256) return self.fail(error.SqlLimitExceeded, "row expression exceeds column limit");
-            left = try self.scalarNode(.{ .call = .{ .name = if (row) "$row" else name_value, .args = try args.toOwnedSlice(self.alloc), .star = star, .distinct = distinct, .filter = filter, .window = window_spec, .within_group = within_group } });
+            left = try self.scalarNode(.{ .call = .{ .name = if (row) "$row" else if (std.mem.eql(u8, name_value, "_pg_expandarray")) "$pg_expandarray" else name_value, .args = try args.toOwnedSlice(self.alloc), .star = star, .distinct = distinct, .filter = filter, .window = window_spec, .within_group = within_group } });
         } else if (self.ddlWord("current_user")) {
             self.uses_current_setting = true;
             left = try self.scalarNode(.{ .call = .{ .name = "$current_user", .args = &.{} } });
@@ -792,6 +793,15 @@ const Parser = struct {
                     left = try self.scalarNode(.{ .unary = .{ .op = .not, .operand = try self.likeExpression(left, pattern, insensitive, depth) } });
                     continue;
                 }
+            }
+            if (self.take(.dot)) {
+                const label = try self.identifier();
+                if (!std.mem.eql(u8, label, "x") and !std.mem.eql(u8, label, "n"))
+                    return self.fail(error.UnsupportedSqlShape, "unsupported expanded-array record field");
+                const key = try self.scalarNode(.{ .literal = .{ .string = label } });
+                const field_value = try self.scalarNode(.{ .binary = .{ .op = .json_text, .left = left, .right = key } });
+                left = try self.scalarNode(.{ .cast = .{ .operand = field_value, .type = .integer, .element_type = .int64 } });
+                continue;
             }
             if (self.take(.lbracket)) {
                 var args: std.ArrayList(*const ast.Scalar) = .empty;
@@ -1286,6 +1296,69 @@ const Parser = struct {
         return left;
     }
 
+    fn expandArrayProjection(self: *Parser, columns: []ast.Projection, source: *const ast.Relation, filter: ?*const ast.Predicate) Error!?*const ast.Relation {
+        const same = @import("aggregate_binding.zig").same;
+        var input: ?*const ast.Scalar = null;
+        const alias = "$expanded_array";
+        const ordinal_name = alias ++ "\x00n";
+        var bound_ordinal: ?*const ast.Scalar = null;
+        for (columns) |*projection| {
+            const expression = projection.expression orelse continue;
+            // The parser lowers a parenthesized .x/.n selection to a
+            // typed JSON field read. A whole record remains JSON.
+            const selector = if (expression.* == .cast and expression.cast.type == .integer and
+                expression.cast.operand.* == .binary and expression.cast.operand.binary.op == .json_text)
+                expression.cast.operand.binary
+            else
+                null;
+            const call = if (selector) |selection| selection.left else expression;
+            if (call.* != .call or !std.mem.eql(u8, call.call.name, "$pg_expandarray")) continue;
+            if (call.call.args.len != 1 or call.call.window != null or call.call.distinct or call.call.star or call.call.filter != null or call.call.within_group != null)
+                return self.fail(error.UnsupportedSqlShape, "expected one array argument");
+            const array = call.call.args[0];
+            if (input) |prior| if (!same(prior, array))
+                return self.fail(error.UnsupportedSqlShape, "independent expanded arrays in one projection are unsupported");
+            input = array;
+            const ordinal = if (bound_ordinal) |bound| bound else create: {
+                const bound = try self.scalarNode(.{ .column = ordinal_name });
+                bound_ordinal = bound;
+                break :create bound;
+            };
+            const field_name = if (selector) |selection| label: {
+                if (selection.right.* != .literal or selection.right.literal != .string)
+                    return self.fail(error.UnsupportedSqlShape, "expected a named expanded-array field");
+                break :label selection.right.literal.string;
+            } else null;
+            if (field_name != null and std.mem.eql(u8, field_name.?, "n")) {
+                projection.expression = ordinal;
+                continue;
+            }
+            const one = try self.scalarNode(.{ .literal = .{ .integer = 1 } });
+            const lower = try self.scalarNode(.{ .call = .{ .name = "array_lower", .args = try self.alloc.dupe(*const ast.Scalar, &.{ array, one }) } });
+            const offset = try self.scalarNode(.{ .binary = .{ .op = .subtract, .left = ordinal, .right = one } });
+            const index = try self.scalarNode(.{ .binary = .{ .op = .add, .left = lower, .right = offset } });
+            const cell = try self.scalarNode(.{ .call = .{ .name = "$array_subscript", .args = try self.alloc.dupe(*const ast.Scalar, &.{ array, index }) } });
+            if (field_name != null) {
+                projection.expression = cell;
+            } else {
+                const x = try self.scalarNode(.{ .literal = .{ .string = "x" } });
+                const n = try self.scalarNode(.{ .literal = .{ .string = "n" } });
+                projection.expression = try self.scalarNode(.{ .call = .{ .name = "jsonb_build_object", .args = try self.alloc.dupe(*const ast.Scalar, &.{ x, cell, n, ordinal }) } });
+            }
+        }
+        const array = input orelse return null;
+        // Filter the input before opening a per-row array producer.
+        const base = if (filter) |predicate_| blk: {
+            const selected = try self.alloc.create(ast.Select);
+            selected.* = .{ .source = source, .predicate = predicate_ };
+            break :blk try self.relationNode(.{ .derived = .{ .query = selected, .alias = "$expanded_input", .preserve_scope = true } });
+        } else source;
+        const one = try self.scalarNode(.{ .literal = .{ .integer = 1 } });
+        const count = try self.scalarNode(.{ .call = .{ .name = "cardinality", .args = try self.alloc.dupe(*const ast.Scalar, &.{array}) } });
+        const series = try self.seriesRelation(one, count, one, alias, "n", true);
+        return try self.relationNode(.{ .join = .{ .kind = .cross, .left = base, .right = series } });
+    }
+
     fn selectCore(self: *Parser) Error!ast.Select {
         var columns = std.ArrayList(ast.Projection).empty;
         while (true) {
@@ -1300,6 +1373,7 @@ const Parser = struct {
         const simple = source != null and source.?.* == .table and source.?.table.alias == null and source.?.table.search == null;
         const table = if (simple) source.?.table.name else null;
         const filter = try self.where();
+        const expanded = if (source) |relation_source| try self.expandArrayProjection(columns.items, relation_source, filter) else null;
         var group_by: std.ArrayList(*const ast.Scalar) = .empty;
         if (self.keyword(.group)) {
             try self.expectKeyword(.by);
@@ -1318,7 +1392,9 @@ const Parser = struct {
             try windows.append(self.alloc, .{ .name = window_name, .window = try self.window(0) });
             if (!self.take(.comma)) break;
         };
-        var result = ast.Select{ .table = table, .source = if (simple) null else source, .columns = try columns.toOwnedSlice(self.alloc), .predicate = filter, .group_by = try group_by.toOwnedSlice(self.alloc), .having = having, .windows = try windows.toOwnedSlice(self.alloc) };
+        if (expanded != null and (group_by.items.len != 0 or having != null or windows.items.len != 0 or columns.items.len == 0))
+            return self.fail(error.UnsupportedSqlShape, "expanded arrays require explicit ungrouped projections");
+        var result = ast.Select{ .table = if (expanded == null) table else null, .source = expanded orelse (if (simple) null else source), .columns = try columns.toOwnedSlice(self.alloc), .predicate = if (expanded == null) filter else null, .group_by = try group_by.toOwnedSlice(self.alloc), .having = having, .windows = try windows.toOwnedSlice(self.alloc) };
         try @import("window_names.zig").resolveCore(self.alloc, &result, self.limits.max_depth);
         return result;
     }
@@ -1460,6 +1536,10 @@ const Parser = struct {
             break :blk name_value;
         } else alias;
 
+        return self.seriesRelation(start, stop, step, alias, label, lateral);
+    }
+
+    fn seriesRelation(self: *Parser, start: *const ast.Scalar, stop: *const ast.Scalar, step: *const ast.Scalar, alias: []const u8, label: []const u8, lateral: bool) Error!*const ast.Relation {
         const columns: []const []const u8 = &.{ "$series_value", "$series_stop", "$series_step" };
         const relation_value = try self.relationNode(.{ .table = .{ .name = .{ .table = "$integer_series" } } });
         var inputs: [3]*const ast.Scalar = undefined;

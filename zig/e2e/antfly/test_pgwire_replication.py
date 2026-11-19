@@ -343,6 +343,32 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             timeout=40,
         ).splitlines()
         assert primary_key == ["ordered_primary|i|2|2|1"]
+        jdbc_keys = subprocess.check_output(
+            [
+                psql,
+                *connection,
+                "-XAt",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                "SELECT r.column_name, r.key_seq, r.pk_name FROM "
+                "(SELECT a.attname AS column_name, (information_schema._pg_expandarray(i.indkey)).n AS key_seq, "
+                "ci.relname AS pk_name, information_schema._pg_expandarray(i.indkey) AS keys, "
+                "a.attnum AS a_attnum, i.indnkeyatts AS key_count FROM pg_catalog.pg_class ct "
+                "JOIN pg_catalog.pg_attribute a ON ct.oid = a.attrelid "
+                "JOIN pg_catalog.pg_index i ON a.attrelid = i.indrelid "
+                "JOIN pg_catalog.pg_class ci ON ci.oid = i.indexrelid "
+                "WHERE ct.relname = 'catalog_key_order' AND i.indisprimary) r "
+                "WHERE r.a_attnum = (r.keys).x AND r.key_seq <= key_count ORDER BY r.key_seq",
+            ],
+            text=True,
+            env=env,
+            timeout=40,
+        ).splitlines()
+        assert jdbc_keys == [
+            "second_key|1|ordered_primary",
+            "first_key|2|ordered_primary",
+        ]
         assert catalog_publication() == []
         sql("CREATE PUBLICATION changes FOR TABLE smoke")
         assert catalog_publication() == ["f|t|t|t|f"]
