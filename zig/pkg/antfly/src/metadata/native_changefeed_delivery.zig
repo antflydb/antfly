@@ -122,12 +122,15 @@ pub fn ScheduledProvider(comptime Root: type, comptime Factory: type, comptime P
                 var provider: ProviderFor(Root, Policy) = .{ .root = &root, .policy = self.policy };
                 return provider.prepare(a, state, before, limits, request);
             }
+            const bootstrap_positions = if (state.phase == .bootstrap) try state.rootsAt(a, before) else null;
             const start = state.latest_delivery % state.roots.len;
             var heartbeat: ?delivery.Prepared = null;
             var unavailable = false;
             for (0..state.roots.len) |offset| {
                 try request.ensureActive();
-                const selected = state.roots[(start + offset) % state.roots.len];
+                const index = (start + offset) % state.roots.len;
+                if (bootstrap_positions) |positions| if (positions[index].snapshot_delivered.done) continue;
+                const selected = state.roots[index];
                 var root: Root = try self.factory.open(selected.namespace);
                 var provider: ProviderFor(Root, Policy) = .{ .root = &root, .policy = self.policy };
                 var attempt = std.heap.ArenaAllocator.init(a);
@@ -143,7 +146,7 @@ pub fn ScheduledProvider(comptime Root: type, comptime Factory: type, comptime P
                 if (heartbeat == null) heartbeat = try copyPage(a, page);
             }
             if (unavailable) return error.ReadUnavailable;
-            return heartbeat orelse error.ChangefeedResynchronizationRequired;
+            return heartbeat orelse if (state.phase == .bootstrap) error.ChangefeedBackpressure else error.ChangefeedResynchronizationRequired;
         }
 
         fn copyPage(a: A, page: delivery.Prepared) !delivery.Prepared {
@@ -184,7 +187,7 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
             _ = try self.root.validateScope(state);
             _ = try state.rootIndex(self.root.namespace);
             if (state.roots.len == 1 and state.definition.?.tables.len != 1) return error.ChangefeedCapabilityUnsupported;
-            if (state.roots.len != 1 and (state.phase == .bootstrap or !@hasDecl(Root, "readProjectedWithContext"))) return error.ChangefeedCapabilityUnsupported;
+            if (state.roots.len != 1 and !@hasDecl(Root, "readProjectedWithContext")) return error.ChangefeedCapabilityUnsupported;
             if (self.raw_bytes_limit == 0 or self.raw_bytes_limit > page_types.max_source_bytes) return error.InvalidChangefeed;
         }
         pub fn nowSeconds(self: *Self, request: anytype) !u64 {
@@ -206,7 +209,7 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
             return ordinal;
         }
 
-        fn renderSnapshot(self: *Self, a: A, state: control.State, root: control.Root, original: ?control.Delivery, limits: delivery.Limits, request: anytype) !delivery.Prepared {
+        fn renderSnapshot(self: *Self, a: A, state: control.State, root: control.Root, other_roots_done: bool, original: ?control.Delivery, limits: delivery.Limits, request: anytype) !delivery.Prepared {
             if (comptime !@hasDecl(Root, "readBootstrap") or !@hasDecl(Policy, "snapshotImage")) return error.ChangefeedCapabilityUnsupported;
             const pin = root.snapshot orelse return error.ChangefeedResynchronizationRequired;
             const position = root.snapshot_delivered;
@@ -228,7 +231,7 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
             if (page.rows.len > max_rows or page.next_row != start + @as(u32, @intCast(page.rows.len)) or (page.rows.len == 0 and !page.done))
                 return error.ChangefeedResynchronizationRequired;
 
-            const table = state.definition.?.tables[0];
+            const table = try self.root.validateScope(state);
             const table_id = try std.fmt.allocPrint(a, "{d}", .{table.table_id});
             const scope_id = scope(state);
             const projected: projection.Projection = switch (state.definition.?.projection) {
@@ -274,7 +277,7 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
                 if (expected.page != next.page or expected.done != next.done or !std.mem.eql(u8, expected.continuation, next.continuation))
                     return error.ChangefeedResynchronizationRequired;
             }
-            const body = try std.json.Stringify.valueAlloc(a, SnapshotEnvelope{ .events = events.items, .snapshot = .{ .complete = next.done } }, .{});
+            const body = try std.json.Stringify.valueAlloc(a, SnapshotEnvelope{ .events = events.items, .snapshot = .{ .complete = next.done and other_roots_done } }, .{});
             if (body.len > limits.bytes) return error.ChangefeedBackpressure;
             return .{
                 .body = body,
@@ -288,9 +291,14 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
             try limits.validate();
             try self.authorize(state, request);
             const roots = try state.rootsAt(a, before);
-            if (state.phase == .bootstrap) return self.renderSnapshot(a, state, roots[0], original, limits, request);
-            const context = try state.contextAt(before);
             const index = try state.rootIndex(self.root.namespace);
+            if (state.phase == .bootstrap) {
+                const other_roots_done = for (roots, 0..) |root, i| {
+                    if (i != index and !root.snapshot_delivered.done) break false;
+                } else true;
+                return self.renderSnapshot(a, state, roots[index], other_roots_done, original, limits, request);
+            }
+            const context = try state.contextAt(before);
             const coordinated = try continuation.Coordinated.decode(scope(state), roots, context);
             const seen = if (coordinated == null) try continuation.decode(a, scope(state), roots, context) else try a.alloc(bool, roots.len);
             if (coordinated != null) @memset(seen, false);

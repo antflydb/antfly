@@ -296,7 +296,7 @@ pub fn qualifyEnrollmentCut(a: A, source: Source, policy: anytype, captured: *co
                     return error.ChangefeedResynchronizationRequired;
             }
             const latest = grant.quiescent_latest orelse return error.ReadUnavailable;
-            if (latest != root.start) return error.ChangefeedResynchronizationRequired;
+            if (latest != root.start) return error.ChangefeedEnrollmentCutAdvanced;
             if (scan == 0) proof = control.hash(.{ .proof = proof, .namespace = root.namespace, .grant = root.grant_sequence, .epoch = root.consumer_epoch, .sequence = root.start, .pin = root.snapshot });
         }
     }
@@ -560,7 +560,7 @@ pub const test_support = if (@import("builtin").is_test) struct {
         fixture = .{ .fail_at = 1 };
         try std.testing.expectError(error.ReadUnavailable, qualifyEnrollmentCut(a, reader, &policy, captured, state, .{}));
         fixture = .{ .fail_at = captured.roots.len + 1, .moved = true };
-        try std.testing.expectError(error.ChangefeedResynchronizationRequired, qualifyEnrollmentCut(a, reader, &policy, captured, state, .{}));
+        try std.testing.expectError(error.ChangefeedEnrollmentCutAdvanced, qualifyEnrollmentCut(a, reader, &policy, captured, state, .{}));
     }
     fn captureAllocations(a: A, fixture: *Fixture, definition: control.Definition) !void {
         var owned = try fixture.source().capture(a, definition, .{});

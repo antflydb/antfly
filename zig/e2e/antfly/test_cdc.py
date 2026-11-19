@@ -2502,3 +2502,97 @@ def test_standalone_postgres_bootstraps_and_streams_to_writable_iceberg(
         check_row_count()
     finally:
         server.stop()
+
+
+def test_public_changefeed_bootstraps_multiple_partitions_and_replays():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    table = f"multi_partition_feed_{time.time_ns()}"
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            table_url = f"{server.api_url}/tables/{table}"
+            created_table = client.post(table_url, json={"num_shards": 3}, timeout=30)
+            assert created_table.status_code in (200, 201), created_table.text
+            seeds = {f"{letter}-seed": {"phase": "snapshot"} for letter in "amz"}
+
+            def write(rows):
+                reply = client.post(
+                    f"{table_url}/batch", json={"inserts": rows}, timeout=15
+                )
+                reply.raise_for_status()
+
+            write(seeds)
+            table_state = client.get(table_url, timeout=10)
+            table_state.raise_for_status()
+            assert len(table_state.json()["shards"]) == 3
+            feeds = f"{server.api_url}/changefeeds"
+            definition = {
+                "tables": [table],
+                "start": "snapshot_then_changes",
+                "include": "rows",
+            }
+            headers = {"Idempotency-Key": table}
+
+            def call(method, url, **options):
+                expires = time.monotonic() + 30
+                while True:
+                    reply = client.request(method, url, timeout=15, **options)
+                    retryable = reply.status_code == 503 or (
+                        reply.status_code == 409
+                        and "changefeed_retry_required" in reply.text
+                    )
+                    if not retryable or time.monotonic() >= expires:
+                        reply.raise_for_status()
+                        return reply
+                    time.sleep(0.2)
+
+            enrollment = call("POST", feeds, headers=headers, json=definition).json()
+            assert (
+                call("POST", feeds, headers=headers, json=definition).json()
+                == enrollment
+            )
+            feed = f"{feeds}/{enrollment['id']}"
+            cursor = enrollment["cursor"]
+            write({"post-cut": {"phase": "stream"}})
+            delivered = set()
+            for page_number in range(8):
+                reply = call(
+                    "GET", f"{feed}/events", params={"after": cursor, "limit": 1}
+                )
+                page = reply.json()
+                next_cursor = reply.headers["Antfly-Changefeed-Cursor"]
+                if page_number == 0:
+                    replay = call(
+                        "GET", f"{feed}/events", params={"after": cursor, "limit": 1}
+                    )
+                    assert replay.content == reply.content
+                    assert replay.headers["Antfly-Changefeed-Cursor"] == next_cursor
+                for event in page["events"]:
+                    assert event["kind"] == "document_snapshot"
+                    assert event["after"]["phase"] == "snapshot"
+                    key = event["key"]["value"]
+                    assert key not in delivered
+                    delivered.add(key)
+                call("POST", f"{feed}/ack", json={"cursor": next_cursor})
+                cursor = next_cursor
+                if page["snapshot"]["complete"]:
+                    break
+            else:
+                pytest.fail(server.debug_logs())
+            assert delivered == set(seeds)
+            for _ in range(8):
+                reply = call("GET", f"{feed}/events", params={"after": cursor})
+                events = reply.json()["events"]
+                if events:
+                    assert [
+                        (event["key"]["value"], event["after"]) for event in events
+                    ] == [("post-cut", {"phase": "stream"})]
+                    break
+                cursor = reply.headers["Antfly-Changefeed-Cursor"]
+                call("POST", f"{feed}/ack", json={"cursor": cursor})
+            else:
+                pytest.fail(server.debug_logs())
+            call("DELETE", feed)
+    finally:
+        server.stop()

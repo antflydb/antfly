@@ -216,8 +216,12 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
         if (active.phase != .streaming or active.epoch != confirmed.value.epoch or !same(active.acknowledged_cursor, selection.after))
             return error.MetadataMutationOutcomeUnknown;
     }
-    for (captured.roots) |root| {
+    for (captured.roots, active.roots) |root, item| {
+        if (item.snapshot == null or item.snapshot_released) continue;
         try releaseStreamingSnapshot(&client, &driver_policy, a, active, root, internal);
+        break; // Maintenance resumes any remaining releases against fresh metadata.
+    }
+    for (captured.roots) |root| {
         _ = try source_api.flushAcknowledged(&client, &driver_policy, a, active, root, internal);
     }
     return .{ .acknowledged = confirmed.value.acknowledged_cursor };
@@ -370,10 +374,13 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
     };
     var captured = try source.capture(a, definition, internal);
     defer captured.deinit();
-    if (captured.roots.len != 1) return error.ChangefeedCapabilityUnsupported;
+    if (captured.roots.len == 0) return error.ChangefeedResynchronizationRequired;
     const root = captured.roots[0];
-    if (!std.mem.eql(u8, root.table_name, table_name)) return error.TopologyChanged;
-    const authority = try @import("history_policy_provisioning.zig").authority(root.fence);
+    const history_authority = @import("history_policy_provisioning.zig").authority;
+    const authority = try history_authority(root.fence);
+    for (captured.roots) |route| {
+        if (!std.mem.eql(u8, route.table_name, table_name) or !same(authority, try history_authority(route.fence))) return error.TopologyChanged;
+    }
     const id: control.Id = control.hash(.{ .domain = "antfly:public-changefeed-create:v1", .owner = caller, .key = key })[0..16].*;
     var client: config.Client = .{ .port = meta };
     var policy: RootPolicy(Policy) = .{
@@ -383,7 +390,7 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
         .allocator = a,
     };
     const now = try policy.access.nowSeconds(internal);
-    for (0..8) |_| {
+    for (0..@min(64, 8 + captured.roots.len * 4)) |_| {
         var parsed = try load(&client, a, id, internal);
         defer parsed.deinit();
         const state = parsed.value;
@@ -408,19 +415,39 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
         try policy.access.authorize(state, internal);
         if (state.expiryDue(now)) return error.ChangefeedLeaseExpired;
         if (state.phase == .streaming or state.phase == .bootstrap) {
-            var active = try roots.Routed.init(source, &captured);
+            var active = try roots.Routed.initForRoot(source, &captured, root.namespace);
             _ = try active.validateScope(state);
             return .{ .id = id, .cursor = state.acknowledged_cursor, .expires_at = state.expires_at };
         }
-        if (state.phase != .enrolling) return error.ChangefeedResynchronizationRequired;
-        if (state.roots.len == 0) {
-            try change(&client, a, state, .{ .plan_roots = &.{.{ .namespace = root.namespace, .ownership_epoch = 1 }} }, internal);
+        if (state.phase == .reset_required and state.reset_reason == .history_expired and std.mem.allEqual(u8, &state.cut, 0)) {
+            policy.closing = true;
+            const retired = try retireOne(&client, &policy, a, state, internal);
+            policy.closing = false;
+            if (retired) continue;
+            try change(&client, a, state, .{ .restart = .{
+                .definition = definition,
+                .now = now,
+                .expires_at = state.expires_at,
+                .bootstrap_expires_at = state.bootstrap_expires_at,
+            } }, internal);
             continue;
         }
-        if (state.roots.len != 1 or !std.mem.eql(u8, &state.roots[0].namespace, &root.namespace))
-            return error.ChangefeedResynchronizationRequired;
-        const item = state.roots[0];
-        if (item.consumer_epoch != 0) {
+        if (state.phase != .enrolling) return error.ChangefeedResynchronizationRequired;
+        if (state.roots.len == 0) {
+            const plans = try captured.initialPlans(scratch);
+            try change(&client, a, state, .{ .plan_roots = plans }, internal);
+            continue;
+        }
+        try captured.validateInitialRoutes(state.roots);
+        const pending = for (state.roots, captured.roots) |item, route| {
+            if (item.consumer_epoch == 0) break route;
+        } else null;
+        if (pending) |route| {
+            try source_api.enrollRoot(&client, &policy, a, state, route, tables[0].policy_revision, internal);
+            continue;
+        }
+        if (state.roots.len == 1) {
+            const item = state.roots[0];
             try policy.validateRoot(state, root.namespace, root.fence, root.table_name, internal);
             const ordinary_cut = control.hash(.{
                 .domain = "antfly:public-changefeed-start:v1",
@@ -437,7 +464,14 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
             try change(&client, a, state, .{ .seal = .{ .cut = cut } }, internal);
             continue;
         }
-        try source_api.enrollRoot(&client, &policy, a, state, root, tables[0].policy_revision, internal);
+        const cut = source_api.qualifyEnrollmentCut(a, source, &policy, &captured, state, internal) catch |err| switch (err) {
+            error.ChangefeedEnrollmentCutAdvanced => {
+                try change(&client, a, state, .{ .reset = .history_expired }, internal);
+                continue;
+            },
+            else => return err,
+        };
+        try change(&client, a, state, .{ .seal = .{ .cut = cut } }, internal);
     }
     return error.MetadataMutationOutcomeUnknown;
 }
