@@ -281,7 +281,7 @@ pub const EvalLimits = struct {
     regex_checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     regex_context: ?*anyopaque = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, value_identity, is_missing, date_bin, @"$array_subscript", @"$series_step", current_schemas, pg_current_wal_lsn, pg_current_xact_id };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, value_identity, is_missing, date_bin, @"$array_subscript", @"$series_step", current_schemas, pg_current_wal_lsn, pg_current_xact_id, pg_get_expr };
 
 fn regexFunction(function: Function) ?regex_functions.Function {
     return switch (function) {
@@ -747,6 +747,7 @@ pub const Program = struct {
                 .current_schemas,
                 .pg_current_wal_lsn,
                 .pg_current_xact_id,
+                .pg_get_expr,
                 .@"$single",
                 .trunc,
                 .sign,
@@ -2415,6 +2416,18 @@ test "SQL PostgreSQL array search transforms unwind every allocation failure" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
+test "SQL pg_get_expr reads catalog expression text and propagates nulls" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "pg_catalog.pg_get_expr(NULL, 1259) IS NULL AND pg_get_expr('42', NULL) IS NULL AND pg_get_expr('42', 1259) = '42'", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const value = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+    try std.testing.expect(!value.sql_null and value.value.bool);
+}
+
 test "SQL pg_is_in_recovery evaluates as a boolean on Antfly" {
     const a = std.testing.allocator;
     var compiled = try @import("compiler.zig").compileScalar(a, "pg_is_in_recovery() OR pg_catalog.PG_IS_IN_RECOVERY()", .{});
@@ -2632,6 +2645,7 @@ pub fn validateFunctionArity(function: Function, count: usize) !void {
     const valid = switch (function) {
         .value_identity, .is_missing, .current_schemas => count == 1,
         .pg_current_wal_lsn, .pg_current_xact_id => count == 0,
+        .pg_get_expr => count == 2,
         .regexp_like, .regexp_count, .regexp_instr, .regexp_substr, .regexp_replace => unreachable,
         .array_position => count == 2 or count == 3,
         .array_positions, .array_remove, .array_append, .array_prepend, .array_cat => count == 2,
@@ -2845,6 +2859,14 @@ const Binder = struct {
                     if (call.args.len == 0) return error.InvalidSqlParameters;
                     for (call.args) |arg| _ = try self.infer(arg, depth + 1);
                     break :blk .{ .kind = .integer, .nullable = false };
+                }
+                if (std.mem.eql(u8, call.name, "pg_get_expr")) {
+                    if (call.args.len != 2) return error.SqlUndefinedFunction;
+                    const expression_type = try self.infer(call.args[0], depth + 1);
+                    const relation_type = try self.infer(call.args[1], depth + 1);
+                    if ((expression_type.kind != null and expression_type.kind != .string) or
+                        (relation_type.kind != null and relation_type.kind != .integer)) return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = .string, .element_type = .text, .nullable = true };
                 }
                 if (std.mem.eql(u8, call.name, "pg_current_xact_id")) {
                     if (call.args.len != 0) return error.SqlUndefinedFunction;
@@ -3370,6 +3392,14 @@ const Binder = struct {
                     break :blk .{ .literal = .{ .bool = false } };
                 if (std.mem.eql(u8, call.name, "pg_last_wal_receive_lsn"))
                     break :blk .{ .literal = .null };
+                if (std.mem.eql(u8, call.name, "pg_get_expr")) {
+                    const first = try self.compile(call.args[0], .string, depth + 1);
+                    const second = try self.compile(call.args[1], .integer, depth + 1);
+                    // The compatibility catalog uses SQL text for adbin.
+                    // Retain strict NULL propagation for a missing definition.
+                    const args = try self.alloc.dupe(u32, &.{ first, second });
+                    break :blk .{ .call = .{ .function = .pg_get_expr, .args = args } };
+                }
                 if (scopeField(call.name)) |field| {
                     if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };
                     const view = self.settings orelse return error.SettingCatalogUnavailable;
@@ -4275,6 +4305,11 @@ const Evaluator = struct {
                             break :ordinary if (mixed_number) try mixedNumberQuantified(array.*, element, compare_op, every.bool, &work) else try array.quantified(element, compare_op, if (every.bool) .all else .any, &work);
                         };
                         break :blk if (accepted) |value| Datum.json(.{ .bool = value }) else .{};
+                    },
+                    .pg_get_expr => {
+                        const expression_value = try self.runDatum(call.args[0], depth + 1);
+                        const relation = try self.runDatum(call.args[1], depth + 1);
+                        break :blk if (relation.sql_null) .{} else expression_value;
                     },
                     .pg_current_xact_id => {
                         const view = self.program.settings orelse return error.NoActiveSqlTransaction;

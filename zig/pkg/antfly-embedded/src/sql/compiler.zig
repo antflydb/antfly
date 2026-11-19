@@ -49,6 +49,8 @@ pub const PostgresInputProcedure = enum {
 pub const PostgresCatalogRelation = enum(u32) {
     pg_class = 1259,
     pg_description = 2609,
+    pg_attribute = 1249,
+    pg_attrdef = 2604,
     pg_type = 1247,
     pg_namespace = 2615,
     pg_publication = 6104,
@@ -526,7 +528,7 @@ const Parser = struct {
                 return if (t.owned) std.mem.eql(u8, t.text, expected) else std.ascii.eqlIgnoreCase(t.text, expected);
             }
         }.name;
-        return matches(schema, "pg_catalog") and (matches(function, "current_schemas") or matches(function, "pg_is_in_recovery") or matches(function, "pg_current_wal_lsn") or matches(function, "pg_last_wal_receive_lsn") or matches(function, "pg_current_xact_id"));
+        return matches(schema, "pg_catalog") and (matches(function, "current_schemas") or matches(function, "pg_is_in_recovery") or matches(function, "pg_current_wal_lsn") or matches(function, "pg_last_wal_receive_lsn") or matches(function, "pg_current_xact_id") or matches(function, "pg_get_expr"));
     }
 
     fn scalar(self: *Parser, depth: usize, minimum: u8) Error!*const ast.Scalar {

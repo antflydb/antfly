@@ -2968,6 +2968,11 @@ const GuardedCatalog = struct {
             defer arena.deinit();
             return system.scanNamespaces(alloc, request, try self.catalogNamespaces(arena.allocator(), request.conditions));
         }
+        if (system.isAttributes(table)) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            return system.scanAttributes(alloc, request, try self.catalogAttributes(arena.allocator(), request.conditions));
+        }
         if (system.owns(table)) return system.scan(alloc, request);
         if (self.authority.importedSnapshot()) |snapshot| return self.scanPinned(alloc, snapshot, table, request);
         return self.native.vtable.scan(self.native.ptr, alloc, table, request);
@@ -3122,12 +3127,20 @@ const GuardedCatalog = struct {
                 arena.deinit();
                 return err;
             };
-            return system.openClasses(request, arena, items);
+            return system.openRows(system.Class, request, arena, items);
         }
         if (system.isNamespaces(table)) {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             return system.openNamespaces(alloc, request, try self.catalogNamespaces(arena.allocator(), request.conditions));
+        }
+        if (system.isAttributes(table)) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            const items = self.catalogAttributes(arena.allocator(), request.conditions) catch |err| {
+                arena.deinit();
+                return err;
+            };
+            return system.openRows(system.Attribute, request, arena, items);
         }
         return system.open(alloc, request);
     }
@@ -3267,6 +3280,7 @@ const GuardedCatalog = struct {
                     if (try item.matches(conditions)) {
                         var retained = item;
                         retained.name = try a.dupe(u8, item.name);
+                        retained.logical = .{ .namespace = namespace.name, .id = entry.table.table_id, .revision = page.revision };
                         try result.append(a, retained);
                     }
                 }
@@ -3285,6 +3299,57 @@ const GuardedCatalog = struct {
             if (index > 0 and item.oid == result.items[index - 1].oid) return error.InvalidSqlBackendResponse;
         }
         return result.items;
+    }
+
+    fn catalogAttributes(self: *GuardedCatalog, alloc: std.mem.Allocator, conditions: []const catalog.Condition) ![]const system.Attribute {
+        const database = self.authority.request.database orelse "default";
+        const classes = try self.catalogClasses(alloc, &.{});
+        var attributes: std.ArrayList(system.Attribute) = .empty;
+        var visited: usize = 0;
+        for (classes) |class| {
+            try checkpoint(self);
+            var needs_class = true;
+            for (conditions) |condition| {
+                if (condition.op != .eq or !std.mem.eql(u8, condition.column, "attrelid")) continue;
+                if (condition.value != .integer or condition.value.integer != class.oid) needs_class = false;
+            }
+            if (!needs_class) continue;
+            var arena = std.heap.ArenaAllocator.init(if (self.authority.server) |server| server.alloc else alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const table = if (class.logical) |logical| table: {
+                const server = self.authority.server orelse return error.InvalidSqlBackendResponse;
+                const context = try self.authority.context();
+                const target = @import("antfly_local_sources").system_catalog_domain.Target{
+                    .database = database,
+                    .namespace = logical.namespace,
+                    .table = class.name,
+                };
+                const bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = .{
+                    .targets = &.{target},
+                    .include_query_definitions = true,
+                    .expected_revision = logical.revision,
+                } });
+                const snapshot = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").system_catalog_domain.ResolvedMany, a, bytes, .{});
+                if (snapshot.tables.len != 1 or snapshot.revision != logical.revision) return error.CatalogGenerationChanged;
+                const current = snapshot.tables[0] orelse return error.CatalogGenerationChanged;
+                if (current.table_id != logical.id) return error.CatalogGenerationChanged;
+                try current.requireAccess(context.native_service);
+                const definition = current.query_definition orelse return error.InvalidSqlBackendResponse;
+                if (definition.table_id != logical.id) return error.CatalogGenerationChanged;
+                break :table try server.sql_schema_cache.resolve(server.sqlPlanCacheIo(), a, definition.schema_json, current.table_id, current.name);
+            } else (try system.resolve(.{ .namespace = "pg_catalog", .table = class.name }, .read, database)) orelse return error.InvalidSqlBackendResponse;
+            for (table.columns, 1..) |column, ordinal| {
+                visited += 1;
+                if (visited > 32768) return error.SqlProgramLimitExceeded;
+                var item: system.Attribute = .{ .relation = class.oid, .ordinal = std.math.cast(u16, ordinal) orelse return error.SqlProgramLimitExceeded, .column = column };
+                if (!try item.matches(a, conditions)) continue;
+                item.column.name = try alloc.dupe(u8, column.name);
+                item.column.path = item.column.name;
+                try attributes.append(alloc, item);
+            }
+        }
+        return attributes.items;
     }
 
     fn catalogNamespaces(self: *GuardedCatalog, a: std.mem.Allocator, conditions: []const catalog.Condition) ![]const system.Namespace {

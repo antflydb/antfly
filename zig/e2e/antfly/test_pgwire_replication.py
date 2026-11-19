@@ -301,6 +301,25 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             env=env,
             timeout=40,
         ).splitlines()
+        columns = subprocess.check_output(
+            [
+                psql,
+                *connection,
+                "-XAt",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                "SELECT a.attname, t.typname, a.attnum, a.attnotnull, pg_catalog.pg_get_expr(d.adbin,d.adrelid) "
+                "FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+                "JOIN pg_catalog.pg_type t ON a.atttypid = t.oid "
+                "LEFT JOIN pg_catalog.pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum "
+                "WHERE c.relname = 'smoke' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+            ],
+            text=True,
+            env=env,
+            timeout=40,
+        ).splitlines()
+        assert columns == ["id|int8|1|t|", "content|text|2|f|"]
         assert names == ["public|smoke|r|"]
         assert catalog_publication() == []
         sql("CREATE PUBLICATION changes FOR TABLE smoke")

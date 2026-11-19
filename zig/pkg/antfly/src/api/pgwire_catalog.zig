@@ -28,6 +28,8 @@ const pg_namespace_storage = "\x00pg_catalog.pg_namespace";
 const pg_auth_members_storage = "\x00pg_catalog.pg_auth_members";
 const pg_publication_storage = "\x00pg_catalog.pg_publication";
 const pg_replication_slots_storage = "\x00pg_catalog.pg_replication_slots";
+const pg_attribute_storage = "\x00pg_catalog.pg_attribute";
+const pg_attrdef_storage = "\x00pg_catalog.pg_attrdef";
 const pg_class_storage = "\x00pg_catalog.pg_class";
 const pg_description_storage = "\x00pg_catalog.pg_description";
 const pg_enum_storage = "\x00pg_catalog.pg_enum";
@@ -46,7 +48,9 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
     const publications = std.mem.eql(u8, name.table, "pg_publication");
     const descriptions = std.mem.eql(u8, name.table, "pg_description");
     const classes = std.mem.eql(u8, name.table, "pg_class");
-    if (!classes and !descriptions and !roles and !members and !namespaces and !enums and !slots and !publications and !std.mem.eql(u8, name.table, pg_type_name)) return null;
+    const attributes = std.mem.eql(u8, name.table, "pg_attribute");
+    const defaults = std.mem.eql(u8, name.table, "pg_attrdef");
+    if (!attributes and !defaults and !classes and !descriptions and !roles and !members and !namespaces and !enums and !slots and !publications and !std.mem.eql(u8, name.table, pg_type_name)) return null;
     if (name.namespace) |namespace| if (!std.mem.eql(u8, namespace, "pg_catalog")) return null;
     if (name.database) |qualified| if (!std.mem.eql(u8, qualified, database)) return error.Forbidden;
     if (action != .read) return error.SqlReadOnlyTransaction;
@@ -99,6 +103,37 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
             .{ .name = "safe_wal_size", .path = "safe_wal_size", .type = .integer, .nullable = true },
             .{ .name = "two_phase", .path = "two_phase", .type = .boolean, .nullable = false },
             .{ .name = "conflicting", .path = "conflicting", .type = .boolean, .nullable = false },
+        },
+    };
+    if (defaults) return .{
+        .id = @backingInt(RelationOid.pg_attrdef),
+        .physical_name = pg_attrdef_storage,
+        .schema_version = 1,
+        .scope = .{ .database = database, .namespace = "pg_catalog", .name = "pg_attrdef", .revision = 1 },
+        .columns = &.{
+            .{ .name = "oid", .path = "oid", .type = .integer, .nullable = false },
+            .{ .name = "adrelid", .path = "adrelid", .type = .integer, .nullable = false },
+            .{ .name = "adnum", .path = "adnum", .type = .integer, .element_type = .int16, .nullable = false },
+            .{ .name = "adbin", .path = "adbin", .type = .string, .nullable = false },
+        },
+    };
+    if (attributes) return .{
+        .id = @backingInt(RelationOid.pg_attribute),
+        .physical_name = pg_attribute_storage,
+        .schema_version = 1,
+        .scope = .{ .database = database, .namespace = "pg_catalog", .name = "pg_attribute", .revision = 1 },
+        .columns = &.{
+            .{ .name = "attrelid", .path = "attrelid", .type = .integer, .nullable = false },
+            .{ .name = "attname", .path = "attname", .type = .string, .nullable = false },
+            .{ .name = "atttypid", .path = "atttypid", .type = .integer, .nullable = false },
+            .{ .name = "attlen", .path = "attlen", .type = .integer, .element_type = .int16, .nullable = false },
+            .{ .name = "attnum", .path = "attnum", .type = .integer, .element_type = .int16, .nullable = false },
+            .{ .name = "atttypmod", .path = "atttypmod", .type = .integer, .element_type = .int32, .nullable = false },
+            .{ .name = "attnotnull", .path = "attnotnull", .type = .boolean, .nullable = false },
+            .{ .name = "atthasdef", .path = "atthasdef", .type = .boolean, .nullable = false },
+            .{ .name = "attisdropped", .path = "attisdropped", .type = .boolean, .nullable = false },
+            .{ .name = "attidentity", .path = "attidentity", .type = .string, .nullable = false },
+            .{ .name = "attgenerated", .path = "attgenerated", .type = .string, .nullable = false },
         },
     };
     if (classes) return .{
@@ -190,7 +225,7 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
 }
 
 pub fn owns(table: catalog.Table) bool {
-    return std.mem.eql(u8, table.physical_name, pg_type_storage) or isRoles(table) or isEmpty(table) or isNamespaces(table) or isReplicationSlots(table) or isPublications(table) or isClasses(table);
+    return std.mem.eql(u8, table.physical_name, pg_type_storage) or isRoles(table) or isEmpty(table) or isNamespaces(table) or isReplicationSlots(table) or isPublications(table) or isClasses(table) or isAttributes(table);
 }
 
 pub fn isClasses(table: catalog.Table) bool {
@@ -202,6 +237,7 @@ pub const Class = struct {
     name: []const u8,
     namespace: u32,
     kind: []const u8 = "r",
+    logical: ?struct { namespace: []const u8, id: u64, revision: u64 } = null,
 
     pub fn matches(self: Class, conditions: []const catalog.Condition) !bool {
         for (conditions) |condition| {
@@ -240,18 +276,18 @@ pub fn scanClasses(a: std.mem.Allocator, request: catalog.Scan, items: []const C
     return Class.page(a, items, try startOf(request.after, items.len), request.limit);
 }
 
-pub fn openClasses(request: catalog.Scan, arena: std.heap.ArenaAllocator, items: []const Class) !catalog.Cursor {
+pub fn openRows(comptime RowType: type, request: catalog.Scan, arena: std.heap.ArenaAllocator, items: []const RowType) !catalog.Cursor {
     var owned = arena;
     errdefer owned.deinit();
     if (request.search != null) return error.UnsupportedSqlShape;
     const start = try startOf(request.after, items.len);
     const Classes = struct {
         arena: std.heap.ArenaAllocator,
-        items: []const Class,
+        items: []const RowType,
         index: usize,
         fn next(raw: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            const result = try Class.page(alloc, self.items, self.index, limit);
+            const result = try RowType.page(alloc, self.items, self.index, limit);
             self.index += result.rows.len;
             return result;
         }
@@ -264,6 +300,79 @@ pub fn openClasses(request: catalog.Scan, arena: std.heap.ArenaAllocator, items:
     const state = try owned.allocator().create(Classes);
     state.* = .{ .arena = owned, .items = items, .index = start };
     return .{ .ptr = state, .next = Classes.next, .close = Classes.close, .estimated_rows = items.len - start };
+}
+
+pub fn isAttributes(table: catalog.Table) bool {
+    return std.mem.eql(u8, table.physical_name, pg_attribute_storage);
+}
+
+pub const Attribute = struct {
+    relation: u32,
+    ordinal: u16,
+    column: catalog.Column,
+
+    fn attrs(self: Attribute, alloc: std.mem.Allocator) !std.json.ObjectMap {
+        const column = self.column;
+        const element: Element = column.element_type orelse switch (column.type) {
+            .integer => .int64,
+            .number => .float64,
+            .boolean => .boolean,
+            .json => .jsonb,
+            .uuid => .uuid,
+            .string, .datetime => .text,
+            .array => return error.InvalidSqlBackendResponse,
+        };
+        const oid: u32 = if (column.type == .array) element.arrayOid() else if (column.type == .datetime) 1184 else element.oid();
+        const length: i64 = for (types) |item| {
+            if (item.oid == oid) break item.length;
+        } else return error.InvalidSqlBackendResponse;
+        const modifier: i64 = if (column.numeric_modifier) |m|
+            try m.postgres()
+        else
+            -1;
+        var values: std.json.ObjectMap = .empty;
+        try values.put(alloc, "attrelid", .{ .integer = self.relation });
+        try values.put(alloc, "attname", .{ .string = try alloc.dupe(u8, column.name) });
+        try values.put(alloc, "atttypid", .{ .integer = oid });
+        try values.put(alloc, "attlen", .{ .integer = length });
+        try values.put(alloc, "attnum", .{ .integer = self.ordinal });
+        try values.put(alloc, "atttypmod", .{ .integer = modifier });
+        try values.put(alloc, "attnotnull", .{ .bool = !column.nullable });
+        try values.put(alloc, "atthasdef", .{ .bool = column.defaulted or column.generated });
+        try values.put(alloc, "attisdropped", .{ .bool = false });
+        try values.put(alloc, "attidentity", .{ .string = "" });
+        try values.put(alloc, "attgenerated", .{ .string = if (column.generated) "s" else "" });
+        return values;
+    }
+
+    pub fn matches(self: Attribute, a: std.mem.Allocator, conditions: []const catalog.Condition) !bool {
+        if (conditions.len == 0) return true;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const values = try self.attrs(arena.allocator());
+        for (conditions) |condition|
+            if (!try conditionMatches(values.get(condition.column) orelse return error.InvalidSqlBackendResponse, condition)) return false;
+        return true;
+    }
+
+    fn page(a: std.mem.Allocator, items: []const Attribute, start: usize, limit: u32) !catalog.Page {
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+        const end = @min(items.len, start +| limit);
+        const rows = try alloc.alloc(catalog.Row, end - start);
+        for (items[start..end], rows) |item, *output| output.* = .{
+            .id = try std.fmt.allocPrint(alloc, "{d:0>10}:{d:0>5}", .{ item.relation, item.ordinal }),
+            .version = 1,
+            .value = .{ .object = try item.attrs(alloc) },
+        };
+        return .{ .rows = rows, .owned_arena = arena, .after = if (end < items.len) try std.fmt.allocPrint(alloc, "{d}", .{end}) else null };
+    }
+};
+
+pub fn scanAttributes(a: std.mem.Allocator, request: catalog.Scan, items: []const Attribute) !catalog.Page {
+    if (request.search != null) return error.UnsupportedSqlShape;
+    return Attribute.page(a, items, try startOf(request.after, items.len), request.limit);
 }
 
 pub fn isPublications(table: catalog.Table) bool {
@@ -465,10 +574,11 @@ pub fn openNamespaces(a: std.mem.Allocator, request: catalog.Scan, items: []cons
 
 /// Antfly's PostgreSQL catalog exposes built-in types and the session's
 /// effective role. SQL enum declarations, comments and separate role grants
-/// are absent from this catalog.
+/// are absent from this catalog. Stored default expressions currently lack
+/// a PostgreSQL SQL renderer.
 pub fn isEmpty(table: catalog.Table) bool {
     return std.mem.eql(u8, table.physical_name, pg_auth_members_storage) or std.mem.eql(u8, table.physical_name, pg_enum_storage) or
-        std.mem.eql(u8, table.physical_name, pg_description_storage);
+        std.mem.eql(u8, table.physical_name, pg_description_storage) or std.mem.eql(u8, table.physical_name, pg_attrdef_storage);
 }
 
 pub fn openEmpty(context: *anyopaque) catalog.Cursor {
@@ -693,6 +803,27 @@ test "pgwire pg_roles describes only the supplied authenticated role" {
     try std.testing.expectEqual(@as(usize, 0), exhausted.rows.len);
 }
 
+test "pgwire pg_attribute preserves array OIDs and numeric modifiers" {
+    const a = std.testing.allocator;
+    const attribute: Attribute = .{ .relation = 17000, .ordinal = 2, .column = .{
+        .name = "amount",
+        .path = "amount",
+        .type = .array,
+        .element_type = .numeric,
+        .numeric_modifier = .{ .precision = 12, .scale = -2 },
+        .nullable = false,
+        .generated = true,
+    } };
+    const captured = try scanAttributes(a, .{ .fields = &.{}, .limit = 1 }, &.{attribute});
+    defer captured.deinit();
+    const attrs = captured.rows[0].value.object;
+    try std.testing.expectEqual(@as(i64, 1231), attrs.get("atttypid").?.integer);
+    try std.testing.expectEqual(@as(i64, (12 << 16) + 2046 + 4), attrs.get("atttypmod").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), attrs.get("attnum").?.integer);
+    try std.testing.expect(attrs.get("attnotnull").?.bool);
+    try std.testing.expectEqualStrings("s", attrs.get("attgenerated").?.string);
+}
+
 test "pgwire pg_class exposes the regclass identity and paginates the captured rows" {
     const a = std.testing.allocator;
     const relation = (try resolve(.{ .table = "pg_class" }, .read, "default")).?;
@@ -707,7 +838,7 @@ test "pgwire pg_class exposes the regclass identity and paginates the captured r
         storage.deinit();
         return err;
     };
-    const cursor = try openClasses(.{ .fields = &.{}, .limit = 1 }, storage, items);
+    const cursor = try openRows(Class, .{ .fields = &.{}, .limit = 1 }, storage, items);
     defer cursor.close(cursor.ptr);
     const first = try cursor.next(cursor.ptr, a, 1);
     defer first.deinit();
