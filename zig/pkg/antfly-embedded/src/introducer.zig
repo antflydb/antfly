@@ -520,12 +520,18 @@ pub const TypedFieldValue = struct {
 
 /// A document with raw text fields that will be analyzed before indexing.
 pub const NamedSortValue = struct { field_name: []const u8, value: segment_mod.SegmentIndexSortBoundValue };
+pub const NumericCoverageRejection = struct {
+    path: []const u8,
+    kind: enum { field, descendants, subtree },
+};
+
 pub const TextDocument = struct {
     /// Native navigation tuples may include nulls without inventing typed column values.
     index_sort_values: []const NamedSortValue = &.{},
     /// A mapped projection may reject a non-null scalar or multivalued key.
     index_sort_projection_valid: bool = true,
     /// Exact numeric fields whose source and typed projection agree for this row.
+    numeric_coverage_rejections: []const NumericCoverageRejection = &.{},
     complete_numeric_fields: []const []const u8 = &.{},
     /// When supplied, includes owned subsets and the builder's shared list
     /// allocation on the row that creates it.
@@ -547,7 +553,7 @@ pub const TextDocument = struct {
     stored_source_bytes: u64 = 0,
 
     pub fn numericCoverageInputBytes(self: TextDocument) usize {
-        return self.numeric_coverage_bytes orelse self.complete_numeric_fields.len * @sizeOf([]const u8);
+        return self.numeric_coverage_bytes orelse (self.complete_numeric_fields.len * @sizeOf([]const u8) + self.numeric_coverage_rejections.len * @sizeOf(NumericCoverageRejection));
     }
 
     pub fn numericWitnessSegmentBytes(self: TextDocument) usize {
@@ -1393,6 +1399,10 @@ fn writeTextSegmentWithScratch(
     var start: usize = 0;
     while (start < docs.len) {
         const complete = docs[start].complete_numeric_fields;
+        if (complete.len == 0) {
+            numeric_coverage.clearRetainingCapacity();
+            break;
+        }
         // Ordinary rows share the schema's complete field list. Count a run
         // once instead of hashing every declared field for every row.
         var end = start + 1;
@@ -1406,12 +1416,28 @@ fn writeTextSegmentWithScratch(
         }
         start = end;
     }
+    var rejected_fields: std.StringHashMapUnmanaged(void) = .empty;
+    defer rejected_fields.deinit(alloc);
+    var rejected_parents: std.StringHashMapUnmanaged(void) = .empty;
+    defer rejected_parents.deinit(alloc);
+    if (numeric_coverage.count() != 0) for (docs) |doc| {
+        for (doc.numeric_coverage_rejections) |rejection| {
+            if (rejection.kind != .descendants) try rejected_fields.put(alloc, rejection.path, {});
+            if (rejection.kind != .field) try rejected_parents.put(alloc, rejection.path, {});
+        }
+    };
     var witnesses: std.ArrayListUnmanaged(segment_mod.NumericRangeWitness) = .empty;
     defer witnesses.deinit(alloc);
     var coverage_it = numeric_coverage.iterator();
-    while (coverage_it.next()) |entry| {
+    fields: while (coverage_it.next()) |entry| {
         if (entry.value_ptr.* != docs.len) continue;
         const name = entry.key_ptr.*;
+        if (rejected_fields.contains(name)) continue;
+        var components = std.mem.splitScalar(u8, name, '.');
+        while (components.next() != null) {
+            const next = components.index orelse break;
+            if (rejected_parents.contains(name[0 .. next - 1])) continue :fields;
+        }
         const collector = typed_fields.getPtr(name);
         if (collector) |typed| if (typed.conflicted) continue;
         const populated = if (collector) |typed|

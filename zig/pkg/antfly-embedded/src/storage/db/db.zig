@@ -47428,6 +47428,7 @@ pub const DB = struct {
         resolved_doc_filter: ?*doc_set.ResolvedDocFilter = null,
         resolved_doc_filter_alloc: ?Allocator = null,
         graph_memory: ?*GraphFilterMemory = null,
+        frontier_scoped: bool = false,
         graph_memory_alloc: ?Allocator = null,
 
         pub fn deinit(self: *@This()) void {
@@ -49241,6 +49242,10 @@ pub const DB = struct {
     /// Stored-document matching cannot reproduce an index's analyzer. Preserve
     /// any pre-resolved row authorization when intersecting the new predicate.
     fn graphRequestWithIndexedFilterAlloc(self: *DB, req: types.SearchRequest) !AlgebraicDocFilterRequest {
+        return self.graphRequestWithIndexedFilterForKeysAlloc(req, null);
+    }
+
+    fn graphRequestWithIndexedFilterForKeysAlloc(self: *DB, req: types.SearchRequest, keys: ?[]const []const u8) !AlgebraicDocFilterRequest {
         var needs_index = false;
         for ([_][]const u8{ req.filter_query_json, req.exclusion_query_json }) |json| {
             if (json.len == 0) continue;
@@ -49256,11 +49261,70 @@ pub const DB = struct {
         memory.tracked = .{ .backing = self.alloc, .budget = req.graph_work_budget orelse &memory.local_budget };
         var native = AlgebraicDocFilterRequest{ .req = req, .graph_memory = memory, .graph_memory_alloc = self.alloc };
         errdefer native.deinit();
-        self.prepareGraphIndexedFilter(&native, req) catch |err| return if (err == error.OutOfMemory and memory.tracked.denied) error.GraphWorkBudgetExceeded else err;
+        self.prepareGraphIndexedFilter(&native, req, keys) catch |err| return if (err == error.OutOfMemory and memory.tracked.denied) error.GraphWorkBudgetExceeded else err;
         return native;
     }
 
-    fn prepareGraphIndexedFilter(self: *DB, native: *AlgebraicDocFilterRequest, req: types.SearchRequest) !void {
+    const GraphPredicateFrontier = struct {
+        db: *DB,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+        include: *const doc_set.ResolvedDocSet,
+
+        fn collect(ctx: *anyopaque, alloc: Allocator) !std.AutoHashMapUnmanaged(doc_set.DocOrdinal, []const u8) {
+            const self: *GraphPredicateFrontier = @ptrCast(@alignCast(ctx));
+            const req = self.req;
+            const control = @import("../../search/query.zig").ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
+            try control.check();
+            const ordinals = try self.db.lookupLiveDocOrdinalsNoLock(alloc, self.keys, req.identity_read_generation);
+            defer alloc.free(ordinals);
+            const prior: ?*const doc_set.ResolvedDocFilter = if (req.resolved_doc_filter) |raw| @ptrCast(@alignCast(raw)) else null;
+            var include_keys = try graphFrontierKeySet(alloc, req.filter_doc_ids);
+            defer include_keys.deinit(alloc);
+            var exclude_keys = try graphFrontierKeySet(alloc, req.exclude_doc_ids);
+            defer exclude_keys.deinit(alloc);
+            var allowed_keys = try graphFrontierKeySet(alloc, if (prior != null and prior.?.include == .doc_keys) prior.?.include.doc_keys else &.{});
+            defer allowed_keys.deinit(alloc);
+            var denied_keys = try graphFrontierKeySet(alloc, if (prior != null and prior.?.exclude == .doc_keys) prior.?.exclude.doc_keys else &.{});
+            defer denied_keys.deinit(alloc);
+            var result: std.AutoHashMapUnmanaged(doc_set.DocOrdinal, []const u8) = .empty;
+            errdefer result.deinit(alloc);
+            for (self.keys, ordinals) |key, maybe_ordinal| {
+                try control.check();
+                const ordinal = maybe_ordinal orelse continue;
+                if (!self.include.containsOrdinal(ordinal)) continue;
+                if (prior) |filter| {
+                    if (!containsGraphFrontierRow(&filter.include, &allowed_keys, key, ordinal) or containsGraphFrontierRow(&filter.exclude, &denied_keys, key, ordinal)) continue;
+                }
+                if ((req.filter_doc_ids_positive or req.filter_doc_ids.len != 0) and !include_keys.contains(key)) continue;
+                if (exclude_keys.contains(key)) continue;
+                try result.put(alloc, ordinal, key);
+            }
+            return result;
+        }
+    };
+
+    fn graphFrontierKeySet(alloc: Allocator, ids: []const []const u8) !std.StringHashMapUnmanaged(void) {
+        var keys: std.StringHashMapUnmanaged(void) = .empty;
+        errdefer keys.deinit(alloc);
+        for (ids) |id| try keys.put(alloc, id, {});
+        return keys;
+    }
+
+    fn containsGraphFrontierRow(set: *const doc_set.ResolvedDocSet, keys: *const std.StringHashMapUnmanaged(void), key: []const u8, ordinal: doc_set.DocOrdinal) bool {
+        return if (set.* == .doc_keys) keys.contains(key) else set.containsOrdinal(ordinal);
+    }
+
+    fn graphPriorKeyOrdinalsAlloc(self: *DB, alloc: Allocator, keys: []const []const u8, generation: ?u64) !doc_set.ResolvedDocSet {
+        const ordinals = try self.lookupLiveDocOrdinalsNoLock(alloc, keys, generation);
+        defer alloc.free(ordinals);
+        var bitmap = @import("../../encoding/roaring.zig").RoaringBitmap.init(alloc);
+        errdefer bitmap.deinit();
+        for (ordinals) |maybe_ordinal| if (maybe_ordinal) |ordinal| try bitmap.add(ordinal);
+        return .{ .ordinal_bitmap = bitmap };
+    }
+
+    fn prepareGraphIndexedFilter(self: *DB, native: *AlgebraicDocFilterRequest, req: types.SearchRequest, keys: ?[]const []const u8) !void {
         const a = native.graph_memory.?.tracked.allocator();
         const filter = try a.create(doc_set.ResolvedDocFilter);
         filter.* = .{};
@@ -49273,13 +49337,20 @@ pub const DB = struct {
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .identity_read_generation = req.identity_read_generation,
         };
-        if (req.filter_query_json.len > 0) filter.include = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.filter_query_json);
-        if (req.exclusion_query_json.len > 0) filter.exclude = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json);
+        var input = GraphPredicateFrontier{ .db = self, .req = req, .keys = keys orelse &.{}, .include = &filter.include };
+        const frontier: ?db_query_search.GraphPredicateFrontier = if (keys != null) .{ .ptr = &input, .collect = GraphPredicateFrontier.collect } else null;
+        const budget = native.graph_memory.?.tracked.budget.?;
+        if (req.filter_query_json.len > 0) filter.include = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.filter_query_json, frontier, budget, &native.frontier_scoped);
+        if (req.exclusion_query_json.len > 0) filter.exclude = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json, frontier, budget, &native.frontier_scoped);
         if (req.resolved_doc_filter) |raw| {
             const prior: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(raw));
-            var include = (try doc_set.intersectAlloc(a, &prior.include, &filter.include)) orelse return error.UnsupportedQueryRequest;
+            var prior_include = if (prior.include == .doc_keys) try self.graphPriorKeyOrdinalsAlloc(a, prior.include.doc_keys, req.identity_read_generation) else null;
+            defer if (prior_include) |*set| set.deinit(a);
+            var prior_exclude = if (prior.exclude == .doc_keys) try self.graphPriorKeyOrdinalsAlloc(a, prior.exclude.doc_keys, req.identity_read_generation) else null;
+            defer if (prior_exclude) |*set| set.deinit(a);
+            var include = (try doc_set.intersectAlloc(a, if (prior_include) |*set| set else &prior.include, &filter.include)) orelse return error.UnsupportedQueryRequest;
             errdefer include.deinit(a);
-            const exclude = (try doc_set.unionAlloc(a, &prior.exclude, &filter.exclude)) orelse return error.UnsupportedQueryRequest;
+            const exclude = (try doc_set.unionAlloc(a, if (prior_exclude) |*set| set else &prior.exclude, &filter.exclude)) orelse return error.UnsupportedQueryRequest;
             filter.include.deinit(a);
             filter.exclude.deinit(a);
             filter.include = include;
@@ -49297,7 +49368,7 @@ pub const DB = struct {
         original_req: types.SearchRequest,
         keys: []const []const u8,
     ) !GraphKeyAdmission {
-        var indexed_filter = try self.graphRequestWithIndexedFilterAlloc(original_req);
+        var indexed_filter = try self.graphRequestWithIndexedFilterForKeysAlloc(original_req, keys);
         defer indexed_filter.deinit();
         const req = indexed_filter.req;
         const ordinals = try self.lookupLiveDocOrdinalsNoLock(
@@ -49320,11 +49391,13 @@ pub const DB = struct {
             .ordinals = ordinals,
         };
 
-        const loaded = if (req.include_stored)
+        // Stored-only predicates can reuse the requested payload during
+        // verification. Indexed predicates have already produced membership.
+        const preload = if (req.include_stored and (req.filter_query_json.len != 0 or req.exclusion_query_json.len != 0))
             try loadStoredSearchDocumentsMany(self, alloc, keys, null)
         else
             null;
-        defer if (loaded) |items| freeOptionalOwnedBytes(alloc, items);
+        defer if (preload) |items| freeOptionalOwnedBytes(alloc, items);
 
         var hits = try alloc.alloc(types.SearchHit, live_count);
         var initialized: usize = 0;
@@ -49337,7 +49410,7 @@ pub const DB = struct {
             const ordinal = maybe_ordinal orelse continue;
             const id = try alloc.dupe(u8, key);
             errdefer alloc.free(id);
-            const stored_data = if (loaded) |items| blk: {
+            const stored = if (preload) |items| blk: {
                 const value = items[i] orelse return error.InvalidGraphNodeAdmissionResult;
                 items[i] = null;
                 break :blk value;
@@ -49346,7 +49419,7 @@ pub const DB = struct {
                 .id = id,
                 .doc_ordinal = ordinal,
                 .score = 1.0,
-                .stored_data = stored_data,
+                .stored_data = stored,
             };
             initialized += 1;
         }
@@ -49366,6 +49439,14 @@ pub const DB = struct {
         hits_owned = false;
         defer filtered.deinit();
 
+        const loaded = if (req.include_stored and preload == null and filtered.hits.len != 0) blk: {
+            const admitted = try alloc.alloc([]const u8, filtered.hits.len);
+            defer alloc.free(admitted);
+            for (filtered.hits, admitted) |hit, *key| key.* = hit.id;
+            break :blk try loadStoredSearchDocumentsMany(self, alloc, admitted, null);
+        } else null;
+        defer if (loaded) |items| freeOptionalOwnedBytes(alloc, items);
+
         const stored_data = if (req.include_stored) blk: {
             const values = try alloc.alloc(?[]u8, keys.len);
             @memset(values, null);
@@ -49381,9 +49462,9 @@ pub const DB = struct {
             mask[i] = allowed;
             if (!allowed) continue;
             if (stored_data) |items| {
-                items[i] = filtered.hits[filtered_index].stored_data orelse
-                    return error.InvalidGraphNodeAdmissionResult;
-                filtered.hits[filtered_index].stored_data = null;
+                const value = if (loaded) |rows| &rows[filtered_index] else &filtered.hits[filtered_index].stored_data;
+                items[i] = value.* orelse return error.InvalidGraphNodeAdmissionResult;
+                value.* = null;
             }
             filtered_index += 1;
         }
@@ -49483,6 +49564,7 @@ pub const DB = struct {
                 }
                 if (node.external or node.table != null) continue;
                 const key = node.key;
+                if (!std.mem.startsWith(u8, key, self.node_filter.filter_prefix)) continue;
                 if (self.decisions.contains(key)) continue;
                 const entry = try missing_by_key.getOrPut(result_alloc, key);
                 if (entry.found_existing) continue;
@@ -49491,23 +49573,17 @@ pub const DB = struct {
             }
 
             if (missing_keys.items.len > 0) {
-                if (self.indexed_request_filter == null) self.indexed_request_filter = try self.db.graphRequestWithIndexedFilterAlloc(self.req);
-                const missing_mask = try self.db.filterGraphKeysAlloc(
-                    result_alloc,
-                    self.indexed_request_filter.?.req,
-                    missing_keys.items,
-                );
+                var scoped_request: ?AlgebraicDocFilterRequest = null;
+                defer if (scoped_request) |*entry| entry.deinit();
+                if (self.indexed_request_filter == null) {
+                    const prepared = try self.db.graphRequestWithIndexedFilterForKeysAlloc(self.req, missing_keys.items);
+                    if (prepared.frontier_scoped) scoped_request = prepared else self.indexed_request_filter = prepared;
+                }
+                const request_filter = if (scoped_request) |*entry| entry else &self.indexed_request_filter.?;
+                const missing_mask = try self.db.filterGraphKeysAlloc(result_alloc, request_filter.req, missing_keys.items);
                 defer result_alloc.free(missing_mask);
                 if (missing_mask.len != missing_keys.items.len) {
                     return error.InvalidGraphNodeAdmissionResult;
-                }
-
-                for (missing_keys.items, missing_mask) |key, *allowed| {
-                    if (allowed.* and self.node_filter.filter_prefix.len > 0 and
-                        !std.mem.startsWith(u8, key, self.node_filter.filter_prefix))
-                    {
-                        allowed.* = false;
-                    }
                 }
 
                 if (self.node_filter.filter_query_json) |filter_query_json| {
@@ -49521,15 +49597,19 @@ pub const DB = struct {
                         try query_positions.append(result_alloc, i);
                     }
                     if (query_keys.items.len > 0) {
+                        var scoped_node: ?AlgebraicDocFilterRequest = null;
+                        defer if (scoped_node) |*entry| entry.deinit();
                         if (self.indexed_node_filter == null) {
                             var filter_req = self.req;
                             filter_req.filter_query_json = filter_query_json;
                             filter_req.exclusion_query_json = "";
                             filter_req.resolved_doc_filter = null;
-                            self.indexed_node_filter = try self.db.graphRequestWithIndexedFilterAlloc(filter_req);
+                            const prepared = try self.db.graphRequestWithIndexedFilterForKeysAlloc(filter_req, query_keys.items);
+                            if (prepared.frontier_scoped) scoped_node = prepared else self.indexed_node_filter = prepared;
                         }
-                        if (self.indexed_node_filter.?.resolved_doc_filter != null) {
-                            const mask = try self.db.filterGraphKeysAlloc(result_alloc, self.indexed_node_filter.?.req, query_keys.items);
+                        const node_filter = if (scoped_node) |*entry| entry else &self.indexed_node_filter.?;
+                        if (node_filter.resolved_doc_filter != null) {
+                            const mask = try self.db.filterGraphKeysAlloc(result_alloc, node_filter.req, query_keys.items);
                             defer result_alloc.free(mask);
                             for (query_positions.items, mask) |position, allowed| missing_mask[position] = allowed;
                         } else {
@@ -49563,6 +49643,8 @@ pub const DB = struct {
             for (nodes, 0..) |node, i| {
                 result[i] = if (node.external or node.table != null)
                     !graph_query_mod.nodeFilterActive(self.node_filter)
+                else if (!std.mem.startsWith(u8, node.key, self.node_filter.filter_prefix))
+                    false
                 else
                     self.decisions.get(node.key) orelse return error.InvalidGraphNodeAdmissionResult;
             }
@@ -156408,4 +156490,67 @@ test "optional numeric range graph admission preserves legacy indexed predicates
         defer a.free(rows);
         try std.testing.expectEqualSlices(bool, case.expected, rows);
     }
+
+    const disjunction = cases[1].json;
+    const conjunction = cases[0].json;
+    var budget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(.{ .max_scanned_anchors = 1 });
+    var admission = DB.GraphNodeAdmissionCache.init(&db, a, .{
+        .index_name = "ft",
+        .filter_query_json = disjunction,
+        .graph_work_budget = &budget,
+    }, "ft", .{});
+    defer admission.deinit();
+    const first = try DB.GraphNodeAdmissionCache.filterMany(&admission, a, &.{.{ .key = "a" }});
+    defer a.free(first);
+    try std.testing.expectEqualSlices(bool, &.{true}, first);
+    try std.testing.expectEqual(@as(usize, 1), budget.remaining_anchors);
+    const second = try DB.GraphNodeAdmissionCache.filterMany(&admission, a, &.{.{ .key = "c" }});
+    defer a.free(second);
+    try std.testing.expectEqualSlices(bool, &.{true}, second);
+    try std.testing.expectEqual(@as(usize, 0), budget.remaining_anchors);
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = conjunction,
+        .graph_work_budget = &budget,
+    }, &.{"b"}));
+
+    // Leave a posting and visible identity without a primary row. Predicates
+    // on the current frontier must ignore it when outside the requested or
+    // authorized keys, including when evaluating a negated range.
+    const stale_key = try internal_keys.documentKeyAlloc(a, "a");
+    defer a.free(stale_key);
+    try db.core.store.delete(stale_key);
+    const bounded = try db.filterGraphKeysAlloc(a, .{ .index_name = "ft", .filter_query_json = conjunction }, &.{"b"});
+    defer a.free(bounded);
+    try std.testing.expectEqualSlices(bool, &.{true}, bounded);
+
+    const pruned = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = "{\"bool\":{\"must\":[" ++ range ++ "],\"must_not\":[" ++ match ++ "]}}",
+    }, &.{ "a", "c" });
+    defer a.free(pruned);
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, pruned);
+
+    var policy = doc_set.ResolvedDocFilter{ .include = try doc_set.cloneDocKeysAlloc(a, &.{"b"}) };
+    defer policy.deinit(a);
+    var authorized = try db.filterGraphKeysWithOrdinalsAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = conjunction,
+        .resolved_doc_filter = &policy,
+    }, &.{ "a", "b" });
+    defer authorized.deinit(a);
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, authorized.allowed);
+    try std.testing.expect(authorized.stored_data.?[0] == null);
+    try std.testing.expect(authorized.stored_data.?[1] != null);
+    const negated = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .exclusion_query_json = conjunction,
+        .exclude_doc_ids = &.{"a"},
+    }, &.{ "a", "b", "c" });
+    defer a.free(negated);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, true }, negated);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = conjunction,
+    }, &.{"a"}));
 }

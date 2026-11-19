@@ -966,7 +966,9 @@ pub const TextProjectionBatchBuilder = struct {
     selected_field: ?[]const u8 = null,
     store_source_columns: bool = false,
     text_docs: std.ArrayListUnmanaged(introducer_mod.TextDocument) = .empty,
-    numeric_projection_lookup: std.StringHashMapUnmanaged(?typed_dv.NumericValue) = .empty,
+    numeric_coverage_terminals: std.StringHashMapUnmanaged(*NumericCoverageNode) = .empty,
+    numeric_coverage_emitted: std.ArrayListUnmanaged(*NumericCoverageNode) = .empty,
+    numeric_coverage_root: NumericCoverageNode = .{},
     numeric_coverage_fields: ?[]const []const u8 = null,
     numeric_witness_segment_bytes: usize = 0,
 
@@ -1043,17 +1045,19 @@ pub const TextProjectionBatchBuilder = struct {
 
         const order = if (!has_selected_field) try mappedIndexSortProjection(self.arena, extraction_root, self.schema, extracted.typed_fields) else IndexSortProjection{};
         const had_numeric_schema = self.numeric_coverage_fields != null;
-        const complete_numeric_fields = if (has_selected_field)
-            &.{}
+        const has_numeric_source = !has_selected_field and extraction_root == .object and self.schema != null;
+        const rejections = if (has_numeric_source)
+            try self.numericCoverageRejections(extraction_root.object, extracted.typed_fields orelse &.{})
         else
-            try self.completeNumericFields(extraction_root, extracted.typed_fields orelse &.{});
+            &.{};
         const shared = self.numeric_coverage_fields orelse &.{};
-        const subset_count = if (complete_numeric_fields.ptr == shared.ptr) 0 else complete_numeric_fields.len;
+        const complete_numeric_fields = if (has_numeric_source) shared else &.{};
         const new_shared_count = if (had_numeric_schema) 0 else shared.len;
         try self.text_docs.append(self.arena, .{
             .index_sort_values = order.values,
             .complete_numeric_fields = complete_numeric_fields,
-            .numeric_coverage_bytes = (subset_count + new_shared_count) * @sizeOf([]const u8),
+            .numeric_coverage_rejections = rejections,
+            .numeric_coverage_bytes = new_shared_count * @sizeOf([]const u8) + rejections.len * @sizeOf(introducer_mod.NumericCoverageRejection),
             .numeric_witness_segment_bytes = if (complete_numeric_fields.len == 0) 0 else self.numeric_witness_segment_bytes,
             .index_sort_projection_valid = order.valid and !has_selected_field,
             .id = doc.key,
@@ -1074,47 +1078,61 @@ pub const TextProjectionBatchBuilder = struct {
         });
     }
 
-    fn completeNumericFields(
+    fn numericCoverageRejections(
         self: *TextProjectionBatchBuilder,
-        root: std.json.Value,
+        root: std.json.ObjectMap,
         projected: []const introducer_mod.TypedFieldValue,
-    ) ![]const []const u8 {
-        const schema = self.schema orelse return &.{};
-        if (root != .object) return &.{};
+    ) ![]const introducer_mod.NumericCoverageRejection {
         const alloc = self.arena;
-        const fields = self.numeric_coverage_fields orelse init: {
+        if (self.numeric_coverage_fields == null) {
             var eligible: std.ArrayList([]const u8) = .empty;
-            for (schema.exact_fields) |field| {
-                if (runtime_schema.supportsNumericRangeCoverage(field)) try eligible.append(alloc, field.field);
+            for (self.schema.?.exact_fields) |field| {
+                if (!runtime_schema.supportsNumericRangeCoverage(field)) continue;
+                try eligible.append(alloc, field.field);
+                var node = &self.numeric_coverage_root;
+                var components = std.mem.splitScalar(u8, field.field, '.');
+                while (components.next()) |part| {
+                    const child = try node.children.getOrPut(alloc, part);
+                    if (!child.found_existing) {
+                        const end = if (components.index) |next| next - 1 else field.field.len;
+                        const created = try alloc.create(NumericCoverageNode);
+                        created.* = .{ .path = field.field[0..end] };
+                        child.value_ptr.* = created;
+                    }
+                    node = child.value_ptr.*;
+                }
+                node.terminal = true;
+                try self.numeric_coverage_terminals.put(alloc, field.field, node);
             }
             const names = try eligible.toOwnedSlice(alloc);
             self.numeric_coverage_fields = names;
             self.numeric_witness_segment_bytes = segment_mod.estimateNumericRangeWitnessBytes(names);
-            break :init names;
-        };
-        if (fields.len == 0) return fields;
+        }
+        if (self.numeric_coverage_fields.?.len == 0) return &.{};
 
-        const by_field = &self.numeric_projection_lookup;
-        by_field.clearRetainingCapacity();
+        const emitted = &self.numeric_coverage_emitted;
+        defer {
+            for (emitted.items) |node| node.observed = null;
+            emitted.clearRetainingCapacity();
+        }
         for (projected) |typed| {
-            const slot = try by_field.getOrPut(alloc, typed.field_name);
-            slot.value_ptr.* = if (slot.found_existing or typed.conflicted or typed.value != .numeric_val)
+            const node = self.numeric_coverage_terminals.get(typed.field_name) orelse continue;
+            const duplicate = node.observed != null;
+            if (!duplicate) try emitted.append(alloc, node);
+            const numeric: ?typed_dv.NumericValue = if (duplicate or typed.conflicted or typed.value != .numeric_val)
                 null
             else
                 typed.value.numeric_val;
+            node.observed = @as(??typed_dv.NumericValue, numeric);
         }
 
-        var complete: ?std.ArrayList([]const u8) = null;
-        for (fields, 0..) |field, i| {
-            if (!numericSourceMatchesProjection(root, field, by_field.get(field))) {
-                if (complete == null) {
-                    complete = .empty;
-                    try complete.?.appendSlice(alloc, fields[0..i]);
-                }
-            } else if (complete) |*subset| try subset.append(alloc, field);
+        var rejected: std.ArrayList(introducer_mod.NumericCoverageRejection) = .empty;
+        try self.numeric_coverage_root.rejectIncomplete(alloc, root, &rejected);
+        // A projected value with no matching source path cannot prove absence.
+        for (emitted.items) |node| {
+            if (node.observed != null) try rejected.append(alloc, .{ .path = node.path, .kind = .field });
         }
-        if (complete) |*subset| return subset.toOwnedSlice(alloc);
-        return fields;
+        return rejected.toOwnedSlice(alloc);
     }
 
     /// Borrow only under a retained column lease. Otherwise promote source
@@ -3169,8 +3187,46 @@ fn mappedTypedDocValueFieldAlloc(
     };
 }
 
-fn numericSourceMatchesProjection(root: std.json.Value, field: []const u8, observed: ??typed_dv.NumericValue) bool {
-    const raw = numericCoverageSourceValue(root, field) orelse return false;
+const NumericCoverageNode = struct {
+    path: []const u8 = "",
+    terminal: bool = false,
+    observed: ??typed_dv.NumericValue = null,
+    children: std.StringHashMapUnmanaged(*NumericCoverageNode) = .empty,
+
+    fn rejectIncomplete(
+        self: *const NumericCoverageNode,
+        alloc: Allocator,
+        object: std.json.ObjectMap,
+        rejected: *std.ArrayList(introducer_mod.NumericCoverageRejection),
+    ) Allocator.Error!void {
+        for (object.keys(), object.values()) |key, value| {
+            if (self.children.get(key)) |child| {
+                if (child.terminal) {
+                    const observed = child.observed;
+                    child.observed = null;
+                    if (!numericSourceMatchesProjection(value, observed))
+                        try rejected.append(alloc, .{ .path = child.path, .kind = .field });
+                }
+                if (child.children.count() == 0 or value == .null) continue;
+                if (value == .object)
+                    try child.rejectIncomplete(alloc, value.object, rejected)
+                else
+                    try rejected.append(alloc, .{ .path = child.path, .kind = .descendants });
+            } else if (std.mem.indexOfScalar(u8, key, '.') != null) {
+                // Literal dotted keys can alias the column beneath this object.
+                var node = self;
+                var components = std.mem.splitScalar(u8, key, '.');
+                while (components.next()) |part| {
+                    node = node.children.get(part) orelse break;
+                } else {
+                    try rejected.append(alloc, .{ .path = node.path, .kind = .subtree });
+                }
+            }
+        }
+    }
+};
+
+fn numericSourceMatchesProjection(raw: std.json.Value, observed: ??typed_dv.NumericValue) bool {
     const expected: typed_dv.NumericValue = switch (raw) {
         .null => return observed == null,
         .integer => |number| .{ .i64_val = number },
@@ -3179,21 +3235,6 @@ fn numericSourceMatchesProjection(root: std.json.Value, field: []const u8, obser
     };
     const emitted = (observed orelse return false) orelse return false;
     return typed_dv.compareNumericValues(emitted, expected) == .eq;
-}
-
-/// A literal dotted key can alias the typed column, and a multivalued
-/// ancestor can contribute more than one source value. Reject both.
-fn numericCoverageSourceValue(root: std.json.Value, path: []const u8) ?std.json.Value {
-    var value = root;
-    var remaining = path;
-    while (value == .object) {
-        const dot = std.mem.indexOfScalar(u8, remaining, '.') orelse
-            return value.object.get(remaining) orelse .null;
-        if (value.object.contains(remaining)) return null;
-        value = value.object.get(remaining[0..dot]) orelse .null;
-        remaining = remaining[dot + 1 ..];
-    }
-    return if (value == .null) .null else null;
 }
 
 const IndexSortProjection = struct { values: []const introducer_mod.NamedSortValue = &.{}, valid: bool = true };

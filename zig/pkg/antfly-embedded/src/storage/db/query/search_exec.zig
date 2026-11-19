@@ -27,6 +27,7 @@ const doc_identity = @import("../doc_identity.zig");
 const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
 const dense_exact = @import("../dense_exact.zig");
 const graph_exec = @import("graph_exec.zig");
+const WorkBudget = @import("../../../graph/work_budget.zig").WorkBudget;
 const result_shape = @import("result_shape.zig");
 const search_mod = @import("../../../search/search.zig");
 const query_mod = @import("../../../search/query.zig");
@@ -9471,21 +9472,25 @@ const GraphIndexedFilter = struct {
     control: query_mod.ExecutionControl,
     alloc: Allocator,
     scratch: Allocator,
+    budget: *WorkBudget,
+    frontier: std.AutoHashMapUnmanaged(doc_set.DocOrdinal, []const u8) = .empty,
+    frontier_by_key: std.StringHashMapUnmanaged(doc_set.DocOrdinal) = .empty,
 
     fn indexed(self: GraphIndexedFilter, query: search_mod.SearchQuery) !bool {
         return searchQueryCanUseSnapshotWithControl(self.snapshot, query, self.analysis, self.schema, false, self.control);
     }
 
     fn executeIndexed(self: GraphIndexedFilter, query: search_mod.SearchQuery, scope: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        if (scope) |domain| if (domain.cardinality() == 0) return roaring.RoaringBitmap.init(self.alloc);
         const filter = try search_mod.searchQueryToFilterArena(self.scratch, query);
-        var result = try self.snapshot.executeFilterBitmap(self.alloc, filter.withControl(self.control));
-        if (scope) |domain| result.andWith(domain);
-        return result;
+        var docs = try self.snapshot.executeFilterBitmap(self.alloc, filter.withControl(self.control));
+        defer docs.deinit();
+        return self.resolveOrdinals(&docs, scope);
     }
 
-    fn execute(self: GraphIndexedFilter, query: search_mod.SearchQuery, scope: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
+    fn execute(self: GraphIndexedFilter, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
         try self.control.check();
-        if (scope) |domain| if (domain.isEmpty()) return roaring.RoaringBitmap.init(self.alloc);
+        if (scope.cardinality() == 0) return roaring.RoaringBitmap.init(self.alloc);
         if (try self.indexed(query)) return self.executeIndexed(query, scope);
         return switch (query) {
             .bool_query => |boolean| self.executeBoolean(boolean, scope),
@@ -9494,7 +9499,7 @@ const GraphIndexedFilter = struct {
         };
     }
 
-    fn executeBoolean(self: GraphIndexedFilter, boolean: search_mod.BoolQuery, scope: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+    fn executeBoolean(self: GraphIndexedFilter, boolean: search_mod.BoolQuery, scope: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
         var indexed_must: std.ArrayListUnmanaged(search_mod.SearchQuery) = .empty;
         var residual_must: std.ArrayListUnmanaged(search_mod.SearchQuery) = .empty;
         for (boolean.must) |clause| {
@@ -9505,6 +9510,17 @@ const GraphIndexedFilter = struct {
         errdefer if (result) |*rows| rows.deinit();
         if (indexed_must.items.len != 0) {
             result = try self.executeIndexed(.{ .bool_query = .{ .must = indexed_must.items } }, scope);
+        }
+        var residual_exclusions: std.ArrayListUnmanaged(search_mod.SearchQuery) = .empty;
+        for (boolean.must_not) |clause| {
+            if (!try self.indexed(clause)) {
+                try residual_exclusions.append(self.scratch, clause);
+                continue;
+            }
+            var excluded = try self.executeIndexed(clause, if (result) |*rows| rows else scope);
+            defer excluded.deinit();
+            if (result == null) result = try scope.clone(self.alloc);
+            result.?.andNotWith(&excluded);
         }
         for (residual_must.items) |clause| {
             const next = try self.execute(clause, if (result) |*rows| rows else scope);
@@ -9520,8 +9536,8 @@ const GraphIndexedFilter = struct {
             if (result) |*rows| rows.deinit();
             result = matched;
         }
-        if (result == null) result = if (scope) |domain| try domain.clone(self.alloc) else try self.executeIndexed(.{ .match_all = {} }, null);
-        for (boolean.must_not) |clause| {
+        if (result == null) result = try scope.clone(self.alloc);
+        for (residual_exclusions.items) |clause| {
             var excluded = try self.execute(clause, &result.?);
             defer excluded.deinit();
             result.?.andNotWith(&excluded);
@@ -9529,28 +9545,35 @@ const GraphIndexedFilter = struct {
         return result.?;
     }
 
-    fn executeShould(self: GraphIndexedFilter, clauses: []const search_mod.SearchQuery, required: u32, scope: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+    fn executeShould(self: GraphIndexedFilter, clauses: []const search_mod.SearchQuery, required: u32, scope: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
         var result = roaring.RoaringBitmap.init(self.alloc);
         errdefer result.deinit();
         if (required > clauses.len) return result;
         if (required == 1) {
+            var remaining = try scope.clone(self.alloc);
+            defer remaining.deinit();
+            var residual: std.ArrayListUnmanaged(search_mod.SearchQuery) = .empty;
             for (clauses) |clause| {
-                var matched = try self.execute(clause, scope);
+                if (!try self.indexed(clause)) {
+                    try residual.append(self.scratch, clause);
+                    continue;
+                }
+                var matched = try self.executeIndexed(clause, &remaining);
                 defer matched.deinit();
+                remaining.andNotWith(&matched);
                 try result.orWith(&matched);
+                if (remaining.cardinality() == 0) return result;
+            }
+            for (residual.items) |clause| {
+                var matched = try self.execute(clause, &remaining);
+                defer matched.deinit();
+                remaining.andNotWith(&matched);
+                try result.orWith(&matched);
+                if (remaining.cardinality() == 0) break;
             }
             return result;
         }
-        if (required == clauses.len) {
-            var domain = try self.execute(clauses[0], scope);
-            errdefer domain.deinit();
-            for (clauses[1..]) |clause| {
-                const narrowed = try self.execute(clause, &domain);
-                domain.deinit();
-                domain = narrowed;
-            }
-            return domain;
-        }
+        if (required == clauses.len) return self.execute(.{ .bool_query = .{ .must = clauses } }, scope);
         var counts: std.AutoHashMapUnmanaged(u32, u32) = .empty;
         defer counts.deinit(self.alloc);
         for (clauses) |clause| {
@@ -9572,70 +9595,120 @@ const GraphIndexedFilter = struct {
         return result;
     }
 
-    fn executeStoredRange(self: GraphIndexedFilter, range: std.json.Value, scope: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
-        if (self.executor.load_many_stored_values == null and self.executor.load_stored == null) return error.UnsupportedQueryRequest;
+    fn executeStoredRange(self: GraphIndexedFilter, range: std.json.Value, scope: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        const load = self.executor.load_many_stored_values orelse return error.UnsupportedQueryRequest;
         var wrapper: std.json.ObjectMap = .empty;
         try wrapper.put(self.scratch, "range", range);
         var predicate = try graph_exec.PreparedPatternFilter.initValue(self.alloc, .{ .object = wrapper });
         defer predicate.deinit();
-        var universe = if (scope == null) try self.executeIndexed(.{ .match_all = {} }, null) else null;
-        defer if (universe) |*domain| domain.deinit();
-        const candidates = scope orelse &universe.?;
         var matches = roaring.RoaringBitmap.init(self.alloc);
         errdefer matches.deinit();
         var row = std.heap.ArenaAllocator.init(self.alloc);
         defer row.deinit();
 
-        var docs = candidates.iterator();
-        var next = docs.next();
-        var lower: u32 = 0;
-        for (self.snapshot.segments, 0..) |segment, i| {
-            const upper = try std.math.add(u32, lower, segment.reader.doc_count);
-            if (next == null) break;
-            if (next.? < upper) {
-                var lease = try self.snapshot.leaseSegment(i);
-                defer lease.deinit();
-                while (next != null and next.? < upper) {
-                    try self.control.check();
-                    _ = row.reset(.retain_capacity);
-                    const scratch = row.allocator();
-                    var keys: [64][]const u8 = undefined;
-                    var numbers: [64]u32 = undefined;
-                    var count: usize = 0;
-                    while (count < keys.len and next != null and next.? < upper) : (count += 1) {
-                        const doc = next.?;
-                        keys[count] = (try lease.entry.reader.storedIdScoped(scratch, doc - lower)) orelse return error.StorageReadTemporarilyUnavailable;
-                        numbers[count] = doc;
-                        next = docs.next();
-                    }
-                    if (self.executor.load_many_stored_values) |load| {
-                        const stored = try load(self.executor.ctx, scratch, keys[0..count]);
-                        if (stored.len != count) return error.InvalidData;
-                        for (keys[0..count], numbers[0..count], stored) |key, doc, raw| {
-                            try self.control.check();
-                            const value = raw orelse return error.StorageReadTemporarilyUnavailable;
-                            if (try predicate.matchesStored(scratch, key, value)) try matches.add(doc);
-                        }
-                    } else {
-                        const load = self.executor.load_stored.?;
-                        for (keys[0..count], numbers[0..count]) |key, doc| {
-                            try self.control.check();
-                            const value = (try load(self.executor.ctx, scratch, key)) orelse return error.StorageReadTemporarilyUnavailable;
-                            if (try predicate.matchesStored(scratch, key, value)) try matches.add(doc);
-                        }
-                    }
-                }
+        var docs = scope.iterator();
+        while (true) {
+            try self.control.check();
+            var keys: [64][]const u8 = undefined;
+            var ordinals: [64]doc_set.DocOrdinal = undefined;
+            var count: usize = 0;
+            while (count < keys.len) : (count += 1) {
+                const ordinal = docs.next() orelse break;
+                ordinals[count] = ordinal;
+                keys[count] = self.frontier.get(ordinal) orelse return error.InvalidData;
             }
-            lower = upper;
+            if (count == 0) break;
+            try self.budget.consumeAnchors(count);
+            _ = row.reset(.retain_capacity);
+            const scratch = row.allocator();
+            const stored = try load(self.executor.ctx, scratch, keys[0..count]);
+            if (stored.len != count) return error.InvalidData;
+            for (keys[0..count], ordinals[0..count], stored) |key, ordinal, raw| {
+                try self.control.check();
+                const value = raw orelse return error.StorageReadTemporarilyUnavailable;
+                if (try predicate.matchesStored(scratch, key, value)) try matches.add(ordinal);
+            }
         }
         return matches;
     }
+
+    fn resolveOrdinals(self: GraphIndexedFilter, docs: *const roaring.RoaringBitmap, scope: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        var rows = roaring.RoaringBitmap.init(self.alloc);
+        errdefer rows.deinit();
+        if (scope) |domain| if (domain.cardinality() == 0) return rows;
+        const max_matches = if (scope) |domain| domain.cardinality() else null;
+        var match_count: usize = 0;
+        var identities = segment_mod.SegmentReadScratch.init(self.alloc, 64 * 1024);
+        defer identities.deinit();
+        var fallback = GraphOrdinalBatch{ .alloc = self.alloc };
+        defer fallback.deinit();
+        var it = docs.iterator();
+        var next = it.next();
+        var offset: u32 = 0;
+        for (self.snapshot.segments, 0..) |seg, segment_index| {
+            try self.control.check();
+            const upper = try std.math.add(u32, offset, seg.reader.doc_count);
+            if (next == null) break;
+            if (next.? >= upper) {
+                offset = upper;
+                continue;
+            }
+            var lease = try self.snapshot.leaseSegment(segment_index);
+            defer lease.deinit();
+            var ordinals = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
+            while (next) |doc| {
+                if (doc >= upper) break;
+                try self.control.check();
+                if (try ordinals.get(doc - offset)) |ordinal| {
+                    if (scope == null) {
+                        try rows.add(ordinal);
+                    } else if (scope.?.contains(ordinal) and !rows.contains(ordinal)) {
+                        try rows.add(ordinal);
+                        match_count += 1;
+                    }
+                } else {
+                    // Decode through bounded scratch, then resolve a bounded batch.
+                    identities.reset();
+                    if (try self.snapshot.storedIdScoped(identities.allocator(), doc)) |id| {
+                        if (scope) |domain| {
+                            if (self.frontier_by_key.get(id)) |ordinal| {
+                                if (domain.contains(ordinal) and !rows.contains(ordinal)) {
+                                    try rows.add(ordinal);
+                                    match_count += 1;
+                                }
+                            }
+                        } else {
+                            try fallback.append(id, &rows, self.executor, self.executor.identity_read_generation, self.control);
+                        }
+                    }
+                }
+                if (max_matches) |cap| if (match_count == cap) return rows;
+                next = it.next();
+            }
+            offset = upper;
+        }
+        try fallback.flush(&rows, self.executor, self.executor.identity_read_generation, self.control);
+        try self.control.check();
+        return rows;
+    }
 };
 
-/// Compressed, snapshot- and analyzer-bound graph membership. Repeated shard
-/// admission batches reuse the same immutable set instead of executing postings
-/// and expanding matching document-number arrays for every hop.
-pub fn graphIndexedPredicateAlloc(a: Allocator, req: types.SearchRequest, executor: StructuredFilterResolverExecutor, json: []const u8) !doc_set.ResolvedDocSet {
+pub const GraphPredicateFrontier = struct {
+    ptr: *anyopaque,
+    collect: *const fn (*anyopaque, Allocator) anyerror!std.AutoHashMapUnmanaged(doc_set.DocOrdinal, []const u8),
+};
+
+/// Native membership is snapshot-bound and reusable. Hybrid membership is
+/// computed in the authorized frontier's ordinal space.
+pub fn graphIndexedPredicateAlloc(
+    a: Allocator,
+    req: types.SearchRequest,
+    executor: StructuredFilterResolverExecutor,
+    json: []const u8,
+    frontier: ?GraphPredicateFrontier,
+    budget: *WorkBudget,
+    frontier_scoped: *bool,
+) !doc_set.ResolvedDocSet {
     const control = query_mod.ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
     try control.check();
     const entry = (try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name)) orelse return error.UnsupportedQueryRequest;
@@ -9663,7 +9736,7 @@ pub fn graphIndexedPredicateAlloc(a: Allocator, req: types.SearchRequest, execut
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, json, .{});
     if (patternFilterValueHasRole(parsed)) return error.UnsupportedQueryRequest;
     const search_query = try patternFilterValueToSearchQuery(scratch, parsed, entry.text_analysis, entry.runtime_schema);
-    const matcher = GraphIndexedFilter{
+    var matcher = GraphIndexedFilter{
         .snapshot = snapshot,
         .analysis = entry.text_analysis,
         .schema = entry.runtime_schema,
@@ -9671,6 +9744,7 @@ pub fn graphIndexedPredicateAlloc(a: Allocator, req: types.SearchRequest, execut
         .control = control,
         .alloc = a,
         .scratch = scratch,
+        .budget = budget,
     };
     const fully_indexed = try matcher.indexed(search_query);
     // Only immutable index membership can be cached on the text snapshot.
@@ -9683,49 +9757,24 @@ pub fn graphIndexedPredicateAlloc(a: Allocator, req: types.SearchRequest, execut
         try control.check();
         return .{ .ordinal_bitmap = owned };
     };
-    var docs = if (fully_indexed)
+    var rows = if (fully_indexed)
         try matcher.executeIndexed(search_query, null)
-    else
-        try matcher.execute(search_query, null);
-    defer docs.deinit();
-    var rows = roaring.RoaringBitmap.init(a);
-    errdefer rows.deinit();
-    var identities = segment_mod.SegmentReadScratch.init(a, 64 * 1024);
-    defer identities.deinit();
-    var fallback = GraphOrdinalBatch{ .alloc = a };
-    defer fallback.deinit();
-    var it = docs.iterator();
-    var next = it.next();
-    var offset: u32 = 0;
-    for (snapshot.segments, 0..) |seg, segment_index| {
-        try control.check();
-        const upper = try std.math.add(u32, offset, seg.reader.doc_count);
-        if (next == null) break;
-        if (next.? >= upper) {
-            offset = upper;
-            continue;
-        }
-        var lease = try snapshot.leaseSegment(segment_index);
-        defer lease.deinit();
-        var ordinals = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
-        while (next) |doc| {
-            if (doc >= upper) break;
+    else scoped: {
+        const input = frontier orelse return error.UnsupportedQueryRequest;
+        frontier_scoped.* = true;
+        matcher.frontier = try input.collect(input.ptr, scratch);
+        var domain = roaring.RoaringBitmap.init(a);
+        defer domain.deinit();
+        try matcher.frontier_by_key.ensureTotalCapacity(scratch, matcher.frontier.count());
+        var items = matcher.frontier.iterator();
+        while (items.next()) |item| {
             try control.check();
-            if (try ordinals.get(doc - offset)) |ordinal| {
-                try rows.add(ordinal);
-            } else {
-                // Decode through bounded scratch, then resolve a bounded batch.
-                identities.reset();
-                if (try snapshot.storedIdScoped(identities.allocator(), doc)) |id| {
-                    try fallback.append(id, &rows, executor, req.identity_read_generation, control);
-                }
-            }
-            next = it.next();
+            try domain.add(item.key_ptr.*);
+            matcher.frontier_by_key.putAssumeCapacity(item.value_ptr.*, item.key_ptr.*);
         }
-        offset = upper;
-    }
-    try fallback.flush(&rows, executor, req.identity_read_generation, control);
-    try control.check();
+        break :scoped try matcher.execute(search_query, &domain);
+    };
+    errdefer rows.deinit();
     if (fully_indexed) cache.put(snapshot.alloc, key, &rows);
     try control.check();
     return .{ .ordinal_bitmap = rows };
@@ -38957,6 +39006,33 @@ test "optional numeric range rejects legacy path aliases and standard nullable s
     try std.testing.expect(try searchQueryCanUseSnapshot(sorted_writer.snapshot(), numeric, .{}, sorted_schema, false));
 }
 
+test "optional numeric range projection rejects only affected paths across a segment" {
+    const a = std.testing.allocator;
+    const mapping: runtime_schema_mod.FieldMapping = .{ .field_type = .numeric, .doc_values = true };
+    const schema: runtime_schema_mod.TableSchema = .{ .exact_fields = &.{
+        .{ .field = "alias.rank", .source_field = "alias.rank", .mapping = mapping },
+        .{ .field = "alias.safe", .source_field = "alias.safe", .mapping = mapping },
+        .{ .field = "details.rank", .source_field = "details.rank", .mapping = mapping },
+        .{ .field = "other.rank", .source_field = "other.rank", .mapping = mapping },
+        .{ .field = "unused", .source_field = "unused", .mapping = mapping },
+    } };
+    const bytes = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{
+        .{ .key = "one", .value = "{\"alias\":{\"rank\":6,\"safe\":8},\"other\":null}" },
+        .{ .key = "two", .value = "{\"alias.rank\":9,\"details\":[{\"rank\":7}],\"other\":{\"rank\":10}}" },
+        .{ .key = "three", .value = "{}" },
+    }, .{}, schema)).?;
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const reader = writer.snapshot().segments[0].reader;
+    try std.testing.expect((try reader.numericRangeCoverage("alias.rank")) == null);
+    try std.testing.expect((try reader.numericRangeCoverage("details.rank")) == null);
+    try std.testing.expectEqual(.populated, (try reader.numericRangeCoverage("alias.safe")).?);
+    try std.testing.expectEqual(.populated, (try reader.numericRangeCoverage("other.rank")).?);
+    try std.testing.expectEqual(.empty, (try reader.numericRangeCoverage("unused")).?);
+}
+
 test "optional numeric range cold and warm measurement" {
     if (getenv("ANTFLY_BENCH_OPTIONAL_NUMERIC_RANGE") == null) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -38965,12 +39041,13 @@ test "optional numeric range cold and warm measurement" {
     const scratch = arena.allocator();
     const field_count = 32;
     const row_count = 16_384;
-    var fields: [field_count]runtime_schema_mod.ExactField = undefined;
+    const wide_field_count = 1024;
+    var fields: [wide_field_count]runtime_schema_mod.ExactField = undefined;
     for (&fields, 0..) |*field, i| {
-        const name = try std.fmt.allocPrint(scratch, "field_{d:0>2}", .{i});
+        const name = try std.fmt.allocPrint(scratch, "field_{d:0>4}", .{i});
         field.* = .{ .field = name, .source_field = name, .mapping = .{ .field_type = .numeric, .doc_values = true } };
     }
-    const schema: runtime_schema_mod.TableSchema = .{ .exact_fields = &fields };
+    const schema: runtime_schema_mod.TableSchema = .{ .exact_fields = fields[0..field_count] };
     const docs = try scratch.alloc(mapper_mod.MapperDoc, row_count);
     for (docs, 0..) |*doc, i| {
         doc.* = .{
@@ -38978,8 +39055,16 @@ test "optional numeric range cold and warm measurement" {
             .value = try std.fmt.allocPrint(scratch, "{{\"{s}\":6}}", .{fields[i % field_count].field}),
         };
     }
+    const build_start = platform_time.monotonicNs();
     const segment = (try mapper_mod.buildTextSegmentFromDocuments(a, docs, .{}, schema)).?;
+    const build_ns = platform_time.monotonicNs() - build_start;
     defer a.free(segment);
+    var wide_schema = schema;
+    wide_schema.exact_fields = &fields;
+    const wide_start = platform_time.monotonicNs();
+    const wide_segment = (try mapper_mod.buildTextSegmentFromDocuments(a, docs, .{}, wide_schema)).?;
+    const wide_build_ns = platform_time.monotonicNs() - wide_start;
+    a.free(wide_segment);
     var writer = try index_mod.IndexWriter.init(a);
     defer writer.deinit();
     try writer.addSegment(segment);
@@ -39004,5 +39089,5 @@ test "optional numeric range cold and warm measurement" {
     const cold_filtering_ns = filtering[0];
     std.mem.sort(u64, planning[1..], {}, std.sort.asc(u64));
     std.mem.sort(u64, filtering[1..], {}, std.sort.asc(u64));
-    std.debug.print("optional numeric range rows={d} fields={d} cold_planning_ns={d} cold_filtering_ns={d} warm_median_planning_ns={d} warm_median_filtering_ns={d}\n", .{ row_count, field_count, cold_planning_ns, cold_filtering_ns, (planning[5] + planning[6]) / 2, (filtering[5] + filtering[6]) / 2 });
+    std.debug.print("optional numeric range rows={d} fields={d} build_ns={d} wide_fields={d} wide_build_ns={d} cold_planning_ns={d} cold_filtering_ns={d} warm_median_planning_ns={d} warm_median_filtering_ns={d}\n", .{ row_count, field_count, build_ns, wide_field_count, wide_build_ns, cold_planning_ns, cold_filtering_ns, (planning[5] + planning[6]) / 2, (filtering[5] + filtering[6]) / 2 });
 }
