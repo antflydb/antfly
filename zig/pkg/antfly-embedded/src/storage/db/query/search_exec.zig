@@ -288,6 +288,7 @@ pub const SearchTextQueryExecutor = struct {
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
     primary_residual_scope: ?PrimaryResidualScope = null,
+    range_projection_current: ?RangeProjectionCurrent = null,
     live_filter_doc_set: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -431,6 +432,7 @@ pub const DenseSearchExecutor = struct {
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
     primary_residual_scope: ?PrimaryResidualScope = null,
+    range_projection_current: ?RangeProjectionCurrent = null,
     live_filter_doc_set: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -512,6 +514,7 @@ pub const SparseSearchExecutor = struct {
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
     primary_residual_scope: ?PrimaryResidualScope = null,
+    range_projection_current: ?RangeProjectionCurrent = null,
     live_filter_doc_set: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -638,6 +641,7 @@ pub const MatchAllExecutor = struct {
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
     primary_residual_scope: ?PrimaryResidualScope = null,
+    range_projection_current: ?RangeProjectionCurrent = null,
     live_filter_doc_set: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -1908,6 +1912,7 @@ const NativeDocIdConstraints = struct {
     }
 };
 
+pub const RangeProjectionCurrent = *const fn (?*anyopaque, Allocator, []const u8) anyerror!bool;
 pub const PrimaryResidualScope = *const fn (?*anyopaque, Allocator, ?u64, QueryExecutionControl) anyerror!?doc_set.ResolvedDocSet;
 
 pub const StructuredFilterResolverExecutor = struct {
@@ -1935,6 +1940,7 @@ pub const StructuredFilterResolverExecutor = struct {
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
     primary_residual_scope: ?PrimaryResidualScope = null,
+    range_projection_current: ?RangeProjectionCurrent = null,
     structured_visibility_verified: ?*bool = null,
     live_filter_doc_set: ?*const fn (
         ctx: ?*anyopaque,
@@ -1986,8 +1992,6 @@ pub fn resolveStructuredDocFilterForComposedAlloc(
 
     var active_executor = executor;
     if (active_executor.identity_read_generation == null) active_executor.identity_read_generation = req.identity_read_generation;
-    var cache = StructuredFilterDocSetCache{};
-    defer cache.deinit(alloc);
 
     var out = doc_set.ResolvedDocFilter{};
     var owns_out = true;
@@ -1997,7 +2001,7 @@ pub fn resolveStructuredDocFilterForComposedAlloc(
     if (req.filter_text) |filter_text| {
         var include = (try collectFullTextResolvedDocSetAlloc(alloc, req, active_executor, filter_text)) orelse return null;
         defer include.deinit(alloc);
-        const next_include = (try doc_set.intersectAlloc(alloc, &out.include, &include)) orelse return null;
+        const next_include = (try combineComposedScope(alloc, active_executor, &out.include, &include, .intersection)) orelse return null;
         out.include.deinit(alloc);
         out.include = next_include;
         changed = true;
@@ -2006,25 +2010,29 @@ pub fn resolveStructuredDocFilterForComposedAlloc(
     if (req.exclusion_text) |exclusion_text| {
         var exclude = (try collectFullTextResolvedDocSetAlloc(alloc, req, active_executor, exclusion_text)) orelse return null;
         defer exclude.deinit(alloc);
-        const next_exclude = (try doc_set.unionAlloc(alloc, &out.exclude, &exclude)) orelse return null;
+        const next_exclude = (try combineComposedScope(alloc, active_executor, &out.exclude, &exclude, .union_set)) orelse return null;
         out.exclude.deinit(alloc);
         out.exclude = next_exclude;
         changed = true;
     }
 
     if (req.filter_query_json.len > 0) {
-        var include = (try collectStructuredFilterResolvedDocSetCachedAlloc(alloc, req, active_executor, &cache, req.filter_query_json)) orelse return null;
+        var scoped = req;
+        scoped.resolved_doc_filter = &out;
+        var include = (try collectStructuredFilterResolvedDocSetAlloc(alloc, scoped, active_executor, req.filter_query_json)) orelse return null;
         defer include.deinit(alloc);
-        const next_include = (try doc_set.intersectAlloc(alloc, &out.include, &include)) orelse return null;
+        const next_include = (try combineComposedScope(alloc, active_executor, &out.include, &include, .intersection)) orelse return null;
         out.include.deinit(alloc);
         out.include = next_include;
         changed = true;
     }
 
     if (req.exclusion_query_json.len > 0) {
-        var exclude = (try collectStructuredFilterResolvedDocSetCachedAlloc(alloc, req, active_executor, &cache, req.exclusion_query_json)) orelse return null;
+        var scoped = req;
+        scoped.resolved_doc_filter = &out;
+        var exclude = (try collectStructuredFilterResolvedDocSetAlloc(alloc, scoped, active_executor, req.exclusion_query_json)) orelse return null;
         defer exclude.deinit(alloc);
-        const next_exclude = (try doc_set.unionAlloc(alloc, &out.exclude, &exclude)) orelse return null;
+        const next_exclude = (try combineComposedScope(alloc, active_executor, &out.exclude, &exclude, .union_set)) orelse return null;
         out.exclude.deinit(alloc);
         out.exclude = next_exclude;
         changed = true;
@@ -2033,6 +2041,27 @@ pub fn resolveStructuredDocFilterForComposedAlloc(
     if (!changed) return null;
     owns_out = false;
     return out;
+}
+
+fn combineComposedScope(
+    alloc: Allocator,
+    executor: StructuredFilterResolverExecutor,
+    left: *const doc_set.ResolvedDocSet,
+    right: *const doc_set.ResolvedDocSet,
+    operation: enum { intersection, union_set },
+) !?doc_set.ResolvedDocSet {
+    const combine: *const fn (Allocator, *const doc_set.ResolvedDocSet, *const doc_set.ResolvedDocSet) anyerror!?doc_set.ResolvedDocSet = switch (operation) {
+        .intersection => &doc_set.intersectAlloc,
+        .union_set => &doc_set.unionAlloc,
+    };
+    if (try combine(alloc, left, right)) |resolved| return resolved;
+    const resolve = executor.resolve_doc_set_doc_ids orelse return null;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const left_keys = (try resolve(executor.ctx, a, left, executor.identity_read_generation)) orelse return null;
+    const right_keys = (try resolve(executor.ctx, a, right, executor.identity_read_generation)) orelse return null;
+    return combine(alloc, &.{ .doc_keys = left_keys }, &.{ .doc_keys = right_keys });
 }
 
 pub fn resolveStructuredTextDocNumFilterForComposedAlloc(
@@ -9639,6 +9668,7 @@ const IndexedPredicateEvaluator = struct {
     key_domain: ?*const std.StringHashMapUnmanaged(u32) = null,
     skip_unmapped: bool = false,
     reconcile_primary_ranges: bool = false,
+    range_projection_is_current: bool = true,
     presence_cache_prefix: ?[]const u8 = null,
     local_cache: ?LocalCache = null,
     probe_input: ?*FrontierProbeInput = null,
@@ -10387,6 +10417,20 @@ const IndexedPredicateEvaluator = struct {
                 rows.andWith(scope);
                 return rows;
             }
+            if (self.frontier) |frontier| {
+                var wanted: std.StringHashMapUnmanaged(void) = .empty;
+                defer wanted.deinit(self.alloc);
+                for (resolved.doc_keys) |key| {
+                    try self.control.check();
+                    try wanted.put(self.alloc, key, {});
+                }
+                var candidates = scope.iterator();
+                while (candidates.next()) |ordinal| {
+                    try self.control.check();
+                    if (wanted.contains(frontier.get(ordinal) orelse return error.InvalidData)) try rows.add(ordinal);
+                }
+                return rows;
+            }
             const reverse = self.executor.resolve_doc_set_doc_ids orelse return error.UnsupportedQueryRequest;
             var wanted: std.StringHashMapUnmanaged(void) = .empty;
             defer wanted.deinit(self.alloc);
@@ -10442,11 +10486,25 @@ const IndexedPredicateEvaluator = struct {
             offset = try std.math.add(u32, base, segment.reader.doc_count);
             if (physical != null and next == null) break;
             if (physical != null and next.? >= offset) continue;
-            var lease = try self.snapshot.leaseSegment(index);
+            var lease = self.snapshot.leaseSegment(index) catch |err| switch (err) {
+                error.StorageReadTemporarilyUnavailable => {
+                    complete = false;
+                    if (physical_it) |*iter| while (next != null and next.? < offset) {
+                        try self.control.check();
+                        next = iter.next();
+                    };
+                    continue;
+                },
+                else => return err,
+            };
             defer lease.deinit();
             const entry = lease.entry;
             const witness = entry.reader.numericRangeCoverage(field) catch |err| switch (err) {
                 error.InvalidSegment, error.CrcMismatch => null,
+                error.StorageReadTemporarilyUnavailable => unavailable: {
+                    complete = false;
+                    break :unavailable null;
+                },
                 else => return err,
             };
             const exact = exact: {
@@ -10462,17 +10520,19 @@ const IndexedPredicateEvaluator = struct {
                         else => return err,
                     };
                 }
-                const value = (entry.typedDocValuesCoverageWithValidation(field, .{
-                    .execution_deadline_ns = self.control.deadline_ns,
-                    .cancellation = self.control.cancellation,
-                }) catch |err| switch (err) {
+                switch (entry.cachedTypedDocValuesCoverage(field)) {
+                    .initialized => |value| break :exact value.status == .covered and value.value_type == .numeric_val,
+                    .missing => break :exact false,
+                    .uninitialized => {},
+                }
+                break :exact entry.hasDenseNumericScanNavigation(field, self.control) catch |err| switch (err) {
+                    error.InvalidSegment, error.InvalidData, error.CrcMismatch => false,
                     error.StorageReadTemporarilyUnavailable => {
                         complete = false;
                         break :exact false;
                     },
                     else => return err,
-                }) orelse break :exact false;
-                break :exact value.status == .covered and value.value_type == .numeric_val;
+                };
             };
             var pending = roaring.RoaringBitmap.init(self.alloc);
             defer pending.deinit();
@@ -10484,10 +10544,16 @@ const IndexedPredicateEvaluator = struct {
                 }
             }
             if (!exact) continue;
-            var matches = if (physical != null)
-                try filter.executeWithinScope(self.alloc, entry, base, &pending, self.control)
+            var matches = (if (physical != null)
+                filter.executeWithinScope(self.alloc, entry, base, &pending, self.control)
             else
-                try filter.executeWithOffset(self.alloc, entry, base);
+                filter.executeWithOffset(self.alloc, entry, base)) catch |err| switch (err) {
+                error.StorageReadTemporarilyUnavailable, error.InvalidData, error.InvalidSegment, error.CrcMismatch => {
+                    complete = false;
+                    continue;
+                },
+                else => return err,
+            };
             defer matches.deinit();
             try entry.shared.lockDeletionSharedWithControl(self.control);
             defer entry.shared.unlockDeletionShared();
@@ -10557,7 +10623,7 @@ const IndexedPredicateEvaluator = struct {
             }
         }
 
-        const narrow = scope.cardinality() <= 8 or scope.cardinality() *| 32 <= self.snapshot.filterPhysicalDocCount();
+        const narrow = self.budget != null or scope.cardinality() <= 8 or scope.cardinality() *| 32 <= self.snapshot.filterPhysicalDocCount();
         if (narrow) {
             if (self.snapshot.graphOrdinalScanCost() > scope.cardinality() *| 8) return RangeEvidence.init(self.alloc);
             if (self.probe_input != null) {
@@ -10590,7 +10656,7 @@ const IndexedPredicateEvaluator = struct {
             }
             return RangeEvidence.init(self.alloc);
         }
-        const flight = try cache.lockFlight(match_key, self.control);
+        const flight = try cache.lockFlight(if (cached_coverage == null) coverage_key else match_key, self.control);
         defer flight.unlock();
         if (cached_coverage == null) cached_coverage = try cache.getScoped(self.alloc, coverage_key, self.control, scope);
         if (cached_coverage) |covered| {
@@ -10624,13 +10690,16 @@ const IndexedPredicateEvaluator = struct {
         const range = query.numeric_range;
         const stored = (range.stored_standard_range orelse return error.UnsupportedQueryRequest).*;
         const schema = self.schema orelse return self.executeStoredRange(stored, scope);
-        if (!self.reconcile_primary_ranges or range.exact_bounds == null or !runtime_schema_mod.hasNumericRangeCoverageMapping(schema, range.field)) {
+        if (!self.reconcile_primary_ranges or !self.range_projection_is_current or range.exact_bounds == null or !runtime_schema_mod.hasNumericRangeCoverageMapping(schema, range.field)) {
             return self.executeStoredRange(stored, scope);
         }
         if (self.key_domain != null and (scope.cardinality() <= 128 or scope.cardinality() *| 32 <= self.snapshot.filterPhysicalDocCount())) {
             return self.executeStoredRange(stored, scope);
         }
-        var evidence = try self.rangeEvidence(query, scope, path);
+        var evidence = self.rangeEvidence(query, scope, path) catch |err| switch (err) {
+            error.StorageReadTemporarilyUnavailable => return self.executeStoredRange(stored, scope),
+            else => return err,
+        };
         defer evidence.covered.deinit();
         errdefer evidence.matches.deinit();
         evidence.covered.andWith(scope);
@@ -10767,6 +10836,14 @@ pub fn graphIndexedPredicateAlloc(
     const entry = (try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name)) orelse return error.UnsupportedQueryRequest;
     entry.lockAnalysisShared();
     defer entry.unlockAnalysisShared();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const parsed = try graph_exec.parsePatternJsonLeaky(scratch, json);
+    if (patternFilterValueHasRole(parsed)) return error.UnsupportedQueryRequest;
+    const search_query = try patternFilterValueToSearchQuery(scratch, parsed, entry.text_analysis, entry.runtime_schema);
+    const has_range = hasStoredStandardRange(search_query);
+    const projection_current = if (has_range) try isRangeProjectionCurrent(executor, a, entry.config.name) else false;
     const snapshot = entry.persistent.acquireSnapshot();
     defer snapshot.release();
     var deletion_hash = std.hash.Wyhash.init(0);
@@ -10777,16 +10854,11 @@ pub fn graphIndexedPredicateAlloc(
     const key = try std.fmt.allocPrint(a, "{d}:{d}:{d}:{d}:{s}", .{ entry.instance_id, entry.projection_revision, req.identity_read_generation orelse 0, deletion_hash.final(), json });
     defer a.free(key);
     const cache = &snapshot.graph_predicates;
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const scratch = arena.allocator();
-    const parsed = try graph_exec.parsePatternJsonLeaky(scratch, json);
-    if (patternFilterValueHasRole(parsed)) return error.UnsupportedQueryRequest;
-    const search_query = try patternFilterValueToSearchQuery(scratch, parsed, entry.text_analysis, entry.runtime_schema);
     var probe_input: IndexedPredicateEvaluator.FrontierProbeInput = .{};
     defer probe_input.deinit(a);
     var matcher = IndexedPredicateEvaluator{
         .snapshot = snapshot,
+        .range_projection_is_current = projection_current,
         .analysis = entry.text_analysis,
         .schema = entry.runtime_schema,
         .executor = executor,
@@ -10798,8 +10870,13 @@ pub fn graphIndexedPredicateAlloc(
         .local_cache = local_cache,
         .probe_input = &probe_input,
     };
-    const fully_indexed = try matcher.indexed(search_query);
-    if (!fully_indexed and (mode == .indexed_only or frontier == null)) return error.GraphResidualFrontierRequired;
+    matcher.reconcile_primary_ranges = has_range;
+    const primary_ids = containsPrimaryIds(search_query);
+    const indexed = try matcher.indexed(search_query);
+    const fully_indexed = !primary_ids and indexed;
+    // ID predicates can be resolved within the frontier without reading
+    // stored rows. Apply these exclusions before any residual range work.
+    if (!fully_indexed and (frontier == null or (mode == .indexed_only and !indexed))) return error.GraphResidualFrontierRequired;
     const physical_count = snapshot.filterPhysicalDocCount();
     const available = budget.max_retained_state_bytes -| budget.retained_state_bytes;
     const use_global = frontier == null or (fully_indexed and mode != .indexed_only and physical_count < 65_536 and
@@ -11202,6 +11279,14 @@ fn requiredPrimaryIds(query: search_mod.SearchQuery) ?[]const []const u8 {
     return null;
 }
 
+fn isRangeProjectionCurrent(executor: StructuredFilterResolverExecutor, alloc: Allocator, index_name: []const u8) !bool {
+    const current = executor.range_projection_current orelse return true;
+    return current(executor.ctx, alloc, index_name) catch |err| switch (err) {
+        error.StorageReadTemporarilyUnavailable => false,
+        else => return err,
+    };
+}
+
 fn collectMixedStructuredFilterAlloc(
     alloc: Allocator,
     scratch: Allocator,
@@ -11216,6 +11301,8 @@ fn collectMixedStructuredFilterAlloc(
     if (executor.load_many_stored_values == null or executor.resolve_doc_set_doc_ids == null or executor.live_filter_doc_set == null or
         req.resolved_text_doc_filter != null or
         entry.chunk_name != null or entry.source_artifact_names.len != 0 or entry.selected_field != null) return error.UnsupportedQueryRequest;
+    const has_range = hasStoredStandardRange(query);
+    const projection_current = if (has_range) try isRangeProjectionCurrent(executor, alloc, entry.config.name) else false;
     const snapshot = entry.persistent.acquireSnapshot();
     defer snapshot.release();
     var deletions = std.hash.Wyhash.init(0);
@@ -11225,11 +11312,11 @@ fn collectMixedStructuredFilterAlloc(
     }
     const cache_prefix = try std.fmt.allocPrint(scratch, "{d}:{d}:{d}:{d}:{s}:{s}", .{ entry.instance_id, entry.projection_revision, executor.identity_read_generation orelse 0, deletions.final(), if (skip_unmapped) "ordinal" else "complete", filter_json });
     const presence_key = try std.fmt.allocPrint(scratch, "primary-presence:{d}:{d}:{d}:{d}:{d}", .{ entry.instance_id, entry.projection_revision, executor.identity_read_generation orelse 0, deletions.final(), @intFromBool(skip_unmapped) });
-    const has_range = hasStoredStandardRange(query);
     var missing_rows = roaring.RoaringBitmap.init(alloc);
     defer missing_rows.deinit();
     const matcher = IndexedPredicateEvaluator{
         .snapshot = snapshot,
+        .range_projection_is_current = projection_current,
         .analysis = entry.text_analysis,
         .schema = entry.runtime_schema,
         .executor = executor,
@@ -11468,8 +11555,9 @@ test "optional numeric range keeps typed evidence in mixed segment generations" 
             var busy = try evaluator.collectRangeEvidence(query, null, true);
             defer busy.covered.deinit();
             defer busy.matches.deinit();
-            try std.testing.expect(!busy.complete);
-            try std.testing.expectEqual(@as(usize, 0), busy.covered.cardinality());
+            try std.testing.expect(busy.complete);
+            try std.testing.expect(busy.covered.contains(5));
+            try std.testing.expect(busy.matches.contains(5));
         }
     }
 
@@ -11701,6 +11789,8 @@ fn collectStructuredFilterTextDocNumsAlloc(
     if (patternFilterValueHasRole(parsed)) return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
+    if (hasStoredStandardRange(search_query) or containsPrimaryIds(search_query)) return null;
+
     const snapshot = text_entry.persistent.acquireSnapshot();
     defer snapshot.release();
     if (!(try searchQueryCanUseSnapshotWithControl(
@@ -11760,22 +11850,6 @@ fn resolvedDocSetForTextDocNumsFromOrdinalSidecarAlloc(
         resolved.deinit(alloc);
         return try doc_set.cloneAlloc(alloc, live_set);
     }
-    return resolved;
-}
-
-fn collectStructuredFilterResolvedDocSetCachedAlloc(
-    alloc: Allocator,
-    req: types.SearchRequest,
-    executor: StructuredFilterResolverExecutor,
-    cache: *StructuredFilterDocSetCache,
-    filter_query_json: []const u8,
-) !?doc_set.ResolvedDocSet {
-    if (cache.get(filter_query_json, executor.identity_read_generation)) |cached| {
-        return try doc_set.cloneAlloc(alloc, cached);
-    }
-    var resolved = (try collectStructuredFilterResolvedDocSetAlloc(alloc, req, executor, filter_query_json)) orelse return null;
-    errdefer resolved.deinit(alloc);
-    try cache.putCloneAlloc(alloc, filter_query_json, executor.identity_read_generation, &resolved);
     return resolved;
 }
 
@@ -13782,6 +13856,7 @@ fn deriveNativeDenseConstraintsAlloc(
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
         .primary_residual_scope = executor.primary_residual_scope,
+        .range_projection_current = executor.range_projection_current,
         .live_filter_doc_set = executor.live_filter_doc_set,
         .nonvisible_doc_set = executor.nonvisible_doc_set,
         .project_ordinals_to_doc_ids = false,
@@ -15641,6 +15716,7 @@ pub fn searchTextQuery(
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
         .primary_residual_scope = executor.primary_residual_scope,
+        .range_projection_current = executor.range_projection_current,
         .live_filter_doc_set = executor.live_filter_doc_set,
         .nonvisible_doc_set = executor.nonvisible_doc_set,
         .project_ordinals_to_doc_ids = false,
@@ -15668,6 +15744,7 @@ pub fn searchTextQuery(
             .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
             .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
             .primary_residual_scope = executor.primary_residual_scope,
+            .range_projection_current = executor.range_projection_current,
             .live_filter_doc_set = executor.live_filter_doc_set,
             .nonvisible_doc_set = executor.nonvisible_doc_set,
             .project_ordinals_to_doc_ids = false,
@@ -19698,6 +19775,7 @@ pub fn searchSparse(
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
         .primary_residual_scope = executor.primary_residual_scope,
+        .range_projection_current = executor.range_projection_current,
         .live_filter_doc_set = executor.live_filter_doc_set,
         .nonvisible_doc_set = executor.nonvisible_doc_set,
         .lookup_doc_nums_for_ordinals = executor.lookup_doc_nums_for_ordinals,
@@ -21749,6 +21827,7 @@ pub fn searchMatchAll(
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
         .primary_residual_scope = executor.primary_residual_scope,
+        .range_projection_current = executor.range_projection_current,
         .live_filter_doc_set = executor.live_filter_doc_set,
         .nonvisible_doc_set = executor.nonvisible_doc_set,
         .project_ordinals_to_doc_ids = false,

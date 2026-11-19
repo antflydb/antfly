@@ -45706,6 +45706,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .primary_residual_scope = primaryResidualScopeCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .project_ordinals_to_doc_ids = false,
@@ -45729,6 +45730,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .primary_residual_scope = primaryResidualScopeCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .all_docs_visible = allDocsVisibleCallback,
@@ -46142,6 +46144,7 @@ pub const DB = struct {
                 .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
                 .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
                 .primary_residual_scope = primaryResidualScopeCallback,
+                .range_projection_current = rangeProjectionCurrentCallback,
                 .live_filter_doc_set = liveFilterDocSetCallback,
                 .all_docs_visible = allDocsVisibleCallback,
                 .project_ordinals_to_doc_ids = false,
@@ -46183,6 +46186,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .primary_residual_scope = primaryResidualScopeCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .live_filter_doc_set_controlled = textLiveFilterDocSetControlledCallback,
             // An absent legacy summary is unknown, not a reason to scan the
@@ -46425,6 +46429,15 @@ pub const DB = struct {
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
         });
+    }
+
+    fn rangeProjectionCurrentCallback(ctx: ?*anyopaque, alloc: Allocator, index_name: []const u8) anyerror!bool {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        const primary_sequence = try self.core.store.lastReplaySequenceFromTxn(&txn, 0);
+        if (self.executor.appliedSequence(index_name)) |applied| if (applied >= primary_sequence) return true;
+        return (try self.core.loadAppliedSequence(alloc, index_name)) >= primary_sequence;
     }
 
     fn textIndexEntryCallback(
@@ -47187,6 +47200,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .primary_residual_scope = primaryResidualScopeCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
@@ -47334,6 +47348,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .primary_residual_scope = primaryResidualScopeCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
@@ -47396,6 +47411,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .primary_residual_scope = primaryResidualScopeCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .lookup_doc_nums_for_ordinals = sparseDocNumsForOrdinalsCallback,
@@ -47735,6 +47751,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .primary_residual_scope = primaryResidualScopeCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .project_ordinals_to_doc_ids = false,
@@ -48684,6 +48701,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .primary_residual_scope = primaryResidualScopeCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
@@ -49451,6 +49469,8 @@ pub const DB = struct {
             .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .identity_read_generation = req.identity_read_generation,
         };
         var input = GraphPredicateFrontier{ .db = self, .req = req, .keys = keys orelse &.{}, .include = &filter.include, .exclude = &filter.exclude };
@@ -156640,9 +156660,10 @@ test "optional numeric range reconciles witnessed text coverage with primary ide
     try db.batch(.{ .sync_level = .full_index, .writes = &.{
         .{ .key = "a", .value = "{\"body\":\"beacon\",\"rank\":2,\"_embeddings\":{\"dv\":[1,0]}}" },
         .{ .key = "b", .value = "{\"body\":\"relay\",\"rank\":1,\"_embeddings\":{\"dv\":[0.9,0.1]}}" },
+        .{ .key = "c", .value = "{\"body\":\"legacy\",\"rank\":0,\"_embeddings\":{\"dv\":[0,1]}}" },
     } });
     const entry = db.core.index_manager.textIndex("ft").?;
-    const deletions = try entry.deleteByIdsTracked(&.{"a"});
+    const deletions = try entry.deleteByIdsTracked(&.{ "a", "c" });
     defer entry.freeDeleteInfos(deletions);
     try std.testing.expect(deletions.len != 0);
     const snapshot = entry.acquireSnapshot();
@@ -156651,6 +156672,17 @@ test "optional numeric range reconciles witnessed text coverage with primary ide
     for (snapshot.segments) |segment| {
         if (segment.liveDocCount() != 0) try std.testing.expect((try segment.reader.numericRangeCoverage("rank")) == .populated);
     }
+
+    const legacy_ordinal = ordinal: {
+        var read = try db.core.store.beginProbeTxn();
+        defer read.abort();
+        break :ordinal (try doc_identity.lookupOrdinalTxn(a, &read, "c")).?;
+    };
+    const legacy = (try mapper.buildTextSegmentFromDocuments(a, &.{
+        .{ .key = "c", .doc_ordinal = legacy_ordinal, .value = "{\"body\":\"legacy\",\"rank\":0}" },
+    }, .{}, null)).?;
+    defer a.free(legacy);
+    try entry.indexSegment(legacy);
 
     const range = "{\"range\":{\"rank\":{\"gte\":2}}}";
     const mixed = "{\"conjuncts\":[{\"doc_id\":[\"a\"]},{\"disjuncts\":[{\"match\":{\"field\":\"body\",\"text\":\"beacon\"}}," ++ range ++ "]}]}";
@@ -156673,6 +156705,45 @@ test "optional numeric range reconciles witnessed text coverage with primary ide
         try std.testing.expectEqual(@as(usize, 1), result.result.hits.len);
         try std.testing.expectEqualStrings(case.expected, result.result.hits[0].id);
     }
+    const graph = try db.filterGraphKeysAlloc(a, .{ .index_name = "ft", .filter_query_json = range }, &.{ "a", "b", "c" });
+    defer a.free(graph);
+    try std.testing.expectEqualSlices(bool, &.{ true, false, false }, graph);
+
+    if (getenv("ANTFLY_BENCH_OPTIONAL_NUMERIC_RANGE") != null) {
+        var bench_arena = std.heap.ArenaAllocator.init(a);
+        defer bench_arena.deinit();
+        const scratch = bench_arena.allocator();
+        const bench_rows = try scratch.alloc(types.BatchWrite, 512);
+        for (bench_rows, 0..) |*row, index| {
+            row.* = .{
+                .key = try std.fmt.allocPrint(scratch, "range-bench:{d}", .{index}),
+                .value = "{\"body\":\"archive\",\"rank\":0}",
+            };
+        }
+        try db.batch(.{ .sync_level = .full_index, .writes = bench_rows });
+        for ([_][]const []const u8{ &.{}, &.{ "a", "b" } }) |ids| {
+            const start = platform_time.monotonicNs();
+            var first_ns: u64 = 0;
+            for (0..12) |iteration| {
+                const filter = if (iteration % 2 == 0) range else "{\"range\":{\"rank\":{\"gte\":1}}}";
+                var measured = try db.searchDenseProfiled(a, .{
+                    .index_name = "dv",
+                    .primary_text_index_name = "ft",
+                    .limit = 1,
+                    .include_stored = false,
+                    .filter_doc_ids = ids,
+                    .filter_query_json = filter,
+                }, .{ .vector = &.{ 1, 0 }, .k = 1 });
+                defer measured.result.deinit();
+                try std.testing.expectEqual(@as(usize, 1), measured.result.hits.len);
+                if (iteration == 0) first_ns = platform_time.monotonicNs() - start;
+            }
+            std.debug.print("structured standard range mixed-generation rows={d} ids={d} first_ns={d} subsequent_mean_ns={d}\n", .{
+                bench_rows.len + 3, ids.len, first_ns, (platform_time.monotonicNs() - start - first_ns) / 11,
+            });
+        }
+    }
+
     const forward = try internal_keys.identityDocToOrdinalKeyAlloc(a, "b");
     defer a.free(forward);
     {

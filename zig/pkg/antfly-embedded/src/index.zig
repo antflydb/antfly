@@ -791,6 +791,16 @@ pub const SegmentEntry = struct {
     /// Prove physical density once for this immutable column. A cold source
     /// requiring a whole-column checksum can become eligible on a later read.
     pub fn hasDenseNumericNavigation(self: *const SegmentEntry, field: []const u8, control: query_mod.ExecutionControl) !bool {
+        return self.denseNumericNavigation(field, control, false);
+    }
+
+    /// Broad scans already need the column, so they may authenticate a
+    /// contiguous section before inspecting its directory.
+    pub fn hasDenseNumericScanNavigation(self: *const SegmentEntry, field: []const u8, control: query_mod.ExecutionControl) !bool {
+        return self.denseNumericNavigation(field, control, true);
+    }
+
+    fn denseNumericNavigation(self: *const SegmentEntry, field: []const u8, control: query_mod.ExecutionControl, allow_checksum: bool) !bool {
         var low: usize = 0;
         var high = self.shared.typed_doc_values_coverage.len;
         while (low < high) {
@@ -805,7 +815,7 @@ pub const SegmentEntry = struct {
                         .sparse => return false,
                         .unknown => {},
                     }
-                    if (!self.reader.hasCheapTypedNavigation(field)) return false;
+                    if (!allow_checksum and !self.reader.hasCheapTypedNavigation(field)) return false;
                     const dense = try self.checkDenseNumericNavigation(field, control);
                     coverage.dense_numeric_navigation.store(if (dense) .dense else .sparse, .release);
                     return dense;
