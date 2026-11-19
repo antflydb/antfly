@@ -36845,13 +36845,21 @@ pub const DB = struct {
             return self.advanceGraphReplacementForIdentityUntil(null, null, .detached);
         }
         const before = self.core.nextDerivedSequence();
-        try self.runUntilIdleWithReplayDrainOptions(.{
+        self.runUntilIdleWithReplayDrainOptions(.{
             .cancellation = cancellation,
             .drain_relational_indexes = false,
             .drain_graph_replacements = false,
             .bounded_replay = true,
             .max_windows_per_index = 1,
-        });
+        }) catch |err| {
+            // A refused publication can be scoped to one index whose inputs
+            // changed under this snapshot. Merges of the other indexes do not
+            // depend on that replay; run them before reporting the refusal so
+            // a busy index cannot starve them.
+            if (err == error.EnrichmentWaitCanceled and !cancellation.isCancelled())
+                self.drainScheduledTextMerges() catch |merge_err| if (merge_err != error.EnrichmentWaitCanceled) return merge_err;
+            return err;
+        };
         const resolution = self.resolutionStageStats();
         const promotion = self.promotionStageStats();
         const finalized = try self.finalizeDenseProjectionLifecycleForIdle();

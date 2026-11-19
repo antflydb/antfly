@@ -276,6 +276,9 @@ pub const PreparedPublication = struct {
     };
 
     fn indexInputsUnchanged(self: *@This(), captured: *native.NativeFile, latest: *native.NativeFile) !bool {
+        // Per index where the snapshot's sink tracks the scopes: a change to
+        // one index then fences only that index's publications.
+        if (self.shadow_scopes.len == 0 and try self.snapshot_root.owned_lite_backend.?.native_docstore.?.markChangedIndexScopes(latest)) return true;
         if (self.shadow_scopes.len == 0) return captured.indexCatalogPrefixUnchanged(latest, self.index_prefix);
         for (self.shadow_scopes) |scope| if (!try captured.indexCatalogPrefixUnchanged(latest, scope.prefix)) return false;
         return true;

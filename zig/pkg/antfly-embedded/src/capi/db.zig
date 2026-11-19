@@ -1880,6 +1880,8 @@ pub const JsonDBIndexStats = struct {
     catch_up_phase: []const u8,
     doc_count: u64,
     term_count: u64,
+    // Full-text segments this index currently serves (merge backlog).
+    text_active_segments: u64,
     edge_count: u64,
     graph_counts_pending: bool,
     node_count: u64,
@@ -6421,6 +6423,7 @@ pub fn dbIndexStatsProjectionAlloc(alloc: Allocator, stats: db_mod.types.DBStats
             .catch_up_phase = @tagName(item.catch_up_phase),
             .doc_count = item.doc_count,
             .term_count = item.term_count,
+            .text_active_segments = item.text_merge.active_segments,
             .edge_count = item.edge_count,
             .graph_counts_pending = item.graph_counts_pending,
             .node_count = item.node_count,
