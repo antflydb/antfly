@@ -2770,3 +2770,181 @@ def test_public_changefeed_multiple_tables_use_independent_row_filters():
             assert "events" not in denied.json()
     finally:
         server.stop()
+
+
+def _changefeed_call(client, method, url, **options):
+    deadline = time.monotonic() + 30
+    while True:
+        reply = client.request(method, url, timeout=15, **options)
+        retryable = reply.status_code == 503 or (
+            reply.status_code == 409 and "changefeed_retry_required" in reply.text
+        )
+        if not retryable or time.monotonic() >= deadline:
+            reply.raise_for_status()
+            return reply
+        time.sleep(0.2)
+
+
+def test_public_changefeed_projects_exact_before_and_after_predicates():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            name = "changefeed_predicates"
+            feeds = f"{server.api_url}/changefeeds"
+            table = f"{server.api_url}/tables/{name}"
+
+            _changefeed_call(client, "POST", table, json={"num_shards": 1})
+            _changefeed_call(
+                client,
+                "POST",
+                f"{table}/batch",
+                json={
+                    "inserts": {
+                        key: {"eligible": eligible, "visible": "before", "hidden": key}
+                        for key, eligible in [
+                            ("enter", False),
+                            ("update", True),
+                            ("leave", True),
+                            ("delete", True),
+                        ]
+                    }
+                },
+            )
+            created = _changefeed_call(
+                client,
+                "POST",
+                feeds,
+                headers={"Idempotency-Key": name},
+                json={
+                    "tables": [name],
+                    "selectors": [
+                        {
+                            "table": name,
+                            "fields": ["visible"],
+                            "predicates": [{"field": "eligible", "value": True}],
+                        }
+                    ],
+                    "include": "rows",
+                },
+            ).json()
+            feed = f"{feeds}/{created['id']}"
+            progress = _changefeed_call(client, "GET", feed).json()
+            assert progress["phase"] == "streaming"
+            assert progress["acknowledged_cursor"] == created["cursor"]
+            assert progress["unacknowledged_deliveries"] == 0
+            assert progress["oldest_unacknowledged_at"] is None
+            _changefeed_call(
+                client,
+                "POST",
+                f"{table}/batch",
+                json={
+                    "inserts": {
+                        key: {"eligible": eligible, "visible": "after", "hidden": key}
+                        for key, eligible in [
+                            ("enter", True),
+                            ("update", True),
+                            ("leave", False),
+                            ("excluded", False),
+                        ]
+                    },
+                    "deletes": ["delete"],
+                },
+            )
+            cursor = created["cursor"]
+            seen = {}
+            for _ in range(12):
+                page = _changefeed_call(
+                    client,
+                    "GET",
+                    f"{feed}/events",
+                    params={"after": cursor, "limit": 1},
+                )
+                cursor = page.headers["Antfly-Changefeed-Cursor"]
+                events = page.json()["events"]
+                if events and not seen:
+                    progress = _changefeed_call(client, "GET", feed).json()
+                    assert progress["unacknowledged_deliveries"] == 1
+                    assert progress["oldest_unacknowledged_at"] > 0
+                for event in events:
+                    key = event["key"]["value"]
+                    assert key not in seen
+                    seen[key] = (event["operation"], event["before"], event["after"])
+                _changefeed_call(client, "POST", f"{feed}/ack", json={"cursor": cursor})
+                if len(seen) == 4:
+                    break
+            before = {"visible": "before"}
+            after = {"visible": "after"}
+            assert seen == {
+                "enter": ("enter", None, after),
+                "update": ("update", before, after),
+                "leave": ("leave", before, None),
+                "delete": ("delete", before, None),
+            }
+            _changefeed_call(client, "DELETE", feed)
+    finally:
+        server.stop()
+
+
+def test_public_changefeed_bootstraps_and_streams_native_sql_rows():
+    from decimal import Decimal
+
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            feeds = f"{server.api_url}/changefeeds"
+            amount = "12345678901234567890.12345678"
+
+            def sql(statement):
+                reply = client.post(
+                    f"{server.api_url}/sql", json={"statement": statement}, timeout=40
+                )
+                assert reply.ok, reply.text
+
+            sql(
+                "CREATE TABLE cdc_rows (id BIGINT PRIMARY KEY, amount NUMERIC(38,8), label TEXT)"
+            )
+            sql(
+                f"INSERT INTO cdc_rows (id, amount, label) VALUES (1, {amount}, 'before')"
+            )
+            created = _changefeed_call(
+                client,
+                "POST",
+                feeds,
+                headers={"Idempotency-Key": "cdc-sql-rows"},
+                json={
+                    "tables": ["cdc_rows"],
+                    "start": "snapshot_then_changes",
+                    "include": "rows",
+                },
+            ).json()
+            feed = f"{feeds}/{created['id']}"
+            sql("UPDATE cdc_rows SET label = 'after' WHERE id = 1")
+            cursor = created["cursor"]
+            observed = []
+            for _ in range(8):
+                page = _changefeed_call(
+                    client,
+                    "GET",
+                    f"{feed}/events",
+                    params={"after": cursor, "limit": 1},
+                )
+                cursor = page.headers["Antfly-Changefeed-Cursor"]
+                observed.extend(page.json(parse_float=Decimal)["events"])
+                _changefeed_call(client, "POST", f"{feed}/ack", json={"cursor": cursor})
+                if len(observed) == 2:
+                    break
+            expected = {"id": 1, "amount": Decimal(amount), "label": "before"}
+            assert len(observed) == 2, server.debug_logs()
+            assert observed[0]["kind"] == "document_snapshot"
+            assert observed[0]["after"] == expected
+            assert observed[1]["kind"] == "document_committed"
+            assert observed[1]["before"] == expected
+            assert observed[1]["after"] == {**expected, "label": "after"}
+            assert observed[1]["key"] == observed[0]["key"]
+            _changefeed_call(client, "DELETE", feed)
+    finally:
+        server.stop()

@@ -73,6 +73,44 @@ a missing or different spool incarnation prevents the node from serving that
 configuration. A replacement spool requires resynchronizing consumers that were
 bound to the original incarnation.
 
+## Public HTTP changefeeds
+
+Create an authorized feed with `POST /db/v1/changefeeds` and an
+`Idempotency-Key` header. The definition selects native document or relational tables,
+`start`, `include`, and an optional lease. `start` accepts `now` and
+`snapshot_then_changes`. Use optional per-table selectors to limit row payloads
+and match exact scalar values.
+
+```json
+{
+  "tables": ["orders"],
+  "start": "snapshot_then_changes",
+  "include": "rows",
+  "selectors": [{
+    "table": "orders",
+    "fields": ["status", "total"],
+    "predicates": [{"field": "region", "value": "eu"}]
+  }]
+}
+```
+
+A selector table name matches an entry in `tables`. Each selector supports up to
+64 top-level fields and 16 exact predicates. All predicates must match. Field
+selection applies to the payload after authorization and predicate matching.
+The feed evaluates both historical row images to produce `enter`, `update`,
+`leave`, and `delete` effects. Delivery is at least once. Use `event_id` for
+deduplication and the transaction completion marker before applying a whole
+transaction.
+
+Read `GET /db/v1/changefeeds/{id}/events?after={cursor}` and advance using
+`Antfly-Changefeed-Cursor`. Acknowledge successfully applied pages with
+`POST /db/v1/changefeeds/{id}/ack` and a JSON `cursor`. Get the acknowledged
+cursor, current phase, outstanding delivery count and expiry with
+`GET /db/v1/changefeeds/{id}`. The outstanding count measures deliveries
+already issued to the client. Delete the feed to release its retention grants.
+Expired or invalidated cuts require resynchronization. Each read rechecks
+current authorization.
+
 ## Retained HTTP feed benchmark
 
 From the `zig` directory, run the isolated fixture against a local binary.

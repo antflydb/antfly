@@ -1828,6 +1828,7 @@ pub const AntflyApiHandler = struct {
         }
 
         try server.post("/db/v1/changefeeds", httpx.Handler.bind(self, createChangefeed));
+        try server.get("/db/v1/changefeeds/:feed_id", httpx.Handler.bind(self, inspectChangefeed));
         try server.delete("/db/v1/changefeeds/:feed_id", httpx.Handler.bind(self, closeChangefeed));
         try server.get("/db/v1/changefeeds/:feed_id/events", httpx.Handler.bind(self, pullChangefeed));
         try server.post("/db/v1/changefeeds/:feed_id/ack", httpx.Handler.bind(self, acknowledgeChangefeed));
@@ -4993,7 +4994,7 @@ pub const AntflyApiHandler = struct {
         const key = ctx.header("Idempotency-Key") orelse return jsonErrorResponse(ctx, 400, "missing changefeed idempotency key");
         const bytes = (try ctx.body()) orelse return jsonErrorResponse(ctx, 400, "missing changefeed definition");
         if (bytes.len > 8192) return jsonErrorResponse(ctx, 400, "invalid changefeed definition");
-        const parsed = std.json.parseFromSlice(api.Create, ctx.allocator, bytes, .{}) catch
+        const parsed = std.json.parseFromSlice(api.Create, ctx.allocator, bytes, .{ .parse_numbers = false }) catch
             return jsonErrorResponse(ctx, 400, "invalid changefeed definition");
         defer parsed.deinit();
         const result = api.create(self.api_server, ctx.allocator, .{
@@ -5009,12 +5010,27 @@ pub const AntflyApiHandler = struct {
         });
     }
 
+    fn inspectChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const id = feedId(ctx) orelse return jsonErrorResponse(ctx, 400, "invalid changefeed id");
+        const progress = @import("changefeed_public.zig").inspect(self.api_server, ctx.allocator, .{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }, id, operationContext(ctx, null)) catch |err| return changefeedError(ctx, err);
+        try ctx.setHeader("cache-control", "no-store");
+        return ctx.json(progress);
+    }
+
+    fn feedId(ctx: *httpx.Context) ?@import("../metadata/changefeed_control.zig").Id {
+        var id: @import("../metadata/changefeed_control.zig").Id = undefined;
+        const raw = ctx.param("feed_id") orelse return null;
+        if (raw.len != id.len * 2) return null;
+        _ = std.fmt.hexToBytes(&id, raw) catch return null;
+        return id;
+    }
+
     fn closeChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         const api = @import("changefeed_public.zig");
-        var id: @import("../metadata/changefeed_control.zig").Id = undefined;
-        const raw = ctx.param("feed_id") orelse "";
-        if (raw.len != id.len * 2) return jsonErrorResponse(ctx, 400, "invalid changefeed id");
-        _ = std.fmt.hexToBytes(&id, raw) catch return jsonErrorResponse(ctx, 400, "invalid changefeed id");
+        const id = feedId(ctx) orelse return jsonErrorResponse(ctx, 400, "invalid changefeed id");
         api.close(self.api_server, ctx.allocator, .{
             .authorization = ctx.header("authorization"),
             .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),

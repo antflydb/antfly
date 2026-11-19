@@ -52,7 +52,7 @@ pub const Adapter = struct {
         const table = for (definition.tables) |table| {
             if (table.table_id == table_id) break table;
         } else return error.ChangefeedConflict;
-        if (table.contract != .native_document) return error.ChangefeedCapabilityUnsupported;
+        if (table.contract != .native_document and table.contract != .native_relational) return error.ChangefeedCapabilityUnsupported;
         if (!same(table.binding, self.table_binding)) return error.ChangefeedResynchronizationRequired;
         return table;
     }
@@ -187,7 +187,7 @@ pub const Routed = struct {
         const table = for (definition.tables) |table| {
             if (selected.fence.table_id == table.table_id) break table;
         } else return error.ChangefeedResynchronizationRequired;
-        if (table.contract != .native_document) return error.ChangefeedCapabilityUnsupported;
+        if (table.contract != .native_document and table.contract != .native_relational) return error.ChangefeedCapabilityUnsupported;
         if (!same(selected.table_binding, table.binding)) return error.ChangefeedResynchronizationRequired;
         return table;
     }

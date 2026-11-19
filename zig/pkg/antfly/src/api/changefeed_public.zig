@@ -192,6 +192,80 @@ pub const Result = union(enum) {
     }
 };
 
+fn authorizedTableAccess(api: *http.ApiHttpServer, a: A, identity: http.AuthenticatedIdentity, definition: control.Definition, captured: *const source_api.Captured, internal: Context) ![]const TableAccess {
+    const access = try a.alloc(TableAccess, definition.tables.len);
+    var root_index: usize = 0;
+    for (definition.tables, access) |table, *item| {
+        if (root_index >= captured.roots.len) return error.ChangefeedResynchronizationRequired;
+        const route = captured.roots[root_index];
+        if (route.fence.table_id != table.table_id) return error.ChangefeedResynchronizationRequired;
+        const permission_name = try resolvePermissionName(api, a, route.table_name, internal);
+        item.* = .{
+            .id = table.table_id,
+            .storage_name = route.table_name,
+            .permission_name = permission_name,
+            .filter = try http.resolveEffectiveRowFilterJson(a, identity, permission_name),
+        };
+        while (root_index < captured.roots.len and captured.roots[root_index].fence.table_id == table.table_id) : (root_index += 1) {}
+    }
+    return access;
+}
+
+pub const Progress = struct {
+    phase: control.Phase,
+    acknowledged_cursor: [@sizeOf(control.Digest) * 2]u8,
+    unacknowledged_deliveries: usize,
+    oldest_unacknowledged_at: ?u64,
+    cursor_window: u16,
+    cursor_byte_limit: u64,
+    expires_at: u64,
+    bootstrap_expires_at: ?u64,
+};
+
+pub fn inspect(api: *http.ApiHttpServer, backing: A, credential: http.AuthenticatedRequest, id: control.Id, public: Context) !Progress {
+    try public.ensureActive();
+    var identity = try authenticate(api, credential);
+    defer identity.deinit(api.alloc);
+    const metadata = api.source.changefeeds orelse return error.ChangefeedCapabilityUnsupported;
+    const source = api.cfg.native_history_roots orelse return error.ChangefeedCapabilityUnsupported;
+    const internal: Context = .{
+        .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" },
+        .deadline_ns = public.deadline_ns,
+        .deadline_io = public.deadline_io,
+        .cancellation = public.cancellation,
+    };
+    var client: config.Client = .{ .port = metadata };
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var parsed = try load(&client, a, id, internal);
+    defer parsed.deinit();
+    const state = parsed.value;
+    const definition = state.definition orelse return error.Forbidden;
+    try requireOwner(identity, definition);
+    if (state.slot != null) return error.ChangefeedCapabilityUnsupported;
+    if (state.phase != .streaming and state.phase != .bootstrap)
+        return error.ChangefeedResynchronizationRequired;
+    if (state.expiryDue(clock.realtimeNs() / std.time.ns_per_s))
+        return error.ChangefeedLeaseExpired;
+    var captured = try source.capture(a, definition, internal);
+    defer captured.deinit();
+    try captured.validateInitialRoutes(state.roots);
+    const access = try authorizedTableAccess(api, a, identity, definition, &captured, internal);
+    var policy: Policy = .{ .api = api, .credential = credential, .tables = access };
+    try policy.authorize(state, internal);
+    return .{
+        .phase = state.phase,
+        .acknowledged_cursor = std.fmt.bytesToHex(state.acknowledged_cursor, .lower),
+        .unacknowledged_deliveries = state.cursors.len,
+        .oldest_unacknowledged_at = if (state.cursors.len != 0) state.cursors[0].issued_at else null,
+        .cursor_window = definition.cursor_window,
+        .cursor_byte_limit = definition.cursor_byte_limit,
+        .expires_at = state.expires_at,
+        .bootstrap_expires_at = if (state.phase == .bootstrap) state.bootstrap_expires_at else null,
+    };
+}
+
 /// Public cursors identify previously issued positions. Metadata maintenance
 /// and owner history reads only receive a locally constructed request context.
 pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequest, selection: Selection, limits: ?delivery.Limits, public: Context) !Result {
@@ -220,21 +294,7 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
     var access_arena = std.heap.ArenaAllocator.init(a);
     defer access_arena.deinit();
     const scratch = access_arena.allocator();
-    const access = try scratch.alloc(TableAccess, definition.tables.len);
-    var root_index: usize = 0;
-    for (definition.tables, access) |table, *item| {
-        if (root_index >= captured.roots.len) return error.ChangefeedResynchronizationRequired;
-        const route = captured.roots[root_index];
-        if (route.fence.table_id != table.table_id) return error.ChangefeedResynchronizationRequired;
-        const permission_name = try resolvePermissionName(api, scratch, route.table_name, internal);
-        item.* = .{
-            .id = table.table_id,
-            .storage_name = route.table_name,
-            .permission_name = permission_name,
-            .filter = try http.resolveEffectiveRowFilterJson(scratch, identity, permission_name),
-        };
-        while (root_index < captured.roots.len and captured.roots[root_index].fence.table_id == table.table_id) : (root_index += 1) {}
-    }
+    const access = try authorizedTableAccess(api, scratch, identity, definition, &captured, internal);
     var policy: Policy = .{ .api = api, .credential = credential, .tables = access };
     var provider: native.ScheduledProvider(roots.Routed, RoutedFactory, Policy) = .{ .factory = .{ .source = source, .captured = &captured }, .policy = &policy };
     if (limits) |bounds|
@@ -275,7 +335,14 @@ const RoutedFactory = struct {
 };
 
 pub const Create = struct {
+    pub const Selector = struct {
+        table: []const u8,
+        fields: []const []const u8 = &.{},
+        predicates: []const control.Predicate = &.{},
+    };
+
     tables: []const []const u8,
+    selectors: []const Selector = &.{},
     start: control.Start = .now,
     events: []const enum { document_committed } = &.{.document_committed},
     include: control.Projection = .keys_and_versions,
@@ -366,7 +433,8 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
     if (key.len == 0 or key.len > 128 or input.lease_seconds == 0 or input.lease_seconds > control.max_lease_seconds)
         return error.InvalidChangefeed;
     if (input.events.len != 1) return error.ChangefeedCapabilityUnsupported;
-    if (input.tables.len == 0 or input.tables.len > control.max_tables) return error.InvalidChangefeed;
+    if (input.tables.len == 0 or input.tables.len > control.max_tables or input.selectors.len > input.tables.len)
+        return error.InvalidChangefeed;
     var identity = try authenticate(api, credential);
     defer identity.deinit(api.alloc);
     const caller = try durableOwner(identity);
@@ -391,6 +459,7 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
         }
     };
     const selected = try scratch.alloc(SelectionBinding, input.tables.len);
+    var selectors_used: usize = 0;
     for (input.tables, selected) |requested, *entry| {
         if (requested.len == 0 or requested.len > 1024) return error.InvalidChangefeed;
         if (!try http.tablePermissionCurrentlyAllowed(identity, requested, .replicate)) return error.Forbidden;
@@ -404,8 +473,39 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
             !std.mem.eql(u8, requested_target.table, permission_target.table))
             return error.ChangefeedResynchronizationRequired;
         if (record.storage.engine != .local) return error.ChangefeedCapabilityUnsupported;
+        const parsed_schema = try local.schema_mod.parseValidatedTableSchema(scratch, record.schema_json);
+        const schema = try local.schema_mod.deriveRuntimeTableSchema(scratch, parsed_schema);
+        if (schema.external_base_source != null) return error.ChangefeedCapabilityUnsupported;
+        var table: control.Table = .{
+            .table_id = record.table_id,
+            .binding = control.tableBinding(record),
+            .policy_revision = 1,
+            .contract = if (schema.storage_mode == .relational) .native_relational else .native_document,
+        };
+        var selector_found = false;
+        for (input.selectors) |selector| {
+            if (!std.mem.eql(u8, selector.table, requested)) continue;
+            if (selector_found or selector.fields.len > 64 or selector.predicates.len > 16)
+                return error.InvalidChangefeed;
+            selector_found = true;
+            selectors_used += 1;
+            const fields = try scratch.dupe([]const u8, selector.fields);
+            const predicates = try scratch.dupe(control.Predicate, selector.predicates);
+            std.mem.sort([]const u8, fields, {}, struct {
+                fn less(_: void, left: []const u8, right: []const u8) bool {
+                    return std.mem.lessThan(u8, left, right);
+                }
+            }.less);
+            std.mem.sort(control.Predicate, predicates, {}, struct {
+                fn less(_: void, left: control.Predicate, right: control.Predicate) bool {
+                    return std.mem.lessThan(u8, left.field, right.field);
+                }
+            }.less);
+            table.fields = fields;
+            table.predicates = predicates;
+        }
         entry.* = .{
-            .table = .{ .table_id = record.table_id, .binding = control.tableBinding(record), .policy_revision = 1, .contract = .native_document },
+            .table = table,
             .access = .{
                 .id = record.table_id,
                 .storage_name = table_name,
@@ -414,6 +514,7 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
             },
         };
     }
+    if (selectors_used != input.selectors.len) return error.InvalidChangefeed;
     std.mem.sort(SelectionBinding, selected, {}, SelectionBinding.less);
     const tables = try scratch.alloc(control.Table, selected.len);
     const access = try scratch.alloc(TableAccess, selected.len);

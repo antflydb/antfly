@@ -13,12 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Native JSON document provider over an authoritative root-local commit.
+//! Native row provider over an authoritative committed history root.
 //! The policy adapter must authorize the principal/replication privilege, live
 //! table incarnation, COMPLETE selected root set and exact policy revision, and
 //! authorize/redact BOTH historical images. This provider cannot substitute for
 //! that authority. Coordinated/legacy frames require separate completion proof;
-//! relational tuples and lifecycle sources have distinct providers.
+//! derived lifecycle sources have distinct providers.
 const std = @import("std");
 const local = @import("antfly_local_sources").api_local_table_writes;
 const page_types = local.table_write_source.history_page;
@@ -45,6 +45,40 @@ fn parseImage(a: A, raw: ?[]const u8) !?Value {
         else => return error.ChangefeedCapabilityUnsupported,
     };
 }
+const HistoryRows = @import("antfly_local_sources").storage_db_algebraic_relational_row_codec;
+
+const RowImages = union(enum) {
+    document,
+    relational: ?struct {
+        schema: @import("antfly_local_sources").storage_schema.TableSchema,
+        layout: HistoryRows.PhysicalLayout,
+    },
+
+    fn init(a: A, contract: control.Contract, schema_json: ?[]const u8, rows: usize) !RowImages {
+        if (contract == .native_document) return .document;
+        if (contract != .native_relational) return error.ChangefeedCapabilityUnsupported;
+        const encoded = schema_json orelse return .{ .relational = null };
+        const schema_api = @import("antfly_local_sources").schema_mod;
+        const schema = try schema_api.deriveRuntimeTableSchema(a, try schema_api.parseValidatedTableSchema(a, encoded));
+        const width = schema.relational_columns.len;
+        if (schema.storage_mode != .relational or schema.external_base_source != null or width == 0 or width > 1024)
+            return error.ChangefeedCapabilityUnsupported;
+        if (rows > 65536 / width) return error.HistoryTooLarge;
+        return .{ .relational = .{ .schema = schema, .layout = try HistoryRows.PhysicalLayout.init(a, schema) } };
+    }
+
+    fn decode(self: *const RowImages, a: A, physical: ?[]const u8) !?Value {
+        const image = physical orelse return null;
+        return switch (self.*) {
+            .document => parseImage(a, image),
+            .relational => if (self.relational) |*view| blk: {
+                const row = try HistoryRows.ordinalRowView(image, view.schema, &view.layout);
+                const json_image = try row.reconstructValueAlloc(a);
+                break :blk parseImage(a, json_image);
+            } else error.HistoryCorrupt,
+        };
+    }
+};
 const json = @import("changefeed_json.zig");
 const Json = json.Value;
 const RawJson = json.Raw;
@@ -245,10 +279,11 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
             var events: std.ArrayList(RawJson) = .empty;
             var event_bytes: u64 = 0;
             var consumed: u32 = 0;
+            const decoder = try RowImages.init(a, table.contract, page.schema, page.rows.len);
             for (page.rows) |row| {
                 try request.ensureActive();
                 const document = try page_types.documentId(a, row.key);
-                const snapshot_value = try parseImage(a, row.value);
+                const snapshot_value = try decoder.decode(a, row.value);
                 const image = if (@hasDecl(Policy, "snapshotImageFor"))
                     try self.policy.snapshotImageFor(a, state, table.table_id, document, snapshot_value, request)
                 else
@@ -362,10 +397,12 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
                 .rows => .rows,
                 .keys_and_versions => .keys_and_versions,
             };
+            const before_decoder = try RowImages.init(a, table.contract, header.schema_before, page.events.len);
+            const after_decoder = try RowImages.init(a, table.contract, header.schema_after, page.events.len);
             for (page.events, 0..) |raw, ordinal_in_page| {
                 try request.ensureActive();
                 const document = try page_types.documentId(a, raw.key);
-                const images = try self.policy.images(a, state, header, document, try parseImage(a, raw.before), try parseImage(a, raw.after), request);
+                const images = try self.policy.images(a, state, header, document, try before_decoder.decode(a, raw.before), try after_decoder.decode(a, raw.after), request);
                 const effect = try projection.project(a, table, projected, images.before, images.after);
                 if (effect) |value| {
                     const ordinal = page.first_ordinal + @as(u32, @intCast(ordinal_in_page));
