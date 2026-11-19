@@ -1334,19 +1334,22 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// Indexed immutable navigation, not name-based rediscovery or a full
     /// catalog scan. The producer subsequently rejoins its SignedBinding and
     /// current Boot at native/metadata boundaries before publishing anything.
-    pub fn loadDescriptorByTableIdWithDeadline(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, table_id: u64, deadline_ns: ?u64) !RecoveryDescriptor {
+    pub fn loadDescriptorByTableIdWithBudget(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, table_id: u64, incoming: table_catalog.RoutingBudget) !RecoveryDescriptor {
         if (table_id == 0) return error.InvalidSqlRelationPersistence;
         const acquire_generation = self.catalog.vtable.acquire_routing_generation orelse return error.CatalogRoutingUnavailable;
-        const generation = try acquire_generation(self.catalog.ptr, self.catalog.deadlineFrom(.{ .deadline_ns = deadline_ns }), false);
+        var budget = self.catalog.budget(self.catalog.deadlineFrom(incoming));
+        budget.cancellation = incoming.cancellation;
+        const generation = try acquire_generation(self.catalog.ptr, budget, false);
         defer generation.release();
         const indexed = &generation.indexed;
         const index = indexed.table_id_indexes.get(table_id) orelse return error.TableNotFound;
         const table = indexed.snapshot.value.tables[index];
-        const ranges = indexed.table_range_refs.get(table_id) orelse return error.IdentityNamespaceMismatch;
-        if (table.sql_persistence == null or ranges.len != 1 or ranges[0].table_id != table_id) return error.InvalidSqlRelationPersistence;
+        const range_index = indexed.table_range_refs.get(table_id) orelse return error.IdentityNamespaceMismatch;
+        const ranges = range_index.ranges;
+        if (table.sql_persistence == null or !range_index.covers_keyspace or ranges.len != 1 or ranges[0].table_id != table_id) return error.InvalidSqlRelationPersistence;
         const name = try a.dupe(u8, table.name);
         errdefer a.free(name);
-        var loaded = try self.loadDescriptorWithDeadline(a, ranges[0].group_id, name, deadline_ns);
+        var loaded = try self.loadDescriptorWithBudget(a, ranges[0].group_id, name, budget);
         errdefer loaded.deinit(a);
         if (loaded.identity.table_id != table_id or loaded.sql_persistence == null or !loaded.sql_persistence.?.eql(table.sql_persistence.?)) return error.SqlRelationOwnerChanged;
         return .{ .group_id = ranges[0].group_id, .table_name = name, .loaded = loaded };
@@ -2938,7 +2941,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !abi.ReconcileResult {
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
         defer descriptor.deinit(self.alloc);
-        return self.reconcileDescriptorCatalog(group_id, table_name, descriptor.path, descriptor.view(), target_index_name, advance_index_repair, retain_cold_owner, context);
+        return self.reconcileDescriptorCatalog(group_id, table_name, descriptor.path, descriptor.view(), target_index_name, advance_index_repair, retain_cold_owner, context, descriptor.readControls(.{}));
     }
 
     fn reconcileDescriptorCatalog(
@@ -2951,13 +2954,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         advance_index_repair: bool,
         retain_cold_owner: bool,
         context: ?request_operation.RequestContext,
+        controls: ReadControls,
     ) !abi.ReconcileResult {
         var lease = if (context) |request| control: {
             const normalized = try platformDeadlineContext(request);
             // Serving reconciliation is a control-round inspection, not an
             // admitted structural writer. Yield without closing foreground
             // admission when a retained statement already pins this owner.
-            break :control (try self.tryAcquireServingCatalogOwner(group_id, table_name, path, descriptor, normalized)) orelse return .{ .state = .busy };
+            break :control (try self.tryAcquireServingCatalogOwner(group_id, table_name, path, descriptor, normalized, controls)) orelse return .{ .state = .busy };
         } else (try self.acquireDescriptorForReconcile(
             group_id,
             table_name,
@@ -2965,7 +2969,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             descriptor,
             retain_cold_owner or advance_index_repair,
             if (retain_cold_owner) .resident else .transient,
-            descriptor.readControls(.{}),
+            controls,
         )) orelse return .{ .state = .busy };
         defer lease.deinit();
         errdefer lease.requestTransientRetirement();
@@ -7276,12 +7280,12 @@ pub const ProvisionedKernelOwnerSource = struct {
         return try self.nativeProofForDescriptor(descriptor.view(), .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
     }
 
-    fn tryAcquireServingCatalogOwner(self: *ProvisionedKernelOwnerSource, group: u64, table: []const u8, path: []const u8, descriptor: descriptor_contract.Descriptor, context: request_operation.RequestContext) !?Lease {
-        const controls = try self.prepareDescriptorControls(descriptor, .{
-            .allow_deferred_catalog = true,
-            .execution_deadline_ns = context.deadline_ns,
-            .cancellation = context.cancellation,
-        });
+    fn tryAcquireServingCatalogOwner(self: *ProvisionedKernelOwnerSource, group: u64, table: []const u8, path: []const u8, descriptor: descriptor_contract.Descriptor, context: request_operation.RequestContext, source_controls: ReadControls) !?Lease {
+        var requested = source_controls;
+        requested.allow_deferred_catalog = true;
+        requested.execution_deadline_ns = context.deadline_ns;
+        requested.cancellation = context.cancellation;
+        const controls = try self.prepareDescriptorControls(descriptor, requested);
         return self.acquireDescriptorOnce(group, table, path, descriptor, .exclusive_if_idle, .resident, controls) catch |err| switch (err) {
             error.StorageKernelOwnerTransitionRequired, error.StorageKernelOwnerStaleDescriptor => null,
             else => return err,
@@ -13672,12 +13676,12 @@ test "SQL relation lifetime serving reconciliation yields to retained owners wit
     defer reader.deinit();
     const entry = reader.entry;
     const context: request_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| std.time.ns_per_s };
-    const pending = try source.reconcileDescriptorCatalog(1, "docs", path, descriptor, null, false, true, context);
+    const pending = try source.reconcileDescriptorCatalog(1, "docs", path, descriptor, null, false, true, context, .{});
     try std.testing.expectEqual(abi.ReconcileState.busy, pending.state);
     try std.testing.expect(!entry.exclusive_pending and !entry.exclusive_active);
-    try std.testing.expectError(error.DeadlineExceeded, source.reconcileDescriptorCatalog(1, "docs", path, descriptor, null, false, true, .{ .deadline_ns = platform_time.monotonicNs() -| 1 }));
+    try std.testing.expectError(error.DeadlineExceeded, source.reconcileDescriptorCatalog(1, "docs", path, descriptor, null, false, true, .{ .deadline_ns = platform_time.monotonicNs() -| 1 }, .{}));
     var canceled = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(error.Canceled, source.reconcileDescriptorCatalog(1, "docs", path, descriptor, null, false, true, .{ .cancellation = .fromAtomic(&canceled) }));
+    try std.testing.expectError(error.Canceled, source.reconcileDescriptorCatalog(1, "docs", path, descriptor, null, false, true, .{ .cancellation = .fromAtomic(&canceled) }, .{}));
     try std.testing.expect(!entry.exclusive_pending and !entry.exclusive_active);
     var next = try source.acquireDescriptorWithMode(1, "docs", path, descriptor, false, .resident, .{});
     defer next.deinit();
@@ -13698,11 +13702,11 @@ test "SQL relation lifetime serving reconciliation yields to retained owners wit
     const reserved = Source.tryReserveEntryLeaseLocked(entry, .exclusive);
     source.mutex.unlock();
     try std.testing.expect(!reserved and entry.exclusive_pending);
-    try std.testing.expect((try source.tryAcquireServingCatalogOwner(1, "docs", path, descriptor, context)) == null);
+    try std.testing.expect((try source.tryAcquireServingCatalogOwner(1, "docs", path, descriptor, context, .{})) == null);
     try std.testing.expect(entry.exclusive_pending);
     source.clearExclusivePending(1, "docs");
     reader.deinit();
-    const installed = try source.reconcileDescriptorCatalog(1, "docs", path, descriptor, null, false, true, context);
+    const installed = try source.reconcileDescriptorCatalog(1, "docs", path, descriptor, null, false, true, context, .{});
     try std.testing.expectEqual(abi.ReconcileState.complete, installed.state);
     var retained = try source.acquireDescriptorWithMode(1, "docs", path, descriptor, false, .resident, .{});
     defer retained.deinit();
@@ -13776,7 +13780,7 @@ test "SQL relation lifetime terminal ordinary sessions release actual compiled o
         plan.deinit();
         const context: request_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| std.time.ns_per_s };
         try std.testing.expectEqual(@as(usize, 1), entry.active_users);
-        try std.testing.expect((try source.tryAcquireServingCatalogOwner(1, "docs", path, descriptor, context)) == null);
+        try std.testing.expect((try source.tryAcquireServingCatalogOwner(1, "docs", path, descriptor, context, .{})) == null);
         const execution = registry.tryAcquireCommitExecution(info.txn_id) orelse return error.TestExpectedExecutionLease;
         var execution_active = true;
         defer if (execution_active) execution.release();
@@ -13815,7 +13819,7 @@ test "SQL relation lifetime terminal ordinary sessions release actual compiled o
             try std.testing.expectEqual(sessions.TerminalCommitStatus.committed_recovery_pending, terminal.status);
             try std.testing.expect(!terminal.coordinator_acknowledged);
         }
-        var serving = (try source.tryAcquireServingCatalogOwner(1, "docs", path, descriptor, context)) orelse return error.TestExpectedLease;
+        var serving = (try source.tryAcquireServingCatalogOwner(1, "docs", path, descriptor, context, .{})) orelse return error.TestExpectedLease;
         defer serving.deinit();
         const reconciled = try serving.owner().reconcile("docs", "{\"version\":2,\"storage_mode\":\"document\"}", "{}", null, false);
         try std.testing.expectEqual(abi.ReconcileState.complete, reconciled.state);

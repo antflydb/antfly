@@ -241,6 +241,7 @@ pub fn executeWithCodec(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope:
             // This establishes only quorum/topology readiness. Row-policy
             // proofs belong to open; admission must never perform a raw read.
             try owner.source.admitStatementReadGroupLocal(alloc, scope.group_id, table);
+            return encode(alloc, .{});
         },
         .admit_graph => {
             // A bounded point probe establishes the owner read-index barrier

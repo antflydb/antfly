@@ -111,13 +111,7 @@ pub const TransactionWrite = BatchWrite;
 pub const GraphEdgeWrite = @import("graph_edge_types.zig").GraphEdgeWrite;
 pub const GraphEdgeDelete = @import("graph_edge_types.zig").GraphEdgeDelete;
 
-pub const SyncLevel = enum {
-    propose,
-    write,
-    full_text,
-    enrichments,
-    full_index,
-};
+pub const SyncLevel = @import("../../common/sync_level.zig").SyncLevel;
 
 /// Admission prerequisite, independent of the response visibility barrier.
 /// Optional at ingress to retain the embedded legacy migration boundary.

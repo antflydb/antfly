@@ -7053,7 +7053,7 @@ pub const DataServer = struct {
                 // fence the old birth before this worker may advance.
                 if (std.mem.eql(u8, &entry.descriptor.generation_instance, &instance)) {
                     if (boot.phase != .ready) return error.SqlRelationRecoveryIncomplete;
-                    var owned = source.loadDescriptorByTableIdWithDeadline(a, entry.table_id, context.deadline_ns) catch |err| {
+                    var owned = source.loadDescriptorByTableIdWithBudget(a, entry.table_id, .{ .deadline_ns = context.deadline_ns, .io = context.deadline_io, .cancellation = context.cancellation }) catch |err| {
                         diagnoseNativeOwnerInit(.load_descriptor, err, entry.table_id, 0, boot, entry.initialized != null, false);
                         return err;
                     };
@@ -7065,7 +7065,7 @@ pub const DataServer = struct {
             if (entry.initialized) |before| {
                 if (before.boot_generation == boot.generation and std.mem.eql(u8, &before.binding.native_instance, &instance)) {
                     if (boot.phase == .ready) {
-                        var owned = source.loadDescriptorByTableIdWithDeadline(a, entry.table_id, context.deadline_ns) catch |err| {
+                        var owned = source.loadDescriptorByTableIdWithBudget(a, entry.table_id, .{ .deadline_ns = context.deadline_ns, .io = context.deadline_io, .cancellation = context.cancellation }) catch |err| {
                             diagnoseNativeOwnerInit(.load_descriptor, err, entry.table_id, 0, boot, entry.initialized != null, false);
                             return err;
                         };
@@ -7080,7 +7080,7 @@ pub const DataServer = struct {
                     // verifier cannot advance while the old Entry remains.
                     return error.SqlRelationRecoveryIncomplete;
                 }
-                var descriptor = source.loadDescriptorByTableIdWithDeadline(a, entry.table_id, context.deadline_ns) catch |err| {
+                var descriptor = source.loadDescriptorByTableIdWithBudget(a, entry.table_id, .{ .deadline_ns = context.deadline_ns, .io = context.deadline_io, .cancellation = context.cancellation }) catch |err| {
                     diagnoseNativeOwnerInit(.load_descriptor, err, entry.table_id, 0, boot, entry.initialized != null, false);
                     return err;
                 };
@@ -7092,7 +7092,7 @@ pub const DataServer = struct {
                 // permitted. This lane must inspect/close the actual empty
                 // image and publish initialization, never assume absence means
                 // an acknowledged root may be recreated.
-                var owned = source.loadDescriptorByTableIdWithDeadline(a, entry.table_id, context.deadline_ns) catch |err| {
+                var owned = source.loadDescriptorByTableIdWithBudget(a, entry.table_id, .{ .deadline_ns = context.deadline_ns, .io = context.deadline_io, .cancellation = context.cancellation }) catch |err| {
                     diagnoseNativeOwnerInit(.load_descriptor, err, entry.table_id, 0, boot, entry.initialized != null, false);
                     return err;
                 };
@@ -7575,7 +7575,9 @@ pub const DataServer = struct {
         const catalog = self.write_source.catalog;
         const acquire = catalog.vtable.acquire_routing_generation orelse return error.CatalogRoutingUnavailable;
         const deadline = catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
-        const generation = try acquire(catalog.ptr, deadline, false);
+        var budget = catalog.budget(deadline);
+        budget.cancellation = context.cancellation;
+        const generation = try acquire(catalog.ptr, budget, false);
         defer generation.release();
         const indexed = &generation.indexed;
         const snapshot = indexed.snapshot.value;
@@ -14809,7 +14811,7 @@ pub const DataServer = struct {
         try context.ensureActive();
         const routing = self.status_source.routingSource() orelse return error.MetadataSnapshotUnavailable;
         const acquire = routing.acquire_generation orelse return error.MetadataSnapshotUnavailable;
-        const generation = try acquire(routing.projection.ptr, context.deadline_ns, true);
+        const generation = try acquire(routing.projection.ptr, .{ .deadline_ns = context.deadline_ns, .io = context.deadline_io, .cancellation = context.cancellation }, true);
         defer generation.release();
         const indexed = &generation.indexed;
         const table_index = indexed.table_id_indexes.get(namespace.table_id) orelse return error.RestoreStagingInProgress;

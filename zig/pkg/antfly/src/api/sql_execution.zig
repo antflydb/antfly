@@ -4124,7 +4124,7 @@ pub const Adapter = struct {
         const domain_preparation = for (table.columns) |column| {
             if (column.domain_view != null) break true;
         } else false;
-        const prepared_here = !already_prepared and (table.has_triggers or domain_preparation or omitted_default or http_server.effectiveRowFilterJson(self.identity.*, table.physical_name) != null);
+        const prepared_here = !already_prepared and (table.has_triggers or domain_preparation or omitted_default or http_server.hasEffectiveRowFilter(self.identity.*, table.physical_name));
         const normalized_input = if (prepared_here) try prepareMutationsWithVisibility(ptr, alloc, table, raw_input, false) else raw_input;
         const input: []const catalog.Mutation = if (table.has_triggers) selected: {
             const command = self.command orelse return error.SqlTriggerCoordinationRequired;

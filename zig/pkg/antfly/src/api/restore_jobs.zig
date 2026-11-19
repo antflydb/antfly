@@ -1213,7 +1213,7 @@ pub const Store = struct {
     }
 
     fn startObservedPrepared(self: *Store, alloc: std.mem.Allocator, req: StartRequest, allow_new: bool, submitted: ?*bool, prepared: ?*const immutable_inputs.Prepared, permit: ?*PreparationPermit) !Admission {
-        try validateStartRequest(req);
+        try validateStartRequest(alloc, req);
         _ = self.io orelse return error.AsyncRestoreUnavailable;
         const fingerprint = try requestFingerprintAlloc(alloc, req);
         defer alloc.free(fingerprint);

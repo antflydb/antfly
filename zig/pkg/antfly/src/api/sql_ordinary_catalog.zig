@@ -42,7 +42,7 @@ fn operation(target: native.Target) common.Receipt.Operation {
         .create => .create,
         .drop => .drop,
         .rename => .rename,
-        .comment, .set_tablespace, .alter => .alter,
+        .comment, .set_tablespace, .set_definition, .alter => .alter,
     };
 }
 pub fn authorize(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, a: A, target: native.Target) !void {
