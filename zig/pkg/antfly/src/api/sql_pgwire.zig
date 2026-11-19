@@ -451,6 +451,12 @@ pub const CatalogReplicationSlots = struct {
         return page;
     }
 
+    pub fn readExportedSnapshotRows(self: CatalogReplicationSlots, a: std.mem.Allocator, name: []const u8, namespace: control.Namespace, after: u32, rows: u32, bytes: u32, context: operation.RequestContext) !@import("../pgwire/values.zig").HistoricalSnapshot {
+        var raw = try self.readExportedSnapshot(a, name, namespace, after, rows, bytes, context);
+        defer raw.deinit();
+        return @import("../pgwire/values.zig").HistoricalSnapshot.decode(a, raw);
+    }
+
     pub fn dropWrite(self: CatalogReplicationSlots, a: std.mem.Allocator, name: []const u8, now: u64, context: operation.RequestContext) !control.Write {
         var observed = try self.readOwned(a, name, context);
         defer observed.deinit();
@@ -3863,7 +3869,7 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
         defer qualified.deinit();
         try std.testing.expectEqual(@as(u64, 10), qualified.value.roots[0].start);
         try std.testing.expectError(error.InvalidReplicationSnapshot, slots.readExportedSnapshot(alloc, "invalid", namespace, 0, 1, 4096, .{}));
-        try std.testing.expectError(error.ChangefeedCapabilityUnsupported, slots.readExportedSnapshot(alloc, &token.name(), namespace, 0, 1, 4096, .{}));
+        try std.testing.expectError(error.ChangefeedCapabilityUnsupported, slots.readExportedSnapshotRows(alloc, &token.name(), namespace, 0, 1, 4096, .{}));
     }
     {
         var tmp = std.testing.tmpDir(.{});

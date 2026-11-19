@@ -267,6 +267,24 @@ pub fn historicalColumn(column: HistorySchema.RelationalColumn) !Column {
     return descriptor;
 }
 
+fn historicalCells(a: std.mem.Allocator, schema: HistorySchema.TableSchema, layout: *const HistoryRow.PhysicalLayout, image: []const u8, cells: []@import("backend.zig").Cell, copy_json: bool) !void {
+    const row = try HistoryRow.ordinalRowView(image, schema, layout);
+    for (schema.relational_columns, cells, 0..) |column, *cell, ordinal| {
+        const stored = try row.findCell(ordinal) orelse {
+            cell.* = .{ .sql_null = true };
+            continue;
+        };
+        if (stored.is_null) {
+            cell.* = .{ .sql_null = true };
+        } else if (column.column_type == .json) {
+            const bytes = stored.value.bytes_val;
+            cell.* = .{ .sql_null = false, .json_bytes = if (copy_json) try a.dupe(u8, bytes) else bytes };
+        } else {
+            cell.* = .{ .sql_null = false, .value = try row.materializeCellAlloc(a, stored) };
+        }
+    }
+}
+
 /// Decode a retained row image against the schema bound to that image. The
 /// returned cells own their bytes and may outlive the image and scratch arena.
 pub fn encodeHistoricalRow(
@@ -278,28 +296,51 @@ pub fn encodeHistoricalRow(
     byte_limit: usize,
 ) ![]const @import("pgoutput.zig").Cell {
     if (schema.relational_columns.len == 0 or schema.relational_columns.len > std.math.maxInt(u16)) return error.ChangefeedCapabilityUnsupported;
-    const row = try HistoryRow.ordinalRowView(image, schema, layout);
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const a = scratch.allocator();
     const columns = try a.alloc(Column, schema.relational_columns.len);
+    for (schema.relational_columns, columns) |column, *descriptor| descriptor.* = try historicalColumn(column);
     const cells = try a.alloc(@import("backend.zig").Cell, columns.len);
-    for (schema.relational_columns, columns, cells, 0..) |column, *descriptor, *cell, ordinal| {
-        descriptor.* = try historicalColumn(column);
-        const stored = try row.findCell(ordinal) orelse {
-            cell.* = .{ .sql_null = true };
-            continue;
-        };
-        if (stored.is_null) {
-            cell.* = .{ .sql_null = true };
-        } else if (column.column_type == .json) {
-            cell.* = .{ .sql_null = false, .json_bytes = stored.value.bytes_val };
-        } else {
-            cell.* = .{ .sql_null = false, .value = try row.materializeCellAlloc(a, stored) };
-        }
-    }
+    try historicalCells(a, schema, layout, image, cells, false);
     return encodeReplicationTuple(alloc, columns, cells, format, byte_limit);
 }
+
+pub const HistoricalSnapshot = struct {
+    arena: std.heap.ArenaAllocator,
+    columns: []const Column,
+    rows: []const []const @import("backend.zig").Cell,
+    next_row: u32,
+    done: bool,
+
+    pub fn deinit(self: *HistoricalSnapshot) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn decode(alloc: std.mem.Allocator, page: history_sources.api_local_table_writes.table_write_source.history_page.BootstrapPage) !HistoricalSnapshot {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const schema = try HistorySchema.deserializeSchema(a, page.schema);
+        const width = schema.relational_columns.len;
+        if (schema.storage_mode != .relational or schema.external_base_source != null or width == 0 or width > 1024) return error.ChangefeedCapabilityUnsupported;
+        // Bound sparse-row amplification independently of raw transport bytes.
+        if (page.rows.len > 65536 / width) return error.HistoryTooLarge;
+        const columns = try a.alloc(Column, width);
+        for (schema.relational_columns, columns) |column, *descriptor| descriptor.* = try historicalColumn(column);
+        var layout = try HistoryRow.PhysicalLayout.init(a, schema);
+        defer layout.deinit();
+        const rows = try a.alloc([]const @import("backend.zig").Cell, page.rows.len);
+        for (page.rows, rows) |raw, *row| {
+            if (!history_sources.storage_internal_keys.isRelationalRowKey(raw.key)) return error.ChangefeedCapabilityUnsupported;
+            const cells = try a.alloc(@import("backend.zig").Cell, width);
+            try historicalCells(a, schema, &layout, raw.value, cells, true);
+            row.* = cells;
+        }
+        return .{ .arena = arena, .columns = columns, .rows = rows, .next_row = page.next_row, .done = page.done };
+    }
+};
 
 /// A relation mapping frozen by the publication at the retained schema cut.
 /// Key ordinals are in relation order and refer to historical columns.
@@ -409,6 +450,28 @@ test "pgwire retained ordinal row preserves historical column types and null ide
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 17 }, tuple[0].binary);
     try std.testing.expectEqualSlices(u8, "\x01null", tuple[1].binary);
     try std.testing.expect(tuple[2] == .null);
+    var page: history_sources.api_local_table_writes.table_write_source.history_page.BootstrapPage = .{
+        .arena = .init(a),
+        .schema = "",
+        .rows = &.{},
+        .next_row = 8,
+        .done = true,
+    };
+    const pinned = page.arena.allocator();
+    page.schema = try HistorySchema.serializeSchema(pinned, schema);
+    page.rows = &.{.{ .key = try history_sources.storage_internal_keys.relationalRowKeyAlloc(pinned, "id=17"), .value = try pinned.dupe(u8, image) }};
+    var snapshot = try HistoricalSnapshot.decode(std.testing.allocator, page);
+    defer snapshot.deinit();
+    @memset(@constCast(page.rows[0].value), 0);
+    page.deinit();
+    try std.testing.expectEqual(@as(u32, 8), snapshot.next_row);
+    try std.testing.expect(snapshot.done);
+    try std.testing.expectEqualStrings("j", snapshot.columns[1].name);
+    try std.testing.expectEqual(@as(i64, 17), try integer(snapshot.rows[0][0].value));
+    try std.testing.expect(!snapshot.rows[0][1].sql_null);
+    try std.testing.expectEqualStrings("null", snapshot.rows[0][1].json_bytes.?);
+    try std.testing.expect(snapshot.rows[0][2].sql_null);
+
     try std.testing.expectEqual(@as(u32, 23), try columnOid(try historicalColumn(schema.relational_columns[0])));
     const relation: HistoricalRelation = .{ .oid = 42, .namespace = "public", .name = "docs", .identity = .default, .key_ordinals = &.{0} };
     const metadata = try relation.encodeRelation(a, schema, 128);
