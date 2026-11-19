@@ -139,6 +139,8 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                 "SHOW wal_level",
                 "-c",
                 "SELECT version(), current_user, current_database(), current_catalog",
+                "-c",
+                "SELECT oid, typname, typelem, typarray FROM pg_catalog.pg_type WHERE oid IN (23, 1007) ORDER BY oid",
             ],
             env=env,
             text=True,
@@ -147,6 +149,8 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
         assert discovery == [
             "logical",
             "PostgreSQL 16.0 compatibility (Antfly)|admin|default|default",
+            "23|int4|0|1007",
+            "1007|_int4|23|0",
         ]
         sql("CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT)")
         if export_snapshot:

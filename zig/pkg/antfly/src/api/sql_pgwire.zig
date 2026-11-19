@@ -2768,6 +2768,8 @@ const Authority = struct {
 };
 
 const GuardedCatalog = struct {
+    const system = @import("pgwire_catalog.zig");
+
     native: catalog.Backend,
     authority: *Authority,
     revision: *const ?u64,
@@ -2796,6 +2798,11 @@ const GuardedCatalog = struct {
         return table;
     }
     fn checkTableRead(self: *GuardedCatalog, table: catalog.Table) !void {
+        if (system.owns(table)) {
+            try checkpoint(self);
+            try self.authority.credential.validate();
+            return;
+        }
         if (table.graph) |binding| {
             try checkpoint(self);
             if (!try http.resourcePermissionCurrentlyAllowed(self.authority.identity.*, .graph, binding.graph.name, .read)) return error.Forbidden;
@@ -2848,7 +2855,8 @@ const GuardedCatalog = struct {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try checkpoint(raw);
         try self.authority.credential.validate();
-        const table = try resolveOnPath(self.native, alloc, name, action, if (self.authority.request.search_path) |*path| path else null);
+        const table = (try system.resolve(name, action, self.authority.request.database orelse "default")) orelse
+            try resolveOnPath(self.native, alloc, name, action, if (self.authority.request.search_path) |*path| path else null);
         if (self.expected_guard) |guard| try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, table);
         return table;
     }
@@ -2936,6 +2944,7 @@ const GuardedCatalog = struct {
     fn scan(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try self.checkTableRead(table);
+        if (system.owns(table)) return system.scan(alloc, request);
         if (self.authority.importedSnapshot()) |snapshot| return self.scanPinned(alloc, snapshot, table, request);
         return self.native.vtable.scan(self.native.ptr, alloc, table, request);
     }
@@ -3072,6 +3081,7 @@ const GuardedCatalog = struct {
     fn openScan(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try self.checkTableRead(table);
+        if (system.owns(table)) return try system.open(alloc, request);
         if (self.authority.importedSnapshot()) |snapshot| return try self.openPinned(alloc, snapshot, table, request);
         const open = self.native.vtable.open_scan orelse return null;
         const inner = (try open(self.native.ptr, alloc, table, request)) orelse return null;
@@ -3127,7 +3137,26 @@ const GuardedCatalog = struct {
 
     fn openStatement(raw: *anyopaque, alloc: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
-        for (scans) |scan_request| try self.checkTableRead(scan_request.table);
+        var system_count: usize = 0;
+        for (scans) |scan_request| {
+            try self.checkTableRead(scan_request.table);
+            if (system.owns(scan_request.table)) system_count += 1;
+        }
+        if (system_count != 0) {
+            if (system_count != scans.len) return error.UnsupportedSqlShape;
+            const owner = try alloc.create(PinnedStatement);
+            errdefer alloc.destroy(owner);
+            const cursors = try alloc.alloc(catalog.Cursor, scans.len);
+            errdefer alloc.free(cursors);
+            var opened: usize = 0;
+            errdefer for (cursors[0..opened]) |cursor| cursor.close(cursor.ptr);
+            for (scans, cursors) |selection, *cursor| {
+                cursor.* = try system.open(alloc, selection.request);
+                opened += 1;
+            }
+            owner.* = .{ .alloc = alloc, .cursors = cursors };
+            return .{ .ptr = owner, .cursors = cursors, .close = PinnedStatement.close };
+        }
         if (self.authority.importedSnapshot()) |snapshot| return self.openPinnedStatement(alloc, snapshot, scans);
         const open = self.native.vtable.open_statement orelse return error.SqlStatementSnapshotRequired;
         const inner = try open(self.native.ptr, alloc, scans);
