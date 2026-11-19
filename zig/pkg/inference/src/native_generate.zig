@@ -715,9 +715,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         else
             requested_draft_kv_dtype;
     } else null;
-    const prepared_prompt_inputs = backend_kind == .cuda and explicit_partition_backend != .pjrt and
-        (opts.image_count != 0 or opts.audio_count != 0 or opts.video_path != null) and
-        @import("execution/gemma4_native_plan.zig").Geometry.resolve(gpt_config) != null;
+    const prepared_prompt_inputs = @import("execution/decoder_routes.zig").retainsPreparedPromptInputs(backend_kind, gpt_config) and explicit_partition_backend != .pjrt and
+        (opts.image_count != 0 or opts.audio_count != 0 or opts.video_path != null);
     var budget_components: [2]runtime.tier.memory.GptGenerationBudgetComponent = undefined;
     budget_components[0] = .{
         .backend = backend_kind,
@@ -6635,6 +6634,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
     const prefer_prefill_greedy_token = prefillGreedyTokenEnabled() and use_greedy_decode;
     const allow_swa_ring = kv_capacity_policy == .split_swa_ring;
     const graph_stats_before_generate = graph_mod.executor_stats.snapshot();
+    debugGenerateSetup("live prefill prompt_token_count={d}", .{prompt_ids.len});
     const prefill_started_at = std.Io.Timestamp.now(io, .awake);
     var output = blk: {
         var processed: usize = 0;
@@ -6651,6 +6651,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 .attention_mode = .paged_prefill,
                 .max_inflight_tokens = if (allow_swa_ring) prefill_chunk_size else 0,
                 .allow_swa_ring = allow_swa_ring,
+                .kv_only = chunk_end < prompt_ids.len,
                 .force_host_logits = forcePrefillHostLogits(),
                 .prefer_greedy_token = prefer_prefill_greedy_token and chunk_end == prompt_ids.len,
             }) catch |err| {

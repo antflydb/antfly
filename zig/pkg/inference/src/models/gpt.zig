@@ -292,6 +292,22 @@ pub const Config = struct {
         return if (self.num_key_value_heads > 0) self.num_key_value_heads else self.num_attention_heads;
     }
 
+    /// Qualified dense shared-KV prefix. Shared suffix layers retain no KV;
+    /// intermediate chunks may omit them and final logits need one suffix row.
+    pub fn sharedKvPrefillDonorLayers(config: Config) ?usize {
+        if (config.family != .gemma or config.hidden_size != 2560 or config.num_hidden_layers != 42 or
+            config.num_kv_shared_layers != 18 or config.num_attention_heads != 8 or
+            config.num_key_value_heads != 2 or config.attention_head_dim != 256 or
+            config.global_head_dim != 512 or config.position_encoding != .rope or
+            config.gemma4_mtp_assistant or config.usesMoe()) return null;
+        const boundary = config.num_hidden_layers - config.num_kv_shared_layers;
+        for (boundary..config.num_hidden_layers) |layer| {
+            const donor = config.kvDonorGeometry(layer) catch return null;
+            if (donor.donor_layer >= boundary or config.layerSharesKv(donor.donor_layer)) return null;
+        }
+        return boundary;
+    }
+
     pub fn headDim(self: Config) u32 {
         return if (self.attention_head_dim > 0) self.attention_head_dim else self.hidden_size / self.num_attention_heads;
     }

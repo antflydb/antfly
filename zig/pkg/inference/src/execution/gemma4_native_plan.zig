@@ -39,16 +39,7 @@ pub const Plan = struct {
             .prompt_input_copies = 2,
             .host_prompt_input_copies = 1,
         };
-        const estimate = try component.estimate(context_tokens - 1, 1, self.geometry.prefillChunkRows(context_tokens, 0));
-        const host = try std.math.add(usize, estimate.host_input_bytes, estimate.host_metadata_bytes);
-        const backend = try std.math.add(usize, backend_residency_bytes, try std.math.add(usize, estimate.kv_bytes, estimate.scratch_bytes));
-        return .{
-            .host_limit_bytes = try std.math.add(usize, auxiliary.host_limit_bytes, host),
-            .backend_limit_bytes = try std.math.add(usize, auxiliary.backend_limit_bytes, backend),
-            .combined_limit_bytes = try std.math.add(usize, auxiliary.combined_limit_bytes, try std.math.add(usize, host, backend)),
-            .kv_limit_bytes = @max(auxiliary.kv_limit_bytes, estimate.kv_bytes),
-            .scratch_limit_bytes = try std.math.add(usize, auxiliary.scratch_limit_bytes, try std.math.add(usize, host, estimate.scratch_bytes)),
-        };
+        return component.fullWindowBudgetFloor(context_tokens, self.geometry.prefillChunkRows(context_tokens, 0), backend_residency_bytes, auxiliary);
     }
 
     pub fn resolve(config: Config) ?Plan {
@@ -85,16 +76,7 @@ pub const Geometry = struct {
     pub fn resolve(config: Config) ?Geometry {
         // Scope the plan to the E4B geometry exercised by the native prefill
         // path. Other Gemma configurations continue through their own routes.
-        if (config.family != .gemma or config.hidden_size != 2560 or config.num_hidden_layers != 42 or
-            config.num_kv_shared_layers != 18 or config.num_attention_heads != 8 or
-            config.num_key_value_heads != 2 or config.attention_head_dim != 256 or
-            config.global_head_dim != 512 or config.position_encoding != .rope or
-            config.gemma4_mtp_assistant or config.usesMoe()) return null;
-        const boundary = config.num_hidden_layers - config.num_kv_shared_layers;
-        for (boundary..config.num_hidden_layers) |layer| {
-            const donor = config.kvDonorGeometry(layer) catch return null;
-            if (donor.donor_layer >= boundary or config.layerSharesKv(donor.donor_layer)) return null;
-        }
+        const boundary = config.sharedKvPrefillDonorLayers() orelse return null;
         return .{ .donor_layers = boundary };
     }
 

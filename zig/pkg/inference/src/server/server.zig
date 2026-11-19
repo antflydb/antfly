@@ -6610,8 +6610,8 @@ pub const Node = struct {
                 .config = gpt_config,
                 .kv_capacity_policy = kv_capacity_policy,
                 .workspace_capacity = model.session.generationWorkspaceCapacity(),
-                .prompt_input_copies = if (backend_kind == .cuda and preflight.media_count > 0 and @import("../execution/gemma4_native_plan.zig").Geometry.resolve(gpt_config) != null) 2 else 0,
-                .host_prompt_input_copies = if (backend_kind == .cuda and preflight.media_count > 0 and @import("../execution/gemma4_native_plan.zig").Geometry.resolve(gpt_config) != null) 1 else 0,
+                .prompt_input_copies = if (@import("../execution/decoder_routes.zig").retainsPreparedPromptInputs(backend_kind, gpt_config) and preflight.media_count > 0) 2 else 0,
+                .host_prompt_input_copies = if (@import("../execution/decoder_routes.zig").retainsPreparedPromptInputs(backend_kind, gpt_config) and preflight.media_count > 0) 1 else 0,
             },
         };
         const direct_prefill_ceiling = @min(
@@ -18075,8 +18075,8 @@ pub const Node = struct {
             .config = gpt_config,
             .kv_capacity_policy = target_kv_capacity_policy,
             .workspace_capacity = model.session.generationWorkspaceCapacity(),
-            .prompt_input_copies = if (backend_kind == .cuda and effective_compiled_partition_backend != .pjrt and generateMessagesHaveMedia(effective_messages) and @import("../execution/gemma4_native_plan.zig").Geometry.resolve(gpt_config) != null) 2 else 0,
-            .host_prompt_input_copies = if (backend_kind == .cuda and effective_compiled_partition_backend != .pjrt and generateMessagesHaveMedia(effective_messages) and @import("../execution/gemma4_native_plan.zig").Geometry.resolve(gpt_config) != null) 1 else 0,
+            .prompt_input_copies = if (@import("../execution/decoder_routes.zig").retainsPreparedPromptInputs(backend_kind, gpt_config) and effective_compiled_partition_backend != .pjrt and generateMessagesHaveMedia(effective_messages)) 2 else 0,
+            .host_prompt_input_copies = if (@import("../execution/decoder_routes.zig").retainsPreparedPromptInputs(backend_kind, gpt_config) and effective_compiled_partition_backend != .pjrt and generateMessagesHaveMedia(effective_messages)) 1 else 0,
         };
         var budget_component_count: usize = 1;
         if (draft_model_for_generation != null) {
@@ -20533,8 +20533,7 @@ pub const Node = struct {
                 var runnable_count: usize = 0;
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
-                    const prepared_inputs = backend_kind == .cuda and generateMessagesHaveMedia(owned_messages[idx].messages) and
-                        @import("../execution/gemma4_native_plan.zig").Geometry.resolve(gpt_config) != null;
+                    const prepared_inputs = @import("../execution/decoder_routes.zig").retainsPreparedPromptInputs(backend_kind, gpt_config) and generateMessagesHaveMedia(owned_messages[idx].messages);
                     const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{.{
                         .backend = backend_kind,
                         .kv_dtype = kv_dtype,

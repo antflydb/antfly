@@ -691,6 +691,10 @@ pub const PrefillRequest = struct {
     /// prefill write.
     max_inflight_tokens: usize = 0,
     allow_swa_ring: bool = false,
+    /// The caller discards this intermediate prefill output. A backend may
+    /// omit logits and a suffix proven to have no independent KV effects.
+    /// Unsupported backends can retain the ordinary complete computation.
+    kv_only: bool = false,
     force_host_logits: bool = false,
     prefer_greedy_token: bool = false,
 
@@ -1657,4 +1661,24 @@ test "decode continuation is lexical and invalid geometry refuses before runtime
     try std.testing.expect(old.continuation == null);
     const invalid = DecodeRequest{ .token_id = 1, .position = 0, .continuation = .{ .remaining_tokens = 0 } };
     try std.testing.expectError(error.InvalidDecodeContinuation, invalid.check());
+}
+
+test "model runtime preserves explicit KV-only prefill intent without logits" {
+    const Probe = struct {
+        fn prefill(raw: *anyopaque, _: std.mem.Allocator, request: PrefillRequest) !ModelOutput {
+            const calls: *usize = @ptrCast(@alignCast(raw));
+            try std.testing.expect(request.kv_only);
+            try std.testing.expectEqual(@as(usize, 2), request.query_seq_len);
+            calls.* += 1;
+            return .{};
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var calls: usize = 0;
+    var instance = ModelRuntime{ .ptr = &calls, .vtable = &.{ .prefill = Probe.prefill, .deinit = Probe.close } };
+    defer instance.deinit();
+    var output = try instance.prefill(std.testing.allocator, .{ .input_ids = &.{ 1, 2 }, .seq_len = 2, .query_seq_len = 2, .attention_mode = .paged_prefill, .kv_only = true });
+    defer output.deinit(std.testing.allocator);
+    try std.testing.expect(output.logits == null and output.device_logits == null and output.prepared_tail == null);
+    try std.testing.expectEqual(@as(usize, 1), calls);
 }

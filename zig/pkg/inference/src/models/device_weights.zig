@@ -814,7 +814,15 @@ fn metalHostedBudgetPolicy(
     arch_config: ArchConfig,
     quant_mode: GpuHostedQuantExecutionMode,
 ) GpuHostedBudgetPolicy {
-    return sharedGpuHostedBudgetPolicy(model_weight_bytes, manifest, arch_config, quant_mode);
+    var policy = sharedGpuHostedBudgetPolicy(model_weight_bytes, manifest, arch_config, quant_mode);
+    if (arch_config == .gpt and arch_config.gpt.sharedKvPrefillDonorLayers() != null) {
+        const component = runtime.tier.memory.GptGenerationBudgetComponent{ .backend = .metal, .kv_dtype = .f16, .config = arch_config.gpt, .prompt_input_copies = 2, .host_prompt_input_copies = 1 };
+        const floor = component.fullWindowBudgetFloor(@min(@as(usize, arch_config.gpt.max_position_embeddings), 131072), 512, std.math.cast(usize, model_weight_bytes) orelse return policy, runtime.tier.memory.defaultLimitsForBackend(.gpu)) catch return policy;
+        policy.budget_floor = runtime.tier.memory.maxCompositeLimits(policy.budget_floor, floor);
+        policy.plan_context.host_budget_bytes = @max(policy.plan_context.host_budget_bytes, floor.host_limit_bytes);
+        policy.plan_context.backend_budget_bytes = @max(policy.plan_context.backend_budget_bytes, floor.backend_limit_bytes);
+    }
+    return policy;
 }
 
 pub fn lightOnOcr4bBudgetPolicy(

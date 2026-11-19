@@ -153,7 +153,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         if (!std.mem.eql(u8, command, "finish")) return error.InvalidMeasurementControl;
     }
     const cuda_after = factory.getCudaRuntimeStats(model.session);
-    const cuda_counts = if (cuda_before != null and cuda_after != null) factory.cudaStatsDelta(cuda_after.?, cuda_before.?) else null;
+    const cuda_counts = if (comptime @import("build_options").enable_cuda) (if (cuda_before != null and cuda_after != null) factory.cudaStatsDelta(cuda_after.?, cuda_before.?) else null) else @as(?u8, null);
     const held = reference orelse return error.NoGenerationOutput;
     const report = try std.json.Stringify.valueAlloc(a, .{
         .task = "public_generation",
@@ -186,7 +186,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .samples_ns = samples,
         .stage_samples_ms = stage_samples,
         .cuda_request_counters = cuda_counts,
-        .cuda_measured_counters = if (cuda_before_measured != null and cuda_after != null) factory.cudaStatsDelta(cuda_after.?, cuda_before_measured.?) else null,
+        .cuda_measured_counters = if (comptime @import("build_options").enable_cuda) (if (cuda_before_measured != null and cuda_after != null) factory.cudaStatsDelta(cuda_after.?, cuda_before_measured.?) else null) else @as(?u8, null),
         .cuda_profile_intervals = "nested; category durations are not additive",
         .cached_stage_samples_ms = if (comparison) cached_stage_samples else null,
         .warmup = options.warmup,

@@ -2549,6 +2549,19 @@ fn runtimeDeinitWithCleanup(ctx: *anyopaque, current: @import("../execution/clea
     runtime_ctx.deinitWithCleanup(current);
 }
 
+fn recordPrefillFamilyTiming(cb: *const ops.ComputeBackend, started_at: u64, before: ops.DirectFamilyTimingSnapshot, include_frame: bool) void {
+    const delta = cb.directFamilyTimingSnapshot().delta(before);
+    timing_stats.prefill_direct_family_nanos += @intCast(monotonicNowNs() - started_at);
+    timing_stats.prefill_direct_family_project_nanos += delta.project_nanos;
+    timing_stats.prefill_direct_family_span_prep_nanos += delta.span_prep_nanos;
+    timing_stats.prefill_direct_family_quant_attn_nanos += delta.quant_attn_nanos;
+    timing_stats.prefill_direct_family_block_apply_nanos += delta.block_apply_nanos;
+    if (include_frame) {
+        timing_stats.prefill_direct_family_frame_wait_nanos += delta.frame_wait_nanos;
+        timing_stats.prefill_direct_family_frame_gpu_nanos += delta.frame_gpu_nanos;
+    }
+}
+
 fn runtimePrefill(
     ctx: *anyopaque,
     allocator: std.mem.Allocator,
@@ -2604,6 +2617,19 @@ fn runtimePrefill(
         const configured_layer_count = runtime_ctx.decoderRuntimeConfiguredLayerCount();
         const timing_before = runtime_ctx.cb.directFamilyTimingSnapshot();
         const direct_started_at = monotonicNowNs();
+        const config = runtime_ctx.definition.configuration.value;
+        if (request.kv_only and !request.force_host_logits and !request.prefer_greedy_token and
+            request.query_seq_len > 1 and config.sharedKvPrefillDonorLayers() != null and
+            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_SHARED_KV_PREFILL", true))
+        {
+            if (try decoder_gated_runtime.forwardFinalHiddenRowsKvOnly(&runtime_ctx.cb, allocator, config, configured_layer_count, request.input_ids, request.seq_len, &decode_context)) |owned| {
+                var rows = owned;
+                rows.deinit(&runtime_ctx.cb);
+                recordPrefillFamilyTiming(&runtime_ctx.cb, direct_started_at, timing_before, true);
+                runtime_ctx.noteDecoderRuntimeStateFromCurrentView();
+                return .{};
+            }
+        }
         if (try metal_runtime.forwardPrefillLastPreparedTailFamily(
             &runtime_ctx.cb,
             allocator,
@@ -2614,15 +2640,7 @@ fn runtimePrefill(
             &decode_context,
             request.prefer_greedy_token,
         )) |tail| {
-            const timing_after = runtime_ctx.cb.directFamilyTimingSnapshot();
-            const delta = timing_after.delta(timing_before);
-            timing_stats.prefill_direct_family_nanos += @intCast(monotonicNowNs() - direct_started_at);
-            timing_stats.prefill_direct_family_project_nanos += delta.project_nanos;
-            timing_stats.prefill_direct_family_span_prep_nanos += delta.span_prep_nanos;
-            timing_stats.prefill_direct_family_quant_attn_nanos += delta.quant_attn_nanos;
-            timing_stats.prefill_direct_family_block_apply_nanos += delta.block_apply_nanos;
-            timing_stats.prefill_direct_family_frame_wait_nanos += delta.frame_wait_nanos;
-            timing_stats.prefill_direct_family_frame_gpu_nanos += delta.frame_gpu_nanos;
+            recordPrefillFamilyTiming(&runtime_ctx.cb, direct_started_at, timing_before, true);
             runtime_ctx.noteDecoderRuntimeStateFromCurrentView();
             return .{ .prepared_tail = .{
                 .final_hidden = tail.final_hidden,
@@ -2638,13 +2656,7 @@ fn runtimePrefill(
                 .greedy_token_id = tail.greedy_token_id,
             } };
         }
-        const timing_after = runtime_ctx.cb.directFamilyTimingSnapshot();
-        const delta = timing_after.delta(timing_before);
-        timing_stats.prefill_direct_family_nanos += @intCast(monotonicNowNs() - direct_started_at);
-        timing_stats.prefill_direct_family_project_nanos += delta.project_nanos;
-        timing_stats.prefill_direct_family_span_prep_nanos += delta.span_prep_nanos;
-        timing_stats.prefill_direct_family_quant_attn_nanos += delta.quant_attn_nanos;
-        timing_stats.prefill_direct_family_block_apply_nanos += delta.block_apply_nanos;
+        recordPrefillFamilyTiming(&runtime_ctx.cb, direct_started_at, timing_before, false);
     }
     try request.check();
     const fallback_started_at = monotonicNowNs();

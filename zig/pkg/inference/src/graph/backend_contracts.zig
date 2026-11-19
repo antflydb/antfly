@@ -1463,6 +1463,7 @@ pub const DecoderRuntimeGraphCommandPlanFrameRequest = struct {
     hidden: CT,
     ple_vectors: ?CT = null,
     layers: []const DecoderRuntimeLayerSpec,
+    include_tail: bool = true,
     output_hidden: *?CT,
     /// Borrowed synchronous request control; check between encoded layers.
     execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,

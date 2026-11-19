@@ -29,6 +29,15 @@ pub const Request = struct {
     has_token_observer: bool,
     exact_hybrid: bool,
 };
+pub fn metalPreparedEmbeddingChunkRows(config: gpt_mod.Config, admitted_rows: usize) ?usize {
+    _ = config.sharedKvPrefillDonorLayers() orelse return null;
+    return @min(@as(usize, 512), if (admitted_rows == 0) 512 else admitted_rows);
+}
+
+pub fn retainsPreparedPromptInputs(backend: runtime.kv.pool.BackendKind, config: gpt_mod.Config) bool {
+    return (backend == .cuda or backend == .metal) and config.sharedKvPrefillDonorLayers() != null;
+}
+
 pub const PrefillOutputIntent = enum {
     kv_only,
     last_logits,
@@ -314,4 +323,22 @@ pub fn cudaCapturedPrefillGreedyEnabled() bool {
 pub fn metalPreparedPrefillHiddenCaptureEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_ENABLE_METAL_PREFILL_HIDDEN_CAPTURE", false) and
         !platform.env.getenvBool("ANTFLY_GEMMA4_MTP_DISABLE_METAL_PREFILL_HIDDEN_CAPTURE");
+}
+
+test "Metal shared KV prefill keeps admitted chunks and isolates unsupported adapters" {
+    const config = gpt_mod.Config{ .family = .gemma, .hidden_size = 2560, .num_hidden_layers = 42, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 512, .num_kv_shared_layers = 18, .sliding_window = 512, .sliding_window_pattern = 6, .ple_hidden_size = 256 };
+    try std.testing.expectEqual(@as(?usize, 512), metalPreparedEmbeddingChunkRows(config, 0));
+    try std.testing.expectEqual(@as(?usize, 512), metalPreparedEmbeddingChunkRows(config, 8192));
+    try std.testing.expectEqual(@as(?usize, 1), metalPreparedEmbeddingChunkRows(config, 1));
+    try std.testing.expectEqual(@as(?usize, 128), metalPreparedEmbeddingChunkRows(config, 128));
+    try std.testing.expect(retainsPreparedPromptInputs(.metal, config));
+    try std.testing.expect(retainsPreparedPromptInputs(.cuda, config));
+    try std.testing.expect(!retainsPreparedPromptInputs(.native, config));
+    var unsupported = config;
+    unsupported.gemma4_mtp_assistant = true;
+    try std.testing.expect(metalPreparedEmbeddingChunkRows(unsupported, 512) == null);
+    unsupported = config;
+    unsupported.num_hidden_layers = 35;
+    try std.testing.expect(metalPreparedEmbeddingChunkRows(unsupported, 512) == null);
+    try std.testing.expect(!retainsPreparedPromptInputs(.metal, unsupported));
 }

@@ -659,6 +659,8 @@ pub fn firstTokenCoalesceLimit() usize {
     return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS") orelse 2048;
 }
 
+const PreparedEmbeddingOutput = enum { last_logits, kv_only };
+
 pub const Runtime = struct {
     inline fn acquireForObservation(self: *Runtime) !?@import("../ops/execution_scope.zig").Scope {
         return self.execution.acquireScope() catch |err| {
@@ -793,8 +795,9 @@ pub const Runtime = struct {
         // intents. Checkpoint fitting collects queries from every
         // consumer; hidden-row/MTP consumers also retain the full path.
         const shared_prefill = if (allow_shared_kv_prefill and
+            !(self.forward.context.cb.kind() == .metal and request.prepared_metal_whole_prompt and output_intent != .kv_only) and
             (output_intent == .kv_only or output_intent == .last_logits or output_intent == .greedy_token))
-            try gpt_arch.tryCudaSharedKvPrefill(self.forward.context.cb, allocator, self.forward.context.gpt_config.*, chunk, total_chunk_end, &decode_context, output_intent != .kv_only)
+            try gpt_arch.trySharedKvPrefill(self.forward.context.cb, allocator, self.forward.context.gpt_config.*, chunk, total_chunk_end, &decode_context, output_intent != .kv_only)
         else
             null;
         const metal_prepared: ?Output = if (shared_prefill == null and request.prepared_metal_whole_prompt)
@@ -1089,19 +1092,21 @@ pub const Runtime = struct {
         const embeddings = if (request.ensure_device_resident) try cb.ensureDeviceResidentOwned(original) else original;
         var owned = true;
         errdefer if (owned) cb.free(embeddings);
-        if (comptime build_options.enable_cuda) {
-            if (request.route == .prepared_last_row and !request.capture_hidden and request.attention_mask == null and
-                request.positions == null and request.visual_mask == null and request.deepstack_embeddings == null and
-                self.state.isPaged())
-            {
-                if (cuda_compute.CudaCompute.nativePrefillChunkRows(cb, request.sequence_length, request.chunk_rows)) |rows| {
-                    if (request.sequence_length > rows) {
-                        owned = false;
-                        defer cb.free(embeddings);
-                        return self.runEmbeddingChunks(embeddings, request, rows);
-                    }
-                }
-            }
+        if (request.route == .prepared_last_row and !request.capture_hidden and request.attention_mask == null and
+            request.positions == null and request.visual_mask == null and request.deepstack_embeddings == null and
+            self.state.isPaged())
+        {
+            const rows = if (cb.kind() == .metal)
+                decoder_routes.metalPreparedEmbeddingChunkRows(self.forward.context.gpt_config.*, request.chunk_rows)
+            else if (comptime build_options.enable_cuda)
+                cuda_compute.CudaCompute.nativePrefillChunkRows(cb, request.sequence_length, request.chunk_rows)
+            else
+                null;
+            if (rows) |bounded_rows| if (request.sequence_length > bounded_rows) {
+                owned = false;
+                defer cb.free(embeddings);
+                return self.runEmbeddingChunks(embeddings, request, bounded_rows);
+            };
         }
         var state = BorrowedDecodeStateRuntime.init(self.state);
         var decode = state.makeDecodeContext(request.sequence_length, request.sequence_length);
@@ -1127,6 +1132,9 @@ pub const Runtime = struct {
         const config = self.forward.context.gpt_config.*;
         if (request.token_ids.len != request.sequence_length or rows == 0) return error.InvalidPreparedPrompt;
         var state = BorrowedDecodeStateRuntime.init(self.state);
+        // Disabling the arithmetic optimization cannot waive the admitted
+        // physical row bound or the retained full-prompt input reservation.
+        const prune_suffix = cb.kind() != .metal or platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_SHARED_KV_PREFILL", true);
         var start: usize = 0;
         while (start < request.sequence_length) {
             if (cb.execution_control) |active| try active.check();
@@ -1145,10 +1153,17 @@ pub const Runtime = struct {
                 owns_part = false;
                 return numerical.forwardPreparedEmbeddingsLastLogits(part, ids, end, &decode, false);
             }
+            if (cb.kind() == .metal and count > 1) {
+                var framed = Forward{ .forward = self.forward };
+                if (try framed.tryMetalPreparedEmbeddingChunk(part, ids, end, &decode, false, .kv_only)) |_| {
+                    start = end;
+                    continue;
+                }
+            }
             const ple = try gpt_arch.computePleVectors(cb, a, config, ids, part, count);
             defer if (ple) |value| cb.free(value);
             owns_part = false;
-            const result = try gpt_arch.forwardFinalHiddenWithSharedKvOutput(cb, a, config, part, .{}, 1, end, &decode, ple, null, null, if (count > 1) .kv_only else .all);
+            const result = try gpt_arch.forwardFinalHiddenWithSharedKvOutput(cb, a, config, part, .{}, 1, end, &decode, ple, null, null, if (count > 1 and prune_suffix) .kv_only else .all);
             cb.free(result.hidden);
             start = end;
         }
@@ -1559,7 +1574,7 @@ pub const Forward = struct {
     ) !Output {
         var owns_input = true;
         defer if (owns_input) self.forward.context.cb.free(input_embeddings);
-        if (try self.tryMetalPreparedMultimodalPrefill(input_embeddings, ple_token_ids, seq_len, decode_context, capture_last_hidden)) |logits| {
+        if (try self.tryMetalPreparedEmbeddingChunk(input_embeddings, ple_token_ids, seq_len, decode_context, capture_last_hidden, .last_logits)) |logits| {
             return logits;
         }
         if (capture_last_hidden) return error.MultimodalMtpPrefillUnavailable;
@@ -1584,31 +1599,35 @@ pub const Forward = struct {
     /// whole layer stack runs as one command buffer instead of one
     /// submission per op. Null leaves the embeddings untouched for the
     /// generic forward.
-    pub fn tryMetalPreparedMultimodalPrefill(
+    pub fn tryMetalPreparedEmbeddingChunk(
         self: *Forward,
         input_embeddings: ops.CT,
         ple_token_ids: []const i64,
         seq_len: usize,
         provided_decode_context: *const gpt_arch.DecodeContext,
         capture_last_hidden: bool,
+        intent: PreparedEmbeddingOutput,
     ) !?Output {
         var current_decode_context = provided_decode_context.*;
         try self.forward.context.bindDecoderCleanup(&current_decode_context);
         const decode_context = &current_decode_context;
-        return @import("invocation_observation.zig").callContextOperation(&self.forward.context, .prefill, @This().tryMetalPreparedMultimodalPrefillUnobserved, .{ self, input_embeddings, ple_token_ids, seq_len, decode_context, capture_last_hidden });
+        return @import("invocation_observation.zig").callContextOperation(&self.forward.context, .prefill, @This().tryMetalPreparedEmbeddingChunkUnobserved, .{ self, input_embeddings, ple_token_ids, seq_len, decode_context, capture_last_hidden, intent });
     }
 
-    fn tryMetalPreparedMultimodalPrefillUnobserved(
+    fn tryMetalPreparedEmbeddingChunkUnobserved(
         self: *Forward,
         input_embeddings: ops.CT,
         ple_token_ids: []const i64,
         seq_len: usize,
         decode_context: *const gpt_arch.DecodeContext,
         capture_last_hidden: bool,
+        intent: PreparedEmbeddingOutput,
     ) !?Output {
         if (self.forward.context.cb.kind() != .metal) return null;
         if (decode_context.attention_mode != .paged_prefill or decode_context.attn_or_mask != null) return null;
-        if (!metalPreparedTailOwnsWholePrefill(ple_token_ids.len, seq_len, decode_context)) return null;
+        if (decode_context.total_sequence_len != seq_len or decode_context.query_sequence_len != ple_token_ids.len or
+            decode_context.kv_sequence_len != seq_len or decode_context.kv_position_offset != 0 or ple_token_ids.len > seq_len) return null;
+        if (intent == .kv_only and capture_last_hidden) return null;
         const prepared = self.forward.context.cb.decoderRuntimePrepareOrReuseFamily(
             self.forward.context.allocator,
             self.forward.context.gpt_config.*,
@@ -1625,8 +1644,10 @@ pub const Forward = struct {
             ple_token_ids,
             seq_len,
             decode_context,
+            if (intent == .kv_only and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_SHARED_KV_PREFILL", true)) .kv_only else .all,
         )) orelse return null;
         defer rows.deinit(self.forward.context.cb);
+        if (intent == .kv_only) return .{};
         const last_hidden = try self.forward.context.cb.sliceRows2D(self.forward.context.allocator, rows.final_hidden, rows.rows - 1, 1, self.forward.context.gpt_config.*.hidden_size);
         var owns_last_hidden = true;
         defer if (owns_last_hidden) self.forward.context.cb.free(last_hidden);

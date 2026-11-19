@@ -3616,6 +3616,22 @@ pub const GptGenerationBudgetComponent = struct {
     prompt_input_copies: u8 = 0,
     host_prompt_input_copies: u8 = 0,
 
+    /// Automatic allowances beside model residency, never upfront reservations.
+    /// Operator overrides and physical/process checks remain authoritative.
+    pub fn fullWindowBudgetFloor(self: @This(), context_tokens: usize, chunk_rows: usize, backend_residency_bytes: usize, auxiliary: Limits) !Limits {
+        if (context_tokens < 2 or context_tokens > self.config.max_position_embeddings) return error.InvalidModelConfig;
+        const footprint = try self.estimate(context_tokens - 1, 1, chunk_rows);
+        const host = try std.math.add(usize, footprint.host_input_bytes, footprint.host_metadata_bytes);
+        const backend = try std.math.add(usize, backend_residency_bytes, try std.math.add(usize, footprint.kv_bytes, footprint.scratch_bytes));
+        return .{
+            .host_limit_bytes = try std.math.add(usize, auxiliary.host_limit_bytes, host),
+            .backend_limit_bytes = try std.math.add(usize, auxiliary.backend_limit_bytes, backend),
+            .combined_limit_bytes = try std.math.add(usize, auxiliary.combined_limit_bytes, try std.math.add(usize, host, backend)),
+            .kv_limit_bytes = @max(auxiliary.kv_limit_bytes, footprint.kv_bytes),
+            .scratch_limit_bytes = try std.math.add(usize, auxiliary.scratch_limit_bytes, try std.math.add(usize, host, footprint.scratch_bytes)),
+        };
+    }
+
     pub fn estimate(self: @This(), prompt_tokens: usize, max_tokens: usize, chunk: usize) !Estimate {
         var result = try estimateGptGenerationForKvPolicy(self.backend, self.kv_dtype, self.config, prompt_tokens, max_tokens, chunk, self.kv_capacity_policy);
         if (self.backend == .native and self.backend_owns_kv) result.kv_bytes = 0;
@@ -6419,4 +6435,25 @@ test "prepared prompt input planes remain admitted when layer chunks shrink" {
     try std.testing.expectError(error.ResourceLimitExceeded, exact.reserveEstimate(overflow));
     try std.testing.expectError(error.ResourceLimitExceeded, AdmissionAmounts.fromEstimate(overflow));
     try std.testing.expectEqual(@as(usize, 0), exact.backendTotalBytes());
+}
+
+test "shared full window allowance admits Metal residency and preserves explicit caps" {
+    const config = gpt_mod.Config{ .hidden_size = 8, .num_hidden_layers = 2, .num_attention_heads = 1, .num_key_value_heads = 1, .attention_head_dim = 8, .intermediate_size = 16, .vocab_size = 8, .max_position_embeddings = 4096 };
+    const component = GptGenerationBudgetComponent{ .backend = .metal, .kv_dtype = .f16, .config = config, .prompt_input_copies = 2, .host_prompt_input_copies = 1 };
+    const residency = 8 * 1024 * 1024;
+    const floor = try component.fullWindowBudgetFloor(4096, 512, residency, .{});
+    const request = try component.estimate(4064, 32, 512);
+    var budget = RunBudget.init(floor);
+    try budget.tryReserve(.{ .kind = .weight, .tier = .backend, .bytes = residency });
+    try budget.reserveEstimate(request);
+    budget.releaseEstimate(request);
+    try std.testing.expectEqual(residency, budget.backendTotalBytes());
+    budget.release(.{ .kind = .weight, .tier = .backend, .bytes = residency });
+    try std.testing.expectEqual(@as(usize, 0), budget.hostTotalBytes());
+    try std.testing.expectEqual(@as(usize, 0), budget.backendTotalBytes());
+    var capped = RunBudget.init(applyLimitOverrides(floor, .{ .kv_limit_bytes = request.kv_bytes - 1 }));
+    try std.testing.expectError(error.MemoryBudgetExceeded, capped.reserveEstimate(request));
+    try std.testing.expectEqual(@as(usize, 0), capped.backendTotalBytes());
+    try std.testing.expectError(error.InvalidModelConfig, component.fullWindowBudgetFloor(4097, 512, residency, .{}));
+    try std.testing.expectError(error.Overflow, component.fullWindowBudgetFloor(4096, 512, std.math.maxInt(usize), .{}));
 }

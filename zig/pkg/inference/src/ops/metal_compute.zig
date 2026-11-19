@@ -37429,6 +37429,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             );
             return false;
         }
+        if (request.contract == .gemma4_gated_ple_shared_kv and request.seq_len != 0 and request.seq_len < request.rows) return false;
         if (request.hidden_size == 0 or request.num_attention_heads == 0) {
             traceMetalPrefillFramePlan(
                 "decline=model-shape hidden={d} heads={d}",
@@ -37592,6 +37593,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn buildSelectedPrefillFrame(frame_plan: *metal_command_planner.GatedFrameCommandLowerer, request: *const ops.DecoderRuntimePrefillFramePlanRequest, layers: []const metal_command_planner.GatedFrameCommandLowerer.Layer, tail_quant_format: metal_command_planner.QuantMatmulFormat) !void {
         try frame_plan.build(.{
             .rows = request.rows,
+            .kv_tokens = if (request.contract == .gemma4_gated_ple_shared_kv) request.seq_len else 0,
             .hidden_size = request.hidden_size,
             .vocab_size = request.vocab_size,
             .num_attention_heads = request.num_attention_heads,
@@ -37643,6 +37645,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         errdefer if (owns_hidden) freeTemporaryWorkspaceCtOp(ctx, hidden);
 
         const full_frame_contract = self.activePrefillFrameFullContract() orelse return self.declinePrefillFrameExecute(.plan_mismatch);
+        // Reject a stale or mismatched prefix/tail plan before the first KV
+        // write. The same cursor will drive the actual existing layer kernels.
+        var validation = metal_command_planner.GatedFramePlanCursor.init(frame_plan.view());
+        for (request.layers) |layer| {
+            _ = validation.nextLayer(.{ .shares_kv = layer.shares_kv, .value_norm = request.global_head_dim != 0 and !layer.shares_kv, .kv_seed = true, .include_ple = true }) orelse return self.declinePrefillFrameExecute(.plan_mismatch);
+        }
+        if (request.include_tail) _ = validation.nextTailLogits() orelse return self.declinePrefillFrameExecute(.plan_mismatch);
+        if (!validation.complete()) return self.declinePrefillFrameExecute(.plan_mismatch);
         var frame_cursor = metal_command_planner.GatedFramePlanCursor.init(frame_plan.view());
         for (request.layers, 0..) |layer, layer_index| {
             const head_dim = layer.head_dim;
@@ -37735,9 +37745,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             _ = attention_input_size;
         }
 
-        const tail_window = frame_cursor.nextTailLogits() orelse return self.declinePrefillFrameExecute(.plan_mismatch);
-        if (!frame_cursor.complete()) return self.declinePrefillFrameExecute(.plan_mismatch);
-        self.active_prefill_frame_tail_contract = self.activePrefillFrameTailContract(tail_window) orelse return self.declinePrefillFrameExecute(.plan_mismatch);
+        if (request.include_tail) {
+            const tail_window = frame_cursor.nextTailLogits() orelse return error.PrefillFramePlanChangedAfterCommit;
+            self.active_prefill_frame_tail_contract = self.activePrefillFrameTailContract(tail_window) orelse return error.PrefillFramePlanChangedAfterCommit;
+        } else self.active_prefill_frame_tail_contract = null;
+        if (!frame_cursor.complete()) return error.PrefillFramePlanChangedAfterCommit;
         request.output_hidden.* = hidden;
         owns_hidden = false;
         execute_success = true;

@@ -4985,7 +4985,9 @@ pub const NativeGenerationPipeline = struct {
                 .leased_plan = if (self.scheduler_lease) |lease| if (lease.prefill_chunk_plan.isAdmitted()) lease.prefill_chunk_plan else null else null,
                 .configured_chunk_rows = config.prefill_chunk_size,
                 .scheduler_chunk_rows = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
-                .default_chunk_rows = if (comptime build_options.enable_cuda) bounded: {
+                .default_chunk_rows = if (self.cb.kind() == .metal)
+                    decoder_routes.metalPreparedEmbeddingChunkRows(self.gpt_config, 0) orelse 0
+                else if (comptime build_options.enable_cuda) bounded: {
                     if (self.cb.kind() == .cuda) {
                         if (@import("../execution/gemma4_native_plan.zig").Plan.resolve(self.gpt_config)) |plan|
                             break :bounded plan.geometry.prefillChunkRows(seq_len, 0);

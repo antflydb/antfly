@@ -1538,7 +1538,7 @@ pub const Executor = struct {
                 var decode_runtime = BorrowedDecodeStateRuntime.init(work.decode_state);
                 var context = decode_runtime.makeDecodeContext(work.seq_len, work.query_seq_len);
                 try self.context.bindDecoderCleanup(&context);
-                if (try gpt_arch.tryCudaSharedKvPrefill(self.context.cb, self.context.allocator, self.context.gpt_config.*, work.token_ids, work.seq_len, &context, false)) |_| {
+                if (try gpt_arch.trySharedKvPrefill(self.context.cb, self.context.allocator, self.context.gpt_config.*, work.token_ids, work.seq_len, &context, false)) |_| {
                     return .{ .logits = null, .max_query_seq_len = max_query_seq_len };
                 }
             }

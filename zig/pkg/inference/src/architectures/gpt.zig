@@ -1365,8 +1365,8 @@ pub fn forwardLastLogitsLastRowTensorFromEmbeddingsWithLayer0Overrides(
         .last
     else
         .all;
-    if (output == .last) std.log.info("cuda_multimodal_shared_kv_prefill rows={d} donor_layers={d}", .{
-        seq_len, config.num_hidden_layers - config.num_kv_shared_layers,
+    if (output == .last) std.log.info("multimodal_shared_kv_prefill backend={s} rows={d} donor_layers={d}", .{
+        @tagName(cb.kind()), seq_len, config.num_hidden_layers - config.num_kv_shared_layers,
     });
     const hidden_result = try forwardFinalHiddenWithSharedKvOutput(
         cb,
@@ -2944,7 +2944,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0OverridesAndTrace(
 pub const SharedKvPrefillOutput = enum { all, last, kv_only };
 
 fn sharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
-    const geometry = @import("../execution/gemma4_native_plan.zig").Geometry.resolve(config) orelse return null;
+    const donor_layers = config.sharedKvPrefillDonorLayers() orelse return null;
     const functional = dc.attention_mode == .full_recompute and dc.forward_kv_reuse != null and dc.kv_cache == null;
     if ((!functional and (dc.attention_mode != .paged_prefill or dc.kv_cache == null)) or dc.query_sequence_len <= 1 or
         dc.query_sequence_len > dc.total_sequence_len or
@@ -2956,7 +2956,7 @@ fn sharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
             mask.len != (std.math.mul(usize, dc.total_sequence_len, dc.total_sequence_len) catch return null)) return null;
     }
     if (dc.input_ids) |ids| if (ids.len == 0) return null;
-    return geometry.donor_layers;
+    return donor_layers;
 }
 
 fn preparedSharedKvPrefillEligible(config: Config, overrides: Layer0DecoderOverrides, batch: usize, seq_len: usize, context: ?*const DecodeContext) bool {
@@ -3122,7 +3122,7 @@ pub const SharedKvPrefillResult = struct { last_logits: ?[]f32 = null };
 /// E4B's shared suffix produces no KV. KV-only chunks can omit it, and a
 /// final-logit chunk only needs its last row. Null always precedes KV writes;
 /// errors after execution begins must be handled by the caller's rollback.
-pub fn tryCudaSharedKvPrefill(
+pub fn trySharedKvPrefill(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     config: Config,
@@ -3131,7 +3131,13 @@ pub fn tryCudaSharedKvPrefill(
     dc: *const DecodeContext,
     want_last_logits: bool,
 ) !?SharedKvPrefillResult {
-    if (cb.kind() != .cuda or disableSharedKvDebug() or !@import("../ops/cuda/cuda_compute.zig").CudaCompute.gemma4SharedKvPrefillEnabled(cb)) return null;
+    if (disableSharedKvDebug()) return null;
+    const enabled = switch (cb.kind()) {
+        .metal => platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_SHARED_KV_PREFILL", true),
+        .cuda => if (comptime build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig").CudaCompute.gemma4SharedKvPrefillEnabled(cb) else false,
+        else => false,
+    };
+    if (!enabled) return null;
     // This entry consumes actual token embeddings. Prepared media embeddings
     // use the positioned-embedding entry instead; a checkpoint having a vision
     // tower must not disable pruning for its ordinary text requests.
@@ -3143,6 +3149,14 @@ pub fn tryCudaSharedKvPrefill(
     }
     _ = sharedKvPrefillBoundary(config, dc.*) orelse return null;
     if (input_ids.len != dc.query_sequence_len or seq_len != dc.total_sequence_len) return null;
+    if (cb.kind() == .metal) {
+        if (want_last_logits) return null;
+        const prepared = cb.decoderRuntimePrepareOrReuseFamily(allocator, config, seq_len, config.num_hidden_layers) catch return null;
+        if (!prepared.prepared) return null;
+        var rows = (try @import("../backends/decoder_gated_runtime.zig").forwardFinalHiddenRowsKvOnly(cb, allocator, config, config.num_hidden_layers, input_ids, seq_len, dc)) orelse return null;
+        rows.deinit(cb);
+        return .{};
+    }
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
     const hidden = try lookupScaledTokenEmbeddings(cb, allocator, config, embed_w, input_ids, input_ids.len, config.hidden_size);
@@ -3150,8 +3164,8 @@ pub fn tryCudaSharedKvPrefill(
     errdefer if (owns_hidden) cb.free(hidden);
     const ple = try computePleVectors(cb, allocator, config, input_ids, hidden, input_ids.len);
     defer if (ple) |tensor| cb.free(tensor);
-    std.log.info("cuda_shared_kv_prefill query_rows={d} donor_layers={d} shared_layers={d} output={s}", .{
-        input_ids.len,                                                config.num_hidden_layers - config.num_kv_shared_layers, config.num_kv_shared_layers,
+    std.log.info("shared_kv_prefill backend={s} query_rows={d} donor_layers={d} shared_layers={d} output={s}", .{
+        @tagName(cb.kind()),                                          input_ids.len, config.num_hidden_layers - config.num_kv_shared_layers, config.num_kv_shared_layers,
         if (want_last_logits) @as([]const u8, "last") else "kv_only",
     });
     owns_hidden = false;
