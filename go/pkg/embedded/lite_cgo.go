@@ -186,18 +186,28 @@ func EncodeBatchWire(writes []WriteIntent, syncLevel SyncLevel) ([]byte, error) 
 		return nil, err
 	}
 	var writeCount, deleteCount uint32
-	size := 4 + 2 + 1 + 1 + 4 + 4 // magic, version, sync_level, reserved, write_count, delete_count
+	var writeSizer, deleteSizer batchWireSizer
+	sizer := batchWireSizer{size: 4 + 2 + 1 + 1 + 4 + 4} // magic, version, sync_level, reserved, write_count, delete_count
 	for _, w := range writes {
+		counter := &writeSizer
 		if w.Delete {
-			deleteCount++
-			size += 4 + len(w.Key)
-			continue
+			counter = &deleteSizer
 		}
-		writeCount++
-		size += 4 + len(w.Key) + 4 + len(w.Value)
+		if err := counter.addEntry(); err != nil {
+			return nil, err
+		}
+		if err := sizer.addLength(len(w.Key)); err != nil {
+			return nil, err
+		}
+		if !w.Delete {
+			if err := sizer.addLength(len(w.Value)); err != nil {
+				return nil, err
+			}
+		}
 	}
+	writeCount, deleteCount = uint32(writeSizer.entries), uint32(deleteSizer.entries)
 
-	buf := make([]byte, size)
+	buf := make([]byte, sizer.size)
 	cursor := 0
 	putU32 := func(v uint32) {
 		binary.LittleEndian.PutUint32(buf[cursor:], v)
