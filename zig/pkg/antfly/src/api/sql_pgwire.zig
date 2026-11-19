@@ -417,7 +417,7 @@ pub const CatalogReplicationSlots = struct {
 
     /// Read the existing SQL transaction and qualified replication cut before
     /// the importer installs a read provider. No transaction is created here.
-    pub fn qualifyTransactionSnapshot(self: CatalogReplicationSlots, a: std.mem.Allocator, identity: wire.Identity, request: wire.Request, name: []const u8) !control.SlotSnapshot {
+    pub fn qualifyTransactionSnapshot(self: CatalogReplicationSlots, a: std.mem.Allocator, identity: wire.Identity, request: wire.Request, name: []const u8) !ImportedSnapshot {
         try request.check();
         if (self.identity.context != identity.context or self.identity.read != &Adapter.replicationIdentity) return error.Forbidden;
         const credential: *Credential = @ptrCast(@alignCast(identity.context));
@@ -432,9 +432,10 @@ pub const CatalogReplicationSlots = struct {
         if (!std.mem.eql(u8, self.database_name, request.database orelse "default")) return error.SqlTransactionNotActive;
         const snapshot = try control.SlotSnapshot.parse(name);
         var qualified = try self.qualifySnapshot(a, snapshot, try @import("../pgwire/retained_stream.zig").metadataContext(request));
-        qualified.deinit();
+        defer qualified.deinit();
+        if (qualified.value.roots.len != 1) return error.ChangefeedCapabilityUnsupported;
         try request.check();
-        return snapshot;
+        return .{ .transaction = id, .token = snapshot, .namespace = qualified.value.roots[0].namespace };
     }
 
     fn validateSnapshotTransaction(transaction: @import("transactions.zig").SessionRegistry.SqlState, database: []const u8, namespace: []const u8) !void {
@@ -1305,6 +1306,7 @@ pub const Adapter = struct {
         .evaluate_parameters = evaluateParameters,
         .evaluate_parameter_cells = evaluateParameterCells,
         .fail_transaction = failTransaction,
+        .import_snapshot = importSnapshot,
         .open_stream = openStream,
         .disconnect = disconnect,
         .completion_safe = completionSafe,
@@ -1347,6 +1349,22 @@ pub const Adapter = struct {
         const bytes = try self.server.source.systemCatalog(alloc, context, .{ .setting_snapshot = scope });
         defer alloc.free(bytes);
         return std.json.parseFromSliceLeaky(@import("antfly_local_sources").sql_setting_catalog.RawSnapshot, alloc, bytes, .{ .allocate = .alloc_always });
+    }
+
+    fn importSnapshot(raw: *anyopaque, a: std.mem.Allocator, identity: wire.Identity, request: wire.Request, name: []const u8) !void {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        const credential: *Credential = @ptrCast(@alignCast(identity.context));
+        if (self.server.cfg.native_history_roots == null or self.server.cfg.native_history_roots.?.bootstrap_pages == null)
+            return error.ChangefeedCapabilityUnsupported;
+        const context = try @import("../pgwire/retained_stream.zig").metadataContext(request);
+        if (credential.imported_snapshot) |existing| {
+            if (request.session_id) |encoded| {
+                const id = try @import("distributed_txn.zig").parseTxnIdHex(encoded);
+                if (std.mem.eql(u8, &id, &existing.transaction)) return error.ActiveSqlTransaction;
+            }
+        }
+        const slots = try CatalogReplicationSlots.open(self.server, .{ .context = credential, .read = replicationIdentity }, a, request.database orelse "default", context);
+        credential.imported_snapshot = try slots.qualifyTransactionSnapshot(a, identity, request, name);
     }
 
     fn failTransaction(raw: *anyopaque, identity: wire.Identity, request: wire.Request) !void {
@@ -1641,7 +1659,7 @@ const OwnedRead = struct {
         errdefer self.identity.?.deinit(server.alloc);
         // Statement, parameter and binding-guard data are portal-owned. Keep a
         // private request capsule so I/O borrows point to a stable address.
-        self.authority = .{ .credential = credential, .identity = &self.identity, .request = request };
+        self.authority = .{ .server = server, .credential = credential, .identity = &self.identity, .request = request };
         self.authority.request.statement = try arena.dupe(u8, request.statement);
         self.authority.request.database = try arena.dupe(u8, request.database orelse "default");
         self.authority.request.namespace = try arena.dupe(u8, request.namespace orelse "public");
@@ -1936,6 +1954,12 @@ const StreamJob = struct {
 /// must be a valid token signed with this instance's configured HTTP authority.
 pub const trusted_principal_username = "__antfly_trusted_principal__";
 
+const ImportedSnapshot = struct {
+    transaction: [16]u8,
+    token: publication_control.SlotSnapshot,
+    namespace: publication_control.Namespace,
+};
+
 const Credential = struct {
     manager: ?*usermgr.UserManager,
     username: []u8,
@@ -1946,6 +1970,7 @@ const Credential = struct {
     trusted_issuer: ?[]u8 = null,
     trusted_expires: i64 = 0,
     session_cleanup_complete: bool = true,
+    imported_snapshot: ?ImportedSnapshot = null,
     user_instance_id: ?[16]u8 = null,
 
     fn sessionPrincipal(self: *const Credential) []const u8 {
@@ -2319,7 +2344,7 @@ const Job = struct {
         preparation.release();
         var identity: ?http.AuthenticatedIdentity = try self.credential.identity(server.alloc);
         defer identity.?.deinit(server.alloc);
-        var authority = Authority{ .credential = self.credential, .identity = &identity, .request = self.request };
+        var authority = Authority{ .server = server, .credential = self.credential, .identity = &identity, .request = self.request };
         const context = try authority.context();
         var native_adapter = execution.Adapter{
             .server = server,
@@ -2608,6 +2633,7 @@ fn releaseResult(raw: *anyopaque) void {
 }
 
 const Authority = struct {
+    server: ?*http.ApiHttpServer = null,
     credential: *Credential,
     identity: *?http.AuthenticatedIdentity,
     request: wire.Request,
@@ -2653,8 +2679,16 @@ const Authority = struct {
         const self: *Authority = @ptrCast(@alignCast(raw));
         try @import("sql_completion.zig").rejectMetadata(self.credential.trusted_server orelse return error.DurabilityUnavailable, self.request.completion_allocator orelse return error.InvalidArgument, self.request.completion.?, owner);
     }
+    fn importedSnapshot(self: *const Authority) ?ImportedSnapshot {
+        const snapshot = self.credential.imported_snapshot orelse return null;
+        const encoded = self.request.session_id orelse return null;
+        const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return null;
+        return if (std.mem.eql(u8, &snapshot.transaction, &id)) snapshot else null;
+    }
+
     fn allowsWrite(raw: *const anyopaque, table: []const u8) bool {
         const self: *const Authority = @ptrCast(@alignCast(raw));
+        if (self.importedSnapshot() != null) return false;
         self.credential.validate() catch return false;
         return http.tablePermissionCurrentlyAllowed(self.identity.*, table, .write) catch false;
     }
@@ -2668,12 +2702,20 @@ const GuardedCatalog = struct {
     fn backend(self: *GuardedCatalog) catalog.Backend {
         var result = self.native;
         result.ptr = self;
+        if (self.authority.importedSnapshot() != null) {
+            result.distributed_join = null;
+            result.supports_search_relations = false;
+            result.coordinated_point_reads = false;
+            result.coordinated_index_reads = false;
+            result.dynamic_statement_read_set = false;
+        }
         result.vtable = &.{ .resolve = resolve, .resolve_graph = resolveGraph, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
         return result;
     }
     fn resolveGraph(raw: *anyopaque, alloc: std.mem.Allocator, definition: ast.GraphTable) !catalog.Table {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try checkpoint(raw);
+        if (self.authority.importedSnapshot() != null) return error.UnsupportedSqlShape;
         const resolve_graph = self.native.vtable.resolve_graph orelse return error.UnsupportedSqlExecution;
         const table = try resolve_graph(self.native.ptr, alloc, definition);
         if (self.expected_guard) |guard| try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, table);
@@ -2737,9 +2779,88 @@ const GuardedCatalog = struct {
         if (self.expected_guard) |guard| try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, table);
         return table;
     }
+    fn scanPinned(self: *GuardedCatalog, alloc: std.mem.Allocator, snapshot: ImportedSnapshot, table: catalog.Table, request: catalog.Scan) !catalog.Page {
+        if (request.search != null or request.index_equality != null or request.index_range != null or
+            request.primary_key != null or request.before != null or request.physical_selection != null or request.row_refs != null or
+            request.include_document or request.include_primary_digest or request.conditions.len != 0 or request.order.len != 0)
+            return error.UnsupportedSqlShape;
+        const authority = self.authority;
+        const server = authority.server orelse return error.ChangefeedCapabilityUnsupported;
+        const context = try authority.context();
+        const slots = try CatalogReplicationSlots.open(server, .{ .context = authority.credential, .read = Adapter.replicationIdentity }, alloc, authority.request.database orelse "default", context);
+        return slots.readExportedSnapshotCatalogPage(alloc, &snapshot.token.name(), snapshot.namespace, table, request.after, @min(request.limit, 256), 4 * 1024 * 1024, context);
+    }
+
+    const PinnedCursor = struct {
+        alloc: std.mem.Allocator,
+        guard: *GuardedCatalog,
+        table: catalog.Table,
+        request: catalog.Scan,
+        snapshot: ImportedSnapshot,
+        after: ?[]u8 = null,
+        done: bool = false,
+
+        fn next(raw: *anyopaque, a: std.mem.Allocator, limit: u32) !catalog.Page {
+            const self: *PinnedCursor = @ptrCast(@alignCast(raw));
+            if (self.done) return .{ .rows = &.{} };
+            try self.guard.checkTableRead(self.table);
+            var request = self.request;
+            request.limit = limit;
+            request.after = self.after;
+            const page = try self.guard.scanPinned(a, self.snapshot, self.table, request);
+            errdefer page.deinit();
+            const after = if (page.after) |position| try self.alloc.dupe(u8, position) else null;
+            if (self.after) |old| self.alloc.free(old);
+            self.after = after;
+            self.done = after == null;
+            return page;
+        }
+
+        fn close(raw: *anyopaque) void {
+            const self: *PinnedCursor = @ptrCast(@alignCast(raw));
+            if (self.after) |after| self.alloc.free(after);
+            self.alloc.destroy(self);
+        }
+    };
+
+    fn openPinned(self: *GuardedCatalog, a: std.mem.Allocator, snapshot: ImportedSnapshot, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {
+        const cursor = try a.create(PinnedCursor);
+        errdefer a.destroy(cursor);
+        const after = if (request.after) |position| try a.dupe(u8, position) else null;
+        cursor.* = .{ .alloc = a, .guard = self, .table = table, .request = request, .snapshot = snapshot, .after = after };
+        return .{ .ptr = cursor, .next = PinnedCursor.next, .close = PinnedCursor.close };
+    }
+
+    const PinnedStatement = struct {
+        alloc: std.mem.Allocator,
+        cursors: []catalog.Cursor,
+        fn close(raw: *anyopaque) void {
+            const self: *PinnedStatement = @ptrCast(@alignCast(raw));
+            for (self.cursors) |cursor| cursor.close(cursor.ptr);
+            self.alloc.free(self.cursors);
+            self.alloc.destroy(self);
+        }
+    };
+
+    fn openPinnedStatement(self: *GuardedCatalog, a: std.mem.Allocator, snapshot: ImportedSnapshot, scans: []const catalog.StatementScan) !catalog.StatementRead {
+        const statement = try a.create(PinnedStatement);
+        errdefer a.destroy(statement);
+        const cursors = try a.alloc(catalog.Cursor, scans.len);
+        errdefer a.free(cursors);
+        var opened: usize = 0;
+        errdefer for (cursors[0..opened]) |cursor| cursor.close(cursor.ptr);
+        for (scans, cursors) |selection, *cursor| {
+            cursor.* = try self.openPinned(a, snapshot, selection.table, selection.request);
+            opened += 1;
+        }
+        statement.* = .{ .alloc = a, .cursors = cursors };
+        return .{ .ptr = statement, .cursors = cursors, .close = PinnedStatement.close };
+    }
+
     fn scan(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try self.checkTableRead(table);
+        if (self.authority.importedSnapshot()) |snapshot| return self.scanPinned(alloc, snapshot, table, request);
         return self.native.vtable.scan(self.native.ptr, alloc, table, request);
     }
     fn checkRead(self: *GuardedCatalog, table: []const u8) !void {
@@ -2875,6 +2996,7 @@ const GuardedCatalog = struct {
     fn openScan(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try self.checkTableRead(table);
+        if (self.authority.importedSnapshot()) |snapshot| return try self.openPinned(alloc, snapshot, table, request);
         const open = self.native.vtable.open_scan orelse return null;
         const inner = (try open(self.native.ptr, alloc, table, request)) orelse return null;
         errdefer inner.close(inner.ptr);
@@ -2930,6 +3052,7 @@ const GuardedCatalog = struct {
     fn openStatement(raw: *anyopaque, alloc: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         for (scans) |scan_request| try self.checkTableRead(scan_request.table);
+        if (self.authority.importedSnapshot()) |snapshot| return self.openPinnedStatement(alloc, snapshot, scans);
         const open = self.native.vtable.open_statement orelse return error.SqlStatementSnapshotRequired;
         const inner = try open(self.native.ptr, alloc, scans);
         errdefer inner.close(inner.ptr);
@@ -2956,6 +3079,7 @@ const GuardedCatalog = struct {
     fn ddl(raw: *anyopaque, allocators: catalog.DdlAllocators, input: catalog.Ddl) !catalog.DdlOutcome {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try checkpoint(raw);
+        if (self.authority.importedSnapshot() != null) return error.SqlReadOnlyTransaction;
         const dispatch_ddl = self.native.vtable.ddl orelse return error.UnsupportedSqlExecution;
         // Refresh current grants before native DDL authorizes resource, rename
         // destination and tablespace. Prepared metadata never grants authority.
@@ -3925,6 +4049,17 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
         try std.testing.expectError(error.InvalidReplicationSnapshot, slots.readExportedSnapshot(alloc, "invalid", namespace, 0, 1, 4096, .{}));
         try std.testing.expectError(error.ChangefeedCapabilityUnsupported, slots.readExportedSnapshotRows(alloc, &token.name(), namespace, 0, 1, 4096, .{}));
         const sql_table: catalog.Table = .{ .id = after.members[0].table.table_id, .physical_name = "physical", .schema_version = 1, .columns = &.{} };
+        const transaction: [16]u8 = @splat(9);
+        credential.imported_snapshot = .{ .transaction = transaction, .token = token, .namespace = namespace };
+        defer credential.imported_snapshot = null;
+        var wrong_request = authority.request;
+        var bound_authority: Authority = .{ .credential = credential, .identity = &identity, .request = wrong_request };
+        try std.testing.expect(bound_authority.importedSnapshot() == null);
+        const session_hex = std.fmt.bytesToHex(transaction, .lower);
+        wrong_request.session_id = &session_hex;
+        bound_authority.request = wrong_request;
+        try std.testing.expectEqualDeep(token, bound_authority.importedSnapshot().?.token);
+        try std.testing.expect(!Authority.allowsWrite(&bound_authority, "physical"));
         try std.testing.expectError(error.HistoryCheckpointConflict, slots.readExportedSnapshotCatalogPage(alloc, &token.name(), namespace, sql_table, "bad", 1, 4096, .{}));
         try std.testing.expectError(error.ChangefeedCapabilityUnsupported, slots.readExportedSnapshotCatalogPage(alloc, &token.name(), namespace, sql_table, null, 1, 4096, .{}));
     }
