@@ -209,6 +209,9 @@ pub const Backend = struct {
         refresh: ?*const fn (*anyopaque, std.mem.Allocator, Identity, []const u8) anyerror!void = null,
         describe: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Description,
         execute: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Result,
+        /// Attach a qualified cut to the existing SQL transaction. The owner
+        /// checks isolation, prior transaction work and import eligibility.
+        import_snapshot: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request, []const u8) anyerror!void = null,
         /// Authenticated catalog snapshot for typed dotted-name SET/SHOW/RESET.
         load_settings: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!@import("antfly_local_sources").sql_setting_catalog.RawSnapshot = null,
         validate_namespace: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!void = null,

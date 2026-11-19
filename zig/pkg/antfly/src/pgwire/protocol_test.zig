@@ -3251,3 +3251,40 @@ test "pgwire CopyBoth validated reconnect feedback can precede rewound transacti
     try std.testing.expectEqual(@as(u64, 0), mock.replication_ack);
     try std.testing.expectEqual(@as(usize, 1), mock.replication_stream_closes);
 }
+
+test "pgwire snapshot imports dispatch only inside the current transaction" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn attach(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request, name: []const u8) !void {
+            const mock: *Mock = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", request.session_id.?);
+            try std.testing.expectEqualStrings("qualified-snapshot", name);
+            try request.check();
+            mock.setting_stream_opens += 1;
+        }
+    };
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "SET TRANSACTION SNAPSHOT 'qualified-snapshot'\x00");
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try frame(&input.writer, 'Q', "SET TRANSACTION SNAPSHOT 'qualified-snapshot'\x00");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var source = mock.source();
+    var vtable = source.vtable.*;
+    vtable.import_snapshot = Fixture.attach;
+    source.vtable = &vtable;
+    var reader = std.Io.Reader.fixed(input.written());
+    var output = std.Io.Writer.Allocating.init(a);
+    defer output.deinit();
+    var session: protocol.Session = .{ .alloc = a, .io = std.testing.io, .source = source, .reader = &reader, .writer = &output.writer };
+    defer session.deinit();
+    try session.run();
+    try std.testing.expectEqual(@as(usize, 1), mock.setting_stream_opens);
+    try std.testing.expectEqual(@as(usize, 2), mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "25001") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "25P01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "SET\x00") != null);
+}

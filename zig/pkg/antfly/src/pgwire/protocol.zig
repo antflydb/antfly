@@ -555,7 +555,7 @@ pub const Session = struct {
                 .formatting => |value| self.executeFormattingSetting(alloc, value),
                 .client_encoding => |value| self.executeEncodingSetting(alloc, value),
                 .catalog => |value| self.executeCatalogSetting(alloc, statement, value),
-                .transaction_snapshot => error.UnsupportedReplicationOption,
+                .transaction_snapshot => |name| self.importSnapshot(alloc, statement, name),
                 .reset_all => self.executeResetAll(),
                 .discard_all => self.executeDiscardAll(),
             };
@@ -663,6 +663,20 @@ pub const Session = struct {
         };
         if (self.status == .idle) self.finishSqlCursors(std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT"));
         return result;
+    }
+
+    fn importSnapshot(self: *Session, alloc: std.mem.Allocator, statement: []const u8, name: []const u8) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        if (self.status != .in_transaction or self.session_id == null) return error.NoActiveSqlTransaction;
+        const attach = self.source.vtable.import_snapshot orelse return error.UnsupportedReplicationOption;
+        const identity = self.identity orelse return error.AuthenticationFailed;
+        self.cancel_requested.store(false, .release);
+        self.executing.store(true, .release);
+        defer self.executing.store(false, .release);
+        const req = self.request(statement, &.{}, &.{});
+        try req.check();
+        try attach(self.source.context, alloc, identity, req, name);
+        return .{ .command_tag = "SET", .transaction_status = self.status, .session_id = self.session_id };
     }
 
     fn executeSearchPathSetting(self: *Session, alloc: std.mem.Allocator, statement: []const u8, setting: commands.SearchPathSetting) !backend.Result {
