@@ -522,7 +522,7 @@ pub const TypedFieldValue = struct {
 pub const NamedSortValue = struct { field_name: []const u8, value: segment_mod.SegmentIndexSortBoundValue };
 pub const NumericCoverageRejection = struct {
     path: []const u8,
-    kind: enum { field, descendants, subtree },
+    kind: enum { field, descendants, subtree, exact_source },
 };
 
 pub const TextDocument = struct {
@@ -1423,10 +1423,19 @@ fn writeTextSegmentWithScratch(
     defer rejected_fields.deinit(alloc);
     var rejected_parents: std.StringHashMapUnmanaged(void) = .empty;
     defer rejected_parents.deinit(alloc);
+    var projected_only: std.StringHashMapUnmanaged(void) = .empty;
+    defer projected_only.deinit(alloc);
     if (numeric_coverage.count() != 0) for (docs) |doc| {
         for (doc.numeric_coverage_rejections) |rejection| {
-            if (rejection.kind != .descendants) try rejected_fields.put(alloc, rejection.path, {});
-            if (rejection.kind != .field) try rejected_parents.put(alloc, rejection.path, {});
+            switch (rejection.kind) {
+                .field => try rejected_fields.put(alloc, rejection.path, {}),
+                .descendants => try rejected_parents.put(alloc, rejection.path, {}),
+                .subtree => {
+                    try rejected_fields.put(alloc, rejection.path, {});
+                    try rejected_parents.put(alloc, rejection.path, {});
+                },
+                .exact_source => try projected_only.put(alloc, rejection.path, {}),
+            }
         }
     };
     var witnesses: std.ArrayListUnmanaged(segment_mod.NumericRangeWitness) = .empty;
@@ -1447,7 +1456,8 @@ fn writeTextSegmentWithScratch(
             (typed.writer != null and typed.writer.?.entries.items.len != 0) or typed.staged.items.len != 0
         else
             false;
-        try witnesses.append(alloc, .{ .field = name, .coverage = if (populated) .populated else .empty });
+        const coverage: segment_mod.NumericRangeCoverage = if (!populated) .empty else if (projected_only.contains(name)) .projected else .populated;
+        try witnesses.append(alloc, .{ .field = name, .coverage = coverage });
     }
     try seg_writer.addNumericRangeWitnesses(witnesses.items);
 

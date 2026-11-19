@@ -127,7 +127,13 @@ const numeric_range_coverage_field = "\x00__antfly_numeric_range_coverage";
 const numeric_range_coverage_section: SectionType = .synonym;
 const numeric_range_coverage_header = "AFNR\x03";
 
-pub const NumericRangeCoverage = enum(u8) { empty = 1, populated = 2 };
+pub const NumericRangeCoverage = enum(u8) {
+    empty = 1,
+    /// The column preserves exact source values and null membership.
+    populated = 2,
+    /// The column preserves numeric_range's f64 projection only.
+    projected = 3,
+};
 pub const NumericRangeWitness = struct {
     field: []const u8,
     coverage: NumericRangeCoverage,
@@ -2400,7 +2406,7 @@ pub const SegmentReader = struct {
     }
 
     fn numericRangeWitnessConsistent(self: *const SegmentReader, field: []const u8, coverage: NumericRangeCoverage) bool {
-        return self.hasSection(field, .typed_doc_values) == (coverage == .populated);
+        return self.hasSection(field, .typed_doc_values) == (coverage != .empty);
     }
 
     pub fn provesNullIndexSortField(self: *const SegmentReader, name: []const u8) !bool {
@@ -5904,17 +5910,19 @@ const MergeNumericRangeCoverage = struct {
         wrote_typed_values: bool,
     ) !?NumericRangeCoverage {
         if (!self.fields.contains(field)) return null;
+        var projected_only = false;
         for (inputs, self.by_input) |input, map| {
             if (!inputHasLiveDocs(input)) continue;
             // A dense legacy column proves membership, but it cannot certify
             // that its values represent the declared source path.
             const proof = map.get(field) orelse return null;
+            projected_only = projected_only or proof == .projected;
             if (proof == .empty or wrote_typed_values) continue;
             var typed = (try input.reader.typedDocValuesScoped(alloc, field)) orelse return null;
             defer typed.deinit();
             if (!typedDocValuesValueTypeIsNumeric(typed.value_type)) return null;
         }
-        return if (wrote_typed_values) .populated else .empty;
+        return if (!wrote_typed_values) .empty else if (projected_only) .projected else .populated;
     }
 };
 
@@ -6436,7 +6444,7 @@ pub const InverseDocOrdinalReader = struct {
         return std.mem.readInt(u64, bytes[0..8], .big);
     }
 
-    pub fn addMatches(self: InverseDocOrdinalReader, ordinal: u32, offset: u32, docs: anytype, control: anytype) !void {
+    pub fn addMatches(self: InverseDocOrdinalReader, ordinal: u32, offset: u32, docs: anytype, control: anytype, deleted: ?*const roaring.RoaringBitmap) !void {
         const first = @as(u64, ordinal) << 32;
         var lo: u32 = 0;
         var hi = self.count;
@@ -6450,6 +6458,7 @@ pub const InverseDocOrdinalReader = struct {
             if (pair >> 32 != ordinal) break;
             const doc: u32 = @truncate(pair);
             if (doc >= self.count) return error.InvalidSegment;
+            if (deleted) |mask| if (mask.contains(doc)) continue;
             try docs.add(try std.math.add(u32, offset, doc), ordinal);
         }
     }

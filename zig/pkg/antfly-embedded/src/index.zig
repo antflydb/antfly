@@ -957,18 +957,24 @@ const max_bm25_bound_tables_per_snapshot: usize = 4;
 const GraphOrdinalNavigation = struct {
     const Entry = struct { ordinal: u32, doc: u32 };
     entries: []Entry,
+    segment_ends: []u32 = &.{},
     refs: std.atomic.Value(usize) = .init(1),
     owner: *GraphPredicateCache,
     alloc: Allocator,
     reservation: resource_manager_mod.Reservation,
 
+    fn ownedBytes(self: *const GraphOrdinalNavigation) usize {
+        return self.entries.len * @sizeOf(Entry) + self.segment_ends.len * @sizeOf(u32) + @sizeOf(GraphOrdinalNavigation);
+    }
+
     fn release(self: *@This()) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         const owner = self.owner;
-        const bytes = self.entries.len * @sizeOf(Entry) + @sizeOf(GraphOrdinalNavigation);
+        const bytes = self.ownedBytes();
         const alloc = self.alloc;
         var reservation = self.reservation;
         alloc.free(self.entries);
+        alloc.free(self.segment_ends);
         alloc.destroy(self);
         _ = owner.resident_bytes.fetchSub(bytes, .acq_rel);
         reservation.release();
@@ -1050,7 +1056,7 @@ pub const GraphPredicateCache = struct {
             } else null;
             self.mutex.unlock();
             if (retired) |navigation| {
-                freed += navigation.entries.len * @sizeOf(GraphOrdinalNavigation.Entry) + @sizeOf(GraphOrdinalNavigation);
+                freed += navigation.ownedBytes();
                 navigation.release();
             }
         }
@@ -2210,7 +2216,7 @@ pub const IndexSnapshot = struct {
         const manager = self.graph_predicates.manager.load(.acquire) orelse return null;
         var total: u32 = 0;
         for (self.segments) |segment| total = try std.math.add(u32, total, segment.reader.doc_count);
-        const bytes = @as(usize, total) * @sizeOf(GraphOrdinalNavigation.Entry) + @sizeOf(GraphOrdinalNavigation);
+        const bytes = @as(usize, total) * @sizeOf(GraphOrdinalNavigation.Entry) + self.segments.len * @sizeOf(u32) + @sizeOf(GraphOrdinalNavigation);
         if (bytes > 32 * 1024 * 1024 or !cache.ensureReclaimer(manager)) return null;
         if (manager.admissionDecision(.graph_predicate_cache, bytes).pressure != .normal) return null;
         if (!try self.hasDocOrdinalCoverage()) {
@@ -2227,6 +2233,8 @@ pub const IndexSnapshot = struct {
         const alloc = @import("antfly_platform").allocator.reclaimingScratch(self.alloc);
         const entries = alloc.alloc(GraphOrdinalNavigation.Entry, total) catch return null;
         defer if (owned) alloc.free(entries);
+        const segment_ends = alloc.alloc(u32, self.segments.len) catch return null;
+        defer if (owned) alloc.free(segment_ends);
         var offset: u32 = 0;
         for (self.segments, 0..) |segment, segment_index| {
             try control.check();
@@ -2243,6 +2251,7 @@ pub const IndexSnapshot = struct {
                 entries[doc] = .{ .ordinal = ordinal, .doc = doc };
             }
             offset += segment.reader.doc_count;
+            segment_ends[segment_index] = offset;
         }
         const Order = struct {
             fn less(_: void, a: GraphOrdinalNavigation.Entry, b: GraphOrdinalNavigation.Entry) bool {
@@ -2256,7 +2265,7 @@ pub const IndexSnapshot = struct {
         if (!cache.mutex.tryLock()) return null;
         defer cache.mutex.unlock();
         if (cache.ordinal_navigation != null) return null;
-        navigation.* = .{ .entries = entries, .refs = .init(2), .owner = cache, .alloc = alloc, .reservation = reservation };
+        navigation.* = .{ .entries = entries, .segment_ends = segment_ends, .refs = .init(2), .owner = cache, .alloc = alloc, .reservation = reservation };
         cache.ordinal_navigation = navigation;
         owned = false;
         return navigation;
@@ -2285,22 +2294,26 @@ pub const IndexSnapshot = struct {
     };
 
     fn seekGraphSegmentFrontier(
-        reader: *const SegmentReader,
+        segment: *const SegmentEntry,
         frontier: anytype,
         control: query_mod.ExecutionControl,
         offset: u32,
         docs: *GraphFrontierDocs,
     ) !bool {
-        const inverse = (try segment_mod.InverseDocOrdinalReader.init(reader)) orelse return false;
+        const inverse = (try segment_mod.InverseDocOrdinalReader.init(&segment.reader)) orelse return false;
+        segment.shared.lockDeletionShared();
+        defer segment.shared.unlockDeletionShared();
+        const deleted = if (segment.shared.deleted) |*mask| mask else null;
         var keys = frontier.keyIterator();
         while (keys.next()) |key| {
             try control.check();
-            try inverse.addMatches(key.*, offset, docs, control);
+            try inverse.addMatches(key.*, offset, docs, control, deleted);
         }
         return true;
     }
 
     fn addGraphNavigationFrontier(
+        self: *const IndexSnapshot,
         navigation: *const GraphOrdinalNavigation,
         frontier: anytype,
         control: query_mod.ExecutionControl,
@@ -2317,7 +2330,20 @@ pub const IndexSnapshot = struct {
             }
             while (low < navigation.entries.len and navigation.entries[low].ordinal == key.*) : (low += 1) {
                 try control.check();
-                try docs.add(navigation.entries[low].doc, key.*);
+                const doc = navigation.entries[low].doc;
+                var first: usize = 0;
+                var end = navigation.segment_ends.len;
+                while (first < end) {
+                    const middle = first + (end - first) / 2;
+                    if (navigation.segment_ends[middle] <= doc) first = middle + 1 else end = middle;
+                }
+                if (first >= self.segments.len) return error.InvalidSegment;
+                const base = if (first == 0) 0 else navigation.segment_ends[first - 1];
+                const segment = &self.segments[first];
+                segment.shared.lockDeletionShared();
+                defer segment.shared.unlockDeletionShared();
+                if (segment.shared.deleted) |deleted| if (deleted.contains(doc - base)) continue;
+                try docs.add(doc, key.*);
             }
         }
     }
@@ -2342,7 +2368,7 @@ pub const IndexSnapshot = struct {
         if (frontier.count() == 0) return docs;
         if (self.graph_predicates.acquireOrdinalNavigation()) |navigation| {
             defer navigation.release();
-            try addGraphNavigationFrontier(navigation, frontier, control, &docs);
+            try self.addGraphNavigationFrontier(navigation, frontier, control, &docs);
             return docs;
         }
         var attempted_shared = false;
@@ -2360,7 +2386,7 @@ pub const IndexSnapshot = struct {
             defer lease.deinit();
             var local = GraphFrontierDocs.init(alloc);
             defer local.deinit();
-            const seek = seekGraphSegmentFrontier(&lease.entry.reader, frontier, control, offset, &local) catch |err| switch (err) {
+            const seek = seekGraphSegmentFrontier(lease.entry, frontier, control, offset, &local) catch |err| switch (err) {
                 error.InvalidSegment, error.CrcMismatch => false,
                 else => return err,
             };
@@ -2378,7 +2404,7 @@ pub const IndexSnapshot = struct {
                 };
                 if (shared) |navigation| {
                     defer navigation.release();
-                    try addGraphNavigationFrontier(navigation, frontier, control, &docs);
+                    try self.addGraphNavigationFrontier(navigation, frontier, control, &docs);
                     return docs;
                 }
             }

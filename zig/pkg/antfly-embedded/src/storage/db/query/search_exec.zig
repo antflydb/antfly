@@ -9614,17 +9614,25 @@ const IndexedPredicateEvaluator = struct {
     fn indexedCandidateEstimate(self: IndexedPredicateEvaluator, filter: query_mod.Filter, ceiling: u32) anyerror!u32 {
         try self.control.check();
         return switch (filter) {
-            .term => |term| @min(ceiling, try self.snapshot.termDocFreq(self.alloc, term.field, term.term)),
-            .bool_filter => |boolean| estimate: {
-                var count = ceiling;
-                for (boolean.must) |required| count = try self.indexedCandidateEstimate(required, count);
-                const minimum = if (boolean.must.len == 0) @max(1, boolean.min_should_match) else boolean.min_should_match;
-                if (minimum > 0 and boolean.should.len != 0) {
-                    var sum: u64 = 0;
-                    for (boolean.should) |optional| sum +|= try self.indexedCandidateEstimate(optional, count);
-                    count = @intCast(@min(count, sum / minimum));
+            .term => |term| estimate: {
+                for (self.snapshot.segments) |*segment| {
+                    try self.control.check();
+                    if (segment.liveDocCount() != 0 and segment.reader.hasSection(term.field, .synonym)) break :estimate ceiling;
                 }
-                break :estimate count;
+                break :estimate @min(ceiling, try self.snapshot.termDocFreq(self.alloc, term.field, term.term));
+            },
+            .bool_filter => |boolean| estimate: {
+                // Global Boolean execution can materialize each clause before
+                // intersecting it. A narrow final result cannot bound that work.
+                var peak: u32 = 0;
+                for (boolean.must) |required| peak = @max(peak, try self.indexedCandidateEstimate(required, ceiling));
+                for (boolean.must_not) |excluded| peak = @max(peak, try self.indexedCandidateEstimate(excluded, ceiling));
+                if (boolean.must.len == 0 or boolean.min_should_match != 0) {
+                    var votes: u32 = 0;
+                    for (boolean.should) |optional| votes = @min(ceiling, votes +| try self.indexedCandidateEstimate(optional, ceiling));
+                    peak = @max(peak, votes);
+                }
+                break :estimate peak;
             },
             else => ceiling,
         };
@@ -9716,11 +9724,45 @@ const IndexedPredicateEvaluator = struct {
         for (plans.items) |plan| {
             var threshold = try self.prepareThreshold(plan, if (result) |*rows| rows else null);
             if (result) |*rows| {
+                const before = rows.cardinality();
                 rows.andWith(&threshold);
                 threshold.deinit();
+                if (rows.cardinality() < before) try self.restrictThresholdCounts(rows);
             } else result = threshold;
         }
         return result orelse try self.executeIndexedClause(.{ .match_all = {} }, null, "/universe");
+    }
+
+    fn compactThresholdCounts(self: IndexedPredicateEvaluator, counts: *std.AutoHashMapUnmanaged(u32, u32)) !void {
+        if (counts.count() == 0) {
+            counts.deinit(self.alloc);
+            counts.* = .empty;
+            return;
+        }
+        if (counts.capacity() <= @as(u64, counts.count()) * 2 + 16) return;
+        var compact: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        errdefer compact.deinit(self.alloc);
+        try compact.ensureTotalCapacity(self.alloc, counts.count());
+        var entries = counts.iterator();
+        while (entries.next()) |entry| {
+            try self.control.check();
+            compact.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
+        }
+        counts.deinit(self.alloc);
+        counts.* = compact;
+    }
+
+    fn restrictThresholdCounts(self: IndexedPredicateEvaluator, scope: *const roaring.RoaringBitmap) !void {
+        const thresholds = self.thresholds orelse return;
+        var states = thresholds.valueIterator();
+        while (states.next()) |state| {
+            var entries = state.counts.iterator();
+            while (entries.next()) |entry| {
+                try self.control.check();
+                if (!scope.contains(entry.key_ptr.*)) state.counts.removeByPtr(entry.key_ptr);
+            }
+            try self.compactThresholdCounts(&state.counts);
+        }
     }
 
     fn prepareThreshold(self: IndexedPredicateEvaluator, plan: ThresholdPlan, scope: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
@@ -9753,6 +9795,7 @@ const IndexedPredicateEvaluator = struct {
                 counts.removeByPtr(entry.key_ptr);
             }
         }
+        try self.compactThresholdCounts(&counts);
         const state = try self.thresholds.?.getOrPut(self.alloc, plan.path);
         if (state.found_existing) state.value_ptr.counts.deinit(self.alloc);
         state.value_ptr.* = .{ .counts = counts, .residual = residual.items };
@@ -10321,6 +10364,7 @@ fn collectMixedStructuredFilterAlloc(
         defer authorized.deinit();
         domain.andWith(&authorized);
     }
+    try user_matcher.restrictThresholdCounts(&domain);
     if (req.authorization_filter_query_json.len != 0) {
         const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, req.authorization_filter_query_json, .{});
         const auth = try patternFilterValueToSearchQuery(scratch, parsed, entry.text_analysis, entry.runtime_schema);
@@ -19265,7 +19309,7 @@ fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
             return .{ .status = .missing_doc_values_section };
         };
         const value_type = cached.value_type orelse return .{ .status = cached.status };
-        if ((numeric_coverage == .populated and value_type != .numeric_val) or
+        if ((numeric_coverage != null and value_type != .numeric_val) or
             !typedDocValuesTypeMatchesMappedSortField(value_type, mapping)) return .{ .status = .doc_values_kind_mismatch };
         if (expected_value_type) |expected| {
             const both_numeric = (mapping.field_type == .numeric or mapping.field_type == .datetime) and
@@ -19276,7 +19320,7 @@ fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
         } else {
             expected_value_type = value_type;
         }
-        const sparse_witness = mode == .numeric_range and numeric_coverage == .populated and
+        const sparse_witness = mode == .numeric_range and numeric_coverage != null and
             cached.status == .sparse_live_doc_values and !nulls_complete;
         used_sparse_witness = used_sparse_witness or sparse_witness;
         const sparse_complete = cached.status == .sparse_live_doc_values and
@@ -39450,6 +39494,7 @@ test "optional numeric range coverage survives compaction and rejects unproven i
     const populated = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{
         .{ .key = "a", .value = "{\"rank\":6.5}" },
         .{ .key = "b", .value = "{\"size\":6e0}" },
+        .{ .key = "decimal", .value = "{\"rank\":0.1}" },
     }, .{}, schema)).?;
     defer a.free(populated);
     const empty = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{
@@ -39482,6 +39527,12 @@ test "optional numeric range coverage survives compaction and rejects unproven i
         defer a.free(matches);
         try std.testing.expectEqualSlices(u32, &.{@intCast(expected_doc_num)}, matches);
     }
+    const decimal: search_mod.SearchQuery = .{ .numeric_range = .{ .field = "rank", .min = 0.1, .max = 0.1, .inclusive_max = true } };
+    try std.testing.expect(try searchQueryCanUseSnapshot(writer.snapshot(), decimal, .{}, schema, false));
+    try std.testing.expectEqual(.projected, (try writer.snapshot().segments[0].reader.numericRangeCoverage("rank")).?);
+    const decimal_rows = try writer.snapshot().executeFilter(a, .{ .range = .{ .field = "rank", .min_val = 0.1, .max_val = 0.1, .inclusive_max = true } });
+    defer a.free(decimal_rows);
+    try std.testing.expectEqualSlices(u32, &.{2}, decimal_rows);
     try std.testing.expectEqual(TypedDocValuesCoverageStatus.sparse_live_doc_values, try snapshotTypedDocValuesCoverageForMapping(writer.snapshot(), "rank", numeric));
     try writer.addSegment(conflicted);
     try std.testing.expect(!try searchQueryCanUseSnapshot(writer.snapshot(), rank, .{}, schema, false));
@@ -39640,13 +39691,17 @@ test "optional numeric range covers unsigned values and uses identical stored se
     const a = std.testing.allocator;
     const mapping: runtime_schema_mod.FieldMapping = .{ .field_type = .numeric, .doc_values = true };
     const schema: runtime_schema_mod.TableSchema = .{
-        .exact_fields = &.{.{ .field = "rank", .source_field = "rank", .mapping = mapping }},
+        .exact_fields = &.{
+            .{ .field = "active", .source_field = "active", .mapping = .{ .field_type = .boolean, .doc_values = true } },
+            .{ .field = "created", .source_field = "created", .mapping = .{ .field_type = .datetime, .doc_values = true } },
+            .{ .field = "rank", .source_field = "rank", .mapping = mapping },
+        },
         .full_text_documents = &.{.{ .name = "doc", .fields = &.{.{ .path = "body", .emitted_name = "body", .analyzer = "standard" }} }},
         .default_type = "doc",
     };
     const bytes = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{
-        .{ .key = "wide", .doc_ordinal = 1, .value = "{\"body\":\"beacon rare\",\"rank\":9223372036854775808}" },
-        .{ .key = "absent", .doc_ordinal = 2, .value = "{\"body\":\"beacon relay\"}" },
+        .{ .key = "wide", .doc_ordinal = 1, .value = "{\"body\":\"beacon rare\",\"rank\":9223372036854775808,\"active\":true,\"created\":\"2024-01-01T00:00:00Z\"}" },
+        .{ .key = "absent", .doc_ordinal = 2, .value = "{\"body\":\"beacon relay\",\"active\":false,\"created\":\"2023-01-01T00:00:00Z\"}" },
     }, .{}, schema)).?;
     defer a.free(bytes);
     var manager = @import("../../resource_manager.zig").ResourceManager.init(.{});
@@ -39765,7 +39820,7 @@ test "optional numeric range covers unsigned values and uses identical stored se
     var rounded_writer = try index_mod.IndexWriter.init(a);
     defer rounded_writer.deinit();
     try rounded_writer.addSegment(rounded);
-    try std.testing.expect((try rounded_writer.snapshot().segments[0].reader.numericRangeCoverage("rank")) == null);
+    try std.testing.expectEqual(segment_mod.NumericRangeCoverage.projected, (try rounded_writer.snapshot().segments[0].reader.numericRangeCoverage("rank")).?);
     try std.testing.expect(try fractional.matchesStored(a, "rounded", "{\"rank\":18446744073709551617}"));
     try std.testing.expect(try fractional.matchesStored(a, "extreme", "{\"rank\":1e9223372036854775808}"));
     try std.testing.expect(!try fractional.matchesStored(a, "extreme", "{\"rank\":-1e9223372036854775808}"));
@@ -39808,6 +39863,50 @@ test "optional numeric range covers unsigned values and uses identical stored se
     defer later.deinit();
     try std.testing.expectEqual(@as(usize, 1), later.cardinality());
     try std.testing.expect(later.contains(2));
+
+    const allocation_check = struct {
+        fn run(allocator: Allocator, seg: *const index_mod.SegmentEntry) !void {
+            var scope = roaring.RoaringBitmap.init(allocator);
+            defer scope.deinit();
+            try scope.add(0);
+            try scope.add(1);
+            const phrase_filter: query_mod.Filter = .{ .multi_phrase = .{
+                .field = "body",
+                .term_alternatives = &.{ &.{"beacon"}, &.{"relay"} },
+            } };
+            var rows = try phrase_filter.executeWithinScope(allocator, seg, 0, &scope, .{});
+            defer rows.deinit();
+            try std.testing.expect(rows.contains(1));
+        }
+    };
+    var test_lease = try bounded.snapshot.leaseSegment(0);
+    defer test_lease.deinit();
+    try std.testing.checkAllAllocationFailures(a, allocation_check.run, .{test_lease.entry});
+
+    var scoped_docs = roaring.RoaringBitmap.init(a);
+    defer scoped_docs.deinit();
+    try scoped_docs.add(0);
+    try scoped_docs.add(1);
+    const typed_filters = [_]query_mod.Filter{
+        .{ .bool_field = .{ .field = "active", .value = true } },
+        .{ .date_range = .{ .field = "created", .start_ns = 1_704_067_200_000_000_000 } },
+    };
+    for (typed_filters) |filter| {
+        var scanned = try filter.execute(a, test_lease.entry);
+        defer scanned.deinit();
+        var probed = try filter.executeWithinScope(a, test_lease.entry, 0, &scoped_docs, .{});
+        defer probed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), scanned.cardinality());
+        try std.testing.expectEqual(scanned.cardinality(), probed.cardinality());
+        try std.testing.expect(probed.contains(0));
+    }
+
+    test_lease.deinit();
+    try std.testing.expect(try writer.deleteById("wide"));
+    var live_frontier = try writer.snapshot().graphFrontierDocNumsAlloc(a, frontier, .{});
+    defer live_frontier.deinit();
+    try std.testing.expect(!live_frontier.bitmap.contains(0));
+    try std.testing.expect(live_frontier.bitmap.contains(1));
 }
 
 test "optional numeric range cold and warm measurement" {

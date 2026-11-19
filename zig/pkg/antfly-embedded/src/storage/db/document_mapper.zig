@@ -1456,7 +1456,9 @@ fn appendTextProjectionSourceDoc(
         return;
     }
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, arena, value, .{});
+    // Preserve decimal tokens so a rounded projection cannot attest exact
+    // source equality merely because the source parser rounded it too.
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, value, .{ .parse_numbers = false });
     const root = parsed.value;
     const stored_projection = try fullTextStoredProjection(arena, root, value, opts);
     try source_docs.append(arena, .{
@@ -3231,8 +3233,16 @@ const NumericCoverageNode = struct {
                 if (child.terminal) {
                     const observed = child.observed;
                     child.observed = null;
-                    if (!numericSourceMatchesProjection(value, observed))
-                        try rejected.append(alloc, .{ .path = child.path, .kind = .field });
+                    if (!numericSourceMatchesProjection(value, observed)) {
+                        const equivalent = if (observed orelse null) |emitted|
+                            if (typed_dv.numericValueFromJson(value)) |source|
+                                typed_dv.numericValueAsF64(emitted) == typed_dv.numericValueAsF64(source)
+                            else
+                                false
+                        else
+                            false;
+                        try rejected.append(alloc, .{ .path = child.path, .kind = if (equivalent) .exact_source else .field });
+                    }
                 }
                 if (child.children.count() == 0 or value == .null) continue;
                 if (value == .object)

@@ -79,7 +79,7 @@ pub const Filter = union(enum) {
             .wildcard => |*f| f.control = control,
             .regexp => |*f| f.control = control,
             .term_range => |*f| f.control = control,
-            .range => |*f| f.control = control,
+            inline .range, .date_range, .bool_field => |*f| f.control = control,
             else => {},
         }
         return result;
@@ -141,7 +141,7 @@ pub const Filter = union(enum) {
             .regexp => |f| f.executeInternal(alloc, seg, false, null, scope),
             .term_range => |f| f.executeWithScope(alloc, seg, scope),
             .wildcard => |f| f.executeInternal(alloc, seg, false, null, scope),
-            .range => |f| f.executeWithScope(alloc, seg, scope),
+            inline .range, .date_range, .bool_field => |f| f.executeWithScope(alloc, seg, scope),
             else => {
                 var rows = try self.withControl(control).executeWithOffset(alloc, seg, offset);
                 rows.andWith(scope);
@@ -2240,6 +2240,14 @@ fn addGeoCellCandidatesToBitmap(
 
 /// Multi-phrase filter: like PhraseFilter but allows alternative terms at each position.
 /// e.g., [["hello","hi"], ["world","earth"]] matches "hello world" or "hi earth" etc.
+fn rememberPhraseTerm(alloc: Allocator, terms: *std.StringHashMapUnmanaged(void), term: []const u8) !bool {
+    if (terms.contains(term)) return false;
+    const owned = try alloc.dupe(u8, term);
+    errdefer alloc.free(owned);
+    try terms.put(alloc, owned, {});
+    return true;
+}
+
 pub const MultiPhraseFilter = struct {
     field: []const u8,
     term_alternatives: []const []const []const u8,
@@ -2276,21 +2284,17 @@ pub const MultiPhraseFilter = struct {
             errdefer pos_bm.deinit();
             var any_found = false;
             var seen_terms: std.StringHashMapUnmanaged(void) = .empty;
-            var owned_seen_terms = std.ArrayListUnmanaged([]const u8).empty;
             defer {
-                for (owned_seen_terms.items) |owned_term| alloc.free(owned_term);
-                owned_seen_terms.deinit(alloc);
+                var keys = seen_terms.keyIterator();
+                while (keys.next()) |key| alloc.free(key.*);
                 seen_terms.deinit(alloc);
             }
 
             for (alternatives) |term| {
                 const fuzziness = if (self.auto_fuzzy) autoFuzziness(term) else self.max_edits;
                 if (fuzziness == 0) {
-                    if (seen_terms.contains(term)) continue;
-                    const owned_term = try alloc.dupe(u8, term);
-                    errdefer alloc.free(owned_term);
-                    try seen_terms.put(alloc, owned_term, {});
-                    try owned_seen_terms.append(alloc, owned_term);
+                    try control.check();
+                    if (!try rememberPhraseTerm(alloc, &seen_terms, term)) continue;
                     const lr = (try inv_reader.lookup(term)) orelse continue;
                     try position_lookups[pos_idx].append(alloc, lr);
                     any_found = true;
@@ -2304,11 +2308,8 @@ pub const MultiPhraseFilter = struct {
                     alloc.free(expanded_terms);
                 }
                 for (expanded_terms) |expanded_term| {
-                    if (seen_terms.contains(expanded_term)) continue;
-                    const owned_term = try alloc.dupe(u8, expanded_term);
-                    errdefer alloc.free(owned_term);
-                    try seen_terms.put(alloc, owned_term, {});
-                    try owned_seen_terms.append(alloc, owned_term);
+                    try control.check();
+                    if (!try rememberPhraseTerm(alloc, &seen_terms, expanded_term)) continue;
                     const lr = (try inv_reader.lookup(expanded_term)) orelse continue;
                     try position_lookups[pos_idx].append(alloc, lr);
                     any_found = true;
@@ -2495,37 +2496,44 @@ pub const DateRangeFilter = struct {
     inclusive_start: bool = true,
     inclusive_end: bool = false,
     boost: f32 = 1.0,
+    control: ExecutionControl = .{},
 
     pub fn execute(self: DateRangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return roaring.RoaringBitmap.init(alloc);
-        defer reader.deinit();
+        return self.executeWithScope(alloc, seg, null);
+    }
 
+    fn executeWithScope(self: DateRangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, scope: ?*const roaring.RoaringBitmap) FilterError!roaring.RoaringBitmap {
+        try self.control.check();
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
-
+        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return result;
+        defer reader.deinit();
         if (reader.value_type != .u64_val and reader.value_type != .datetime_ns) return result;
-        var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
-        defer cursor.deinit();
-        while (try cursor.next()) |entry| {
-            if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
-            const doc_id = entry.doc_id;
-            const val: ?i128 = if (entry.value == .datetime_ns) entry.value.datetime_ns else entry.value.u64_val;
-            if (val) |v| {
-                const above_start = if (self.start_ns) |s|
-                    (if (self.inclusive_start) v >= s else v > s)
-                else
-                    true;
-                const below_end = if (self.end_ns) |e|
-                    (if (self.inclusive_end) v <= e else v < e)
-                else
-                    true;
-                if (above_start and below_end) {
-                    try result.add(@intCast(doc_id));
-                }
+        if (scope) |domain| {
+            var docs = domain.iterator();
+            while (docs.next()) |doc| {
+                try self.control.check();
+                const value = (try reader.getDateTimeNs(doc)) orelse continue;
+                if (self.matches(value)) try result.add(doc);
+            }
+        } else {
+            var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
+            defer cursor.deinit();
+            var visited: usize = 0;
+            while (try cursor.next()) |entry| : (visited += 1) {
+                if (visited % 256 == 0) try self.control.check();
+                if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
+                const value: i128 = if (entry.value == .datetime_ns) entry.value.datetime_ns else entry.value.u64_val;
+                if (self.matches(value)) try result.add(@intCast(entry.doc_id));
             }
         }
-
         return result;
+    }
+
+    fn matches(self: DateRangeFilter, value: i128) bool {
+        if (self.start_ns) |start| if (value < start or (!self.inclusive_start and value == start)) return false;
+        if (self.end_ns) |end| if (value > end or (!self.inclusive_end and value == end)) return false;
+        return true;
     }
 };
 
@@ -2765,28 +2773,36 @@ pub const DocNumFilter = struct {
 pub const BoolFieldFilter = struct {
     field: []const u8,
     value: bool,
+    control: ExecutionControl = .{},
 
     pub fn execute(self: BoolFieldFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return roaring.RoaringBitmap.init(alloc);
-        defer reader.deinit();
+        return self.executeWithScope(alloc, seg, null);
+    }
 
+    fn executeWithScope(self: BoolFieldFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, scope: ?*const roaring.RoaringBitmap) FilterError!roaring.RoaringBitmap {
+        try self.control.check();
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
-
+        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return result;
+        defer reader.deinit();
         if (reader.value_type != .bool_val) return result;
-        var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
-        defer cursor.deinit();
-        while (try cursor.next()) |entry| {
-            if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
-            const doc_id = entry.doc_id;
-            const val = @as(?@TypeOf(entry.value.bool_val), entry.value.bool_val);
-            if (val) |v| {
-                if (v == self.value) {
-                    try result.add(@intCast(doc_id));
-                }
+        if (scope) |domain| {
+            var docs = domain.iterator();
+            while (docs.next()) |doc| {
+                try self.control.check();
+                const value = (try reader.getBool(doc)) orelse continue;
+                if (value == self.value) try result.add(doc);
+            }
+        } else {
+            var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
+            defer cursor.deinit();
+            var visited: usize = 0;
+            while (try cursor.next()) |entry| : (visited += 1) {
+                if (visited % 256 == 0) try self.control.check();
+                if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
+                if (entry.value.bool_val == self.value) try result.add(@intCast(entry.doc_id));
             }
         }
-
         return result;
     }
 };
