@@ -95,6 +95,9 @@ pub const SectionType = enum(u16) {
 };
 
 pub const doc_ordinals_field = "\x00__antfly_doc_ordinals";
+const inverse_ordinals_section: SectionType = .synonym;
+const max_inverse_ordinal_docs = 4 * 1024 * 1024;
+
 pub const index_sort_field = "\x00__antfly_index_sort";
 pub const doc_key_range_field = "\x00__antfly_doc_key_range";
 // Use an existing opaque section kind under a reserved field name. Older
@@ -458,7 +461,8 @@ pub const SegmentWriter = struct {
     pub fn addDocOrdinals(self: *SegmentWriter, ordinals: []const u32) !void {
         if (ordinals.len != self.doc_count) return error.InvalidSegment;
         const data = try encodeDocOrdinalsAlloc(self.alloc, ordinals);
-        errdefer self.alloc.free(data);
+        var owns_forward = true;
+        errdefer if (owns_forward) self.alloc.free(data);
         if (data.len == 0) {
             self.alloc.free(data);
             return;
@@ -466,6 +470,22 @@ pub const SegmentWriter = struct {
 
         const field_idx = try self.addField(doc_ordinals_field);
         try self.addSectionOwned(field_idx, .doc_ordinals, data);
+        owns_forward = false;
+        self.addInverseOrdinals(field_idx, ordinals) catch {};
+    }
+
+    fn addInverseOrdinals(self: *SegmentWriter, field_idx: u16, ordinals: []const u32) !void {
+        if (ordinals.len > max_inverse_ordinal_docs or std.mem.indexOfScalar(u32, ordinals, 0) != null) return;
+        const pairs = try self.alloc.alloc(u64, ordinals.len);
+        defer self.alloc.free(pairs);
+        for (ordinals, 0..) |ordinal, doc| pairs[doc] = (@as(u64, ordinal) << 32) | doc;
+        std.mem.sort(u64, pairs, {}, std.sort.asc(u64));
+        const bytes = try self.alloc.alloc(u8, 5 + pairs.len * 8);
+        errdefer self.alloc.free(bytes);
+        bytes[0] = 1;
+        std.mem.writeInt(u32, bytes[1..5], @intCast(pairs.len), .big);
+        for (pairs, 0..) |pair, i| std.mem.writeInt(u64, bytes[5 + i * 8 ..][0..8], pair, .big);
+        try self.addSectionOwned(field_idx, inverse_ordinals_section, bytes);
     }
 
     pub fn addNumericRangeWitnesses(self: *SegmentWriter, witnesses: []NumericRangeWitness) !void {
@@ -1145,6 +1165,8 @@ pub const SegmentReader = struct {
                     navigation.* = try typed_dv.RangeTypedDocValuesReader.init(alloc, view, std.math.maxInt(usize), std.math.maxInt(usize));
                     section.typed_navigation = navigation;
                 }
+                if (section.section_type == inverse_ordinals_section and
+                    std.mem.eql(u8, field.name, doc_ordinals_field)) continue;
                 // Optional coverage is fetched on demand so a damaged proof
                 // cannot prevent unrelated queries from opening the segment.
                 if (section.section_type == numeric_range_coverage_section and
@@ -4030,10 +4052,13 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
 
     const ordinal_start = sink.len();
     sink.beginSection();
-    if (try writeMergedDocOrdinals(alloc, sink, inputs, null, doc_count)) {
+    const inverse = if (doc_count <= max_inverse_ordinal_docs) alloc.alloc(u64, doc_count) catch null else null;
+    defer if (inverse) |pairs| alloc.free(pairs);
+    if (try writeMergedDocOrdinals(alloc, sink, inputs, null, doc_count, inverse)) {
         var built_field = BuiltField{ .name = doc_ordinals_field };
         errdefer built_field.deinit(alloc);
         try built_field.sections.append(alloc, .{ .section_type = .doc_ordinals, .offset = ordinal_start, .length = sink.len() - ordinal_start, .checksum = try sink.crc32Range(ordinal_start, sink.len() - ordinal_start) });
+        if (inverse) |pairs| try appendMergedInverseOrdinals(alloc, sink, &built_field, pairs);
         try built_fields.append(alloc, built_field);
     }
     if (try mergeDocKeyRangeSectionsAlloc(alloc, inputs)) |merged_key_range| {
@@ -4170,10 +4195,13 @@ fn writeSortedMergedSegmentToSink(
 
     const ordinal_start = sink.len();
     sink.beginSection();
-    if (try writeMergedDocOrdinals(alloc, sink, inputs, plan.ordered(), doc_count)) {
+    const inverse = if (doc_count <= max_inverse_ordinal_docs) alloc.alloc(u64, doc_count) catch null else null;
+    defer if (inverse) |pairs| alloc.free(pairs);
+    if (try writeMergedDocOrdinals(alloc, sink, inputs, plan.ordered(), doc_count, inverse)) {
         var built_field = BuiltField{ .name = doc_ordinals_field };
         errdefer built_field.deinit(alloc);
         try built_field.sections.append(alloc, .{ .section_type = .doc_ordinals, .offset = ordinal_start, .length = sink.len() - ordinal_start, .checksum = try sink.crc32Range(ordinal_start, sink.len() - ordinal_start) });
+        if (inverse) |pairs| try appendMergedInverseOrdinals(alloc, sink, &built_field, pairs);
         try built_fields.append(alloc, built_field);
     }
     if (try mergeDocKeyRangeSectionsAlloc(alloc, inputs)) |merged_key_range| {
@@ -6352,6 +6380,45 @@ const OrdinalReader = struct {
 /// capability must outlive this cursor; no borrowed source escapes the lease.
 /// Sequential projections read one window instead of two metadata-cache probes
 /// per document. Zero and absent ordinals retain the scalar reader's semantics.
+/// Bounded point seeks into an optional inverse of the physical ordinal column.
+pub const InverseDocOrdinalReader = struct {
+    view: @import("segment_source.zig").View,
+    count: u32,
+
+    pub fn init(reader: *const SegmentReader) !?InverseDocOrdinalReader {
+        const view = (try reader.sectionView(doc_ordinals_field, inverse_ordinals_section)) orelse return null;
+        var header: [5]u8 = undefined;
+        if (view.length < header.len) return error.InvalidSegment;
+        try view.readInto(0, &header);
+        const count = std.mem.readInt(u32, header[1..5], .big);
+        if (header[0] != 1 or count != reader.doc_count or view.length != 5 + @as(u64, count) * 8) return error.InvalidSegment;
+        return .{ .view = view, .count = count };
+    }
+
+    fn pairAt(self: InverseDocOrdinalReader, i: u32) !u64 {
+        var bytes: [8]u8 = undefined;
+        try self.view.readInto(5 + @as(u64, i) * 8, &bytes);
+        return std.mem.readInt(u64, &bytes, .big);
+    }
+
+    pub fn addMatches(self: InverseDocOrdinalReader, ordinal: u32, offset: u32, docs: anytype) !void {
+        const first = @as(u64, ordinal) << 32;
+        var lo: u32 = 0;
+        var hi = self.count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (try self.pairAt(mid) < first) lo = mid + 1 else hi = mid;
+        }
+        while (lo < self.count) : (lo += 1) {
+            const pair = try self.pairAt(lo);
+            if (pair >> 32 != ordinal) break;
+            const doc: u32 = @truncate(pair);
+            if (doc >= self.count) return error.InvalidSegment;
+            try docs.add(try std.math.add(u32, offset, doc));
+        }
+    }
+};
+
 pub const DocOrdinalCursor = struct {
     reader: OrdinalReader,
     bytes: [4096]u8 = undefined,
@@ -6418,7 +6485,7 @@ fn gatherOrdinals(readers: []const OrdinalReader, refs: []const SortedMergeDoc, 
     return present;
 }
 
-fn ordinalPass(sink: ?*SegmentSink, readers: []const OrdinalReader, inputs: []const MergeInput, records: ?SortedRecords, doc_count: u32) !bool {
+fn ordinalPass(sink: ?*SegmentSink, readers: []const OrdinalReader, inputs: []const MergeInput, records: ?SortedRecords, doc_count: u32, inverse: ?[]u64) !bool {
     var refs: [128]SortedMergeDoc = undefined;
     var values: [128]u32 = undefined;
     var output = OrdinalOutput{};
@@ -6443,7 +6510,13 @@ fn ordinalPass(sink: ?*SegmentSink, readers: []const OrdinalReader, inputs: []co
         if (used == refs.len or (ref == null and used != 0)) {
             const present = try gatherOrdinals(readers, refs[0..used], values[0..used]);
             if (sink) |destination| {
-                for (values[0..used]) |value| try output.add(destination, value);
+                for (values[0..used]) |value| {
+                    if (inverse) |pairs| {
+                        if (output.count >= pairs.len) return error.InvalidSegment;
+                        pairs[output.count] = (@as(u64, value) << 32) | output.count;
+                    }
+                    try output.add(destination, value);
+                }
             } else if (present) return true;
             used = 0;
         }
@@ -6456,7 +6529,7 @@ fn ordinalPass(sink: ?*SegmentSink, readers: []const OrdinalReader, inputs: []co
     return false;
 }
 
-fn writeMergedDocOrdinals(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput, records: ?SortedRecords, doc_count: u32) !bool {
+fn writeMergedDocOrdinals(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput, records: ?SortedRecords, doc_count: u32, inverse: ?[]u64) !bool {
     var local_readers: [16]OrdinalReader = undefined;
     const readers = if (inputs.len <= local_readers.len) local_readers[0..inputs.len] else try alloc.alloc(OrdinalReader, inputs.len);
     defer if (inputs.len > local_readers.len) alloc.free(readers);
@@ -6465,11 +6538,37 @@ fn writeMergedDocOrdinals(alloc: Allocator, sink: *SegmentSink, inputs: []const 
         reader.* = if (inputHasLiveDocs(input)) try OrdinalReader.init(input.reader) else .{};
         any = any or reader.view != null;
     }
-    if (!any or !try ordinalPass(null, readers, inputs, records, doc_count)) return false;
+    if (!any or !try ordinalPass(null, readers, inputs, records, doc_count, null)) return false;
     try sink.appendByte(1);
     try sinkAppendU32BE(sink, doc_count);
-    _ = try ordinalPass(sink, readers, inputs, records, doc_count);
+    _ = try ordinalPass(sink, readers, inputs, records, doc_count, inverse);
     return true;
+}
+
+fn appendMergedInverseOrdinals(alloc: Allocator, sink: *SegmentSink, field: *BuiltField, pairs: []u64) !void {
+    for (pairs) |pair| if (pair >> 32 == 0) return;
+    std.mem.sort(u64, pairs, {}, std.sort.asc(u64));
+    const start = sink.len();
+    sink.beginSection();
+    try sink.appendByte(1);
+    try sinkAppendU32BE(sink, @intCast(pairs.len));
+    var buffer: [8192]u8 = undefined;
+    var used: usize = 0;
+    for (pairs) |pair| {
+        std.mem.writeInt(u64, buffer[used..][0..8], pair, .big);
+        used += 8;
+        if (used == buffer.len) {
+            try sink.appendSlice(&buffer);
+            used = 0;
+        }
+    }
+    if (used != 0) try sink.appendSlice(buffer[0..used]);
+    try field.sections.append(alloc, .{
+        .section_type = inverse_ordinals_section,
+        .offset = start,
+        .length = sink.len() - start,
+        .checksum = try sink.crc32Range(start, sink.len() - start),
+    });
 }
 
 const index_sort_metadata_version: u8 = 2;
@@ -11983,11 +12082,11 @@ test "ordinal gathers batch native reads and preserve shuffled duplicate mixed r
     defer output.deinit();
     var sink = output.sink();
     const inputs = [_]MergeInput{ .{ .reader = &native }, .{ .reader = &heap } };
-    try std.testing.expect(try writeMergedDocOrdinals(a, &sink, &inputs, .{ .memory = &refs, .len = refs.len }, 128));
+    try std.testing.expect(try writeMergedDocOrdinals(a, &sink, &inputs, .{ .memory = &refs, .len = refs.len }, 128, null));
     for (ordinals[0..128], 0..) |expected, i| try std.testing.expectEqual(expected, (try decodeDocOrdinal(output.out.items, @intCast(i))) orelse 0);
     output.out.clearRetainingCapacity();
     for (&refs) |*ref| ref.* = .{ .ref = .{ .input_idx = 0, .doc_id = 0 } };
-    try std.testing.expect(!try writeMergedDocOrdinals(a, &sink, &inputs, .{ .memory = &refs, .len = refs.len }, 128));
+    try std.testing.expect(!try writeMergedDocOrdinals(a, &sink, &inputs, .{ .memory = &refs, .len = refs.len }, 128, null));
     try std.testing.expectEqual(@as(usize, 0), output.out.items.len);
     var seed: u64 = 89312;
     for (0..40) |_| {
@@ -12039,7 +12138,7 @@ test "ordinal descriptor overflow releases allocations on every failure" {
             var output = MemorySegmentSink.init(alloc);
             defer output.deinit();
             var sink = output.sink();
-            try std.testing.expect(try writeMergedDocOrdinals(alloc, &sink, &inputs, null, 17));
+            try std.testing.expect(try writeMergedDocOrdinals(alloc, &sink, &inputs, null, 17, null));
             for (0..17) |i| try std.testing.expectEqual(@as(?u32, 7), try decodeDocOrdinal(output.out.items, @intCast(i)));
         }
     };

@@ -789,6 +789,7 @@ fn estimateTextDocumentInputBytes(alloc: Allocator, doc: TextDocument) !u64 {
 
 pub fn estimateTextDocumentSegmentBytes(doc: TextDocument) u64 {
     var total: u64 = 64 + @as(u64, @intCast(doc.id.len)) + @max(doc.stored_data.len, doc.stored_source_bytes);
+    if (doc.doc_ordinal != null) total +|= @sizeOf(u64);
     for (doc.text_fields) |field| {
         total +|= 16 + @as(u64, @intCast(field.field_name.len + field.text.len));
     }
@@ -809,7 +810,9 @@ pub fn estimateTextDocumentBuildMemoryBytes(alloc: Allocator, doc: TextDocument)
     }
     const typed_count: u64 = if (doc.typed_fields) |typed_fields| @intCast(typed_fields.len) else 0;
     const field_count: u64 = @intCast(doc.text_fields.len);
+    const inverse_ordinal_bytes: u64 = if (doc.doc_ordinal != null) 2 * @sizeOf(u64) else 0;
     return (try estimateTextDocumentInputBytes(alloc, doc)) +
+        inverse_ordinal_bytes +
         estimateStoredDocBytes(&.{doc}) +
         text_bytes * 4 +
         field_count * 384 +

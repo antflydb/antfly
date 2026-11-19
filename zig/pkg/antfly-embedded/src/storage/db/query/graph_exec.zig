@@ -4756,6 +4756,13 @@ fn jsonValuesContainStandardRange(values: []const std.json.Value, range_query: s
     return false;
 }
 
+fn isStandardRangeNumber(value: std.json.Value) bool {
+    return switch (value) {
+        .integer, .float, .number_string => true,
+        else => false,
+    };
+}
+
 fn jsonValueMatchesStandardRange(value: std.json.Value, lower: ?PatternJsonRangeBound, upper: ?PatternJsonRangeBound) !bool {
     if (value == .array) {
         for (value.array.items) |item| {
@@ -4778,6 +4785,24 @@ fn jsonValueMatchesStandardRange(value: std.json.Value, lower: ?PatternJsonRange
             }
             return true;
         }
+    }
+
+    // JSON numeric spellings outside the typed domain still have a numeric
+    // order. Temporal strings retain their separate date semantics.
+    if (isStandardRangeNumber(value) and
+        (lower == null or isStandardRangeNumber(lower.?.value)) and
+        (upper == null or isStandardRangeNumber(upper.?.value)))
+    {
+        const scalar = @import("../../../sql/scalar.zig");
+        if (lower) |bound| {
+            const order = try scalar.compare(value, bound.value);
+            if (order == .lt or (order == .eq and !bound.inclusive)) return false;
+        }
+        if (upper) |bound| {
+            const order = try scalar.compare(value, bound.value);
+            if (order == .gt or (order == .eq and !bound.inclusive)) return false;
+        }
+        return true;
     }
 
     // Temporal strings and typed nanosecond columns share one signed order.

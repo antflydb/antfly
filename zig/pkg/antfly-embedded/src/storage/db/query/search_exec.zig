@@ -9528,6 +9528,19 @@ const IndexedPredicateEvaluator = struct {
     probe_input: ?*FrontierProbeInput = null,
     applied_gates: ?*AppliedGates = null,
 
+    thresholds: ?*Thresholds = null,
+
+    const ThresholdPlan = struct {
+        path: []const u8,
+        clauses: []const search_mod.SearchQuery,
+        required: u32,
+    };
+    const ThresholdState = struct {
+        counts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+        residual: []const Clause,
+    };
+    const Thresholds = std.StringHashMapUnmanaged(ThresholdState);
+
     const AppliedGates = std.StringHashMapUnmanaged(enum { exact, necessary });
 
     const LocalCache = IndexedClauseCache;
@@ -9558,8 +9571,15 @@ const IndexedPredicateEvaluator = struct {
             const low_headroom = if (self.budget) |budget| limited: {
                 const available = budget.max_retained_state_bytes -| budget.retained_state_bytes;
                 if (@as(u64, live_count) * 8 <= available) break :limited false;
-                const filter = try search_mod.searchQueryToFilterArena(self.scratch, query);
-                break :limited @as(u64, try self.indexedCandidateEstimate(filter, live_count)) * 8 > available;
+                const filter = search_mod.searchQueryToFilterArena(self.scratch, query) catch |err| switch (err) {
+                    error.Canceled, error.Timeout => return err,
+                    else => break :limited true,
+                };
+                const estimate = self.indexedCandidateEstimate(filter, live_count) catch |err| switch (err) {
+                    error.Canceled, error.Timeout => return err,
+                    else => break :limited true,
+                };
+                break :limited @as(u64, estimate) * 8 > available;
             } else false;
             if (warm_frontier or low_headroom or (self.local_cache != null and self.local_cache.?.memory.shouldProbe(key))) {
                 if (try self.probeFrontier(query, domain)) |rows| return rows;
@@ -9600,13 +9620,11 @@ const IndexedPredicateEvaluator = struct {
         const memo = self.probe_input orelse return null;
         if (!memo.attempted) {
             memo.attempted = true;
-            if (!try self.snapshot.hasDocOrdinalCoverage()) return null;
             const frontier = self.frontier orelse return null;
-            memo.docs = (try self.snapshot.graphFrontierDocNumsAlloc(self.alloc, frontier, self.control)) orelse
-                try self.snapshot.tryDocNumBitmapForOrdinalMembershipWithCoverageAlloc(self.alloc, frontier, self.control, true);
+            memo.docs = try self.snapshot.graphFrontierDocNumsAlloc(self.alloc, frontier, self.control);
         }
-        const candidates_bitmap = if (memo.docs) |*docs| docs else return null;
         const filter = (try search_mod.searchQueryToFilterArena(self.scratch, query)).withControl(self.control);
+        const candidates_bitmap = if (memo.docs) |*docs| docs else return try self.probeLegacyFrontier(filter, scope);
         const plan = try query_mod.PredicateProbePlan.compile(filter);
         var rows = roaring.RoaringBitmap.init(self.alloc);
         errdefer rows.deinit();
@@ -9647,6 +9665,53 @@ const IndexedPredicateEvaluator = struct {
         return rows;
     }
 
+    // Old segments can lack reverse navigation. Resolve only documents
+    // produced by the predicate, with one segment bitmap at a time.
+    fn probeLegacyFrontier(self: IndexedPredicateEvaluator, filter: query_mod.Filter, scope: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        const frontier = self.frontier orelse return error.UnsupportedQueryRequest;
+        var keys: std.StringHashMapUnmanaged(u32) = .empty;
+        defer keys.deinit(self.alloc);
+        var ids = scope.iterator();
+        while (ids.next()) |ordinal| {
+            const key = frontier.get(ordinal) orelse return error.InvalidData;
+            try keys.put(self.alloc, key, ordinal);
+        }
+        var result = roaring.RoaringBitmap.init(self.alloc);
+        errdefer result.deinit();
+        var scratch = segment_mod.SegmentReadScratch.init(self.alloc, 64 * 1024);
+        defer scratch.deinit();
+        var offset: u32 = 0;
+        const expected = scope.cardinality();
+        var matches: usize = 0;
+        for (self.snapshot.segments, 0..) |segment, segment_index| {
+            try self.control.check();
+            defer offset += segment.reader.doc_count;
+            if (segment.liveDocCount() == 0) continue;
+            var lease = try self.snapshot.leaseSegment(segment_index);
+            defer lease.deinit();
+            var local = try filter.executeWithOffset(self.alloc, lease.entry, offset);
+            defer local.deinit();
+            var ordinals = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
+            lease.entry.shared.lockDeletionShared();
+            defer lease.entry.shared.unlockDeletionShared();
+            var candidates = local.iterator();
+            while (candidates.next()) |doc| {
+                try self.control.check();
+                if (lease.entry.shared.deleted) |deleted| if (deleted.contains(doc)) continue;
+                const ordinal = (try ordinals.get(doc)) orelse legacy: {
+                    scratch.reset();
+                    const key = (try lease.entry.reader.storedIdScoped(scratch.allocator(), doc)) orelse continue;
+                    break :legacy keys.get(key) orelse continue;
+                };
+                if (!scope.contains(ordinal) or result.contains(ordinal)) continue;
+                try result.add(ordinal);
+                matches += 1;
+                if (matches == expected) return result;
+            }
+        }
+        return result;
+    }
+
     fn copyMembership(self: IndexedPredicateEvaluator, source: *const roaring.RoaringBitmap, scope: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
         const domain = scope orelse return source.cloneExact(self.alloc);
         var result = roaring.RoaringBitmap.init(self.alloc);
@@ -9661,14 +9726,55 @@ const IndexedPredicateEvaluator = struct {
 
     fn initialScope(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery) !roaring.RoaringBitmap {
         var necessary: std.ArrayListUnmanaged(search_mod.SearchQuery) = .empty;
-        try self.collectNecessaryIndexed(query, "", &necessary);
-        if (necessary.items.len != 0) {
-            return self.executeIndexedClause(.{ .bool_query = .{ .must = necessary.items } }, null, "/initial");
+        var plans: std.ArrayListUnmanaged(ThresholdPlan) = .empty;
+        try self.collectNecessaryIndexed(query, "", &necessary, &plans);
+        var result = if (necessary.items.len != 0)
+            try self.executeIndexedClause(.{ .bool_query = .{ .must = necessary.items } }, null, "/initial")
+        else
+            null;
+        errdefer if (result) |*rows| rows.deinit();
+        for (plans.items) |plan| {
+            var threshold = try self.prepareThreshold(plan, if (result) |*rows| rows else null);
+            if (result) |*rows| {
+                rows.andWith(&threshold);
+                threshold.deinit();
+            } else result = threshold;
         }
-        return self.executeIndexedClause(.{ .match_all = {} }, null, "/universe");
+        return result orelse try self.executeIndexedClause(.{ .match_all = {} }, null, "/universe");
     }
 
-    fn collectNecessaryIndexed(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, path: []const u8, out: *std.ArrayListUnmanaged(search_mod.SearchQuery)) anyerror!void {
+    fn prepareThreshold(self: IndexedPredicateEvaluator, plan: ThresholdPlan, scope: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        var residual: std.ArrayListUnmanaged(Clause) = .empty;
+        var counts: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        for (plan.clauses, 0..) |clause, i| {
+            const child_path = try self.clausePath(plan.path, 's', i);
+            if (!try self.indexed(clause)) {
+                try residual.append(self.scratch, .{ .query = clause, .path = child_path });
+                continue;
+            }
+            var rows = try self.executeIndexedClause(clause, scope, child_path);
+            defer rows.deinit();
+            var ids = rows.iterator();
+            while (ids.next()) |id| {
+                try self.control.check();
+                const entry = try counts.getOrPutValue(self.scratch, id, 0);
+                entry.value_ptr.* += 1;
+            }
+        }
+        try self.thresholds.?.put(self.scratch, plan.path, .{ .counts = counts, .residual = residual.items });
+        var necessary = roaring.RoaringBitmap.init(self.alloc);
+        errdefer necessary.deinit();
+        var it = counts.iterator();
+        while (it.next()) |entry| {
+            try self.control.check();
+            if (@as(usize, entry.value_ptr.*) + residual.items.len >= plan.required) {
+                try necessary.add(entry.key_ptr.*);
+            }
+        }
+        return necessary;
+    }
+
+    fn collectNecessaryIndexed(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, path: []const u8, out: *std.ArrayListUnmanaged(search_mod.SearchQuery), plans: *std.ArrayListUnmanaged(ThresholdPlan)) anyerror!void {
         if (try self.indexed(query)) {
             try out.append(self.scratch, query);
             if (self.applied_gates) |gates| try gates.put(self.scratch, path, .exact);
@@ -9677,13 +9783,19 @@ const IndexedPredicateEvaluator = struct {
         if (query != .bool_query) return;
         const boolean = query.bool_query;
         for (boolean.must, 0..) |child, i| {
-            try self.collectNecessaryIndexed(child, try self.clausePath(path, 'm', i), out);
+            try self.collectNecessaryIndexed(child, try self.clausePath(path, 'm', i), out, plans);
         }
-        if (try self.indexedShouldGate(boolean.should, requiredShould(boolean))) |gate| {
-            try out.append(self.scratch, gate);
+        const required = requiredShould(boolean);
+        if (try self.indexedShouldGate(boolean.should, required)) |gate| {
+            const exact = gate.bool_query.should.len == boolean.should.len;
+            if (!exact and self.thresholds != null) {
+                try plans.append(self.scratch, .{ .path = path, .clauses = boolean.should, .required = required });
+            } else {
+                try out.append(self.scratch, gate);
+            }
             if (self.applied_gates) |gates| {
                 const gate_path = try self.clausePath(path, 't', 0);
-                try gates.put(self.scratch, gate_path, if (gate.bool_query.should.len == boolean.should.len) .exact else .necessary);
+                try gates.put(self.scratch, gate_path, if (exact) .exact else .necessary);
             }
         }
     }
@@ -9787,6 +9899,24 @@ const IndexedPredicateEvaluator = struct {
         var result = roaring.RoaringBitmap.init(self.alloc);
         errdefer result.deinit();
         if (required > clauses.len) return result;
+        if (self.thresholds) |thresholds| if (thresholds.get(path)) |prepared| {
+            var counts: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+            defer counts.deinit(self.alloc);
+            var remaining = try scope.clone(self.alloc);
+            defer remaining.deinit();
+            var ids = scope.iterator();
+            while (ids.next()) |id| {
+                try self.control.check();
+                const count = prepared.counts.get(id) orelse 0;
+                if (count >= required) {
+                    try result.add(id);
+                } else if (count != 0) try counts.put(self.alloc, id, count);
+            }
+            remaining.andNotWith(&result);
+            try self.completeThreshold(prepared.residual, required, &counts, &remaining, &result);
+            return result;
+        };
+
         if (required == 1) {
             var remaining = try scope.clone(self.alloc);
             defer remaining.deinit();
@@ -9830,22 +9960,26 @@ const IndexedPredicateEvaluator = struct {
             remaining.andNotWith(&result);
             if (remaining.cardinality() == 0) return result;
         }
-        for (residual.items, 0..) |clause, i| {
+        try self.completeThreshold(residual.items, required, &counts, &remaining, &result);
+        return result;
+    }
+
+    fn completeThreshold(self: IndexedPredicateEvaluator, residual: []const Clause, required: u32, counts: *std.AutoHashMapUnmanaged(u32, u32), remaining: *roaring.RoaringBitmap, result: *roaring.RoaringBitmap) !void {
+        for (residual, 0..) |clause, i| {
             var undecided = remaining.iterator();
             var impossible = roaring.RoaringBitmap.init(self.alloc);
             defer impossible.deinit();
             while (undecided.next()) |doc| {
                 try self.control.check();
-                if (@as(usize, counts.get(doc) orelse 0) + residual.items.len - i < required) try impossible.add(doc);
+                if (@as(usize, counts.get(doc) orelse 0) + residual.len - i < required) try impossible.add(doc);
             }
             remaining.andNotWith(&impossible);
             if (remaining.cardinality() == 0) break;
-            var matched = try self.execute(clause.query, &remaining, clause.path);
+            var matched = try self.execute(clause.query, remaining, clause.path);
             defer matched.deinit();
-            try self.addThresholdMatches(&matched, required, &counts, &result);
-            remaining.andNotWith(&result);
+            try self.addThresholdMatches(&matched, required, counts, result);
+            remaining.andNotWith(result);
         }
-        return result;
     }
 
     fn addThresholdMatches(
@@ -10151,7 +10285,9 @@ fn collectMixedStructuredFilterAlloc(
         query;
     // The cache key must bind the lowered tree as well as its source text.
     var applied_gates: IndexedPredicateEvaluator.AppliedGates = .empty;
+    var thresholds: IndexedPredicateEvaluator.Thresholds = .empty;
     var user_matcher = matcher;
+    user_matcher.thresholds = &thresholds;
     user_matcher.applied_gates = &applied_gates;
     if (original != null) user_matcher.cache_prefix = try std.fmt.allocPrint(scratch, "user:{s}", .{cache_prefix});
     var domain = try user_matcher.initialScope(user_query);
@@ -39592,6 +39728,27 @@ test "optional numeric range covers unsigned values and uses identical stored se
     try std.testing.expectError(error.UnsupportedQueryRequest, evaluator.execute(nested, &gated, ""));
     try std.testing.expectEqual(misses, snapshot.graph_predicates.misses);
 
+    var plans: IndexedPredicateEvaluator.Thresholds = .empty;
+    var threshold_evaluator = evaluator;
+    threshold_evaluator.thresholds = &plans;
+    const partial: search_mod.SearchQuery = .{ .bool_query = .{
+        .min_should = 2,
+        .should = &.{
+            .{ .match = .{ .field = "body", .text = "rare", .analyzer = &analysis_mod.default_analyzer } },
+            .{ .match = .{ .field = "body", .text = "beacon", .analyzer = &analysis_mod.default_analyzer } },
+            .{ .numeric_range = .{ .field = "unmapped", .min = 0 } },
+        },
+    } };
+    var threshold_scope = try threshold_evaluator.initialScope(partial);
+    defer threshold_scope.deinit();
+    try std.testing.expectEqual(@as(usize, 2), threshold_scope.cardinality());
+    threshold_scope.andWith(&domain);
+    const misses_before_threshold = snapshot.graph_predicates.misses;
+    var threshold_matches = try threshold_evaluator.execute(partial, &threshold_scope, "");
+    defer threshold_matches.deinit();
+    try std.testing.expect(threshold_matches.contains(1));
+    try std.testing.expectEqual(misses_before_threshold, snapshot.graph_predicates.misses);
+
     const rounded = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{
         .{ .key = "rounded", .value = "{\"body\":\"beacon\",\"rank\":18446744073709551617}" },
     }, .{}, schema)).?;
@@ -39600,6 +39757,7 @@ test "optional numeric range covers unsigned values and uses identical stored se
     defer rounded_writer.deinit();
     try rounded_writer.addSegment(rounded);
     try std.testing.expect((try rounded_writer.snapshot().segments[0].reader.numericRangeCoverage("rank")) == null);
+    try std.testing.expect(try fractional.matchesStored(a, "rounded", "{\"rank\":18446744073709551617}"));
 }
 
 test "optional numeric range cold and warm measurement" {

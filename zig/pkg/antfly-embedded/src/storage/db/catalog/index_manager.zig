@@ -27227,6 +27227,10 @@ pub const IndexManager = struct {
         // estimate is cached across snapshots; the task allocator still caps
         // real live bytes, including publication and oversized values.
         bytes = try std.math.add(u64, bytes, try seg.typedMergeWorkingSetBytes());
+        // An inverse ordinal directory sorts one pair per live output row.
+        if (layout.doc_ordinals_bytes != 0) {
+            bytes = try std.math.add(u64, bytes, @as(u64, seg.reader.doc_count) * @sizeOf(u64));
+        }
         bytes = try std.math.add(u64, bytes, if (native_scratch) @as(u64, 16 * 1024) else try std.math.mul(u64, layout.doc_ordinals_bytes, 2));
         return bytes;
     }

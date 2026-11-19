@@ -2265,7 +2265,38 @@ pub const IndexSnapshot = struct {
 
     /// The directory maps physical documents, including deleted copies.
     /// Callers still apply the active segment deletion mask when probing.
+    fn graphFrontierDocNumsFromSegmentsAlloc(self: *IndexSnapshot, alloc: Allocator, frontier: anytype, control: query_mod.ExecutionControl) !?roaring.RoaringBitmap {
+        var docs = roaring.RoaringBitmap.init(alloc);
+        var owned = true;
+        defer if (owned) docs.deinit();
+        var offset: u32 = 0;
+        for (self.segments, 0..) |segment, segment_index| {
+            try control.check();
+            if (segment.liveDocCount() != 0) {
+                var lease = try self.leaseSegment(segment_index);
+                defer lease.deinit();
+                const inverse = segment_mod.InverseDocOrdinalReader.init(&lease.entry.reader) catch |err| switch (err) {
+                    error.InvalidSegment, error.CrcMismatch => return null,
+                    else => return err,
+                };
+                const reader = inverse orelse return null;
+                var keys = frontier.keyIterator();
+                while (keys.next()) |key| {
+                    try control.check();
+                    reader.addMatches(key.*, offset, &docs) catch |err| switch (err) {
+                        error.InvalidSegment, error.CrcMismatch => return null,
+                        else => return err,
+                    };
+                }
+            }
+            offset = try std.math.add(u32, offset, segment.reader.doc_count);
+        }
+        owned = false;
+        return docs;
+    }
+
     pub fn graphFrontierDocNumsAlloc(self: *IndexSnapshot, alloc: Allocator, frontier: anytype, control: query_mod.ExecutionControl) !?roaring.RoaringBitmap {
+        if (try self.graphFrontierDocNumsFromSegmentsAlloc(alloc, frontier, control)) |docs| return docs;
         const navigation = (try self.graphOrdinalNavigation(control)) orelse return null;
         defer navigation.release();
         const entries = navigation.entries;
