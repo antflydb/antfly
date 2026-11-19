@@ -1009,9 +1009,9 @@ pub const Session = struct {
             },
             .tick => {},
         };
-        self.replication_copy_active = true;
         try select.concurrent(.input, replication_input.read, .{ self.alloc, self.reader, self.identity.?.renewable });
         try select.concurrent(.tick, replicationTick, .{ self.io, @as(u32, 0) });
+        self.replication_copy_active = true;
         self.replicationDeadline(deadline);
         // Text format, no ordinary COPY column descriptors.
         try self.message('W', &.{ 0, 0, 0 });
@@ -1062,7 +1062,10 @@ pub const Session = struct {
                     defer scratch.deinit();
                     self.replicationDeadline(@intCast(request_value.deadline.raw.nanoseconds));
                     try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
-                    var poll = try stream.poll(stream.context, scratch.allocator(), request_value, sent, limits.frame_bytes - 30);
+                    var poll = stream.poll(stream.context, scratch.allocator(), request_value, sent, limits.frame_bytes - 30) catch |err| {
+                        std.log.debug("PostgreSQL replication poll failed err={s}", .{@errorName(err)});
+                        return err;
+                    };
                     defer poll.deinit();
                     if (@backingInt(poll.end_lsn) < @backingInt(observed_end)) return error.InvalidResult;
                     observed_end = poll.end_lsn;

@@ -533,6 +533,41 @@ test "pgwire retained ordinal row preserves historical column types and null ide
     try std.testing.expectEqualSlices(u8, &.{ 't', 0, 0, 0, 2, '1', '7', 'n', 'n' }, deleted[8..]);
 }
 
+test "pgwire retained ordinal numeric encodes an exact replication value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema: HistorySchema.TableSchema = .{
+        .version = 1,
+        .storage_mode = .relational,
+        .relational_columns = &.{.{
+            .name = "amount",
+            .path = "amount",
+            .column_type = .numeric,
+            .sql_element_type = .numeric,
+            .numeric_modifier = .{ .precision = 38, .scale = 8 },
+        }},
+    };
+    const exact = "12345678901234567890.12345678";
+    const numeric = try history_sources.sql_numeric_storage.encodeJsonAlloc(a, .{ .number_string = exact });
+    const image = try HistoryRow.serializeOrdinal(a, schema.version, schema.relational_columns, &.{.{
+        .ordinal = 0,
+        .path = "amount",
+        .value_type = .bytes_val,
+        .is_numeric = true,
+        .value = .{ .bytes_val = numeric },
+    }}, @splat(0));
+    var layout = try HistoryRow.PhysicalLayout.init(a, schema);
+    defer layout.deinit();
+    const text = try encodeHistoricalRow(a, schema, &layout, image, 0, 128);
+    try std.testing.expectEqualStrings(exact, text[0].text);
+    const binary = try encodeHistoricalRow(a, schema, &layout, image, 1, 128);
+    var context: history_sources.sql_numeric_value.Context = .{ .alloc = a };
+    var decoded = try history_sources.sql_numeric_binary.decode(&context, binary[0].binary, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings(exact, try history_sources.sql_numeric_value.format(&context, decoded.value));
+}
+
 test "pgwire replication tuples preserve exact numeric and distinguish JSON null from SQL NULL" {
     const backend = @import("backend.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -563,10 +598,13 @@ fn encodeColumnUnchecked(a: std.mem.Allocator, writer: *std.Io.Writer, column: C
     if (format > 1) return error.UnsupportedResultFormat;
     _ = try columnOid(column);
     if (column.type == .number and column.element_type == .numeric) {
-        if (value != .string) return error.InvalidResult;
+        const text = switch (value) {
+            .number_string, .string => |text| text,
+            else => return error.InvalidResult,
+        };
         const sources = @import("antfly_local_sources");
         var context: sources.sql_numeric_value.Context = .{ .alloc = a, .max_output_bytes = wire_bytes };
-        var number = try sources.sql_numeric_value.parse(&context, value.string);
+        var number = try sources.sql_numeric_value.parse(&context, text);
         defer number.deinit();
         if (format == 0) return sources.sql_numeric_value.write(&context, number.value, writer);
         return sources.sql_numeric_binary.encode(&context, number.value, writer);

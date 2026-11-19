@@ -168,7 +168,7 @@ def run(options, directory):
     password = os.environ.get("QUALIFICATION_DATABASE_PASSWORD", "local-test-only")
     env = dict(os.environ, PGPASSWORD=password)
 
-    def sql(*statements):
+    def postgres_client(executable, *args):
         return command(
             "docker",
             "run",
@@ -180,7 +180,7 @@ def run(options, directory):
             "-e",
             "PGCONNECT_TIMEOUT=5",
             POSTGRES,
-            "psql",
+            executable,
             "-h",
             host,
             "-p",
@@ -189,11 +189,17 @@ def run(options, directory):
             options.user,
             "-d",
             options.database,
+            *args,
+            env=env,
+        )
+
+    def sql(*statements):
+        return postgres_client(
+            "psql",
             "-v",
             "ON_ERROR_STOP=1",
             "-At",
             *(arg for text in statements for arg in ("-c", text)),
-            env=env,
         )
 
     try:
@@ -304,6 +310,8 @@ def run(options, directory):
         inserted = client.wait(lambda event: row(event, "c", 2))
         updated = client.wait(lambda event: row(event, "u", 1))
         assert updated["value"]["before"]["label"] == "snapshot", updated
+        assert updated["value"]["before"]["amount"] == expected_decimal, updated
+        assert updated["value"]["after"]["amount"] == expected_decimal, updated
         # PostgreSQL's Debezium transaction id includes each record's LSN;
         # source.txId is the stable transaction identity across row messages.
         assert inserted["value"]["source"]["txId"] == updated["value"]["source"]["txId"]
@@ -371,8 +379,11 @@ def run(options, directory):
             except Exception:
                 subprocess.run(["docker", "rm", "-f", client_name], capture_output=True)
         if options.external:
+            try:
+                postgres_client("pg_recvlogical", "--drop-slot", "--slot", slot)
+            except Exception as error:
+                print(f"qualification slot cleanup failed: {error}", file=sys.stderr)
             for text in (
-                f"SELECT pg_drop_replication_slot('{slot}')",
                 f"DROP PUBLICATION IF EXISTS {publication}",
                 f"DROP TABLE IF EXISTS public.{table}",
             ):

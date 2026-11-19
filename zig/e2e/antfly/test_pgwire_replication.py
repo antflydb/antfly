@@ -283,6 +283,23 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
         sql("CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT)")
         if export_snapshot:
             sql("ALTER TABLE smoke REPLICA IDENTITY FULL")
+        replica_identity = subprocess.check_output(
+            [
+                psql,
+                *connection,
+                "-XAt",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                "SELECT c.relreplident FROM pg_catalog.pg_class c "
+                "JOIN pg_catalog.pg_namespace n ON c.relnamespace=n.oid "
+                "WHERE n.nspname='public' AND c.relname='smoke'",
+            ],
+            env=env,
+            text=True,
+            timeout=40,
+        )
+        assert replica_identity.strip() == ("f" if export_snapshot else "d")
         names = subprocess.check_output(
             [
                 psql,

@@ -51,15 +51,25 @@ pub const Listener = struct {
     alloc: std.mem.Allocator,
     adapter: Adapter,
     replication: ?CatalogReplicationFactory = null,
+    network: std.Io.Threaded,
     server: @import("../pgwire/server.zig").Server,
 
     pub fn start(api: *http.ApiHttpServer, config: @import("antfly_local_sources").common_config.Config.PgwireConfig) !*Listener {
         if (api.cfg.user_manager == null and (api.cfg.trusted_principal_secret == null or api.cfg.trusted_principal_issuer == null)) return error.PgwireRequiresAuthentication;
         if (api.cfg.backend_runtime == null) return error.PgwireRequiresBackendRuntime;
-        const io = api.sharedApiNetworkIo() orelse return error.PgwireRequiresBackendRuntime;
         const self = try api.owner_alloc.create(Listener);
         errdefer api.owner_alloc.destroy(self);
         self.alloc = api.owner_alloc;
+        // Listener, connection, session, and watchdog tasks are long-lived.
+        // CopyBoth adds an input reader, poll timer, and publication worker.
+        // Give those tasks separate capacity from API and durable storage I/O.
+        const workers = 1 + 6 * (@as(u32, config.max_connections) + 4);
+        self.network = .init(self.alloc, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(@min(workers, @import("antfly_runtime_fs").threaded_io_limits.service)),
+        });
+        errdefer self.network.deinit();
+        const io = self.network.io();
         self.adapter = .{ .server = api };
         self.replication = null;
         if (config.replication_publication) |name| {
@@ -79,6 +89,7 @@ pub const Listener = struct {
 
     pub fn deinit(self: *Listener) void {
         self.server.deinit();
+        self.network.deinit();
         self.alloc.destroy(self);
     }
 };
@@ -3195,7 +3206,10 @@ const GuardedCatalog = struct {
         const slots = try CatalogReplicationSlots.open(server, identity, a, self.authority.request.database orelse "default", context);
         var observed = slots.readOwned(a, name, context) catch |err| switch (err) {
             error.ReplicationSlotNotFound, error.Forbidden => return .{ .rows = &.{} },
-            else => return err,
+            else => {
+                std.log.debug("PostgreSQL slot catalog read failed err={s}", .{@errorName(err)});
+                return err;
+            },
         };
         defer observed.deinit();
         const slot = observed.value.slot.?;
@@ -3298,7 +3312,18 @@ const GuardedCatalog = struct {
                     const key = try (domain.Target{ .database = database, .namespace = namespace.name, .table = entry.name }).resourceNameAlloc(scratch);
                     if (!try http.tablePermissionCurrentlyAllowed(identity, key, .read)) continue;
                     const digest = publication_control.hash(.{ .domain = "antfly:pg-class-oid:v1", .table = entry.table.table_id });
-                    const item: system.Class = .{ .oid = 16384 + std.mem.readInt(u32, digest[0..4], .big) % (std.math.maxInt(u32) - 16384), .name = entry.name, .namespace = namespace.oid };
+                    const schema = if (entry.table.schema_json.len == 0) null else try std.json.parseFromSliceLeaky(
+                        struct { replica_identity: ?enum { default, full } = null },
+                        scratch,
+                        entry.table.schema_json,
+                        .{ .ignore_unknown_fields = true },
+                    );
+                    const item: system.Class = .{
+                        .oid = 16384 + std.mem.readInt(u32, digest[0..4], .big) % (std.math.maxInt(u32) - 16384),
+                        .name = entry.name,
+                        .namespace = namespace.oid,
+                        .replica_identity = if (schema != null and schema.?.replica_identity == .full) "f" else "d",
+                    };
                     if (include_indexes or try item.matches(conditions)) {
                         var retained = item;
                         retained.name = try a.dupe(u8, item.name);

@@ -164,6 +164,7 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
             .{ .name = "relname", .path = "relname", .type = .string, .nullable = false },
             .{ .name = "relnamespace", .path = "relnamespace", .type = .integer, .nullable = false },
             .{ .name = "relkind", .path = "relkind", .type = .string, .nullable = false },
+            .{ .name = "relreplident", .path = "relreplident", .type = .string, .nullable = false },
         },
     };
     if (descriptions) return .{
@@ -255,16 +256,18 @@ pub const Class = struct {
     name: []const u8,
     namespace: u32,
     kind: []const u8 = "r",
+    replica_identity: []const u8 = "n",
     logical: ?struct { namespace: []const u8, id: u64, revision: u64 } = null,
 
     pub fn matches(self: Class, conditions: []const catalog.Condition) !bool {
         for (conditions) |condition| {
-            const field = std.meta.stringToEnum(enum { oid, relname, relnamespace, relkind }, condition.column) orelse return error.InvalidSqlBackendResponse;
+            const field = std.meta.stringToEnum(enum { oid, relname, relnamespace, relkind, relreplident }, condition.column) orelse return error.InvalidSqlBackendResponse;
             const value: std.json.Value = switch (field) {
                 .oid => .{ .integer = self.oid },
                 .relname => .{ .string = self.name },
                 .relnamespace => .{ .integer = self.namespace },
                 .relkind => .{ .string = self.kind },
+                .relreplident => .{ .string = self.replica_identity },
             };
             if (!try conditionMatches(value, condition)) return false;
         }
@@ -283,6 +286,7 @@ pub const Class = struct {
             try attrs.put(alloc, "relname", .{ .string = try alloc.dupe(u8, item.name) });
             try attrs.put(alloc, "relnamespace", .{ .integer = item.namespace });
             try attrs.put(alloc, "relkind", .{ .string = try alloc.dupe(u8, item.kind) });
+            try attrs.put(alloc, "relreplident", .{ .string = try alloc.dupe(u8, item.replica_identity) });
             output.* = .{ .id = try std.fmt.allocPrint(alloc, "{d:0>10}", .{item.oid}), .version = 1, .value = .{ .object = attrs } };
         }
         return .{ .rows = rows, .owned_arena = arena, .after = if (end < items.len) try std.fmt.allocPrint(alloc, "{d}", .{end}) else null };
