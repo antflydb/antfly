@@ -92,6 +92,25 @@ const Entry = struct {
     retired: bool = false,
     newer: ?*Entry = null,
     older: ?*Entry = null,
+    expiry_prev: ?*Entry = null,
+    expiry_next: ?*Entry = null,
+};
+
+const ExpiryQueue = struct {
+    first: ?*Entry = null,
+    last: ?*Entry = null,
+
+    fn append(self: *ExpiryQueue, entry: *Entry) void {
+        entry.expiry_prev = self.last;
+        entry.expiry_next = null;
+        if (self.last) |last| last.expiry_next = entry else self.first = entry;
+        self.last = entry;
+    }
+
+    fn remove(self: *ExpiryQueue, entry: *Entry) void {
+        if (entry.expiry_prev) |prev| prev.expiry_next = entry.expiry_next else self.first = entry.expiry_next;
+        if (entry.expiry_next) |next| next.expiry_prev = entry.expiry_prev else self.last = entry.expiry_prev;
+    }
 };
 
 const Flight = struct {
@@ -117,6 +136,8 @@ pub const QueryEmbeddingCache = struct {
     flights: std.AutoHashMapUnmanaged(Key, *Flight) = .empty,
     newest: ?*Entry = null,
     oldest: ?*Entry = null,
+    fixed_expiry: ExpiryQueue = .{},
+    sliding_expiry: ExpiryQueue = .{},
     live_bytes: usize = 0,
     active_pins: usize = 0,
     uncached_inflight: usize = 0,
@@ -475,7 +496,7 @@ pub const QueryEmbeddingCache = struct {
         const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        self.expireOldestLocked(self.nowNs(), budget, metrics_expire_batch);
+        self.expireDueLocked(self.nowNs(), budget, metrics_expire_batch);
         var result = self.counters;
         result.entries = self.entries.count();
         result.live_bytes = self.live_bytes;
@@ -547,17 +568,15 @@ pub const QueryEmbeddingCache = struct {
             self.counters.rejected_admissions +|= 1;
             return;
         }
-        self.expireOldestLocked(self.nowNs(), budget, admission_expire_batch);
+        self.expireDueLocked(self.nowNs(), budget, admission_expire_batch);
         while (self.live_bytes > self.config.max_bytes - charge) {
-            const victim = self.oldest orelse break;
-            self.removeEntryLocked(victim, budget, false);
+            if (!self.reclaimForAdmissionLocked(budget)) break;
         }
         while (!budget.tryReserve(charge)) {
-            const victim = self.oldest orelse {
+            if (!self.reclaimForAdmissionLocked(budget)) {
                 self.counters.rejected_admissions +|= 1;
                 return;
-            };
-            self.removeEntryLocked(victim, budget, false);
+            }
         }
         errdefer budget.release(charge);
 
@@ -574,6 +593,7 @@ pub const QueryEmbeddingCache = struct {
         };
         try self.entries.put(self.alloc, key, entry);
         self.linkNewestLocked(entry);
+        self.expiryQueue(expiration).append(entry);
         self.live_bytes += charge;
     }
 
@@ -585,7 +605,13 @@ pub const QueryEmbeddingCache = struct {
     }
 
     fn touchLocked(self: *QueryEmbeddingCache, entry: *Entry, now_ns: u64) void {
-        if (entry.expiration == .sliding) entry.expires_at_ns = now_ns +| self.config.ttl_ns;
+        if (entry.expiration == .sliding) {
+            entry.expires_at_ns = now_ns +| self.config.ttl_ns;
+            if (self.sliding_expiry.last != entry) {
+                self.sliding_expiry.remove(entry);
+                self.sliding_expiry.append(entry);
+            }
+        }
         if (self.newest == entry) return;
         self.unlinkLocked(entry);
         self.linkNewestLocked(entry);
@@ -605,22 +631,42 @@ pub const QueryEmbeddingCache = struct {
         entry.older = null;
     }
 
-    fn expireOldestLocked(self: *QueryEmbeddingCache, now_ns: u64, budget: *cache_budget.CacheBudget, max_entries: usize) void {
-        var expired: usize = 0;
-        while (expired < max_entries) : (expired += 1) {
-            const entry = self.oldest orelse return;
-            // Fixed-expiry entries can be newer than this LRU position.
-            // Lookups enforce their individual deadlines. Stop the sweep
-            // here to keep maintenance bounded by the expired LRU prefix.
-            if (now_ns < entry.expires_at_ns) return;
+    fn expiryQueue(self: *QueryEmbeddingCache, expiration: Expiration) *ExpiryQueue {
+        return switch (expiration) {
+            .fixed => &self.fixed_expiry,
+            .sliding => &self.sliding_expiry,
+        };
+    }
+
+    fn expiredEntryLocked(self: *const QueryEmbeddingCache, now_ns: u64) ?*Entry {
+        if (self.fixed_expiry.first) |entry| {
+            if (entry.expires_at_ns <= now_ns) return entry;
+        }
+        if (self.sliding_expiry.first) |entry| {
+            if (entry.expires_at_ns <= now_ns) return entry;
+        }
+        return null;
+    }
+
+    fn expireDueLocked(self: *QueryEmbeddingCache, now_ns: u64, budget: *cache_budget.CacheBudget, max_entries: usize) void {
+        for (0..max_entries) |_| {
+            const entry = self.expiredEntryLocked(now_ns) orelse return;
             self.removeEntryLocked(entry, budget, true);
         }
+    }
+
+    fn reclaimForAdmissionLocked(self: *QueryEmbeddingCache, budget: *cache_budget.CacheBudget) bool {
+        const expired = self.expiredEntryLocked(self.nowNs());
+        const victim = expired orelse self.oldest orelse return false;
+        self.removeEntryLocked(victim, budget, expired != null);
+        return true;
     }
 
     fn removeEntryLocked(self: *QueryEmbeddingCache, entry: *Entry, budget: *cache_budget.CacheBudget, expired: bool) void {
         std.debug.assert(!entry.retired);
         _ = self.entries.remove(entry.key);
         self.unlinkLocked(entry);
+        self.expiryQueue(entry.expiration).remove(entry);
         entry.retired = true;
         if (entry.pins == 0) self.destroyEntryLocked(entry, budget);
         if (expired) self.counters.expirations +|= 1 else self.counters.evictions +|= 1;
@@ -1211,6 +1257,36 @@ test "query embedding cache fixed TTL survives hot hits without renewal" {
     defer alloc.free(recomputed);
     try std.testing.expectEqual(@as(f32, 4), recomputed[0]);
     try std.testing.expectEqual(@as(u64, 2), cache.stats(&budget).producer_computations);
+}
+
+test "query embedding cache reclaims a hot expired fixed entry before a live sliding entry" {
+    const alloc = std.testing.allocator;
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer clock.deinit();
+    const capacity = 2 * QueryEmbeddingCache.entryChargeBytes(2);
+    var budget = cache_budget.CacheBudget.init(capacity);
+    var cache = QueryEmbeddingCache.init(alloc, clock.io(), .{ .ttl_ns = 50, .max_bytes = capacity });
+    defer cache.deinit(&budget);
+    var compute = TestCompute{ .value = 3 };
+    const fixed: Key = @splat(1);
+    const sliding: Key = @splat(2);
+    const incoming: Key = @splat(3);
+
+    alloc.free(try cache.getOrComputeWithRetryHint(&budget, alloc, fixed, null, .none, &compute, TestCompute.run, null, .fixed));
+    try clock.advance(10);
+    alloc.free(try cache.getOrCompute(&budget, alloc, sliding, null, &compute, TestCompute.run));
+    try clock.advance(30);
+    alloc.free((try cache.lookup(&budget, alloc, fixed)).?);
+    try std.testing.expectEqual(cache.entries.get(sliding), cache.oldest);
+    try clock.advance(10);
+    alloc.free(try cache.getOrCompute(&budget, alloc, incoming, null, &compute, TestCompute.run));
+
+    try std.testing.expect(!cache.entries.contains(fixed));
+    try std.testing.expect(cache.entries.contains(sliding));
+    try std.testing.expect(cache.entries.contains(incoming));
+    const stats = cache.stats(&budget);
+    try std.testing.expectEqual(@as(u64, 1), stats.expirations);
+    try std.testing.expectEqual(@as(u64, 0), stats.evictions);
 }
 
 test "query embedding cache skips zero TTL retention" {

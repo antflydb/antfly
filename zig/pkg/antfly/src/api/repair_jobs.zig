@@ -599,6 +599,7 @@ pub const Store = struct {
         // debt_remaining and the authoritative remaining_failures summary.
         total.unresolved = pass.unresolved;
         total.in_progress = pass.in_progress;
+        total.document_replay_in_progress = pass.document_replay_in_progress;
         total.indexes_rebuilt +|= pass.indexes_rebuilt;
         // These are job-level state gauges for the one named index, not work
         // counters. A bounded retry may observe the same index repeatedly;

@@ -4469,6 +4469,9 @@ pub const ArtifactRepairResult = struct {
     has_more: bool = false,
     debt_remaining: bool = false,
 
+    /// The document-replay subset of in_progress. Document replay stays on
+    /// its ledger cursor while generation work can be observed by shard.
+    document_replay_in_progress: u64 = 0,
     /// Coordinator-owned group IDs that still need index repair observation.
     pending_index_groups: ?[]u64 = null,
     terminal_error: ?[]u8 = null,
