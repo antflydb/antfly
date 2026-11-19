@@ -1608,8 +1608,7 @@ pub const ExternalStreamDestination = struct {
     pub const Outcome = enum { accepted, committed };
     pub const Request = struct {
         table: metadata_table_manager.TableRecord,
-        source_ordinal: u32,
-        cutover_authority_id: u64,
+        cutover: metadata_table_manager.ReplicationSourceStatusRecord,
         previous_checkpoint: ?[]const u8,
         checkpoint: []const u8,
         changes: []const foreign_mod.ReplicationChange,
@@ -1754,12 +1753,11 @@ pub const StreamingReplicationRunner = struct {
     }
 
     fn applyExternal(self: *StreamingReplicationRunner, owner: ExternalStreamDestination, table: metadata_table_manager.TableRecord, source_ordinal: u32, status: ?metadata_table_manager.ReplicationSourceStatusRecord, previous: []const u8, checkpoint: []const u8, changes: []const foreign_mod.ReplicationChange) !void {
-        const authority = if (status) |record| record.cutover_authority_id else 0;
-        if (authority == 0) return error.UnsupportedReplicationRoute;
+        const cutover = status orelse return error.UnsupportedReplicationRoute;
+        if (cutover.cutover_authority_id == 0 or cutover.table_id != table.table_id or cutover.source_ordinal != source_ordinal) return error.UnsupportedReplicationRoute;
         const outcome = try owner.apply(owner.ptr, self.alloc, .{
             .table = table,
-            .source_ordinal = source_ordinal,
-            .cutover_authority_id = authority,
+            .cutover = cutover,
             .previous_checkpoint = if (previous.len != 0) previous else null,
             .checkpoint = checkpoint,
             .changes = changes,
@@ -7300,7 +7298,7 @@ test "metadata replication stream resumes complete durable transactions while de
         fn external(raw: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) !ExternalStreamDestination.Outcome {
             const self: *Self = @ptrCast(@alignCast(raw));
             self.external_calls += 1;
-            try std.testing.expectEqual(@as(u64, 9), request.cutover_authority_id);
+            try std.testing.expectEqual(@as(u64, 9), request.cutover.cutover_authority_id);
             if (self.external_calls == 1) {
                 try std.testing.expectEqualStrings("initial", request.previous_checkpoint.?);
                 try std.testing.expectEqualStrings("first-commit", request.checkpoint);

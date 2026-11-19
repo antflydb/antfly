@@ -3937,6 +3937,34 @@ const LocalStandaloneMetadata = struct {
         return .{ .ptr = self, .checkpoint_fn = cdcPermitCheckpoint, .deadline_fn = cdcPermitDeadline };
     }
 
+    const LakeStreamRequest = antfly.metadata_replication_backfill.ExternalStreamDestination.Request;
+
+    fn checkLakeStreamOwner(raw: *anyopaque, request: LakeStreamRequest) !void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(raw));
+        try cdcPermitCheckpoint(self, .stream_step);
+        const service = CdcService{ .metadata = self };
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const store = try service.store();
+        const table = (try store.getTable(self.alloc, CdcService.group, request.table.table_id)) orelse return error.CatalogGenerationChanged;
+        defer CdcService.tm.freeTable(self.alloc, table);
+        if (table.object_storage_generation != request.table.object_storage_generation or
+            !std.mem.eql(u8, table.schema_json, request.table.schema_json) or
+            !std.mem.eql(u8, table.replication_sources_json, request.table.replication_sources_json)) return error.CatalogGenerationChanged;
+        const current = (try store.getReplicationSourceStatus(self.alloc, CdcService.group, table.table_id, request.cutover.source_ordinal)) orelse return error.ReplicationCutoverAuthorityLost;
+        defer CdcService.tm.freeReplicationSourceStatus(self.alloc, current);
+        if (!antfly.metadata_service.replicationCutoverAuthorityMatches(current, request.cutover)) return error.ReplicationCutoverAuthorityLost;
+        const definition = try @import("../metadata/source_control.zig").definitionDigest(self.alloc, table.replication_sources_json, request.cutover.source_ordinal);
+        if (!try store.legacyReplicationSourceIntakeAllowed(self.alloc, CdcService.group, table.table_id, request.cutover.source_ordinal, definition)) return error.SourcePendingWork;
+    }
+
+    fn resolveLakeStreamOwner(raw: *anyopaque, a: std.mem.Allocator, request: LakeStreamRequest) !@import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(raw));
+        const data = self.data_server orelse return error.UnsupportedReplicationRoute;
+        const server = if (data.http_server) |*api| api else return error.UnsupportedReplicationRoute;
+        return @import("../api/lake_source_owner.zig").options(a, server, request.table, .{ .deadline_ns = request.deadline_ns });
+    }
+
     /// One snapshot round then one streaming round, the same sequence and
     /// coordinators cluster metadata runs from its leader. The snapshot and
     /// streaming resume cursors live on `self.cdc` (the scheduler), not on
@@ -3974,11 +4002,17 @@ const LocalStandaloneMetadata = struct {
             "standalone cdc snapshot round tables={d} sources={d} started={d} resumed={d} completed={d} yielded={d} failed={d}",
             .{ summary.tables_considered, summary.sources_considered, summary.sources_started, summary.sources_resumed, summary.sources_completed, summary.sources_yielded, summary.sources_failed },
         );
+        var lake_owner: @import("../serverless/lake_ingestion.zig").StreamOwner = .{
+            .ptr = self,
+            .resolve = resolveLakeStreamOwner,
+            .check = checkLakeStreamOwner,
+        };
         const stream_summary = backfill.runStreamingRound(self.alloc, service, .{
             .alloc = self.alloc,
             .io = io,
             .registry = &self.cdc.registry,
             .write_source = write_source,
+            .external_destination = lake_owner.port(),
             .secret_store = server.write_source.secret_store,
             .work_permit = self.cdcWorkPermit(),
             .destination_authorizer = server.write_source.destination_authorizer,

@@ -152,6 +152,53 @@ fn keyImage(a: A, keys: []const []const u8, row: V) !V {
     return .{ .object = key };
 }
 
+/// The serving owner supplies qualified transport and rechecks the live
+/// table incarnation and PostgreSQL cutover throughout catalog work.
+pub const StreamOwner = struct {
+    const Port = @import("../metadata/replication_backfill.zig").ExternalStreamDestination;
+
+    ptr: *anyopaque,
+    resolve: *const fn (*anyopaque, A, Port.Request) anyerror!Options,
+    check: *const fn (*anyopaque, Port.Request) anyerror!void,
+
+    pub fn port(self: *StreamOwner) Port {
+        return .{ .ptr = self, .apply = apply };
+    }
+
+    const Guard = struct {
+        owner: *StreamOwner,
+        request: Port.Request,
+
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *Guard = @ptrCast(@alignCast(raw));
+            try self.owner.check(self.owner.ptr, self.request);
+        }
+    };
+
+    fn apply(raw: *anyopaque, backing: A, request: Port.Request) !Port.Outcome {
+        const self: *StreamOwner = @ptrCast(@alignCast(raw));
+        if (request.table.table_id == 0 or request.table.table_id != request.cutover.table_id or request.cutover.cutover_authority_id == 0) return error.UnsupportedReplicationRoute;
+        var arena = std.heap.ArenaAllocator.init(backing);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var guard: Guard = .{ .owner = self, .request = request };
+        const context: Context = .{ .deadline_ns = request.deadline_ns, .checkpoint = .{ .ptr = &guard, .check = Guard.checkpoint } };
+        try context.ensureActive();
+        var bound = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, request.table.schema_json)) orelse return error.UnsupportedReplicationRoute;
+        defer bound.deinit(a);
+        try bound.binding.validateSupported();
+        if (bound.binding.format != .iceberg or bound.binding.write_policy != .iceberg_writer) return error.UnsupportedReplicationRoute;
+        const identity = bound.binding.row_identity orelse return error.UnsupportedReplicationRoute;
+        const options = try self.resolve(self.ptr, a, request);
+        if (options.catalog_table_id != request.table.table_id or options.catalog_generation != request.table.object_storage_generation) return error.CatalogGenerationChanged;
+        const source = try std.fmt.allocPrint(a, "postgres:{d}:{d}", .{ request.table.table_id, request.cutover.source_ordinal });
+        const epoch = try std.fmt.allocPrint(a, "{d}", .{request.cutover.cutover_authority_id});
+        const batch = try postgresBatch(a, source, epoch, request.previous_checkpoint, request.checkpoint, identity.key_columns, request.changes);
+        const outcome = try applyBatch(a, bound.binding, options, context, batch);
+        return if (outcome.committed) .committed else .accepted;
+    }
+};
+
 pub const BatchOutcome = struct {
     accepted_sequence: u64,
     committed: bool,
@@ -964,4 +1011,69 @@ test "external lake WAL grouping bounds checkpoint-only records independently of
     const tail = try group(a, records[max_group_records..], max_group_changes, max_group_payload_bytes);
     try std.testing.expectEqual(@as(usize, 1), tail.records);
     try std.testing.expect(tail.batch.follows(folded.batch));
+}
+
+test "external lake filesystem WAL applies the managed PostgreSQL stream owner port" {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-wal-postgres-owner");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(a, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+
+    const uri = try std.fmt.allocPrint(a, "file://{s}/warehouse", .{directory.path()});
+    const schema = try std.json.Stringify.valueAlloc(a, .{ .base_source = .{
+        .kind = "external",
+        .table_id = "events",
+        .uri = uri,
+        .format = "iceberg",
+        .write_policy = "iceberg_writer",
+        .catalog = .{ .type = "managed" },
+        .row_identity = .{ .key_columns = .{"id"} },
+    } }, .{});
+    var bound = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
+    defer bound.deinit(a);
+    const options: Options = .{ .node_config = &config, .catalog_table_id = 9, .catalog_generation = 4 };
+    var opened = try configured.openBindingObjectStoreAlloc(alloc, bound.binding, options);
+    defer opened.deinit();
+    var managed: catalog.managed.Managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = uri };
+    _ = try managed.create(a, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+
+    const Fixture = struct {
+        options: Options,
+        authority: u64 = 12,
+        checks: usize = 0,
+        fn resolve(raw: *anyopaque, _: A, _: StreamOwner.Port.Request) !Options {
+            return (@as(*@This(), @ptrCast(@alignCast(raw)))).options;
+        }
+        fn check(raw: *anyopaque, request: StreamOwner.Port.Request) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.authority != request.cutover.cutover_authority_id) return error.ReplicationCutoverAuthorityLost;
+        }
+    };
+    var fixture: Fixture = .{ .options = options };
+    var owner: StreamOwner = .{ .ptr = &fixture, .resolve = Fixture.resolve, .check = Fixture.check };
+    const port = owner.port();
+    var checkpoint = [_]u8{'1'};
+    const row = try std.json.parseFromSliceLeaky(V, a, "{\"id\":1}", .{});
+    var request: StreamOwner.Port.Request = .{
+        .table = .{ .table_id = 9, .name = "events", .schema_json = schema, .object_storage_generation = 4 },
+        .cutover = .{ .table_id = 9, .source_ordinal = 2, .source_kind = "postgres", .cutover_authority_id = 12 },
+        .previous_checkpoint = null,
+        .checkpoint = &checkpoint,
+        .changes = &.{.{ .op = .insert, .checkpoint = &checkpoint, .row = row }},
+        .deadline_ns = null,
+    };
+    try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, request));
+    try std.testing.expect(fixture.checks > 1);
+    try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, request));
+    request.table.object_storage_generation += 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, port.apply(port.ptr, alloc, request));
+    fixture.authority += 1;
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, port.apply(port.ptr, alloc, request));
+    try std.testing.expectEqual(@as(u64, 1), try watermark(a, bound.binding, options, .{}));
 }
