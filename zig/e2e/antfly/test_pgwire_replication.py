@@ -77,6 +77,23 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             timeout=40,
         )
 
+    def catalog_publication():
+        return subprocess.check_output(
+            [
+                psql,
+                *connection,
+                "-XAt",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                "SELECT puballtables, pubinsert, pubupdate, pubdelete, pubtruncate "
+                "FROM pg_publication WHERE pubname = 'changes'",
+            ],
+            text=True,
+            env=env,
+            timeout=40,
+        ).splitlines()
+
     def catalog_slot(name="smoke_slot", plugin="pgoutput"):
         result = subprocess.check_output(
             [psql, *connection, "-XAt", "-v", "ON_ERROR_STOP=1"],
@@ -266,7 +283,9 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
         sql("CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT)")
         if export_snapshot:
             sql("ALTER TABLE smoke REPLICA IDENTITY FULL")
+        assert catalog_publication() == []
         sql("CREATE PUBLICATION changes FOR TABLE smoke")
+        assert catalog_publication() == ["f|t|t|t|f"]
         assert catalog_slot() == []
         if export_snapshot:
             sql("INSERT INTO smoke (id, content) VALUES (6, 'snapshot-before-cut')")
@@ -355,6 +374,7 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             time.sleep(12)
 
         server.restart()
+        assert catalog_publication() == ["f|t|t|t|f"]
         (recovered,) = catalog_slot()
         assert recovered[:3] == ["smoke_slot", "pgoutput", "f"]
         assert recovered[4] != created[4]
@@ -366,6 +386,8 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
         assert resumed.read_bytes() == b""
         slot("--drop-slot")
         assert catalog_slot() == []
+        sql("DROP PUBLICATION changes")
+        assert catalog_publication() == []
     except Exception:
         print(server.debug_logs())
         raise

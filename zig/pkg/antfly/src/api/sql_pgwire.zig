@@ -2957,6 +2957,7 @@ const GuardedCatalog = struct {
         if (system.isRoles(table)) return system.scanRole(alloc, request, try self.catalogRole());
         if (system.isEmpty(table)) return .{ .rows = &.{} };
         if (system.isReplicationSlots(table)) return self.replicationSlotPage(alloc, request);
+        if (system.isPublications(table)) return self.publicationPage(alloc, request);
         if (system.isNamespaces(table)) {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
@@ -3108,7 +3109,8 @@ const GuardedCatalog = struct {
     fn openSystemScan(self: *GuardedCatalog, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {
         if (system.isRoles(table)) return system.openRole(alloc, request, try self.catalogRole());
         if (system.isEmpty(table)) return system.openEmpty(self);
-        if (system.isReplicationSlots(table)) return system.openReplicationSlot(alloc, try self.replicationSlotPage(alloc, request));
+        if (system.isReplicationSlots(table)) return system.openSingleRow(alloc, try self.replicationSlotPage(alloc, request));
+        if (system.isPublications(table)) return system.openSingleRow(alloc, try self.publicationPage(alloc, request));
         if (system.isNamespaces(table)) {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
@@ -3116,8 +3118,32 @@ const GuardedCatalog = struct {
         }
         return system.open(alloc, request);
     }
+    fn publicationPage(self: *GuardedCatalog, alloc: std.mem.Allocator, request: catalog.Scan) !catalog.Page {
+        const name = (try system.keyedName(request, "pubname")) orelse return .{ .rows = &.{} };
+        if (name.len == 0 or name.len > 63 or std.mem.indexOfScalar(u8, name, 0) != null or request.limit == 0 or request.after != null) return .{ .rows = &.{} };
+        const server = self.authority.server orelse return error.UnsupportedReplicationMode;
+        const port = server.source.pg_publications orelse return .{ .rows = &.{} };
+        const identity = self.authority.identity.* orelse return error.Forbidden;
+        const owner = try @import("changefeed_public.zig").durableOwner(identity);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var context = try self.authority.context();
+        const database = try CatalogReplicationSlots.readDatabase(server, a, self.authority.request.database orelse "default", context);
+        context.principal = .{ .kind = .internal, .subject = "pg-publication-maintenance" };
+        var record = (try port.read(port.ptr, a, database, name, context)) orelse return .{ .rows = &.{} };
+        defer record.deinit();
+        const value = record.value;
+        if (!std.meta.eql(value.database, database) or !std.mem.eql(u8, value.name, name)) return error.ChangefeedCorrupt;
+        if (!std.crypto.timing_safe.eql(publication_control.Digest, owner, value.owner) or value.members == null) return .{ .rows = &.{} };
+        try self.authority.credential.validate();
+        const digest = publication_control.hash(.{ .database = database, .name = name });
+        const oid = 16384 + std.mem.readInt(u32, digest[0..4], .big) % (std.math.maxInt(u32) - 16384);
+        return system.publicationPage(alloc, request, name, oid, @import("antfly_local_sources").sql_scalar.postgresRoleOid(self.authority.credential.sessionPrincipal()));
+    }
+
     fn replicationSlotPage(self: *GuardedCatalog, alloc: std.mem.Allocator, request: catalog.Scan) !catalog.Page {
-        const name = (try system.slotName(request)) orelse return .{ .rows = &.{} };
+        const name = (try system.keyedName(request, "slot_name")) orelse return .{ .rows = &.{} };
         if (!publication_control.pg_slot.validName(name) or request.limit == 0 or request.after != null) return .{ .rows = &.{} };
         const server = self.authority.server orelse return error.UnsupportedReplicationMode;
         if (server.source.changefeeds == null) return .{ .rows = &.{} };
