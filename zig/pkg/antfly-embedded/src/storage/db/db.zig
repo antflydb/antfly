@@ -156622,6 +156622,59 @@ test "db optional numeric range filters lexical and dense candidates on fresh an
     }
 }
 
+test "optional numeric range reconciles witnessed text coverage with primary identities" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("range-primary-coverage");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{});
+    defer db.close();
+    try db.setSchema(.{
+        .default_type = "doc",
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{
+            .{ .path = "body", .emitted_name = "body", .analyzer = "standard" },
+        } }},
+        .exact_fields = &.{.{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .numeric, .doc_values = true } }},
+    });
+    try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{ .name = "dv", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"external\":true}" });
+    try db.batch(.{ .sync_level = .full_index, .writes = &.{
+        .{ .key = "a", .value = "{\"body\":\"beacon\",\"rank\":2,\"_embeddings\":{\"dv\":[1,0]}}" },
+        .{ .key = "b", .value = "{\"body\":\"relay\",\"rank\":1,\"_embeddings\":{\"dv\":[0.9,0.1]}}" },
+    } });
+    const entry = db.core.index_manager.textIndex("ft").?;
+    const deletions = try entry.deleteByIdsTracked(&.{"a"});
+    defer entry.freeDeleteInfos(deletions);
+    try std.testing.expect(deletions.len != 0);
+    const snapshot = entry.acquireSnapshot();
+    defer snapshot.release();
+    try std.testing.expectEqual(@as(u32, 1), snapshot.liveDocCount());
+    for (snapshot.segments) |segment| {
+        if (segment.liveDocCount() != 0) try std.testing.expect((try segment.reader.numericRangeCoverage("rank")) == .populated);
+    }
+
+    const range = "{\"range\":{\"rank\":{\"gte\":2}}}";
+    const mixed = "{\"conjuncts\":[{\"doc_id\":[\"a\"]},{\"disjuncts\":[{\"match\":{\"field\":\"body\",\"text\":\"beacon\"}}," ++ range ++ "]}]}";
+    for ([_]struct { include: []const u8 = "", exclude: []const u8 = "", ids: []const []const u8 = &.{}, expected: []const u8 }{
+        .{ .include = range, .expected = "a" },
+        .{ .include = range, .ids = &.{ "a", "b" }, .expected = "a" },
+        .{ .exclude = range, .expected = "b" },
+        .{ .include = mixed, .expected = "a" },
+    }) |case| {
+        var result = try db.searchDenseProfiled(a, .{
+            .index_name = "dv",
+            .primary_text_index_name = "ft",
+            .limit = 1,
+            .include_stored = false,
+            .filter_doc_ids = case.ids,
+            .filter_query_json = case.include,
+            .exclusion_query_json = case.exclude,
+        }, .{ .vector = &.{ 1, 0 }, .k = 1 });
+        defer result.result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.result.hits.len);
+        try std.testing.expectEqualStrings(case.expected, result.result.hits[0].id);
+    }
+}
+
 test "optional numeric range prefilters dense search without a text index" {
     const a = std.testing.allocator;
     var tmp = try TestDirectory.init("dense-primary-range");

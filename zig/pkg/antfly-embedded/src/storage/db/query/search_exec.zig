@@ -9638,7 +9638,8 @@ const IndexedPredicateEvaluator = struct {
     missing_rows: ?*roaring.RoaringBitmap = null,
     key_domain: ?*const std.StringHashMapUnmanaged(u32) = null,
     skip_unmapped: bool = false,
-    verify_mixed_ranges_from_primary: bool = false,
+    reconcile_primary_ranges: bool = false,
+    presence_cache_prefix: ?[]const u8 = null,
     local_cache: ?LocalCache = null,
     probe_input: ?*FrontierProbeInput = null,
     applied_gates: ?*AppliedGates = null,
@@ -9789,7 +9790,7 @@ const IndexedPredicateEvaluator = struct {
     }
 
     fn indexed(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery) !bool {
-        if (self.verify_mixed_ranges_from_primary and structuredRangeLeaves(query).range) return false;
+        if (self.reconcile_primary_ranges and structuredRangeLeaves(query).range) return false;
         return searchQueryCanUseSnapshotWithControl(self.snapshot, query, self.analysis, self.schema, false, self.control);
     }
 
@@ -9812,7 +9813,14 @@ const IndexedPredicateEvaluator = struct {
             return rows;
         }
         const cache = &self.snapshot.graph_predicates;
-        if (try cache.getScoped(self.alloc, key, self.control, scope)) |rows| return rows;
+        // Scoped callers use real ordinals. Unmapped postings cannot
+        // belong to their domain, but must remain visible to strict callers.
+        const ordinal_only = scope != null and !self.skip_unmapped;
+        const global_key = if (ordinal_only) try std.fmt.allocPrint(self.scratch, "ordinal-only:{s}", .{key}) else key;
+        if (ordinal_only) {
+            if (self.local_cache) |local| if (local.memory.entries.getPtr(global_key)) |rows| return self.copyMembership(rows, scope);
+        }
+        if (try cache.getScoped(self.alloc, global_key, self.control, scope)) |rows| return rows;
         if (scope) |domain| if (self.probe_input != null) {
             const physical_count = self.snapshot.filterPhysicalDocCount();
             const small_frontier = physical_count >= 65_536 and domain.cardinality() *| 32 <= physical_count;
@@ -9826,28 +9834,23 @@ const IndexedPredicateEvaluator = struct {
                 physical_count;
             const low_headroom = @as(u64, estimate) * 8 > available;
             const prefer_probe = small_frontier and estimate > @max(@as(u64, 256), @as(u64, domain.cardinality()) * 8, self.snapshot.graphOrdinalScanCost() / 32);
-            if (prefer_probe or low_headroom or (self.local_cache != null and self.local_cache.?.memory.shouldProbe(key))) {
+            if (prefer_probe or low_headroom or (self.local_cache != null and self.local_cache.?.memory.shouldProbe(global_key))) {
                 if (try self.probeFrontier(query, domain)) |rows| return rows;
             }
         };
-        const flight = try cache.lockFlight(key, self.control);
+        const flight = try cache.lockFlight(global_key, self.control);
         defer flight.unlock();
-        if (try cache.getScoped(self.alloc, key, self.control, scope)) |rows| return rows;
-        var all = self.executeIndexed(query) catch |err| {
-            if (err == error.UnsupportedQueryRequest and scope != null and !self.skip_unmapped) {
-                var ordinal_only = self;
-                ordinal_only.skip_unmapped = true;
-                var matched = try ordinal_only.executeIndexed(query);
-                defer matched.deinit();
-                return self.copyMembership(&matched, scope);
-            }
+        if (try cache.getScoped(self.alloc, global_key, self.control, scope)) |rows| return rows;
+        var global = self;
+        global.skip_unmapped = self.skip_unmapped or ordinal_only;
+        var all = global.executeIndexed(query) catch |err| {
             if (err == error.OutOfMemory) if (scope) |domain| {
                 if (try self.probeFrontier(query, domain)) |rows| return rows;
             };
             return err;
         };
-        cache.put(self.snapshot.alloc, key, &all);
-        if (self.local_cache) |local| local.memory.put(local.alloc, local.budget, key, &all);
+        cache.put(self.snapshot.alloc, global_key, &all);
+        if (self.local_cache) |local| local.memory.put(local.alloc, local.budget, global_key, &all);
         if (scope == null) return all;
         defer all.deinit();
         return self.copyMembership(&all, scope);
@@ -10107,7 +10110,7 @@ const IndexedPredicateEvaluator = struct {
     }
 
     fn requiresTextPosting(query: search_mod.SearchQuery) bool {
-        if (query == .match_all) return false;
+        if (query == .match_all or query == .doc_id) return false;
         if (query != .bool_query) return true;
         const boolean = query.bool_query;
         for (boolean.must) |child| if (requiresTextPosting(child)) return true;
@@ -10178,6 +10181,7 @@ const IndexedPredicateEvaluator = struct {
         return switch (query) {
             .bool_query => |boolean| self.executeBoolean(boolean, scope, path),
             .numeric_range => self.executeMixedRange(query, scope, path),
+            .doc_id => |ids| self.executePrimaryIds(ids.ids, scope),
             else => error.UnsupportedQueryRequest,
         };
     }
@@ -10358,15 +10362,62 @@ const IndexedPredicateEvaluator = struct {
         }
     }
 
+    fn executePrimaryIds(self: IndexedPredicateEvaluator, keys: []const []const u8, scope: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        var rows = roaring.RoaringBitmap.init(self.alloc);
+        errdefer rows.deinit();
+        if (self.key_domain) |domain| {
+            for (keys) |key| {
+                try self.control.check();
+                if (domain.get(key)) |ordinal| if (scope.contains(ordinal)) try rows.add(ordinal);
+            }
+        } else {
+            const identity = ResidualIdentityContext{ .alloc = self.alloc, .executor = self.executor, .control = self.control };
+            const wanted = doc_set.ResolvedDocSet{ .doc_keys = keys };
+            rows = try scope.cloneExact(self.alloc);
+            try restrictMixedFilterScope(identity, &rows, &wanted, true);
+        }
+        return rows;
+    }
+
+    fn primaryRangeCoverage(self: IndexedPredicateEvaluator, scope: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        if (self.probe_input != null) if (try self.probeFrontier(.{ .match_all = {} }, scope)) |covered| return covered;
+        if (self.key_domain == null and scope.cardinality() *| 32 <= self.snapshot.filterPhysicalDocCount()) {
+            if (self.executor.resolve_doc_set_doc_ids) |resolve| {
+                var temporary = std.heap.ArenaAllocator.init(self.alloc);
+                defer temporary.deinit();
+                const a = temporary.allocator();
+                const requested = doc_set.ResolvedDocSet{ .ordinal_bitmap = scope.* };
+                const ids = (try resolve(self.executor.ctx, a, &requested, self.executor.identity_read_generation)) orelse return error.StorageReadTemporarilyUnavailable;
+                if (ids.len != scope.cardinality()) return error.InvalidData;
+                var frontier: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+                var ordinals = scope.iterator();
+                for (ids) |id| {
+                    try self.control.check();
+                    try frontier.put(a, ordinals.next().?, id);
+                }
+                var memo: FrontierProbeInput = .{};
+                defer memo.deinit(self.alloc);
+                var candidate = self;
+                candidate.frontier = frontier;
+                candidate.probe_input = &memo;
+                candidate.scratch = a;
+                if (try candidate.probeFrontier(.{ .match_all = {} }, scope)) |covered| return covered;
+            }
+        }
+        var presence = self;
+        presence.cache_prefix = self.presence_cache_prefix orelse self.cache_prefix;
+        return presence.executeIndexedClause(.{ .match_all = {} }, scope, "/range-coverage");
+    }
+
     /// A witness covers the rows represented by this snapshot. A primary
     /// candidate missing from the snapshot still needs stored evaluation.
     fn executeMixedRange(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap, path: []const u8) !roaring.RoaringBitmap {
         const stored = (query.numeric_range.stored_standard_range orelse return error.UnsupportedQueryRequest).*;
-        if (!self.verify_mixed_ranges_from_primary or !try searchQueryCanUseSnapshotWithControl(self.snapshot, query, self.analysis, self.schema, false, self.control)) {
+        if (!self.reconcile_primary_ranges or !try searchQueryCanUseSnapshotWithControl(self.snapshot, query, self.analysis, self.schema, false, self.control)) {
             return self.executeStoredRange(stored, scope);
         }
 
-        var covered = try self.executeIndexedClause(.{ .match_all = {} }, scope, "/range-coverage");
+        var covered = try self.primaryRangeCoverage(scope);
         defer covered.deinit();
         if (covered.cardinality() == 0) return self.executeStoredRange(stored, scope);
         var typed_matches = try self.executeIndexedClause(query, &covered, path);
@@ -10861,7 +10912,8 @@ fn collectStructuredFilterResolvedDocSetAlloc(
                 (if (resolvedDocFilterFromRequest(req)) |prior| prior.include != .all else false);
             const leaves = structuredRangeLeaves(search_query);
             const mixed_range = leaves.range and (leaves.other or has_match);
-            if (!finite and !mixed_range) if (try collectSearchQueryResolvedDocSetAlloc(
+            const has_primary_ids = containsPrimaryIds(search_query);
+            if (!finite and !leaves.range and !has_primary_ids) if (try collectSearchQueryResolvedDocSetAlloc(
                 alloc,
                 scratch,
                 executor,
@@ -10873,13 +10925,13 @@ fn collectStructuredFilterResolvedDocSetAlloc(
             )) |native| return native;
             const analyzed_policy = leaves.range and req.authorization_filter_query_json.len != 0 and
                 try patternFilterContainsMatch(try graph_exec.parsePatternJsonLeaky(scratch, req.authorization_filter_query_json), 0);
-            const searchable_finite = finite and !mixed_range and capable: {
+            const searchable_range_or_finite = (finite or leaves.range) and !mixed_range and capable: {
                 if (!leaves.range) break :capable true;
                 const snapshot = text_entry.persistent.acquireSnapshot();
                 defer snapshot.release();
                 break :capable try searchQueryCanUseSnapshotWithControl(snapshot, search_query, text_entry.text_analysis, text_entry.runtime_schema, false, .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns });
             };
-            if (has_match or analyzed_policy or (leaves.range and (leaves.other or (!finite and executor.primary_residual_scope == null))) or searchable_finite) {
+            if (has_match or has_primary_ids or analyzed_policy or (leaves.range and (leaves.other or (!finite and executor.primary_residual_scope == null))) or searchable_range_or_finite) {
                 if (collectMixedStructuredFilterAlloc(alloc, scratch, req, executor, text_entry, search_query, filter_query_json, false, false)) |mixed| {
                     if (executor.structured_visibility_verified) |verified| verified.* = true;
                     return mixed;
@@ -10931,6 +10983,27 @@ fn addResolvedOrdinals(rows: *roaring.RoaringBitmap, set: *const doc_set.Resolve
     }
 }
 
+fn containsPrimaryIds(query: search_mod.SearchQuery) bool {
+    if (query == .doc_id) return true;
+    if (query == .bool_query) {
+        const boolean = query.bool_query;
+        for ([_][]const search_mod.SearchQuery{ boolean.must, boolean.should, boolean.must_not }) |children| {
+            for (children) |child| if (containsPrimaryIds(child)) return true;
+        }
+    }
+    return false;
+}
+
+fn requiredPrimaryIds(query: search_mod.SearchQuery) ?[]const []const u8 {
+    if (query == .doc_id) return query.doc_id.ids;
+    if (query == .bool_query) {
+        for (query.bool_query.must) |child| {
+            if (requiredPrimaryIds(child)) |ids| return ids;
+        }
+    }
+    return null;
+}
+
 fn collectMixedStructuredFilterAlloc(
     alloc: Allocator,
     scratch: Allocator,
@@ -10953,6 +11026,7 @@ fn collectMixedStructuredFilterAlloc(
         deletions.update(std.mem.asBytes(&revision));
     }
     const cache_prefix = try std.fmt.allocPrint(scratch, "{d}:{d}:{d}:{d}:{s}:{s}", .{ entry.instance_id, entry.projection_revision, executor.identity_read_generation orelse 0, deletions.final(), if (skip_unmapped) "ordinal" else "complete", filter_json });
+    const presence_key = try std.fmt.allocPrint(scratch, "primary-presence:{d}:{d}:{d}:{d}:{d}", .{ entry.instance_id, entry.projection_revision, executor.identity_read_generation orelse 0, deletions.final(), @intFromBool(skip_unmapped) });
     const leaves = structuredRangeLeaves(query);
     var missing_rows = roaring.RoaringBitmap.init(alloc);
     defer missing_rows.deinit();
@@ -10968,7 +11042,8 @@ fn collectMixedStructuredFilterAlloc(
         .cache_prefix = cache_prefix,
         .missing_rows = &missing_rows,
         .skip_unmapped = skip_unmapped,
-        .verify_mixed_ranges_from_primary = leaves.range and leaves.other,
+        .reconcile_primary_ranges = leaves.range,
+        .presence_cache_prefix = presence_key,
     };
     const identity = ResidualIdentityContext{ .executor = executor, .alloc = alloc, .control = matcher.control };
     const original = if (std.mem.eql(u8, filter_json, req.filter_query_json))
@@ -10988,9 +11063,12 @@ fn collectMixedStructuredFilterAlloc(
     user_matcher.applied_gates = &applied_gates;
     if (original != null) user_matcher.cache_prefix = try std.fmt.allocPrint(scratch, "user:{s}", .{cache_prefix});
     const prior_filter = resolvedDocFilterFromRequest(req);
-    const explicit = req.filter_doc_ids_positive or req.filter_doc_ids.len != 0;
-    const positive = doc_set.ResolvedDocSet{ .doc_keys = req.filter_doc_ids };
-    const finite = explicit or (prior_filter != null and prior_filter.?.include != .all);
+    const requested_ids = req.filter_doc_ids_positive or req.filter_doc_ids.len != 0;
+    const prior_is_finite = prior_filter != null and prior_filter.?.include != .all;
+    const gate_ids = if (!requested_ids and !prior_is_finite) requiredPrimaryIds(user_query) else null;
+    const explicit = requested_ids or gate_ids != null;
+    const positive = doc_set.ResolvedDocSet{ .doc_keys = gate_ids orelse req.filter_doc_ids };
+    const finite = explicit or prior_is_finite;
     var owned_scope: doc_set.ResolvedDocSet = .none;
     defer owned_scope.deinit(alloc);
     var owned_keys: doc_set.ResolvedDocSet = .none;

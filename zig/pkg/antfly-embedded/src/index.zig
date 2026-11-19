@@ -2605,7 +2605,7 @@ pub const IndexSnapshot = struct {
 
     pub fn docOrdinalsForDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, doc_nums: []const u32) !?[]u32 {
         var out = std.ArrayListUnmanaged(u32).empty;
-        errdefer out.deinit(alloc);
+        defer out.deinit(alloc);
 
         for (doc_nums) |doc_num| {
             const ordinal = (try self.docOrdinal(doc_num)) orelse return null;
