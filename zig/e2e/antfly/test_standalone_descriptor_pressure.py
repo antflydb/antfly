@@ -182,13 +182,18 @@ def test_full_index_ingest_and_reopen_with_minimum_file_limit(
         measurements.phase = "recovery"
         server.resume()
         with requests.Session() as session:
-            wait_visible(
-                session,
-                url,
-                batch_size * batches,
-                check_health=measurements.check,
-                failure_event=measurements.failed,
-            )
+            deadline = time.monotonic() + 300
+            for index_name in ("vec", "lexical"):
+                wait_visible(
+                    session,
+                    url,
+                    batch_size * batches,
+                    index_name=index_name,
+                    require_query_visible_count=index_name == "vec",
+                    deadline=deadline,
+                    check_health=measurements.check,
+                    failure_event=measurements.failed,
+                )
             for index in range(batch_size - 1, batch_size * batches, batch_size):
                 call(session, url, "GET", f"/tables/documents/documents/d{index:09d}")
             query(session, url, first_vector)

@@ -782,6 +782,46 @@ def test_visibility_status_timeouts_cannot_extend_overall_deadline(monkeypatch):
     assert len(calls) == 1
 
 
+def test_lexical_visibility_waits_for_queryability_within_shared_deadline(monkeypatch):
+    import bench_descriptor_pressure as bench
+
+    clock = [297.0]
+    requests = []
+    waits = []
+
+    def call(_session, _url, _method, path, *, timeout):
+        requests.append((path, timeout))
+        return {
+            "status": {
+                "total_indexed": 256,
+                "readiness": {"queryable": len(requests) > 1},
+            }
+        }
+
+    def wait(seconds):
+        waits.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(bench, "call", call)
+    monkeypatch.setattr(bench.time, "monotonic", lambda: clock[0])
+    status = bench.wait_visible(
+        None,
+        "http://unused",
+        256,
+        index_name="lexical",
+        require_query_visible_count=False,
+        deadline=300.0,
+        check_health=lambda: None,
+        failure_event=SimpleNamespace(wait=wait),
+    )
+    assert status["readiness"]["queryable"]
+    assert requests == [
+        ("/tables/documents/indexes/lexical", 3.0),
+        ("/tables/documents/indexes/lexical", 2.75),
+    ]
+    assert waits == [0.25]
+
+
 @pytest.fixture
 def body_timeout_session():
     """Exercise Requests' real response consumption and exception wrapping."""
