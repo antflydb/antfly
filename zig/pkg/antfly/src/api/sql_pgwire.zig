@@ -373,13 +373,17 @@ pub const CatalogReplicationSlots = struct {
     pub fn readOwned(self: CatalogReplicationSlots, a: std.mem.Allocator, name: []const u8, context: operation.RequestContext) !control.Parsed {
         try context.ensureActive();
         if (!control.pg_slot.validName(name)) return error.InvalidReplicationSlotName;
+        return self.readOwnedId(a, control.pg_slot.feedId(self.database, name), name, context);
+    }
+
+    fn readOwnedId(self: CatalogReplicationSlots, a: std.mem.Allocator, id: control.Id, expected_name: ?[]const u8, context: operation.RequestContext) !control.Parsed {
+        try context.ensureActive();
         const metadata = self.server.source.changefeeds orelse return error.UnsupportedReplicationMode;
         const current = try readDatabase(self.server, a, self.database_name, context);
         if (!std.meta.eql(current, self.database)) return error.ChangefeedResynchronizationRequired;
         var identity = try self.identity.read(self.identity.context, a);
         defer identity.deinit(a);
         const owner = try @import("changefeed_public.zig").durableOwner(identity);
-        const id = control.pg_slot.feedId(self.database, name);
         const bytes = try metadata.read(a, id, maintenanceContext(context));
         defer a.free(bytes);
         var state = try control.parse(a, bytes);
@@ -387,9 +391,64 @@ pub const CatalogReplicationSlots = struct {
         const definition = state.value.definition orelse return error.ReplicationSlotNotFound;
         if (!std.crypto.timing_safe.eql(control.Digest, owner, definition.owner)) return error.Forbidden;
         const slot = state.value.slot orelse return error.ReplicationSlotNotFound;
-        if (!std.meta.eql(slot.database, self.database) or !std.mem.eql(u8, slot.name, name)) return error.ChangefeedCorrupt;
+        if (!std.meta.eql(slot.database, self.database) or !std.meta.eql(state.value.id, id)) return error.ChangefeedCorrupt;
+        if (expected_name) |name| if (!std.mem.eql(u8, slot.name, name)) return error.ChangefeedCorrupt;
         try context.ensureActive();
         return state;
+    }
+
+    fn qualifySnapshot(self: CatalogReplicationSlots, a: std.mem.Allocator, snapshot: control.SlotSnapshot, context: operation.RequestContext) !control.Parsed {
+        var observed = try self.readOwnedId(a, snapshot.feed, null, context);
+        errdefer observed.deinit();
+        const state = observed.value;
+        const slot = state.slot.?;
+        const binding = slot.binding orelse return error.ChangefeedCapabilityUnsupported;
+        var resolver: CatalogReplicationPublication = .{ .server = self.server, .database_name = self.database_name, .identity = self.identity };
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const publication = try resolver.resolve(scratch, self.database, binding.publications, context);
+        try publication.authorize(self.identity, scratch, state, binding);
+        const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_s;
+        // readOwnedId and authorize have independently checked the live owner.
+        try snapshot.verify(state, self.database, state.definition.?.owner, now);
+        return observed;
+    }
+
+    /// Qualified raw rows for a SQL snapshot importer. The importer still
+    /// owns transaction lifetime and conversion to authorized SQL tuples.
+    pub fn readExportedSnapshot(self: CatalogReplicationSlots, a: std.mem.Allocator, name: []const u8, namespace: control.Namespace, after: u32, rows: u32, bytes: u32, context: operation.RequestContext) !@import("history_page_operations.zig").pages.BootstrapPage {
+        const snapshot = try control.SlotSnapshot.parse(name);
+        var observed = try self.qualifySnapshot(a, snapshot, context);
+        defer observed.deinit();
+        const state = observed.value;
+        const source = self.server.cfg.native_history_roots orelse return error.ChangefeedCapabilityUnsupported;
+        const port = source.bootstrap_pages orelse return error.ChangefeedCapabilityUnsupported;
+        const root = state.roots[try state.rootIndex(namespace)];
+        const pin = root.snapshot.?;
+        const maintenance = maintenanceContext(context);
+        var captured = try source.capture(a, state.definition.?, maintenance);
+        defer captured.deinit();
+        if (captured.roots.len != state.roots.len) return error.ChangefeedResynchronizationRequired;
+        for (state.roots, captured.roots) |expected, current|
+            if (!std.meta.eql(expected.namespace, current.namespace)) return error.ChangefeedResynchronizationRequired;
+        const selected = try captured.find(namespace);
+        var page = try port.read(a, selected.fence, selected.table_name, .{
+            .version = 1,
+            .request = .{
+                .reference = .{ .namespace = namespace, .authority = state.authority, .consumer = state.consumerId(), .epoch = root.consumer_epoch, .grant = root.grant_sequence, .definition = state.definition.?.identity() },
+                .digest = pin.digest,
+                .after_rows = after,
+                .max_rows = rows,
+                .max_bytes = bytes,
+                .now_seconds = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_s,
+            },
+        }, maintenance);
+        errdefer page.deinit();
+        var rechecked = try self.qualifySnapshot(a, snapshot, context);
+        rechecked.deinit();
+        try context.ensureActive();
+        return page;
     }
 
     pub fn dropWrite(self: CatalogReplicationSlots, a: std.mem.Allocator, name: []const u8, now: u64, context: operation.RequestContext) !control.Write {
@@ -3786,6 +3845,26 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
     fixture.slot_state.definition.?.owner = @splat(8);
     try std.testing.expectError(error.Forbidden, slots.readOwned(alloc, "docs_slot", .{}));
     fixture.slot_state.definition.?.owner = definition.owner;
+    {
+        const prior = fixture.slot_state;
+        defer fixture.slot_state = prior;
+        var snapshot_definition = definition;
+        snapshot_definition.start = .snapshot_then_changes;
+        snapshot_definition.tables = &.{after.members[0].table};
+        snapshot_definition.authorization = (try after.binding()).identity();
+        var bootstrap = try (publication_control.Mutation{ .create = .{ .id = id, .definition = snapshot_definition, .now = now, .expires_at = now + 600, .bootstrap_expires_at = now + 300 } }).apply(alloc, .{}, .{ .incarnation = incarnation, .sequence = 1 });
+        bootstrap = try (publication_control.Mutation{ .plan_roots = &.{.{ .namespace = namespace, .ownership_epoch = 1 }} }).apply(alloc, bootstrap, .{ .incarnation = incarnation, .sequence = 2 });
+        bootstrap = try (publication_control.Mutation{ .enroll = .{ .namespace = namespace, .ownership_epoch = 1, .grant_sequence = 2, .consumer_epoch = 1, .start = 10, .snapshot = .{ .id = bootstrap.consumerId(), .digest = @splat(4), .expires_at = now + 300 } } }).apply(alloc, bootstrap, .{ .incarnation = incarnation, .sequence = 3 });
+        var pinned = configuration;
+        pinned.binding = try after.binding();
+        fixture.slot_state = try (publication_control.Mutation{ .seal = .{ .cut = @splat(7), .slot = pinned } }).apply(alloc, bootstrap, .{ .incarnation = incarnation, .sequence = 4 });
+        const token = try publication_control.SlotSnapshot.capture(fixture.slot_state, database, snapshot_definition.owner, now);
+        var qualified = try slots.qualifySnapshot(alloc, token, .{});
+        defer qualified.deinit();
+        try std.testing.expectEqual(@as(u64, 10), qualified.value.roots[0].start);
+        try std.testing.expectError(error.InvalidReplicationSnapshot, slots.readExportedSnapshot(alloc, "invalid", namespace, 0, 1, 4096, .{}));
+        try std.testing.expectError(error.ChangefeedCapabilityUnsupported, slots.readExportedSnapshot(alloc, &token.name(), namespace, 0, 1, 4096, .{}));
+    }
     {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();

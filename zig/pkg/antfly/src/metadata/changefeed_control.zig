@@ -1062,6 +1062,62 @@ pub fn recoverSlotStart(state: State, original: Write, now: u64) !SlotStart {
     return .{ .consistent_lsn = slot.consistent_lsn, .cursor = initialCursor(state, state.cut) };
 }
 
+/// The name identifies the exact durable slot cut. Import must also recheck
+/// the caller's database, replication privilege and publication binding.
+pub const SlotSnapshot = struct {
+    feed: Id,
+    proof: Digest,
+    const prefix = "antfly_v1_";
+    pub const name_size = prefix.len + 2 * (@sizeOf(Id) + @sizeOf(Digest));
+
+    pub fn parse(encoded: []const u8) !SlotSnapshot {
+        if (encoded.len != name_size or !std.mem.startsWith(u8, encoded, prefix)) return error.InvalidReplicationSnapshot;
+        var value: SlotSnapshot = undefined;
+        const split = prefix.len + 2 * @sizeOf(Id);
+        _ = std.fmt.hexToBytes(&value.feed, encoded[prefix.len..split]) catch return error.InvalidReplicationSnapshot;
+        _ = std.fmt.hexToBytes(&value.proof, encoded[split..]) catch return error.InvalidReplicationSnapshot;
+        if (!nz(value.feed) or !nz(value.proof) or !std.mem.eql(u8, encoded, &value.name())) return error.InvalidReplicationSnapshot;
+        return value;
+    }
+
+    pub fn name(self: SlotSnapshot) [name_size]u8 {
+        return prefix.* ++ std.fmt.bytesToHex(self.feed, .lower) ++ std.fmt.bytesToHex(self.proof, .lower);
+    }
+
+    pub fn capture(state: State, database: Digest, owner: Digest, now: u64) !SlotSnapshot {
+        try state.validate();
+        const definition = state.definition orelse return error.ReplicationSlotNotFound;
+        const slot = state.slot orelse return error.ReplicationSlotNotFound;
+        if (!equal(slot.database, database) or !std.crypto.timing_safe.eql(Digest, definition.owner, owner)) return error.Forbidden;
+        if (state.phase != .bootstrap or definition.start != .snapshot_then_changes or state.latest_delivery != 0 or slot.session != null)
+            return error.ChangefeedResynchronizationRequired;
+        if (now < state.created_at or state.expiryDue(now)) return error.ChangefeedLeaseExpired;
+        const binding = slot.binding orelse return error.ChangefeedCapabilityUnsupported;
+        var proof = hash(.{
+            .domain = "antfly:pg-slot-exported-snapshot:v1",
+            .feed = state.id,
+            .authority = state.authority,
+            .epoch = state.epoch,
+            .database = database,
+            .definition = definition.identity(),
+            .binding = binding.identity(),
+            .lsn = slot.consistent_lsn,
+            .cut = state.cut,
+        });
+        for (state.roots) |root| {
+            const pin = root.snapshot orelse return error.ChangefeedCorrupt;
+            if (root.released or root.snapshot_released) return error.ChangefeedResynchronizationRequired;
+            proof = hash(.{ .previous = proof, .namespace = root.namespace, .ownership_epoch = root.ownership_epoch, .grant = root.grant_sequence, .consumer_epoch = root.consumer_epoch, .start = root.start, .pin = pin });
+        }
+        return .{ .feed = state.id, .proof = proof };
+    }
+
+    pub fn verify(self: SlotSnapshot, state: State, database: Digest, owner: Digest, now: u64) !void {
+        const qualified = try capture(state, database, owner, now);
+        if (!equal(self.feed, qualified.feed) or !std.crypto.timing_safe.eql(Digest, self.proof, qualified.proof)) return error.InvalidReplicationSnapshot;
+    }
+};
+
 pub const Write = struct {
     id: Id,
     authority: Digest,
@@ -1959,4 +2015,37 @@ test "changefeed retirement fence displaces only irrevocable cleanup and retains
     forged.root_control.operation.prepare_fence.retirement_sequence = state.authority_sequence;
     forged.root_control.operation.prepare_fence.payload.table = "other";
     try std.testing.expectError(error.ChangefeedConflict, step(a, state, forged));
+}
+
+test "changefeed slot snapshot name binds pins and initial LSN across metadata reopen" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var definition = testDefinition(.snapshot_then_changes);
+    definition.projection = .rows;
+    const database: Digest = @splat(1);
+    const id = pg_slot.feedId(database, "snapshot_slot");
+    var state = try step(a, .{}, .{ .create = .{ .id = id, .definition = definition, .now = 100, .expires_at = 1000, .bootstrap_expires_at = 500 } });
+    const namespace = testNamespace(7);
+    state = try step(a, state, .{ .plan_roots = &.{.{ .namespace = namespace, .ownership_epoch = 1 }} });
+    state = try step(a, state, .{ .enroll = .{ .namespace = namespace, .ownership_epoch = 1, .grant_sequence = state.roots[0].grant_sequence, .consumer_epoch = 6, .start = 10, .snapshot = .{ .id = state.consumerId(), .digest = @splat(4), .expires_at = 500 } } });
+    const config: pg_slot.Configuration = .{ .database = database, .name = "snapshot_slot", .consistent_lsn = 1024, .binding = .{ .publications = &.{"docs_publication"}, .projection = @splat(5) } };
+    const enrollment = state;
+    state = try step(a, state, .{ .seal = .{ .cut = @splat(7), .slot = config } });
+    const snapshot = try SlotSnapshot.capture(state, database, definition.owner, 101);
+    const name = snapshot.name();
+    var reopened = try parse(a, try encode(a, state));
+    defer reopened.deinit();
+    const imported = try SlotSnapshot.parse(&name);
+    try imported.verify(reopened.value, database, definition.owner, 101);
+    try std.testing.expectError(error.Forbidden, imported.verify(reopened.value, @splat(8), definition.owner, 101));
+    try std.testing.expectError(error.Forbidden, imported.verify(reopened.value, database, @splat(8), 101));
+    try std.testing.expectError(error.ChangefeedLeaseExpired, imported.verify(reopened.value, database, definition.owner, 500));
+    var altered_config = config;
+    altered_config.consistent_lsn += 1;
+    const different_lsn = try step(a, enrollment, .{ .seal = .{ .cut = @splat(7), .slot = altered_config } });
+    try std.testing.expectError(error.InvalidReplicationSnapshot, imported.verify(different_lsn, database, definition.owner, 101));
+    const issued = testDelivery(state, &.{.{ .namespace = namespace, .position = .{ .sequence = 10 }, .snapshot = .{ .page = 1, .done = true } }});
+    state = try step(a, state, .{ .issue = issued });
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, imported.verify(state, database, definition.owner, 101));
 }
