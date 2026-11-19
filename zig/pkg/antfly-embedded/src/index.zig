@@ -2121,6 +2121,10 @@ pub const IndexSnapshot = struct {
     /// Stream directly into compact membership without a corpus-sized u32
     /// result array. Check request control even across deleted/sparse rows.
     pub fn tryDocNumBitmapForOrdinalMembershipAlloc(self: *const IndexSnapshot, alloc: Allocator, membership: anytype, control: query_mod.ExecutionControl) !?roaring.RoaringBitmap {
+        return self.tryDocNumBitmapForOrdinalMembershipWithCoverageAlloc(alloc, membership, control, false);
+    }
+
+    pub fn tryDocNumBitmapForOrdinalMembershipWithCoverageAlloc(self: *const IndexSnapshot, alloc: Allocator, membership: anytype, control: query_mod.ExecutionControl, require_complete: bool) !?roaring.RoaringBitmap {
         var out = roaring.RoaringBitmap.init(alloc);
         errdefer out.deinit();
         var offset: u32 = 0;
@@ -2146,7 +2150,13 @@ pub const IndexSnapshot = struct {
                 const doc: u32 = @intCast(local);
                 if (seg.shared.deleted) |deleted| if (deleted.contains(doc)) continue;
                 if (cursor == null) cursor = try segment_mod.DocOrdinalCursor.init(&seg.reader);
-                const ordinal = (try cursor.?.get(doc)) orelse continue;
+                const ordinal = (try cursor.?.get(doc)) orelse {
+                    if (require_complete) {
+                        out.deinit();
+                        return null;
+                    }
+                    continue;
+                };
                 if (membership.contains(ordinal)) {
                     pending[used] = offset + doc;
                     used += 1;

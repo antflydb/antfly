@@ -116,6 +116,24 @@ pub fn compareNumericValues(a: NumericValue, b: NumericValue) std.math.Order {
     };
 }
 
+/// Decode the finite numeric kinds accepted by typed numeric projections.
+pub fn numericValueFromJson(value: std.json.Value) ?NumericValue {
+    return switch (value) {
+        .integer => |number| .{ .i64_val = number },
+        .float => |number| if (std.math.isFinite(number)) .{ .f64_val = number } else null,
+        .number_string => |number| blk: {
+            if (std.mem.indexOfAny(u8, number, ".eE") == null) {
+                if (std.fmt.parseInt(i64, number, 10)) |parsed| break :blk .{ .i64_val = parsed } else |_| {}
+                if (std.fmt.parseUnsigned(u64, number, 10)) |parsed| break :blk .{ .u64_val = parsed } else |_| {}
+            }
+            const parsed = std.fmt.parseFloat(f64, number) catch return null;
+            if (!std.math.isFinite(parsed)) return null;
+            break :blk .{ .f64_val = parsed };
+        },
+        else => null,
+    };
+}
+
 pub fn numericValueAsF64(value: NumericValue) f64 {
     return switch (value) {
         .u64_val => |number| @floatFromInt(number),

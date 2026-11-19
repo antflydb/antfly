@@ -3254,12 +3254,8 @@ const NumericCoverageNode = struct {
 };
 
 fn numericSourceMatchesProjection(raw: std.json.Value, observed: ??typed_dv.NumericValue) bool {
-    const expected: typed_dv.NumericValue = switch (raw) {
-        .null => return observed == null,
-        .integer => |number| .{ .i64_val = number },
-        .float => |number| if (std.math.isFinite(number)) .{ .f64_val = number } else return false,
-        else => return false,
-    };
+    if (raw == .null) return observed == null;
+    const expected = typed_dv.numericValueFromJson(raw) orelse return false;
     const emitted = (observed orelse return false) orelse return false;
     return typed_dv.compareNumericValues(emitted, expected) == .eq;
 }
@@ -3329,20 +3325,7 @@ pub fn typedDocValueForMappedFieldAlloc(
             .string => |text| .{ .bytes_val = try alloc.dupe(u8, text) },
             else => null,
         },
-        .numeric => switch (value) {
-            .integer => |number| .{ .numeric_val = .{ .i64_val = number } },
-            .float => |number| if (std.math.isFinite(number)) .{ .numeric_val = .{ .f64_val = number } } else null,
-            .number_string => |number| blk: {
-                if (std.mem.indexOfAny(u8, number, ".eE") == null) {
-                    if (std.fmt.parseInt(i64, number, 10)) |parsed| break :blk .{ .numeric_val = .{ .i64_val = parsed } } else |_| {}
-                    if (std.fmt.parseUnsigned(u64, number, 10)) |parsed| break :blk .{ .numeric_val = .{ .u64_val = parsed } } else |_| {}
-                }
-                const parsed = std.fmt.parseFloat(f64, number) catch return null;
-                if (!std.math.isFinite(parsed)) return null;
-                break :blk .{ .numeric_val = .{ .f64_val = parsed } };
-            },
-            else => null,
-        },
+        .numeric => if (typed_dv.numericValueFromJson(value)) |number| .{ .numeric_val = number } else null,
         .datetime => if (if (value == .string) @import("../../datetime.zig").parseDateTimeToSignedNs(value.string) else @import("../../datetime.zig").rangeNanoseconds(value)) |ns| .{ .datetime_ns = ns } else null,
         .boolean => switch (value) {
             .bool => |boolean| .{ .bool_val = boolean },

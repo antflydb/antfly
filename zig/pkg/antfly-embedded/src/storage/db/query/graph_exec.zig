@@ -5075,11 +5075,8 @@ fn jsonValuesContainGeoShape(alloc: Allocator, values: []const std.json.Value, g
 }
 
 fn jsonNumberFromValue(value: std.json.Value) !f64 {
-    return switch (value) {
-        .integer => |number| @floatFromInt(number),
-        .float => |number| number,
-        else => error.InvalidArgument,
-    };
+    const column = @import("../../../section/typed_doc_values.zig");
+    return column.numericValueAsF64(column.numericValueFromJson(value) orelse return error.InvalidArgument);
 }
 
 fn jsonI64FromValue(value: std.json.Value) !i64 {

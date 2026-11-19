@@ -49354,7 +49354,19 @@ pub const DB = struct {
                 else => return err,
             };
         }
-        if (req.filter_query_json.len > 0) filter.include = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.filter_query_json, frontier, budget, &native.frontier_scoped, clause_cache);
+        if (req.authorization_filter_query_json.len > 0) {
+            filter.include = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.authorization_filter_query_json, frontier, budget, &native.frontier_scoped, clause_cache);
+        }
+        const stripped = try db_query_search.stripInjectedPolicyAlloc(a, req.filter_query_json, req.authorization_filter_query_json);
+        defer if (stripped) |json| if (json.len != 0) a.free(json);
+        const user_filter = stripped orelse req.filter_query_json;
+        if (user_filter.len > 0) {
+            var user = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, user_filter, frontier, budget, &native.frontier_scoped, clause_cache);
+            defer user.deinit(a);
+            const include = (try doc_set.intersectAlloc(a, &filter.include, &user)) orelse return error.UnsupportedQueryRequest;
+            filter.include.deinit(a);
+            filter.include = include;
+        }
         if (residual_exclusion) filter.exclude = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json, frontier, budget, &native.frontier_scoped, clause_cache);
         if (req.resolved_doc_filter) |raw| {
             const prior: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(raw));
@@ -49621,6 +49633,7 @@ pub const DB = struct {
                             filter_req.filter_query_json = filter_query_json;
                             filter_req.exclusion_query_json = "";
                             filter_req.resolved_doc_filter = null;
+                            filter_req.authorization_filter_query_json = "";
                             const prepared = try self.db.graphRequestWithIndexedFilterForKeysAlloc(filter_req, query_keys.items, clause_cache);
                             if (prepared.frontier_scoped) scoped_node = prepared else self.indexed_node_filter = prepared;
                         }
@@ -156588,6 +156601,17 @@ test "optional numeric range graph admission preserves legacy indexed predicates
     defer policy_result.deinit();
     try std.testing.expectEqual(@as(usize, 1), policy_result.hits.len);
     try std.testing.expectEqualStrings("b", policy_result.hits[0].id);
+
+    var policy_budget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(.{ .max_scanned_anchors = 1 });
+    const denied = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = "{\"conjuncts\":[{\"conjuncts\":[" ++ match ++ ",{\"range\":{\"rank\":{\"gte\":9007199254740992}}}]}," ++ range ++ "]}",
+        .authorization_filter_query_json = range,
+        .graph_work_budget = &policy_budget,
+    }, &.{"a"});
+    defer a.free(denied);
+    try std.testing.expectEqualSlices(bool, &.{false}, denied);
+    try std.testing.expectEqual(@as(usize, 0), policy_budget.remaining_anchors);
 
     var wide: std.ArrayList(u8) = .empty;
     defer wide.deinit(a);
