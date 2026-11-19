@@ -11256,6 +11256,36 @@ pub const DB = struct {
         return outcome == .produced or outcome == .skipped;
     }
 
+    fn artifactRepairConsumerCoverageComplete(self: *DB, alloc: Allocator, coverage_marker_key: ?[]const u8, extraction_key: ?[]const u8) !bool {
+        if (coverage_marker_key) |marker_key| {
+            if (!try self.repairCoverageMarkerComplete(alloc, marker_key)) return false;
+        }
+
+        if (extraction_key) |manifest_key| {
+            const raw = self.core.store.get(alloc, manifest_key) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+            defer alloc.free(raw);
+            const health = @import("enrichment/document_extraction_completion.zig").publicationState(alloc, raw) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return false,
+            };
+            if (health != .complete) return false;
+        }
+        return true;
+    }
+
+    fn observedArtifactRepairConsumerCoverageComplete(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !bool {
+        const coverage_key = try self.enrichmentFailureCoverageMarkerKeyAlloc(alloc, issue);
+        defer if (coverage_key) |key| alloc.free(key);
+        const extraction_key = try self.documentExtractionRepairKeyAlloc(alloc, issue);
+        defer if (extraction_key) |key| alloc.free(key);
+        lockAtomicWithBackoff(&self.async_context.artifact_repair_issue_mutex);
+        defer self.async_context.artifact_repair_issue_mutex.unlock();
+        return self.artifactRepairConsumerCoverageComplete(alloc, coverage_key, extraction_key);
+    }
+
     fn completeArtifactRepairIssueIfCurrent(
         self: *DB,
         alloc: Allocator,
@@ -11299,22 +11329,7 @@ pub const DB = struct {
         // clears debt first (and stale terminal transitions are rejected) or a
         // terminal transition lands first (and debt remains queued). There is
         // no interleaving that can leave terminal coverage without repair debt.
-        if (coverage_marker_key) |marker_key| {
-            if (!try self.repairCoverageMarkerComplete(alloc, marker_key)) return .coverage_incomplete;
-        }
-
-        if (extraction_key) |manifest_key| {
-            const raw = self.core.store.get(alloc, manifest_key) catch |err| switch (err) {
-                error.NotFound => return .coverage_incomplete,
-                else => return err,
-            };
-            defer alloc.free(raw);
-            const health = @import("enrichment/document_extraction_completion.zig").publicationState(alloc, raw) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return .coverage_incomplete,
-            };
-            if (health != .complete) return .coverage_incomplete;
-        }
+        if (!try self.artifactRepairConsumerCoverageComplete(alloc, coverage_marker_key, extraction_key)) return .coverage_incomplete;
         completion.completed_sequence = @max(completion.completed_sequence, revision.sequence);
         completion.pending_issues -|= 1;
 
@@ -17481,6 +17496,11 @@ pub const DB = struct {
             if (result.next_cursor) |cursor| alloc.free(cursor);
             result.next_cursor = if (req.cursor) |cursor| try alloc.dupe(u8, cursor) else null;
             result.has_more = true;
+            // This page will be read again. Only a settled page contributes
+            // terminal outcomes to the durable job's cumulative counts.
+            result.failed = 0;
+            result.unsupported = 0;
+            result.missing_source_docs = 0;
             return result;
         }
         if (result.repaired != 0) {
@@ -17567,7 +17587,8 @@ pub const DB = struct {
                     continue;
                 }
                 if (issue.reason == .enrichment_failed and completion.completed_sequence >= issue.sequence and
-                    (issue.artifact_kind == .chunk or try self.artifactNowReadable(alloc, issue))) continue;
+                    (issue.artifact_kind == .chunk or try self.artifactNowReadable(alloc, issue)) and
+                    try self.observedArtifactRepairConsumerCoverageComplete(alloc, issue)) continue;
                 if (queued != 0 and issue.sequence < queued and completion.failed_sequence < queued and
                     completion.completed_sequence < queued)
                 {
@@ -90244,6 +90265,14 @@ test "db shared repair completion reprocesses consumer with terminal coverage" {
         .doc_key = "doc:a",
         .outcome = .terminal_failed,
     }});
+
+    try std.testing.expect(try db.artifactNowReadable(alloc, pending[0]));
+    var observed: types.ArtifactRepairResult = .{ .limit = 1, .observed_only = true };
+    defer observed.deinit(alloc);
+    try db.observeIndexDocumentRepairs(alloc, .{ .index_name = "semantic" }, .{}, &observed);
+    try std.testing.expectEqual(@as(u64, 1), observed.failed);
+    try std.testing.expect(observed.debt_remaining);
+    try std.testing.expectEqual(@as(u64, 0), observed.in_progress);
 
     var repair = try db.repairArtifactIssues(alloc, .embedding, 1);
     defer repair.deinit(alloc);

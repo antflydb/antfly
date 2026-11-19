@@ -116,6 +116,9 @@ pub const JobState = struct {
     pending_observation: ?struct { cursor: ?[]const u8 = null } = null,
     pending_index_groups: ?[]const u64 = null,
     observe_index_groups: ?[]const u64 = null,
+    /// Parked document cursors, excluding the cursor currently being resumed.
+    pending_document_pages: ?[]const []const u8 = null,
+    resume_document_page: bool = false,
     repair_groups: ?u64 = null,
     result: db_mod.types.ArtifactRepairResult = .{},
     last_error: ?[]const u8 = null,
@@ -423,6 +426,8 @@ pub const Store = struct {
                 .pending_observation = current.pending_observation,
                 .pending_index_groups = current.pending_index_groups,
                 .observe_index_groups = current.observe_index_groups,
+                .pending_document_pages = null,
+                .resume_document_page = false,
                 .repair_groups = current.repair_groups,
                 .control = current.control,
                 .repair_id = current.repair_id,
@@ -455,6 +460,8 @@ pub const Store = struct {
             .pending_observation = previous.pending_observation,
             .pending_index_groups = previous.pending_index_groups,
             .observe_index_groups = previous.observe_index_groups,
+            .pending_document_pages = previous.pending_document_pages,
+            .resume_document_page = previous.resume_document_page,
             .repair_groups = previous.repair_groups,
             .control = previous.control,
             .repair_id = previous.repair_id,
@@ -508,6 +515,8 @@ pub const Store = struct {
             .pending_observation = current.pending_observation,
             .pending_index_groups = current.pending_index_groups,
             .observe_index_groups = current.observe_index_groups,
+            .pending_document_pages = current.pending_document_pages,
+            .resume_document_page = current.resume_document_page,
             .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
@@ -543,6 +552,8 @@ pub const Store = struct {
             previous.pending_observation = null;
             previous.pending_index_groups = null;
             previous.observe_index_groups = null;
+            previous.pending_document_pages = null;
+            previous.resume_document_page = false;
             previous.cursor = null;
             // Failures from the retired topology cannot describe the current
             // traversal. Recount debt from the groups the restarted job sees.
@@ -555,6 +566,7 @@ pub const Store = struct {
             pass.unsupported = 0;
             pass.missing_source_docs = 0;
             pass.pending_index_groups = null;
+            pass.pending_document_pages = null;
             pass.has_more = true;
             pass.next_cursor = null;
             pass.in_progress = 1;
@@ -568,6 +580,12 @@ pub const Store = struct {
                 if (std.mem.indexOfScalar(u64, pending_groups.items, group) == null) try pending_groups.append(alloc, group);
             }
         }
+        var document_pages: std.ArrayList([]const u8) = .empty;
+        defer document_pages.deinit(alloc);
+        if (previous.pending_document_pages) |pages| try document_pages.appendSlice(alloc, pages);
+        if (pass.pending_document_pages) |pages| {
+            for (pages) |page| try document_pages.append(alloc, page);
+        }
         const tracks_groups = pass.pending_index_groups != null or previous.observe_index_groups != null or previous.pending_index_groups != null;
         var pending_observation = previous.pending_observation;
         const stationary_page = pass.has_more and std.mem.eql(u8, previous.cursor orelse "", pass.next_cursor orelse "");
@@ -575,22 +593,29 @@ pub const Store = struct {
             pending_observation = .{ .cursor = previous.cursor };
         }
         const revisit = !pass.has_more and pending_observation != null;
-        const observe_groups = !pass.has_more and !revisit and pending_groups.items.len != 0;
+        const resume_document_page = !pass.has_more and !revisit and document_pages.items.len != 0;
+        const observe_groups = !pass.has_more and !revisit and !resume_document_page and pending_groups.items.len != 0;
         const rewind_cursor = if (revisit) blk: {
             const cursor = pending_observation.?.cursor orelse break :blk null;
             break :blk try alloc.dupe(u8, cursor);
         } else null;
         defer if (rewind_cursor) |cursor| alloc.free(cursor);
-        const next_cursor = if (revisit or observe_groups) rewind_cursor else pass.next_cursor;
+        const next_cursor = if (revisit or observe_groups) rewind_cursor else if (resume_document_page) document_pages.items[0] else pass.next_cursor;
 
         var total = previous.result;
         total.scanned +|= pass.scanned;
         total.groups_scanned +|= pass.groups_scanned;
         total.reprocessed +|= pass.reprocessed;
         total.repaired +|= pass.repaired;
-        total.missing_source_docs +|= pass.missing_source_docs;
-        total.failed +|= pass.failed;
-        total.unsupported +|= pass.unsupported;
+        // A parked local page contributes outcomes only when it advances.
+        // This also covers older shard readers that still return provisional
+        // failures alongside a stationary cursor.
+        const settled_page = !stationary_page or pass.in_progress == 0 or previous.control != null;
+        if (settled_page) {
+            total.missing_source_docs +|= pass.missing_source_docs;
+            total.failed +|= pass.failed;
+            total.unsupported +|= pass.unsupported;
+        }
         // Pending work is a snapshot of this bounded pass for every target.
         // Artifact jobs also poll durable provider submissions; accumulating
         // these gauges counts the same queued source on every observation and
@@ -609,14 +634,17 @@ pub const Store = struct {
         total.indexes_degraded_after = pass.indexes_degraded_after;
         total.controls_applied +|= pass.controls_applied;
         total.limit = pass.limit;
-        total.has_more = pass.has_more or revisit or observe_groups;
+        total.has_more = pass.has_more or revisit or observe_groups or resume_document_page;
         // A later page may succeed while documents on an earlier page still
         // failed. Keep that outcome when the traversal reaches its last page.
-        total.debt_remaining = pass.debt_remaining or pending_observation != null or pending_groups.items.len != 0 or (previous.control == null and
+        total.debt_remaining = pass.debt_remaining or pending_observation != null or pending_groups.items.len != 0 or document_pages.items.len != 0 or (previous.control == null and
             (total.failed != 0 or total.unsupported != 0 or total.missing_source_docs != 0));
-        total.next_cursor = next_cursor;
+        total.next_cursor = if (next_cursor) |value| @constCast(value) else null;
         total.pending_index_groups = null;
-        if (pass.terminal_error) |reason| total.terminal_error = reason;
+        total.pending_document_pages = null;
+        if (settled_page) if (pass.terminal_error) |reason| {
+            total.terminal_error = reason;
+        };
 
         // A failed source or shard must not finish the job while another
         // rebuild or provider submission still has work in progress.
@@ -668,6 +696,8 @@ pub const Store = struct {
                 .pending_observation = current.pending_observation,
                 .pending_index_groups = current.pending_index_groups,
                 .observe_index_groups = current.observe_index_groups,
+                .pending_document_pages = null,
+                .resume_document_page = false,
                 .repair_groups = current.repair_groups,
                 .control = current.control,
                 .repair_id = current.repair_id,
@@ -702,6 +732,8 @@ pub const Store = struct {
             .pending_observation = if (final_phase == .queued and !revisit) pending_observation else null,
             .pending_index_groups = if (final_phase == .queued and !observe_groups and pending_groups.items.len != 0) pending_groups.items else null,
             .observe_index_groups = if (final_phase != .queued) null else if (observe_groups) pending_groups.items else previous.observe_index_groups,
+            .pending_document_pages = if (final_phase != .queued or document_pages.items.len == @intFromBool(resume_document_page)) null else document_pages.items[@intFromBool(resume_document_page)..],
+            .resume_document_page = final_phase == .queued and resume_document_page,
             .repair_groups = pass.repair_groups orelse previous.repair_groups,
             .control = previous.control,
             .repair_id = previous.repair_id,
@@ -717,7 +749,7 @@ pub const Store = struct {
             .result = total,
             .last_error = final_last_error,
             .cancel_requested = cancel_requested,
-            .next_retry_at_millis = if (previous.auto_advance == true and final_phase == .queued and (revisit or observe_groups or (retryable_in_progress and stationary_page)))
+            .next_retry_at_millis = if (previous.auto_advance == true and final_phase == .queued and (revisit or observe_groups or (retryable_in_progress and (stationary_page or (previous.resume_document_page and resume_document_page)))))
                 now_ms +| repairObservationDelayMs(previous.job_id)
             else
                 0,
@@ -768,6 +800,8 @@ pub const Store = struct {
             .pending_observation = current.pending_observation,
             .pending_index_groups = current.pending_index_groups,
             .observe_index_groups = current.observe_index_groups,
+            .pending_document_pages = current.pending_document_pages,
+            .resume_document_page = current.resume_document_page,
             .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
@@ -817,6 +851,8 @@ pub const Store = struct {
             .pending_observation = current.pending_observation,
             .pending_index_groups = current.pending_index_groups,
             .observe_index_groups = current.observe_index_groups,
+            .pending_document_pages = current.pending_document_pages,
+            .resume_document_page = current.resume_document_page,
             .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
@@ -867,6 +903,8 @@ pub const Store = struct {
             .pending_observation = current.pending_observation,
             .pending_index_groups = current.pending_index_groups,
             .observe_index_groups = current.observe_index_groups,
+            .pending_document_pages = if (durable_cancel) null else current.pending_document_pages,
+            .resume_document_page = !durable_cancel and current.resume_document_page,
             .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
@@ -929,6 +967,8 @@ pub const Store = struct {
             .pending_observation = current.pending_observation,
             .pending_index_groups = current.pending_index_groups,
             .observe_index_groups = current.observe_index_groups,
+            .pending_document_pages = current.pending_document_pages,
+            .resume_document_page = current.resume_document_page,
             .repair_groups = pass.repair_groups orelse current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
@@ -1185,6 +1225,8 @@ pub const Store = struct {
                     .pending_observation = parsed.value.pending_observation,
                     .pending_index_groups = parsed.value.pending_index_groups,
                     .observe_index_groups = parsed.value.observe_index_groups,
+                    .pending_document_pages = if (durable_cancel) null else parsed.value.pending_document_pages,
+                    .resume_document_page = !durable_cancel and parsed.value.resume_document_page,
                     .repair_groups = parsed.value.repair_groups,
                     .control = parsed.value.control,
                     .repair_id = parsed.value.repair_id,
@@ -1282,6 +1324,8 @@ pub const Store = struct {
             .pending_observation = current.pending_observation,
             .pending_index_groups = current.pending_index_groups,
             .observe_index_groups = current.observe_index_groups,
+            .pending_document_pages = current.pending_document_pages,
+            .resume_document_page = current.resume_document_page,
             .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
@@ -1366,6 +1410,12 @@ fn validateJobState(state: JobState) !void {
     }
     if (state.cursor) |value| {
         if (value.len > max_job_string_bytes) return error.InvalidRepairJobState;
+    }
+    if (state.resume_document_page and state.cursor == null) return error.InvalidRepairJobState;
+    if (state.pending_document_pages) |pages| {
+        for (pages) |page| {
+            if (page.len == 0 or page.len > max_job_string_bytes) return error.InvalidRepairJobState;
+        }
     }
     if (state.last_error) |value| {
         if (value.len > max_job_string_bytes) return error.InvalidRepairJobState;
@@ -1861,6 +1911,8 @@ test "durable cancellation scan rotates past a backed off head window" {
             .pending_observation = current.pending_observation,
             .pending_index_groups = current.pending_index_groups,
             .observe_index_groups = current.observe_index_groups,
+            .pending_document_pages = current.pending_document_pages,
+            .resume_document_page = current.resume_document_page,
             .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
@@ -2626,4 +2678,78 @@ test "table index repair rediscovers groups when observation becomes stale" {
     defer parsed_final.deinit();
     try std.testing.expectEqualStrings("succeeded", parsed_final.value.phase);
     try std.testing.expect(!parsed_final.value.result.debt_remaining);
+}
+
+test "table repair job dispatches later shards before resuming parked document pages" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+    var state = try store.startJob(alloc, "docs", .{ .target = "index", .index = "semantic", .limit = 1, .force = true, .advance = false });
+    defer alloc.free(state);
+
+    var shard_one = "1:".*;
+    var shard_two = "2:".*;
+    var shard_three = "3:".*;
+    var first = [_][]u8{&shard_one};
+    var second = [_][]u8{&shard_two};
+    const passes: []const db_mod.types.ArtifactRepairResult = &.{
+        .{ .scanned = 1, .in_progress = 1, .document_replay_in_progress = 1, .has_more = true, .next_cursor = &shard_two, .pending_document_pages = &first, .pending_index_groups = &.{}, .debt_remaining = true },
+        .{ .scanned = 1, .in_progress = 1, .document_replay_in_progress = 1, .has_more = true, .next_cursor = &shard_three, .pending_document_pages = &second, .pending_index_groups = &.{}, .debt_remaining = true },
+        .{ .scanned = 1, .pending_index_groups = &.{} },
+        .{ .scanned = 1, .in_progress = 1, .document_replay_in_progress = 1, .pending_document_pages = &first, .pending_index_groups = &.{}, .debt_remaining = true },
+        .{ .scanned = 1, .repaired = 1, .pending_index_groups = &.{} },
+        .{ .scanned = 1, .repaired = 1, .pending_index_groups = &.{} },
+    };
+    const cursors: []const ?[]const u8 = &.{ null, "2:", "3:", "1:", "2:", "1:" };
+    for (passes, cursors, 0..) |pass, cursor, i| {
+        const current = try std.json.parseFromSlice(JobState, alloc, state, .{});
+        defer current.deinit();
+        try std.testing.expectEqualDeep(cursor, current.value.cursor);
+        try std.testing.expectEqual(i >= 3, current.value.resume_document_page);
+        try std.testing.expectEqual(i < 3, current.value.force);
+
+        const claim = try store.beginAdvance(alloc, current.value);
+        defer alloc.free(claim.encoded);
+        try std.testing.expect(claim.started);
+        const running = try std.json.parseFromSlice(JobState, alloc, claim.encoded, .{});
+        defer running.deinit();
+        const updated = try store.recordPass(alloc, running.value, pass);
+        alloc.free(state);
+        state = updated;
+    }
+    const completed = try std.json.parseFromSlice(JobState, alloc, state, .{});
+    defer completed.deinit();
+    try std.testing.expectEqualStrings("succeeded", completed.value.phase);
+    try std.testing.expectEqual(@as(u64, 2), completed.value.result.repaired);
+}
+
+test "table repair job commits stationary page failures only when the page settles" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+    var state = try store.startJob(alloc, "docs", .{ .target = "artifact", .limit = 2, .advance = false });
+    defer alloc.free(state);
+    for (0..3) |i| {
+        const current = try std.json.parseFromSlice(JobState, alloc, state, .{});
+        defer current.deinit();
+        try std.testing.expectEqual(@as(u64, 0), current.value.result.failed);
+        try std.testing.expectEqual(@as(u64, 0), current.value.result.missing_source_docs);
+
+        const claim = try store.beginAdvance(alloc, current.value);
+        defer alloc.free(claim.encoded);
+        try std.testing.expect(claim.started);
+        const running = try std.json.parseFromSlice(JobState, alloc, claim.encoded, .{});
+        defer running.deinit();
+        const pass: db_mod.types.ArtifactRepairResult = if (i < 2)
+            .{ .scanned = 2, .has_more = true, .in_progress = 1, .failed = 1, .missing_source_docs = 1, .debt_remaining = true }
+        else
+            .{ .scanned = 2, .repaired = 2 };
+        const updated = try store.recordPass(alloc, running.value, pass);
+        alloc.free(state);
+        state = updated;
+    }
+    const completed = try std.json.parseFromSlice(JobState, alloc, state, .{});
+    defer completed.deinit();
+    try std.testing.expectEqualStrings("succeeded", completed.value.phase);
+    try std.testing.expect(!completed.value.result.debt_remaining);
 }

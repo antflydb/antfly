@@ -24964,6 +24964,7 @@ pub const ApiHttpServer = struct {
             .operator_initiated = running_state.control == null,
         }, .{
             .observe_index_groups = running_state.observe_index_groups,
+            .resume_document_page = running_state.resume_document_page,
             .expected_repair_groups = running_state.repair_groups,
             .cancel_check = .{
                 .ptr = &cancel_probe,
@@ -26157,6 +26158,8 @@ pub const ApiHttpServer = struct {
             state.auto_advance = null;
             state.pending_observation = null;
             state.pending_index_groups = null;
+            state.pending_document_pages = null;
+            state.resume_document_page = false;
             state.observe_index_groups = null;
             state.result.terminal_error = null;
             if (state.control == null and repair_jobs.isTerminalPhase(state.phase)) {

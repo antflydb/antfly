@@ -4372,6 +4372,8 @@ pub const ArtifactRepairRunOptions = struct {
     /// Coordinator-only filter for already-dispatched index repair work.
     observe_index_groups: ?[]const u64 = null,
     expected_repair_groups: ?u64 = null,
+    /// Continue exactly one shard from its parked document-ledger cursor.
+    resume_document_page: bool = false,
     /// Lite's live coordinator may enqueue a bounded source page or retire a
     /// proven canonical initial build. It must never construct/activate a
     /// shadow while holding the short connection publication fence.
@@ -4474,6 +4476,7 @@ pub const ArtifactRepairResult = struct {
     document_replay_in_progress: u64 = 0,
     /// Coordinator-owned group IDs that still need index repair observation.
     pending_index_groups: ?[]u64 = null,
+    pending_document_pages: ?[][]u8 = null,
     terminal_error: ?[]u8 = null,
     observed_only: bool = false,
     observation_changed: bool = false,
@@ -4481,6 +4484,10 @@ pub const ArtifactRepairResult = struct {
 
     pub fn deinit(self: *ArtifactRepairResult, alloc: Allocator) void {
         if (self.pending_index_groups) |groups| alloc.free(groups);
+        if (self.pending_document_pages) |pages| {
+            for (pages) |page| alloc.free(page);
+            alloc.free(pages);
+        }
         if (self.terminal_error) |message| alloc.free(message);
         if (self.next_cursor) |value| alloc.free(value);
         self.* = undefined;
