@@ -276,6 +276,8 @@ pub const MultiPhraseQuery = struct {
 pub const NumericRangeQuery = struct {
     field: []const u8,
     exact_bounds: ?query_mod.RangeFilter.ExactBounds = null,
+    /// Borrowed structured range for exact residual evaluation after postings.
+    stored_standard_range: ?*const std.json.Value = null,
     min: ?f64 = null,
     max: ?f64 = null,
     inclusive_min: bool = true,

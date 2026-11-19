@@ -530,6 +530,7 @@ pub const TextDocument = struct {
     /// When supplied, includes owned subsets and the builder's shared list
     /// allocation on the row that creates it.
     numeric_coverage_bytes: ?usize = null,
+    numeric_witness_segment_bytes: ?usize = null,
     id: []const u8,
     stored_data: []const u8,
     text_fields: []const TextField,
@@ -547,6 +548,10 @@ pub const TextDocument = struct {
 
     pub fn numericCoverageInputBytes(self: TextDocument) usize {
         return self.numeric_coverage_bytes orelse self.complete_numeric_fields.len * @sizeOf([]const u8);
+    }
+
+    pub fn numericWitnessSegmentBytes(self: TextDocument) usize {
+        return self.numeric_witness_segment_bytes orelse segment_mod.estimateNumericRangeWitnessBytes(self.complete_numeric_fields);
     }
 };
 
@@ -836,11 +841,13 @@ pub fn splitTextDocumentsForBuildBudget(
     var end = start;
     var build_bytes: u64 = 0;
     var segment_bytes: u64 = 0;
+    var witness_bytes: u64 = 0;
     while (end < docs.len) {
         const doc_build_bytes = try estimateTextDocumentBuildMemoryBytes(alloc, docs[end]);
         const doc_segment_bytes = estimateTextDocumentSegmentBytes(docs[end]);
         const next_build_bytes = build_bytes +| doc_build_bytes;
-        const next_segment_bytes = segment_bytes +| doc_segment_bytes;
+        const next_witness_bytes = @max(witness_bytes, docs[end].numericWitnessSegmentBytes());
+        const next_segment_bytes = segment_bytes +| doc_segment_bytes +| (next_witness_bytes - witness_bytes);
         if (end > start and next_build_bytes > target_build) {
             return .{
                 .end = end,
@@ -860,6 +867,7 @@ pub fn splitTextDocumentsForBuildBudget(
         end += 1;
         build_bytes = next_build_bytes;
         segment_bytes = next_segment_bytes;
+        witness_bytes = next_witness_bytes;
         if (end == start + 1 and (build_bytes > target_build or segment_bytes > target_segment)) {
             return .{
                 .end = end,
@@ -1411,7 +1419,6 @@ fn writeTextSegmentWithScratch(
         else
             false;
         try witnesses.append(alloc, .{ .field = name, .coverage = if (populated) .populated else .empty });
-        if (!populated and !field_indices.contains(name)) _ = try seg_writer.addField(name);
     }
     try seg_writer.addNumericRangeWitnesses(witnesses.items);
 
@@ -5788,4 +5795,23 @@ test "highlight compact alias indexing fits a bounded working set with one analy
         try std.testing.expectEqual(@as(usize, 1), result.hits.len);
         std.debug.print("ALIAS_INDEX_BUDGET input={d} tokens={d} peak={d} quota={d} analyses={d} reuses={d}\n", .{ text.len, profile.token_count, budget.peak, budget.limit, profile.shared_analysis_runs, profile.shared_analysis_reuses });
     }
+}
+
+test "optional numeric range witness bytes are budgeted once per segment" {
+    const a = std.testing.allocator;
+    const fields: []const []const u8 = &.{ "rank", "size" };
+    const docs = [_]TextDocument{
+        .{ .id = "a", .stored_data = "{}", .text_fields = &.{}, .complete_numeric_fields = fields },
+        .{ .id = "b", .stored_data = "{}", .text_fields = &.{}, .complete_numeric_fields = fields },
+    };
+    const row_bytes = estimateTextDocumentSegmentBytes(docs[0]);
+    const witness_bytes = docs[0].numericWitnessSegmentBytes();
+    const full = try splitTextDocumentsForBuildBudget(a, &docs, 0, .{ .target_segment_bytes = @intCast(row_bytes * 2 + witness_bytes) });
+    try std.testing.expectEqual(@as(usize, 2), full.end);
+    try std.testing.expectEqual(row_bytes * 2 + witness_bytes, full.estimated_segment_bytes);
+    const split = try splitTextDocumentsForBuildBudget(a, &docs, 0, .{ .target_segment_bytes = @intCast(row_bytes * 2 + witness_bytes - 1) });
+    try std.testing.expectEqual(@as(usize, 1), split.end);
+    try std.testing.expectEqual(TextBuildSplitReason.segment_bytes, split.reason);
+    const next = try splitTextDocumentsForBuildBudget(a, &docs, split.end, .{});
+    try std.testing.expectEqual(row_bytes + witness_bytes, next.estimated_segment_bytes);
 }

@@ -49268,6 +49268,7 @@ pub const DB = struct {
         native.resolved_doc_filter_alloc = a;
         const executor = db_query_search.StructuredFilterResolverExecutor{
             .ctx = self,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .identity_read_generation = req.identity_read_generation,
@@ -156359,5 +156360,52 @@ test "db optional numeric range filters lexical and dense candidates on fresh an
                 }
             }
         }
+    }
+}
+
+test "optional numeric range graph admission preserves legacy indexed predicates" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("graph-legacy-range");
+    defer tmp.cleanup();
+    var db = try DB.open(a, tmp.path(), .{});
+    defer db.close();
+    // Mapped numeric values are dense, but this generation predates source
+    // witnesses. A dynamic mapping builds that physical shape.
+    try db.setSchema(.{
+        .default_type = "doc",
+        .dynamic_templates = &.{.{
+            .name = "rank",
+            .path_match = "rank",
+            .mapping = .{ .field_type = .numeric, .doc_values = true },
+        }},
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{
+            .{ .path = "body", .emitted_name = "body", .analyzer = "standard" },
+        } }},
+    });
+    try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .sync_level = .full_index, .writes = &.{
+        .{ .key = "a", .value = "{\"body\":\"beacon\",\"rank\":9007199254740992}" },
+        .{ .key = "b", .value = "{\"body\":\"beacon\",\"rank\":9007199254740993}" },
+        .{ .key = "c", .value = "{\"body\":\"mast\",\"rank\":9007199254740993}" },
+    } });
+    const snapshot = db.core.index_manager.textIndex("ft").?.acquireSnapshot();
+    defer snapshot.release();
+    try std.testing.expectEqual(@as(u32, 3), snapshot.liveDocCount());
+    for (snapshot.segments) |segment| {
+        try std.testing.expect((try segment.reader.numericRangeCoverage("rank")) == null);
+    }
+
+    const match = "{\"match\":{\"field\":\"body\",\"text\":\"beacon\"}}";
+    const range = "{\"range\":{\"rank\":{\"gt\":9007199254740992}}}";
+    const cases = [_]struct { json: []const u8, expected: []const bool }{
+        .{ .json = "{\"conjuncts\":[" ++ match ++ "," ++ range ++ "]}", .expected = &.{ false, true, false } },
+        .{ .json = "{\"disjuncts\":[" ++ match ++ "," ++ range ++ "]}", .expected = &.{ true, true, true } },
+        .{ .json = "{\"bool\":{\"should\":[" ++ match ++ "," ++ range ++ "],\"minimum_should_match\":2}}", .expected = &.{ false, true, false } },
+        .{ .json = "{\"bool\":{\"must\":[" ++ match ++ "],\"must_not\":[" ++ range ++ "]}}", .expected = &.{ true, false, false } },
+    };
+    for (cases) |case| {
+        const rows = try db.filterGraphKeysAlloc(a, .{ .index_name = "ft", .filter_query_json = case.json }, &.{ "a", "b", "c" });
+        defer a.free(rows);
+        try std.testing.expectEqualSlices(bool, case.expected, rows);
     }
 }

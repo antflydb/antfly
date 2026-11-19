@@ -968,6 +968,7 @@ pub const TextProjectionBatchBuilder = struct {
     text_docs: std.ArrayListUnmanaged(introducer_mod.TextDocument) = .empty,
     numeric_projection_lookup: std.StringHashMapUnmanaged(?typed_dv.NumericValue) = .empty,
     numeric_coverage_fields: ?[]const []const u8 = null,
+    numeric_witness_segment_bytes: usize = 0,
 
     pub fn init(
         arena: Allocator,
@@ -1053,6 +1054,7 @@ pub const TextProjectionBatchBuilder = struct {
             .index_sort_values = order.values,
             .complete_numeric_fields = complete_numeric_fields,
             .numeric_coverage_bytes = (subset_count + new_shared_count) * @sizeOf([]const u8),
+            .numeric_witness_segment_bytes = if (complete_numeric_fields.len == 0) 0 else self.numeric_witness_segment_bytes,
             .index_sort_projection_valid = order.valid and !has_selected_field,
             .id = doc.key,
             .stored_data = if (self.store_source_columns) "" else doc.stored_data,
@@ -1087,6 +1089,7 @@ pub const TextProjectionBatchBuilder = struct {
             }
             const names = try eligible.toOwnedSlice(alloc);
             self.numeric_coverage_fields = names;
+            self.numeric_witness_segment_bytes = segment_mod.estimateNumericRangeWitnessBytes(names);
             break :init names;
         };
         if (fields.len == 0) return fields;

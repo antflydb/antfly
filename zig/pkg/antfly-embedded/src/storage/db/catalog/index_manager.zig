@@ -28825,6 +28825,7 @@ pub const IndexManager = struct {
                 var projection_doc_limit: usize = 0;
                 var projected_build_bytes: u64 = 0;
                 var projected_segment_bytes: u64 = 0;
+                var projected_witness_bytes: u64 = 0;
                 while (source_end < source_docs_with_ordinals.len) {
                     const projection_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
                     const previous_projection_docs = builder.text_docs.items.len;
@@ -28845,7 +28846,8 @@ pub const IndexManager = struct {
                     const doc_build_bytes = try introducer_mod.estimateTextDocumentBuildMemoryBytes(projection_alloc, projected_doc);
                     const doc_segment_bytes = introducer_mod.estimateTextDocumentSegmentBytes(projected_doc);
                     const next_build_bytes = projected_build_bytes +| doc_build_bytes;
-                    const next_segment_bytes = projected_segment_bytes +| doc_segment_bytes;
+                    const next_witness_bytes = @max(projected_witness_bytes, projected_doc.numericWitnessSegmentBytes());
+                    const next_segment_bytes = projected_segment_bytes +| doc_segment_bytes +| (next_witness_bytes - projected_witness_bytes);
                     if (previous_projection_docs > 0 and (next_build_bytes > target_build_memory_bytes or next_segment_bytes > target_segment_bytes)) {
                         projection_doc_limit = previous_projection_docs;
                         next_source_start = source_end - 1;
@@ -28854,6 +28856,7 @@ pub const IndexManager = struct {
 
                     projected_build_bytes = next_build_bytes;
                     projected_segment_bytes = next_segment_bytes;
+                    projected_witness_bytes = next_witness_bytes;
                     projection_doc_limit = builder.text_docs.items.len;
                     next_source_start = source_end;
                     if (projection_doc_limit >= max_text_projection_docs_per_segment_build) break;

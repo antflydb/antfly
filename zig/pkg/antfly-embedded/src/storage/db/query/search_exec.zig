@@ -9463,6 +9463,175 @@ const GraphOrdinalBatch = struct {
     }
 };
 
+const GraphIndexedFilter = struct {
+    snapshot: *const index_mod.IndexSnapshot,
+    analysis: introducer_mod.TextAnalysisConfig,
+    schema: ?runtime_schema_mod.TableSchema,
+    executor: StructuredFilterResolverExecutor,
+    control: query_mod.ExecutionControl,
+    alloc: Allocator,
+    scratch: Allocator,
+
+    fn indexed(self: GraphIndexedFilter, query: search_mod.SearchQuery) !bool {
+        return searchQueryCanUseSnapshotWithControl(self.snapshot, query, self.analysis, self.schema, false, self.control);
+    }
+
+    fn executeIndexed(self: GraphIndexedFilter, query: search_mod.SearchQuery, scope: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        const filter = try search_mod.searchQueryToFilterArena(self.scratch, query);
+        var result = try self.snapshot.executeFilterBitmap(self.alloc, filter.withControl(self.control));
+        if (scope) |domain| result.andWith(domain);
+        return result;
+    }
+
+    fn execute(self: GraphIndexedFilter, query: search_mod.SearchQuery, scope: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
+        try self.control.check();
+        if (scope) |domain| if (domain.isEmpty()) return roaring.RoaringBitmap.init(self.alloc);
+        if (try self.indexed(query)) return self.executeIndexed(query, scope);
+        return switch (query) {
+            .bool_query => |boolean| self.executeBoolean(boolean, scope),
+            .numeric_range => |range| self.executeStoredRange((range.stored_standard_range orelse return error.UnsupportedQueryRequest).*, scope),
+            else => error.UnsupportedQueryRequest,
+        };
+    }
+
+    fn executeBoolean(self: GraphIndexedFilter, boolean: search_mod.BoolQuery, scope: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        var indexed_must: std.ArrayListUnmanaged(search_mod.SearchQuery) = .empty;
+        var residual_must: std.ArrayListUnmanaged(search_mod.SearchQuery) = .empty;
+        for (boolean.must) |clause| {
+            const target = if (try self.indexed(clause)) &indexed_must else &residual_must;
+            try target.append(self.scratch, clause);
+        }
+        var result: ?roaring.RoaringBitmap = null;
+        errdefer if (result) |*rows| rows.deinit();
+        if (indexed_must.items.len != 0) {
+            result = try self.executeIndexed(.{ .bool_query = .{ .must = indexed_must.items } }, scope);
+        }
+        for (residual_must.items) |clause| {
+            const next = try self.execute(clause, if (result) |*rows| rows else scope);
+            if (result) |*rows| rows.deinit();
+            result = next;
+        }
+        const required_should = if (boolean.should.len != 0 and boolean.must.len == 0 and !boolean.pure_should_optional)
+            @max(@as(u32, 1), boolean.min_should)
+        else
+            boolean.min_should;
+        if (required_should != 0) {
+            const matched = try self.executeShould(boolean.should, required_should, if (result) |*rows| rows else scope);
+            if (result) |*rows| rows.deinit();
+            result = matched;
+        }
+        if (result == null) result = if (scope) |domain| try domain.clone(self.alloc) else try self.executeIndexed(.{ .match_all = {} }, null);
+        for (boolean.must_not) |clause| {
+            var excluded = try self.execute(clause, &result.?);
+            defer excluded.deinit();
+            result.?.andNotWith(&excluded);
+        }
+        return result.?;
+    }
+
+    fn executeShould(self: GraphIndexedFilter, clauses: []const search_mod.SearchQuery, required: u32, scope: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        var result = roaring.RoaringBitmap.init(self.alloc);
+        errdefer result.deinit();
+        if (required > clauses.len) return result;
+        if (required == 1) {
+            for (clauses) |clause| {
+                var matched = try self.execute(clause, scope);
+                defer matched.deinit();
+                try result.orWith(&matched);
+            }
+            return result;
+        }
+        if (required == clauses.len) {
+            var domain = try self.execute(clauses[0], scope);
+            errdefer domain.deinit();
+            for (clauses[1..]) |clause| {
+                const narrowed = try self.execute(clause, &domain);
+                domain.deinit();
+                domain = narrowed;
+            }
+            return domain;
+        }
+        var counts: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        defer counts.deinit(self.alloc);
+        for (clauses) |clause| {
+            var matched = try self.execute(clause, scope);
+            defer matched.deinit();
+            var iterator = matched.iterator();
+            var visited: usize = 0;
+            while (iterator.next()) |doc| : (visited += 1) {
+                if ((visited & 1023) == 0) try self.control.check();
+                if (result.contains(doc)) continue;
+                const count = try counts.getOrPutValue(self.alloc, doc, 0);
+                count.value_ptr.* += 1;
+                if (count.value_ptr.* == required) {
+                    try result.add(doc);
+                    _ = counts.remove(doc);
+                }
+            }
+        }
+        return result;
+    }
+
+    fn executeStoredRange(self: GraphIndexedFilter, range: std.json.Value, scope: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        if (self.executor.load_many_stored_values == null and self.executor.load_stored == null) return error.UnsupportedQueryRequest;
+        var wrapper: std.json.ObjectMap = .empty;
+        try wrapper.put(self.scratch, "range", range);
+        var predicate = try graph_exec.PreparedPatternFilter.initValue(self.alloc, .{ .object = wrapper });
+        defer predicate.deinit();
+        var universe = if (scope == null) try self.executeIndexed(.{ .match_all = {} }, null) else null;
+        defer if (universe) |*domain| domain.deinit();
+        const candidates = scope orelse &universe.?;
+        var matches = roaring.RoaringBitmap.init(self.alloc);
+        errdefer matches.deinit();
+        var row = std.heap.ArenaAllocator.init(self.alloc);
+        defer row.deinit();
+
+        var docs = candidates.iterator();
+        var next = docs.next();
+        var lower: u32 = 0;
+        for (self.snapshot.segments, 0..) |segment, i| {
+            const upper = try std.math.add(u32, lower, segment.reader.doc_count);
+            if (next == null) break;
+            if (next.? < upper) {
+                var lease = try self.snapshot.leaseSegment(i);
+                defer lease.deinit();
+                while (next != null and next.? < upper) {
+                    try self.control.check();
+                    _ = row.reset(.retain_capacity);
+                    const scratch = row.allocator();
+                    var keys: [64][]const u8 = undefined;
+                    var numbers: [64]u32 = undefined;
+                    var count: usize = 0;
+                    while (count < keys.len and next != null and next.? < upper) : (count += 1) {
+                        const doc = next.?;
+                        keys[count] = (try lease.entry.reader.storedIdScoped(scratch, doc - lower)) orelse return error.StorageReadTemporarilyUnavailable;
+                        numbers[count] = doc;
+                        next = docs.next();
+                    }
+                    if (self.executor.load_many_stored_values) |load| {
+                        const stored = try load(self.executor.ctx, scratch, keys[0..count]);
+                        if (stored.len != count) return error.InvalidData;
+                        for (keys[0..count], numbers[0..count], stored) |key, doc, raw| {
+                            try self.control.check();
+                            const value = raw orelse return error.StorageReadTemporarilyUnavailable;
+                            if (try predicate.matchesStored(scratch, key, value)) try matches.add(doc);
+                        }
+                    } else {
+                        const load = self.executor.load_stored.?;
+                        for (keys[0..count], numbers[0..count]) |key, doc| {
+                            try self.control.check();
+                            const value = (try load(self.executor.ctx, scratch, key)) orelse return error.StorageReadTemporarilyUnavailable;
+                            if (try predicate.matchesStored(scratch, key, value)) try matches.add(doc);
+                        }
+                    }
+                }
+            }
+            lower = upper;
+        }
+        return matches;
+    }
+};
+
 /// Compressed, snapshot- and analyzer-bound graph membership. Repeated shard
 /// admission batches reuse the same immutable set instead of executing postings
 /// and expanding matching document-number arrays for every hop.
@@ -9488,23 +9657,36 @@ pub fn graphIndexedPredicateAlloc(a: Allocator, req: types.SearchRequest, execut
         try control.check();
         return .{ .ordinal_bitmap = owned };
     }
-    const flight = try cache.lockFlight(key, control);
-    defer flight.unlock();
-    if (try cache.get(a, key, control)) |rows| {
-        var owned = rows;
-        errdefer owned.deinit();
-        try control.check();
-        return .{ .ordinal_bitmap = owned };
-    }
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, json, .{});
     if (patternFilterValueHasRole(parsed)) return error.UnsupportedQueryRequest;
     const search_query = try patternFilterValueToSearchQuery(scratch, parsed, entry.text_analysis, entry.runtime_schema);
-    if (!try searchQueryCanUseSnapshotWithControl(snapshot, search_query, entry.text_analysis, entry.runtime_schema, false, control)) return error.UnsupportedQueryRequest;
-    const filter = try search_mod.searchQueryToFilterArena(scratch, search_query);
-    var docs = try snapshot.executeFilterBitmap(a, filter.withControl(control));
+    const matcher = GraphIndexedFilter{
+        .snapshot = snapshot,
+        .analysis = entry.text_analysis,
+        .schema = entry.runtime_schema,
+        .executor = executor,
+        .control = control,
+        .alloc = a,
+        .scratch = scratch,
+    };
+    const fully_indexed = try matcher.indexed(search_query);
+    // Only immutable index membership can be cached on the text snapshot.
+    // A residual range also depends on primary row contents.
+    const flight = if (fully_indexed) try cache.lockFlight(key, control) else null;
+    defer if (flight) |held| held.unlock();
+    if (fully_indexed) if (try cache.get(a, key, control)) |rows| {
+        var owned = rows;
+        errdefer owned.deinit();
+        try control.check();
+        return .{ .ordinal_bitmap = owned };
+    };
+    var docs = if (fully_indexed)
+        try matcher.executeIndexed(search_query, null)
+    else
+        try matcher.execute(search_query, null);
     defer docs.deinit();
     var rows = roaring.RoaringBitmap.init(a);
     errdefer rows.deinit();
@@ -9544,7 +9726,7 @@ pub fn graphIndexedPredicateAlloc(a: Allocator, req: types.SearchRequest, execut
     }
     try fallback.flush(&rows, executor, req.identity_read_generation, control);
     try control.check();
-    cache.put(snapshot.alloc, key, &rows);
+    if (fully_indexed) cache.put(snapshot.alloc, key, &rows);
     try control.check();
     return .{ .ordinal_bitmap = rows };
 }
@@ -10321,7 +10503,7 @@ fn patternFilterValueToSearchQuery(
             .auto_fuzzy = field_fuzzy.auto_fuzzy,
         } };
     }
-    if (value.object.get("range")) |range_query| return try parseStandardRangeQuery(alloc, range_query, runtime_schema);
+    if (value.object.getPtr("range")) |range_query| return try parseStandardRangeQuery(alloc, range_query, runtime_schema);
     if (value.object.get("numeric_range")) |range_query| return .{ .numeric_range = try parseNumericRangeQuery(range_query) };
     if (value.object.get("date_range")) |range_query| return .{ .date_range = try parseDateRangeQuery(range_query) };
     if (value.object.get("bool_field")) |bool_query| return .{ .bool_field = try parseBoolFieldQuery(bool_query) };
@@ -11401,20 +11583,22 @@ const JsonRangeBound = struct {
 
 fn parseStandardRangeQuery(
     alloc: Allocator,
-    value: std.json.Value,
+    value: *const std.json.Value,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !search_mod.SearchQuery {
-    if (value != .object) return error.InvalidArgument;
-    if (value.object.get("field") orelse value.object.get("path")) |field_value| {
+    if (value.* != .object) return error.InvalidArgument;
+    var query = if (value.object.get("field") orelse value.object.get("path")) |field_value| explicit: {
         const field = jsonString(field_value) orelse return error.InvalidArgument;
-        return try parseStandardRangeObject(try nativeFilterFieldAlloc(alloc, field), value.object, runtime_schema);
-    }
-
-    if (value.object.count() != 1) return error.InvalidArgument;
-    var it = value.object.iterator();
-    const entry = it.next() orelse return error.InvalidArgument;
-    if (entry.value_ptr.* != .object) return error.InvalidArgument;
-    return try parseStandardRangeObject(try nativeFilterFieldAlloc(alloc, entry.key_ptr.*), entry.value_ptr.object, runtime_schema);
+        break :explicit try parseStandardRangeObject(try nativeFilterFieldAlloc(alloc, field), value.object, runtime_schema);
+    } else shorthand: {
+        if (value.object.count() != 1) return error.InvalidArgument;
+        var it = value.object.iterator();
+        const entry = it.next() orelse return error.InvalidArgument;
+        if (entry.value_ptr.* != .object) return error.InvalidArgument;
+        break :shorthand try parseStandardRangeObject(try nativeFilterFieldAlloc(alloc, entry.key_ptr.*), entry.value_ptr.object, runtime_schema);
+    };
+    if (query == .numeric_range) query.numeric_range.stored_standard_range = value;
+    return query;
 }
 
 fn parseStandardRangeObject(

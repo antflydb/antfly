@@ -127,6 +127,89 @@ const NumericRangeWitnessIterator = struct {
     }
 };
 
+const NumericRangeDirectory = struct {
+    const State = enum(u8) { unloaded, ready, invalid };
+
+    alloc: Allocator,
+    state: std.atomic.Value(State) = .init(.unloaded),
+    lock: std.atomic.Mutex = .unlocked,
+    records: []NumericRangeWitness = &.{},
+    owned_bytes: ?[]u8 = null,
+
+    fn deinit(self: *NumericRangeDirectory) void {
+        const alloc = self.alloc;
+        alloc.free(self.records);
+        if (self.owned_bytes) |bytes| alloc.free(bytes);
+        alloc.destroy(self);
+    }
+
+    fn load(self: *NumericRangeDirectory, reader: *const SegmentReader) ![]const NumericRangeWitness {
+        switch (self.state.load(.acquire)) {
+            .ready => return self.records,
+            .invalid => return error.InvalidSegment,
+            .unloaded => {},
+        }
+        if (!self.lock.tryLock()) return error.StorageReadTemporarilyUnavailable;
+        defer self.lock.unlock();
+        switch (self.state.load(.acquire)) {
+            .ready => return self.records,
+            .invalid => return error.InvalidSegment,
+            .unloaded => {},
+        }
+        self.decode(reader) catch |err| {
+            switch (err) {
+                error.CrcMismatch, error.InvalidSegment => self.state.store(.invalid, .release),
+                else => {},
+            }
+            return err;
+        };
+        self.state.store(.ready, .release);
+        return self.records;
+    }
+
+    fn decode(self: *NumericRangeDirectory, reader: *const SegmentReader) !void {
+        var owned: ?[]u8 = null;
+        defer if (owned) |bytes| self.alloc.free(bytes);
+        const bytes = if (reader.native) |native| data: {
+            const section = native.range.findSection(numeric_range_coverage_field, numeric_range_coverage_section) orelse return;
+            const payload = try self.alloc.alloc(u8, @intCast(section.length));
+            owned = payload;
+            var crc_scratch: [8192]u8 = undefined;
+            _ = try native.range.readSectionInto(numeric_range_coverage_field, numeric_range_coverage_section, 0, payload, &crc_scratch);
+            break :data payload;
+        } else data: {
+            const source = (try reader.getSection(numeric_range_coverage_field, numeric_range_coverage_section)) orelse return;
+            const payload = try self.alloc.dupe(u8, source);
+            owned = payload;
+            break :data payload;
+        };
+        // Older encodings could attest a merged legacy column without proof
+        // of its source projection.
+        if (!std.mem.startsWith(u8, bytes, numeric_range_coverage_header)) return;
+        var iterator = NumericRangeWitnessIterator{ .remaining = bytes[numeric_range_coverage_header.len..] };
+        var records: std.ArrayListUnmanaged(NumericRangeWitness) = .empty;
+        defer records.deinit(self.alloc);
+        while (try iterator.next()) |witness| try records.append(self.alloc, witness);
+        self.records = try records.toOwnedSlice(self.alloc);
+        self.owned_bytes = owned;
+        owned = null;
+    }
+
+    fn retainedBytes(self: *const NumericRangeDirectory) usize {
+        if (self.state.load(.acquire) != .ready) return @sizeOf(NumericRangeDirectory);
+        return @sizeOf(NumericRangeDirectory) + self.records.len * @sizeOf(NumericRangeWitness) +
+            if (self.owned_bytes) |bytes| bytes.len else 0;
+    }
+};
+
+/// Upper bound for the shared payload and its single directory entry.
+pub fn estimateNumericRangeWitnessBytes(fields: []const []const u8) usize {
+    if (fields.len == 0) return 0;
+    var bytes: usize = numeric_range_coverage_header.len + numeric_range_coverage_field.len + 26;
+    for (fields) |field| bytes +|= 3 +| field.len;
+    return bytes;
+}
+
 fn encodeNumericRangeWitnesses(alloc: Allocator, witnesses: []NumericRangeWitness) ![]u8 {
     std.mem.sort(NumericRangeWitness, witnesses, {}, struct {
         fn lessThan(_: void, lhs: NumericRangeWitness, rhs: NumericRangeWitness) bool {
@@ -388,7 +471,11 @@ pub const SegmentWriter = struct {
     pub fn addNumericRangeWitnesses(self: *SegmentWriter, witnesses: []NumericRangeWitness) !void {
         if (witnesses.len == 0) return;
         const field_idx: u16 = for (self.fields.items, 0..) |field, i| {
-            if (std.mem.eql(u8, field.name, numeric_range_coverage_field)) break @intCast(i);
+            if (!std.mem.eql(u8, field.name, numeric_range_coverage_field)) continue;
+            // Older term readers interpret this section as synonyms. A user
+            // field with postings takes precedence over optional coverage.
+            for (field.sections.items) |section| if (section.section_type == .inverted_text or section.section_type == .synonym) return;
+            break @intCast(i);
         } else try self.addField(numeric_range_coverage_field);
         const bytes = try encodeNumericRangeWitnesses(self.alloc, witnesses);
         errdefer self.alloc.free(bytes);
@@ -787,8 +874,19 @@ pub const SegmentReader = struct {
     fields: []FieldInfo,
     fields_sorted: bool = false,
 
+    numeric_range_directory: ?*NumericRangeDirectory = null,
+    borrowed_numeric_range_directory: bool = false,
     native: ?*Native = null,
     deferred: ?*const fn (Allocator, SegmentSource) anyerror!SegmentReader = null,
+
+    fn withNumericRangeDirectory(self: SegmentReader) !SegmentReader {
+        if (!self.hasSection(numeric_range_coverage_field, numeric_range_coverage_section)) return self;
+        var reader = self;
+        const directory = try self.alloc.create(NumericRangeDirectory);
+        directory.* = .{ .alloc = self.alloc };
+        reader.numeric_range_directory = directory;
+        return reader;
+    }
 
     pub const RoutingField = struct { name: []const u8, stats: ?InvertedFieldStats, section_mask: u16 = 0 };
     /// Compact immutable scoring inventory. Full navigation is admitted under
@@ -823,7 +921,7 @@ pub const SegmentReader = struct {
             field.* = .{ .name = name, .sections = sections, .inverted_stats = route_field.stats };
             initialized += 1;
         }
-        return .{ .alloc = a, .data = &.{}, .doc_count = doc_count, .num_fields = @intCast(fields.len), .fields = fields, .fields_sorted = true, .stored_offset = 0, .stored_length = 0, .stored_metadata_length = 0, .index_offset = 0, .deferred = load };
+        return (SegmentReader{ .alloc = a, .data = &.{}, .doc_count = doc_count, .num_fields = @intCast(fields.len), .fields = fields, .fields_sorted = true, .stored_offset = 0, .stored_length = 0, .stored_metadata_length = 0, .index_offset = 0, .deferred = load }).withNumericRangeDirectory();
     }
 
     const Native = struct {
@@ -997,8 +1095,9 @@ pub const SegmentReader = struct {
         errdefer alloc.free(info);
         for (info, fields, metadata.fields) |*out, field, descriptor| out.* = .{ .name = field.name, .sections = field.sections, .inverted_stats = descriptor.stats };
         const validations = try alloc.alloc(std.atomic.Value(u8), blocks);
+        errdefer alloc.free(validations);
         for (validations) |*validation| validation.* = .init(integrity_unverified);
-        return .{ .alloc = alloc, .data = &.{}, .native = native, .stored_offset = metadata.stored_offset, .stored_length = metadata.stored_length, .stored_metadata_length = metadata.stored_metadata_length, .index_offset = metadata.index_offset, .doc_count = metadata.doc_count, .num_fields = @intCast(fields.len), .fields = info, .fields_sorted = true, .stored_block_validations = validations };
+        return (SegmentReader{ .alloc = alloc, .data = &.{}, .native = native, .stored_offset = metadata.stored_offset, .stored_length = metadata.stored_length, .stored_metadata_length = metadata.stored_metadata_length, .index_offset = metadata.index_offset, .doc_count = metadata.doc_count, .num_fields = @intCast(fields.len), .fields = info, .fields_sorted = true, .stored_block_validations = validations }).withNumericRangeDirectory();
     }
 
     /// The caller owns the immutable source and keeps it alive until reader deinit.
@@ -1062,11 +1161,11 @@ pub const SegmentReader = struct {
             }
         }
         const validations = try alloc.alloc(std.atomic.Value(u8), native.range.num_blocks);
+        errdefer alloc.free(validations);
         for (validations) |*validation| validation.* = .init(integrity_unverified);
         var index_bytes: [8]u8 = undefined;
-        errdefer alloc.free(validations);
         try input_source.readInto(input_source.len() - 24, &index_bytes);
-        return .{ .alloc = alloc, .data = &.{}, .native = native, .stored_offset = native.range.stored_offset, .stored_length = native.range.stored_length, .stored_metadata_length = native.range.stored_metadata_length, .stored_block_validations = validations, .index_offset = std.mem.readInt(u64, &index_bytes, .big), .doc_count = native.range.doc_count, .num_fields = @intCast(fields.len), .fields = fields, .fields_sorted = native.range.fields_sorted };
+        return (SegmentReader{ .alloc = alloc, .data = &.{}, .native = native, .stored_offset = native.range.stored_offset, .stored_length = native.range.stored_length, .stored_metadata_length = native.range.stored_metadata_length, .stored_block_validations = validations, .index_offset = std.mem.readInt(u64, &index_bytes, .big), .doc_count = native.range.doc_count, .num_fields = @intCast(fields.len), .fields = fields, .fields_sorted = native.range.fields_sorted }).withNumericRangeDirectory();
     }
 
     pub fn hasSection(self: *const SegmentReader, name: []const u8, kind: SectionType) bool {
@@ -1090,6 +1189,11 @@ pub const SegmentReader = struct {
                 if (!std.meta.eql(try reader.invertedFieldStats(expected.name), expected.inverted_stats) or actual.sections.len != expected.sections.len) return error.InvalidSegment;
                 for (expected.sections) |section| if (!reader.hasSection(expected.name, section.section_type)) return error.InvalidSegment;
             }
+            if (self.numeric_range_directory) |directory| {
+                if (!reader.borrowed_numeric_range_directory) if (reader.numeric_range_directory) |owned| owned.deinit();
+                reader.numeric_range_directory = directory;
+                reader.borrowed_numeric_range_directory = true;
+            }
             return reader;
         }
         const base = self.native orelse return error.InvalidSegment;
@@ -1111,19 +1215,21 @@ pub const SegmentReader = struct {
         var bound = self.*;
         bound.alloc = alloc;
         bound.native = native;
+        bound.borrowed_numeric_range_directory = true;
         return bound;
     }
 
     pub fn nativeNavigationBytes(self: *const SegmentReader) usize {
+        const witness_bytes = if (self.borrowed_numeric_range_directory) 0 else if (self.numeric_range_directory) |directory| directory.retainedBytes() else 0;
         const native = self.native orelse {
-            if (self.deferred == null) return 0;
-            var bytes: usize = self.fields.len * @sizeOf(FieldInfo);
+            if (self.deferred == null) return witness_bytes;
+            var bytes: usize = witness_bytes + self.fields.len * @sizeOf(FieldInfo);
             for (self.fields) |field| bytes += field.name.len + field.sections.len * @sizeOf(SectionInfo);
             return bytes;
         };
         @import("antfly_platform").sync.lockYielding(&native.identity_mutex);
         defer native.identity_mutex.unlock();
-        var bytes = @sizeOf(Native) + native.identity_bytes + native.metadata_cache.?.retainedBytes() +
+        var bytes = witness_bytes + @sizeOf(Native) + native.identity_bytes + native.metadata_cache.?.retainedBytes() +
             self.fields.len * (@sizeOf(FieldInfo) + @sizeOf(RangeSegmentReader.Field)) +
             self.stored_block_validations.?.len * @sizeOf(std.atomic.Value(u8));
         if (native.range.paged_source) |paged| {
@@ -1314,7 +1420,7 @@ pub const SegmentReader = struct {
         errdefer alloc.free(stored_block_validations);
         for (stored_block_validations) |*validation| validation.* = .init(integrity_unverified);
 
-        return .{
+        return (SegmentReader{
             .alloc = alloc,
             .data = data,
             .stored_offset = stored_offset,
@@ -1327,10 +1433,11 @@ pub const SegmentReader = struct {
             .num_fields = num_fields,
             .fields = fields,
             .fields_sorted = true,
-        };
+        }).withNumericRangeDirectory();
     }
 
     pub fn deinit(self: *SegmentReader) void {
+        if (!self.borrowed_numeric_range_directory) if (self.numeric_range_directory) |directory| directory.deinit();
         if (self.native) |native| {
             if (!native.borrowed_navigation) {
                 for (self.fields) |field| for (field.sections) |section| {
@@ -2224,24 +2331,30 @@ pub const SegmentReader = struct {
         return try decodeIndexSortMetadataAlloc(alloc, section);
     }
 
-    fn numericRangeWitnesses(self: *const SegmentReader) !NumericRangeWitnessIterator {
-        const bytes = (try self.getSection(numeric_range_coverage_field, numeric_range_coverage_section)) orelse return .{};
-        // Earlier witness encodings could attest a merged legacy column
-        // without evidence of its source projection.
-        if (!std.mem.startsWith(u8, bytes, numeric_range_coverage_header)) return .{};
-        return .{ .remaining = bytes[numeric_range_coverage_header.len..] };
+    fn numericRangeWitnesses(self: *const SegmentReader) ![]const NumericRangeWitness {
+        if (self.deferred != null) return &.{};
+        const directory = self.numeric_range_directory orelse return &.{};
+        return directory.load(self);
     }
 
     /// A producer witness for an exact, source-backed numeric field.
     pub fn numericRangeCoverage(self: *const SegmentReader, field: []const u8) !?NumericRangeCoverage {
-        var witnesses = try self.numericRangeWitnesses();
-        var found: ?NumericRangeCoverage = null;
-        while (try witnesses.next()) |witness| {
-            if (std.mem.eql(u8, witness.field, field)) found = witness.coverage;
+        const witnesses = try self.numericRangeWitnesses();
+        var low: usize = 0;
+        var high = witnesses.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const witness = witnesses[mid];
+            switch (std.mem.order(u8, witness.field, field)) {
+                .lt => low = mid + 1,
+                .gt => high = mid,
+                .eq => {
+                    if (!self.numericRangeWitnessConsistent(field, witness.coverage)) return error.InvalidSegment;
+                    return witness.coverage;
+                },
+            }
         }
-        const coverage = found orelse return null;
-        if (!self.numericRangeWitnessConsistent(field, coverage)) return error.InvalidSegment;
-        return coverage;
+        return null;
     }
 
     fn numericRangeWitnessConsistent(self: *const SegmentReader, field: []const u8, coverage: NumericRangeCoverage) bool {
@@ -3912,6 +4025,7 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
         try built_fields.append(alloc, built_field);
     }
 
+    try coverage.appendMetadataOnlyFields(alloc, inputs, &field_set, &witnesses);
     try appendMergedNumericRangeWitnesses(alloc, sink, &built_fields, witnesses.items);
 
     const ordinal_start = sink.len();
@@ -4051,6 +4165,7 @@ fn writeSortedMergedSegmentToSink(
         try built_fields.append(alloc, built_field);
     }
 
+    try coverage.appendMetadataOnlyFields(alloc, inputs, &field_set, &witnesses);
     try appendMergedNumericRangeWitnesses(alloc, sink, &built_fields, witnesses.items);
 
     const ordinal_start = sink.len();
@@ -5696,14 +5811,11 @@ const MergeNumericRangeCoverage = struct {
         errdefer out.deinit(alloc);
         for (inputs, maps) |input, *map| {
             if (!inputHasLiveDocs(input)) continue;
-            var records = input.reader.numericRangeWitnesses() catch |err| switch (err) {
+            const records = input.reader.numericRangeWitnesses() catch |err| switch (err) {
                 error.CrcMismatch, error.InvalidSegment => continue,
                 else => return err,
             };
-            while (records.next() catch {
-                map.clearRetainingCapacity();
-                break;
-            }) |witness| {
+            for (records) |witness| {
                 if (input.reader.numericRangeWitnessConsistent(witness.field, witness.coverage)) {
                     try map.put(alloc, witness.field, witness.coverage);
                 }
@@ -5718,6 +5830,22 @@ const MergeNumericRangeCoverage = struct {
         for (self.by_input) |*map| map.deinit(alloc);
         alloc.free(self.by_input);
         self.fields.deinit(alloc);
+    }
+
+    fn appendMetadataOnlyFields(
+        self: MergeNumericRangeCoverage,
+        alloc: Allocator,
+        inputs: []const MergeInput,
+        physical_fields: *const std.StringHashMapUnmanaged(void),
+        witnesses: *std.ArrayListUnmanaged(NumericRangeWitness),
+    ) !void {
+        var names = self.fields.keyIterator();
+        while (names.next()) |name| {
+            if (physical_fields.contains(name.*)) continue;
+            if (try self.forField(alloc, name.*, inputs, false)) |coverage| {
+                try witnesses.append(alloc, .{ .field = name.*, .coverage = coverage });
+            }
+        }
     }
 
     fn forField(
@@ -5753,6 +5881,7 @@ fn appendMergedNumericRangeWitnesses(
     defer alloc.free(bytes);
     for (fields.items) |*existing| {
         if (std.mem.eql(u8, existing.name, numeric_range_coverage_field)) {
+            for (existing.sections.items) |section| if (section.section_type == .inverted_text) return;
             return appendBuiltSection(alloc, sink, existing, numeric_range_coverage_section, bytes);
         }
     }
@@ -13108,4 +13237,54 @@ test "optional numeric range damaged witness does not prevent range-backed posti
     var body = (try native.invertedIndexScoped(a, "body")).?;
     defer body.deinit();
     try std.testing.expect((try body.lookup("beacon")) != null);
+}
+
+test "optional numeric range directory is reused across bound readers and metadata-only merges" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    try writer.addStoredDoc("row", "{}");
+    var fields = [_]NumericRangeWitness{
+        .{ .field = "score", .coverage = .empty },
+        .{ .field = "rank", .coverage = .empty },
+    };
+    try writer.addNumericRangeWitnesses(&fields);
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var base = try SegmentReader.initSource(a, .{ .contiguous = bytes });
+    defer base.deinit();
+    const CountedSource = struct {
+        bytes: []const u8,
+        reads: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, target: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            @memcpy(target, self.bytes[@intCast(offset)..][0..target.len]);
+        }
+        fn close(_: *anyopaque) void {}
+        fn source(self: *@This()) SegmentSource {
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close } };
+        }
+    };
+    var cold_source = CountedSource{ .bytes = bytes };
+    {
+        var scope = try base.bindSource(a, cold_source.source());
+        defer scope.deinit();
+        try std.testing.expectEqual(NumericRangeCoverage.empty, (try scope.numericRangeCoverage("rank")).?);
+    }
+    try std.testing.expect(cold_source.reads > 0);
+    var warm_source = CountedSource{ .bytes = bytes };
+    var scope = try base.bindSource(a, warm_source.source());
+    defer scope.deinit();
+    try std.testing.expectEqual(NumericRangeCoverage.empty, (try scope.numericRangeCoverage("score")).?);
+    try std.testing.expect((try scope.numericRangeCoverage("unknown")) == null);
+    try std.testing.expectEqual(@as(usize, 0), warm_source.reads);
+
+    const merged = try mergeSegmentInputs(a, &.{ .{ .reader = &base }, .{ .reader = &base } });
+    defer a.free(merged);
+    var result = try SegmentReader.init(a, merged);
+    defer result.deinit();
+    try std.testing.expectEqual(NumericRangeCoverage.empty, (try result.numericRangeCoverage("rank")).?);
+    try std.testing.expectEqual(NumericRangeCoverage.empty, (try result.numericRangeCoverage("score")).?);
+    try std.testing.expectEqual(@as(u16, 1), result.num_fields);
 }
