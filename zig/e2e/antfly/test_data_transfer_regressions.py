@@ -69,7 +69,9 @@ def test_data_only_restore_serves_partial_vectors_after_restart(tmp_path, vector
         response = requests.post(
             server.api_url + "/tables/records",
             json={
-                "schema": {k: v for k, v in definition["schema"].items() if k != "version"},
+                "schema": {
+                    k: v for k, v in definition["schema"].items() if k != "version"
+                },
                 "indexes": {"vectors": definition["indexes"]["vectors"]},
             },
             timeout=30,
@@ -96,8 +98,18 @@ def test_data_only_restore_serves_partial_vectors_after_restart(tmp_path, vector
         output = tmp_path / "prepared.aflite"
         result = subprocess.run(
             [
-                binary, "--no-agent", "restore", "--data-only", "--input", str(source),
-                "--out", str(output), "--table", "records", "--definition", str(trusted),
+                binary,
+                "--no-agent",
+                "restore",
+                "--data-only",
+                "--input",
+                str(source),
+                "--out",
+                str(output),
+                "--table",
+                "records",
+                "--definition",
+                str(trusted),
             ],
             env={**os.environ, "ANTFLY_URL": "://invalid-server-url"},
             capture_output=True,
@@ -107,11 +119,16 @@ def test_data_only_restore_serves_partial_vectors_after_restart(tmp_path, vector
         assert result.returncode == 0, result.stdout + result.stderr
         report = json.loads(result.stdout)
         assert report["inventory"] == {
-            "documents": 2, "artifact_records": vector_count, "shards": 1
+            "documents": 2,
+            "artifact_records": vector_count,
+            "shards": 1,
         }
         assert report["source"]["sha256"] == source_hash
         assert hashlib.sha256(source.read_bytes()).hexdigest() == source_hash
-        assert hashlib.sha256(output.read_bytes()).hexdigest() == report["output"]["sha256"]
+        assert (
+            hashlib.sha256(output.read_bytes()).hexdigest()
+            == report["output"]["sha256"]
+        )
         os.replace(output, source)
         server.resume()
 
@@ -139,7 +156,10 @@ def test_data_only_restore_serves_partial_vectors_after_restart(tmp_path, vector
             assert wait_until(ready, timeout_s=30, interval_s=0.2), last
             for query, expected in (
                 ({"full_text_search": {"match": "searchable", "field": "content"}}, 2),
-                ({"embeddings": {"vectors": vector}, "indexes": ["vectors"]}, vector_count),
+                (
+                    {"embeddings": {"vectors": vector}, "indexes": ["vectors"]},
+                    vector_count,
+                ),
             ):
                 response = requests.post(
                     server.api_url + "/tables/records/query", json=query, timeout=10
