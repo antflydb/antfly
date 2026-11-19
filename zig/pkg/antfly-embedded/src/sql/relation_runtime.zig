@@ -712,6 +712,30 @@ test "SQL materialized relation replay spills once and shares a single statement
     }
 }
 
+test "SQL generate_series accepts expression bounds and alias columns" {
+    const allocator = std.testing.allocator;
+    var backend: SetTestBackend = .{};
+    const Case = struct { sql: []const u8, expected: []const i64 };
+    for ([_]Case{
+        .{ .sql = "SELECT s.r FROM generate_series(1, array_upper(ARRAY['public','misc'], 1)) AS s(r) ORDER BY s.r", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT n FROM pg_catalog.generate_series(5, 0, -2) AS n ORDER BY n DESC", .expected = &.{ 5, 3, 1 } },
+        .{ .sql = "SELECT generate_series FROM generate_series(2, 1)", .expected = &.{} },
+        .{ .sql = "SELECT generate_series FROM generate_series(NULL, 1, 0)", .expected = &.{} },
+        .{ .sql = "SELECT generate_series FROM generate_series(9223372036854775807, 9223372036854775807)", .expected = &.{9223372036854775807} },
+    }) |case| {
+        errdefer std.debug.print("generate_series SQL failed: {s}\n", .{case.sql});
+        var compiled = try @import("compiler.zig").compile(allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(allocator, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(case.expected.len, result.output.rows.len);
+        for (result.output.rows, case.expected) |row, value| try std.testing.expectEqual(value, try std.fmt.parseInt(i64, row[0].string, 10));
+    }
+    var zero = try @import("compiler.zig").compile(allocator, "SELECT n FROM generate_series(2, 1, 0) AS n", .{});
+    defer zero.deinit();
+    try std.testing.expectError(error.SqlZeroSeriesStep, @import("runtime.zig").execute(allocator, backend.backend(), &zero, &.{}, .{}));
+}
+
 test "SQL set operations preserve multiplicities precedence and output ordering" {
     const runtime = @import("runtime.zig");
     const compiler = @import("compiler.zig");

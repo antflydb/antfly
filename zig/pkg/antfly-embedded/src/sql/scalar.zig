@@ -281,7 +281,7 @@ pub const EvalLimits = struct {
     regex_checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     regex_context: ?*anyopaque = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, value_identity, is_missing, date_bin, @"$array_subscript" };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, value_identity, is_missing, date_bin, @"$array_subscript", @"$series_step" };
 
 fn regexFunction(function: Function) ?regex_functions.Function {
     return switch (function) {
@@ -391,6 +391,10 @@ pub fn validateTypedInstructions(instructions: []const Instruction, root: u32, o
                         for (op.args[1..]) |ordinal| try requireInstructionKind(instructions[ordinal].type, .integer);
                     },
                     .array_position => if (op.args.len == 3) try requireInstructionKind(instructions[op.args[2]].type, .integer),
+                    .@"$series_step" => {
+                        try requireInstructionKind(instruction.type, .integer);
+                        for (op.args) |ordinal| try requireInstructionKind(instructions[ordinal].type, .integer);
+                    },
                     .is_missing => if (instruction.type.kind != .boolean) return error.InvalidSqlProgram,
                     .value_identity => if (instruction.type.kind != .string) return error.InvalidSqlProgram,
                     else => {},
@@ -769,6 +773,7 @@ pub const Program = struct {
                 .array_lower,
                 .array_upper,
                 .@"$array_subscript",
+                .@"$series_step",
                 .@"$array_pattern_quantified",
                 .@"$contains",
                 .@"$overlaps",
@@ -2602,7 +2607,7 @@ pub fn validateFunctionArity(function: Function, count: usize) !void {
         .regexp_like, .regexp_count, .regexp_instr, .regexp_substr, .regexp_replace => unreachable,
         .array_position => count == 2 or count == 3,
         .array_positions, .array_remove, .array_append, .array_prepend, .array_cat => count == 2,
-        .array_replace, .date_bin => count == 3,
+        .array_replace, .date_bin, .@"$series_step" => count == 3,
         .@"$like_escape" => count == 4,
         .@"$contains", .@"$overlaps", .jsonb_exists, .jsonb_exists_any, .jsonb_exists_all => count == 2,
         .array_to_string => count == 2 or count == 3,
@@ -2913,6 +2918,13 @@ const Binder = struct {
                         }
                     }
                     break :blk .{ .kind = .array, .nullable = false, .element_type = kind, .numeric_modifier = try self.commonModifier(call.args, depth) };
+                }
+                if (function == .@"$series_step") {
+                    for (call.args) |arg| {
+                        const input = try self.infer(arg, depth + 1);
+                        if (input.kind != null and input.kind != .integer) return error.SqlTypeMismatch;
+                    }
+                    break :blk .{ .kind = .integer, .element_type = .int64, .nullable = true };
                 }
                 if (function == .@"$array_subscript") {
                     const input = try self.infer(call.args[0], depth + 1);
@@ -4197,6 +4209,15 @@ const Evaluator = struct {
                             break :ordinary if (mixed_number) try mixedNumberQuantified(array.*, element, compare_op, every.bool, &work) else try array.quantified(element, compare_op, if (every.bool) .all else .any, &work);
                         };
                         break :blk if (accepted) |value| Datum.json(.{ .bool = value }) else .{};
+                    },
+                    .@"$series_step" => {
+                        const start = try self.runDatum(call.args[0], depth + 1);
+                        const stop = try self.runDatum(call.args[1], depth + 1);
+                        const step = try self.runDatum(call.args[2], depth + 1);
+                        if (start.sql_null or stop.sql_null or step.sql_null) break :blk .{};
+                        if (step.value != .integer) return error.SqlTypeMismatch;
+                        if (step.value.integer == 0) return error.SqlZeroSeriesStep;
+                        break :blk step;
                     },
                     .@"$array_subscript" => {
                         const input = try self.runDatum(call.args[0], depth + 1);

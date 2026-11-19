@@ -1371,6 +1371,69 @@ const Parser = struct {
         return null;
     }
 
+    fn seriesSelect(self: *Parser, values: [3]*const ast.Scalar, source: ?*const ast.Relation) Error!*const ast.Select {
+        const zero = try self.scalarNode(.{ .literal = .{ .integer = 0 } });
+        const positive = try self.scalarNode(.{ .binary = .{ .op = .gt, .left = values[2], .right = zero } });
+        const negative = try self.scalarNode(.{ .binary = .{ .op = .lt, .left = values[2], .right = zero } });
+        const below = try self.scalarNode(.{ .binary = .{ .op = .lte, .left = values[0], .right = values[1] } });
+        const above = try self.scalarNode(.{ .binary = .{ .op = .gte, .left = values[0], .right = values[1] } });
+        const ascending = try self.scalarNode(.{ .binary = .{ .op = .@"and", .left = positive, .right = below } });
+        const descending = try self.scalarNode(.{ .binary = .{ .op = .@"and", .left = negative, .right = above } });
+        const bound = try self.scalarNode(.{ .binary = .{ .op = .@"or", .left = ascending, .right = descending } });
+        try self.checkScalarDepth(bound, 0);
+        const columns = try self.alloc.alloc(ast.Projection, values.len);
+        for (columns, values) |*column, expression| column.* = .{ .expression = expression };
+        const result = try self.alloc.create(ast.Select);
+        result.* = .{ .columns = columns, .source = source, .predicate = try self.predicateNode(.{ .scalar = bound }) };
+        return result;
+    }
+
+    fn integerSeries(self: *Parser, lateral: bool) Error!*const ast.Relation {
+        const start = try self.scalar(0, 0);
+        try self.expect(.comma);
+        const stop = try self.scalar(0, 0);
+        const step = if (self.take(.comma)) try self.scalar(0, 0) else try self.scalarNode(.{ .literal = .{ .integer = 1 } });
+        try self.expect(.rparen);
+        const alias = (try self.sourceAlias()) orelse "generate_series";
+        const label = if (self.take(.lparen)) blk: {
+            const name_value = try self.identifier();
+            try self.expect(.rparen);
+            break :blk name_value;
+        } else alias;
+
+        const columns: []const []const u8 = &.{ "$series_value", "$series_stop", "$series_step" };
+        const relation_value = try self.relationNode(.{ .table = .{ .name = .{ .table = "$integer_series" } } });
+        var inputs: [3]*const ast.Scalar = undefined;
+        for (&inputs, [_]*const ast.Scalar{ start, stop, step }) |*input, arg| {
+            input.* = try self.scalarNode(.{ .cast = .{ .operand = arg, .type = .integer, .element_type = .int64 } });
+        }
+        inputs[2] = try self.scalarNode(.{ .call = .{ .name = "$series_step", .args = try self.alloc.dupe(*const ast.Scalar, &inputs) } });
+        var seed_values: [3]*const ast.Scalar = undefined;
+        var current: [3]*const ast.Scalar = undefined;
+        for (&seed_values, &current, columns, inputs) |*seed_value, *cell, column, input| {
+            seed_value.* = try self.scalarNode(.{ .cast = .{ .operand = input, .type = .number, .element_type = .numeric } });
+            cell.* = try self.scalarNode(.{ .column = column });
+        }
+        // Exact arithmetic allows the terminating candidate to exceed bigint
+        // without overflow. Only candidates within the bigint bounds emit.
+        const next = try self.scalarNode(.{ .binary = .{ .op = .add, .left = current[0], .right = current[2] } });
+        const recursive = try self.alloc.create(ast.Select);
+        recursive.* = .{ .set_operation = .{
+            .kind = .@"union",
+            .all = true,
+            .left = try self.seriesSelect(seed_values, null),
+            .right = try self.seriesSelect(.{ next, current[1], current[2] }, relation_value),
+        } };
+        const query = try self.alloc.create(ast.Select);
+        const output = try self.scalarNode(.{ .cast = .{ .operand = current[0], .type = .integer, .element_type = .int64 } });
+        query.* = .{
+            .source = relation_value,
+            .columns = try self.alloc.dupe(ast.Projection, &.{.{ .alias = label, .expression = output }}),
+            .ctes = try self.alloc.dupe(ast.Cte, &.{.{ .name = "$integer_series", .columns = columns, .query = recursive, .recursive = true }}),
+        };
+        return self.relationNode(.{ .derived = .{ .query = query, .alias = alias, .lateral = lateral } });
+    }
+
     fn relationAtom(self: *Parser) Error!*const ast.Relation {
         const lateral = self.keyword(.lateral);
         if (self.take(.lparen)) {
@@ -1394,8 +1457,10 @@ const Parser = struct {
             query.* = statement_value.select;
             return self.relationNode(.{ .derived = .{ .query = query, .alias = alias, .columns = try names.toOwnedSlice(self.alloc), .lateral = lateral } });
         }
-        if (lateral) return self.fail(error.InvalidSqlSyntax, "LATERAL requires a derived query");
         const name_value = try self.tableReferenceName();
+        if (name_value.database == null and (name_value.namespace == null or std.mem.eql(u8, name_value.namespace.?, "pg_catalog")) and std.mem.eql(u8, name_value.table, "generate_series") and self.take(.lparen))
+            return self.integerSeries(lateral);
+        if (lateral) return self.fail(error.InvalidSqlSyntax, "LATERAL requires a derived query");
         if (name_value.database == null and name_value.namespace == null and std.mem.eql(u8, name_value.table, "graph_table") and self.take(.lparen)) {
             const graph_name = try self.tableReferenceName();
             try self.expectKeyword(.match);
