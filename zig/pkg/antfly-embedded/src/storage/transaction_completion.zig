@@ -25,6 +25,7 @@ const A = std.mem.Allocator;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
 pub const max_participants = 1024;
+pub const max_projection_roots = 4096;
 pub const max_locator_bytes = 1024;
 pub const max_bytes = 16 * 1024 * 1024;
 pub const admission_prefix = "\x00\x00__txn_completion_admission__:";
@@ -458,7 +459,7 @@ pub const Certificate = struct {
     /// Out-of-scope participants and positive no-effect outcomes both leave
     /// no pending frame for the subscriber.
     pub fn projectEffects(self: Certificate, selected: []const Namespace, effects: []?Effects) !void {
-        if (selected.len == 0 or selected.len > max_participants or effects.len != selected.len) return error.InvalidTxnRecord;
+        if (selected.len == 0 or selected.len > max_projection_roots or effects.len != selected.len) return error.InvalidTxnRecord;
         try self.validate();
         var resolution_index: usize = 0;
         for (selected, effects, 0..) |namespace, *effect, i| {

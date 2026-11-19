@@ -533,8 +533,7 @@ test "source plan HTTP preserves authentication recovery and unknown outcomes" {
         defer response.deinit();
         const expected: u16 = switch (mode) {
             .rejected, .unknown => 200,
-            .malformed => 500,
-            .busy => 503,
+            .malformed, .busy => 503,
         };
         try std.testing.expectEqual(expected, response.status.code);
         if (mode == .rejected) {
@@ -1941,7 +1940,7 @@ pub const AntflyApiHandler = struct {
             try server.postWithBodyLimit(table_prefix ++ routes.history_page_suffix, @import("history_page_operations.zig").max_request_bytes, httpx.Handler.bind(self, internalHistoryPage));
         } else try server.post(table_prefix ++ routes.history_page_suffix, httpx.Handler.bind(self, internalHistoryPage));
         if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
-            try server.postWithBodyLimit(table_prefix ++ routes.history_bootstrap_page_suffix, @import("history_page_operations.zig").max_request_bytes, httpx.Handler.bind(self, internalHistoryBootstrapPage));
+            try server.postWithBodyLimit(table_prefix ++ routes.history_bootstrap_page_suffix, @import("history_page_operations.zig").max_bootstrap_request_bytes, httpx.Handler.bind(self, internalHistoryBootstrapPage));
         } else try server.post(table_prefix ++ routes.history_bootstrap_page_suffix, httpx.Handler.bind(self, internalHistoryBootstrapPage));
         if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
             try server.postWithBodyLimit(table_prefix ++ routes.history_grant_suffix, @import("history_grant_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryGrant));
@@ -4180,7 +4179,7 @@ pub const AntflyApiHandler = struct {
         var params = (try internalGroupTableParams(ctx)) orelse return historyPageFailure(ctx, error.InvalidHistoryPageRequest);
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return historyPageFailure(ctx, error.InvalidHistoryPageRequest);
-        if (body.len > operations.max_request_bytes) return textResponse(ctx, 413, "history page request exceeds byte limit");
+        if (body.len > (if (bootstrap) operations.max_bootstrap_request_bytes else operations.max_request_bytes)) return textResponse(ctx, 413, "history page request exceeds byte limit");
         const context = operationContext(ctx, null);
         const encoded = (if (bootstrap)
             operations.Bootstrap.execute(self.api_server.cfg.native_history_bootstrap_page, ctx.allocator, params.group_id, params.table_name, body, context)

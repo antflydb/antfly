@@ -226,6 +226,14 @@ pub const Routed = struct {
     }
 
     pub fn readWithContext(self: *Routed, a: A, state: control.State, cursor: Digest, now: u64, max_events: u32, max_bytes: u32, request: Context) !root_page.Page {
+        return self.readPage(a, state, cursor, now, max_events, max_bytes, false, request);
+    }
+
+    pub fn readProjectedWithContext(self: *Routed, a: A, state: control.State, cursor: Digest, now: u64, max_events: u32, max_bytes: u32, request: Context) !root_page.Page {
+        return self.readPage(a, state, cursor, now, max_events, max_bytes, true, request);
+    }
+
+    fn readPage(self: *Routed, a: A, state: control.State, cursor: Digest, now: u64, max_events: u32, max_bytes: u32, project_completion: bool, request: Context) !root_page.Page {
         try request.ensureActive();
         _ = try self.validateScope(state);
         if (state.phase != .streaming) return error.ChangefeedResynchronizationRequired;
@@ -237,6 +245,9 @@ pub const Routed = struct {
         const positions = try state.rootsAt(a, cursor);
         defer a.free(positions);
         const after = positions[index].delivered;
+        const completion_roots = try a.alloc(control.Namespace, if (project_completion) positions.len else 0);
+        defer a.free(completion_roots);
+        for (completion_roots, positions[0..completion_roots.len]) |*namespace, position| namespace.* = position.namespace;
         var page = try self.source.pages.read(a, selected.fence, selected.table_name, .{
             .version = 1,
             .request = .{
@@ -253,6 +264,7 @@ pub const Routed = struct {
                 .max_events = max_events,
                 .max_bytes = max_bytes,
                 .include_completion = true,
+                .completion_roots = completion_roots,
             },
         }, request);
         errdefer page.deinit();

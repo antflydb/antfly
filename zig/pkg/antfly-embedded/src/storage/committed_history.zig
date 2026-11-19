@@ -432,6 +432,8 @@ pub const FrameCompletion = struct {
     commit_version: u64,
 };
 
+pub const max_completion_projection_roots = completion.max_projection_roots;
+pub const CompletionEffect = completion.Effects;
 pub const CompletionProjection = struct {
     roots: []const frame.Namespace,
     effects: []?completion.Effects,

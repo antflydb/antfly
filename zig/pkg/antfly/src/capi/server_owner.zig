@@ -5020,8 +5020,8 @@ pub fn storageOwnerOrderedHistoryPage(
     if (request._reserved0 != 0) return .invalid_argument;
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    if (request.request_json.len > 4096 or !borrowedBytesValid(request.request_json)) return .invalid_argument;
     const wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page_wire;
+    if (request.request_json.len > wire.max_request_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
     var parsed = std.json.parseFromSlice(wire.OrderedRead, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) storageOwnerStatusFromError(err) else .invalid_argument;
     defer parsed.deinit();
     var page = handle.db.orderedHistoryPage(handle.alloc, parsed.value.request, parsed.value.minimum_applied_index) catch |err| return storageOwnerStatusFromError(err);

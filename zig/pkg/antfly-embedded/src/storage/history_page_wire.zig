@@ -20,13 +20,17 @@ const pages = @import("history_page.zig");
 const frame = @import("committed_frame.zig");
 pub const prefix_bytes = 96;
 const completion_bytes = 40;
-pub const max_bytes = prefix_bytes + completion_bytes + frame.max_bytes;
+const effect_bytes = 40;
+pub const max_bytes = prefix_bytes + completion_bytes + pages.max_projection_roots * effect_bytes + frame.max_bytes;
+// JSON namespaces use up to four characters per decimal byte, plus brackets.
+pub const max_request_bytes = 4096 + pages.max_projection_roots * (24 * 4 + 2);
 
 pub fn prefixSize(request: pages.Request) usize {
-    return prefix_bytes + if (request.include_completion) @as(usize, completion_bytes) else 0;
+    return prefix_bytes + if (request.include_completion) completion_bytes + request.completion_roots.len * effect_bytes else @as(usize, 0);
 }
 
 fn magic(request: pages.Request) *const [4]u8 {
+    if (request.completion_roots.len != 0) return "HPG3";
     return if (request.include_completion) "HPG2" else "HPG1";
 }
 pub const OrderedRead = struct { request: pages.Request, minimum_applied_index: u64 };
@@ -43,18 +47,26 @@ fn checksum(prefix: []const u8, payload: []const u8, request: pages.Request) [32
         std.mem.writeInt(u64, &bytes, value, .little);
         hash.update(&bytes);
     }
+    for (request.completion_roots) |root| hash.update(&root);
     hash.update(prefix);
     hash.update(payload);
     return hash.finalResult();
 }
 pub fn validate(page: pages.Page, request: pages.Request) !void {
+    try request.validateCompletionRoots();
     if (request.max_events == 0 or request.max_events > 1024 or request.max_bytes == 0 or request.max_bytes > frame.max_bytes) return error.InvalidHistoryAdmission;
     if (page.events.len > request.max_events or page.first_ordinal != request.after.event) return error.HistoryCorrupt;
     if (page.completion) |proof| {
         const header = page.header orelse return error.HistoryCorrupt;
         if (!request.include_completion or header.transaction_scope != .coordinated or
-            std.mem.allEqual(u8, &proof.certificate_digest, 0) or proof.commit_version == 0) return error.HistoryCorrupt;
-    }
+            std.mem.allEqual(u8, &proof.certificate_digest, 0) or proof.commit_version == 0 or page.completion_effects.len != request.completion_roots.len) return error.HistoryCorrupt;
+        for (page.completion_effects, request.completion_roots) |effect, root| {
+            const local = std.mem.eql(u8, &root, &header.namespace);
+            if (effect) |value| {
+                if (value.sequence == 0 or std.mem.allEqual(u8, &value.frame_digest, 0) or (local and value.sequence != header.sequence)) return error.HistoryCorrupt;
+            } else if (local) return error.HistoryCorrupt;
+        }
+    } else if (page.completion_effects.len != 0) return error.HistoryCorrupt;
     if (page.header) |header| {
         if (!std.mem.eql(u8, &header.namespace, &request.reference.namespace) or request.after.sequence == std.math.maxInt(u64) or
             header.sequence != request.after.sequence + 1 or header.sequence > page.observed_latest or
@@ -80,6 +92,11 @@ pub fn encode(a: std.mem.Allocator, page: pages.Page, request: pages.Request) ![
     if (page.completion) |proof| {
         @memcpy(out[96..128], &proof.certificate_digest);
         std.mem.writeInt(u64, out[128..136], proof.commit_version, .little);
+        for (page.completion_effects, 0..) |entry, i| if (entry) |effect| {
+            const field = out[136 + i * effect_bytes ..][0..effect_bytes];
+            std.mem.writeInt(u64, field[0..8], effect.sequence, .little);
+            @memcpy(field[8..40], &effect.frame_digest);
+        };
     }
     out[4] = @intFromBool(page.header != null);
     out[5] = @intFromBool(page.caught_up);
@@ -95,6 +112,7 @@ pub fn encode(a: std.mem.Allocator, page: pages.Page, request: pages.Request) ![
 }
 
 pub fn decode(a: std.mem.Allocator, raw: []const u8, request: pages.Request) !pages.Page {
+    try request.validateCompletionRoots();
     if (request.max_events == 0 or request.max_events > 1024 or request.max_bytes == 0 or request.max_bytes > frame.max_bytes) return error.InvalidHistoryAdmission;
     const prefix = prefixSize(request);
     if (raw.len < prefix or raw.len > prefix + @as(usize, request.max_bytes) or
@@ -108,7 +126,16 @@ pub fn decode(a: std.mem.Allocator, raw: []const u8, request: pages.Request) !pa
     var page: pages.Page = .{ .arena = arena, .first_ordinal = std.mem.readInt(u32, raw[8..12], .little), .frame_events = std.mem.readInt(u32, raw[12..16], .little), .next = .{ .sequence = std.mem.readInt(u64, raw[16..24], .little), .event = std.mem.readInt(u32, raw[24..28], .little) }, .observed_latest = std.mem.readInt(u64, raw[32..40], .little), .caught_up = raw[5] == 1 };
     if (request.include_completion and !std.mem.allEqual(u8, raw[96..136], 0)) {
         page.completion = .{ .certificate_digest = raw[96..128].*, .commit_version = std.mem.readInt(u64, raw[128..136], .little) };
-    }
+        const effects = try scratch.alloc(?pages.CompletionEffect, request.completion_roots.len);
+        for (effects, 0..) |*out, i| {
+            const field = raw[136 + i * effect_bytes ..][0..effect_bytes];
+            out.* = if (std.mem.allEqual(u8, field, 0)) null else .{
+                .sequence = std.mem.readInt(u64, field[0..8], .little),
+                .frame_digest = field[8..40].*,
+            };
+        }
+        page.completion_effects = effects;
+    } else if (!std.mem.allEqual(u8, raw[96..prefix], 0)) return error.HistoryCorrupt;
     if (raw[4] == 1) {
         const payload = raw[prefix..];
         if (payload.len < 112) return error.HistoryCorrupt;
@@ -184,6 +211,21 @@ fn completionRoundTrip() !void {
     try std.testing.expectError(error.HistoryCorrupt, encode(a, page, legacy));
     raw[prefix_bytes] ^= 1;
     try std.testing.expectError(error.HistoryCorrupt, decode(a, raw, request));
+
+    var projection = request;
+    projection.completion_roots = &.{ @splat(1), @splat(2), @splat(3) };
+    var projected = page;
+    projected.completion_effects = &.{ .{ .sequence = 5, .frame_digest = @splat(9) }, null, .{ .sequence = 11, .frame_digest = @splat(10) } };
+    const projected_raw = try encode(a, projected, projection);
+    defer a.free(projected_raw);
+    var decoded_projection = try decode(a, projected_raw, projection);
+    defer decoded_projection.deinit();
+    try std.testing.expectEqualDeep(projected.completion_effects, decoded_projection.completion_effects);
+    try std.testing.expectError(error.HistoryCorrupt, decode(a, projected_raw, request));
+    projection.completion_roots = &.{ @splat(1), @splat(2), @splat(4) };
+    try std.testing.expectError(error.HistoryCorrupt, decode(a, projected_raw, projection));
+    projected.completion_effects = &.{ null, null, null };
+    try std.testing.expectError(error.HistoryCorrupt, encode(a, projected, projection));
 }
 
 pub const test_support = if (@import("builtin").is_test) struct {

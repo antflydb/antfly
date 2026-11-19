@@ -3081,7 +3081,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(uri);
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
-        if (body.len > contract.max_request_bytes) return error.InvalidHistoryPageRequest;
+        if (body.len > (if (bootstrap) contract.max_bootstrap_request_bytes else contract.max_request_bytes)) return error.InvalidHistoryPageRequest;
         const encoded_fence = try std.json.Stringify.valueAlloc(self.alloc, fence, .{});
         defer self.alloc.free(encoded_fence);
         if (encoded_fence.len > 16384) return error.InvalidCatalogRouteFence;

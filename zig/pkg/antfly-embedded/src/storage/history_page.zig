@@ -30,6 +30,8 @@ pub const Position = struct {
     sequence: u64 = 0,
     event: u32 = 0,
 };
+pub const max_projection_roots = history.max_completion_projection_roots;
+pub const CompletionEffect = history.CompletionEffect;
 pub const Request = struct {
     reference: control.Reference,
     after: Position,
@@ -40,6 +42,14 @@ pub const Request = struct {
     /// larger budget; it is never allocated before this limit is checked.
     max_bytes: u32 = 1024 * 1024,
     include_completion: bool = false,
+    completion_roots: []const frame.Namespace = &.{},
+
+    pub fn validateCompletionRoots(self: Request) !void {
+        if (self.completion_roots.len > max_projection_roots or (self.completion_roots.len != 0 and !self.include_completion)) return error.InvalidHistoryAdmission;
+        for (self.completion_roots, 0..) |root, i| {
+            if (std.mem.allEqual(u8, &root, 0) or (i != 0 and std.mem.order(u8, &self.completion_roots[i - 1], &root) != .lt)) return error.InvalidHistoryAdmission;
+        }
+    }
 
     pub fn jsonStringify(self: Request, jw: anytype) !void {
         try jw.beginObject();
@@ -51,6 +61,10 @@ pub const Request = struct {
             try jw.objectField("include_completion");
             try jw.write(true);
         }
+        if (self.completion_roots.len != 0) {
+            try jw.objectField("completion_roots");
+            try jw.write(self.completion_roots);
+        }
         try jw.endObject();
     }
 };
@@ -58,6 +72,7 @@ pub const Page = struct {
     arena: std.heap.ArenaAllocator,
     header: ?frame.Header = null,
     completion: ?history.FrameCompletion = null,
+    completion_effects: []const ?history.CompletionEffect = &.{},
     events: []const frame.Event = &.{},
     first_ordinal: u32 = 0,
     frame_events: u32 = 0,
@@ -143,6 +158,7 @@ pub fn read(a: std.mem.Allocator, txn: anytype, request: Request) !Page {
 }
 
 pub fn readWithCompletion(a: std.mem.Allocator, txn: anytype, request: Request, root_generation: ?u64) !Page {
+    try request.validateCompletionRoots();
     if (request.include_completion and root_generation == null) return error.ChangefeedCapabilityUnsupported;
     if (request.now_seconds == 0 or request.max_events == 0 or request.max_events > 1024 or request.max_bytes == 0 or request.max_bytes > frame.max_bytes) return error.InvalidHistoryAdmission;
     const consumer = try control.inspect(txn, request.reference);
@@ -164,8 +180,12 @@ pub fn readWithCompletion(a: std.mem.Allocator, txn: anytype, request: Request, 
     defer chunks.deinit();
     var reader: frame.Reader = .{ .descriptor = descriptor, .source = chunks.source() };
     const header = try reader.seek(scratch, request.after.event);
+    const effects: []?history.CompletionEffect = if (request.include_completion and header.transaction_scope == .coordinated)
+        try scratch.alloc(?history.CompletionEffect, request.completion_roots.len)
+    else
+        &.{};
     const completion = if (request.include_completion and header.transaction_scope == .coordinated)
-        try history.readFrameCompletion(a, txn, root_generation.?, header, descriptor)
+        try history.readProjectedFrameCompletion(a, txn, root_generation.?, header, descriptor, if (effects.len == 0) null else .{ .roots = request.completion_roots, .effects = effects })
     else
         null;
     const capacity = @min(request.max_events, descriptor.events - request.after.event);
@@ -185,5 +205,5 @@ pub fn readWithCompletion(a: std.mem.Allocator, txn: anytype, request: Request, 
     }
     const complete = request.after.event + count == descriptor.events;
     const next: Position = if (complete) .{ .sequence = descriptor.sequence } else .{ .sequence = request.after.sequence, .event = request.after.event + count };
-    return .{ .arena = arena, .header = header, .completion = completion, .events = events[0..count], .first_ordinal = request.after.event, .frame_events = descriptor.events, .next = next, .observed_latest = native.latest, .caught_up = complete and descriptor.sequence == native.latest };
+    return .{ .arena = arena, .header = header, .completion = completion, .completion_effects = if (completion != null) effects else &.{}, .events = events[0..count], .first_ordinal = request.after.event, .frame_events = descriptor.events, .next = next, .observed_latest = native.latest, .caught_up = complete and descriptor.sequence == native.latest };
 }

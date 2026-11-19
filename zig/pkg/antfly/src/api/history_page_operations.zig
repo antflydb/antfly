@@ -22,12 +22,14 @@ const operation = local.api_operation;
 const metadata = @import("../metadata/api.zig");
 pub const pages = source.history_page;
 pub const wire = source.history_page_wire;
-pub const max_request_bytes = 4096;
+pub const max_request_bytes = wire.max_request_bytes;
+pub const max_bootstrap_request_bytes = 4096;
 pub const Request = struct {
     version: u8,
     request: pages.Request,
     pub fn validate(self: Request, namespace: [24]u8) !void {
         const value = self.request;
+        value.validateCompletionRoots() catch return error.InvalidHistoryPageRequest;
         if (self.version != 1 or std.mem.allEqual(u8, &namespace, 0) or !std.mem.eql(u8, &namespace, &value.reference.namespace) or
             value.reference.epoch == 0 or value.reference.grant == 0 or value.now_seconds == 0 or
             value.max_events == 0 or value.max_events > 1024 or value.max_bytes == 0 or value.max_bytes > pages.max_source_bytes) return error.InvalidHistoryPageRequest;
@@ -92,16 +94,16 @@ fn PagePort(comptime Input: type, comptime Page: type) type {
     };
 }
 
+/// The request may borrow allocations from the caller-owned arena.
 pub fn decode(a: std.mem.Allocator, body: []const u8, namespace: [24]u8) !Request {
     return decodePage(Request, a, body, namespace);
 }
 
 fn decodePage(comptime Input: type, a: std.mem.Allocator, body: []const u8, namespace: [24]u8) !Input {
-    if (body.len > max_request_bytes) return error.InvalidHistoryPageRequest;
-    var parsed = std.json.parseFromSlice(Input, a, body, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidHistoryPageRequest;
-    defer parsed.deinit();
-    try parsed.value.validate(namespace);
-    return parsed.value;
+    if (body.len > (if (Input == Request) max_request_bytes else max_bootstrap_request_bytes)) return error.InvalidHistoryPageRequest;
+    const parsed = std.json.parseFromSliceLeaky(Input, a, body, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidHistoryPageRequest;
+    try parsed.validate(namespace);
+    return parsed;
 }
 
 /// The caller owns returned HPG1 bytes. No result escapes after cancellation,
@@ -125,7 +127,9 @@ fn executePage(comptime Input: type, comptime Codec: type, port: anytype, a: std
     std.mem.writeInt(u64, namespace[0..8], fence.route.identity_namespace.table_id, .big);
     std.mem.writeInt(u64, namespace[8..16], fence.route.identity_namespace.shard_id, .big);
     std.mem.writeInt(u64, namespace[16..24], fence.route.identity_namespace.range_id, .big);
-    const input = try decodePage(Input, a, body, namespace);
+    var request_arena = std.heap.ArenaAllocator.init(a);
+    defer request_arena.deinit();
+    const input = try decodePage(Input, request_arena.allocator(), body, namespace);
     const target = port orelse return error.ChangefeedCapabilityUnsupported;
     var page = try target.read(a, fence, table, input, context);
     defer page.deinit();
@@ -172,6 +176,16 @@ test "history page ingress rejects scope mismatches forged pages and late cancel
     var page = try wire.decode(a, encoded, input.request);
     defer page.deinit();
     try std.testing.expect(page.caught_up);
+    var projected = input;
+    projected.request.include_completion = true;
+    projected.request.completion_roots = &.{ namespace, @splat(8) };
+    const projected_body = try std.json.Stringify.valueAlloc(a, projected, .{});
+    defer a.free(projected_body);
+    const projected_reply = try execute(port, a, 17, "docs", projected_body, context);
+    defer a.free(projected_reply);
+    var projected_page = try wire.decode(a, projected_reply, projected.request);
+    defer projected_page.deinit();
+    try std.testing.expect(projected_page.caught_up);
     fake.forged = true;
     try std.testing.expectError(error.HistoryCorrupt, execute(port, a, 17, "docs", body, context));
     fake.forged = false;
@@ -189,9 +203,11 @@ test "history page ingress rejects scope mismatches forged pages and late cancel
     try std.testing.expectEqual(calls, fake.calls);
     const duplicate = try std.fmt.allocPrint(a, "{s},\"version\":1}}", .{body[0 .. body.len - 1]});
     defer a.free(duplicate);
-    try std.testing.expectError(error.InvalidHistoryPageRequest, decode(a, duplicate, namespace));
+    var request_arena = std.heap.ArenaAllocator.init(a);
+    defer request_arena.deinit();
+    try std.testing.expectError(error.InvalidHistoryPageRequest, decode(request_arena.allocator(), duplicate, namespace));
     const oversized: [max_request_bytes + 1]u8 = @splat(' ');
-    try std.testing.expectError(error.InvalidHistoryPageRequest, decode(a, &oversized, namespace));
+    try std.testing.expectError(error.InvalidHistoryPageRequest, decode(request_arena.allocator(), &oversized, namespace));
     try std.testing.expectEqual(@as(u16, 409), ErrorResponse.fromError(error.TopologyChanged).status());
     try std.testing.expectEqual(.resynchronization_required, ErrorResponse.fromError(error.HistoryConsumerConflict).code);
     try std.testing.expectEqual(.page_budget_exceeded, ErrorResponse.fromError(error.HistoryTooLarge).code);
