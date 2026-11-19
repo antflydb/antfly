@@ -1561,6 +1561,16 @@ pub const Context = struct {
             if (literal.parameter == 0) return error.InvalidSqlParameters;
             return describe.coerceDatum(self.arena, try self.parameterDatum(literal.parameter - 1), column.type, column.element_type);
         }
+        if (column.type == .number and column.element_type == .numeric) {
+            const raw: Json = switch (literal) {
+                .null => .null,
+                .integer => |integer| .{ .integer = integer },
+                .numeric => |text| .{ .number_string = text },
+                .string => |text| .{ .string = text },
+                else => return error.SqlTypeMismatch,
+            };
+            return describe.coerceDatum(self.arena, Datum.fromJson(raw), column.type, column.element_type);
+        }
         const result = try self.value(literal, column);
         return .{ .value = result, .sql_null = result == .null and !(column.type == .json and literal == .string) };
     }
@@ -2116,6 +2126,32 @@ test "SQL NUMERIC executes exact scalar projections through public result metada
         try std.testing.expectEqual(ast.ColumnType.number, column.type);
         try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, column.element_type.?);
     }
+}
+
+test "SQL NUMERIC insert literals preserve decimals at the mutation boundary" {
+    const Fixture = struct {
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .number, .element_type = .numeric }} };
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedScan;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+            try std.testing.expectEqual(@as(usize, 2), mutations.len);
+            try std.testing.expectEqualStrings("12345678901234567890.12345678", mutations[0].row.?.object.get("n").?.string);
+            try std.testing.expectEqualStrings("3", mutations[1].row.?.object.get("n").?.string);
+            return .committed;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var context: u8 = 0;
+    const backend: catalog.Backend = .{ .ptr = &context, .vtable = &.{ .resolve = Fixture.resolve, .scan = Fixture.scan, .mutate = Fixture.mutate, .checkpoint = Fixture.checkpoint } };
+    var compiled = try compiler.compile(alloc, "INSERT INTO docs (_id, n) VALUES ('a', 12345678901234567890.12345678), ('b', 3)", .{});
+    defer compiled.deinit();
+    var result = try execute(alloc, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
 }
 
 test "SQL NUMERIC predicates preserve inferred and explicit parameters for reads and mutations" {
