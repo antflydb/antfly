@@ -238,6 +238,123 @@ pub fn inspect(txn: anytype, ref: Reference) !history.Consumer {
     var native = (try history.load(txn)) orelse return error.HistoryCorrupt;
     return (try native.findConsumer(ref.consumer, ref.epoch)).*;
 }
+const bootstrap_prefix = "\x00\x00__committed_history__:bootstrap:";
+const bootstrap_header_size = 36;
+pub const max_bootstrap_bytes = 8 * 1024 * 1024;
+pub const max_bootstrap_examined_keys = 65536;
+
+pub const BootstrapPin = struct {
+    consumer: history.Consumer,
+    digest: Digest,
+    expires_at_seconds: u64,
+};
+
+fn bootstrapKey(id: Id) [bootstrap_prefix.len + @sizeOf(Id)]u8 {
+    return bootstrap_prefix.* ++ id;
+}
+
+fn readBootstrapBlob(txn: anytype, id: Id) !?[]const u8 {
+    const raw = txn.get(&bootstrapKey(id)) catch |err| if (err == error.NotFound) return null else return err;
+    if (raw.len < bootstrap_header_size or raw.len > max_bootstrap_bytes or !std.mem.eql(u8, raw[0..4], "HBS1"))
+        return error.HistoryCorrupt;
+    return raw;
+}
+
+fn bootstrapPin(namespace: Namespace, consumer: history.Consumer, raw: []const u8) !BootstrapPin {
+    const start = std.mem.readInt(u64, raw[4..12], .little);
+    const epoch = std.mem.readInt(u64, raw[12..20], .little);
+    const expires = std.mem.readInt(u64, raw[20..28], .little);
+    if (start != consumer.start or epoch != consumer.epoch or expires == 0 or expires > consumer.expires_at_seconds)
+        return error.HistoryCorrupt;
+    var proof = std.crypto.hash.sha2.Sha256.init(.{});
+    proof.update("antfly:root-bootstrap-pin:v1");
+    proof.update(&namespace);
+    proof.update(&consumer.id);
+    proof.update(raw);
+    return .{ .consumer = consumer, .digest = proof.finalResult(), .expires_at_seconds = expires };
+}
+
+/// Materialize an immutable bounded bootstrap image and enroll its continuation
+/// in the same root transaction. The caller aborts the transaction on any error.
+/// This stores physical historical rows and schema for an authorized projection
+/// to decode, and never exposes auxiliary row keys.
+pub fn captureBootstrap(a: std.mem.Allocator, txn: anytype, grant: Grant, expires_at_seconds: u64) !BootstrapPin {
+    try grant.validate();
+    if (expires_at_seconds == 0 or expires_at_seconds > grant.expires_at_seconds) return error.InvalidHistoryAdmission;
+    var state = try stateFor(txn, grant.namespace, grant.authority);
+    if (try readBootstrapBlob(txn, grant.consumer)) |_| {
+        if (state.find(grant.consumer) == null) return error.HistoryCorrupt;
+        const consumer = try enroll(txn, grant);
+        const pin = try bootstrapPin(grant.namespace, consumer, (try readBootstrapBlob(txn, grant.consumer)) orelse return error.HistoryCorrupt);
+        if (pin.expires_at_seconds != expires_at_seconds) return error.HistoryConsumerConflict;
+        return pin;
+    }
+    if (state.find(grant.consumer) != null) return error.HistoryConsumerConflict;
+    const frontier = try history.requireBootstrapCut(txn, grant.namespace);
+    var image: std.ArrayList(u8) = .empty;
+    defer image.deinit(a);
+    try image.appendNTimes(a, 0, bootstrap_header_size);
+    const schema = txn.get(keys.public_schema_json_key) catch |err| switch (err) {
+        error.NotFound => "",
+        else => return err,
+    };
+    if (schema.len > history.frame.max_schema_bytes) return error.HistoryTooLarge;
+    try image.appendSlice(a, schema);
+    const schema_size: u32 = @intCast(schema.len);
+    var rows: u32 = 0;
+    {
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(&.{keys.user_namespace});
+        var examined: usize = 0;
+        while (entry) |item| : (entry = try cursor.next()) {
+            if (item.key.len == 0 or item.key[0] != keys.user_namespace) break;
+            if (examined == max_bootstrap_examined_keys) return error.HistoryTooLarge;
+            examined += 1;
+            if (!keys.isStoredDocumentRowKey(item.key)) continue;
+            if (8 +| item.key.len +| item.value.len > max_bootstrap_bytes - image.items.len) return error.HistoryTooLarge;
+            var lengths: [8]u8 = undefined;
+            std.mem.writeInt(u32, lengths[0..4], @intCast(item.key.len), .little);
+            std.mem.writeInt(u32, lengths[4..8], @intCast(item.value.len), .little);
+            try image.appendSlice(a, &lengths);
+            try image.appendSlice(a, item.key);
+            try image.appendSlice(a, item.value);
+            rows += 1;
+        }
+    }
+    const consumer = try enroll(txn, grant);
+    if (consumer.start != frontier) return error.HistoryCorrupt;
+    @memcpy(image.items[0..4], "HBS1");
+    std.mem.writeInt(u64, image.items[4..12], frontier, .little);
+    std.mem.writeInt(u64, image.items[12..20], consumer.epoch, .little);
+    std.mem.writeInt(u64, image.items[20..28], expires_at_seconds, .little);
+    std.mem.writeInt(u32, image.items[28..32], schema_size, .little);
+    std.mem.writeInt(u32, image.items[32..36], rows, .little);
+    const pin = try bootstrapPin(grant.namespace, consumer, image.items);
+    try txn.put(&bootstrapKey(grant.consumer), image.items);
+    return pin;
+}
+
+/// Borrow an immutable physical snapshot from the authorized root transaction.
+pub fn readBootstrap(txn: anytype, ref: Reference, digest: Digest, now: u64) ![]const u8 {
+    const consumer = try inspect(txn, ref);
+    const raw = (try readBootstrapBlob(txn, ref.consumer)) orelse return error.HistoryResynchronizationRequired;
+    const pin = try bootstrapPin(ref.namespace, consumer, raw);
+    if (!same(pin.digest, digest) or now == 0 or now >= pin.expires_at_seconds)
+        return error.HistoryResynchronizationRequired;
+    return raw;
+}
+
+/// Release only the image under an already authorized live native grant.
+/// The streaming continuation and its acknowledgment remain intact.
+pub fn releaseBootstrap(txn: anytype, ref: Reference, digest: Digest) !void {
+    const consumer = try inspect(txn, ref);
+    const raw = (try readBootstrapBlob(txn, ref.consumer)) orelse return;
+    const pin = try bootstrapPin(ref.namespace, consumer, raw);
+    if (!same(pin.digest, digest)) return error.HistoryConsumerConflict;
+    try txn.delete(&bootstrapKey(ref.consumer));
+}
+
 pub fn acknowledge(txn: anytype, ref: Reference, previous: u64, next: u64) !void {
     const consumer = try inspect(txn, ref);
     if (next < previous) return error.HistoryCheckpointConflict;
@@ -270,6 +387,7 @@ pub fn retire(txn: anytype, closed: Retirement) !void {
     if (state.find(closed.consumer)) |lease| {
         if (!same(lease.definition, closed.definition) or lease.grant > closed.grant) return error.HistoryConsumerConflict;
         try history.release(txn, closed.namespace, lease.id, lease.epoch);
+        if (try readBootstrapBlob(txn, lease.id)) |_| try txn.delete(&bootstrapKey(lease.id));
         lease.* = .{};
     } else if (try history.load(txn)) |native| {
         for (native.consumers) |consumer| if (consumer.epoch != 0 and same(consumer.id, closed.consumer)) return error.HistoryConsumerConflict;

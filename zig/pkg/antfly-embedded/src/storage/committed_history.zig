@@ -242,6 +242,21 @@ fn requireNamespace(txn: anytype, state: State, namespace: frame.Namespace) !voi
     const owner = try authority.load(txn) orelse return error.HistoryAuthorityRequired;
     if (!std.mem.eql(u8, &owner.namespace, &namespace)) return error.HistoryResynchronizationRequired;
 }
+/// Read while holding the same ordered write transaction that installs the
+/// bootstrap pin. A partially resolved coordinated commit can already have
+/// changed rows while its completion credit still owns the publication debt.
+pub fn requireBootstrapCut(txn: anytype, namespace: frame.Namespace) !u64 {
+    const state = (try load(txn)) orelse State{ .namespace = namespace };
+    try requireNamespace(txn, state, namespace);
+    if (state.reserved_bytes != 0) return error.HistoryPreparedTransactionsPresent;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    if (try cursor.seekAtOrAfter(intents_prefix)) |entry| {
+        if (std.mem.startsWith(u8, entry.key, intents_prefix)) return error.HistoryPreparedTransactionsPresent;
+    }
+    return state.latest;
+}
+
 pub fn admit(txn: anytype, namespace: frame.Namespace, id: [16]u8, limit: u64, expires: u64, policy_revision: u64) !Consumer {
     if (std.mem.allEqual(u8, &id, 0) or limit < transaction_overhead + frame.chunk_bytes) return error.InvalidHistoryAdmission;
     var state = (try load(txn)) orelse State{ .namespace = namespace, .limit = limit };

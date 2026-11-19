@@ -45142,6 +45142,66 @@ fn implementationTests() type {
             try std.testing.expectError(error.OnlineSourceScopeChanged, raft_db.nativeHistoryConsumerControl(.{ .enroll = grant }));
         }
 
+        test "native history consumer control persists a bootstrap image with its continuation" {
+            const a = std.testing.allocator;
+            const history = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-bootstrap-pin", .{tmp.sub_path});
+            defer a.free(path);
+            const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .online_source_authority = .native };
+            var db = try db_mod.DB.open(a, path, options);
+            var open = true;
+            defer if (open) db.close();
+            const namespace = try db.nativeSourceAdmissionNamespace();
+            const grant: history.Grant = .{ .namespace = namespace, .authority = @splat(9), .sequence = 1, .consumer = @splat(1), .definition = @splat(2), .expires_at_seconds = 1000, .policy_revision = 1 };
+            try db.batch(.{ .writes = &.{.{ .key = "one", .value = "{\"value\":\"before-bootstrap\"}" }} });
+            {
+                var blocked = try db.core.store.beginWriteTxn();
+                defer blocked.abort();
+                try blocked.put("\x00\x00__txn_intents__:bootstrap-guard", "prepared");
+                try std.testing.expectError(error.HistoryPreparedTransactionsPresent, history.captureBootstrap(a, &blocked, grant, 500));
+            }
+            const pin = captured: {
+                var txn = try db.core.store.beginWriteTxn();
+                errdefer txn.abort();
+                const pin = try history.captureBootstrap(a, &txn, grant, 500);
+                try txn.commit();
+                break :captured pin;
+            };
+            const ref: history.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = pin.consumer.epoch, .grant = grant.sequence, .definition = grant.definition };
+            try db.batch(.{ .writes = &.{.{ .key = "one", .value = "{\"value\":\"after-bootstrap\"}" }} });
+            db.close();
+            open = false;
+            db = try db_mod.DB.open(a, path, options);
+            open = true;
+            {
+                var txn = try db.core.store.beginWriteTxn();
+                defer txn.abort();
+                const retry = try history.captureBootstrap(a, &txn, grant, 500);
+                try std.testing.expectEqualDeep(pin, retry);
+                const image = try history.readBootstrap(&txn, ref, pin.digest, 101);
+                try std.testing.expect(std.mem.indexOf(u8, image, "before-bootstrap") != null);
+                try std.testing.expect(std.mem.indexOf(u8, image, "after-bootstrap") == null);
+                try std.testing.expectError(error.HistoryResynchronizationRequired, history.readBootstrap(&txn, ref, pin.digest, 500));
+                var wrong_digest = pin.digest;
+                wrong_digest[0] ^= 1;
+                try std.testing.expectError(error.HistoryConsumerConflict, history.releaseBootstrap(&txn, ref, wrong_digest));
+                try history.releaseBootstrap(&txn, ref, pin.digest);
+                try history.releaseBootstrap(&txn, ref, pin.digest);
+                try std.testing.expectError(error.HistoryResynchronizationRequired, history.readBootstrap(&txn, ref, pin.digest, 101));
+                try std.testing.expectEqual(pin.consumer.start, (try history.inspect(&txn, ref)).start);
+            }
+            var page = try db.nativeHistoryPage(a, .{ .reference = ref, .after = .{ .sequence = pin.consumer.start }, .now_seconds = 101 });
+            defer page.deinit();
+            try std.testing.expectEqual(pin.consumer.start + 1, page.header.?.sequence);
+            try std.testing.expect(std.mem.indexOf(u8, page.events[0].after.?, "after-bootstrap") != null);
+            _ = try db.nativeHistoryConsumerControl(.{ .retire = .{ .namespace = namespace, .authority = grant.authority, .sequence = 2, .consumer = grant.consumer, .definition = grant.definition, .grant = 1 } });
+            var txn = try db.core.store.beginReadTxn();
+            defer txn.abort();
+            try std.testing.expectError(error.HistoryResynchronizationRequired, history.readBootstrap(&txn, ref, pin.digest, 101));
+        }
+
         test "native history consumer control document provider preserves authorized historical replay" {
             try @import("../metadata/native_changefeed_delivery_test.zig").run();
         }
