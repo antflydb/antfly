@@ -156087,8 +156087,9 @@ test "db ordered DAG source fence persists with the apply receipt" {
         try std.testing.expectEqualDeep(fence, (try dag.SourceFence.read(&read)).?);
     }
     request.dag_source_fence.?.action = .scan;
-    request.dag_source_fence.?.scan = .{ .domain = domain, .owner_epoch = 1 };
+    request.dag_source_fence.?.scan = .{ .domain = domain, .owner_epoch = 1, .root_count = 1 };
     try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 2 }, true);
+    request.dag_source_fence.?.scan.?.root_count = null;
     const owner: dag.Digest = @splat(6);
     var source_result = (try db.lookup(a, "", .{ .relational_topology_json = source_query })).?;
     defer source_result.deinit(a);

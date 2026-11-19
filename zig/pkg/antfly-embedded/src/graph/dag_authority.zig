@@ -122,6 +122,7 @@ pub const SourceFenceCommand = struct {
         /// A takeover changes the epoch of an existing pinned scan. It cannot
         /// initialize a scan or change its cursor.
         previous_owner_epoch: ?u64 = null,
+        root_count: ?u32 = null,
         /// Without a previous owner or page, pin a new scan.
         page: ?Page = null,
     };
@@ -153,6 +154,8 @@ pub const SourceFenceCommand = struct {
         }
         if (scan.page) |page| {
             try ScanPosition.requireSuccessor(page.after, page.next);
+            const count = (try Contributions.activationRootCount(txn, scan.domain)) orelse return error.GraphConstraintNotReady;
+            if ((try ScanPosition.decode(page.next)).root >= count) return error.InvalidDagMutation;
             const ScanClock = struct {
                 fn now(_: *anyopaque) u64 {
                     // Raft apply must produce the same result on every replica.
@@ -164,10 +167,13 @@ pub const SourceFenceCommand = struct {
             try Contributions.seedActivationPage(alloc, txn, scan.domain, scan.owner_epoch, self.fence.snapshot, page.after, page.next, page.replacements, &budget, &witness);
             return;
         }
+        const count = scan.root_count orelse return error.InvalidDagMutation;
+        if (count == 0) return error.InvalidDagMutation;
         Storage.create(txn, scan.domain, scan.owner_epoch) catch |err| {
             if (err != error.GraphConstraintAlreadyExists) return err;
         };
         try Contributions.beginActivation(txn, scan.domain, scan.owner_epoch, self.fence.snapshot);
+        try Contributions.pinActivationRootCount(txn, scan.domain, count);
     }
 
     const completed_prefix = "\x00\x00__metadata__:dag-source-fence-completed:";
@@ -194,6 +200,9 @@ pub const SourceFenceCommand = struct {
         if ((command.action == .scan) != (command.scan != null)) return error.InvalidBatchRequest;
         if (command.scan) |scan| {
             if (scan.owner_epoch == 0) return error.InvalidBatchRequest;
+            const initializing = scan.page == null and scan.previous_owner_epoch == null;
+            if (initializing != (scan.root_count != null) or scan.root_count == 0)
+                return error.InvalidBatchRequest;
             if (scan.previous_owner_epoch) |previous| {
                 if (previous == 0 or previous >= scan.owner_epoch or scan.page != null)
                     return error.InvalidBatchRequest;
@@ -1163,6 +1172,30 @@ pub const Contributions = struct {
         try txn.put(&activationKey(id), &snapshot);
     }
 
+    const activation_root_count_prefix = "\x00\x00__metadata__:dag-activation-root-count:";
+
+    fn activationRootCount(txn: anytype, id: Digest) !?u32 {
+        const count_key = activation_root_count_prefix.* ++ id;
+        const bytes = txn.get(&count_key) catch |err| {
+            if (err == error.NotFound) return null;
+            return err;
+        };
+        if (bytes.len != 4) return error.InvalidDagAuthority;
+        const count = std.mem.readInt(u32, bytes[0..4], .big);
+        if (count == 0) return error.InvalidDagAuthority;
+        return count;
+    }
+
+    fn pinActivationRootCount(txn: anytype, id: Digest, count: u32) !void {
+        if (try activationRootCount(txn, id)) |current| {
+            if (current != count) return error.GraphConstraintRevisionChanged;
+            return;
+        }
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, count, .big);
+        try txn.put(&(activation_root_count_prefix.* ++ id), &bytes);
+    }
+
     pub fn activationSnapshot(txn: anytype, id: Digest, epoch: u64) !?Digest {
         _ = try activationState(txn, id, epoch);
         const progress = (try readActivationProgress(txn, id)) orelse return null;
@@ -1326,6 +1359,11 @@ pub const Contributions = struct {
         if (state.phase != .validating or state.revision != 0) return error.GraphConstraintNotReady;
         try SourceFence.requireSnapshot(txn, snapshot);
         try requireActivationCursor(txn, id, snapshot, if (after.len == 0) null else after);
+        if (try activationRootCount(txn, id)) |count| {
+            const position = ScanPosition.decode(after) catch return error.GraphConstraintNotReady;
+            if (position.after != null or position.root != count - 1) return error.GraphConstraintNotReady;
+            try txn.delete(&(activation_root_count_prefix.* ++ id));
+        }
         try saveActivationCertificate(txn, id, proof);
         try txn.delete(&activationKey(id));
         state.phase = .active;
@@ -1858,6 +1896,28 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, empty_id, 2));
     try Contributions.finishActivation(&txn, empty_id, 2, versions, "");
     try Contributions.finishActivation(&txn, empty_id, 2, versions, "");
+    const ordered_id: Digest = @splat(4);
+    var ordered: SourceFenceCommand = .{
+        .namespace = @splat(0),
+        .action = .scan,
+        .fence = fence,
+        .scan = .{ .domain = ordered_id, .owner_epoch = 1, .root_count = 2 },
+    };
+    try ordered.stageScan(alloc, &txn);
+    ordered.scan.?.root_count = 3;
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, ordered.stageScan(alloc, &txn));
+    ordered.scan.?.root_count = null;
+    const first_end = "\x00\x00\x00\x00\x01";
+    const second_end = "\x00\x00\x00\x01\x01";
+    ordered.scan.?.page = .{ .next = first_end, .replacements = &.{} };
+    try ordered.stageScan(alloc, &txn);
+    try std.testing.expectError(error.GraphConstraintNotReady, Contributions.finishActivation(&txn, ordered_id, 1, versions, first_end));
+    ordered.scan.?.page = .{ .after = first_end, .next = second_end, .replacements = &.{} };
+    try ordered.stageScan(alloc, &txn);
+    ordered.scan.?.page = .{ .after = second_end, .next = "\x00\x00\x00\x02\x01", .replacements = &.{} };
+    try std.testing.expectError(error.InvalidDagMutation, ordered.stageScan(alloc, &txn));
+    try Contributions.finishActivation(&txn, ordered_id, 1, versions, second_end);
+    try Contributions.finishActivation(&txn, ordered_id, 1, versions, second_end);
     const release: SourceFenceCommand = .{ .namespace = @splat(0), .action = .release, .fence = fence };
     try release.stageRelease(&txn);
     const subsequent: SourceFence = .{ .activation = @splat(10), .snapshot = @splat(11) };
