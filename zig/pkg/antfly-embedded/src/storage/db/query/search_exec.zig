@@ -9668,7 +9668,7 @@ const IndexedPredicateEvaluator = struct {
             var pending = roaring.RoaringBitmap.init(self.alloc);
             defer pending.deinit();
             {
-                lease.entry.shared.lockDeletionShared();
+                try lease.entry.shared.lockDeletionSharedWithControl(self.control);
                 defer lease.entry.shared.unlockDeletionShared();
                 while (next) |doc| {
                     if (doc >= upper) break;
@@ -9677,18 +9677,26 @@ const IndexedPredicateEvaluator = struct {
                     next = candidates.next();
                     if (lease.entry.shared.deleted) |deleted| if (deleted.contains(local_doc)) continue;
                     const ordinal = frontier_docs.ordinals.get(doc) orelse return error.InvalidData;
-                    if (!scope.contains(ordinal)) continue;
-                    if (probe) |active| {
-                        if (try active.contains(local_doc)) try rows.add(ordinal);
-                    } else try pending.add(local_doc);
+                    if (scope.contains(ordinal)) try pending.add(local_doc);
                 }
             }
             if (pending.cardinality() != 0) {
-                var matched = try filter.executeWithinScope(self.alloc, lease.entry, offset, &pending, self.control);
+                var matched = if (probe) |active| result: {
+                    var rows_in_segment = roaring.RoaringBitmap.init(self.alloc);
+                    errdefer rows_in_segment.deinit();
+                    var docs = pending.iterator();
+                    while (docs.next()) |doc| {
+                        try self.control.check();
+                        if (try active.contains(doc)) try rows_in_segment.add(doc);
+                    }
+                    break :result rows_in_segment;
+                } else try filter.executeWithinScope(self.alloc, lease.entry, offset, &pending, self.control);
                 defer matched.deinit();
-                lease.entry.shared.lockDeletionShared();
-                defer lease.entry.shared.unlockDeletionShared();
-                if (lease.entry.shared.deleted) |deleted| matched.andNotWith(&deleted);
+                {
+                    try lease.entry.shared.lockDeletionSharedWithControl(self.control);
+                    defer lease.entry.shared.unlockDeletionShared();
+                    if (lease.entry.shared.deleted) |deleted| matched.andNotWith(&deleted);
+                }
                 var docs = matched.iterator();
                 while (docs.next()) |doc| {
                     try self.control.check();
@@ -9742,7 +9750,7 @@ const IndexedPredicateEvaluator = struct {
         if (counts.capacity() <= @as(u64, counts.count()) * 2 + 16) return;
         var compact: std.AutoHashMapUnmanaged(u32, u32) = .empty;
         errdefer compact.deinit(self.alloc);
-        try compact.ensureTotalCapacity(self.alloc, counts.count());
+        compact.ensureTotalCapacity(self.alloc, counts.count()) catch return;
         var entries = counts.iterator();
         while (entries.next()) |entry| {
             try self.control.check();
@@ -10170,7 +10178,7 @@ pub fn graphIndexedPredicateAlloc(
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, json, .{});
+    const parsed = try graph_exec.parsePatternJsonLeaky(scratch, json);
     if (patternFilterValueHasRole(parsed)) return error.UnsupportedQueryRequest;
     const search_query = try patternFilterValueToSearchQuery(scratch, parsed, entry.text_analysis, entry.runtime_schema);
     var probe_input: IndexedPredicateEvaluator.FrontierProbeInput = .{};
@@ -10249,9 +10257,9 @@ fn collectStructuredFilterResolvedDocSetAlloc(
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
-    const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch return null;
-    if (patternFilterValueHasRole(parsed.value)) return null;
-    const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
+    const parsed = graph_exec.parsePatternJsonLeaky(arena_alloc, filter_query_json) catch return null;
+    if (patternFilterValueHasRole(parsed)) return null;
+    const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
     if (try collectSearchQueryResolvedDocSetAlloc(
         alloc,
@@ -10263,7 +10271,7 @@ fn collectStructuredFilterResolvedDocSetAlloc(
         .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
         null,
     )) |native| return native;
-    if (!(try patternFilterContainsMatch(parsed.value, 0))) return null;
+    if (!(try patternFilterContainsMatch(parsed, 0))) return null;
     return collectMixedStructuredFilterAlloc(alloc, arena_alloc, req, executor, text_entry, search_query, filter_query_json) catch |err| switch (err) {
         error.UnsupportedQueryRequest => null,
         else => return err,
@@ -10280,11 +10288,11 @@ pub fn stripInjectedPolicyAlloc(alloc: Allocator, filter_json: []const u8, polic
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const scratch = arena.allocator();
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, filter_json, .{});
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, filter_json, .{ .parse_numbers = false });
     if (parsed != .object or parsed.object.count() != 1) return null;
     const conjuncts = parsed.object.get("conjuncts") orelse return null;
     if (conjuncts != .array or conjuncts.array.items.len != 2) return null;
-    const policy = try std.json.parseFromSliceLeaky(std.json.Value, scratch, policy_json, .{});
+    const policy = try std.json.parseFromSliceLeaky(std.json.Value, scratch, policy_json, .{ .parse_numbers = false });
     const expected = try std.json.Stringify.valueAlloc(scratch, policy, .{});
     const actual = try std.json.Stringify.valueAlloc(scratch, conjuncts.array.items[1], .{});
     if (!std.mem.eql(u8, actual, expected)) return null;
@@ -10330,7 +10338,7 @@ fn collectMixedStructuredFilterAlloc(
     else
         null;
     const user_query = if (original) |json|
-        if (json.len == 0) search_mod.SearchQuery{ .match_all = {} } else try patternFilterValueToSearchQuery(scratch, try std.json.parseFromSliceLeaky(std.json.Value, scratch, json, .{}), entry.text_analysis, entry.runtime_schema)
+        if (json.len == 0) search_mod.SearchQuery{ .match_all = {} } else try patternFilterValueToSearchQuery(scratch, try graph_exec.parsePatternJsonLeaky(scratch, json), entry.text_analysis, entry.runtime_schema)
     else
         query;
     // The cache key must bind the lowered tree as well as its source text.
@@ -10366,7 +10374,7 @@ fn collectMixedStructuredFilterAlloc(
     }
     try user_matcher.restrictThresholdCounts(&domain);
     if (req.authorization_filter_query_json.len != 0) {
-        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, req.authorization_filter_query_json, .{});
+        const parsed = try graph_exec.parsePatternJsonLeaky(scratch, req.authorization_filter_query_json);
         const auth = try patternFilterValueToSearchQuery(scratch, parsed, entry.text_analysis, entry.runtime_schema);
         var policy_matcher = matcher;
         policy_matcher.cache_prefix = try std.fmt.allocPrint(scratch, "authorization:{d}:{s}:{s}", .{ cache_prefix.len, cache_prefix, req.authorization_filter_query_json });
@@ -10558,9 +10566,9 @@ fn collectStructuredFilterTextDocNumsAlloc(
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
-    const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch return null;
-    if (patternFilterValueHasRole(parsed.value)) return null;
-    const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
+    const parsed = graph_exec.parsePatternJsonLeaky(arena_alloc, filter_query_json) catch return null;
+    if (patternFilterValueHasRole(parsed)) return null;
+    const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
     const snapshot = text_entry.persistent.acquireSnapshot();
     defer snapshot.release();
@@ -10655,9 +10663,9 @@ fn collectStructuredFilterDocIdsAlloc(
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
-    const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch return null;
-    if (patternFilterValueHasRole(parsed.value)) return null;
-    const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
+    const parsed = graph_exec.parsePatternJsonLeaky(arena_alloc, filter_query_json) catch return null;
+    if (patternFilterValueHasRole(parsed)) return null;
+    const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
     const snapshot = text_entry.persistent.acquireSnapshot();
     defer snapshot.release();
@@ -12313,8 +12321,8 @@ fn parseStandardRangeObject(
 
     return switch (mapping.field_type) {
         .numeric => numeric: {
-            const min = if (lower) |bound| typed_dv.exactNumericValueFromJson(bound.value) else null;
-            const max = if (upper) |bound| typed_dv.exactNumericValueFromJson(bound.value) else null;
+            const min = if (lower) |bound| graph_exec.exactStandardRangeBound(bound.value) else null;
+            const max = if (upper) |bound| graph_exec.exactStandardRangeBound(bound.value) else null;
             break :numeric .{ .numeric_range = .{
                 .field = field,
                 .exact_bounds = if ((lower == null or min != null) and (upper == null or max != null)) .{ .min = min, .max = max } else null,
@@ -13166,8 +13174,8 @@ const NativeSortPredicate = struct {
         const fields = try a.alloc(Field, req.order_by.len);
         @memset(fields, .{});
         var self: @This() = .{ .fields = fields, .order = req.order_by, .schema = schema };
-        const parsed = try std.json.parseFromSlice(std.json.Value, a, req.filter_query_json, .{});
-        const compiled = try graph_exec.compilePatternFilter(a, parsed.value);
+        const parsed = try graph_exec.parsePatternJsonLeaky(a, req.filter_query_json);
+        const compiled = try graph_exec.compilePatternFilter(a, parsed);
         try self.required(compiled, 0);
         for (self.fields) |field| if (field.lower != null or field.upper != null) return self;
         return null;
@@ -13188,7 +13196,11 @@ const NativeSortPredicate = struct {
     fn operand(mapping: runtime_schema_mod.FieldMapping, value: std.json.Value, range: bool) ?SortValue {
         if (value == .null) return null;
         return switch (mapping.field_type) {
-            .numeric => switch (value) {
+            .numeric => if (range) switch (graph_exec.exactStandardRangeBound(value) orelse return null) {
+                .i64_val => |v| .{ .integer = v },
+                .u64_val => |v| .{ .u64_value = v },
+                .f64_val => |v| .{ .number = v },
+            } else switch (value) {
                 .integer => |v| .{ .integer = v },
                 .float => |v| if (std.math.isFinite(v)) .{ .number = v } else null,
                 else => null,
@@ -39731,6 +39743,18 @@ test "optional numeric range covers unsigned values and uses identical stored se
     defer precise.deinit();
     try std.testing.expect(try precise.matchesStored(a, "wide", "{\"rank\":9223372036854775808}"));
     try std.testing.expect(!try precise.matchesStored(a, "lower", "{\"rank\":9223372036854775807}"));
+    const exact_decimal_json = "{\"range\":{\"rank\":{\"gte\":9007199254740992.5}}}";
+    const decimal_query = try graph_exec.parsePatternJsonLeaky(compile_arena.allocator(), exact_decimal_json);
+    const decimal_lowered = try patternFilterValueToSearchQuery(compile_arena.allocator(), decimal_query, .{}, schema);
+    try std.testing.expect(decimal_lowered.numeric_range.exact_bounds == null);
+    var exact_decimal = try graph_exec.PreparedPatternFilter.init(a, exact_decimal_json);
+    defer exact_decimal.deinit();
+    try std.testing.expect(!try exact_decimal.matchesStored(a, "lower", "{\"rank\":9007199254740992}"));
+    try std.testing.expect(try exact_decimal.matchesStored(a, "equal", "{\"rank\":9007199254740992.5}"));
+    try std.testing.expect(try exact_decimal.matchesStored(a, "higher", "{\"rank\":9007199254740993}"));
+    var above_zero = try graph_exec.PreparedPatternFilter.init(a, "{\"range\":{\"rank\":{\"gt\":0}}}");
+    defer above_zero.deinit();
+    try std.testing.expect(try above_zero.matchesStored(a, "tiny", "{\"rank\":1e-325}"));
     var fractional_json = try std.json.parseFromSlice(std.json.Value, a, "{\"range\":{\"rank\":{\"gt\":9.5}}}", .{});
     defer fractional_json.deinit();
     var fractional = try graph_exec.PreparedPatternFilter.initValue(a, fractional_json.value);

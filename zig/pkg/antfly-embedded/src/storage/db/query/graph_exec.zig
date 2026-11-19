@@ -2747,6 +2747,52 @@ fn resolveGraphSelectorScoped(alloc: Allocator, selector: graph_query_mod.NodeSe
     };
 }
 
+const PatternNumberContext = enum { predicate, boolean, literal };
+
+pub fn normalizePatternNumbers(value: *std.json.Value) !void {
+    try normalizePatternNumberTree(value, .predicate, 0);
+}
+
+fn normalizePatternNumberTree(value: *std.json.Value, context: PatternNumberContext, depth: usize) !void {
+    if (depth > 128) return error.InvalidArgument;
+    switch (value.*) {
+        .number_string => |raw| value.* = std.json.Value.parseFromNumberSlice(raw),
+        .array => |array| for (array.items) |*item| try normalizePatternNumberTree(item, context, depth + 1),
+        .object => |*object| {
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (context == .predicate and std.mem.eql(u8, key, "range")) continue;
+                const child: PatternNumberContext = if (context == .predicate and std.mem.eql(u8, key, "bool"))
+                    .boolean
+                else if ((context == .predicate and (std.mem.eql(u8, key, "conjuncts") or std.mem.eql(u8, key, "disjuncts"))) or
+                    (context == .boolean and (std.mem.eql(u8, key, "must") or std.mem.eql(u8, key, "should") or std.mem.eql(u8, key, "must_not") or std.mem.eql(u8, key, "filter"))))
+                    .predicate
+                else
+                    .literal;
+                try normalizePatternNumberTree(entry.value_ptr, child, depth + 1);
+            }
+        },
+        else => {},
+    }
+}
+
+pub fn parsePatternJsonLeaky(alloc: Allocator, json: []const u8) !std.json.Value {
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, alloc, json, .{ .parse_numbers = false, .allocate = .alloc_always });
+    try normalizePatternNumbers(&value);
+    return value;
+}
+
+pub fn exactStandardRangeBound(value: std.json.Value) ?@import("../../../section/typed_doc_values.zig").NumericValue {
+    const typed = @import("../../../section/typed_doc_values.zig");
+    if (typed.exactNumericValueFromJson(value)) |exact| return exact;
+    if (value != .number_string) return null;
+    const projected = typed.numericValueFromJson(value) orelse return null;
+    if (projected != .f64_val) return null;
+    const order = compareStoredRangeNumber(value, .{ .float = projected.f64_val }) catch return null;
+    return if (order == .eq) projected else null;
+}
+
 pub fn storedDocMatchesPatternFilter(alloc: Allocator, key: []const u8, stored: []const u8, filter_query_json: []const u8) !bool {
     var prepared = try PreparedPatternFilter.init(alloc, filter_query_json);
     defer prepared.deinit();
@@ -2776,12 +2822,7 @@ pub const PreparedPatternFilter = struct {
         };
         errdefer out.arena.deinit();
         const arena_alloc = out.arena.allocator();
-        const filter_query = try std.json.parseFromSliceLeaky(
-            std.json.Value,
-            arena_alloc,
-            filter_query_json,
-            .{ .allocate = .alloc_always },
-        );
+        const filter_query = try parsePatternJsonLeaky(arena_alloc, filter_query_json);
         out.compiled = try compilePatternFilter(arena_alloc, filter_query);
         out.selector = try out.compiled.selector(arena_alloc);
         return out;
@@ -2823,9 +2864,13 @@ pub const PreparedPatternFilter = struct {
             try view.prepareProjectionWithOptions(selector, .all, .any_container, .{ .defer_fanout = true });
             return self.compiled.matchesWith(arena.allocator(), key, &view);
         };
-        var parsed = try std.json.parseFromSlice(std.json.Value, scratch_alloc, stored, .{});
+        const exact = self.compiled.hasStandardRange();
+        var parsed = try std.json.parseFromSlice(std.json.Value, scratch_alloc, stored, .{ .parse_numbers = !exact });
         defer parsed.deinit();
-        return try self.compiled.matches(scratch_alloc, key, parsed.value);
+        return if (exact)
+            self.compiled.matchesPreservedNumbers(scratch_alloc, key, parsed.value)
+        else
+            self.compiled.matches(scratch_alloc, key, parsed.value);
     }
 
     pub fn matchesJson(
@@ -3484,6 +3529,22 @@ pub const CompiledPatternFilter = union(enum) {
         }
     }
 
+    pub fn hasStandardRange(self: CompiledPatternFilter) bool {
+        switch (self) {
+            .field_matcher => |matcher| return matcher.predicate == .standard_range,
+            .conjuncts, .disjuncts => |children| {
+                for (children) |child| if (child.hasStandardRange()) return true;
+            },
+            .bool_query => |boolean| {
+                for ([_][]const CompiledPatternFilter{ boolean.must, boolean.should, boolean.must_not }) |children| {
+                    for (children) |child| if (child.hasStandardRange()) return true;
+                }
+            },
+            else => {},
+        }
+        return false;
+    }
+
     pub fn needsStoredDoc(self: CompiledPatternFilter) bool {
         return switch (self) {
             .match_all, .match_none, .doc_id => false,
@@ -3545,10 +3606,29 @@ pub const CompiledPatternFilter = union(enum) {
     pub fn matches(self: CompiledPatternFilter, alloc: Allocator, key: []const u8, doc: std.json.Value) !bool {
         return self.matchesWith(alloc, key, doc);
     }
+    const PreservedNumbers = struct { root: std.json.Value };
+
+    pub fn matchesPreservedNumbers(self: CompiledPatternFilter, alloc: Allocator, key: []const u8, root: std.json.Value) !bool {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        return self.matchesWith(scratch.allocator(), key, PreservedNumbers{ .root = root });
+    }
+
+    fn ordinaryStoredValue(alloc: Allocator, value: std.json.Value) !std.json.Value {
+        var ordinary = switch (value) {
+            .object, .array => try owned_json.clone(alloc, value),
+            else => value,
+        };
+        try normalizePatternNumberTree(&ordinary, .literal, 0);
+        return ordinary;
+    }
+
     fn matchesWith(self: CompiledPatternFilter, alloc: Allocator, key: []const u8, doc: anytype) anyerror!bool {
         return switch (self) {
             .logical_value => |matcher| if (comptime @TypeOf(doc) == *JsonView)
                 try matcher.document(try doc.materialize(&doc.root))
+            else if (comptime @TypeOf(doc) == PreservedNumbers)
+                try matcher.document(try ordinaryStoredValue(alloc, doc.root))
             else
                 try matcher.document(doc),
             .match_all => true,
@@ -3598,7 +3678,15 @@ pub const CompiledPatternFilter = union(enum) {
                         .dotted, .json_pointer => |parts| parts,
                     };
                     if (matcher.predicate == .exists) break :blk try doc.hasPath(parts, pointer);
-                    try doc.collect(parts, pointer, &values);
+                    if (matcher.predicate == .standard_range)
+                        try doc.collectExactNumbers(parts, pointer, &values)
+                    else
+                        try doc.collect(parts, pointer, &values);
+                } else if (comptime @TypeOf(doc) == PreservedNumbers) {
+                    try matcher.path.collectValues(alloc, doc.root, &values);
+                    if (matcher.predicate != .standard_range) {
+                        for (values.items) |*value| value.* = try ordinaryStoredValue(alloc, value.*);
+                    }
                 } else try matcher.path.collectValues(alloc, doc, &values);
                 break :blk try matcher.predicate.matches(alloc, values.items);
             },
@@ -3800,10 +3888,13 @@ fn matcherMatchesOrdinal(
         }
     }
 
-    if (cell.is_json and path.remaining.len != 0) {
+    if (cell.is_json and (path.remaining.len != 0 or matcher.predicate == .standard_range)) {
         const view = try evaluation.jsonView(cell);
         var values = std.ArrayListUnmanaged(std.json.Value).empty;
-        try view.collect(path.remaining, path.pointer, &values);
+        if (matcher.predicate == .standard_range)
+            try view.collectExactNumbers(path.remaining, path.pointer, &values)
+        else
+            try view.collect(path.remaining, path.pointer, &values);
         return try matcher.predicate.matches(alloc, values.items);
     }
 

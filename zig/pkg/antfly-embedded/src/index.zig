@@ -271,6 +271,14 @@ pub const SegmentShared = struct {
         return self.deletion_lock.cmpxchgStrong(state, state + 1, .acquire, .monotonic) == null;
     }
 
+    pub fn lockDeletionSharedWithControl(self: *SegmentShared, control: query_mod.ExecutionControl) !void {
+        while (true) {
+            try control.check();
+            if (self.tryLockDeletionShared()) return;
+            spinOrYield();
+        }
+    }
+
     pub fn unlockDeletionShared(self: *SegmentShared) void {
         const previous = self.deletion_lock.fetchSub(1, .release);
         std.debug.assert((previous & ~deletion_writer_bit) > 0);
@@ -2293,6 +2301,22 @@ pub const IndexSnapshot = struct {
         }
     };
 
+    const LiveGraphFrontier = struct {
+        target: *GraphFrontierDocs,
+        shared: *SegmentShared,
+        offset: u32,
+        control: query_mod.ExecutionControl,
+
+        pub fn add(self: LiveGraphFrontier, doc: u32, ordinal: u32) !void {
+            const deleted = blk: {
+                try self.shared.lockDeletionSharedWithControl(self.control);
+                defer self.shared.unlockDeletionShared();
+                break :blk if (self.shared.deleted) |mask| mask.contains(doc - self.offset) else false;
+            };
+            if (!deleted) try self.target.add(doc, ordinal);
+        }
+    };
+
     fn seekGraphSegmentFrontier(
         segment: *const SegmentEntry,
         frontier: anytype,
@@ -2301,13 +2325,11 @@ pub const IndexSnapshot = struct {
         docs: *GraphFrontierDocs,
     ) !bool {
         const inverse = (try segment_mod.InverseDocOrdinalReader.init(&segment.reader)) orelse return false;
-        segment.shared.lockDeletionShared();
-        defer segment.shared.unlockDeletionShared();
-        const deleted = if (segment.shared.deleted) |*mask| mask else null;
+        const live = LiveGraphFrontier{ .target = docs, .shared = segment.shared, .offset = offset, .control = control };
         var keys = frontier.keyIterator();
         while (keys.next()) |key| {
             try control.check();
-            try inverse.addMatches(key.*, offset, docs, control, deleted);
+            try inverse.addMatches(key.*, offset, live, control);
         }
         return true;
     }
@@ -2340,10 +2362,8 @@ pub const IndexSnapshot = struct {
                 if (first >= self.segments.len) return error.InvalidSegment;
                 const base = if (first == 0) 0 else navigation.segment_ends[first - 1];
                 const segment = &self.segments[first];
-                segment.shared.lockDeletionShared();
-                defer segment.shared.unlockDeletionShared();
-                if (segment.shared.deleted) |deleted| if (deleted.contains(doc - base)) continue;
-                try docs.add(doc, key.*);
+                const live = LiveGraphFrontier{ .target = docs, .shared = segment.shared, .offset = base, .control = control };
+                try live.add(doc, key.*);
             }
         }
     }
@@ -2412,12 +2432,10 @@ pub const IndexSnapshot = struct {
             // Stream the historical segment once per frontier, independent of
             // predicate cardinality. Retain only matching physical rows.
             var cursor = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
-            lease.entry.shared.lockDeletionShared();
-            defer lease.entry.shared.unlockDeletionShared();
+            const live = LiveGraphFrontier{ .target = &docs, .shared = lease.entry.shared, .offset = offset, .control = control };
             for (0..segment.reader.doc_count) |i| {
                 if (i % 256 == 0) try control.check();
                 const doc: u32 = @intCast(i);
-                if (lease.entry.shared.deleted) |deleted| if (deleted.contains(doc)) continue;
                 const ordinal = if (try cursor.get(doc)) |ordinal| known: {
                     if (!frontier.contains(ordinal)) continue;
                     break :known ordinal;
@@ -2430,7 +2448,7 @@ pub const IndexSnapshot = struct {
                     const key = (try lease.entry.reader.storedIdScoped(scratch.allocator(), doc)) orelse continue;
                     break :legacy ids.get(key) orelse continue;
                 };
-                try docs.add(offset + doc, ordinal);
+                try live.add(offset + doc, ordinal);
             }
         }
         return docs;

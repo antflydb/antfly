@@ -1553,16 +1553,18 @@ pub fn applyStoredSearchPatternFilters(
     defer native_exclude.deinit(alloc);
 
     var filter_query = if (req.filter_query_json.len > 0)
-        try std.json.parseFromSlice(std.json.Value, alloc, req.filter_query_json, .{})
+        try std.json.parseFromSlice(std.json.Value, alloc, req.filter_query_json, .{ .parse_numbers = false })
     else
         null;
     defer if (filter_query) |*parsed| parsed.deinit();
+    if (filter_query) |*parsed| try graph_exec.normalizePatternNumbers(&parsed.value);
 
     var exclusion_query = if (req.exclusion_query_json.len > 0)
-        try std.json.parseFromSlice(std.json.Value, alloc, req.exclusion_query_json, .{})
+        try std.json.parseFromSlice(std.json.Value, alloc, req.exclusion_query_json, .{ .parse_numbers = false })
     else
         null;
     defer if (exclusion_query) |*parsed| parsed.deinit();
+    if (exclusion_query) |*parsed| try graph_exec.normalizePatternNumbers(&parsed.value);
 
     var matcher_arena = std.heap.ArenaAllocator.init(alloc);
     defer matcher_arena.deinit();
@@ -1589,6 +1591,8 @@ pub fn applyStoredSearchPatternFilters(
     const filter_needs_stored = if (compiled_filter) |compiled| compiled.needsStoredDoc() else false;
     const exclusion_needs_stored = if (compiled_exclusion) |compiled| compiled.needsStoredDoc() else false;
     const needs_stored = filter_needs_stored or exclusion_needs_stored;
+    const exact_numbers = (if (compiled_filter) |compiled| compiled.hasStandardRange() else false) or
+        (if (compiled_exclusion) |compiled| compiled.hasStandardRange() else false);
 
     // Member/chunk-mode hits are a separate full-text/vector document from
     // their parent row: their own stored payload never carries the parent's
@@ -1686,7 +1690,10 @@ pub fn applyStoredSearchPatternFilters(
                 try values.Work.charge(&value_work.documents, 1, req.value_search_execution.max_documents);
                 try values.Work.charge(&value_work.bytes, @intCast(stored.len), req.value_search_execution.max_bytes);
             }
-            break :blk try std.json.parseFromSlice(std.json.Value, hit_alloc, stored, .{});
+            break :blk try std.json.parseFromSliceLeaky(std.json.Value, hit_alloc, stored, .{
+                .parse_numbers = !exact_numbers,
+                .allocate = .alloc_always,
+            });
         } else null;
 
         // Member/chunk-mode hits are a separate document from their parent
@@ -1724,16 +1731,17 @@ pub fn applyStoredSearchPatternFilters(
         }
         if (keep and compiled_filter != null) {
             const compiled = compiled_filter.?;
-            keep = if (filter_needs_stored)
-                try compiled.matches(hit_alloc, match_id, parsed_stored.?.value)
+            keep = if (filter_needs_stored and exact_numbers)
+                try compiled.matchesPreservedNumbers(hit_alloc, match_id, parsed_stored.?)
             else
-                try compiled.matches(hit_alloc, match_id, .null);
+                try compiled.matches(hit_alloc, match_id, if (filter_needs_stored) parsed_stored.? else .null);
         }
         if (keep and compiled_exclusion != null) {
-            keep = !(if (exclusion_needs_stored)
-                try compiled_exclusion.?.matches(hit_alloc, match_id, parsed_stored.?.value)
+            const compiled = compiled_exclusion.?;
+            keep = !(if (exclusion_needs_stored and exact_numbers)
+                try compiled.matchesPreservedNumbers(hit_alloc, match_id, parsed_stored.?)
             else
-                try compiled_exclusion.?.matches(hit_alloc, match_id, .null));
+                try compiled.matches(hit_alloc, match_id, if (exclusion_needs_stored) parsed_stored.? else .null));
         }
 
         keep_hits[i] = keep;

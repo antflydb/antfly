@@ -522,6 +522,7 @@ pub const ExactPredicateProbe = struct {
                     if (try self.range_lease.?.entry.reader.typedDocValuesScoped(self.a, range.field)) |opened| {
                         var reader = opened;
                         errdefer reader.deinit();
+                        reader.enablePointCache(64 * 1024) catch {};
                         const owned = try self.a.create(typed_dv.TypedDocValuesReader);
                         owned.* = reader;
                         self.range_readers[i] = owned;
@@ -1844,6 +1845,7 @@ pub const RangeFilter = struct {
         errdefer result.deinit();
         var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return result;
         defer reader.deinit();
+        if (scope.cardinality() > 1) reader.enablePointCache(64 * 1024) catch {};
         var docs = scope.iterator();
         while (docs.next()) |doc| {
             try self.control.check();
@@ -2510,6 +2512,7 @@ pub const DateRangeFilter = struct {
         defer reader.deinit();
         if (reader.value_type != .u64_val and reader.value_type != .datetime_ns) return result;
         if (scope) |domain| {
+            if (domain.cardinality() > 1) reader.enablePointCache(64 * 1024) catch {};
             var docs = domain.iterator();
             while (docs.next()) |doc| {
                 try self.control.check();
@@ -2787,6 +2790,7 @@ pub const BoolFieldFilter = struct {
         defer reader.deinit();
         if (reader.value_type != .bool_val) return result;
         if (scope) |domain| {
+            if (domain.cardinality() > 1) reader.enablePointCache(64 * 1024) catch {};
             var docs = domain.iterator();
             while (docs.next()) |doc| {
                 try self.control.check();
