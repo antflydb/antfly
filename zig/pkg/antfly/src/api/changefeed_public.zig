@@ -207,7 +207,7 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
     var cutover: ?control.Parsed = null;
     defer if (cutover) |*parsed| parsed.deinit();
     if (active.phase == .bootstrap) {
-        if (!active.roots[0].snapshot_acknowledged.done)
+        if (!active.bootstrapComplete())
             return .{ .acknowledged = active.acknowledged_cursor };
         try change(&client, a, active, .{ .finish_verified_bootstrap = .{ .proof = try active.bootstrapCompletionProof() } }, internal);
         cutover = try load(&client, a, selection.id, internal);
@@ -262,9 +262,7 @@ fn RootPolicy(comptime Access: type) type {
                 defer identity.deinit(access.api.alloc);
                 try requireOwner(identity, state.definition orelse return error.Forbidden);
             } else {
-                const principal = request.principal orelse return error.Forbidden;
-                if (principal.kind != .internal or !std.mem.eql(u8, principal.subject, "changefeed-maintenance"))
-                    return error.Forbidden;
+                try requireMaintenancePrincipal(request);
             }
         }
 
@@ -472,8 +470,8 @@ pub fn close(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReque
     return error.MetadataMutationOutcomeUnknown;
 }
 
-/// Consume one bounded maintenance step. Only already-invalidated native
-/// feeds qualify, and a reset retains its resynchronization reason.
+/// Consume one durable cutover or cleanup step. A reset retains its
+/// resynchronization reason.
 pub fn maintainNativeFeed(metadata: config.Port, source: source_api.Source, io: std.Io, a: A, id: control.Id, request: Context) !void {
     return maintainNativeFeedWithSpool(metadata, source, io, a, id, null, request);
 }
@@ -483,11 +481,15 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
     var parsed = try load(&client, a, id, request);
     defer parsed.deinit();
     const state = parsed.value;
+    if (state.phase == .bootstrap) {
+        if (!state.bootstrapComplete() or state.expiryDue(clock.realtimeNs() / std.time.ns_per_s)) return;
+        try requireMaintenancePrincipal(request);
+        return change(&client, a, state, .{ .finish_verified_bootstrap = .{ .proof = try state.bootstrapCompletionProof() } }, request);
+    }
     if (state.phase == .streaming) {
         for (state.roots) |item| {
             if (item.snapshot == null or item.snapshot_released) continue;
-            const principal = request.principal orelse return error.Forbidden;
-            if (principal.kind != .internal or !std.mem.eql(u8, principal.subject, "changefeed-maintenance")) return error.Forbidden;
+            try requireMaintenancePrincipal(request);
             var captured = try source.capture(a, state.definition.?, request);
             defer captured.deinit();
             var policy: RootPolicy(void) = .{ .access = {}, .io = io, .source = source, .allocator = a };
@@ -505,6 +507,12 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
             _ = try cleanup.cleanup(&metadata, registry, a, id, .{}, request);
         }
     };
+}
+
+fn requireMaintenancePrincipal(request: Context) !void {
+    try request.ensureActive();
+    const principal = request.principal orelse return error.Forbidden;
+    if (principal.kind != .internal or !std.mem.eql(u8, principal.subject, "changefeed-maintenance")) return error.Forbidden;
 }
 
 fn releaseStreamingSnapshot(client: *config.Client, policy: anytype, a: A, state: control.State, selected: source_api.Root, request: Context) !void {

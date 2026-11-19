@@ -45506,6 +45506,15 @@ fn consumerTests() type {
                             try std.testing.expect(std.mem.indexOf(u8, snapshot.page.body, "before-cut") != null);
                             try std.testing.expect(std.mem.indexOf(u8, snapshot.page.body, "after-cut") == null);
                             try std.testing.expect(std.mem.indexOf(u8, snapshot.page.body, "\"complete\":true") != null);
+                            {
+                                svc.lose_ack_at = svc.proposals + 1;
+                                defer svc.lose_ack_at = null;
+                                try std.testing.expectError(error.MetadataMutationOutcomeUnknown, api.execute(http_api, allocator, credential, .{ .id = created.id, .after = snapshot.page.cursor }, null, .{}));
+                            }
+                            const maintenance: antfly.public_api.operation.RequestContext = .{ .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" } };
+                            const metadata_port = http_api.source.changefeeds.?;
+                            try std.testing.expectError(error.Forbidden, api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, created.id, .{}));
+                            try api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, created.id, maintenance);
                             const LostRelease = struct {
                                 fn reach(_: *anyopaque, event: DataRequestLifecycleEvent) !void {
                                     if (event.phase == .proposal_accepted) return error.InjectedSnapshotReleaseReplyLoss;

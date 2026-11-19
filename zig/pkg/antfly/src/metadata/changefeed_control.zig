@@ -242,6 +242,7 @@ pub const State = struct {
     pub fn needsMaintenance(self: State, now: u64) bool {
         return switch (self.phase) {
             .closing => true,
+            .bootstrap => self.bootstrapComplete() or self.expiryDue(now),
             .streaming => for (self.roots) |root| {
                 if (root.snapshot != null and !root.snapshot_released) break true;
             } else self.expiryDue(now),
@@ -252,11 +253,18 @@ pub const State = struct {
         };
     }
 
+    pub fn bootstrapComplete(self: State) bool {
+        if (self.phase != .bootstrap or self.roots.len == 0 or self.latest_delivery != self.acknowledged_delivery) return false;
+        for (self.roots) |root| {
+            if (root.snapshot == null or !root.snapshot_acknowledged.done or root.snapshot_released or root.released) return false;
+        }
+        return true;
+    }
+
     /// Bind the cutover receipt to every durably acknowledged root snapshot.
     /// The issuing service obtains the snapshot pins from their native owners.
     pub fn bootstrapCompletionProof(self: State) !Digest {
-        if (self.phase != .bootstrap or self.roots.len == 0 or
-            self.latest_delivery != self.acknowledged_delivery) return error.ChangefeedConflict;
+        if (!self.bootstrapComplete()) return error.ChangefeedConflict;
         var digest = hash(.{
             .domain = "antfly:changefeed-bootstrap-completion:v1",
             .authority = self.authority,
@@ -268,9 +276,7 @@ pub const State = struct {
             .delivery = self.acknowledged_delivery,
         });
         for (self.roots) |root| {
-            const snapshot = root.snapshot orelse return error.ChangefeedConflict;
-            if (!root.snapshot_acknowledged.done or root.snapshot_released or root.released)
-                return error.ChangefeedConflict;
+            const snapshot = root.snapshot.?;
             digest = hash(.{
                 .previous = digest,
                 .namespace = root.namespace,
@@ -1267,7 +1273,9 @@ test "changefeed control bootstrap completes only after snapshot ACK and retains
     const page = testDelivery(state, &.{.{ .namespace = testNamespace(7), .position = .{ .sequence = 10 }, .snapshot = .{ .page = 1, .continuation = "opaque-page-cut", .done = true } }});
     state = try step(scratch, state, .{ .issue = page });
     try std.testing.expectError(error.ChangefeedConflict, step(scratch, state, .{ .finish_verified_bootstrap = .{ .proof = @splat(1) } }));
+    try std.testing.expect(!state.needsMaintenance(200));
     state = try step(scratch, state, .{ .acknowledge = page.cursor });
+    try std.testing.expect(state.needsMaintenance(200));
     const proof = try state.bootstrapCompletionProof();
     const legacy_finish: Mutation = .{ .finish_bootstrap = .{ .proof = @splat(1) } };
     const verified_finish: Mutation = .{ .finish_verified_bootstrap = .{ .proof = proof } };
