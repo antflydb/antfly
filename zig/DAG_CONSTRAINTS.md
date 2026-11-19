@@ -77,7 +77,11 @@ page at a time and persists a root-completion cursor even for an empty root,
 so resumption uses the authority checkpoint. The fence snapshot digest binds
 the ordered roots and source catalog generations for every activated domain.
 The ordered writer pins each domain's root count and requires the last
-root's terminal cursor before certification.
+root's terminal cursor before certification. Hosted data servers can advance
+a fenced scan through pinned group routes, using read-index lookups and ordered
+authority proposals for initialization, owner takeover, and page commits.
+The reader currently uses the group-local owner interface. Distributed
+activation still needs a durable scheduler and remote source routing.
 An active source fence allows an ordered catalog change only when activation
 proofs match its pinned snapshot. Raft protocol version 31 gates these commands,
 DAG-bearing transaction prepare, and catalog activation proofs. The source-fence

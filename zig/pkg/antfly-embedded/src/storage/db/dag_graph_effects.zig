@@ -17,7 +17,7 @@
 //! Callers must resolve source precedence and validate the physical write set
 //! before using this adapter.
 const std = @import("std");
-const authority = @import("../../graph/dag_authority.zig");
+pub const authority = @import("../../graph/dag_authority.zig");
 const edges = @import("graph_edge_types.zig");
 const keys = @import("../internal_keys.zig");
 const A = std.mem.Allocator;
