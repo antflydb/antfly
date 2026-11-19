@@ -6383,8 +6383,11 @@ pub const Store = struct {
             self.index_fence_refused.store(true, .release);
             return error.EnrichmentWaitCanceled;
         }
+        // Reserved before publishing: recording the commit afterwards must
+        // not fail once storage has changed.
+        try self.reserveIndexScope(scope);
         try self.submitIndexMutation(context, apply, durable);
-        try self.noteIndexScopeCommit(scope, shared.scopeLatestSequence(io, scope));
+        self.noteIndexScopeCommit(scope, shared.scopeLatestSequence(io, scope));
     }
 
     fn indexScopeFence(self: *Store, scope: []const u8) u64 {
@@ -6394,19 +6397,26 @@ pub const Store = struct {
         return @max(self.index_load_sequence, self.index_scope_commits.get(scope) orelse 0);
     }
 
-    fn noteIndexScopeCommit(self: *Store, scope: []const u8, sequence: u64) !void {
+    fn reserveIndexScope(self: *Store, scope: []const u8) !void {
         const io = self.file.runtime();
         self.index_fence_mutex.lockUncancelable(io);
         defer self.index_fence_mutex.unlock(io);
         const gop = try self.index_scope_commits.getOrPut(self.allocator, scope);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = self.allocator.dupe(u8, scope) catch |err| {
-                self.index_scope_commits.removeByPtr(gop.key_ptr);
-                return err;
-            };
-            gop.value_ptr.* = 0;
-        }
-        gop.value_ptr.* = @max(gop.value_ptr.*, sequence);
+        if (gop.found_existing) return;
+        gop.key_ptr.* = self.allocator.dupe(u8, scope) catch |err| {
+            self.index_scope_commits.removeByPtr(gop.key_ptr);
+            return err;
+        };
+        gop.value_ptr.* = 0;
+    }
+
+    /// The entry was reserved by `reserveIndexScope`.
+    fn noteIndexScopeCommit(self: *Store, scope: []const u8, sequence: u64) void {
+        const io = self.file.runtime();
+        self.index_fence_mutex.lockUncancelable(io);
+        defer self.index_fence_mutex.unlock(io);
+        const value = self.index_scope_commits.getPtr(scope).?;
+        value.* = @max(value.*, sequence);
     }
 
     fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool) !void {
