@@ -98,6 +98,27 @@ pub const doc_ordinals_field = "\x00__antfly_doc_ordinals";
 const inverse_ordinals_section: SectionType = .synonym;
 const max_inverse_ordinal_docs = 4 * 1024 * 1024;
 
+const inverse_header_size = 9;
+const inverse_pair_size = 12;
+
+fn encodeInverseHeader(out: *[inverse_header_size]u8, count: u32) void {
+    out[0] = 2;
+    std.mem.writeInt(u32, out[1..5], count, .big);
+    std.mem.writeInt(u32, out[5..9], Crc32.hash(out[0..5]), .big);
+}
+
+fn inversePairChecksum(index: u32, bytes: *const [8]u8) u32 {
+    var checked: [12]u8 = undefined;
+    std.mem.writeInt(u32, checked[0..4], index, .big);
+    checked[4..12].* = bytes.*;
+    return Crc32.hash(&checked);
+}
+
+fn encodeInversePair(out: *[inverse_pair_size]u8, index: u32, pair: u64) void {
+    std.mem.writeInt(u64, out[0..8], pair, .big);
+    std.mem.writeInt(u32, out[8..12], inversePairChecksum(index, out[0..8]), .big);
+}
+
 pub const index_sort_field = "\x00__antfly_index_sort";
 pub const doc_key_range_field = "\x00__antfly_doc_key_range";
 // Use an existing opaque section kind under a reserved field name. Older
@@ -480,11 +501,10 @@ pub const SegmentWriter = struct {
         defer self.alloc.free(pairs);
         for (ordinals, 0..) |ordinal, doc| pairs[doc] = (@as(u64, ordinal) << 32) | doc;
         std.mem.sort(u64, pairs, {}, std.sort.asc(u64));
-        const bytes = try self.alloc.alloc(u8, 5 + pairs.len * 8);
+        const bytes = try self.alloc.alloc(u8, inverse_header_size + pairs.len * inverse_pair_size);
         errdefer self.alloc.free(bytes);
-        bytes[0] = 1;
-        std.mem.writeInt(u32, bytes[1..5], @intCast(pairs.len), .big);
-        for (pairs, 0..) |pair, i| std.mem.writeInt(u64, bytes[5 + i * 8 ..][0..8], pair, .big);
+        encodeInverseHeader(bytes[0..inverse_header_size], @intCast(pairs.len));
+        for (pairs, 0..) |pair, i| encodeInversePair(bytes[inverse_header_size + i * inverse_pair_size ..][0..inverse_pair_size], @intCast(i), pair);
         try self.addSectionOwned(field_idx, inverse_ordinals_section, bytes);
     }
 
@@ -6386,22 +6406,37 @@ pub const InverseDocOrdinalReader = struct {
     count: u32,
 
     pub fn init(reader: *const SegmentReader) !?InverseDocOrdinalReader {
-        const view = (try reader.sectionView(doc_ordinals_field, inverse_ordinals_section)) orelse return null;
-        var header: [5]u8 = undefined;
-        if (view.length < header.len) return error.InvalidSegment;
+        // The header and each addressed record authenticate independently.
+        // Existing page authentication remains active on paged sources.
+        const view = if (reader.native) |native| blk: {
+            const section = native.range.findSection(doc_ordinals_field, inverse_ordinals_section) orelse return null;
+            break :blk try @import("segment_source.zig").View.init(native.range.source, section.offset, section.length);
+        } else blk: {
+            const field = findSegmentField(SegmentReader.FieldInfo, reader.fields, reader.fields_sorted, doc_ordinals_field) orelse return null;
+            for (field.sections) |section| {
+                if (section.section_type != inverse_ordinals_section) continue;
+                break :blk try @import("segment_source.zig").View.init(.{ .contiguous = reader.data }, section.offset, section.length);
+            }
+            return null;
+        };
+        var header: [inverse_header_size]u8 = undefined;
+        if (view.length < header.len) return null;
         try view.readInto(0, &header);
+        if (header[0] != 2) return null;
+        if (Crc32.hash(header[0..5]) != std.mem.readInt(u32, header[5..9], .big)) return error.CrcMismatch;
         const count = std.mem.readInt(u32, header[1..5], .big);
-        if (header[0] != 1 or count != reader.doc_count or view.length != 5 + @as(u64, count) * 8) return error.InvalidSegment;
+        if (count != reader.doc_count or view.length != inverse_header_size + @as(u64, count) * inverse_pair_size) return error.InvalidSegment;
         return .{ .view = view, .count = count };
     }
 
     fn pairAt(self: InverseDocOrdinalReader, i: u32) !u64 {
-        var bytes: [8]u8 = undefined;
-        try self.view.readInto(5 + @as(u64, i) * 8, &bytes);
-        return std.mem.readInt(u64, &bytes, .big);
+        var bytes: [inverse_pair_size]u8 = undefined;
+        try self.view.readInto(inverse_header_size + @as(u64, i) * inverse_pair_size, &bytes);
+        if (inversePairChecksum(i, bytes[0..8]) != std.mem.readInt(u32, bytes[8..12], .big)) return error.CrcMismatch;
+        return std.mem.readInt(u64, bytes[0..8], .big);
     }
 
-    pub fn addMatches(self: InverseDocOrdinalReader, ordinal: u32, offset: u32, docs: anytype) !void {
+    pub fn addMatches(self: InverseDocOrdinalReader, ordinal: u32, offset: u32, docs: anytype, control: anytype) !void {
         const first = @as(u64, ordinal) << 32;
         var lo: u32 = 0;
         var hi = self.count;
@@ -6410,11 +6445,12 @@ pub const InverseDocOrdinalReader = struct {
             if (try self.pairAt(mid) < first) lo = mid + 1 else hi = mid;
         }
         while (lo < self.count) : (lo += 1) {
+            try control.check();
             const pair = try self.pairAt(lo);
             if (pair >> 32 != ordinal) break;
             const doc: u32 = @truncate(pair);
             if (doc >= self.count) return error.InvalidSegment;
-            try docs.add(try std.math.add(u32, offset, doc));
+            try docs.add(try std.math.add(u32, offset, doc), ordinal);
         }
     }
 };
@@ -6550,13 +6586,14 @@ fn appendMergedInverseOrdinals(alloc: Allocator, sink: *SegmentSink, field: *Bui
     std.mem.sort(u64, pairs, {}, std.sort.asc(u64));
     const start = sink.len();
     sink.beginSection();
-    try sink.appendByte(1);
-    try sinkAppendU32BE(sink, @intCast(pairs.len));
-    var buffer: [8192]u8 = undefined;
+    var header: [inverse_header_size]u8 = undefined;
+    encodeInverseHeader(&header, @intCast(pairs.len));
+    try sink.appendSlice(&header);
+    var buffer: [inverse_pair_size * 512]u8 = undefined;
     var used: usize = 0;
-    for (pairs) |pair| {
-        std.mem.writeInt(u64, buffer[used..][0..8], pair, .big);
-        used += 8;
+    for (pairs, 0..) |pair, i| {
+        encodeInversePair(buffer[used..][0..inverse_pair_size], @intCast(i), pair);
+        used += inverse_pair_size;
         if (used == buffer.len) {
             try sink.appendSlice(&buffer);
             used = 0;

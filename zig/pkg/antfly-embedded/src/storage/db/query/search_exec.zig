@@ -9544,7 +9544,7 @@ const IndexedPredicateEvaluator = struct {
     const AppliedGates = std.StringHashMapUnmanaged(enum { exact, necessary });
 
     const LocalCache = IndexedClauseCache;
-    const FrontierProbeInput = struct { attempted: bool = false, docs: ?roaring.RoaringBitmap = null };
+    const FrontierProbeInput = struct { attempted: bool = false, docs: ?index_mod.IndexSnapshot.GraphFrontierDocs = null };
 
     fn indexed(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery) !bool {
         return searchQueryCanUseSnapshotWithControl(self.snapshot, query, self.analysis, self.schema, false, self.control);
@@ -9567,7 +9567,7 @@ const IndexedPredicateEvaluator = struct {
         if (try cache.getScoped(self.alloc, key, self.control, scope)) |rows| return rows;
         if (scope) |domain| if (self.probe_input != null) {
             const live_count = self.snapshot.liveDocCount();
-            const warm_frontier = live_count >= 65_536 and domain.cardinality() <= 128 and self.snapshot.hasGraphOrdinalNavigation();
+            const small_frontier = live_count >= 65_536 and domain.cardinality() <= 128;
             const low_headroom = if (self.budget) |budget| limited: {
                 const available = budget.max_retained_state_bytes -| budget.retained_state_bytes;
                 if (@as(u64, live_count) * 8 <= available) break :limited false;
@@ -9581,7 +9581,7 @@ const IndexedPredicateEvaluator = struct {
                 };
                 break :limited @as(u64, estimate) * 8 > available;
             } else false;
-            if (warm_frontier or low_headroom or (self.local_cache != null and self.local_cache.?.memory.shouldProbe(key))) {
+            if (small_frontier or low_headroom or (self.local_cache != null and self.local_cache.?.memory.shouldProbe(key))) {
                 if (try self.probeFrontier(query, domain)) |rows| return rows;
             }
         };
@@ -9624,11 +9624,11 @@ const IndexedPredicateEvaluator = struct {
             memo.docs = try self.snapshot.graphFrontierDocNumsAlloc(self.alloc, frontier, self.control);
         }
         const filter = (try search_mod.searchQueryToFilterArena(self.scratch, query)).withControl(self.control);
-        const candidates_bitmap = if (memo.docs) |*docs| docs else return try self.probeLegacyFrontier(filter, scope);
+        const frontier_docs = if (memo.docs) |*docs| docs else return null;
         const plan = try query_mod.PredicateProbePlan.compile(filter);
         var rows = roaring.RoaringBitmap.init(self.alloc);
         errdefer rows.deinit();
-        var candidates = candidates_bitmap.iterator();
+        var candidates = frontier_docs.bitmap.iterator();
         var next = candidates.next();
         var offset: u32 = 0;
         for (self.snapshot.segments, 0..) |segment, segment_index| {
@@ -9645,7 +9645,6 @@ const IndexedPredicateEvaluator = struct {
             defer if (probe) |active| active.destroy();
             var local = if (probe == null) try filter.executeWithOffset(self.alloc, lease.entry, offset) else null;
             defer if (local) |*bitmap| bitmap.deinit();
-            var ordinals = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
             lease.entry.shared.lockDeletionShared();
             defer lease.entry.shared.unlockDeletionShared();
             while (next) |doc| {
@@ -9654,62 +9653,14 @@ const IndexedPredicateEvaluator = struct {
                 const local_doc = doc - offset;
                 next = candidates.next();
                 if (lease.entry.shared.deleted) |deleted| if (deleted.contains(local_doc)) continue;
-                if (try ordinals.get(local_doc)) |ordinal| {
-                    if (scope.contains(ordinal) and (if (probe) |active| try active.contains(local_doc) else local.?.contains(local_doc))) {
-                        try rows.add(ordinal);
-                    }
+                const ordinal = frontier_docs.ordinals.get(doc) orelse return error.InvalidData;
+                if (scope.contains(ordinal) and (if (probe) |active| try active.contains(local_doc) else local.?.contains(local_doc))) {
+                    try rows.add(ordinal);
                 }
             }
             offset = upper;
         }
         return rows;
-    }
-
-    // Old segments can lack reverse navigation. Resolve only documents
-    // produced by the predicate, with one segment bitmap at a time.
-    fn probeLegacyFrontier(self: IndexedPredicateEvaluator, filter: query_mod.Filter, scope: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
-        const frontier = self.frontier orelse return error.UnsupportedQueryRequest;
-        var keys: std.StringHashMapUnmanaged(u32) = .empty;
-        defer keys.deinit(self.alloc);
-        var ids = scope.iterator();
-        while (ids.next()) |ordinal| {
-            const key = frontier.get(ordinal) orelse return error.InvalidData;
-            try keys.put(self.alloc, key, ordinal);
-        }
-        var result = roaring.RoaringBitmap.init(self.alloc);
-        errdefer result.deinit();
-        var scratch = segment_mod.SegmentReadScratch.init(self.alloc, 64 * 1024);
-        defer scratch.deinit();
-        var offset: u32 = 0;
-        const expected = scope.cardinality();
-        var matches: usize = 0;
-        for (self.snapshot.segments, 0..) |segment, segment_index| {
-            try self.control.check();
-            defer offset += segment.reader.doc_count;
-            if (segment.liveDocCount() == 0) continue;
-            var lease = try self.snapshot.leaseSegment(segment_index);
-            defer lease.deinit();
-            var local = try filter.executeWithOffset(self.alloc, lease.entry, offset);
-            defer local.deinit();
-            var ordinals = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
-            lease.entry.shared.lockDeletionShared();
-            defer lease.entry.shared.unlockDeletionShared();
-            var candidates = local.iterator();
-            while (candidates.next()) |doc| {
-                try self.control.check();
-                if (lease.entry.shared.deleted) |deleted| if (deleted.contains(doc)) continue;
-                const ordinal = (try ordinals.get(doc)) orelse legacy: {
-                    scratch.reset();
-                    const key = (try lease.entry.reader.storedIdScoped(scratch.allocator(), doc)) orelse continue;
-                    break :legacy keys.get(key) orelse continue;
-                };
-                if (!scope.contains(ordinal) or result.contains(ordinal)) continue;
-                try result.add(ordinal);
-                matches += 1;
-                if (matches == expected) return result;
-            }
-        }
-        return result;
     }
 
     fn copyMembership(self: IndexedPredicateEvaluator, source: *const roaring.RoaringBitmap, scope: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
@@ -9746,6 +9697,7 @@ const IndexedPredicateEvaluator = struct {
     fn prepareThreshold(self: IndexedPredicateEvaluator, plan: ThresholdPlan, scope: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
         var residual: std.ArrayListUnmanaged(Clause) = .empty;
         var counts: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        defer counts.deinit(self.alloc);
         for (plan.clauses, 0..) |clause, i| {
             const child_path = try self.clausePath(plan.path, 's', i);
             if (!try self.indexed(clause)) {
@@ -9757,11 +9709,11 @@ const IndexedPredicateEvaluator = struct {
             var ids = rows.iterator();
             while (ids.next()) |id| {
                 try self.control.check();
-                const entry = try counts.getOrPutValue(self.scratch, id, 0);
+                const entry = try counts.getOrPutValue(self.alloc, id, 0);
                 entry.value_ptr.* += 1;
             }
         }
-        try self.thresholds.?.put(self.scratch, plan.path, .{ .counts = counts, .residual = residual.items });
+        var survivors: std.AutoHashMapUnmanaged(u32, u32) = .empty;
         var necessary = roaring.RoaringBitmap.init(self.alloc);
         errdefer necessary.deinit();
         var it = counts.iterator();
@@ -9769,8 +9721,10 @@ const IndexedPredicateEvaluator = struct {
             try self.control.check();
             if (@as(usize, entry.value_ptr.*) + residual.items.len >= plan.required) {
                 try necessary.add(entry.key_ptr.*);
+                try survivors.put(self.scratch, entry.key_ptr.*, entry.value_ptr.*);
             }
         }
+        try self.thresholds.?.put(self.scratch, plan.path, .{ .counts = survivors, .residual = residual.items });
         return necessary;
     }
 
@@ -9870,11 +9824,19 @@ const IndexedPredicateEvaluator = struct {
         const gate_path = try self.clausePath(path, 't', 0);
         const applied = if (self.applied_gates) |gates| gates.get(gate_path) else null;
         var should_complete = applied != null and applied.? == .exact;
+        var local_thresholds: Thresholds = .empty;
+        var evaluator = self;
         if (applied == null) if (try self.indexedShouldGate(boolean.should, required_should)) |gate| {
-            const narrowed = try self.executeIndexedClause(gate, if (result) |*rows| rows else scope, gate_path);
+            const domain = if (result) |*rows| rows else scope;
+            should_complete = gate.bool_query.should.len == boolean.should.len;
+            const narrowed = if (should_complete)
+                try self.executeIndexedClause(gate, domain, gate_path)
+            else partial: {
+                if (evaluator.thresholds == null) evaluator.thresholds = &local_thresholds;
+                break :partial try evaluator.prepareThreshold(.{ .path = path, .clauses = boolean.should, .required = required_should }, domain);
+            };
             if (result) |*rows| rows.deinit();
             result = narrowed;
-            should_complete = gate.bool_query.should.len == boolean.should.len;
         };
         for (residual_must.items) |clause| {
             const next = try self.execute(clause.query, if (result) |*rows| rows else scope, clause.path);
@@ -9882,7 +9844,7 @@ const IndexedPredicateEvaluator = struct {
             result = next;
         }
         if (required_should != 0 and !should_complete) {
-            const matched = try self.executeShould(boolean.should, required_should, if (result) |*rows| rows else scope, path);
+            const matched = try evaluator.executeShould(boolean.should, required_should, if (result) |*rows| rows else scope, path);
             if (result) |*rows| rows.deinit();
             result = matched;
         }
@@ -10155,9 +10117,14 @@ pub fn graphIndexedPredicateAlloc(
         .probe_input = &probe_input,
     };
     const fully_indexed = try matcher.indexed(search_query);
+    const available = budget.max_retained_state_bytes -| budget.retained_state_bytes;
+    const live_count = snapshot.liveDocCount();
+    const use_frontier = frontier != null and (!fully_indexed or
+        (@as(u64, live_count) * 8 > available) or
+        live_count >= 65_536);
     // Only immutable index membership can be cached on the text snapshot.
     // A residual range also depends on primary row contents.
-    const flight = if (fully_indexed) try cache.lockFlight(key, control) else null;
+    const flight = if (fully_indexed and !use_frontier) try cache.lockFlight(key, control) else null;
     defer if (flight) |held| held.unlock();
     if (fully_indexed) if (try cache.get(a, key, control)) |rows| {
         var owned = rows;
@@ -10165,7 +10132,7 @@ pub fn graphIndexedPredicateAlloc(
         try control.check();
         return .{ .ordinal_bitmap = owned };
     };
-    var rows = if (fully_indexed)
+    var rows = if (fully_indexed and !use_frontier)
         try matcher.executeIndexed(search_query)
     else scoped: {
         const input = frontier orelse return error.GraphResidualFrontierRequired;
@@ -10181,7 +10148,7 @@ pub fn graphIndexedPredicateAlloc(
         break :scoped try matcher.execute(search_query, &domain, "");
     };
     errdefer rows.deinit();
-    if (fully_indexed) cache.put(snapshot.alloc, key, &rows);
+    if (fully_indexed and !use_frontier) cache.put(snapshot.alloc, key, &rows);
     try control.check();
     return .{ .ordinal_bitmap = rows };
 }
@@ -39758,6 +39725,29 @@ test "optional numeric range covers unsigned values and uses identical stored se
     try rounded_writer.addSegment(rounded);
     try std.testing.expect((try rounded_writer.snapshot().segments[0].reader.numericRangeCoverage("rank")) == null);
     try std.testing.expect(try fractional.matchesStored(a, "rounded", "{\"rank\":18446744073709551617}"));
+    try std.testing.expect(try fractional.matchesStored(a, "extreme", "{\"rank\":1e9223372036854775808}"));
+    try std.testing.expect(!try fractional.matchesStored(a, "extreme", "{\"rank\":-1e9223372036854775808}"));
+
+    const historical = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{
+        .{ .key = "historical", .value = "{\"body\":\"beacon\"}" },
+    }, .{}, schema)).?;
+    defer a.free(historical);
+    try writer.addSegment(historical);
+    try frontier.put(a, 3, "historical");
+    try domain.add(3);
+    var mixed_input: IndexedPredicateEvaluator.FrontierProbeInput = .{};
+    defer if (mixed_input.docs) |*docs| docs.deinit();
+    bounded.snapshot = writer.snapshot();
+    bounded.frontier = frontier;
+    bounded.probe_input = &mixed_input;
+    var mixed = (try bounded.probeFrontier(.{ .term = .{ .field = "body", .term = "beacon" } }, &domain)).?;
+    defer mixed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), mixed.cardinality());
+    try std.testing.expect(mixed.contains(1) and mixed.contains(3));
+    var mixed_range = (try bounded.probeFrontier(query, &domain)).?;
+    defer mixed_range.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mixed_range.cardinality());
+    try std.testing.expect(mixed_range.contains(1));
 }
 
 test "optional numeric range cold and warm measurement" {

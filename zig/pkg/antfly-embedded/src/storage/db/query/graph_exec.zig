@@ -4763,6 +4763,19 @@ fn isStandardRangeNumber(value: std.json.Value) bool {
     };
 }
 
+fn compareStoredRangeNumber(value: std.json.Value, bound: std.json.Value) !std.math.Order {
+    const scalar = @import("../../../sql/scalar.zig");
+    return scalar.compare(value, bound) catch |err| {
+        // Structured numeric bounds are finite. A valid JSON token can still
+        // overflow the decimal comparator's exponent domain on the row side.
+        if (err == error.SqlNumericOutOfRange and value == .number_string) {
+            const approximate = std.fmt.parseFloat(f64, value.number_string) catch return err;
+            if (std.math.isInf(approximate)) return if (approximate < 0) .lt else .gt;
+        }
+        return err;
+    };
+}
+
 fn jsonValueMatchesStandardRange(value: std.json.Value, lower: ?PatternJsonRangeBound, upper: ?PatternJsonRangeBound) !bool {
     if (value == .array) {
         for (value.array.items) |item| {
@@ -4793,13 +4806,12 @@ fn jsonValueMatchesStandardRange(value: std.json.Value, lower: ?PatternJsonRange
         (lower == null or isStandardRangeNumber(lower.?.value)) and
         (upper == null or isStandardRangeNumber(upper.?.value)))
     {
-        const scalar = @import("../../../sql/scalar.zig");
         if (lower) |bound| {
-            const order = try scalar.compare(value, bound.value);
+            const order = try compareStoredRangeNumber(value, bound.value);
             if (order == .lt or (order == .eq and !bound.inclusive)) return false;
         }
         if (upper) |bound| {
-            const order = try scalar.compare(value, bound.value);
+            const order = try compareStoredRangeNumber(value, bound.value);
             if (order == .gt or (order == .eq and !bound.inclusive)) return false;
         }
         return true;

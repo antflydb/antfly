@@ -225,13 +225,15 @@ pub const ExactTermProbe = struct {
 /// missing terms are false and unsupported leaves decline before execution.
 pub const PredicateProbePlan = struct {
     const Boolean = struct { start: u8, must: u8, should: u8, excluded: u8, minimum: u32, control: ExecutionControl };
-    const Node = union(enum) { constant: bool, term: u8, doc_num: DocNumFilter, boolean: Boolean };
+    const Node = union(enum) { constant: bool, term: u8, range: u8, doc_num: DocNumFilter, boolean: Boolean };
     nodes: [128]Node = undefined,
     children: [128]u8 = undefined,
     terms: [32]Filter = undefined,
     node_count: usize = 0,
     child_count: usize = 0,
     term_count: usize = 0,
+    ranges: [16]RangeFilter = undefined,
+    range_count: usize = 0,
     has_batch_producer: bool = false,
     control: ExecutionControl = .{},
     pub fn compile(filter: Filter) !?PredicateProbePlan {
@@ -251,7 +253,7 @@ pub const PredicateProbePlan = struct {
         try self.control.check();
         return switch (self.nodes[index]) {
             .constant => |value| if (value) count else 0,
-            .term => count,
+            .term, .range => count,
             .doc_num => |filter| blk: {
                 if (filter.producer != null) break :blk count;
                 const end = @as(u64, offset) + count;
@@ -303,6 +305,13 @@ pub const PredicateProbePlan = struct {
                 self.term_count += 1;
                 break :value .{ .term = i };
             },
+            .range => |range| value: {
+                if (self.range_count == self.ranges.len) return error.UnsupportedPredicateProbe;
+                const i: u8 = @intCast(self.range_count);
+                self.ranges[i] = range;
+                self.range_count += 1;
+                break :value .{ .range = i };
+            },
             .doc_num => |filter_| value: {
                 if (filter_.producer) |producer| {
                     self.has_batch_producer = self.has_batch_producer or producer.contains_many != null;
@@ -345,19 +354,32 @@ pub const ExactPredicateProbe = struct {
     plan: *const PredicateProbePlan,
     terms: [32]?ExactTermProbe = @splat(null),
     opened: [32]bool = @splat(false),
+    range_readers: [16]?*typed_dv.TypedDocValuesReader = @splat(null),
+    ranges_opened: [16]bool = @splat(false),
+    range_lease: ?index_mod.IndexSnapshot.SegmentLease = null,
     snapshot: *const index_mod.IndexSnapshot,
     ordinal: usize,
     offset: u32,
     pub fn create(a: Allocator, plan: *const PredicateProbePlan, snapshot: *const index_mod.IndexSnapshot, ordinal: usize, offset: u32) !?*ExactPredicateProbe {
         var lease = try snapshot.leaseSegment(ordinal);
-        defer lease.deinit();
+        var transfer = false;
+        defer if (!transfer) lease.deinit();
         for (plan.terms[0..plan.term_count]) |term| if (try lease.entry.reader.getSection(term.term.field, .synonym) != null) return null;
         const self = try a.create(ExactPredicateProbe);
         self.* = .{ .a = a, .plan = plan, .snapshot = snapshot, .ordinal = ordinal, .offset = offset };
+        if (plan.range_count != 0) {
+            self.range_lease = lease;
+            transfer = true;
+        }
         return self;
     }
     pub fn destroy(self: *@This()) void {
         for (&self.terms) |*term| if (term.*) |*probe| probe.deinit();
+        for (self.range_readers) |optional| if (optional) |reader| {
+            reader.deinit();
+            self.a.destroy(reader);
+        };
+        if (self.range_lease) |*lease| lease.deinit();
         self.a.destroy(self);
     }
     pub fn contains(self: *@This(), doc: u32) !bool {
@@ -378,7 +400,7 @@ pub const ExactPredicateProbe = struct {
         try self.plan.control.check();
         return switch (self.plan.nodes[index]) {
             .constant => |value| if (value) active else 0,
-            .term => blk: {
+            .term, .range => blk: {
                 var result: u64 = 0;
                 var remaining = active;
                 while (remaining != 0) {
@@ -467,6 +489,22 @@ pub const ExactPredicateProbe = struct {
                     self.opened[i] = true;
                 }
                 break :value if (self.terms[i]) |*term| try term.contains(doc) else false;
+            },
+            .range => |i| value: {
+                const range = self.plan.ranges[i];
+                try range.control.check();
+                if (!self.ranges_opened[i]) {
+                    if (try self.range_lease.?.entry.reader.typedDocValuesScoped(self.a, range.field)) |opened| {
+                        var reader = opened;
+                        errdefer reader.deinit();
+                        const owned = try self.a.create(typed_dv.TypedDocValuesReader);
+                        owned.* = reader;
+                        self.range_readers[i] = owned;
+                    }
+                    self.ranges_opened[i] = true;
+                }
+                const reader = self.range_readers[i] orelse break :value false;
+                break :value try range.matchesDocument(reader, doc);
             },
             .doc_num => |filter_| value: {
                 const global = try std.math.add(u32, self.offset, doc);
@@ -1721,14 +1759,28 @@ pub const RangeFilter = struct {
                 .numeric_val => |number| number,
                 else => continue,
             };
-            const in_range = if (self.exact_bounds) |bounds|
-                self.matchesExact(value, bounds)
-            else
-                self.matches(typed_dv.numericValueAsF64(value));
-            if (in_range) try result.add(@intCast(doc_id));
+            if (self.matchesNumeric(value)) try result.add(@intCast(doc_id));
         }
 
         return result;
+    }
+
+    fn matchesDocument(self: RangeFilter, reader: *const typed_dv.TypedDocValuesReader, doc: u32) !bool {
+        const value: typed_dv.NumericValue = switch (reader.value_type) {
+            .f64_val => .{ .f64_val = (try reader.getF64(doc)) orelse return false },
+            .i64_val => .{ .i64_val = (try reader.getI64(doc)) orelse return false },
+            .u64_val => .{ .u64_val = (try reader.getU64(doc)) orelse return false },
+            .numeric_val => (try reader.getNumeric(doc)) orelse return false,
+            else => return false,
+        };
+        return self.matchesNumeric(value);
+    }
+
+    fn matchesNumeric(self: RangeFilter, value: typed_dv.NumericValue) bool {
+        return if (self.exact_bounds) |bounds|
+            self.matchesExact(value, bounds)
+        else
+            self.matches(typed_dv.numericValueAsF64(value));
     }
 
     fn matchesExact(self: RangeFilter, value: typed_dv.NumericValue, bounds: ExactBounds) bool {

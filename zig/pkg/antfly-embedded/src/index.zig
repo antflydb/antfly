@@ -2195,12 +2195,6 @@ pub const IndexSnapshot = struct {
 
     /// Stream directly into compact membership without a corpus-sized u32
     /// result array. Check request control even across deleted/sparse rows.
-    pub fn hasGraphOrdinalNavigation(self: *IndexSnapshot) bool {
-        const navigation = self.graph_predicates.acquireOrdinalNavigation() orelse return false;
-        navigation.release();
-        return true;
-    }
-
     fn graphOrdinalNavigation(self: *IndexSnapshot, control: query_mod.ExecutionControl) !?*GraphOrdinalNavigation {
         const cache = &self.graph_predicates;
         if (cache.acquireOrdinalNavigation()) |navigation| return navigation;
@@ -2209,15 +2203,15 @@ pub const IndexSnapshot = struct {
         if (cache.acquireOrdinalNavigation()) |navigation| return navigation;
         if (self.graph_ordinal_incomplete) return null;
         const manager = self.graph_predicates.manager.load(.acquire) orelse return null;
-        if (!try self.hasDocOrdinalCoverage()) {
-            self.graph_ordinal_incomplete = true;
-            return null;
-        }
         var total: u32 = 0;
         for (self.segments) |segment| total = try std.math.add(u32, total, segment.reader.doc_count);
         const bytes = @as(usize, total) * @sizeOf(GraphOrdinalNavigation.Entry) + @sizeOf(GraphOrdinalNavigation);
         if (bytes > 32 * 1024 * 1024 or !cache.ensureReclaimer(manager)) return null;
         if (manager.admissionDecision(.graph_predicate_cache, bytes).pressure != .normal) return null;
+        if (!try self.hasDocOrdinalCoverage()) {
+            self.graph_ordinal_incomplete = true;
+            return null;
+        }
         if (!cache.reserve(bytes)) return null;
         var owned = true;
         defer if (owned) {
@@ -2265,53 +2259,134 @@ pub const IndexSnapshot = struct {
 
     /// The directory maps physical documents, including deleted copies.
     /// Callers still apply the active segment deletion mask when probing.
-    fn graphFrontierDocNumsFromSegmentsAlloc(self: *IndexSnapshot, alloc: Allocator, frontier: anytype, control: query_mod.ExecutionControl) !?roaring.RoaringBitmap {
-        var docs = roaring.RoaringBitmap.init(alloc);
-        var owned = true;
-        defer if (owned) docs.deinit();
-        var offset: u32 = 0;
-        for (self.segments, 0..) |segment, segment_index| {
-            try control.check();
-            if (segment.liveDocCount() != 0) {
-                var lease = try self.leaseSegment(segment_index);
-                defer lease.deinit();
-                const inverse = segment_mod.InverseDocOrdinalReader.init(&lease.entry.reader) catch |err| switch (err) {
-                    error.InvalidSegment, error.CrcMismatch => return null,
-                    else => return err,
-                };
-                const reader = inverse orelse return null;
-                var keys = frontier.keyIterator();
-                while (keys.next()) |key| {
-                    try control.check();
-                    reader.addMatches(key.*, offset, &docs) catch |err| switch (err) {
-                        error.InvalidSegment, error.CrcMismatch => return null,
-                        else => return err,
-                    };
-                }
-            }
-            offset = try std.math.add(u32, offset, segment.reader.doc_count);
+    pub const GraphFrontierDocs = struct {
+        bitmap: roaring.RoaringBitmap,
+        ordinals: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+        alloc: Allocator,
+
+        fn init(alloc: Allocator) GraphFrontierDocs {
+            return .{ .bitmap = roaring.RoaringBitmap.init(alloc), .alloc = alloc };
         }
-        owned = false;
-        return docs;
+
+        pub fn deinit(self: *GraphFrontierDocs) void {
+            self.bitmap.deinit();
+            self.ordinals.deinit(self.alloc);
+        }
+
+        pub fn add(self: *GraphFrontierDocs, doc: u32, ordinal: u32) !void {
+            try self.bitmap.add(doc);
+            try self.ordinals.put(self.alloc, doc, ordinal);
+        }
+    };
+
+    fn seekGraphSegmentFrontier(
+        reader: *const SegmentReader,
+        frontier: anytype,
+        control: query_mod.ExecutionControl,
+        offset: u32,
+        docs: *GraphFrontierDocs,
+    ) !bool {
+        const inverse = (try segment_mod.InverseDocOrdinalReader.init(reader)) orelse return false;
+        var keys = frontier.keyIterator();
+        while (keys.next()) |key| {
+            try control.check();
+            try inverse.addMatches(key.*, offset, docs, control);
+        }
+        return true;
     }
 
-    pub fn graphFrontierDocNumsAlloc(self: *IndexSnapshot, alloc: Allocator, frontier: anytype, control: query_mod.ExecutionControl) !?roaring.RoaringBitmap {
-        if (try self.graphFrontierDocNumsFromSegmentsAlloc(alloc, frontier, control)) |docs| return docs;
-        const navigation = (try self.graphOrdinalNavigation(control)) orelse return null;
-        defer navigation.release();
-        const entries = navigation.entries;
-        var docs = roaring.RoaringBitmap.init(alloc);
-        errdefer docs.deinit();
+    fn addGraphNavigationFrontier(
+        navigation: *const GraphOrdinalNavigation,
+        frontier: anytype,
+        control: query_mod.ExecutionControl,
+        docs: *GraphFrontierDocs,
+    ) !void {
         var keys = frontier.keyIterator();
         while (keys.next()) |key| {
             try control.check();
             var low: usize = 0;
-            var high = entries.len;
+            var high = navigation.entries.len;
             while (low < high) {
                 const middle = low + (high - low) / 2;
-                if (entries[middle].ordinal < key.*) low = middle + 1 else high = middle;
+                if (navigation.entries[middle].ordinal < key.*) low = middle + 1 else high = middle;
             }
-            while (low < entries.len and entries[low].ordinal == key.*) : (low += 1) try docs.add(entries[low].doc);
+            while (low < navigation.entries.len and navigation.entries[low].ordinal == key.*) : (low += 1) {
+                try control.check();
+                try docs.add(navigation.entries[low].doc, key.*);
+            }
+        }
+    }
+
+    pub fn graphFrontierDocNumsAlloc(self: *IndexSnapshot, alloc: Allocator, frontier: anytype, control: query_mod.ExecutionControl) !GraphFrontierDocs {
+        var docs = GraphFrontierDocs.init(alloc);
+        errdefer docs.deinit();
+        if (frontier.count() == 0) return docs;
+        if (self.graph_predicates.acquireOrdinalNavigation()) |navigation| {
+            defer navigation.release();
+            try addGraphNavigationFrontier(navigation, frontier, control, &docs);
+            return docs;
+        }
+        var attempted_shared = false;
+        var offset: u32 = 0;
+        var ids: std.StringHashMapUnmanaged(u32) = .empty;
+        defer ids.deinit(alloc);
+        var scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
+        defer scratch.deinit();
+        for (self.segments, 0..) |segment, segment_index| {
+            try control.check();
+            const upper = try std.math.add(u32, offset, segment.reader.doc_count);
+            defer offset = upper;
+            if (segment.liveDocCount() == 0) continue;
+            var lease = try self.leaseSegment(segment_index);
+            defer lease.deinit();
+            var local = GraphFrontierDocs.init(alloc);
+            defer local.deinit();
+            const seek = seekGraphSegmentFrontier(&lease.entry.reader, frontier, control, offset, &local) catch |err| switch (err) {
+                error.InvalidSegment, error.CrcMismatch => false,
+                else => return err,
+            };
+            if (seek) {
+                var pairs = local.ordinals.iterator();
+                while (pairs.next()) |pair| try docs.add(pair.key_ptr.*, pair.value_ptr.*);
+                continue;
+            }
+
+            if (!attempted_shared) {
+                attempted_shared = true;
+                const shared = self.graphOrdinalNavigation(control) catch |err| switch (err) {
+                    error.OutOfMemory, error.InvalidSegment, error.CrcMismatch => null,
+                    else => return err,
+                };
+                if (shared) |navigation| {
+                    defer navigation.release();
+                    try addGraphNavigationFrontier(navigation, frontier, control, &docs);
+                    return docs;
+                }
+            }
+
+            // Stream the historical segment once per frontier, independent of
+            // predicate cardinality. Retain only matching physical rows.
+            var cursor = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
+            lease.entry.shared.lockDeletionShared();
+            defer lease.entry.shared.unlockDeletionShared();
+            for (0..segment.reader.doc_count) |i| {
+                if (i % 256 == 0) try control.check();
+                const doc: u32 = @intCast(i);
+                if (lease.entry.shared.deleted) |deleted| if (deleted.contains(doc)) continue;
+                const ordinal = if (try cursor.get(doc)) |ordinal| known: {
+                    if (!frontier.contains(ordinal)) continue;
+                    break :known ordinal;
+                } else legacy: {
+                    if (ids.count() == 0) {
+                        var keys = frontier.iterator();
+                        while (keys.next()) |key| try ids.put(alloc, key.value_ptr.*, key.key_ptr.*);
+                    }
+                    scratch.reset();
+                    const key = (try lease.entry.reader.storedIdScoped(scratch.allocator(), doc)) orelse continue;
+                    break :legacy ids.get(key) orelse continue;
+                };
+                try docs.add(offset + doc, ordinal);
+            }
         }
         return docs;
     }
