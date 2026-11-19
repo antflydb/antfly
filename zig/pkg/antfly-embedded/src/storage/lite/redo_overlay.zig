@@ -267,6 +267,9 @@ pub const SharedRedoOverlay = struct {
     /// this is how an instance learns another process changed a root's
     /// logical content after its own checkpoint (`replayedSequence`).
     replayed_sequence: [3]std.atomic.Value(u64) = .{ .init(0), .init(0), .init(0) },
+    /// Highest sequence of any version added under each root, from this
+    /// process's own appends or a replay (`latestSequence`).
+    latest_sequence: [3]std.atomic.Value(u64) = .{ .init(0), .init(0), .init(0) },
     /// Every log record at or below this sequence is in the overlay (or in
     /// the tree, below a fold). Own appends advance it under the writer
     /// lease, and a writer replays other processes' records before its own
@@ -497,6 +500,10 @@ pub const SharedRedoOverlay = struct {
         return self.applied_through.load(.acquire);
     }
 
+    pub fn latestSequence(self: *const SharedRedoOverlay, root: u8) u64 {
+        return self.latest_sequence[root].load(.acquire);
+    }
+
     pub fn replayedSequence(self: *const SharedRedoOverlay, root: u8) u64 {
         return self.replayed_sequence[root].load(.acquire);
     }
@@ -515,6 +522,7 @@ pub const SharedRedoOverlay = struct {
     ) !void {
         const allocator = owned_allocator;
         std.debug.assert(root < 3);
+        _ = self.latest_sequence[root].fetchMax(sequence, .acq_rel);
         // perf/lwa-fold-churn: the lock now covers `entry_pool.create` too
         // (moved ahead of where it used to run unlocked) -- the pool's own
         // free list is shared, mutable state this struct's single mutex
@@ -1147,6 +1155,7 @@ pub const SharedRedoOverlay = struct {
             // handed a pointer the pool's own free list does not own.
             const gop = try self.maps[root].getOrPut(allocator, key);
             _ = self.replayed_sequence[root].fetchMax(sequence, .acq_rel);
+            _ = self.latest_sequence[root].fetchMax(sequence, .acq_rel);
             // A catch-up replays records this overlay may already hold, or
             // ones older than this process's own later appends. Keep each
             // chain newest-first and each sequence once.

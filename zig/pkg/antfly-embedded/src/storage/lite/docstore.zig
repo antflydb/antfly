@@ -5537,10 +5537,17 @@ pub const Store = struct {
             }
             const result = self.request.result;
             const sequence = self.request.committed_sequence;
+            const index_only = self.request.index_only;
             self.store.commit_mutex.unlock(io);
             self.store.allocator.destroy(self.request);
             try result;
-            if (self.origin) |origin| origin.adoptWriterTip(self.store);
+            if (self.origin) |origin| {
+                origin.adoptWriterTip(self.store);
+                // The writer committed index content its own runtime did not
+                // build: its indexes, cached in memory, must reload before
+                // they publish again (`NativeFile.adoptionEpoch`).
+                if (index_only) _ = self.store.file.adoption_epoch.fetchAdd(1, .acq_rel);
+            }
             return sequence;
         }
     };
