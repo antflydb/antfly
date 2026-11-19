@@ -17834,6 +17834,11 @@ fn processAsset(
             break :settled try token.accepted(runtime.alloc, &read);
         };
         if (settled) {
+            // The accepted output already matches this context. Its
+            // dependency state still advances to the context just read (and
+            // a snapshot source schedules its next refresh; the timer that
+            // triggered this rebuild was consumed).
+            if (context_publish) |publish| try publishRetainedContextOutput(runtime, request.doc_key, requestArtifactName(request), publish);
             try finishAcceptedAssetGraph(runtime, request);
             try settleAcceptedMediaOutput(runtime, request, window);
             try retireMediaPassForAssetRequest(runtime, request);
@@ -18160,6 +18165,32 @@ fn applyContextPublishTxn(runtime: *EnrichmentRuntime, batch: anytype, doc_key: 
         else => return err,
     };
     try context_dependency_store.applyPlanToTxn(batch, &plan);
+}
+
+/// Publish dependency state for an output reused as is (the rendered
+/// context matched an accepted output): no new lineage version, freshness
+/// and frontier advance, and a snapshot source's next refresh is scheduled.
+fn publishRetainedContextOutput(runtime: *EnrichmentRuntime, doc_key: []const u8, artifact: []const u8, publish: *const ContextPublish) !void {
+    const resolution = &publish.resolution;
+    const now_ms: u64 = @intCast(@divTrunc(runtime.clock.nowRealtimeNs(), std.time.ns_per_ms));
+    const input: context_dependency_store.PublishInput = .{
+        .capture = publish.capture,
+        .tuples = publish.tuples,
+        .input_fingerprint = resolution.rendered.fingerprint,
+        .frontier = resolution.frontier,
+        .published_at_ms = @intCast(now_ms),
+        .inputs = resolution.inputs,
+        .queries = resolution.queries,
+        .absent = resolution.absent,
+        .new_version = false,
+        .snapshot = resolution.snapshot,
+        .refresh_due_ms = if (resolution.refresh_interval_ms == 0) 0 else now_ms +| resolution.refresh_interval_ms,
+    };
+    _ = commitContextDependencyPlan(runtime, context_dependency_store.planPublish, .{ doc_key, artifact, input }) catch |err| switch (err) {
+        // A newer invalidation already re-queued this document.
+        error.DependencyGenerationSuperseded => return,
+        else => return err,
+    };
 }
 
 fn recordContextPublishIntent(runtime: *EnrichmentRuntime, doc_key: []const u8, artifact: []const u8, publish: *const ContextPublish, output: []const u8) !void {
