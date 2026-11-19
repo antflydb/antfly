@@ -8565,6 +8565,40 @@ test "capi native recovery agenda bounds a turn and acknowledges dropped namespa
     try std.testing.expectEqual(@as(u8, 0), root.sql_ddl_agenda_after_len);
 }
 
+test "capi native logical generations maintenance snapshot tracks the index scopes its open loaded" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("snapshot-loaded-scopes");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+    const id = try api.publishHandle(wrapper);
+    defer api.antfly_db_close(id);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(
+        "{\"name\":\"links\",\"kind\":\"graph\",\"config_json\":\"{\\\"edge_types\\\":[{\\\"name\\\":\\\"R\\\",\\\"field\\\":\\\"links\\\"}]}\"}",
+    )));
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice(
+        "{\"inserts\":{\"doc\":{\"body\":\"indexed\",\"links\":[\"other\"]}},\"sync_level\":\"full_index\"}",
+    ), &out));
+    const connection = wrapper.lite_connection.?;
+    var lease = try connection.acquire();
+    defer {
+        lease.close();
+        connection.gate.mutex.unlock(io);
+    }
+    const owner = connection.owner;
+    const snapshot = try owner.refreshMaintenanceSnapshot(owner.current.?, true);
+    // The DB loads its index catalogs during open, before the snapshot gets
+    // its write target. Without these scopes a peer's fold falls back to
+    // the table-wide comparison.
+    try std.testing.expect(snapshot.owned_lite_backend.?.native_docstore.?.loaded_index_scopes.count() != 0);
+}
+
 test "capi native logical generations preserve adaptive retirement budgets across snapshot replacement" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("retirement-budget-refresh", 5000, .batch);

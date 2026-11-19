@@ -1622,13 +1622,13 @@ pub const Region = struct {
             const head = hdr.writer_ticket_head.load(.acquire);
             if (head == my_ticket) break;
             if (Io.Clock.now(.awake, io).compare(.gte, deadline)) {
-                self.ticketAbandonedFlags()[my_ticket % hdr.max_readers].store(1, .release);
+                self.abandonTicket(my_ticket);
                 return error.Timeout;
             }
             // A canceled waiter gives its ticket up like a timed-out one:
             // its owner stays alive, so nobody else would ever skip it.
             countedFutexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, head, deadline) catch {
-                self.ticketAbandonedFlags()[my_ticket % hdr.max_readers].store(1, .release);
+                self.abandonTicket(my_ticket);
                 return error.Canceled;
             };
             const head2 = hdr.writer_ticket_head.load(.acquire);
@@ -1785,6 +1785,18 @@ pub const Region = struct {
     /// step, and only the one that wins should continue the skip-chain.
     /// The others simply loop back to their own wait, see the new `head`
     /// value, and proceed normally.
+    /// Gives up a ticket that has not reached its turn yet. The previous
+    /// writer may already have advanced `head` to it and checked its flag
+    /// before the flag was set; then nobody would skip it until a waiter
+    /// behind it ran out its wait. Skip it here once it is the head: the
+    /// compare-and-swap in `tryHelpDeadTicketAt` moves `head` only off this
+    /// exact ticket, and nothing else can move it off without the flag.
+    fn abandonTicket(self: *Region, ticket: u32) void {
+        const hdr = self.header();
+        self.ticketAbandonedFlags()[ticket % hdr.max_readers].store(1, .release);
+        if (hdr.writer_ticket_head.load(.acquire) == ticket) self.tryHelpDeadTicketAt(ticket);
+    }
+
     fn tryHelpDeadTicketAt(self: *Region, stuck_head: u32) void {
         if (!self.ticketResolvedWithoutOwning(stuck_head)) return;
         const hdr = self.header();
@@ -4004,6 +4016,32 @@ test "shared lock region: a canceled fair waiter gives up its ticket" {
     region.releaseWriter();
     _ = try region.acquireWriterFairBounded(io, pid, soon(io), null);
     region.releaseWriter();
+}
+
+test "shared lock region: a ticket abandoned after the handoff reached it is skipped at once" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-handoff.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+    var region = try Region.open(a, io, db_path);
+    defer region.close();
+    const pid: u32 = @bitCast(std.c.getpid());
+    const hdr = region.header();
+    // A waiter's ticket that the previous writer's handoff already made the
+    // head, before the waiter marked it abandoned.
+    const ticket = region.tryClaimTicket(hdr.writer_ticket_tail.load(.monotonic), pid).?;
+    try std.testing.expectEqual(ticket, hdr.writer_ticket_head.load(.monotonic));
+    region.abandonTicket(ticket);
+    try std.testing.expectEqual(ticket +% 1, hdr.writer_ticket_head.load(.monotonic));
+    // The next bounded writer gets in at once instead of waiting it out.
+    const started = Io.Clock.now(.awake, io);
+    _ = try region.acquireWriterFairBounded(io, pid, started.addDuration(.fromSeconds(2)), null);
+    region.releaseWriter();
+    try std.testing.expect(started.durationTo(Io.Clock.now(.awake, io)).toMilliseconds() < 1000);
 }
 
 test "shared lock region: an abandoned ticket does not wedge an earlier or a later one" {
