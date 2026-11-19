@@ -470,7 +470,7 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
         }
         const definition = try cli.readFileAlloc(io, allocator, opts.definition_path.?, 1024 * 1024);
         defer allocator.free(definition);
-        const report = try lite_restore_staging.restoreDataJsonAlloc(allocator, opts.input_path.?, opts.output_path.?, opts.table_name.?, definition, opts.max_input_bytes, opts.max_expanded_bytes);
+        const report = try lite_restore_staging.restoreDataJsonAlloc(allocator, opts.input_path.?, opts.output_path.?, opts.table_name orelse opts.tables_str orelse "", definition, opts.max_input_bytes, opts.max_expanded_bytes);
         defer allocator.free(report);
         try cli.output.writeJsonArtifact(allocator, io, report);
         return;
@@ -705,10 +705,12 @@ fn validateBackupCursor(cursor: []const u8) !void {
 
 fn validateRestoreArgs(opts: RestoreArgs) !void {
     if (opts.data_only or opts.output_path != null or opts.definition_path != null) {
-        if (!opts.data_only or opts.input_path == null or opts.output_path == null or opts.definition_path == null or opts.table_name == null or
-            opts.tables_str != null or opts.backup_id != null or opts.location_explicit or opts.connection != null or opts.url != null or
+        if (!opts.data_only or opts.input_path == null or opts.output_path == null or opts.definition_path == null or
+            (opts.table_name != null and opts.tables_str != null) or opts.backup_id != null or opts.location_explicit or opts.connection != null or opts.url != null or
             opts.restore_mode != null or opts.idempotency_key != null or opts.wait or opts.max_input_bytes == 0 or opts.max_expanded_bytes == 0)
             return error.InvalidRestoreInputTarget;
+        if (opts.table_name) |name| if (name.len == 0) return error.InvalidRestoreInputTarget;
+        if (opts.tables_str) |names| if (names.len == 0) return error.InvalidRestoreInputTarget;
         return;
     }
     if (opts.limits_explicit) return error.InvalidRestoreInputTarget;
@@ -786,9 +788,9 @@ pub const restore_usage =
     \\  antfly restore --input <db.aflite|backup.afb|backup.afb2> --table <name> --connection <id> --location <shared-uri> [--backup-id <id>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
     \\
     \\  Offline data-only restore:
-    \\    antfly restore --data-only --input <db.aflite> --out <new.aflite> --table <name> --definition <trusted.json> [--max-input-bytes N] [--max-expanded-bytes N]
+    \\    antfly restore --data-only --input <db.aflite> --out <new.aflite> [--table <name> | --tables <a,b>] --definition <trusted.json> [--max-input-bytes N] [--max-expanded-bytes N]
     \\  Creates a new standalone file from documents and external dense vectors.
-    \\  The definition supplies schema and indexes; source configuration must match.
+    \\  Omit table selection to stage all tables. A multi-table definition uses {"tables":{"name":{"schema":...,"indexes":...}}}.
     \\  Source jobs and authority are not imported. Existing output is never replaced.
     \\  Success emits a JSON report with source and output SHA-256 hashes.
     \\
@@ -1094,6 +1096,13 @@ test "data restore CLI requires offline output and trusted definition" {
     const opts = try parseRestoreArgs(&iter);
     try validateRestoreArgs(opts);
     try std.testing.expect(opts.data_only);
+    var all = opts;
+    all.table_name = null;
+    try validateRestoreArgs(all);
+    all.tables_str = "records,other";
+    try validateRestoreArgs(all);
+    all.table_name = "records";
+    try std.testing.expectError(error.InvalidRestoreInputTarget, validateRestoreArgs(all));
     try std.testing.expectEqual(@as(u64, 1024), opts.max_input_bytes);
     var invalid = opts;
     invalid.definition_path = null;

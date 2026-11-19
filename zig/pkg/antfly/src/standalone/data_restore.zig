@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Restore one standalone Lite table as data under a caller-owned definition.
+//! Stage a complete selection of standalone Lite tables under caller-owned definitions.
 //! The input is only opened through storage/catalog readers. Its server state,
 //! producer definitions, identities and jobs never become destination authority.
 const std = @import("std");
@@ -39,23 +39,28 @@ const Definition = struct {
     indexes: Value,
 };
 
-pub fn restoreJsonAlloc(a: Allocator, input: []const u8, output: []const u8, table_name: []const u8, definition_json: []const u8, options: Options) ![]u8 {
-    if (input.len == 0 or output.len == 0 or table_name.len == 0 or table_name.len > 256 or definition_json.len > 1024 * 1024 or options.max_input_bytes == 0 or options.max_expanded_bytes == 0)
+// An empty selection restores every table in the source. A named definition
+// map supplies a separate trusted schema/index policy for each table; the
+// original single-table definition is still accepted for one selected table.
+pub fn restoreJsonAlloc(a: Allocator, input: []const u8, output: []const u8, selection: []const u8, definition_json: []const u8, options: Options) ![]u8 {
+    if (input.len == 0 or output.len == 0 or selection.len > 64 * 1024 or definition_json.len > 1024 * 1024 or options.max_input_bytes == 0 or options.max_expanded_bytes == 0)
         return error.InvalidArguments;
-    var definition = try std.json.parseFromSlice(Definition, a, definition_json, .{});
-    defer definition.deinit();
-    try validateDefinition(definition.value);
-    const schema_json = try std.json.Stringify.valueAlloc(a, definition.value.schema, .{});
-    defer a.free(schema_json);
-    const indexes_json = try std.json.Stringify.valueAlloc(a, definition.value.indexes, .{});
-    defer a.free(indexes_json);
-    // The newly built projections and standalone catalog share fresh native
-    // lifecycle identities. They never inherit the upload's incarnations.
-    const output_indexes_json = try local.api_coverage_policy.withMissingIncarnationsAlloc(a, indexes_json);
-    defer a.free(output_indexes_json);
-    var output_indexes = try std.json.parseFromSlice(Value, a, output_indexes_json, .{});
-    defer output_indexes.deinit();
-
+    var definitions = try std.json.parseFromSlice(Value, a, definition_json, .{});
+    defer definitions.deinit();
+    if (definitions.value != .object) return error.InvalidBackupRequest;
+    const named = definitions.value.object.get("tables");
+    if (named != null and (definitions.value.object.count() != 1 or named.? != .object or named.?.object.count() == 0 or named.?.object.count() > 256)) return error.InvalidBackupRequest;
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(a);
+    if (selection.len != 0) {
+        var it = std.mem.splitScalar(u8, selection, ',');
+        while (it.next()) |part| {
+            const name = std.mem.trim(u8, part, " \t");
+            if (name.len == 0 or name.len > 256 or names.items.len == 256) return error.InvalidArguments;
+            for (names.items) |prior| if (std.mem.eql(u8, prior, name)) return error.InvalidArguments;
+            try names.append(a, name);
+        }
+    }
     var io_impl = std.Io.Threaded.init(a, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
@@ -78,41 +83,30 @@ pub fn restoreJsonAlloc(a: Allocator, input: []const u8, output: []const u8, tab
     const projection = try catalog.captureInspectionCatalog(a, local.common_group_ids.main_metadata_group_id, 4096, 16 * 1024 * 1024, .none);
     defer catalog.freeTables(a, projection.tables);
     defer catalog.freeRanges(a, projection.ranges);
-    const table = selected: {
-        // Resolve the primary logical bindings. A released snapshot may have an
-        // older derived name-index version, which must not be rebuilt in source.
+    defer if (selection.len == 0) {
+        for (names.items) |name| a.free(name);
+    };
+    if (names.items.len == 0) {
+        if (projection.tables.len == 0 or projection.tables.len > 256) return error.UnsupportedLiteInspectionLayout;
+        // Use logical bindings rather than guessing from storage names. Reject
+        // unsupported namespaces instead of silently omitting source tables.
         var txn = try catalog.store.beginReadTxn();
         defer txn.abort();
-        var selected: ?@TypeOf(projection.tables[0]) = null;
         for (projection.tables) |table| {
             var binding = try @import("../system_catalog/storage.zig").getByIdLimited(a, &txn, local.common_group_ids.main_metadata_group_id, .table, table.table_id, 1024 * 1024);
             defer if (binding) |*value| value.deinit();
             const name = if (binding) |value| bound: {
+                if (value.value.parent_id != local.system_catalog_domain.default_namespace_id or value.value.native_service != null) return error.UnsupportedLiteInspectionLayout;
                 if (!std.mem.eql(u8, value.value.storage_name, table.name)) return error.InvalidCatalogRecord;
-                if (value.value.parent_id != local.system_catalog_domain.default_namespace_id) continue;
-                if (value.value.native_service != null) return error.InvalidBackupRequest;
                 break :bound value.value.name;
             } else table.name;
-            if (!std.mem.eql(u8, name, table_name)) continue;
-            if (selected != null) return error.UnsupportedLiteInspectionLayout;
-            selected = table;
+            // Bindings own their strings; keep this name until the restore ends.
+            const owned = try a.dupe(u8, name);
+            errdefer a.free(owned);
+            try names.append(a, owned);
         }
-        break :selected selected orelse return error.TableNotFound;
-    };
-    if (table.storage.engine != .local or table.storage_migration != null or table.lake_index_catalog_json.len != 0) return error.UnsupportedLiteInspectionLayout;
-    if (!try jsonEqual(a, table.schema_json, schema_json) or !try emptyArray(a, table.replication_sources_json)) return error.InvalidBackupRequest;
-    try requireIndexes(a, table.indexes_json, definition.value.indexes);
-    var group: ?u64 = null;
-    for (projection.ranges) |range| if (range.table_id == table.table_id) {
-        if (group != null or range.start_key.len != 0) return error.UnsupportedLiteInspectionLayout;
-        if (range.end_key) |end| if (end.len != 0) return error.UnsupportedLiteInspectionLayout;
-        group = range.group_id;
-    };
-    const namespace = try std.fmt.allocPrint(a, "group-{d}/table-db", .{group orelse return error.UnsupportedLiteInspectionLayout});
-    defer a.free(namespace);
-    var store = try local.storage_docstore.DocStore.openRuntime(a, try backend.runtimeStoreForNamespace(namespace));
-    defer store.close();
-
+    }
+    if (named == null and names.items.len != 1) return error.InvalidBackupRequest;
     var nonce: [16]u8 = undefined;
     try io.randomSecure(&nonce);
     const temporary = try std.fmt.allocPrint(a, "{s}.restore-{s}.aflite", .{ output, std.fmt.bytesToHex(nonce, .lower) });
@@ -121,69 +115,127 @@ pub fn restoreJsonAlloc(a: Allocator, input: []const u8, output: []const u8, tab
     const lock = try std.fmt.allocPrint(a, "{s}.lock", .{temporary});
     defer a.free(lock);
     defer std.Io.Dir.cwd().deleteFile(io, lock) catch {};
-    const archive_path = try std.fmt.allocPrint(a, "{s}.afb", .{temporary});
-    defer a.free(archive_path);
-    defer std.Io.Dir.cwd().deleteFile(io, archive_path) catch {};
-    var archive = try std.Io.Dir.cwd().createFile(io, archive_path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
-    defer archive.close(io);
-    var buffer: [64 * 1024]u8 = undefined;
-    var writer = archive.writer(io, &buffer);
-    var limited = staging.LimitedWriter.init(&writer.interface, options.max_expanded_bytes);
-    portable.exportPortableToWriter(a, &store, &limited.interface) catch |err| {
-        if (limited.exceeded) return error.BackupExpansionLimitExceeded;
-        return err;
-    };
-    try writer.end();
-
     var documents: u64 = 0;
     var vectors: u64 = 0;
-    {
-        var target = try openDestination(a, temporary, true);
-        defer target.close();
-        try target.db.setSchemaJson(a, schema_json);
-        // Only caller-owned indexes exist while copying data. Use normal
-        // native mutations so artifact cardinality and publication counters
-        // are maintained together with the document/vector records.
-        var it = output_indexes.value.object.iterator();
-        while (it.next()) |entry| {
-            const public_json = try std.json.Stringify.valueAlloc(a, entry.value_ptr.*, .{});
-            defer a.free(public_json);
-            const config = try local.api_table_index_config.parseIndexConfig(a, entry.key_ptr.*, public_json);
-            defer a.free(config.name);
-            defer a.free(config.config_json);
-            try target.db.addIndex(config);
-        }
-        var copy: Copy = .{ .a = a, .target = &target, .definition = definition.value, .options = options };
-        defer copy.decoder.deinit(a);
-        const inspection_options: portable.FileInspectionOptions = .{
-            .metadata_first = true,
-            .max_input_bytes = options.max_expanded_bytes,
-            .max_logical_bytes = options.max_expanded_bytes,
-            .max_metadata_bytes = 16 * 1024 * 1024,
-            .max_document_bytes = options.max_document_bytes,
+    var remaining_expanded = options.max_expanded_bytes;
+    for (names.items, 0..) |table_name, table_index| {
+        const definition_value = if (named) |map| map.object.get(table_name) orelse return error.InvalidBackupRequest else definitions.value;
+        if (definition_value != .object or definition_value.object.count() != 2) return error.InvalidBackupRequest;
+        const definition: Definition = .{
+            .schema = definition_value.object.get("schema") orelse return error.InvalidBackupRequest,
+            .indexes = definition_value.object.get("indexes") orelse return error.InvalidBackupRequest,
         };
-        _ = try portable.inspectPortableFileBlocks(a, io, archive, inspection_options, &copy, Copy.visit);
-        // Large archives can flush an artifact block before its document block.
-        // Restore documents first, then validate/copy vectors against those keys.
-        copy.vectors_only = true;
-        _ = try portable.inspectPortableFileBlocks(a, io, archive, inspection_options, &copy, Copy.visit);
-        try target.db.runUntilIdle();
-        try target.db.sync(true);
-        try target.db.syncIndexes(true);
-        documents = copy.documents;
-        vectors = copy.vectors;
-        // Assign the public name to the fresh standalone table. Its native
-        // root identity was fixed before building any derived indexes.
-        const identity = connection.embeddedRootIdentity();
-        var target_catalog = try metadata.RaftApplyStore.init(a, .{ .root_dir = "", .borrowed_store = try target.backend.runtimeStoreForNamespace("system/metadata") });
-        defer target_catalog.deinit();
-        try target_catalog.updateStandaloneCatalog(local.common_group_ids.main_metadata_group_id, 0, .{
-            .replace = true,
-            .auxiliary_json = "{}",
-            .tables = &.{.{ .table_id = identity.table_id, .name = table_name, .schema_json = schema_json, .indexes_json = output_indexes_json, .desired_replica_count = 1 }},
-            .ranges = &.{.{ .table_id = identity.table_id, .group_id = identity.shard_id, .range_id = identity.range_id, .doc_identity_shard_id = identity.shard_id, .doc_identity_range_id = identity.range_id, .start_key = "" }},
-        });
-        try target.backend.markStandaloneArtifact();
+        try validateDefinition(definition);
+        const schema_json = try std.json.Stringify.valueAlloc(a, definition.schema, .{});
+        defer a.free(schema_json);
+        const indexes_json = try std.json.Stringify.valueAlloc(a, definition.indexes, .{});
+        defer a.free(indexes_json);
+        const output_indexes_json = try local.api_coverage_policy.withMissingIncarnationsAlloc(a, indexes_json);
+        defer a.free(output_indexes_json);
+        var output_indexes = try std.json.parseFromSlice(Value, a, output_indexes_json, .{});
+        defer output_indexes.deinit();
+        var table_options = options;
+        table_options.max_documents -= documents;
+        const table = selected: {
+            // Resolve the primary logical bindings. A released snapshot may have an
+            // older derived name-index version, which must not be rebuilt in source.
+            var txn = try catalog.store.beginReadTxn();
+            defer txn.abort();
+            var selected: ?@TypeOf(projection.tables[0]) = null;
+            for (projection.tables) |table| {
+                var binding = try @import("../system_catalog/storage.zig").getByIdLimited(a, &txn, local.common_group_ids.main_metadata_group_id, .table, table.table_id, 1024 * 1024);
+                defer if (binding) |*value| value.deinit();
+                const name = if (binding) |value| bound: {
+                    if (!std.mem.eql(u8, value.value.storage_name, table.name)) return error.InvalidCatalogRecord;
+                    if (value.value.parent_id != local.system_catalog_domain.default_namespace_id) continue;
+                    if (value.value.native_service != null) return error.InvalidBackupRequest;
+                    break :bound value.value.name;
+                } else table.name;
+                if (!std.mem.eql(u8, name, table_name)) continue;
+                if (selected != null) return error.UnsupportedLiteInspectionLayout;
+                selected = table;
+            }
+            break :selected selected orelse return error.TableNotFound;
+        };
+        if (table.storage.engine != .local or table.storage_migration != null or table.lake_index_catalog_json.len != 0) return error.UnsupportedLiteInspectionLayout;
+        if (!try jsonEqual(a, table.schema_json, schema_json) or !try emptyArray(a, table.replication_sources_json)) return error.InvalidBackupRequest;
+        try requireIndexes(a, table.indexes_json, definition.indexes);
+        var group: ?u64 = null;
+        for (projection.ranges) |range| if (range.table_id == table.table_id) {
+            if (group != null or range.start_key.len != 0) return error.UnsupportedLiteInspectionLayout;
+            if (range.end_key) |end| if (end.len != 0) return error.UnsupportedLiteInspectionLayout;
+            group = range.group_id;
+        };
+        const namespace = try std.fmt.allocPrint(a, "group-{d}/table-db", .{group orelse return error.UnsupportedLiteInspectionLayout});
+        defer a.free(namespace);
+        var store = try local.storage_docstore.DocStore.openRuntime(a, try backend.runtimeStoreForNamespace(namespace));
+        defer store.close();
+
+        const archive_path = try std.fmt.allocPrint(a, "{s}.afb", .{temporary});
+        defer a.free(archive_path);
+        defer std.Io.Dir.cwd().deleteFile(io, archive_path) catch {};
+        var archive = try std.Io.Dir.cwd().createFile(io, archive_path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        defer archive.close(io);
+        var buffer: [64 * 1024]u8 = undefined;
+        var writer = archive.writer(io, &buffer);
+        var limited = staging.LimitedWriter.init(&writer.interface, remaining_expanded);
+        portable.exportPortableToWriter(a, &store, &limited.interface) catch |err| {
+            if (limited.exceeded) return error.BackupExpansionLimitExceeded;
+            return err;
+        };
+        try writer.end();
+        var expanded_bytes: u64 = 0;
+
+        {
+            var target = try openTableDestination(a, temporary, table_index == 0, table_index);
+            defer target.close();
+            try target.db.setSchemaJson(a, schema_json);
+            // Only caller-owned indexes exist while copying data. Use normal
+            // native mutations so artifact cardinality and publication counters
+            // are maintained together with the document/vector records.
+            var it = output_indexes.value.object.iterator();
+            while (it.next()) |entry| {
+                const public_json = try std.json.Stringify.valueAlloc(a, entry.value_ptr.*, .{});
+                defer a.free(public_json);
+                const config = try local.api_table_index_config.parseIndexConfig(a, entry.key_ptr.*, public_json);
+                defer a.free(config.name);
+                defer a.free(config.config_json);
+                try target.db.addIndex(config);
+            }
+            var copy: Copy = .{ .a = a, .target = &target, .definition = definition, .options = table_options };
+            defer copy.decoder.deinit(a);
+            const inspection_options: portable.FileInspectionOptions = .{
+                .metadata_first = true,
+                .max_input_bytes = remaining_expanded,
+                .max_logical_bytes = remaining_expanded,
+                .max_metadata_bytes = 16 * 1024 * 1024,
+                .max_document_bytes = options.max_document_bytes,
+            };
+            const inspection = try portable.inspectPortableFileBlocks(a, io, archive, inspection_options, &copy, Copy.visit);
+            expanded_bytes = @max(inspection.size_bytes, inspection.logical_bytes);
+            // Large archives can flush an artifact block before its document block.
+            // Restore documents first, then validate/copy vectors against those keys.
+            copy.vectors_only = true;
+            _ = try portable.inspectPortableFileBlocks(a, io, archive, inspection_options, &copy, Copy.visit);
+            try target.db.runUntilIdle();
+            try target.db.sync(true);
+            try target.db.syncIndexes(true);
+            documents += copy.documents;
+            vectors += copy.vectors;
+            // Assign the public name to the fresh standalone table. Its native
+            // root identity was fixed before building any derived indexes.
+            const identity = destinationIdentity(table_index);
+            var target_catalog = try metadata.RaftApplyStore.init(a, .{ .root_dir = "", .borrowed_store = try target.backend.runtimeStoreForNamespace("system/metadata") });
+            defer target_catalog.deinit();
+            try target_catalog.updateStandaloneCatalog(local.common_group_ids.main_metadata_group_id, try target_catalog.standaloneRevision(), .{
+                .replace = table_index == 0,
+                .auxiliary_json = "{}",
+                .tables = &.{.{ .table_id = identity.table_id, .name = table_name, .schema_json = schema_json, .indexes_json = output_indexes_json, .desired_replica_count = 1 }},
+                .ranges = &.{.{ .table_id = identity.table_id, .group_id = identity.shard_id, .range_id = identity.range_id, .doc_identity_shard_id = identity.shard_id, .doc_identity_range_id = identity.range_id, .start_key = "" }},
+            });
+            try target.backend.markStandaloneArtifact();
+        }
+        remaining_expanded -= expanded_bytes;
     }
     // Do not publish an output if the source name or bytes changed while the
     // read-only catalog and portable readers were using it.
@@ -200,8 +252,8 @@ pub fn restoreJsonAlloc(a: Allocator, input: []const u8, output: []const u8, tab
         .report_version = 1,
         .operation = "data_restore",
         .source = .{ .sha256 = &source_digest, .size_bytes = initial.size, .tables = projection.tables.len },
-        .output = .{ .sha256 = &result_digest, .size_bytes = result_stat.size, .table = table_name },
-        .inventory = .{ .documents = documents, .artifact_records = vectors, .shards = 1 },
+        .output = .{ .sha256 = &result_digest, .size_bytes = result_stat.size, .table = if (names.items.len == 1) names.items[0] else null, .tables = names.items },
+        .inventory = .{ .documents = documents, .artifact_records = vectors, .shards = names.items.len },
     }, .{});
     errdefer a.free(json);
     try std.Io.Dir.hardLink(.cwd(), temporary, .cwd(), output, io, .{});
@@ -209,14 +261,26 @@ pub fn restoreJsonAlloc(a: Allocator, input: []const u8, output: []const u8, tab
     return json;
 }
 
+fn destinationIdentity(index: usize) @TypeOf(connection.embeddedRootIdentity()) {
+    var identity = connection.embeddedRootIdentity();
+    identity.table_id += index;
+    identity.shard_id += index;
+    identity.range_id += index;
+    return identity;
+}
+
 fn openDestination(a: Allocator, path: []const u8, create: bool) !connection.Connection {
+    return openTableDestination(a, path, create, 0);
+}
+
+fn openTableDestination(a: Allocator, path: []const u8, create: bool, index: usize) !connection.Connection {
     var backend = if (create)
         try backend_mod.Handle.create(a, path, true)
     else
         try backend_mod.Handle.open(a, path, .{});
     errdefer backend.deinit();
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const identity = connection.embeddedRootIdentity();
+    const identity = destinationIdentity(index);
     const namespace = try std.fmt.allocPrint(a, "group-{d}/table-db", .{identity.shard_id});
     defer a.free(namespace);
     var options: db_mod.OpenOptions = .{
@@ -481,11 +545,13 @@ fn createTestSource(a: Allocator, path: []const u8, producer: bool) !void {
     });
     // This deliberately is not a runnable restore-job record. A full server
     // startup must not be used to inspect or admit this source.
-    const jobs = try source.backend.runtimeStoreForNamespace("system/api-restore-jobs");
-    var write = try jobs.beginWrite();
-    errdefer write.abort();
-    try write.put("source-only-job", "do not resume");
-    try write.commit();
+    for ([_][]const u8{ "system/api-restore-jobs", "system/auth-users", "system/auth-casbin" }) |name| {
+        const state = try source.backend.runtimeStoreForNamespace(name);
+        var write = try state.beginWrite();
+        errdefer write.abort();
+        try write.put("source-only-state", "must not become destination authority");
+        try write.commit();
+    }
     try source.backend.markStandaloneArtifact();
 }
 
@@ -546,10 +612,12 @@ test "data restore preserves documents and partial external vectors without sour
         if (std.mem.indexOf(u8, response.json, query.expected) == null) std.debug.print("restore query expected {s}: {s}\n", .{ query.expected, response.json });
         try std.testing.expect(std.mem.indexOf(u8, response.json, query.expected) != null);
     }
-    const jobs = try result.backend.runtimeStoreForNamespace("system/api-restore-jobs");
-    var read = try jobs.beginRead();
-    defer read.abort();
-    try std.testing.expectError(error.NotFound, read.get("source-only-job"));
+    for ([_][]const u8{ "system/api-restore-jobs", "system/auth-users", "system/auth-casbin" }) |name| {
+        const state = try result.backend.runtimeStoreForNamespace(name);
+        var read = try state.beginRead();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get("source-only-state"));
+    }
 }
 
 test "data restore rejects hidden producers and never replaces an existing output" {
@@ -606,5 +674,70 @@ test "data restore fails closed on limits corruption and existing outputs" {
         try source.writePositionalAll(io, "trailing garbage", (try source.stat(io)).size);
     }
     try std.testing.expectError(error.InvalidBackupRequest, restoreJsonAlloc(a, input, output, "records", test_definition, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, output, .{}));
+}
+
+fn addSecondTestTable(a: Allocator, path: []const u8) !void {
+    var source = try openTableDestination(a, path, false, 1);
+    defer source.close();
+    try source.db.setSchemaJson(a, test_schema);
+    for ([_][]const u8{ "vectors", "vectors_alt" }) |name| {
+        const config = try local.api_table_index_config.parseIndexConfig(a, name, "{\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"distance_metric\":\"cosine\"}");
+        defer a.free(config.name);
+        defer a.free(config.config_json);
+        try source.db.addIndex(config);
+    }
+    try source.db.batch(.{ .writes = &.{.{ .key = "one", .value = "{\"content\":\"independent second table\",\"_embeddings\":{\"vectors\":[0,1]}}" }}, .sync_level = .write });
+    try source.db.runUntilIdle();
+    try source.db.sync(true);
+    try source.db.syncIndexes(true);
+    const identity = destinationIdentity(1);
+    var catalog = try metadata.RaftApplyStore.init(a, .{ .root_dir = "", .borrowed_store = try source.backend.runtimeStoreForNamespace("system/metadata") });
+    defer catalog.deinit();
+    try catalog.updateStandaloneCatalog(local.common_group_ids.main_metadata_group_id, try catalog.standaloneRevision(), .{
+        .tables = &.{.{ .table_id = identity.table_id, .name = "other", .schema_json = test_schema, .indexes_json = test_indexes, .desired_replica_count = 1 }},
+        .ranges = &.{.{ .table_id = identity.table_id, .group_id = identity.shard_id, .range_id = identity.range_id, .doc_identity_shard_id = identity.shard_id, .doc_identity_range_id = identity.range_id, .start_key = "" }},
+    });
+}
+
+test "data restore stages all or selected tables atomically with aggregate limits" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const input = try std.fs.path.join(a, &.{ root, "source.aflite" });
+    defer a.free(input);
+    try createTestSource(a, input, false);
+    try addSecondTestTable(a, input);
+    const definitions = "{\"tables\":{\"records\":" ++ test_definition ++ ",\"other\":" ++ test_definition ++ "}}";
+    for ([_][]const u8{ "", "records,other", "other" }, 0..) |selection, run| {
+        const output = try std.fmt.allocPrint(a, "{s}/result-{d}.aflite", .{ root, run });
+        defer a.free(output);
+        const report = try restoreJsonAlloc(a, input, output, selection, definitions, .{});
+        defer a.free(report);
+        var parsed = try std.json.parseFromSlice(Value, a, report, .{});
+        defer parsed.deinit();
+        const names = parsed.value.object.get("output").?.object.get("tables").?.array.items;
+        try std.testing.expectEqual(@as(usize, if (run == 2) 1 else 2), names.len);
+        for (names, 0..) |name, index| {
+            var target = try openTableDestination(a, output, false, index);
+            defer target.close();
+            var doc = (try target.db.lookup(a, "one", .{})) orelse return error.MissingDocument;
+            defer doc.deinit(a);
+            const expected = if (std.mem.eql(u8, name.string, "other")) "independent second table" else "first searchable record";
+            try std.testing.expect(std.mem.indexOf(u8, doc.json, expected) != null);
+            try std.testing.expect(target.db.core.index_manager.vectorBlockReadyForDenseIndex("vectors"));
+        }
+    }
+    const output = try std.fs.path.join(a, &.{ root, "rejected.aflite" });
+    defer a.free(output);
+    try std.testing.expectError(error.BackupInputLimitExceeded, restoreJsonAlloc(a, input, output, "records,other", definitions, .{ .max_documents = 2 }));
+    try std.testing.expectError(error.InvalidArguments, restoreJsonAlloc(a, input, output, "records,records", definitions, .{}));
+    try std.testing.expectError(error.InvalidArguments, restoreJsonAlloc(a, input, output, "records,", definitions, .{}));
+    try std.testing.expectError(error.InvalidBackupRequest, restoreJsonAlloc(a, input, output, "", test_definition, .{}));
+    const missing = "{\"tables\":{\"records\":" ++ test_definition ++ "}}";
+    try std.testing.expectError(error.InvalidBackupRequest, restoreJsonAlloc(a, input, output, "records,other", missing, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, output, .{}));
 }

@@ -310,17 +310,30 @@ When a backup's table details exceed the page size, its entry sets
 `table_details_omitted`. Use the backup ID to restore the entire backup.
 
 **Restore data under a trusted definition.** To prepare a standalone file from
-an uploaded standalone Lite table without running that file, use:
+selected tables from an uploaded standalone Lite file without running that file, use:
 
 ```bash
 antfly restore --data-only --input uploaded.aflite --out prepared.aflite \
   --table docs --definition trusted.json
 ```
 
-The caller owns `trusted.json`, which contains `schema` and `indexes` objects.
-The selected table must be in `default.public`, and its authoritative schema
-and indexes must match that definition. Other database/namespace scopes are
-currently unsupported.
+The caller owns `trusted.json`. For one table it contains `schema` and `indexes`
+objects. To restore several tables, supply a definition for each table:
+
+```json
+{"tables": {"docs": {"schema": {}, "indexes": {}}, "notes": {"schema": {}, "indexes": {}}}}
+```
+
+The objects above illustrate the structure; each schema and index definition must
+be complete. Use `--tables docs,notes` to select several tables, or omit both
+`--table` and `--tables` to restore every table in the input. Missing definitions,
+duplicate selections, and unsupported source tables fail the entire operation;
+no partially built output is published. An explicit selection omits all other
+tables. Up to 256 tables are supported, with limits shared across the selection.
+
+Selected tables must be in `default.public`, and their authoritative schemas
+and indexes must match the supplied definitions. Other database/namespace scopes
+are currently unsupported.
 This restricted profile supports document records, the default full-text index,
 and external dense embedding indexes with `name`, `type`, `external: true`,
 `dimension`, and `distance_metric`. It rejects replication sources and stored
@@ -331,17 +344,31 @@ kinds and relational rows are unsupported.
 The source is opened read-only through native storage readers. Its server is
 never started, and its system catalogs, credentials, jobs, identities, and
 source-owned index configuration are never installed in the output. The new
-file gets the selected table name and the caller's definition. This is a
+file gets the selected table names and the caller's definitions. This is a
 restricted data transfer, not a lossless backup of every database feature.
 
 Success emits a JSON report with source/output SHA-256 hashes, file sizes, and
-document/vector counts. `--out` must be a new path; failure before publication
-leaves an existing file untouched. The caller can validate this prepared file
+document/vector counts and the selected table names. `--out` must be a new path;
+failure before publication leaves an existing file untouched. The caller can validate this prepared file
 and select it using its own generation transaction. This command does not
 contact or overwrite a running server.
 
-Defaults are 512 MiB of input, 1 GiB per expanded portable stream or completed
-output, 250,000 documents, and 16 MiB per document. Use `--max-input-bytes` and
+A caller can implement manual one-way synchronization by staging a complete
+selection, validating it, and switching the destination to that generation.
+Documents omitted from the next generation disappear; newly computed vectors
+are included even when document text is unchanged. The caller retains its
+managed instance identity and access controls outside the staged data. Failed
+staging leaves the selected generation untouched; the caller owns activation,
+retry, and recovery. This command is the offline staging primitive, not an
+incremental merge or a live-destination synchronization command.
+
+Restore and restart have different authority: this data-only import excludes
+source jobs and authorization records. Recovery of the same logical instance
+may resume its own accepted work. This restricted profile does not import
+stored enrichment rules; broader restore policies remain separate.
+
+Defaults are 512 MiB of input, 1 GiB across the expanded portable streams and
+for the completed output, 250,000 documents total, and 16 MiB per document. Use `--max-input-bytes` and
 `--max-expanded-bytes` to change the byte limits. Allow space beside the output
 for both the portable scratch file and the new database. A process interruption
 can leave temporary siblings with `.restore-` in their names; remove these only
