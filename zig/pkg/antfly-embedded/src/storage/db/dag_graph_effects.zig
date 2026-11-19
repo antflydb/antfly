@@ -69,6 +69,66 @@ pub const ScanPage = struct {
     replacements: []const Replacement,
 };
 
+/// Advance a single bounded page on the immutable root list for this fence.
+/// The port reads the pinned source and commits the authority command in order.
+/// Read allocations belong to the caller's scratch arena. A completed-root
+/// marker is committed even for an empty root, so resume needs no local state.
+pub fn advanceScan(
+    alloc: A,
+    port: anytype,
+    roots: []const ScanRequest,
+    authority_command: authority.SourceFenceCommand,
+    checkpoint: authority.Contributions.ScanCheckpoint,
+) !bool {
+    if (roots.len == 0 or roots.len > std.math.maxInt(u32)) return error.InvalidDagMutation;
+    var command = authority_command;
+    const scan = command.scan orelse return error.InvalidDagMutation;
+    if (command.action != .scan or scan.page != null) return error.InvalidDagMutation;
+    if (scan.owner_epoch != checkpoint.owner_epoch) return error.GraphConstraintOwnerChanged;
+    var root_index: u32 = 0;
+    var physical_after: ?[]const u8 = null;
+    if (checkpoint.after) |after| {
+        if (after.len < 5) return error.InvalidDagAuthority;
+        root_index = std.mem.readInt(u32, after[0..4], .big);
+        if (root_index >= roots.len) return error.InvalidDagAuthority;
+        switch (after[4]) {
+            0 => {
+                if (after.len == 5) return error.InvalidDagAuthority;
+                physical_after = after[5..];
+            },
+            1 => {
+                if (after.len != 5) return error.InvalidDagAuthority;
+                root_index += 1;
+            },
+            else => return error.InvalidDagAuthority,
+        }
+    }
+    if (root_index == roots.len) return true;
+
+    var source = roots[root_index];
+    if (!std.meta.eql(source.fence, command.fence) or source.after != null)
+        return error.InvalidDagMutation;
+    source.after = physical_after;
+    const page = try port.readSource(alloc, source);
+    if (page.next) |next| {
+        if (next.len == 0 or (physical_after != null and std.mem.order(u8, physical_after.?, next) != .lt))
+            return error.InvalidDagMutation;
+    } else if (!page.exhausted or page.replacements.len != 0) return error.InvalidDagMutation;
+
+    var prefix: [5]u8 = undefined;
+    std.mem.writeInt(u32, prefix[0..4], root_index, .big);
+    prefix[4] = @intFromBool(page.exhausted);
+    const next = try std.mem.concat(alloc, u8, &.{ &prefix, if (page.exhausted) "" else page.next.? });
+    defer alloc.free(next);
+    command.scan.?.page = .{
+        .after = checkpoint.after,
+        .next = next,
+        .replacements = page.replacements,
+    };
+    try port.writePage(command);
+    return page.exhausted and root_index + 1 == roots.len;
+}
+
 /// Read accepted physical graph artifacts from a single fenced root. The
 /// caller supplies the currently admitted catalog generation and owns the arena.
 /// The cursor advances over skipped rows as well as matching relationships.

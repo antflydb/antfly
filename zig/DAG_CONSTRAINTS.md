@@ -72,7 +72,9 @@ current owner epoch and cursor from one storage snapshot.
 A private source-page lookup reads generation-bound graph artifact rows from a
 fenced physical root using its owned key range, with bounded row and byte
 counts. The caller supplies the source catalog generation and must establish
-the owner read barrier before either lookup.
+the owner read barrier before either lookup. The scan driver commits one
+page at a time and persists a root-completion cursor even for an empty root,
+so resumption uses the authority checkpoint.
 An active source fence allows an ordered catalog change only when activation
 proofs match its pinned snapshot. Raft protocol version 31 gates these commands,
 DAG-bearing transaction prepare, and catalog activation proofs. The source-fence

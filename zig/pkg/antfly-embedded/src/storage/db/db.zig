@@ -156091,10 +156091,35 @@ test "db ordered DAG source fence persists with the apply receipt" {
     try std.testing.expectEqual(@as(usize, 1), source_page.value.replacements.len);
     try std.testing.expectEqualStrings("a", source_page.value.replacements[0].source);
     try std.testing.expectEqualStrings("b", source_page.value.replacements[0].targets[0]);
-    request.dag_source_fence.?.scan.?.page = .{ .next = source_page.value.next.?, .replacements = source_page.value.replacements };
-    try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 3 }, true);
-    try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 3 }, true);
-    const cursor = source_page.value.next.?;
+    const Port = struct {
+        db: *DB,
+        source_page: effects.ScanPage,
+
+        pub fn readSource(self: @This(), _: Allocator, source: effects.ScanRequest) !effects.ScanPage {
+            try std.testing.expect(source.after == null);
+            return self.source_page;
+        }
+
+        pub fn writePage(self: @This(), command: dag.SourceFenceCommand) !void {
+            const batch: types.BatchRequest = .{ .dag_source_fence = command };
+            try self.db.applyOrderedCommittedMutation(batch, .{ .term = 1, .index = 3 }, true);
+            try self.db.applyOrderedCommittedMutation(batch, .{ .term = 1, .index = 3 }, true);
+        }
+    };
+    const port: Port = .{ .db = &db, .source_page = source_page.value };
+    const roots: []const effects.ScanRequest = &.{.{
+        .namespace = request.dag_source_fence.?.namespace,
+        .fence = fence,
+        .index_name = "g",
+        .edge_type = "R",
+        .generation = 7,
+    }};
+    try std.testing.expect(try effects.advanceScan(a, port, roots, request.dag_source_fence.?, .{ .owner_epoch = 1, .after = null }));
+    const committed = (try db.dagActivationCheckpoint(a, request.dag_source_fence.?.namespace, domain, fence)).?;
+    defer committed.deinit(a);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 1 }, committed.after.?);
+    try std.testing.expect(try effects.advanceScan(a, port, roots, request.dag_source_fence.?, committed));
+    const cursor = committed.after.?;
     request.dag_source_fence.?.scan.?.page = .{
         .after = cursor,
         .next = "\xff",
