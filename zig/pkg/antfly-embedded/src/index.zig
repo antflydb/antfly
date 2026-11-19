@@ -2383,6 +2383,20 @@ pub const IndexSnapshot = struct {
     }
 
     pub fn graphFrontierDocNumsAlloc(self: *IndexSnapshot, alloc: Allocator, frontier: anytype, control: query_mod.ExecutionControl) !GraphFrontierDocs {
+        var scanned = roaring.RoaringBitmap.init(alloc);
+        defer scanned.deinit();
+        return self.extendGraphFrontierDocNumsAlloc(alloc, frontier, null, &scanned, &scanned, control);
+    }
+
+    pub fn extendGraphFrontierDocNumsAlloc(
+        self: *IndexSnapshot,
+        alloc: Allocator,
+        frontier: anytype,
+        full_frontier: ?@TypeOf(frontier),
+        scanned_legacy: *const roaring.RoaringBitmap,
+        newly_scanned: *roaring.RoaringBitmap,
+        control: query_mod.ExecutionControl,
+    ) !GraphFrontierDocs {
         var docs = GraphFrontierDocs.init(alloc);
         errdefer docs.deinit();
         if (frontier.count() == 0) return docs;
@@ -2401,7 +2415,8 @@ pub const IndexSnapshot = struct {
             try control.check();
             const upper = try std.math.add(u32, offset, segment.reader.doc_count);
             defer offset = upper;
-            if (segment.liveDocCount() == 0) continue;
+            const segment_id: u32 = @intCast(segment_index);
+            if (segment.liveDocCount() == 0 or scanned_legacy.contains(segment_id)) continue;
             var lease = try self.leaseSegment(segment_index);
             defer lease.deinit();
             var local = GraphFrontierDocs.init(alloc);
@@ -2429,19 +2444,21 @@ pub const IndexSnapshot = struct {
                 }
             }
 
-            // Stream the historical segment once per frontier, independent of
-            // predicate cardinality. Retain only matching physical rows.
+            // A legacy scan costs the same regardless of the requested
+            // ordinal count. When the request can retain the complete
+            // legacy frontier, cache it for subsequent clauses.
+            const legacy_frontier = full_frontier orelse frontier;
             var cursor = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
             const live = LiveGraphFrontier{ .target = &docs, .shared = lease.entry.shared, .offset = offset, .control = control };
             for (0..segment.reader.doc_count) |i| {
                 if (i % 256 == 0) try control.check();
                 const doc: u32 = @intCast(i);
                 const ordinal = if (try cursor.get(doc)) |ordinal| known: {
-                    if (!frontier.contains(ordinal)) continue;
+                    if (!legacy_frontier.contains(ordinal)) continue;
                     break :known ordinal;
                 } else legacy: {
                     if (ids.count() == 0) {
-                        var keys = frontier.iterator();
+                        var keys = legacy_frontier.iterator();
                         while (keys.next()) |key| try ids.put(alloc, key.value_ptr.*, key.key_ptr.*);
                     }
                     scratch.reset();
@@ -2450,6 +2467,7 @@ pub const IndexSnapshot = struct {
                 };
                 try live.add(offset + doc, ordinal);
             }
+            if (full_frontier != null) try newly_scanned.add(segment_id);
         }
         return docs;
     }
@@ -2579,6 +2597,16 @@ pub const IndexSnapshot = struct {
     pub fn liveDocCount(self: *const IndexSnapshot) u32 {
         var total: u32 = 0;
         for (self.segments) |*segment| total +|= segment.liveDocCount();
+        return total;
+    }
+
+    /// Physical rows potentially visited by filter execution before deletion
+    /// masks apply. Fully deleted segments contribute no filter work.
+    pub fn filterPhysicalDocCount(self: *const IndexSnapshot) u32 {
+        var total: u32 = 0;
+        for (self.segments) |*segment| if (segment.liveDocCount() != 0) {
+            total +|= segment.reader.doc_count;
+        };
         return total;
     }
 

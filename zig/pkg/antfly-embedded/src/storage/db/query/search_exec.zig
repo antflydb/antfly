@@ -9551,13 +9551,30 @@ const IndexedPredicateEvaluator = struct {
 
     const LocalCache = IndexedClauseCache;
     const FrontierProbeInput = struct {
-        attempted: bool = false,
-        docs: ?index_mod.IndexSnapshot.GraphFrontierDocs = null,
-        covered: ?roaring.RoaringBitmap = null,
+        const Entry = struct { ordinal: u32, previous: ?u32 };
 
-        fn deinit(self: *FrontierProbeInput) void {
-            if (self.docs) |*docs| docs.deinit();
+        attempted: bool = false,
+        heads: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+        entries: std.AutoHashMapUnmanaged(u32, Entry) = .empty,
+        covered: ?roaring.RoaringBitmap = null,
+        scanned_legacy: ?roaring.RoaringBitmap = null,
+
+        fn deinit(self: *FrontierProbeInput, alloc: Allocator) void {
+            self.heads.deinit(alloc);
+            self.entries.deinit(alloc);
             if (self.covered) |*covered| covered.deinit();
+            if (self.scanned_legacy) |*scanned| scanned.deinit();
+        }
+
+        fn add(self: *FrontierProbeInput, alloc: Allocator, doc: u32, ordinal: u32) !void {
+            if (self.entries.get(doc)) |existing| {
+                if (existing.ordinal != ordinal) return error.InvalidSegment;
+                return;
+            }
+            try self.entries.ensureUnusedCapacity(alloc, 1);
+            const previous = self.heads.get(ordinal);
+            try self.heads.put(alloc, ordinal, doc);
+            self.entries.putAssumeCapacity(doc, .{ .ordinal = ordinal, .previous = previous });
         }
     };
 
@@ -9581,16 +9598,16 @@ const IndexedPredicateEvaluator = struct {
         const cache = &self.snapshot.graph_predicates;
         if (try cache.getScoped(self.alloc, key, self.control, scope)) |rows| return rows;
         if (scope) |domain| if (self.probe_input != null) {
-            const live_count = self.snapshot.liveDocCount();
-            const small_frontier = live_count >= 65_536 and domain.cardinality() <= 128;
+            const physical_count = self.snapshot.filterPhysicalDocCount();
+            const small_frontier = physical_count >= 65_536 and domain.cardinality() <= 128;
             const available = if (self.budget) |budget| budget.max_retained_state_bytes -| budget.retained_state_bytes else std.math.maxInt(usize);
-            const estimate = if (small_frontier or @as(u64, live_count) * 8 > available)
-                self.estimateIndexedMembership(query, live_count) catch |err| switch (err) {
+            const estimate = if (small_frontier or @as(u64, physical_count) * 8 > available)
+                self.estimateIndexedMembership(query, physical_count) catch |err| switch (err) {
                     error.Canceled, error.Timeout => return err,
-                    else => live_count,
+                    else => physical_count,
                 }
             else
-                live_count;
+                physical_count;
             const low_headroom = @as(u64, estimate) * 8 > available;
             const prefer_probe = small_frontier and estimate > @max(@as(u64, 256), @as(u64, domain.cardinality()) * 8, self.snapshot.graphOrdinalScanCost() / 32);
             if (prefer_probe or low_headroom or (self.local_cache != null and self.local_cache.?.memory.shouldProbe(key))) {
@@ -9662,29 +9679,50 @@ const IndexedPredicateEvaluator = struct {
             const key = frontier.get(ordinal) orelse return error.InvalidData;
             try missing.put(self.alloc, ordinal, key);
         }
-        if (missing.count() != 0 or memo.docs == null) {
-            var resolved = try self.snapshot.graphFrontierDocNumsAlloc(self.alloc, missing, self.control);
-            var owned = true;
-            defer if (owned) resolved.deinit();
-            if (memo.docs) |*docs| {
-                var pairs = resolved.ordinals.iterator();
-                while (pairs.next()) |pair| {
-                    try self.control.check();
-                    try docs.add(pair.key_ptr.*, pair.value_ptr.*);
+        if (missing.count() != 0) {
+            if (memo.scanned_legacy == null) memo.scanned_legacy = roaring.RoaringBitmap.init(self.alloc);
+            const scanned = &memo.scanned_legacy.?;
+            var newly_scanned = roaring.RoaringBitmap.init(self.alloc);
+            defer newly_scanned.deinit();
+            const available = if (self.budget) |budget| budget.max_retained_state_bytes -| budget.retained_state_bytes else std.math.maxInt(usize);
+            const complete_legacy = @as(u64, frontier.count()) * 96 + 4096 <= available;
+            var resolved = if (complete_legacy)
+                self.snapshot.extendGraphFrontierDocNumsAlloc(self.alloc, missing, frontier, scanned, &newly_scanned, self.control) catch |err| switch (err) {
+                    error.OutOfMemory => fallback: {
+                        newly_scanned.deinit();
+                        newly_scanned = roaring.RoaringBitmap.init(self.alloc);
+                        break :fallback try self.snapshot.extendGraphFrontierDocNumsAlloc(self.alloc, missing, null, scanned, &newly_scanned, self.control);
+                    },
+                    else => return err,
                 }
-            } else {
-                memo.docs = resolved;
-                owned = false;
+            else
+                try self.snapshot.extendGraphFrontierDocNumsAlloc(self.alloc, missing, null, scanned, &newly_scanned, self.control);
+            defer resolved.deinit();
+            var pairs = resolved.ordinals.iterator();
+            while (pairs.next()) |pair| {
+                try self.control.check();
+                try memo.add(self.alloc, pair.key_ptr.*, pair.value_ptr.*);
             }
+            try scanned.orWith(&newly_scanned);
             var ordinals = missing.keyIterator();
             while (ordinals.next()) |ordinal| try covered.add(ordinal.*);
         }
+        var physical_candidates = roaring.RoaringBitmap.init(self.alloc);
+        defer physical_candidates.deinit();
+        requested = scope.iterator();
+        while (requested.next()) |ordinal| {
+            var doc = memo.heads.get(ordinal);
+            while (doc) |physical| {
+                try self.control.check();
+                try physical_candidates.add(physical);
+                doc = memo.entries.get(physical).?.previous;
+            }
+        }
         const filter = (try search_mod.searchQueryToFilterArena(self.scratch, query)).withControl(self.control);
-        const frontier_docs = if (memo.docs) |*docs| docs else return null;
         const plan = try query_mod.PredicateProbePlan.compile(filter);
         var rows = roaring.RoaringBitmap.init(self.alloc);
         errdefer rows.deinit();
-        var candidates = frontier_docs.bitmap.iterator();
+        var candidates = physical_candidates.iterator();
         var next = candidates.next();
         var offset: u32 = 0;
         for (self.snapshot.segments, 0..) |segment, segment_index| {
@@ -9697,8 +9735,6 @@ const IndexedPredicateEvaluator = struct {
             try self.control.check();
             var lease = try self.snapshot.leaseSegment(segment_index);
             defer lease.deinit();
-            const probe = if (plan) |*compiled| try query_mod.ExactPredicateProbe.create(self.alloc, compiled, self.snapshot, segment_index, offset) else null;
-            defer if (probe) |active| active.destroy();
             var pending = roaring.RoaringBitmap.init(self.alloc);
             defer pending.deinit();
             {
@@ -9710,11 +9746,12 @@ const IndexedPredicateEvaluator = struct {
                     const local_doc = doc - offset;
                     next = candidates.next();
                     if (lease.entry.shared.deleted) |deleted| if (deleted.contains(local_doc)) continue;
-                    const ordinal = frontier_docs.ordinals.get(doc) orelse return error.InvalidData;
-                    if (scope.contains(ordinal)) try pending.add(local_doc);
+                    try pending.add(local_doc);
                 }
             }
             if (pending.cardinality() != 0) {
+                const probe = if (plan) |*compiled| try query_mod.ExactPredicateProbe.create(self.alloc, compiled, self.snapshot, segment_index, offset) else null;
+                defer if (probe) |active| active.destroy();
                 var matched = if (probe) |active| result: {
                     var rows_in_segment = roaring.RoaringBitmap.init(self.alloc);
                     errdefer rows_in_segment.deinit();
@@ -9734,7 +9771,7 @@ const IndexedPredicateEvaluator = struct {
                 var docs = matched.iterator();
                 while (docs.next()) |doc| {
                     try self.control.check();
-                    try rows.add(frontier_docs.ordinals.get(offset + doc) orelse return error.InvalidData);
+                    try rows.add((memo.entries.get(offset + doc) orelse return error.InvalidData).ordinal);
                 }
             }
             offset = upper;
@@ -10216,7 +10253,7 @@ pub fn graphIndexedPredicateAlloc(
     if (patternFilterValueHasRole(parsed)) return error.UnsupportedQueryRequest;
     const search_query = try patternFilterValueToSearchQuery(scratch, parsed, entry.text_analysis, entry.runtime_schema);
     var probe_input: IndexedPredicateEvaluator.FrontierProbeInput = .{};
-    defer probe_input.deinit();
+    defer probe_input.deinit(a);
     var matcher = IndexedPredicateEvaluator{
         .snapshot = snapshot,
         .analysis = entry.text_analysis,
@@ -10232,10 +10269,10 @@ pub fn graphIndexedPredicateAlloc(
     };
     const fully_indexed = try matcher.indexed(search_query);
     if (!fully_indexed and (mode == .indexed_only or frontier == null)) return error.GraphResidualFrontierRequired;
-    const live_count = snapshot.liveDocCount();
+    const physical_count = snapshot.filterPhysicalDocCount();
     const available = budget.max_retained_state_bytes -| budget.retained_state_bytes;
-    const use_global = frontier == null or (fully_indexed and mode != .indexed_only and live_count < 65_536 and
-        @as(u64, live_count) * 32 + 8192 <= available);
+    const use_global = frontier == null or (fully_indexed and mode != .indexed_only and physical_count < 65_536 and
+        @as(u64, physical_count) * 32 + 8192 <= available);
     if (use_global) global: {
         const clone_limit = if (frontier == null) std.math.maxInt(usize) else available;
         const cached = cache.getWithinLimit(a, key, control, null, clone_limit) catch |err| switch (err) {
@@ -13191,6 +13228,8 @@ const NativeSortPredicate = struct {
     const Field = struct {
         lower: ?Bound = null,
         upper: ?Bound = null,
+        needs_exact_numeric_source: bool = false,
+
         fn add(self: *@This(), lower: bool, bound: Bound) void {
             const destination = if (lower) &self.lower else &self.upper;
             if (destination.*) |previous| {
@@ -13274,6 +13313,7 @@ const NativeSortPredicate = struct {
                     // different domain, retaining its authoritative evaluator.
                     const lower: ?Bound = if (range.lower) |bound| .{ .value = operand(mapping, bound.value, true) orelse continue, .inclusive = bound.inclusive } else null;
                     const upper: ?Bound = if (range.upper) |bound| .{ .value = operand(mapping, bound.value, true) orelse continue, .inclusive = bound.inclusive } else null;
+                    if (mapping.field_type == .numeric) bounds.needs_exact_numeric_source = true;
                     if (lower) |bound| bounds.add(true, bound);
                     if (upper) |bound| bounds.add(false, bound);
                 }
@@ -13304,12 +13344,36 @@ const NativeSortPredicate = struct {
         }
         return low;
     }
+    fn hasExactNumericSource(snapshot: *const index_mod.IndexSnapshot, segment_index: usize, field: []const u8, req: types.SearchRequest) !bool {
+        try checkSearchRequestDeadline(req);
+        var lease = try snapshot.leaseSegment(segment_index);
+        defer lease.deinit();
+        const segment = lease.entry;
+        const witness = segment.reader.numericRangeCoverage(field) catch |err| switch (err) {
+            error.CrcMismatch, error.InvalidSegment, error.StorageReadTemporarilyUnavailable => return false,
+            else => return err,
+        };
+        if (witness != .populated) return false;
+        const coverage = segment.typedDocValuesCoverageWithValidation(field, .{
+            .execution_deadline_ns = req.execution_deadline_ns,
+            .cancellation = req.cancellation,
+        }) catch |err| switch (err) {
+            error.StorageReadTemporarilyUnavailable => return false,
+            else => return err,
+        };
+        // A standard range can compare an explicit null as a scalar. Only
+        // dense exact numeric coverage rules out such live source values.
+        return if (coverage) |proof| proof.status == .covered and proof.value_type == .numeric_val else false;
+    }
+
     /// Each key is monotone only inside a constant preceding-key group. Exact
     /// equality predicates narrow that group; otherwise compare its endpoints
     /// before considering the next key. Work is O(keys * log(segment rows)).
-    fn restrict(self: @This(), a: Allocator, req: types.SearchRequest, plan: SortExecutionPlan, loader: NativeSortValueLoader, iterator: *SortedSegmentIterator) !void {
+    fn restrict(self: @This(), a: Allocator, req: types.SearchRequest, plan: SortExecutionPlan, snapshot: *const index_mod.IndexSnapshot, loader: NativeSortValueLoader, iterator: *SortedSegmentIterator) !void {
         for (self.order, self.fields) |field, bounds| {
             if (iterator.lower_doc >= iterator.upper_doc.?) break;
+            if (bounds.needs_exact_numeric_source and
+                !try hasExactNumericSource(snapshot, iterator.segment_index, field.field, req)) break;
             const descending = field.desc != plan.sorted_primary_reversed;
             if (if (descending) bounds.upper else bounds.lower) |bound|
                 iterator.lower_doc = try seek(a, req, plan, loader, iterator.*, field, bound, !bound.inclusive);
@@ -13364,7 +13428,7 @@ const SortedPrimaryCandidates = struct {
         const iterator = &self.iterators.items[run];
         if (self.predicate) |bounds| {
             var selected = iterator.*;
-            bounds.restrict(self.a, self.cursor_req, self.plan, self.loader(), &selected) catch |err| switch (err) {
+            bounds.restrict(self.a, self.cursor_req, self.plan, self.snapshot, self.loader(), &selected) catch |err| switch (err) {
                 // Live coverage can allow typed gaps on deleted documents.
                 // Such a binary probe cannot prove an interval. Discard all
                 // partial bounds and let ordinary iteration skip the holes.
@@ -39706,6 +39770,35 @@ test "optional numeric range rejects legacy path aliases and standard nullable s
     const standard = try patternFilterValueToSearchQuery(scratch, raw, .{}, sorted_schema);
     try std.testing.expect(!try searchQueryCanUseSnapshot(sorted_writer.snapshot(), standard, .{}, sorted_schema, false));
     try std.testing.expect(try searchQueryCanUseSnapshot(sorted_writer.snapshot(), numeric, .{}, sorted_schema, false));
+
+    const rounded_source = "{\"details\":{\"rank\":9007199254740993.0}}";
+    const lossy_sorted = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{
+        .{ .key = "rounded", .value = rounded_source },
+        .{ .key = "other", .value = "{\"details\":{\"rank\":9007199254740992}}" },
+    }, .{}, sorted_schema)).?;
+    defer a.free(lossy_sorted);
+    var lossy_writer = try index_mod.IndexWriter.init(a);
+    defer lossy_writer.deinit();
+    try lossy_writer.addSegment(lossy_sorted);
+    const range_json = "{\"range\":{\"details.rank\":{\"gt\":9007199254740992}}}";
+    var authoritative = try graph_exec.PreparedPatternFilter.init(a, range_json);
+    defer authoritative.deinit();
+    try std.testing.expect(try authoritative.matchesStored(a, "rounded", rounded_source));
+    const request = types.SearchRequest{
+        .filter_query_json = range_json,
+        .order_by = &.{.{ .field = "details.rank" }},
+    };
+    const plan = SortExecutionPlan{ .kind = .sorted_segment_seek, .runtime_schema = sorted_schema };
+    const bounds = (try NativeSortPredicate.prepare(scratch, request, plan)).?;
+    const reject_load = struct {
+        fn run(_: ?*anyopaque, _: Allocator, _: types.SearchHit, _: []const u8) !?SortValue {
+            return error.UnsafeSortProbe;
+        }
+    }.run;
+    var run = SortedSegmentIterator{ .segment_index = 0, .doc_base = 0, .next_doc = 0, .upper_doc = 2 };
+    try bounds.restrict(a, request, plan, lossy_writer.snapshot(), .{ .load = reject_load }, &run);
+    try std.testing.expectEqual(@as(u32, 0), run.lower_doc);
+    try std.testing.expectEqual(@as(?u32, 2), run.upper_doc);
 }
 
 test "optional numeric range projection rejects only affected paths across a segment" {
@@ -39817,7 +39910,7 @@ test "optional numeric range covers unsigned values and uses identical stored se
     defer domain.deinit();
     try domain.add(1);
     var input: IndexedPredicateEvaluator.FrontierProbeInput = .{};
-    defer input.deinit();
+    defer input.deinit(a);
     var gates: IndexedPredicateEvaluator.AppliedGates = .empty;
     const evaluator: IndexedPredicateEvaluator = .{
         .snapshot = snapshot,
@@ -39906,8 +39999,9 @@ test "optional numeric range covers unsigned values and uses identical stored se
     try frontier.put(a, 3, "historical");
     try domain.add(3);
     var mixed_input: IndexedPredicateEvaluator.FrontierProbeInput = .{};
-    defer mixed_input.deinit();
+    defer mixed_input.deinit(a);
     bounded.snapshot = writer.snapshot();
+    bounded.budget = null;
     bounded.frontier = frontier;
     bounded.probe_input = &mixed_input;
     var mixed = (try bounded.probeFrontier(.{ .term = .{ .field = "body", .term = "beacon" } }, &domain)).?;
@@ -39927,6 +40021,7 @@ test "optional numeric range covers unsigned values and uses identical stored se
     try std.testing.expect(phrase_and_wildcard.contains(1));
 
     try std.testing.expectEqual(@as(usize, 2), mixed_input.covered.?.cardinality());
+    try std.testing.expect(mixed_input.scanned_legacy.?.contains(1));
     try domain.add(2);
     var later = (try bounded.probeFrontier(.{ .term_phrase = .{ .field = "body", .terms = &.{ "beacon", "relay" } } }, &domain)).?;
     defer later.deinit();
@@ -39977,6 +40072,13 @@ test "optional numeric range covers unsigned values and uses identical stored se
     defer live_frontier.deinit();
     try std.testing.expect(!live_frontier.bitmap.contains(0));
     try std.testing.expect(live_frontier.bitmap.contains(1));
+
+    try std.testing.expect(try writer.deleteById("absent"));
+    try std.testing.expectEqual(@as(u32, 1), writer.snapshot().filterPhysicalDocCount());
+    var remaining = try writer.snapshot().executeFilterBitmap(a, .{ .match_all = {} });
+    defer remaining.deinit();
+    try std.testing.expectEqual(@as(usize, 1), remaining.cardinality());
+    try std.testing.expect(remaining.contains(2));
 }
 
 test "optional numeric range cold and warm measurement" {

@@ -2881,7 +2881,10 @@ pub fn executeFilterBitmap(
 
     var doc_offset: u32 = 0;
     var has_result = false;
-    for (snap.segments, 0..) |_, segment_idx| {
+    for (snap.segments, 0..) |*physical, segment_idx| {
+        const next_offset = std.math.add(u32, doc_offset, physical.reader.doc_count) catch return error.CountOverflow;
+        defer doc_offset = next_offset;
+        if (physical.liveDocCount() == 0) continue;
         var segment_lease = try snap.leaseSegment(segment_idx);
         defer segment_lease.deinit();
         const seg = segment_lease.entry;
@@ -2893,8 +2896,6 @@ pub fn executeFilterBitmap(
             if (seg.shared.deleted) |d| local.andNotWith(&d);
         }
 
-        const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
-            return error.CountOverflow;
         var shifted = try local.addOffset(doc_offset);
         defer shifted.deinit();
         if (!has_result) {
@@ -2905,7 +2906,6 @@ pub fn executeFilterBitmap(
         } else {
             try result.orWith(&shifted);
         }
-        doc_offset = next_offset;
     }
     return result;
 }
