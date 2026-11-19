@@ -1604,6 +1604,9 @@ pub const SnapshotBackfillCoordinator = struct {
 pub const ExternalStreamDestination = struct {
     ptr: *anyopaque,
     apply: *const fn (*anyopaque, Allocator, Request) anyerror!Outcome,
+    /// Positive catalog evidence for the exact prepared cut. Absence does
+    /// not authorize retiring a slot or replacing a pending admission.
+    bootstrap_committed: ?*const fn (*anyopaque, Allocator, Request) anyerror!bool = null,
 
     pub const Outcome = enum { accepted, committed };
     pub const Request = struct {

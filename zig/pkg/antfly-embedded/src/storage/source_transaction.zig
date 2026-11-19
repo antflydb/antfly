@@ -29,6 +29,20 @@ pub const Batch = struct {
     /// commit its progress under the same ownership and predecessor guards.
     changes: []const Change,
 
+    /// Set only by a qualified owner publishing a complete initial cut.
+    bootstrap: bool = false,
+
+    pub fn jsonStringify(self: Batch, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(Batch).@"struct".field_names) |name| {
+            if (!std.mem.eql(u8, name, "bootstrap") or self.bootstrap) {
+                try stream.objectField(name);
+                try stream.write(@field(self, name));
+            }
+        }
+        try stream.endObject();
+    }
+
     pub const Change = struct { op: enum { upsert, delete }, row: std.json.Value };
 
     pub fn validate(self: Batch, max_changes: usize) !void {
@@ -50,6 +64,7 @@ pub const Batch = struct {
             self.checkpoint.len == 0 or self.checkpoint.len > 1024 or
             self.key_fields.len == 0 or self.key_fields.len > 32 or
             self.changes.len > max_changes) return error.InvalidSourceTransaction;
+        if (self.bootstrap and self.expected_checkpoint != null) return error.InvalidSourceTransaction;
         if (self.expected_checkpoint) |previous| {
             if (previous.len == 0 or previous.len > 1024 or std.mem.eql(u8, previous, self.checkpoint)) return error.InvalidSourceTransaction;
         }

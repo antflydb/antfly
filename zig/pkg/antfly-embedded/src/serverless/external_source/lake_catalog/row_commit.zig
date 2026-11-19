@@ -434,6 +434,7 @@ pub fn prepare(a: A, table: types.Table, files: Files, batch: Batch, wal_lsn: u6
     try append(&updates, try json(a, .{ .action = "add-snapshot", .snapshot = snapshot }));
     try append(&updates, try json(a, .{ .action = "set-snapshot-ref", .@"ref-name" = "main", .@"snapshot-id" = snapshot_id, .type = "branch" }));
     try append(&updates, try json(a, .{ .action = "set-properties", .updates = .{ .@"antfly.wal.coverage" = try std.fmt.allocPrint(a, "{d}", .{wal_lsn}), .@"antfly.cdc.source" = batch.source, .@"antfly.cdc.epoch" = batch.epoch, .@"antfly.cdc.checkpoint" = batch.checkpoint, .@"antfly.cdc.key-fields" = key_definition } }));
+    if (batch.bootstrap) try append(&updates, try json(a, .{ .action = "set-properties", .updates = .{ .@"antfly.cdc.bootstrap-cut" = batch.checkpoint } }));
     return .{ .body = try std.json.Stringify.valueAlloc(a, .{ .requirements = requirements, .updates = updates }, .{}), .snapshot_id = snapshot_id };
 }
 

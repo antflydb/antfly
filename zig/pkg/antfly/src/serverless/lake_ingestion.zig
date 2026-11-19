@@ -102,6 +102,7 @@ pub fn accept(a: A, binding: Binding, unresolved_options: Options, context: Cont
     if (body.len == 0 or body.len > catalog.types.max_commit_bytes) return error.LakeWriteTooLarge;
     var parsed = try std.json.parseFromSlice(Batch, a, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
+    if (parsed.value.bootstrap) return error.InvalidSourceTransaction;
     return acceptResolvedBatch(a, binding, options, context, parsed.value);
 }
 
@@ -162,7 +163,7 @@ pub const StreamOwner = struct {
     check: *const fn (*anyopaque, Port.Request) anyerror!void,
 
     pub fn port(self: *StreamOwner) Port {
-        return .{ .ptr = self, .apply = apply };
+        return .{ .ptr = self, .apply = apply, .bootstrap_committed = bootstrapCommitted };
     }
 
     const Guard = struct {
@@ -177,6 +178,15 @@ pub const StreamOwner = struct {
 
     fn apply(raw: *anyopaque, backing: A, request: Port.Request) !Port.Outcome {
         const self: *StreamOwner = @ptrCast(@alignCast(raw));
+        return self.execute(backing, request, .apply);
+    }
+
+    fn bootstrapCommitted(raw: *anyopaque, backing: A, request: Port.Request) !bool {
+        const self: *StreamOwner = @ptrCast(@alignCast(raw));
+        return (try self.execute(backing, request, .observe_bootstrap)) == .committed;
+    }
+
+    fn execute(self: *StreamOwner, backing: A, request: Port.Request, mode: enum { apply, observe_bootstrap }) !Port.Outcome {
         if (request.table.table_id == 0 or request.table.table_id != request.cutover.table_id or request.cutover.cutover_authority_id == 0) return error.UnsupportedReplicationRoute;
         var arena = std.heap.ArenaAllocator.init(backing);
         defer arena.deinit();
@@ -193,6 +203,24 @@ pub const StreamOwner = struct {
         if (options.catalog_table_id != request.table.table_id or options.catalog_generation != request.table.object_storage_generation) return error.CatalogGenerationChanged;
         const source = try std.fmt.allocPrint(a, "postgres:{d}:{d}", .{ request.table.table_id, request.cutover.source_ordinal });
         const epoch = try std.fmt.allocPrint(a, "{d}", .{request.cutover.cutover_authority_id});
+        if (mode == .observe_bootstrap) {
+            if (request.checkpoint.len == 0 or !std.mem.eql(u8, request.checkpoint, request.cutover.prepared_checkpoint)) return error.InvalidReplicationCheckpoint;
+            var current = try configured.executeLakeCatalogAlloc(a, bound.binding, options, context, .load);
+            defer current.deinit(a);
+            const properties = try catalogProperties(try catalog.metadata.parse(a, current.table.metadata_json));
+            const marker = properties.get("antfly.cdc.bootstrap-cut") orelse return .accepted;
+            if (!std.mem.eql(u8, try catalog.metadata.str(marker), request.checkpoint) or try propertyCoverage(properties) == 0) return .accepted;
+            try requireSourceProperties(a, properties, .{
+                .batch_id = "",
+                .source = source,
+                .epoch = epoch,
+                .checkpoint = request.checkpoint,
+                .key_fields = identity.key_columns,
+                .changes = &.{},
+            });
+            try context.ensureActive();
+            return .committed;
+        }
         const batch = if (request.snapshot_rows) |rows| blk: {
             if (request.previous_checkpoint != null or request.changes.len != 0 or
                 !std.mem.eql(u8, request.checkpoint, request.cutover.prepared_checkpoint)) return error.InvalidReplicationCheckpoint;
@@ -200,12 +228,13 @@ pub const StreamOwner = struct {
             const changes = try a.alloc(Batch.Change, rows.len);
             for (rows, changes) |row, *change| change.* = .{ .op = .upsert, .row = row };
             const snapshot: Batch = .{
-                .batch_id = try a.dupe(u8, &catalog.types.digestHex(request.checkpoint)),
+                .batch_id = try std.fmt.allocPrint(a, "antfly-bootstrap-{s}", .{&catalog.types.digestHex(request.checkpoint)}),
                 .source = source,
                 .epoch = epoch,
                 .checkpoint = request.checkpoint,
                 .key_fields = identity.key_columns,
                 .changes = changes,
+                .bootstrap = true,
             };
             try snapshot.validate(max_group_changes);
             break :blk snapshot;
@@ -353,7 +382,7 @@ const GroupBuilder = struct {
         return self.result.records >= max_group_records or count >= max_changes or self.bytes >= max_bytes;
     }
     fn add(self: *GroupBuilder, a: A, record: wal.Record, max_changes: usize, max_bytes: usize) !bool {
-        if (self.full(max_changes, max_bytes) or record.lsn != self.result.last_lsn + 1) return false;
+        if (self.result.batch.bootstrap or self.full(max_changes, max_bytes) or record.lsn != self.result.last_lsn + 1) return false;
         if (record.payload.len > max_bytes - self.bytes) return false;
         const next = try std.json.parseFromSliceLeaky(Batch, a, record.payload, .{ .allocate = .alloc_always });
         const count = if (self.result.records == 1) self.result.batch.changes.len else self.changes.items.len;
@@ -1098,7 +1127,11 @@ test "external lake filesystem WAL applies the managed PostgreSQL stream owner p
     snapshot.checkpoint = "cut";
     const initial_row = try std.json.parseFromSliceLeaky(V, a, "{\"id\":2}", .{});
     snapshot.snapshot_rows = &.{initial_row};
+    var recovery = snapshot;
+    recovery.snapshot_rows = null;
+    try std.testing.expect(!try port.bootstrap_committed.?(port.ptr, alloc, recovery));
     try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, snapshot));
+    try std.testing.expect(try port.bootstrap_committed.?(port.ptr, alloc, recovery));
     try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, request));
     try std.testing.expect(fixture.checks > 1);
     try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, request));
@@ -1107,5 +1140,8 @@ test "external lake filesystem WAL applies the managed PostgreSQL stream owner p
     try std.testing.expectError(error.CatalogGenerationChanged, port.apply(port.ptr, alloc, request));
     fixture.authority += 1;
     try std.testing.expectError(error.ReplicationCutoverAuthorityLost, port.apply(port.ptr, alloc, request));
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, port.bootstrap_committed.?(port.ptr, alloc, recovery));
+    fixture.authority -= 1;
+    try std.testing.expect(try port.bootstrap_committed.?(port.ptr, alloc, recovery));
     try std.testing.expectEqual(@as(u64, 2), try watermark(a, bound.binding, options, .{}));
 }
