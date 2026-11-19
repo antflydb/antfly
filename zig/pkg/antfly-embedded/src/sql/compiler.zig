@@ -997,7 +997,91 @@ const Parser = struct {
     }
 
     fn select(self: *Parser) Error!ast.Select {
-        return self.selectFinish(try self.selectCore());
+        if (!self.keyword(.distinct)) return self.selectFinish(try self.selectCore());
+        if (!self.keyword(.on)) return self.fail(error.UnsupportedSqlShape, "SELECT DISTINCT requires a distinct projection operator");
+        try self.expect(.lparen);
+        var keys: std.ArrayList(*const ast.Scalar) = .empty;
+        while (true) {
+            try keys.append(self.alloc, try self.scalar(0, 0));
+            if (!self.take(.comma)) break;
+        }
+        try self.expect(.rparen);
+        return self.lowerDistinctOn(try self.selectFinish(try self.selectCore()), keys.items);
+    }
+
+    /// Choose the first row of each distinct partition with the existing
+    /// ordered window operator. Apply pagination after selecting those rows.
+    fn lowerDistinctOn(self: *Parser, source: ast.Select, keys: []const *const ast.Scalar) Error!ast.Select {
+        if (source.columns.len == 0 or source.set_operation != null) return self.fail(error.UnsupportedSqlShape, "DISTINCT ON requires explicit result columns");
+        for (source.columns) |column| if (column.wildcard) return self.fail(error.UnsupportedSqlShape, "DISTINCT ON requires explicit result columns");
+        const normalized = @import("order_aliases.zig").normalize(self.alloc, source) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.AmbiguousSqlColumn => return self.fail(error.InvalidSqlSyntax, "ambiguous DISTINCT ON order label"),
+            else => return self.fail(error.SqlLimitExceeded, "DISTINCT ON order budget exceeded"),
+        };
+        const inner_columns = try self.alloc.alloc(ast.Projection, source.columns.len + source.order_by.len + 1);
+        const outer_columns = try self.alloc.alloc(ast.Projection, source.columns.len);
+        for (source.columns, outer_columns, 0..) |column, *outer, i| {
+            const label = try std.fmt.allocPrint(self.alloc, "$project_{d}", .{i});
+            inner_columns[i] = column;
+            inner_columns[i].alias = label;
+            const last = std.mem.lastIndexOfScalar(u8, column.field, 0);
+            outer.* = .{ .field = label, .alias = column.alias orelse if (column.field.len == 0) "?column?" else column.field[(if (last) |end| end + 1 else 0)..] };
+        }
+
+        const window_order = try self.alloc.dupe(ast.Order, normalized.order_by);
+        const outer_order = try self.alloc.dupe(ast.Order, normalized.order_by);
+        const matched = try self.alloc.alloc(bool, keys.len);
+        @memset(matched, false);
+        var passed_prefix = false;
+        for (window_order, outer_order, 0..) |*inner, *outer, i| {
+            const expression = if (inner.position) |ordinal| blk: {
+                if (ordinal > source.columns.len) return self.fail(error.InvalidSqlSyntax, "DISTINCT ON order position exceeds projection");
+                const column = source.columns[ordinal - 1];
+                break :blk column.expression orelse try self.scalarNode(.{ .column = column.field });
+            } else inner.expression.?;
+            const same = @import("aggregate_binding.zig").same;
+            var key_order = false;
+            for (keys, matched) |key, *found| if (same(key, expression)) {
+                key_order = true;
+                found.* = true;
+            };
+            if (!key_order) {
+                for (matched) |found| if (!found) return self.fail(error.InvalidSqlSyntax, "DISTINCT ON expressions must match initial ORDER BY keys");
+                passed_prefix = true;
+            } else if (passed_prefix) return self.fail(error.InvalidSqlSyntax, "DISTINCT ON expressions must match initial ORDER BY keys");
+            inner.position = null;
+            inner.field = "";
+            inner.expression = expression;
+            const label = try std.fmt.allocPrint(self.alloc, "$sort_{d}", .{i});
+            inner_columns[source.columns.len + i] = .{ .expression = expression, .alias = label };
+            outer.position = null;
+            outer.field = label;
+            outer.expression = null;
+        }
+        const rank_name = "$distinct_rank";
+        inner_columns[inner_columns.len - 1] = .{ .alias = rank_name, .expression = try self.scalarNode(.{ .call = .{
+            .name = "row_number",
+            .args = &.{},
+            .window = .{ .partition = keys, .order = window_order },
+        } }) };
+        const inner = try self.alloc.create(ast.Select);
+        inner.* = source;
+        inner.columns = inner_columns;
+        inner.order_by = &.{};
+        inner.limit = null;
+        inner.offset = null;
+        const rank = try self.scalarNode(.{ .column = rank_name });
+        const first = try self.scalarNode(.{ .literal = .{ .integer = 1 } });
+        return .{
+            .source = try self.relationNode(.{ .derived = .{ .query = inner, .alias = "$distinct_source" } }),
+            .columns = outer_columns,
+            .predicate = try self.predicateNode(.{ .scalar = try self.scalarNode(.{ .binary = .{ .op = .eq, .left = rank, .right = first } }) }),
+            .order_by = outer_order,
+            .order_aliases_expanded = true,
+            .limit = source.limit,
+            .offset = source.offset,
+        };
     }
 
     // VALUES shares the flat, bounded row-source representation used by

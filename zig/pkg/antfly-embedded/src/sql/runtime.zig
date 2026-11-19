@@ -3470,6 +3470,21 @@ test "SQL Boolean array positions preserve correlated subquery windows and absen
     for (result.output.rows) |row| try std.testing.expectEqual(std.json.Value{ .bool = true }, row[2]);
 }
 
+test "SQL DISTINCT ON chooses ordered representatives before pagination" {
+    const a = std.testing.allocator;
+    var backend: TestBackend = .{};
+    const source = " FROM (VALUES ('a', 1), ('a', 6), ('b', 2), ('b', 7), ('c', 3)) t(k,v) ";
+    var compiled = try compiler.compile(a, "SELECT DISTINCT ON (k) k AS item, v" ++ source ++ "ORDER BY item, v DESC LIMIT 1 OFFSET 1", .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend.coordinated(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("item", result.output.columns[0].name);
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqualStrings("b", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("7", result.output.rows[0][1].string);
+    try std.testing.expectError(error.InvalidSqlSyntax, compiler.compile(a, "SELECT DISTINCT ON (k) k, v" ++ source ++ "ORDER BY v, k", .{}));
+}
+
 test "SQL CTE aliases feed hash joins and grouped projection without stringifying rows" {
     var backend: TestBackend = .{ .row_count = 4 };
     var compiled = try compiler.compile(std.testing.allocator, "WITH q(k) AS (SELECT _id FROM things WHERE _id != '3') SELECT a.k, count(*) AS n FROM q AS a JOIN q AS b ON a.k = b.k GROUP BY a.k ORDER BY a.k DESC", .{});
