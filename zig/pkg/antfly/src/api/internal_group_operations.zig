@@ -1072,6 +1072,16 @@ pub const Operations = struct {
             const Probe = struct { transition_id: ?u64 = null, mode: ?[]const u8 = null };
             var probe = std.json.parseFromSlice(Probe, alloc, input.options.relational_topology_json, .{ .ignore_unknown_fields = true }) catch return error.InvalidArgument;
             defer probe.deinit();
+            if (probe.value.mode) |mode| {
+                if (std.mem.eql(u8, mode, "dag_activation_checkpoint") or std.mem.eql(u8, mode, "dag_activation_source_page")) {
+                    if (input.key.len != 0 or input.consistency != .read_index or input.options.restore_staging_scope != null or
+                        input.options.restore_staging_plan_id != null or input.options.include_primary_digest or
+                        input.options.fields.len != 0 or input.options.relational_integrity_catalog or
+                        input.options.relational_integrity_action or input.options.relational_integrity_jobs_json.len != 0 or
+                        input.options.group_source_query_json.len != 0 or input.options.relational_index_status_json.len != 0 or
+                        input.options.relational_activation_json.len != 0 or probe.value.transition_id != null) return error.InvalidArgument;
+                }
+            }
             if (probe.value.mode) |mode| if (std.mem.eql(u8, mode, "online_source_status")) {
                 const StatusRequest = struct { mode: enum { online_source_status }, scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope };
                 var scoped = std.json.parseFromSlice(StatusRequest, alloc, input.options.relational_topology_json, .{}) catch return error.InvalidArgument;

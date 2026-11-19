@@ -80,8 +80,9 @@ The ordered writer pins each domain's root count and requires the last
 root's terminal cursor before certification. Hosted data servers can advance
 a fenced scan through pinned group routes, using read-index lookups and ordered
 authority proposals for initialization, owner takeover, and page commits.
-The reader currently uses the group-local owner interface. Distributed
-activation still needs a durable scheduler and remote source routing.
+Hosted readers use the pinned group route for local or authenticated remote
+lookups. Remote requests currently share the private lookup control-size
+limit. Distributed activation still needs a durable scheduler.
 An active source fence allows an ordered catalog change only when activation
 proofs match its pinned snapshot. Raft protocol version 31 gates these commands,
 DAG-bearing transaction prepare, and catalog activation proofs. The source-fence

@@ -6953,6 +6953,20 @@ pub const HostedProvisionedTableReadSource = struct {
         var pinned: RoutePinnedCatalog = undefined;
         var routed: HostedProvisionedTableReadSource = undefined;
         try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        // Activation controls use the pinned group instead of selecting a
+        // group by document key. The recipient checks the exact root namespace
+        // and durable source fence before serving the read.
+        if (std.mem.startsWith(u8, opts.relational_topology_json, "{\"mode\":\"dag_activation_checkpoint\"") or
+            std.mem.startsWith(u8, opts.relational_topology_json, "{\"mode\":\"dag_activation_source_page\""))
+        {
+            if (group_id != fence.route.group_id or key.len != 0 or consistency != .read_index)
+                return error.InvalidArgument;
+            var destination = (try table_router.resolveGroupRoute(alloc, routed.catalog, routed.router.withBudget(.fromRequest(opts)), group_id, routePolicyForConsistency(.read_index))) orelse
+                return error.TopologyChanged;
+            defer destination.deinit(alloc);
+            if (destination == .remote)
+                return try lookupRemote(routed.internalExecutor(), alloc, destination.remote.base_uri, group_id, table_name, key, opts, consistency);
+        }
         return try lookupGroupLocal(&routed, alloc, group_id, table_name, key, opts, consistency);
     }
 

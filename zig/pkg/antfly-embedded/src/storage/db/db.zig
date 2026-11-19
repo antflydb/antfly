@@ -26931,7 +26931,7 @@ pub const DB = struct {
         var request = try std.json.parseFromSlice(struct {
             mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, dag_activation_checkpoint, dag_activation_source_page, merge_copy_receipt },
             scope: ?@import("online_source_contract.zig").Scope = null,
-            dag_source_page: ?@import("dag_graph_effects.zig").ScanRequest = null,
+            dag_source_page: ?@import("dag_activation_contract.zig").ScanRequest = null,
             dag_scan: ?struct {
                 namespace: [24]u8,
                 domain: [32]u8,
@@ -156041,7 +156041,7 @@ test "db ordered DAG source fence persists with the apply receipt" {
     var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
     defer db.close();
     const dag = @import("../../graph/dag_authority.zig");
-    const effects = @import("dag_graph_effects.zig");
+    const effects = @import("dag_activation_contract.zig");
     const domain: dag.Digest = @splat(5);
     const namespace = @import("online_source_contract.zig").namespaceBytes(db.core.identity_namespace);
     const roots: []const effects.ScanRoot = &.{.{

@@ -12369,7 +12369,7 @@ pub const DataServer = struct {
         });
     }
 
-    const DagEffects = @import("antfly_local_sources").storage_db_dag_graph_effects;
+    const DagEffects = @import("antfly_local_sources").storage_db_dag_activation_contract;
     const DagAuthority = DagEffects.authority;
 
     pub const DagActivationRoute = struct {
