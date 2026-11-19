@@ -136,6 +136,48 @@ test "lite physical catalog change fences only the changed index scope" {
     try std.testing.expect(store.indexScopeStale(quiet));
 }
 
+test "lite index fence refuses a physically stale scope on a file without a redo log" {
+    const Admission = struct {
+        fn enter(_: *anyopaque, _: PublicationScope) !void {}
+        fn leave(_: *anyopaque) void {}
+    };
+    const Target = struct {
+        fn resolve(_: *anyopaque) ?*Store {
+            return null;
+        }
+    };
+    const Apply = struct {
+        applied: bool = false,
+        fn apply(ptr: *anyopaque, _: *native.NativeFile) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.applied = true;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "no-redo-scope-fence.aflite");
+    defer a.free(path);
+    const busy = "t/indexes/busy_text/index";
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = false, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    try std.testing.expect(store.file.redo == null);
+    try store.file.putIndexCatalogRecord(native_catalog_sink_prefix ++ busy ++ "\x00ns\x00seg", "b0");
+    store.noteLoadedIndexScope(busy);
+    // A peer's commit changed the scope's records after the snapshot loaded
+    // them; admission marked it stale.
+    store.stale_index_scopes.put(a, try a.dupe(u8, busy), {}) catch unreachable;
+    var admission_state: u8 = 0;
+    store.writer_admission = .{ .ptr = &admission_state, .enter = Admission.enter, .leave = Admission.leave };
+    store.write_target = .{ .ptr = &admission_state, .resolve = Target.resolve };
+    defer store.write_target = null;
+    var ctx: Apply = .{};
+    try std.testing.expectError(error.EnrichmentWaitCanceled, store.submitIndexMutationForScope(busy, &ctx, Apply.apply, false));
+    try std.testing.expect(!ctx.applied);
+    try std.testing.expect(store.index_fence_refused.load(.acquire));
+}
+
 test "lite empty write commits preserve checkpoints and release writer admission" {
     const Admission = struct {
         entered: usize = 0,
@@ -6432,8 +6474,15 @@ pub const Store = struct {
         try admission.enter(admission.ptr, .index);
         defer admission.leave(admission.ptr);
         const io = self.file.runtime();
+        // A physical catalog change admission found under this scope
+        // (`markChangedIndexScopes`), in every redo mode: a file without a
+        // redo log publishes every index commit that way.
+        if (self.indexScopeStale(scope)) {
+            self.index_fence_refused.store(true, .release);
+            return error.EnrichmentWaitCanceled;
+        }
         const shared = if (self.file.redo) |*redo| redo.shared else return self.submitIndexMutation(context, apply, durable);
-        if (shared.scopeLatestSequence(io, scope) > self.indexScopeFence(scope) or self.indexScopeStale(scope)) {
+        if (shared.scopeLatestSequence(io, scope) > self.indexScopeFence(scope)) {
             self.index_fence_refused.store(true, .release);
             return error.EnrichmentWaitCanceled;
         }
