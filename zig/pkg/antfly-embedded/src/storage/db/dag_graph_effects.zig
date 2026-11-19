@@ -19,6 +19,7 @@
 const std = @import("std");
 const authority = @import("../../graph/dag_authority.zig");
 const edges = @import("graph_edge_types.zig");
+const keys = @import("../internal_keys.zig");
 const A = std.mem.Allocator;
 const Replacement = authority.Contributions.Replacement;
 
@@ -51,6 +52,99 @@ pub fn collect(
         if (i != 0 and !lessThan({}, result.items[i - 1], replacement)) return error.InvalidDagMutation;
     }
     return result.toOwnedSlice(alloc);
+}
+
+pub const ScanRequest = struct {
+    namespace: [24]u8,
+    fence: authority.SourceFence,
+    index_name: []const u8,
+    edge_type: []const u8,
+    generation: u64,
+    after: ?[]const u8 = null,
+};
+
+pub const ScanPage = struct {
+    next: ?[]const u8,
+    exhausted: bool,
+    replacements: []const Replacement,
+};
+
+/// Read accepted physical graph artifacts from a single fenced root. The
+/// caller supplies the currently admitted catalog generation and owns the arena.
+/// The cursor advances over skipped rows as well as matching relationships.
+pub fn scanAccepted(alloc: A, txn: anytype, request: ScanRequest, start: []const u8, end: []const u8) !ScanPage {
+    if (request.index_name.len == 0 or request.edge_type.len == 0 or request.generation == 0)
+        return error.InvalidDagMutation;
+    const current = (try authority.SourceFence.read(txn)) orelse return error.GraphConstraintNotReady;
+    if (!std.meta.eql(current, request.fence)) return error.GraphConstraintAttemptConflict;
+
+    const lower = try keys.documentRangeLowerAlloc(alloc, start);
+    const upper = if (end.len != 0)
+        try keys.documentRangeLowerAlloc(alloc, end)
+    else
+        (try keys.documentRangeUpperAlloc(alloc, "")) orelse return error.InvalidDagAuthority;
+    if (request.after) |after| {
+        if (std.mem.order(u8, after, lower) == .lt or std.mem.order(u8, after, upper) != .lt)
+            return error.InvalidDagMutation;
+    }
+
+    const max_rows = 256;
+    const max_bytes = 512 * 1024;
+    var cursor = try txn.openPhysicalCursorAdapter();
+    defer cursor.close();
+    cursor.setUpperBound(upper);
+    var entry = try cursor.seekAtOrAfter(request.after orelse lower);
+    if (entry) |row| {
+        if (request.after) |after| if (std.mem.eql(u8, after, row.key)) {
+            entry = try cursor.next();
+        };
+    }
+
+    var result: std.ArrayList(Replacement) = .empty;
+    var next: ?[]const u8 = null;
+    var visited: usize = 0;
+    var bytes: usize = 0;
+    while (entry) |row| : (entry = try cursor.next()) {
+        if (std.mem.order(u8, row.key, upper) != .lt) {
+            entry = null;
+            break;
+        }
+        const extent = row.key.len +| (if (keys.isGraphEdgeArtifactKey(row.key)) row.value.len else 0);
+        if (visited == max_rows or (visited != 0 and extent > max_bytes - bytes)) break;
+        if (extent > max_bytes) return error.GraphConstraintCapacity;
+        visited += 1;
+        bytes += extent;
+        if (next) |previous| alloc.free(previous);
+        next = try alloc.dupe(u8, row.key);
+        if (try readAccepted(alloc, request, row.key, row.value)) |replacement|
+            try result.append(alloc, replacement);
+    }
+    std.mem.sort(Replacement, result.items, {}, lessThan);
+    return .{ .next = next, .exhausted = entry == null, .replacements = try result.toOwnedSlice(alloc) };
+}
+
+fn readAccepted(alloc: A, request: ScanRequest, key: []const u8, value: []const u8) !?Replacement {
+    if (!keys.matchesGraphEdgeIndexName(key, request.index_name)) return null;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const parsed = (try keys.parseGraphEdgeArtifactKeyAlloc(scratch.allocator(), key)) orelse return error.InvalidDagAuthority;
+    if (!std.mem.eql(u8, parsed.edge_type, request.edge_type)) return null;
+    const codec = @import("enrichment/artifact_codec.zig");
+    const record = try codec.decodeGraphEdgeBorrowed(value);
+    if (record.generation == 0 or codec.isPortableUnboundGraphEdge(value)) return error.GraphConstraintNotReady;
+    if (record.generation != request.generation) return null;
+    const identity: edges.GraphEdgeWrite = .{
+        .index_name = parsed.index_name,
+        .edge_type = parsed.edge_type,
+        .source = parsed.source_node orelse parsed.doc_key,
+        .target = parsed.target_doc_key,
+        .owner = parsed.doc_key,
+        .edge_id = parsed.edge_id,
+    };
+    const source = try alloc.dupe(u8, identity.source);
+    const targets = try alloc.alloc([]const u8, 1);
+    targets[0] = try alloc.dupe(u8, identity.target);
+    return .{ .owner = owner(identity), .source = source, .targets = targets };
 }
 
 fn matches(edge: anytype, index: []const u8, edge_type: []const u8) bool {

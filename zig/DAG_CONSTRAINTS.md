@@ -69,7 +69,10 @@ cursor and fences subsequent proposals from the old owner. Pages advance in
 physical source order, can contain no relationships, and cannot replace a
 contribution imported by an earlier page. A private native lookup returns the
 current owner epoch and cursor from one storage snapshot.
-The hosted caller must establish the owner read barrier before the lookup.
+A private source-page lookup reads generation-bound graph artifact rows from a
+fenced physical root using its owned key range, with bounded row and byte
+counts. The caller supplies the source catalog generation and must establish
+the owner read barrier before either lookup.
 An active source fence allows an ordered catalog change only when activation
 proofs match its pinned snapshot. Raft protocol version 31 gates these commands,
 DAG-bearing transaction prepare, and catalog activation proofs. The source-fence

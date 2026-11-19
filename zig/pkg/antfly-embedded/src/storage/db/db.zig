@@ -26929,8 +26929,9 @@ pub const DB = struct {
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         var request = try std.json.parseFromSlice(struct {
-            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, dag_activation_checkpoint, merge_copy_receipt },
+            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, dag_activation_checkpoint, dag_activation_source_page, merge_copy_receipt },
             scope: ?@import("online_source_contract.zig").Scope = null,
+            dag_source_page: ?@import("dag_graph_effects.zig").ScanRequest = null,
             dag_scan: ?struct {
                 namespace: [24]u8,
                 domain: [32]u8,
@@ -26940,6 +26941,7 @@ pub const DB = struct {
         defer request.deinit();
         if ((request.value.mode == .online_source_status) != (request.value.scope != null)) return error.InvalidOnlineSourceCommand;
         if ((request.value.mode == .dag_activation_checkpoint) != (request.value.dag_scan != null)) return error.InvalidBatchRequest;
+        if ((request.value.mode == .dag_activation_source_page) != (request.value.dag_source_page != null)) return error.InvalidBatchRequest;
         var output: std.Io.Writer.Allocating = .init(alloc);
         errdefer output.deinit();
         var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
@@ -26965,6 +26967,18 @@ pub const DB = struct {
             },
             .status => try @import("relational_integrity_json.zig").write(try self.relationalTopologyStatus(), &stream),
             .online_source_status => try @import("relational_integrity_json.zig").write(try self.onlineSourceStatus(request.value.scope.?), &stream),
+            .dag_activation_source_page => {
+                const scan_request = request.value.dag_source_page.?;
+                if (!std.mem.eql(u8, &scan_request.namespace, &@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace)))
+                    return error.GraphConstraintRevisionChanged;
+                var scratch = std.heap.ArenaAllocator.init(alloc);
+                defer scratch.deinit();
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                const range = self.core.byteRange();
+                const page = try @import("dag_graph_effects.zig").scanAccepted(scratch.allocator(), &read, scan_request, range.start, range.end);
+                try @import("relational_integrity_json.zig").write(page, &stream);
+            },
             .dag_activation_checkpoint => {
                 const scan_request = request.value.dag_scan.?;
                 const checkpoint = try self.dagActivationCheckpoint(alloc, scan_request.namespace, scan_request.domain, scan_request.fence);
@@ -156033,6 +156047,29 @@ test "db ordered DAG source fence persists with the apply receipt" {
         .action = .acquire,
         .fence = fence,
     } };
+    const effects = @import("dag_graph_effects.zig");
+    const graph_key = try internal_keys.graphRelationshipArtifactKeyAlloc(a, "producer", "g", "R", "b", "a", "edge");
+    defer a.free(graph_key);
+    const graph_value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(a, null, 7, 1, 0, 0, "{}");
+    defer a.free(graph_value);
+    {
+        var writer = try db.core.store.beginWriteTxn();
+        errdefer writer.abort();
+        try writer.put(graph_key, graph_value);
+        try writer.commit();
+    }
+    const source_query = try std.json.Stringify.valueAlloc(a, .{
+        .mode = @as(enum { dag_activation_source_page }, .dag_activation_source_page),
+        .dag_source_page = @as(effects.ScanRequest, .{
+            .namespace = request.dag_source_fence.?.namespace,
+            .fence = fence,
+            .index_name = "g",
+            .edge_type = "R",
+            .generation = 7,
+        }),
+    }, .{ .emit_strings_as_arrays = true });
+    defer a.free(source_query);
+    try std.testing.expectError(error.GraphConstraintNotReady, db.lookup(a, "", .{ .relational_topology_json = source_query }));
     try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 1 }, true);
     try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 1 }, true);
     {
@@ -156045,13 +156082,22 @@ test "db ordered DAG source fence persists with the apply receipt" {
     request.dag_source_fence.?.scan = .{ .domain = domain, .owner_epoch = 1 };
     try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 2 }, true);
     const owner: dag.Digest = @splat(6);
-    request.dag_source_fence.?.scan.?.page = .{ .next = "source:a", .replacements = &.{.{ .owner = owner, .source = "a", .targets = &.{"b"} }} };
+    var source_result = (try db.lookup(a, "", .{ .relational_topology_json = source_query })).?;
+    defer source_result.deinit(a);
+    const source_page = try std.json.parseFromSlice(effects.ScanPage, a, source_result.json, .{});
+    defer source_page.deinit();
+    try std.testing.expect(source_page.value.exhausted);
+    try std.testing.expectEqualSlices(u8, graph_key, source_page.value.next.?);
+    try std.testing.expectEqual(@as(usize, 1), source_page.value.replacements.len);
+    try std.testing.expectEqualStrings("a", source_page.value.replacements[0].source);
+    try std.testing.expectEqualStrings("b", source_page.value.replacements[0].targets[0]);
+    request.dag_source_fence.?.scan.?.page = .{ .next = source_page.value.next.?, .replacements = source_page.value.replacements };
     try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 3 }, true);
     try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 3 }, true);
-    const cursor = "source:a";
+    const cursor = source_page.value.next.?;
     request.dag_source_fence.?.scan.?.page = .{
         .after = cursor,
-        .next = "source:b",
+        .next = "\xff",
         .replacements = &.{.{ .owner = owner, .source = "b", .targets = &.{"a"} }},
     };
     try std.testing.expectError(error.GraphCycle, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 4 }, true));
