@@ -55,7 +55,7 @@ pub fn checkpointWalPathAlloc(alloc: Allocator, root_dir: []const u8, generation
 
 pub const RetainedSegment = union(enum) {
     heap: []u8,
-    mapped: []align(std.heap.page_size_min) u8,
+    mapped: @import("../segment_source.zig").MappedArtifact,
     shared: *Shared,
 
     const Shared = struct {
@@ -64,17 +64,40 @@ pub const RetainedSegment = union(enum) {
         namespace: []u8,
         descriptor: posting_wal.Checkpoint.Segment,
         payload: RetainedSegment,
+        reader: ?posting_segment.Reader,
+        verified_reader: std.atomic.Value(?*posting_segment.VerifiedReader) = .init(null),
         retirement_storage: ?lsm_backend.Storage.Lease = null,
         retired: std.atomic.Value(bool) = .init(false),
     };
 
     /// Ownership of payload transfers only on success. Namespace and complete
     /// immutable descriptor identity are required before a mapping is reused.
-    fn share(alloc: Allocator, payload: RetainedSegment, namespace: []const u8, descriptor: posting_wal.Checkpoint.Segment) !RetainedSegment {
+    fn share(alloc: Allocator, payload: RetainedSegment, namespace: []const u8, descriptor: posting_wal.Checkpoint.Segment, reader: ?posting_segment.Reader) !RetainedSegment {
         const shared = try alloc.create(Shared);
         errdefer alloc.destroy(shared);
-        shared.* = .{ .alloc = alloc, .payload = payload, .namespace = try alloc.dupe(u8, namespace), .descriptor = descriptor };
+        shared.* = .{ .alloc = alloc, .payload = payload, .reader = reader, .namespace = try alloc.dupe(u8, namespace), .descriptor = descriptor };
         return .{ .shared = shared };
+    }
+
+    pub fn validatedReader(self: RetainedSegment) !posting_segment.Reader {
+        if (self == .shared) if (self.shared.reader) |reader| return reader;
+        return posting_segment.Reader.init(self.bytes());
+    }
+
+    /// The caller keeps this retained segment alive for the returned view.
+    pub fn verifiedReader(self: RetainedSegment, alloc: Allocator) !posting_segment.VerifiedReader {
+        if (self != .shared) return posting_segment.VerifiedReader.initFromReader(alloc, try self.validatedReader());
+        const shared = self.shared;
+        if (shared.verified_reader.load(.acquire)) |reader| return reader.borrow();
+        const candidate = try shared.alloc.create(posting_segment.VerifiedReader);
+        errdefer shared.alloc.destroy(candidate);
+        candidate.* = try posting_segment.VerifiedReader.initFromReader(shared.alloc, try self.validatedReader());
+        if (shared.verified_reader.cmpxchgStrong(null, candidate, .acq_rel, .acquire)) |winner| {
+            candidate.deinit();
+            shared.alloc.destroy(candidate);
+            return winner.?.borrow();
+        }
+        return candidate.borrow();
     }
 
     pub fn matchesIdentity(self: RetainedSegment, namespace: []const u8, descriptor: posting_wal.Checkpoint.Segment) bool {
@@ -109,7 +132,7 @@ pub const RetainedSegment = union(enum) {
     pub fn bytes(self: RetainedSegment) []const u8 {
         return switch (self) {
             .heap => |data| data,
-            .mapped => |data| data,
+            .mapped => |artifact| artifact.bytes,
             .shared => |value| value.payload.bytes(),
         };
     }
@@ -132,7 +155,7 @@ pub const RetainedSegment = union(enum) {
 
     pub fn mappedBytes(self: RetainedSegment) ?[]align(std.heap.page_size_min) u8 {
         return switch (self) {
-            .mapped => |data| data,
+            .mapped => |artifact| artifact.bytes,
             .heap => null,
             .shared => |value| value.payload.mappedBytes(),
         };
@@ -143,6 +166,10 @@ pub const RetainedSegment = union(enum) {
             .shared => |value| {
                 if (value.refs.fetchSub(1, .acq_rel) == 1) {
                     const owner = value.alloc;
+                    if (value.verified_reader.load(.acquire)) |reader| {
+                        reader.deinit();
+                        owner.destroy(reader);
+                    }
                     value.payload.deinit(owner);
                     if (value.retired.load(.acquire)) if (value.retirement_storage) |*lease| {
                         defer lease.deinit();
@@ -156,10 +183,7 @@ pub const RetainedSegment = union(enum) {
                 }
             },
             .heap => |data| alloc.free(data),
-            .mapped => |data| if (builtin.os.tag != .freestanding and builtin.os.tag != .windows and builtin.os.tag != .wasi)
-                std.posix.munmap(data)
-            else
-                unreachable,
+            .mapped => |*artifact| artifact.deinit(),
         }
         self.* = undefined;
     }
@@ -177,7 +201,7 @@ fn testSharedSegmentOwnership(alloc: Allocator) !void {
     var payload_owned = true;
     defer if (payload_owned) payload.deinit(alloc);
     const descriptor = posting_wal.Checkpoint.Segment{ .generation = 3, .checksum = 17, .admission_checksum = 23 };
-    var original = try RetainedSegment.share(alloc, payload, "/index-a", descriptor);
+    var original = try RetainedSegment.share(alloc, payload, "/index-a", descriptor, null);
     payload_owned = false;
     var original_owned = true;
     defer if (original_owned) original.deinit(alloc);
@@ -217,7 +241,7 @@ test "storage.posting retired segment owns deletion storage past provider shutdo
     var payload_owned = true;
     defer if (payload_owned) payload.deinit(alloc);
     const descriptor = posting_wal.Checkpoint.Segment{ .generation = 1 };
-    var segment = try RetainedSegment.share(alloc, payload, root, descriptor);
+    var segment = try RetainedSegment.share(alloc, payload, root, descriptor, null);
     payload_owned = false;
     var segment_owned = true;
     defer if (segment_owned) segment.deinit(alloc);
@@ -307,6 +331,23 @@ pub const RecoveredWal = struct {
     bytes: []u8,
     replay: posting_wal.Replay,
 
+    /// Replay records borrow from bytes. Shrinking in place preserves those
+    /// pointers. If the allocator cannot shrink, rebuild from the same prefix.
+    fn retainCommittedPrefix(self: *RecoveredWal) !void {
+        const len = self.replay.committed_bytes;
+        if (self.alloc.resize(self.bytes, len)) {
+            self.bytes = if (len == 0) &.{} else self.bytes[0..len];
+            self.replay.valid_bytes = len;
+            return;
+        }
+        self.replay.deinit();
+        self.replay = .{ .alloc = self.alloc };
+        const bytes = try self.alloc.dupe(u8, self.bytes[0..len]);
+        self.alloc.free(self.bytes);
+        self.bytes = bytes;
+        self.replay = try posting_wal.Replay.parse(self.alloc, bytes);
+    }
+
     pub fn deinit(self: *RecoveredWal) void {
         self.replay.deinit();
         self.alloc.free(self.bytes);
@@ -336,10 +377,10 @@ pub const Store = struct {
     poisoned: bool,
 
     pub fn open(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !Store {
-        return try openInternal(alloc, storage, root_dir, null, false);
+        return try openInternal(alloc, storage, root_dir, null, .writer);
     }
     pub fn openReadOnly(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !Store {
-        return try openInternal(alloc, storage, root_dir, null, true);
+        return try openInternal(alloc, storage, root_dir, null, .read_only);
     }
 
     /// Opens and validates the store while retaining the already-read segment
@@ -347,28 +388,42 @@ pub const Store = struct {
     /// This avoids reading and checksumming a large immutable segment twice on
     /// process startup.
     pub fn openWithSegmentAlloc(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !OpenedWithSegment {
-        var retained_segments: ?[]RetainedSegment = null;
-        var store = try openInternal(alloc, storage, root_dir, &retained_segments, false);
-        errdefer store.deinit();
-        return .{
-            .store = store,
-            .segments = retained_segments orelse return error.MissingPostingCheckpoint,
-        };
+        return openRetainingSegments(alloc, storage, root_dir, .read_serving);
     }
+
     pub fn openReadOnlyWithSegmentAlloc(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !OpenedWithSegment {
-        var retained_segments: ?[]RetainedSegment = null;
-        var store = try openInternal(alloc, storage, root_dir, &retained_segments, true);
-        errdefer store.deinit();
-        return .{ .store = store, .segments = retained_segments orelse return error.MissingPostingCheckpoint };
+        return openRetainingSegments(alloc, storage, root_dir, .read_only);
     }
+
+    /// Fence the recovered WAL before its coverage can drive source replay.
+    /// Read-only activation may sync a complete WAL but cannot repair a tail.
+    pub fn openAuthoritativeWithSegmentAlloc(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8, read_only: bool) !OpenedWithSegment {
+        return openRetainingSegments(alloc, storage, root_dir, if (read_only) .authoritative_read_only else .writer);
+    }
+
+    const OpenMode = enum { writer, read_serving, read_only, authoritative_read_only };
+
+    fn openRetainingSegments(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8, mode: OpenMode) !OpenedWithSegment {
+        var retained: ?RetainedOpen = null;
+        var store = try openInternal(alloc, storage, root_dir, &retained, mode);
+        errdefer store.deinit();
+        const snapshot = retained orelse return error.MissingPostingCheckpoint;
+        return .{ .store = store, .segments = snapshot.segments, .wal = snapshot.wal };
+    }
+
+    const RetainedOpen = struct {
+        segments: []RetainedSegment,
+        wal: RecoveredWal,
+    };
 
     fn openInternal(
         alloc: Allocator,
         storage: lsm_backend.Storage,
         root_dir: []const u8,
-        retained_segments: ?*?[]RetainedSegment,
-        read_only: bool,
+        retained_open: ?*?RetainedOpen,
+        mode: OpenMode,
     ) !Store {
+        const read_only = mode == .read_only or mode == .authoritative_read_only;
         const owned_root = try alloc.dupe(u8, root_dir);
         if (!read_only) storage.createDirPath(owned_root) catch |err| {
             alloc.free(owned_root);
@@ -423,7 +478,8 @@ pub const Store = struct {
                 return error.PostingSegmentTooLarge;
         }
         var recovered = try store.recoverWal();
-        defer recovered.deinit();
+        var recovered_owned = true;
+        defer if (recovered_owned) recovered.deinit();
         if (recovered.replay.committed_bytes < checkpoint.wal_committed_bytes) {
             return error.PostingWalShorterThanCheckpoint;
         }
@@ -438,6 +494,16 @@ pub const Store = struct {
         if (recovered.bytes.len != recovered.replay.committed_bytes) {
             if (read_only) return error.PostingWalUncommittedTail;
             try store.replaceWal(recovered.bytes[0..recovered.replay.committed_bytes]);
+            if (retained_open != null) try recovered.retainCommittedPrefix();
+        } else if ((mode == .writer or mode == .authoritative_read_only) and
+            recovered.replay.committed_bytes > checkpoint.sealedWalBytes())
+        {
+            // A complete commit frame may still be in the page cache after
+            // an append's failed fsync. Establish durability before making
+            // recovered coverage available to acknowledge or advance it.
+            const wal_path = try store.walPathAlloc(store.wal_generation);
+            defer alloc.free(wal_path);
+            try storage.syncFileContentsAbsolute(wal_path);
         }
         store.wal_committed_bytes = recovered.replay.committed_bytes;
         store.wal_has_state_records = replayHasStateRecords(&recovered.replay);
@@ -446,8 +512,9 @@ pub const Store = struct {
             checkpoint.covered_source_sequence,
             recovered.replay.covered_source_sequence,
         );
-        if (retained_segments) |out| {
-            out.* = retained;
+        if (retained_open) |out| {
+            out.* = .{ .segments = retained, .wal = recovered };
+            recovered_owned = false;
             retained_count = 0;
         } else {
             for (retained) |*segment| segment.deinit(alloc);
@@ -579,12 +646,10 @@ pub const Store = struct {
         const wal_path = try self.walPathAlloc(self.wal_generation);
         defer self.alloc.free(wal_path);
         const encoded_at = if (trace) @import("antfly_platform").time.monotonicNs() else 0;
-        self.storage.appendFileAbsolute(self.alloc, wal_path, writer.bytes(), options.sync) catch |err| {
-            // The storage error may be ambiguous (for example fsync failed
-            // after the append reached the page cache). Refuse retries on this
-            // handle; reopen reparses the durable prefix without risking a
-            // duplicate committed batch.
-            self.poisoned = true;
+        var may_have_appended: bool = undefined;
+        self.storage.appendFileAbsoluteChecked(self.alloc, wal_path, writer.bytes(), options.sync, &may_have_appended) catch |err| {
+            // An uncertain append must be reconciled against the durable WAL.
+            self.poisoned = may_have_appended;
             return err;
         };
         self.wal_committed_bytes = next_committed_bytes;
@@ -1369,45 +1434,48 @@ pub const Store = struct {
     fn readSegmentAllocFor(self: *Store, descriptor: posting_wal.Checkpoint.Segment) ![]u8 {
         const path = try self.segmentPathAlloc(descriptor.generation);
         defer self.alloc.free(path);
-        const bytes = self.storage.readFileAlloc(self.alloc, path, boundedReadLimit(max_segment_bytes)) catch |err| switch (err) {
-            error.FileNotFound => return error.MissingPostingSegment,
-            else => return err,
-        };
+        const bytes = try self.readSegmentBytes(path);
         errdefer self.alloc.free(bytes);
-        if (descriptor.admission_checksum != 0) {
-            if ((posting_segment.admissionChecksum(bytes) catch 0) != descriptor.admission_checksum) {
-                return error.PostingSegmentChecksumMismatch;
-            }
-        } else if (@import("antfly_hash").Crc32.hash(bytes) != descriptor.checksum) {
-            return error.PostingSegmentChecksumMismatch;
-        }
-        _ = try posting_segment.Reader.init(bytes);
+        _ = try validateSegment(bytes, descriptor);
         return bytes;
+    }
+
+    fn readSegmentBytes(self: *Store, path: []const u8) ![]u8 {
+        return self.storage.readFileAlloc(self.alloc, path, boundedReadLimit(max_segment_bytes)) catch |err| switch (err) {
+            error.FileNotFound => error.MissingPostingSegment,
+            else => err,
+        };
+    }
+
+    fn validateSegment(bytes: []const u8, descriptor: posting_wal.Checkpoint.Segment) !posting_segment.Reader {
+        if (bytes.len > max_segment_bytes) return error.PostingSegmentTooLarge;
+        const reader = try posting_segment.Reader.init(bytes);
+        const checksum = if (descriptor.admission_checksum != 0)
+            reader.admissionChecksum()
+        else
+            @import("antfly_hash").Crc32.hash(bytes);
+        const expected = if (descriptor.admission_checksum != 0) descriptor.admission_checksum else descriptor.checksum;
+        if (checksum != expected) return error.PostingSegmentChecksumMismatch;
+        return reader;
     }
 
     fn readSegmentRetainedFor(self: *Store, descriptor: posting_wal.Checkpoint.Segment) !RetainedSegment {
         const path = try self.segmentPathAlloc(descriptor.generation);
         defer self.alloc.free(path);
-        if (comptime builtin.os.tag != .freestanding and builtin.os.tag != .windows and builtin.os.tag != .wasi) {
-            if (mapSegmentFile(path)) |mapped| {
-                const published_checksum_matches = mapped.len <= max_segment_bytes and (if (descriptor.admission_checksum != 0)
-                    (posting_segment.admissionChecksum(mapped) catch 0) == descriptor.admission_checksum
-                else
-                    @import("antfly_hash").Crc32.hash(mapped) == descriptor.checksum);
-                if (published_checksum_matches) {
-                    if (posting_segment.Reader.init(mapped)) |_| {
-                        std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.RANDOM) catch {};
-                        var payload = RetainedSegment{ .mapped = mapped };
-                        errdefer payload.deinit(self.alloc);
-                        return try RetainedSegment.share(self.alloc, payload, self.root_dir, descriptor);
-                    } else |_| {}
-                }
-                std.posix.munmap(mapped);
-            } else |_| {}
+        const mapped = self.storage.mapValidatedImmutableArtifact(self.alloc, path, true, descriptor, posting_segment.Reader, validateSegment) catch |err| switch (err) {
+            error.FileNotFound => return error.MissingPostingSegment,
+            error.EmptySegment => return error.CorruptedPostingSegment,
+            else => return err,
+        };
+        if (mapped) |validated| {
+            var payload = RetainedSegment{ .mapped = validated.artifact };
+            errdefer payload.deinit(self.alloc);
+            return RetainedSegment.share(self.alloc, payload, self.root_dir, descriptor, validated.reader);
         }
-        var payload = RetainedSegment{ .heap = try self.readSegmentAllocFor(descriptor) };
+        var payload = RetainedSegment{ .heap = try self.readSegmentBytes(path) };
         errdefer payload.deinit(self.alloc);
-        return try RetainedSegment.share(self.alloc, payload, self.root_dir, descriptor);
+        const reader = try validateSegment(payload.bytes(), descriptor);
+        return RetainedSegment.share(self.alloc, payload, self.root_dir, descriptor, reader);
     }
 
     fn replaceWal(self: *Store, contents: []const u8) !void {
@@ -1455,30 +1523,25 @@ pub const OpenedWithSegment = struct {
     /// Ordered oldest-to-newest: one complete base followed by replacement
     /// deltas. The slice and every retained mmap/heap buffer are owned here.
     segments: []RetainedSegment,
+    wal: ?RecoveredWal = null,
+
+    /// Startup uses the replay validated alongside these segments. Prepared
+    /// checkpoint readers recover their WAL on demand.
+    pub fn takeWal(self: *OpenedWithSegment) !RecoveredWal {
+        const wal = self.wal orelse return self.store.recoverWal();
+        self.wal = null;
+        return wal;
+    }
 
     pub fn deinit(self: *OpenedWithSegment) void {
         const alloc = self.store.alloc;
+        if (self.wal) |*wal| wal.deinit();
         self.store.deinit();
         for (self.segments) |*segment| segment.deinit(alloc);
         alloc.free(self.segments);
         self.* = undefined;
     }
 };
-
-fn mapSegmentFile(path: []const u8) ![]align(std.heap.page_size_min) u8 {
-    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        return error.UnsupportedPlatform;
-    }
-    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
-        .ACCMODE = .RDONLY,
-        .CLOEXEC = true,
-    }, 0);
-    defer _ = std.posix.system.close(fd);
-    const size_raw = std.posix.system.lseek(fd, 0, std.posix.SEEK.END);
-    if (size_raw <= 0) return error.EmptyPostingSegment;
-    const size = std.math.cast(usize, size_raw) orelse return error.PostingSegmentTooLarge;
-    return try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
-}
 
 fn boundedReadLimit(max_bytes: usize) usize {
     return std.math.add(usize, max_bytes, 1) catch std.math.maxInt(usize);
@@ -1562,6 +1625,89 @@ test "storage.posting segment store publishes checkpoint and committed WAL gener
     try std.testing.expectEqualStrings("quant-v2", replay.replay.latest(7, .quantized_checkpoint).?.payload);
 }
 
+test "storage.posting WAL retries a pre-write descriptor error and fences an ambiguous append" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const Fault = struct {
+        fn reject(_: *anyopaque, _: []const u8, _: []const u8, _: bool, may_have_appended: *bool) !void {
+            may_have_appended.* = false;
+            return error.ProcessFdQuotaExceeded;
+        }
+
+        fn appendThenFail(ptr: *anyopaque, path: []const u8, bytes: []const u8, sync: bool, may_have_appended: *bool) !void {
+            may_have_appended.* = true;
+            const memory_storage: *lsm_backend.MemoryStorage = @ptrCast(@alignCast(ptr));
+            try memory_storage.storage().vtable.append_file_absolute.?(ptr, path, bytes, sync);
+            return error.InputOutput;
+        }
+    };
+
+    var store = try Store.open(alloc, memory.storage(), "/posting-retry");
+    defer store.deinit();
+    var writer = posting_segment.Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBaseAt(7, 10, "base");
+    const segment = try writer.build();
+    defer alloc.free(segment);
+    try store.publishCheckpoint(1, 10, segment);
+
+    var fault_vtable = memory.storage().vtable.*;
+    store.storage.vtable = &fault_vtable;
+    const batch = &.{BatchRecord{ .kind = .base, .posting_id = 7, .source_sequence = 11, .payload = "update" }};
+    fault_vtable.append_file_absolute_checked = Fault.reject;
+    try std.testing.expectError(error.ProcessFdQuotaExceeded, store.appendBatch(1, batch, 11));
+    try std.testing.expect(!store.poisoned);
+    try std.testing.expectEqual(@as(u64, 0), store.wal_committed_bytes);
+    try std.testing.expectEqual(@as(u64, 1), try store.nextBatchId());
+
+    fault_vtable.append_file_absolute_checked = null;
+    try store.appendBatch(1, batch, 11);
+    try std.testing.expectEqual(@as(u64, 2), try store.nextBatchId());
+
+    const next = &.{BatchRecord{ .kind = .base, .posting_id = 7, .source_sequence = 12, .payload = "second update" }};
+    fault_vtable.append_file_absolute_checked = Fault.appendThenFail;
+    try std.testing.expectError(error.InputOutput, store.appendBatch(2, next, 12));
+    try std.testing.expectError(error.PostingStoreRequiresReopen, store.appendBatch(2, next, 12));
+
+    // Parsing a complete frame after failed sync is not a durability proof.
+    // Repeated writer opens must keep failing until the barrier succeeds.
+    const Sync = struct {
+        fn fail(_: *anyopaque, _: []const u8) !void {
+            return error.InputOutput;
+        }
+    };
+    fault_vtable.sync_contents_absolute = Sync.fail;
+    {
+        var reader = try Store.openWithSegmentAlloc(alloc, store.storage, "/posting-retry");
+        defer reader.deinit();
+        try std.testing.expectEqual(@as(?u64, 2), reader.store.last_committed_batch);
+    }
+    for (0..2) |_| {
+        try std.testing.expectError(error.InputOutput, Store.open(alloc, store.storage, "/posting-retry"));
+        for ([_]bool{ false, true }) |read_only| {
+            try std.testing.expectError(error.InputOutput, Store.openAuthoritativeWithSegmentAlloc(alloc, store.storage, "/posting-retry", read_only));
+        }
+    }
+
+    const syncs_before = memory.sync_contents_calls;
+    var reopened = try Store.open(alloc, memory.storage(), "/posting-retry");
+    defer reopened.deinit();
+    try std.testing.expectEqual(syncs_before + 1, memory.sync_contents_calls);
+    try std.testing.expectEqual(@as(u64, 2), reopened.last_committed_batch);
+    var replay = try reopened.recoverWal();
+    defer replay.deinit();
+    try std.testing.expectEqualStrings("second update", replay.replay.latest(7, .base).?.payload);
+
+    var startup = try Store.openAuthoritativeWithSegmentAlloc(alloc, memory.storage(), "/posting-retry", true);
+    defer startup.deinit();
+    try reopened.appendBatch(3, &.{.{ .kind = .coverage, .posting_id = 0, .source_sequence = 13, .payload = &.{} }}, 13);
+    var snapshot = try startup.takeWal();
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(u64, 12), startup.store.covered_source_sequence);
+    try std.testing.expectEqual(@as(u64, 12), snapshot.replay.covered_source_sequence);
+}
+
 test "storage.posting segment store poisons ambiguous CURRENT publication" {
     @import("antfly_test_error_logs").expectErrorLogs(1);
     const alloc = std.testing.allocator;
@@ -1610,21 +1756,175 @@ test "storage.posting segment store truncates incomplete WAL tail before append"
         .payload = "one",
     }}, 1);
     const committed_bytes = store.wal_committed_bytes;
+    var tail = posting_wal.Writer.initAfterCommitted(alloc, 1, 1);
+    defer tail.deinit();
+    try tail.append(.base, 2, 3, 2, "uncommitted");
+    try memory.storage().appendFileAbsolute(alloc, "/posting-tail/wal-2.afpw", tail.bytes(), false);
     try memory.storage().appendFileAbsolute(alloc, "/posting-tail/wal-2.afpw", "partial", false);
     store.deinit();
 
-    store = try Store.open(alloc, memory.storage(), "/posting-tail");
-    defer store.deinit();
+    var opened = try Store.openAuthoritativeWithSegmentAlloc(alloc, memory.storage(), "/posting-tail", false);
+    defer opened.deinit();
     try std.testing.expectEqual(committed_bytes, try memory.storage().fileSize("/posting-tail/wal-2.afpw"));
-    try store.appendBatch(2, &.{.{
+    var snapshot = try opened.takeWal();
+    defer snapshot.deinit();
+    try std.testing.expectEqual(committed_bytes, snapshot.bytes.len);
+    try std.testing.expectEqual(committed_bytes, snapshot.replay.valid_bytes);
+    try std.testing.expectEqualStrings("one", snapshot.replay.latest(3, .base).?.payload);
+    try opened.store.appendBatch(2, &.{.{
         .kind = .base,
         .posting_id = 3,
         .source_sequence = 2,
         .payload = "two",
     }}, 2);
-    var replay = try store.recoverWal();
+    var replay = try opened.store.recoverWal();
     defer replay.deinit();
     try std.testing.expectEqualStrings("two", replay.replay.latest(3, .base).?.payload);
+}
+
+test "storage.posting WAL committed prefix copy unwinds allocation failures" {
+    const Fixture = struct {
+        fn run(backing: Allocator) !void {
+            const alloc = std.testing.allocator;
+            var writer = posting_wal.Writer.init(alloc);
+            defer writer.deinit();
+            try writer.append(.base, 1, 3, 1, "committed");
+            try writer.commit(1, 1);
+            const committed_len = writer.bytes().len;
+            try writer.append(.base, 2, 3, 2, "uncommitted");
+
+            var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+            const recovery_alloc = no_resize.allocator();
+            const bytes = try recovery_alloc.dupe(u8, writer.bytes());
+            const replay = posting_wal.Replay.parse(recovery_alloc, bytes) catch |err| {
+                recovery_alloc.free(bytes);
+                return err;
+            };
+            var recovered: RecoveredWal = .{ .alloc = recovery_alloc, .bytes = bytes, .replay = replay };
+            defer recovered.deinit();
+            try recovered.retainCommittedPrefix();
+            try std.testing.expectEqual(committed_len, recovered.bytes.len);
+            try std.testing.expectEqual(committed_len, recovered.replay.valid_bytes);
+            try std.testing.expectEqualStrings("committed", recovered.replay.latest(3, .base).?.payload);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "storage.posting admission remaps a stale descriptor from another storage view" {
+    if (builtin.os.tag != .linux and (builtin.os.tag != .macos or !builtin.link_libc)) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("posting-remap");
+    defer directory.cleanup();
+    const root = directory.path();
+    var reader_storage = try lsm_backend.NativeStorage.init(alloc, .threaded);
+    defer reader_storage.deinit();
+    var writer_storage = try lsm_backend.NativeStorage.init(alloc, .threaded);
+    defer writer_storage.deinit();
+
+    var store = try Store.open(alloc, writer_storage.storage(), root);
+    defer store.deinit();
+    const path = try checkpointSegmentPathAlloc(alloc, root, 1);
+    defer alloc.free(path);
+    try writer_storage.storage().writeFileAbsolute(path, "stale");
+    _ = try reader_storage.storage().fileSize(path);
+
+    var segment_writer = posting_segment.Writer.init(alloc);
+    defer segment_writer.deinit();
+    try segment_writer.appendBaseAt(3, 1, "new segment");
+    const segment = try segment_writer.build();
+    defer alloc.free(segment);
+    try store.publishCheckpoint(1, 1, segment);
+
+    var opened = try Store.openWithSegmentAlloc(alloc, reader_storage.storage(), root);
+    defer opened.deinit();
+    try std.testing.expect(opened.segments[0].isMapped());
+    const reader = try opened.segments[0].validatedReader();
+    try std.testing.expectEqualStrings("new segment", (try reader.getBase(3)).?);
+}
+
+test "storage.posting retained generations share payload verification" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const root = "/posting-verification";
+    var store = try Store.open(alloc, memory.storage(), root);
+    defer store.deinit();
+    var segment_writer = posting_segment.Writer.init(alloc);
+    defer segment_writer.deinit();
+    try segment_writer.appendBaseAt(3, 1, "shared segment");
+    const segment = try segment_writer.build();
+    defer alloc.free(segment);
+    try store.publishCheckpoint(1, 1, segment);
+
+    var opened = try Store.openWithSegmentAlloc(alloc, memory.storage(), root);
+    defer opened.deinit();
+    var successor = opened.segments[0].retainMatching(root, opened.store.checkpoint.?.segment(0)).?;
+    defer successor.deinit(alloc);
+    var original = try opened.segments[0].verifiedReader(alloc);
+    defer original.deinit();
+    try std.testing.expectEqualStrings("shared segment", (try original.getBase(3)).?);
+    var reused = try successor.verifiedReader(alloc);
+    defer reused.deinit();
+    try std.testing.expectEqual(original.verification.ptr, reused.verification.ptr);
+    try std.testing.expectEqualStrings("shared segment", (try reused.getBase(3)).?);
+}
+
+test "storage.posting mapping operational errors skip buffered fallback" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var store = try Store.open(alloc, memory.storage(), "/posting-map-errors");
+    defer store.deinit();
+    const Fault = struct {
+        fn read(_: *anyopaque, _: Allocator, _: []const u8, _: usize) ![]u8 {
+            return error.UnexpectedBufferedRead;
+        }
+    };
+    inline for (.{ error.ProcessFdQuotaExceeded, error.OutOfMemory, error.Canceled }) |injected| {
+        const Mapper = struct {
+            fn map(_: *anyopaque, _: Allocator, _: []const u8) !@import("../segment_source.zig").MappedArtifact {
+                return injected;
+            }
+        };
+        var vtable = memory.storage().vtable.*;
+        vtable.direct_immutable_mapping = true;
+        vtable.map_immutable_artifact = Mapper.map;
+        vtable.read_file_alloc = Fault.read;
+        store.storage.vtable = &vtable;
+        try std.testing.expectError(injected, store.readSegmentRetainedFor(.{ .generation = 1 }));
+    }
+}
+
+test "storage.posting validation skips materializing mappings" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const Mapper = struct {
+        fn map(_: *anyopaque, _: Allocator, _: []const u8) !@import("../segment_source.zig").MappedArtifact {
+            @panic("posting validation requested a materializing mapping");
+        }
+    };
+    var vtable = memory.storage().vtable.*;
+    vtable.map_immutable_artifact = Mapper.map;
+    var storage = memory.storage();
+    storage.vtable = &vtable;
+    {
+        var store = try Store.open(alloc, storage, "/posting-materialized");
+        defer store.deinit();
+        var segment_writer = posting_segment.Writer.init(alloc);
+        defer segment_writer.deinit();
+        try segment_writer.appendBaseAt(3, 0, "zero");
+        const segment = try segment_writer.build();
+        defer alloc.free(segment);
+        try store.publishCheckpoint(1, 0, segment);
+    }
+
+    var writer = try Store.open(alloc, storage, "/posting-materialized");
+    defer writer.deinit();
+    var reader = try Store.openWithSegmentAlloc(alloc, storage, "/posting-materialized");
+    defer reader.deinit();
+    try std.testing.expect(!reader.segments[0].isMapped());
 }
 
 test "storage.posting segment store orders maintenance batches independently from source coverage" {
