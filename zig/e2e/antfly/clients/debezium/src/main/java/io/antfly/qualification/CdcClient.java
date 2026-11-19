@@ -29,7 +29,7 @@ public final class CdcClient {
             throw new IllegalArgumentException("qualification requires stock PostgresConnector and pgoutput");
         }
         AtomicReference<Throwable> failure = new AtomicReference<>();
-        try (DebeziumEngine<ChangeEvent<String, String>> engine = DebeziumEngine.create(Json.class)
+        DebeziumEngine<ChangeEvent<String, String>> engine = DebeziumEngine.create(Json.class)
                 .using(config)
                 .using((success, message, error) -> {
                     if (!success) failure.set(error != null ? error : new IllegalStateException(message));
@@ -44,17 +44,18 @@ public final class CdcClient {
                         committer.markProcessed(record);
                     }
                     committer.markBatchFinished();
-                }).build()) {
-            Thread shutdown = new Thread(() -> {
-                try { engine.close(); }
-                catch (Exception error) { failure.compareAndSet(null, error); }
-            }, "qualification-shutdown");
-            Runtime.getRuntime().addShutdownHook(shutdown);
-            try { engine.run(); }
-            finally {
-                try { Runtime.getRuntime().removeShutdownHook(shutdown); }
-                catch (IllegalStateException ignored) { /* JVM is already shutting down. */ }
-            }
+                }).build();
+        // The async engine closes itself when run exits. A second close can
+        // throw and mask the connector's useful completion exception.
+        Thread shutdown = new Thread(() -> {
+            try { engine.close(); }
+            catch (Exception error) { failure.compareAndSet(null, error); }
+        }, "qualification-shutdown");
+        Runtime.getRuntime().addShutdownHook(shutdown);
+        try { engine.run(); }
+        finally {
+            try { Runtime.getRuntime().removeShutdownHook(shutdown); }
+            catch (IllegalStateException ignored) { /* JVM is already shutting down. */ }
         }
         if (failure.get() != null) throw new IllegalStateException("CDC connector failed", failure.get());
     }
