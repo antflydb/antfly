@@ -72,12 +72,16 @@ pub fn Bridge(comptime Host: type) type {
             if (comptime @hasDecl(Host, "schedulePublication"))
                 try self.host.schedulePublication(self.owner.session, request);
             const req = try self.host.request(request);
-            var page = try self.owner.poll(self.host.service, self.host.registry, self.host, a, @backingInt(after), maximum, req);
+            // The connection budget can reclaim large transport buffers
+            // immediately. A fetch arena would retain them through every
+            // nested metadata and artifact read in this poll.
+            const backing = request.scratch_allocator orelse a;
+            var page = try self.owner.poll(self.host.service, self.host.registry, self.host, backing, @backingInt(after), maximum, req);
             defer page.deinit();
             var result: backend.ReplicationPoll = .{ .end_lsn = @fromBackingInt(page.end_lsn) };
             if (page.bytes) |bytes| {
-                const lease = try a.create(Lease);
-                lease.* = .{ .parent = self, .allocator = a, .bytes = bytes };
+                const lease = try backing.create(Lease);
+                lease.* = .{ .parent = self, .allocator = backing, .bytes = bytes };
                 page.bytes = null;
                 self.pages += 1;
                 result.chunk = .{ .start_lsn = @fromBackingInt(page.start_lsn), .bytes = bytes };
@@ -88,7 +92,7 @@ pub fn Bridge(comptime Host: type) type {
         fn feedback(raw: *anyopaque, a: std.mem.Allocator, request: backend.Request, value: backend.pgoutput.Feedback) !void {
             const self: *Self = @ptrCast(@alignCast(raw));
             const req = try self.host.request(request);
-            return self.owner.feedback(self.host.service, self.host, a, .{ .written = @backingInt(value.written), .flushed = @backingInt(value.flushed), .applied = @backingInt(value.applied) }, req);
+            return self.owner.feedback(self.host.service, self.host, request.scratch_allocator orelse a, .{ .written = @backingInt(value.written), .flushed = @backingInt(value.flushed), .applied = @backingInt(value.applied) }, req);
         }
         fn close(raw: *anyopaque) void {
             const self: *Self = @ptrCast(@alignCast(raw));

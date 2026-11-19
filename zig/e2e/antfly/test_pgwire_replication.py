@@ -69,9 +69,9 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             timeout=40,
         )
 
-    def slot(*action, name="smoke_slot"):
+    def slot(*action):
         subprocess.run(
-            [client, *connection, f"--slot={name}", *action],
+            [client, *connection, "--slot=smoke_slot", *action],
             env=env,
             check=True,
             timeout=40,
@@ -93,6 +93,8 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                     "proto_version=1",
                     "-o",
                     "publication_names=changes",
+                    "-o",
+                    "messages=true",
                     "-f",
                     str(output),
                 ],
@@ -127,9 +129,10 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
     )
     try:
         sql("CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT)")
+        if export_snapshot:
+            sql("ALTER TABLE smoke REPLICA IDENTITY FULL")
         sql("CREATE PUBLICATION changes FOR TABLE smoke")
         if export_snapshot:
-            slot("--create-slot", "--plugin=pgoutput", name="history_setup")
             sql("INSERT INTO smoke (id, content) VALUES (6, 'snapshot-before-cut')")
             exporter_connection = [
                 *connection[:-1],
@@ -165,7 +168,9 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                     "-v",
                     "VERBOSITY=verbose",
                     "-c",
-                    "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+                    "BEGIN",
+                    "-c",
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
                     "-c",
                     f"SET TRANSACTION SNAPSHOT '{snapshot}'",
                     "-c",
@@ -182,6 +187,7 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             assert copied.stdout.splitlines() == [
                 "BEGIN",
                 "SET",
+                "SET",
                 "snapshot-before-cut",
                 "COMMIT",
             ]
@@ -197,8 +203,12 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                 time.sleep(0.2)
             assert first.exists() and b"retained-stream-smoke" in first.read_bytes()
             if export_snapshot:
-                assert b"snapshot-after-cut" in first.read_bytes()
-                assert b"snapshot-before-cut" not in first.read_bytes()
+                payload = first.read_bytes()
+                assert payload.count(b"snapshot-after-cut") == 1
+                assert payload.count(b"snapshot-before-cut") == 1
+                assert payload.index(b"snapshot-before-cut") < payload.index(
+                    b"snapshot-after-cut"
+                )
 
             # Give the client time to flush and report the complete frame.
             time.sleep(12)
@@ -211,8 +221,6 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             assert resumed.is_file()
         assert resumed.read_bytes() == b""
         slot("--drop-slot")
-        if export_snapshot:
-            slot("--drop-slot", name="history_setup")
     except Exception:
         print(server.debug_logs())
         raise

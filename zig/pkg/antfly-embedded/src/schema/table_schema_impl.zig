@@ -27,6 +27,7 @@ const relational_native = @import("../storage/relational_index.zig");
 pub const TableSchema = struct {
     version: u32 = 0,
     storage_mode: StorageMode = .document,
+    replica_identity: ?enum { default, full } = null,
     external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
     default_type: []const u8 = "",
     ttl_duration_ns: u64 = 0,
@@ -2612,6 +2613,12 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
         defer alloc.free(bytes);
         parsed.external_base_source = try @import("../serverless/external_source/schema_binding.zig").externalBindingFromSchemaJsonAlloc(alloc, bytes);
         if (parsed.external_base_source != null and parsed.storage_mode != .relational) return error.InvalidSchemaUpdateRequest;
+    }
+    if (root.get("replica_identity")) |identity| {
+        if (identity != .null) {
+            if (parsed.storage_mode != .relational or parsed.external_base_source != null or identity != .string) return error.InvalidSchemaUpdateRequest;
+            parsed.replica_identity = std.meta.stringToEnum(@typeInfo(@FieldType(TableSchema, "replica_identity")).optional.child, identity.string) orelse return error.InvalidSchemaUpdateRequest;
+        }
     }
     if (root.get("default_type")) |default_type| {
         if (default_type != .null) {

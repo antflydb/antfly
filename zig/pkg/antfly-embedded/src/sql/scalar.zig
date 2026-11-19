@@ -24,6 +24,8 @@ const json_order = @import("json_order.zig");
 const setting_catalog = @import("setting_catalog.zig");
 const Allocator = std.mem.Allocator;
 const Json = std.json.Value;
+pub const postgres_compat_version = "16.0";
+const postgres_version_banner = "PostgreSQL " ++ postgres_compat_version ++ " compatibility (Antfly)";
 pub const PatternSet = struct {
     ptr: *anyopaque,
     count: usize,
@@ -2750,6 +2752,10 @@ const Binder = struct {
                     for (call.args) |arg| _ = try self.infer(arg, depth + 1);
                     break :blk .{ .kind = .integer, .nullable = false };
                 }
+                if (std.mem.eql(u8, call.name, "version")) {
+                    if (call.args.len != 0) return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = .string, .nullable = false };
+                }
                 const function = try functionId(call.name);
                 try validateFunctionArity(function, call.args.len);
                 if (function == .value_identity or function == .is_missing) {
@@ -3210,6 +3216,8 @@ const Binder = struct {
                     self.parameter_count = validator.parameter_count;
                     break :blk .{ .literal = .{ .integer = 1 } };
                 }
+                if (std.mem.eql(u8, call.name, "version"))
+                    break :blk .{ .literal = .{ .string = postgres_version_banner } };
                 const function = try functionId(call.name);
                 if (function == .current_setting) {
                     if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };

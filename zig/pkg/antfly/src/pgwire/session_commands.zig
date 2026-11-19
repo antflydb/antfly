@@ -95,6 +95,7 @@ pub const Setting = union(enum) {
     client_encoding: EncodingSetting,
     catalog: CatalogSetting,
     transaction_snapshot: []const u8,
+    transaction_options: @import("backend.zig").TransactionOptions,
     reset_all,
     discard_all,
 };
@@ -111,10 +112,42 @@ fn transactionSnapshot(alloc: std.mem.Allocator, input: []const u8) !?[]const u8
     return name;
 }
 
+fn transactionOptions(alloc: std.mem.Allocator, input: []const u8) !?@import("backend.zig").TransactionOptions {
+    var p: Parser = .{ .alloc = alloc, .input = input };
+    for ([_][]const u8{ "set", "transaction" }) |keyword| {
+        if (!std.ascii.eqlIgnoreCase(p.word() catch return null, keyword)) return null;
+    }
+    var options: @import("backend.zig").TransactionOptions = .{};
+    while (true) {
+        const word = try p.word();
+        if (std.ascii.eqlIgnoreCase(word, "isolation")) {
+            if (options.isolation != null or !std.ascii.eqlIgnoreCase(try p.word(), "level")) return error.InvalidSqlSyntax;
+            const level = try p.word();
+            if (std.ascii.eqlIgnoreCase(level, "serializable")) {
+                options.isolation = .serializable;
+            } else if (std.ascii.eqlIgnoreCase(level, "repeatable") and std.ascii.eqlIgnoreCase(try p.word(), "read")) {
+                options.isolation = .repeatable_read;
+            } else if (std.ascii.eqlIgnoreCase(level, "read")) {
+                const visibility = try p.word();
+                if (!std.ascii.eqlIgnoreCase(visibility, "committed") and !std.ascii.eqlIgnoreCase(visibility, "uncommitted")) return error.InvalidSqlSyntax;
+                options.isolation = .read_committed;
+            } else return error.InvalidSqlSyntax;
+        } else if (std.ascii.eqlIgnoreCase(word, "read")) {
+            if (options.mode != null) return error.InvalidSqlSyntax;
+            const mode = try p.word();
+            options.mode = if (std.ascii.eqlIgnoreCase(mode, "only")) .read_only else if (std.ascii.eqlIgnoreCase(mode, "write")) .read_write else return error.InvalidSqlSyntax;
+        } else return error.UnsupportedSqlShape;
+        if (!try p.take(',')) break;
+    }
+    try p.finish();
+    return options;
+}
+
 /// The protocol uses one classifier for Describe, Execute, and both streaming
 /// paths. A locally owned setting must never be sent to the SQL read provider.
 pub fn settingCommand(alloc: std.mem.Allocator, input: []const u8) !?Setting {
     if (try transactionSnapshot(alloc, input)) |name| return .{ .transaction_snapshot = name };
+    if (try transactionOptions(alloc, input)) |options| return .{ .transaction_options = options };
     if (try readRequirementsSetting(alloc, input)) |value| return .{ .read_requirements = value };
     if (try visibilitySetting(alloc, input, "antfly.read_visibility")) |value| return .{ .read_visibility = value };
     if (try lakeVisibilitySetting(alloc, input)) |value| return .{ .lake_visibility = value };
@@ -974,5 +1007,9 @@ test "pgwire transaction snapshot setting accepts one quoted name and rejects tr
     try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(a, "SET TRANSACTION SNAPSHOT 'abcd-1'; SELECT 1"));
     try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(a, "SET TRANSACTION SNAPSHOT abcd"));
     try std.testing.expectError(error.InvalidParameter, settingCommand(a, "SET TRANSACTION SNAPSHOT ''"));
-    try std.testing.expect((try settingCommand(a, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")) == null);
+    const options = (try settingCommand(a, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;")).?.transaction_options;
+    try std.testing.expect(options.isolation == .repeatable_read);
+    try std.testing.expect(options.mode == .read_only);
+    try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(a, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT 1"));
+    try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(a, "SET TRANSACTION READ ONLY, READ WRITE"));
 }

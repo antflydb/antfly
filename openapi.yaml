@@ -46313,6 +46313,13 @@ components:
                 default: asc
         storage_mode:
           $ref: '#/components/schemas/TableStorageMode'
+        replica_identity:
+          type: string
+          enum:
+            - default
+            - full
+          description: PostgreSQL logical replication identity for native relational tables. Default uses
+            the primary key. Full emits the complete old row.
         base_source:
           $ref: '#/components/schemas/ExternalLakeTableSource'
           description: External tables require relational storage mode. Ordinary row writes are read-only;

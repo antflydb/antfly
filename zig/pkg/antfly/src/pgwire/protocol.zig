@@ -389,7 +389,7 @@ pub const Session = struct {
                             try self.parameterStatus("antfly_session_completion", "12");
                         }
                     }
-                    try self.parameterStatus("server_version", "16.0-antfly");
+                    try self.parameterStatus("server_version", @import("antfly_local_sources").sql_scalar.postgres_compat_version ++ "-antfly");
                     try self.parameterStatus("server_encoding", "UTF8");
                     try self.parameterStatus("client_encoding", "UTF8");
                     inline for (std.meta.tags(formatting.Setting)) |setting| try self.parameterStatus(setting.name(), setting.value());
@@ -466,7 +466,7 @@ pub const Session = struct {
                 .formatting => |value| if (value.action == .show) try alloc.dupe(backend.Column, &.{.{ .name = value.kind.name(), .type = .string }}) else &.{},
                 .client_encoding => |value| if (value == .show) &.{.{ .name = "client_encoding", .type = .string }} else &.{},
                 .catalog => |value| if (value == .show) &.{.{ .name = value.show, .type = .string }} else &.{},
-                .transaction_snapshot => &.{},
+                .transaction_snapshot, .transaction_options => &.{},
                 .reset_all => &.{},
                 .discard_all => &.{},
             } };
@@ -557,6 +557,7 @@ pub const Session = struct {
                 .client_encoding => |value| self.executeEncodingSetting(alloc, value),
                 .catalog => |value| self.executeCatalogSetting(alloc, statement, value),
                 .transaction_snapshot => |name| self.importSnapshot(alloc, statement, name),
+                .transaction_options => |options| self.setTransactionOptions(statement, options),
                 .reset_all => self.executeResetAll(),
                 .discard_all => self.executeDiscardAll(),
             };
@@ -666,6 +667,21 @@ pub const Session = struct {
         };
         if (self.status == .idle) self.finishSqlCursors(std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT"));
         return result;
+    }
+
+    fn setTransactionOptions(self: *Session, statement: []const u8, options: backend.TransactionOptions) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        if (self.status != .in_transaction or self.session_id == null) return error.NoActiveSqlTransaction;
+        if (!self.snapshot_import_allowed) return error.ActiveSqlTransaction;
+        const update = self.source.vtable.set_transaction_options orelse return error.UnsupportedSqlExecution;
+        const identity = self.identity orelse return error.AuthenticationFailed;
+        self.cancel_requested.store(false, .release);
+        self.executing.store(true, .release);
+        defer self.executing.store(false, .release);
+        const req = self.request(statement, &.{}, &.{});
+        try req.check();
+        try update(self.source.context, identity, req, options);
+        return .{ .command_tag = "SET", .transaction_status = self.status, .session_id = self.session_id };
     }
 
     fn importSnapshot(self: *Session, alloc: std.mem.Allocator, statement: []const u8, name: []const u8) !backend.Result {

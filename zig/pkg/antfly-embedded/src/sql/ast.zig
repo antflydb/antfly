@@ -339,6 +339,7 @@ pub const SchemaChange = union(enum) {
     drop_column: []const u8,
     set_default: struct { column: []const u8, expression: *const Scalar },
     drop_default: []const u8,
+    replica_identity: enum { default, full },
 };
 pub const PolicyDdl = struct {
     action: enum { create, alter, drop, enable, disable },

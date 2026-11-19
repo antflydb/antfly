@@ -445,7 +445,7 @@ pub const CatalogReplicationSlots = struct {
             return error.SqlTransactionNotActive;
         if (metadata.failed) return error.InFailedSqlTransaction;
         if (transaction.execution_started or transaction.savepoints != 0) return error.ActiveSqlTransaction;
-        if (metadata.mode != .read_only or metadata.isolation == .read_committed or metadata.accepted_lake_reads)
+        if (metadata.isolation == .read_committed or metadata.accepted_lake_reads)
             return error.UnsupportedSqlExecution;
     }
 
@@ -778,7 +778,10 @@ pub const CatalogRetainedStream = struct {
             self.publication_worker = null;
             if (failure) |err| switch (err) {
                 error.ChangefeedConflict, error.ChangefeedBackpressure, error.MetadataMutationOutcomeUnknown, error.ReadUnavailable, error.SqlWriteCapacityUnavailable, error.DeadlineExceeded, error.Canceled, error.Cancelled => {},
-                else => return err,
+                else => {
+                    std.log.warn("logical slot publication failed: {s}", .{@errorName(err)});
+                    return err;
+                },
             };
         }
         var context = try Bridge.metadataContext(request_value);
@@ -1349,6 +1352,7 @@ pub const Adapter = struct {
         .evaluate_parameter_cells = evaluateParameterCells,
         .fail_transaction = failTransaction,
         .import_snapshot = importSnapshot,
+        .set_transaction_options = setTransactionOptions,
         .open_stream = openStream,
         .disconnect = disconnect,
         .completion_safe = completionSafe,
@@ -1393,6 +1397,30 @@ pub const Adapter = struct {
         return std.json.parseFromSliceLeaky(@import("antfly_local_sources").sql_setting_catalog.RawSnapshot, alloc, bytes, .{ .allocate = .alloc_always });
     }
 
+    fn setTransactionOptions(raw: *anyopaque, identity: wire.Identity, request: wire.Request, options: wire.TransactionOptions) !void {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        const credential: *Credential = @ptrCast(@alignCast(identity.context));
+        const encoded = request.session_id orelse return error.NoActiveSqlTransaction;
+        const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return error.SqlTransactionNotActive;
+        if (options.isolation) |isolation| {
+            if (isolation != .read_committed and !@import("sql_execution.zig").supportsRangeGuards(self.server))
+                return error.UnsupportedSqlExecution;
+        }
+        try self.updateTransactionOptions(credential, request, id, options);
+    }
+
+    fn updateTransactionOptions(self: *Adapter, credential: *Credential, request: wire.Request, id: [16]u8, options: wire.TransactionOptions) !void {
+        try request.check();
+        try credential.validate();
+        const lease = self.server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
+        defer lease.release();
+        try self.server.txn_sessions.setSqlTransactionOptions(self.server.alloc, id, self.server.localSessionNodeId(), .{
+            .principal = credential.sessionPrincipal(),
+            .database = request.database orelse "default",
+            .namespace = request.session_namespace orelse request.namespace orelse "public",
+        }, options.isolation, options.mode);
+    }
+
     fn importSnapshot(raw: *anyopaque, a: std.mem.Allocator, identity: wire.Identity, request: wire.Request, name: []const u8) !void {
         const self: *Adapter = @ptrCast(@alignCast(raw));
         const credential: *Credential = @ptrCast(@alignCast(identity.context));
@@ -1406,7 +1434,9 @@ pub const Adapter = struct {
             }
         }
         const slots = try CatalogReplicationSlots.open(self.server, .{ .context = credential, .read = replicationIdentity }, a, request.database orelse "default", context);
-        credential.imported_snapshot = try slots.qualifyTransactionSnapshot(a, identity, request, name);
+        const snapshot = try slots.qualifyTransactionSnapshot(a, identity, request, name);
+        try self.updateTransactionOptions(credential, request, snapshot.transaction, .{ .mode = .read_only });
+        credential.imported_snapshot = snapshot;
     }
 
     fn failTransaction(raw: *anyopaque, identity: wire.Identity, request: wire.Request) !void {
@@ -2285,13 +2315,14 @@ fn resolvePublicationMembers(
             keys = ordered;
             break;
         };
+        if (parsed.replica_identity == .default and keys.len == 0) return error.ChangefeedCapabilityUnsupported;
         member.* = .{
             .table = .{ .table_id = table.table_id, .binding = binding.?, .contract = .native_relational, .policy_revision = 1 },
             .permission_name = name,
             .namespace = try a.dupe(u8, target.namespace),
             .name = try a.dupe(u8, target.table),
             .oid = 0,
-            .identity = if (keys.len != 0) .default else .full,
+            .identity = if (parsed.replica_identity == .full or keys.len == 0) .full else .default,
             .key_columns = keys,
         };
     }
@@ -4097,8 +4128,7 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
         try CatalogReplicationSlots.validateSnapshotTransaction(txn, "default", "public");
         try std.testing.expectError(error.SqlTransactionNotActive, CatalogReplicationSlots.validateSnapshotTransaction(txn, "other", "public"));
         txn.metadata.mode = .read_write;
-        try std.testing.expectError(error.UnsupportedSqlExecution, CatalogReplicationSlots.validateSnapshotTransaction(txn, "default", "public"));
-        txn.metadata.mode = .read_only;
+        try CatalogReplicationSlots.validateSnapshotTransaction(txn, "default", "public");
         txn.metadata.isolation = .read_committed;
         try std.testing.expectError(error.UnsupportedSqlExecution, CatalogReplicationSlots.validateSnapshotTransaction(txn, "default", "public"));
         txn.metadata.isolation = .repeatable_read;

@@ -20,6 +20,12 @@ const std = @import("std");
 pub const replication_commands = @import("replication_commands.zig");
 pub const pgoutput = @import("pgoutput.zig");
 
+const sql_session = @import("antfly_local_sources").sql_session;
+pub const TransactionOptions = struct {
+    isolation: ?sql_session.Isolation = null,
+    mode: ?sql_session.ReadMode = null,
+};
+
 pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown };
 pub const Parameter = @import("antfly_local_sources").sql_scalar.Type;
 pub const Column = struct {
@@ -212,6 +218,8 @@ pub const Backend = struct {
         /// Attach a qualified cut to the existing SQL transaction. The owner
         /// checks isolation, prior transaction work and import eligibility.
         import_snapshot: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request, []const u8) anyerror!void = null,
+        /// Change transaction characteristics before any readings or writes.
+        set_transaction_options: ?*const fn (*anyopaque, Identity, Request, TransactionOptions) anyerror!void = null,
         /// Authenticated catalog snapshot for typed dotted-name SET/SHOW/RESET.
         load_settings: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!@import("antfly_local_sources").sql_setting_catalog.RawSnapshot = null,
         validate_namespace: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!void = null,

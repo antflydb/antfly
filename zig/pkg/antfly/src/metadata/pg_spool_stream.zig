@@ -155,20 +155,27 @@ pub const Owner = struct {
         return now;
     }
     pub fn poll(self: *Owner, svc: anytype, registry: anytype, policy: anytype, a: A, after: u64, maximum: u32, request: anytype) !Page {
-        var before = try load(svc, a, self.id, request);
-        defer before.deinit();
-        _ = try self.check(policy, before.value, request);
-        if (after != self.frontier or maximum == 0 or maximum > spool.max_message_bytes) return error.PgSpoolCursorInvalid;
-        const slot = before.value.slot.?;
-        if (after < slot.confirmed_lsn or after > slot.next_lsn) return error.ChangefeedResynchronizationRequired;
-        if (after == slot.next_lsn) {
-            self.end_lsn = slot.next_lsn;
-            return .{ .allocator = a, .end_lsn = self.end_lsn, .start_lsn = after };
-        }
-        const entry = for (slot.entries) |entry| {
-            if (after >= entry.start_lsn and after < entry.end_lsn) break entry;
-        } else return error.ChangefeedResynchronizationRequired;
-        const record = slot.spool.find(entry.spool_id) orelse return error.PgSpoolCorrupt;
+        const retained_span = span: {
+            var before = try load(svc, a, self.id, request);
+            defer before.deinit();
+            _ = try self.check(policy, before.value, request);
+            if (after != self.frontier or maximum == 0 or maximum > spool.max_message_bytes) return error.PgSpoolCursorInvalid;
+            const slot = before.value.slot.?;
+            if (after < slot.confirmed_lsn or after > slot.next_lsn) return error.ChangefeedResynchronizationRequired;
+            if (after == slot.next_lsn) {
+                self.end_lsn = slot.next_lsn;
+                return .{ .allocator = a, .end_lsn = self.end_lsn, .start_lsn = after };
+            }
+            const entry = for (slot.entries) |entry| {
+                if (after >= entry.start_lsn and after < entry.end_lsn) break entry;
+            } else return error.ChangefeedResynchronizationRequired;
+            const record = slot.spool.find(entry.spool_id) orelse return error.PgSpoolCorrupt;
+            // The span is self-contained. Release the first metadata response
+            // before fetching artifacts and checking the live record again.
+            break :span .{ .entry = entry, .record = record };
+        };
+        const entry = retained_span.entry;
+        const record = retained_span.record;
         if (record.phase != .live or record.spec.messages < 3 or std.mem.allEqual(u8, &record.spec.wire, 0)) return error.ChangefeedCapabilityUnsupported;
         const store = try registry.artifactStore(record.scope, request);
         if (store.namespace_identity == null or !same(store.namespace_identity.?, record.scope.namespace)) return error.PgSpoolStorageUnsupported;

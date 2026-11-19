@@ -138,7 +138,7 @@ test "SQL attached setting overlay refresh observes a setting committed after at
     try std.testing.expectEqual(@as(i64, 7), overlay[0].value.integer);
 }
 
-fn supportsRangeGuards(server: *const http_server.ApiHttpServer) bool {
+pub fn supportsRangeGuards(server: *const http_server.ApiHttpServer) bool {
     const reads = server.table_reads orelse return false;
     const writes = server.table_writes orelse return false;
     return reads.supports_sql_range_guards and writes.supports_sql_range_guards and

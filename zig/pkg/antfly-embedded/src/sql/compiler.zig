@@ -2065,6 +2065,11 @@ const Parser = struct {
                     try self.expectKeyword(.default);
                     ddl.schema_change = .{ .drop_default = column_name };
                 }
+            } else if (kind == .table and self.ddlWord("REPLICA")) {
+                if (!self.ddlWord("IDENTITY")) return self.fail(error.InvalidSqlSyntax, "expected REPLICA IDENTITY");
+                const mode: @FieldType(ast.SchemaChange, "replica_identity") = if (self.keyword(.default)) .default else if (self.ddlWord("FULL")) .full else return self.fail(error.UnsupportedSqlShape, "supported replica identity modes are DEFAULT and FULL");
+                ddl.action = .alter_schema;
+                ddl.schema_change = .{ .replica_identity = mode };
             } else if (kind == .table and self.ddlWord("VALIDATE")) {
                 try self.expectKeyword(.constraint);
                 ddl.action = .alter_schema;

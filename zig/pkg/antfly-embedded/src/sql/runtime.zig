@@ -2128,6 +2128,17 @@ test "SQL NUMERIC executes exact scalar projections through public result metada
     }
 }
 
+test "SQL version advertises PostgreSQL compatibility and the actual engine" {
+    const alloc = std.testing.allocator;
+    var fixture: TestBackend = .{};
+    var compiled = try compiler.compile(alloc, "SELECT VERSION()", .{});
+    defer compiled.deinit();
+    var result = try execute(alloc, fixture.iface(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(ast.ColumnType.string, result.output.columns[0].type);
+    try std.testing.expectEqualStrings("PostgreSQL " ++ @import("scalar.zig").postgres_compat_version ++ " compatibility (Antfly)", result.output.rows[0][0].string);
+}
+
 test "SQL NUMERIC insert literals preserve decimals at the mutation boundary" {
     const Fixture = struct {
         fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
