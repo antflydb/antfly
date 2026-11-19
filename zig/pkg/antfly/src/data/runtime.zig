@@ -46170,6 +46170,7 @@ fn consumerTests() type {
                 };
                 var found_completion = false;
                 for (0..64) |_| {
+                    metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                     var qualified_page = origin.historyPagePort().read(a, route.fence().?, "docs", qualified_input, .{}) catch |err| {
                         std.debug.print("coordinated frame proof read after sequence {d} failed: {s}\n", .{ qualified_input.request.after.sequence, @errorName(err) });
                         return err;

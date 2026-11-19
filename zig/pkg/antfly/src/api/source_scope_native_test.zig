@@ -168,7 +168,19 @@ fn verifyRetirementOutcome(a: std.mem.Allocator, owner: anytype, fence: metadata
     changed_fence.route.group_id += 1;
     try std.testing.expectError(error.TopologyChanged, owner.sourceRetirementOutcomeRouted(a, changed_fence, "docs", query));
     query.minimum_applied_index += 1000000;
-    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.sourceRetirementOutcomeRouted(a, fence, "docs", query));
+    for (0..1000) |_| {
+        _ = owner.sourceRetirementOutcomeRouted(a, fence, "docs", query) catch |err| switch (err) {
+            // The Raft mutex can be contended before the storage owner
+            // evaluates the requested applied index.
+            error.ReadUnavailable => {
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                continue;
+            },
+            error.StorageReadTemporarilyUnavailable => break,
+            else => return err,
+        };
+        return error.TestFutureMinimumWasIgnored;
+    } else return error.TestReadFenceUnavailable;
     query.minimum_applied_index = cut.index;
     var cancelled: std.atomic.Value(bool) = .init(true);
     var cancelled_fence = fence;
@@ -287,9 +299,9 @@ pub fn verifyMinimumRecovery(a: std.mem.Allocator, server: anytype, fence: metad
     // The server wrapper must retain this independent read minimum, rather
     // than silently replacing it with the original receipt's lower index.
     _ = server.recoverSourceScopeControlLocal(a, bounded, "docs", .{ .command = command, .entry = observed.cut, .minimum_applied_index = observed.cut.index + 1000000 }) catch |err| switch (err) {
-        // Either the outer budget or the real ReadIndex wait may expire first.
-        // Neither permits returning an older receipt as a qualified result.
-        error.DeadlineExceeded, error.Timeout => return,
+        // Routing and ReadIndex share the outer deadline. An expired cut
+        // cannot return an older receipt as a qualified result.
+        error.CatalogRoutingSnapshotTimeout, error.DeadlineExceeded, error.Timeout => return,
         else => return err,
     };
     return error.TestFutureMinimumWasIgnored;
