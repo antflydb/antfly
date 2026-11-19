@@ -3255,7 +3255,7 @@ const NumericCoverageNode = struct {
 
 fn numericSourceMatchesProjection(raw: std.json.Value, observed: ??typed_dv.NumericValue) bool {
     if (raw == .null) return observed == null;
-    const expected = typed_dv.numericValueFromJson(raw) orelse return false;
+    const expected = typed_dv.exactNumericValueFromJson(raw) orelse return false;
     const emitted = (observed orelse return false) orelse return false;
     return typed_dv.compareNumericValues(emitted, expected) == .eq;
 }

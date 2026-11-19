@@ -9526,6 +9526,9 @@ const IndexedPredicateEvaluator = struct {
     missing_rows: ?*roaring.RoaringBitmap = null,
     local_cache: ?LocalCache = null,
     probe_input: ?*FrontierProbeInput = null,
+    applied_gates: ?*AppliedGates = null,
+
+    const AppliedGates = std.StringHashMapUnmanaged(enum { exact, necessary });
 
     const LocalCache = IndexedClauseCache;
     const FrontierProbeInput = struct { attempted: bool = false, docs: ?roaring.RoaringBitmap = null };
@@ -9551,12 +9554,14 @@ const IndexedPredicateEvaluator = struct {
         if (try cache.getScoped(self.alloc, key, self.control, scope)) |rows| return rows;
         if (scope) |domain| if (self.probe_input != null) {
             const live_count = self.snapshot.liveDocCount();
-            const small_frontier = live_count >= 65_536 and domain.cardinality() <= 128;
-            const low_headroom = if (self.budget) |budget|
-                @as(u64, live_count) * 8 > budget.max_retained_state_bytes -| budget.retained_state_bytes
-            else
-                false;
-            if (small_frontier or low_headroom or (self.local_cache != null and self.local_cache.?.memory.shouldProbe(key))) {
+            const warm_frontier = live_count >= 65_536 and domain.cardinality() <= 128 and self.snapshot.hasGraphOrdinalNavigation();
+            const low_headroom = if (self.budget) |budget| limited: {
+                const available = budget.max_retained_state_bytes -| budget.retained_state_bytes;
+                if (@as(u64, live_count) * 8 <= available) break :limited false;
+                const filter = try search_mod.searchQueryToFilterArena(self.scratch, query);
+                break :limited @as(u64, try self.indexedCandidateEstimate(filter, live_count)) * 8 > available;
+            } else false;
+            if (warm_frontier or low_headroom or (self.local_cache != null and self.local_cache.?.memory.shouldProbe(key))) {
                 if (try self.probeFrontier(query, domain)) |rows| return rows;
             }
         };
@@ -9574,6 +9579,21 @@ const IndexedPredicateEvaluator = struct {
         if (scope == null) return all;
         defer all.deinit();
         return self.copyMembership(&all, scope);
+    }
+
+    // Seekable terms can be cheaper to materialize than building a cold
+    // reverse directory. This estimate only chooses execution order.
+    fn indexedCandidateEstimate(self: IndexedPredicateEvaluator, filter: query_mod.Filter, ceiling: u32) anyerror!u32 {
+        try self.control.check();
+        return switch (filter) {
+            .term => |term| @min(ceiling, try self.snapshot.termDocFreq(self.alloc, term.field, term.term)),
+            .bool_filter => |boolean| estimate: {
+                var count = ceiling;
+                for (boolean.must) |required| count = try self.indexedCandidateEstimate(required, count);
+                break :estimate count;
+            },
+            else => ceiling,
+        };
     }
 
     fn probeFrontier(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap) !?roaring.RoaringBitmap {
@@ -9641,22 +9661,31 @@ const IndexedPredicateEvaluator = struct {
 
     fn initialScope(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery) !roaring.RoaringBitmap {
         var necessary: std.ArrayListUnmanaged(search_mod.SearchQuery) = .empty;
-        try self.collectNecessaryIndexed(query, &necessary);
+        try self.collectNecessaryIndexed(query, "", &necessary);
         if (necessary.items.len != 0) {
             return self.executeIndexedClause(.{ .bool_query = .{ .must = necessary.items } }, null, "/initial");
         }
         return self.executeIndexedClause(.{ .match_all = {} }, null, "/universe");
     }
 
-    fn collectNecessaryIndexed(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, out: *std.ArrayListUnmanaged(search_mod.SearchQuery)) anyerror!void {
+    fn collectNecessaryIndexed(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, path: []const u8, out: *std.ArrayListUnmanaged(search_mod.SearchQuery)) anyerror!void {
         if (try self.indexed(query)) {
             try out.append(self.scratch, query);
+            if (self.applied_gates) |gates| try gates.put(self.scratch, path, .exact);
             return;
         }
         if (query != .bool_query) return;
-        for (query.bool_query.must) |child| try self.collectNecessaryIndexed(child, out);
-        if (try self.indexedShouldGate(query.bool_query.should, requiredShould(query.bool_query))) |gate|
+        const boolean = query.bool_query;
+        for (boolean.must, 0..) |child, i| {
+            try self.collectNecessaryIndexed(child, try self.clausePath(path, 'm', i), out);
+        }
+        if (try self.indexedShouldGate(boolean.should, requiredShould(boolean))) |gate| {
             try out.append(self.scratch, gate);
+            if (self.applied_gates) |gates| {
+                const gate_path = try self.clausePath(path, 't', 0);
+                try gates.put(self.scratch, gate_path, if (gate.bool_query.should.len == boolean.should.len) .exact else .necessary);
+            }
+        }
     }
 
     fn requiredShould(boolean: search_mod.BoolQuery) u32 {
@@ -9687,6 +9716,7 @@ const IndexedPredicateEvaluator = struct {
     fn execute(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap, path: []const u8) anyerror!roaring.RoaringBitmap {
         try self.control.check();
         if (scope.cardinality() == 0) return roaring.RoaringBitmap.init(self.alloc);
+        if (self.applied_gates) |gates| if (gates.contains(path)) return scope.clone(self.alloc);
         if (try self.indexed(query)) return self.executeIndexedClause(query, scope, path);
         return switch (query) {
             .bool_query => |boolean| self.executeBoolean(boolean, scope, path),
@@ -9699,10 +9729,12 @@ const IndexedPredicateEvaluator = struct {
         var indexed_must: std.ArrayListUnmanaged(search_mod.SearchQuery) = .empty;
         var residual_must: std.ArrayListUnmanaged(Clause) = .empty;
         for (boolean.must, 0..) |clause, i| {
+            const child_path = try self.clausePath(path, 'm', i);
+            if (self.applied_gates) |gates| if (gates.contains(child_path)) continue;
             if (try self.indexed(clause)) {
                 try indexed_must.append(self.scratch, clause);
             } else {
-                try residual_must.append(self.scratch, .{ .query = clause, .path = try self.clausePath(path, 'm', i) });
+                try residual_must.append(self.scratch, .{ .query = clause, .path = child_path });
             }
         }
         var result: ?roaring.RoaringBitmap = null;
@@ -9723,18 +9755,21 @@ const IndexedPredicateEvaluator = struct {
             result.?.andNotWith(&excluded);
         }
         const required_should = requiredShould(boolean);
-        const gate = try self.indexedShouldGate(boolean.should, required_should);
-        if (gate) |indexed_gate| {
-            const narrowed = try self.executeIndexedClause(indexed_gate, if (result) |*rows| rows else scope, try self.clausePath(path, 't', 0));
+        const gate_path = try self.clausePath(path, 't', 0);
+        const applied = if (self.applied_gates) |gates| gates.get(gate_path) else null;
+        var should_complete = applied != null and applied.? == .exact;
+        if (applied == null) if (try self.indexedShouldGate(boolean.should, required_should)) |gate| {
+            const narrowed = try self.executeIndexedClause(gate, if (result) |*rows| rows else scope, gate_path);
             if (result) |*rows| rows.deinit();
             result = narrowed;
-        }
+            should_complete = gate.bool_query.should.len == boolean.should.len;
+        };
         for (residual_must.items) |clause| {
             const next = try self.execute(clause.query, if (result) |*rows| rows else scope, clause.path);
             if (result) |*rows| rows.deinit();
             result = next;
         }
-        if (required_should != 0 and (gate == null or gate.?.bool_query.should.len != boolean.should.len)) {
+        if (required_should != 0 and !should_complete) {
             const matched = try self.executeShould(boolean.should, required_should, if (result) |*rows| rows else scope, path);
             if (result) |*rows| rows.deinit();
             result = matched;
@@ -10115,7 +10150,9 @@ fn collectMixedStructuredFilterAlloc(
     else
         query;
     // The cache key must bind the lowered tree as well as its source text.
+    var applied_gates: IndexedPredicateEvaluator.AppliedGates = .empty;
     var user_matcher = matcher;
+    user_matcher.applied_gates = &applied_gates;
     if (original != null) user_matcher.cache_prefix = try std.fmt.allocPrint(scratch, "user:{s}", .{cache_prefix});
     var domain = try user_matcher.initialScope(user_query);
     defer domain.deinit();
@@ -39510,6 +39547,7 @@ test "optional numeric range covers unsigned values and uses identical stored se
     try domain.add(1);
     var input: IndexedPredicateEvaluator.FrontierProbeInput = .{};
     defer if (input.docs) |*docs| docs.deinit();
+    var gates: IndexedPredicateEvaluator.AppliedGates = .empty;
     const evaluator: IndexedPredicateEvaluator = .{
         .snapshot = snapshot,
         .analysis = .{},
@@ -39528,6 +39566,7 @@ test "optional numeric range covers unsigned values and uses identical stored se
         .cache_prefix = "",
         .frontier = frontier,
         .probe_input = &input,
+        .applied_gates = &gates,
     };
     var low_budget = WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 1 });
     var bounded = evaluator;
@@ -39549,6 +39588,18 @@ test "optional numeric range covers unsigned values and uses identical stored se
     defer gated.deinit();
     try std.testing.expectEqual(@as(usize, 1), gated.cardinality());
     try std.testing.expect(gated.contains(1));
+    const misses = snapshot.graph_predicates.misses;
+    try std.testing.expectError(error.UnsupportedQueryRequest, evaluator.execute(nested, &gated, ""));
+    try std.testing.expectEqual(misses, snapshot.graph_predicates.misses);
+
+    const rounded = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{
+        .{ .key = "rounded", .value = "{\"body\":\"beacon\",\"rank\":18446744073709551617}" },
+    }, .{}, schema)).?;
+    defer a.free(rounded);
+    var rounded_writer = try index_mod.IndexWriter.init(a);
+    defer rounded_writer.deinit();
+    try rounded_writer.addSegment(rounded);
+    try std.testing.expect((try rounded_writer.snapshot().segments[0].reader.numericRangeCoverage("rank")) == null);
 }
 
 test "optional numeric range cold and warm measurement" {

@@ -101,7 +101,7 @@ pub const doc_key_range_field = "\x00__antfly_doc_key_range";
 // readers can open the segment and ignore the witness, and their merges drop it.
 const numeric_range_coverage_field = "\x00__antfly_numeric_range_coverage";
 const numeric_range_coverage_section: SectionType = .synonym;
-const numeric_range_coverage_header = "AFNR\x02";
+const numeric_range_coverage_header = "AFNR\x03";
 
 pub const NumericRangeCoverage = enum(u8) { empty = 1, populated = 2 };
 pub const NumericRangeWitness = struct {
@@ -183,8 +183,8 @@ const NumericRangeDirectory = struct {
             owned = payload;
             break :data payload;
         };
-        // Older encodings could attest a merged legacy column without proof
-        // of its source projection.
+        // Older encodings could attest unproven legacy columns or numeric
+        // spellings rounded during projection.
         if (!std.mem.startsWith(u8, bytes, numeric_range_coverage_header)) return;
         var iterator = NumericRangeWitnessIterator{ .remaining = bytes[numeric_range_coverage_header.len..] };
         var records: std.ArrayListUnmanaged(NumericRangeWitness) = .empty;

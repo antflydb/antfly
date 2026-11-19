@@ -954,6 +954,27 @@ const max_bm25_bound_tables_per_snapshot: usize = 4;
 
 /// Snapshot-owned scalar membership only; no query reader or capability is
 /// retained. Both entry count and cloned physical storage have hard ceilings.
+const GraphOrdinalNavigation = struct {
+    const Entry = struct { ordinal: u32, doc: u32 };
+    entries: []Entry,
+    refs: std.atomic.Value(usize) = .init(1),
+    owner: *GraphPredicateCache,
+    alloc: Allocator,
+    reservation: resource_manager_mod.Reservation,
+
+    fn release(self: *@This()) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const owner = self.owner;
+        const bytes = self.entries.len * @sizeOf(Entry) + @sizeOf(GraphOrdinalNavigation);
+        const alloc = self.alloc;
+        var reservation = self.reservation;
+        alloc.free(self.entries);
+        alloc.destroy(self);
+        _ = owner.resident_bytes.fetchSub(bytes, .acq_rel);
+        reservation.release();
+    }
+};
+
 pub const GraphPredicateCache = struct {
     pub const max_bytes: usize = 64 * 1024 * 1024;
     const Entry = struct {
@@ -979,6 +1000,7 @@ pub const GraphPredicateCache = struct {
         }
     };
     entries: [16]?*Entry = @splat(null),
+    ordinal_navigation: ?*GraphOrdinalNavigation = null,
     bytes: usize = 0,
     // Includes builders and evicted entries still pinned by readers.
     resident_bytes: std.atomic.Value(usize) = .init(0),
@@ -1020,7 +1042,27 @@ pub const GraphPredicateCache = struct {
             entry.release();
             freed += bytes;
         }
+        if (freed < target and self.mutex.tryLock()) {
+            const retired = if (self.ordinal_navigation) |navigation| unused: {
+                if (navigation.refs.load(.acquire) != 1) break :unused null;
+                self.ordinal_navigation = null;
+                break :unused navigation;
+            } else null;
+            self.mutex.unlock();
+            if (retired) |navigation| {
+                freed += navigation.entries.len * @sizeOf(GraphOrdinalNavigation.Entry) + @sizeOf(GraphOrdinalNavigation);
+                navigation.release();
+            }
+        }
         return freed;
+    }
+
+    fn acquireOrdinalNavigation(self: *@This()) ?*GraphOrdinalNavigation {
+        if (!self.mutex.tryLock()) return null;
+        defer self.mutex.unlock();
+        const navigation = self.ordinal_navigation orelse return null;
+        _ = navigation.refs.fetchAdd(1, .monotonic);
+        return navigation;
     }
 
     pub fn lockFlight(self: *@This(), key: []const u8, control: query_mod.ExecutionControl) !*std.atomic.Mutex {
@@ -1142,10 +1184,41 @@ pub const GraphPredicateCache = struct {
         // Join callbacks before the snapshot/callback context can disappear.
         if (self.manager.load(.acquire)) |manager| manager.unregisterReclaimer(self.reclaimer_id);
         self.reclaimer_id = 0;
+        if (self.ordinal_navigation) |navigation| navigation.release();
+        self.ordinal_navigation = null;
         for (0..self.entries.len) |i| if (self.remove(i)) |entry| entry.release();
         std.debug.assert(self.resident_bytes.load(.acquire) == 0);
     }
 };
+
+test "optional numeric range ordinal directory reclaims only unpinned navigation" {
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var cache: GraphPredicateCache = .{};
+    cache.attachManager(&manager);
+    defer cache.deinit(a);
+    try std.testing.expect(cache.ensureReclaimer(&manager));
+    const bytes = @sizeOf(GraphOrdinalNavigation.Entry) + @sizeOf(GraphOrdinalNavigation);
+    try std.testing.expect(cache.reserve(bytes));
+    const entries = try a.alloc(GraphOrdinalNavigation.Entry, 1);
+    entries[0] = .{ .ordinal = 7, .doc = 0 };
+    const navigation = try a.create(GraphOrdinalNavigation);
+    navigation.* = .{
+        .entries = entries,
+        .owner = &cache,
+        .alloc = a,
+        .reservation = try manager.reserveWithoutReclaim(.graph_predicate_cache, bytes),
+    };
+    cache.ordinal_navigation = navigation;
+    const pinned = cache.acquireOrdinalNavigation().?;
+    try std.testing.expectEqual(@as(u64, 0), GraphPredicateCache.reclaim(&cache, bytes));
+    try std.testing.expectEqual(@as(u32, 7), pinned.entries[0].ordinal);
+    pinned.release();
+    try std.testing.expectEqual(@as(u64, bytes), GraphPredicateCache.reclaim(&cache, bytes));
+    try std.testing.expect(cache.acquireOrdinalNavigation() == null);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.graph_predicate_cache).used_bytes);
+}
 
 test "graph predicate cache clones outside locks and pins evicted membership" {
     const a = std.testing.allocator;
@@ -1300,7 +1373,6 @@ pub const IndexSnapshot = struct {
     epoch: u64,
     graph_predicates: GraphPredicateCache = .{},
     graph_ordinal_mutex: std.atomic.Mutex = .unlocked,
-    graph_ordinal_navigation: ?GraphOrdinalNavigation = null,
     graph_ordinal_incomplete: bool = false,
     segments: []SegmentEntry,
     global_total_field_len: std.StringHashMapUnmanaged(u64),
@@ -1693,10 +1765,6 @@ pub const IndexSnapshot = struct {
     fn freeFinal(self: *IndexSnapshot) void {
         self.quiesceOwnedSources();
         const alloc = self.alloc;
-        if (self.graph_ordinal_navigation) |*navigation| {
-            alloc.free(navigation.entries);
-            navigation.reservation.release();
-        }
         self.graph_predicates.deinit(alloc);
         self.binding_flights.deinit(alloc);
         var entries = self.bound_segments.valueIterator();
@@ -2127,22 +2195,18 @@ pub const IndexSnapshot = struct {
 
     /// Stream directly into compact membership without a corpus-sized u32
     /// result array. Check request control even across deleted/sparse rows.
-    const GraphOrdinalNavigation = struct {
-        const Entry = struct {
-            ordinal: u32,
-            doc: u32,
-        };
-        entries: []Entry,
-        reservation: resource_manager_mod.Reservation,
-    };
+    pub fn hasGraphOrdinalNavigation(self: *IndexSnapshot) bool {
+        const navigation = self.graph_predicates.acquireOrdinalNavigation() orelse return false;
+        navigation.release();
+        return true;
+    }
 
-    fn graphOrdinalNavigation(self: *IndexSnapshot, control: query_mod.ExecutionControl) !?[]const GraphOrdinalNavigation.Entry {
-        while (!self.graph_ordinal_mutex.tryLock()) {
-            try control.check();
-            spinOrYield();
-        }
+    fn graphOrdinalNavigation(self: *IndexSnapshot, control: query_mod.ExecutionControl) !?*GraphOrdinalNavigation {
+        const cache = &self.graph_predicates;
+        if (cache.acquireOrdinalNavigation()) |navigation| return navigation;
+        if (!self.graph_ordinal_mutex.tryLock()) return null;
         defer self.graph_ordinal_mutex.unlock();
-        if (self.graph_ordinal_navigation) |navigation| return navigation.entries;
+        if (cache.acquireOrdinalNavigation()) |navigation| return navigation;
         if (self.graph_ordinal_incomplete) return null;
         const manager = self.graph_predicates.manager.load(.acquire) orelse return null;
         if (!try self.hasDocOrdinalCoverage()) {
@@ -2151,13 +2215,19 @@ pub const IndexSnapshot = struct {
         }
         var total: u32 = 0;
         for (self.segments) |segment| total = try std.math.add(u32, total, segment.reader.doc_count);
-        const bytes = @as(usize, total) * @sizeOf(GraphOrdinalNavigation.Entry);
-        if (bytes > 32 * 1024 * 1024) return null;
-        var reservation = manager.reserveWithoutReclaim(.graph_predicate_cache, bytes) catch return null;
+        const bytes = @as(usize, total) * @sizeOf(GraphOrdinalNavigation.Entry) + @sizeOf(GraphOrdinalNavigation);
+        if (bytes > 32 * 1024 * 1024 or !cache.ensureReclaimer(manager)) return null;
+        if (manager.admissionDecision(.graph_predicate_cache, bytes).pressure != .normal) return null;
+        if (!cache.reserve(bytes)) return null;
         var owned = true;
+        defer if (owned) {
+            _ = cache.resident_bytes.fetchSub(bytes, .acq_rel);
+        };
+        var reservation = manager.reserveWithoutReclaim(.graph_predicate_cache, bytes) catch return null;
         defer if (owned) reservation.release();
-        const entries = try self.alloc.alloc(GraphOrdinalNavigation.Entry, total);
-        defer if (owned) self.alloc.free(entries);
+        const alloc = @import("antfly_platform").allocator.reclaimingScratch(self.alloc);
+        const entries = alloc.alloc(GraphOrdinalNavigation.Entry, total) catch return null;
+        defer if (owned) alloc.free(entries);
         var offset: u32 = 0;
         for (self.segments, 0..) |segment, segment_index| {
             try control.check();
@@ -2182,15 +2252,23 @@ pub const IndexSnapshot = struct {
         };
         std.mem.sort(GraphOrdinalNavigation.Entry, entries, {}, Order.less);
         try control.check();
-        self.graph_ordinal_navigation = .{ .entries = entries, .reservation = reservation };
+        const navigation = alloc.create(GraphOrdinalNavigation) catch return null;
+        defer if (owned) alloc.destroy(navigation);
+        if (!cache.mutex.tryLock()) return null;
+        defer cache.mutex.unlock();
+        if (cache.ordinal_navigation != null) return null;
+        navigation.* = .{ .entries = entries, .refs = .init(2), .owner = cache, .alloc = alloc, .reservation = reservation };
+        cache.ordinal_navigation = navigation;
         owned = false;
-        return entries;
+        return navigation;
     }
 
     /// The directory maps physical documents, including deleted copies.
     /// Callers still apply the active segment deletion mask when probing.
     pub fn graphFrontierDocNumsAlloc(self: *IndexSnapshot, alloc: Allocator, frontier: anytype, control: query_mod.ExecutionControl) !?roaring.RoaringBitmap {
-        const entries = (try self.graphOrdinalNavigation(control)) orelse return null;
+        const navigation = (try self.graphOrdinalNavigation(control)) orelse return null;
+        defer navigation.release();
+        const entries = navigation.entries;
         var docs = roaring.RoaringBitmap.init(alloc);
         errdefer docs.deinit();
         var keys = frontier.keyIterator();
