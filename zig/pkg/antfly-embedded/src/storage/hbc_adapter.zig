@@ -6400,8 +6400,7 @@ pub const HBCIndex = struct {
         var segment_index = opened.segments.len;
         while (segment_index > 0) {
             segment_index -= 1;
-            var segment = try vectorindex_posting_segment.VerifiedReader.init(alloc, opened.segments[segment_index].bytes());
-            defer segment.deinit();
+            const segment = try vectorindex_posting_segment.Reader.init(opened.segments[segment_index].bytes());
             if (try segment.getValue(0, .index_metadata)) |value_bytes| {
                 current = value_bytes;
                 break;
@@ -6414,8 +6413,8 @@ pub const HBCIndex = struct {
         var owned: ?[]u8 = null;
         defer if (owned) |bytes| alloc.free(bytes);
         const wal = if (opened.wal) |*wal| wal else return error.MissingPostingCheckpoint;
-        for (wal.replay.records.items) |record| {
-            if (record.posting_id != 0) continue;
+        var metadata_records = wal.replay.recordsFor(0);
+        while (metadata_records.next()) |record| {
             switch (record.kind) {
                 .index_metadata => {
                     if (owned) |bytes| alloc.free(bytes);

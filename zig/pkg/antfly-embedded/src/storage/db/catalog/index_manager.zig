@@ -223,6 +223,13 @@ var text_doc_scratch_retained_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_segment_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_projection_source_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var sparse_replay_profile_enabled_cache: std.atomic.Value(u8) = .init(0);
+const index_open_descriptor_errors = [_]anyerror{
+    error.StorageDescriptorPressure,
+    error.ProcessFdQuotaExceeded,
+    error.SystemFdQuotaExceeded,
+    error.PersistentDescriptorAdmissionExhausted,
+};
+
 fn isPostingStartupOperationalError(err: anyerror) bool {
     if (@import("../derived/catch_up_policy.zig").isRecoverableAdmissionError(err)) return true;
     return switch (err) {
@@ -7758,8 +7765,9 @@ pub const IndexManager = struct {
         {
             return .rebuild_from_artifacts;
         }
-        if (std.mem.eql(u8, err_name, "TableReadChurn")) {
-            return .retry_open;
+        if (std.mem.eql(u8, err_name, "TableReadChurn")) return .retry_open;
+        inline for (index_open_descriptor_errors) |err| {
+            if (std.mem.eql(u8, err_name, @errorName(err))) return .retry_open;
         }
         return .manual_intervention;
     }
@@ -8636,9 +8644,12 @@ pub const IndexManager = struct {
     /// quarantining everything — the writer cannot race its own (not yet
     /// started) reclaim, so FileNotFound there is persistent damage, and
     /// the writer's self-heal worker covers the unlikely transient case.
-    /// Only meaningful now that the LSM run-table loader classifies
-    /// FileNotFound separately from UnsupportedVersion.
+    /// Descriptor pressure follows the same read-open retry contract.
+    /// Writable opens put it on the retry queue and keep other indexes usable.
     fn indexOpenErrorIsTransientRead(err: anyerror) bool {
+        for (index_open_descriptor_errors) |descriptor_err| {
+            if (err == descriptor_err) return true;
+        }
         return switch (err) {
             error.FileNotFound, error.EndOfStream, error.TableReadChurn => true,
             else => false,
@@ -39246,6 +39257,82 @@ test "fresh dense admission reclaims a certified generation orphaned before cata
         error.FileNotFound,
         std.Io.Dir.cwd().access(std.testing.io, orphan_path, .{}),
     );
+}
+
+test "native posting startup retries descriptor pressure across catalog opens" {
+    const Fault = struct {
+        var original_read: @FieldType(lsm_backend_mod.Storage.VTable, "read_file_alloc") = undefined;
+        var pressured: std.atomic.Value(bool) = .init(false);
+
+        fn read(ptr: *anyopaque, alloc: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+            if (pressured.load(.acquire) and std.mem.endsWith(u8, path, "/posting-segments/CURRENT")) {
+                return error.ProcessFdQuotaExceeded;
+            }
+            return original_read(ptr, alloc, path, max_bytes);
+        }
+
+        fn publicationFence(_: *anyopaque) void {}
+    };
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "posting-fd-open-retry");
+    defer cleanupIndexManagerDir(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    const names = [_][]const u8{ "first_dense", "second_dense" };
+    {
+        var initial = try IndexManager.init(alloc, std.mem.span(path));
+        defer initial.deinit();
+        initial.updateRange(.{ .start = "", .end = "" });
+        for (names) |name| try initial.addManaged(&store, .{
+            .name = name,
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+        }, null);
+        for (names) |name| try std.testing.expect(initial.denseIndex(name).?.index.experimentalPostingWalAuthoritative());
+    }
+
+    var native = try lsm_backend_mod.NativeStorage.init(alloc, .threaded);
+    defer native.deinit();
+    var storage = native.storage();
+    var vtable = storage.vtable.*;
+    Fault.original_read = vtable.read_file_alloc;
+    vtable.read_file_alloc = Fault.read;
+    storage.vtable = &vtable;
+    Fault.pressured.store(true, .release);
+    defer Fault.pressured.store(false, .release);
+
+    // Cover serial and parallel read catalog loading, including cleanup.
+    for ([_]usize{ 1, 2 }) |parallelism| {
+        var reader = try IndexManager.init(alloc, std.mem.span(path));
+        defer reader.deinit();
+        reader.setDenseLsmStorage(storage);
+        reader.load_parallelism = parallelism;
+        reader.io = std.testing.io;
+        try std.testing.expectError(error.ProcessFdQuotaExceeded, reader.loadNoBackfill(&store));
+        try std.testing.expect(!reader.hasLoadFailures());
+    }
+
+    var writer = try IndexManager.init(alloc, std.mem.span(path));
+    defer writer.deinit();
+    writer.updateRange(.{ .start = "", .end = "" });
+    writer.setDenseLsmStorage(storage);
+    try writer.load(&store);
+    try std.testing.expectEqual(names.len, writer.failedIndexLoadSummary().retry_open);
+    try std.testing.expectEqual(@as(usize, 0), writer.failedIndexLoadSummary().manual_intervention);
+
+    Fault.pressured.store(false, .release);
+    var fence_context: u8 = 0;
+    const retry = try writer.retryFailedIndexLoads(&store, nowNs(), true, null, names.len, .{
+        .ptr = &fence_context,
+        .lock_fn = Fault.publicationFence,
+        .unlock_fn = Fault.publicationFence,
+    });
+    try std.testing.expectEqual(names.len, retry.recovered);
+    try std.testing.expect(!writer.hasLoadFailures());
+    for (names) |name| try std.testing.expect(writer.denseIndex(name) != null);
 }
 
 test "posting startup preserves operational errors without classifying corruption as retryable" {
