@@ -2083,10 +2083,11 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     const completion_decision = @import("antfly_local_sources").storage_history_decision_wire;
-    const HistoryReadKind = enum { page, outcome, grant, resolution, publication, admission, decision };
+    const HistoryReadKind = enum { page, bootstrap, outcome, grant, resolution, publication, admission, decision };
     fn HistoryReadInput(comptime kind: HistoryReadKind) type {
         return switch (kind) {
             .page => table_write_source.history_page.Request,
+            .bootstrap => table_write_source.history_page.BootstrapRequest,
             .outcome => table_write_source.history_ordered.Lookup,
             .grant => table_write_source.history_consumer.GrantIdentity,
             .resolution => table_write_source.history_resolution_wire.Request,
@@ -2098,6 +2099,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     fn HistoryReadResult(comptime kind: HistoryReadKind) type {
         return switch (kind) {
             .page => table_write_source.history_page.Page,
+            .bootstrap => table_write_source.history_page.BootstrapPage,
             .outcome => table_write_source.history_ordered.Outcome,
             .grant => table_write_source.history_consumer.GrantObservation,
             .resolution => table_write_source.history_resolution_wire.Reply,
@@ -2110,6 +2112,10 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// Private retained-history reads never fall back to stale consistency.
     pub fn orderedHistoryPageRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, request: table_write_source.history_page.Request) !table_write_source.history_page.Page {
         return self.historyReadRouted(alloc, fence, table_name, .page, request);
+    }
+
+    pub fn orderedHistoryBootstrapPageRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, request: table_write_source.history_page.BootstrapRequest) !table_write_source.history_page.BootstrapPage {
+        return self.historyReadRouted(alloc, fence, table_name, .bootstrap, request);
     }
 
     /// Exact receipt recovery has the same route and leader fences as pages.
@@ -2187,13 +2193,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         std.mem.writeInt(u64, namespace[8..16], identity.shard_id, .big);
         std.mem.writeInt(u64, namespace[16..24], identity.range_id, .big);
         const requested_namespace = switch (kind) {
-            .page => request.reference.namespace,
+            .page, .bootstrap => request.reference.namespace,
             .outcome => request.command.namespace(),
             .grant => request.namespace,
             .resolution => request.namespace,
             .publication, .admission, .decision => request.owner.namespace,
         };
-        if (comptime kind == .grant) try request.validate();
+        if (comptime kind == .grant or kind == .bootstrap) try request.validate();
         if (comptime kind == .resolution) {
             try request.validate();
             if (request.authority != .raft) return error.ChangefeedCapabilityUnsupported;
@@ -2226,6 +2232,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             // positive persisted marker establishes native Raft authority.
             // The quorum/owner fences establish freshness for every read.
             .page => try lease.owner().orderedHistoryPage(alloc, table_name, request, 1),
+            .bootstrap => try lease.owner().orderedHistoryBootstrapPage(alloc, table_name, request, 1),
             .outcome => try lease.owner().orderedHistoryOutcome(alloc, table_name, request),
             .grant => try lease.owner().orderedHistoryGrant(alloc, table_name, request, 1),
             // ReadIndex includes no-ops and protocol barriers which never
@@ -2239,7 +2246,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .admission => try lease.owner().historyAdmission(alloc, table_name, request),
             .decision => try lease.owner().historyDecision(alloc, table_name, request),
         };
-        errdefer if (comptime kind == .page or kind == .decision) result.deinit();
+        errdefer if (comptime kind == .page or kind == .bootstrap or kind == .decision) result.deinit();
         if (comptime kind == .publication or kind == .admission or kind == .decision) try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), request.owner, context);
         try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
         try self.validateRoutedRead(alloc, fence, group, table_name);

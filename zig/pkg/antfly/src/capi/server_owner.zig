@@ -5031,6 +5031,27 @@ pub fn storageOwnerOrderedHistoryPage(
     return .ok;
 }
 
+pub fn storageOwnerOrderedHistoryBootstrapPage(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    if (request.request_json.len > 4096 or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_bootstrap_wire;
+    var parsed = std.json.parseFromSlice(wire.OrderedRead, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) storageOwnerStatusFromError(err) else .invalid_argument;
+    defer parsed.deinit();
+    var page = handle.db.historyBootstrapPage(handle.alloc, parsed.value.request, parsed.value.minimum_applied_index) catch |err| return storageOwnerStatusFromError(err);
+    defer page.deinit();
+    const bytes = wire.encode(std.heap.c_allocator, page, parsed.value.request) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
 pub fn storageOwnerNativeFkGenerationControlJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.NativeFkGenerationControlRequest,

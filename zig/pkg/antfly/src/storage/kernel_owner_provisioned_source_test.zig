@@ -79,7 +79,8 @@ test "ordered history routed pages retain real images and discard failed final f
     std.mem.writeInt(u64, namespace[8..16], 7, .big);
     std.mem.writeInt(u64, namespace[16..24], 7, .big);
     const grant: history.history_consumer.Grant = .{ .namespace = namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1 };
-    const enrolled = try owners.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(a, 7, "docs", descriptor, .{ .enroll = grant }, 1, 1);
+    const capture: history.history_consumer.Command = .{ .capture_bootstrap = .{ .grant = grant, .expires_at_seconds = 500 } };
+    const enrolled = try owners.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(a, 7, "docs", descriptor, capture, 1, 1);
     // Row apply needs graph replay preparation after the control-only owner.
     // The progress lane deliberately yields once while replacing that owner.
     var applied = false;
@@ -104,14 +105,23 @@ test "ordered history routed pages retain real images and discard failed final f
     try std.testing.expectEqual(@as(i64, 1_700_000_000_000_000_000), page.header.?.committed_at_ns);
     try std.testing.expectEqual(@as(usize, 2), fixture.validations);
     fixture.validations = 0;
-    const recovery: history.history_ordered.Lookup = .{ .command = .{ .enroll = grant }, .entry = .{ .term = 1, .index = 1 }, .minimum_applied_index = 1 };
+    const recovery: history.history_ordered.Lookup = .{ .command = capture, .entry = .{ .term = 1, .index = 1 }, .minimum_applied_index = 1 };
     try std.testing.expectEqualDeep(enrolled, try owners.orderedHistoryOutcomeRouted(a, fence, "docs", recovery));
     try std.testing.expectEqual(@as(usize, 2), fixture.validations);
 
     fixture.validations = 0;
-    const grant_identity = history.history_consumer.GrantIdentity.fromGrant(grant);
+    var grant_identity = history.history_consumer.GrantIdentity.fromGrant(grant);
+    grant_identity.include_bootstrap = true;
     const grant_observation = try owners.orderedHistoryGrantRouted(a, fence, "docs", grant_identity);
     try std.testing.expectEqualDeep(enrolled.applied.consumer.?, grant_observation.active.consumer);
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
+    const pin = grant_observation.active.bootstrap.?;
+    const bootstrap: history.history_page.BootstrapRequest = .{ .reference = request.reference, .digest = pin.digest, .now_seconds = 100 };
+    var bootstrap_page = try owners.orderedHistoryBootstrapPageRouted(a, fence, "docs", bootstrap);
+    defer bootstrap_page.deinit();
+    try std.testing.expect(bootstrap_page.done);
+    try std.testing.expectEqual(@as(usize, 0), bootstrap_page.rows.len);
     try std.testing.expectEqual(@as(usize, 2), fixture.validations);
     fixture.validations = 0;
     const resolution: history.history_resolution_wire.Request = .{ .authority = .raft, .namespace = namespace, .transaction_id = @splat(9), .owner_fence = @splat(4), .manifest_digest = @splat(5), .commit_version = 6, .minimum_applied_index = 1 };
@@ -124,6 +134,9 @@ test "ordered history routed pages retain real images and discard failed final f
 
     fixture.validations = 0;
     fixture.mode = .leader_loss;
+    try std.testing.expectError(error.NotLeader, owners.orderedHistoryBootstrapPageRouted(a, fence, "docs", bootstrap));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
     try std.testing.expectError(error.NotLeader, owners.orderedHistoryPageRouted(a, fence, "docs", request));
     fixture.validations = 0;
     try std.testing.expectError(error.NotLeader, owners.orderedHistoryOutcomeRouted(a, fence, "docs", recovery));
@@ -150,7 +163,7 @@ test "ordered history routed pages retain real images and discard failed final f
     fixture.ranges[0].range_id = 7;
     try std.testing.expectError(error.TopologyChanged, owners.orderedHistoryResolutionRouted(a, fence, "docs", resolution));
     try std.testing.expectEqual(@as(usize, 2), fixture.validations);
-    try std.testing.expectEqual(@as(usize, 12), fixture.waits);
+    try std.testing.expectEqual(@as(usize, 14), fixture.waits);
     fixture.mode = .normal;
     fixture.ranges[0].range_id = 7;
     var future = recovery;

@@ -190,6 +190,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerOrderedSourcePlanOutcome, "antfly_storage_owner_ordered_source_plan_outcome");
     exportInternal(&storage_kernel_exports.storageOwnerOrderedHistoryControlJson, "antfly_storage_owner_ordered_history_control_json");
     exportInternal(&storage_kernel_exports.storageOwnerOrderedHistoryPage, "antfly_storage_owner_ordered_history_page");
+    exportInternal(&storage_kernel_exports.storageOwnerOrderedHistoryBootstrapPage, "antfly_storage_owner_ordered_history_bootstrap_page");
     exportInternal(&storage_kernel_exports.storageOwnerOrderedHistoryOutcome, "antfly_storage_owner_ordered_history_outcome");
     exportInternal(&storage_kernel_exports.storageOwnerHistoryGrant, "antfly_storage_owner_history_grant");
     exportInternal(&storage_kernel_exports.storageOwnerHistoryResolution, "antfly_storage_owner_history_resolution");

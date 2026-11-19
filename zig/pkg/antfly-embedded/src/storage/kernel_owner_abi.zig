@@ -2077,6 +2077,11 @@ pub extern fn antfly_storage_owner_ordered_history_page(
     request: *const JsonOperationRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
+pub extern fn antfly_storage_owner_ordered_history_bootstrap_page(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_native_initial_child_control_json(
     owner: ?*anyopaque,

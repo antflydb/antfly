@@ -890,6 +890,19 @@ pub const Owner = struct {
         return wire.decode(alloc, response.bytes(), request);
     }
 
+    pub fn orderedHistoryBootstrapPage(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page.BootstrapRequest, minimum_applied_index: u64) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_page.BootstrapPage {
+        if (minimum_applied_index == 0) return error.InvalidHistoryAdmission;
+        const wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_bootstrap_wire;
+        const json = try std.json.Stringify.valueAlloc(alloc, wire.OrderedRead{ .request = request, .minimum_applied_index = minimum_applied_index }, .{});
+        defer alloc.free(json);
+        if (json.len > 4096) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_ordered_history_bootstrap_page(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json) }, &response.buffer));
+        if (response.bytes().len > wire.max_bytes) return error.HistoryCorrupt;
+        return wire.decode(alloc, response.bytes(), request);
+    }
+
     pub fn nativeFkGenerationControlJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_native_fk_generation_control_json(self.handle, &.{
