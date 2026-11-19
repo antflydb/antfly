@@ -267,9 +267,9 @@ pub const SharedRedoOverlay = struct {
     /// this is how an instance learns another process changed a root's
     /// logical content after its own checkpoint (`replayedSequence`).
     replayed_sequence: [3]std.atomic.Value(u64) = .{ .init(0), .init(0), .init(0) },
-    /// Highest sequence of any version added under each root, from this
-    /// process's own appends or a replay (`latestSequence`).
-    latest_sequence: [3]std.atomic.Value(u64) = .{ .init(0), .init(0), .init(0) },
+    /// Highest sequence of any index-catalog version per index scope (the
+    /// native catalog sink's key scope), under `mutex`. Keys are owned.
+    scope_latest: std.StringHashMapUnmanaged(u64) = .empty,
     /// Every log record at or below this sequence is in the overlay (or in
     /// the tree, below a fold). Own appends advance it under the writer
     /// lease, and a writer replays other processes' records before its own
@@ -326,6 +326,9 @@ pub const SharedRedoOverlay = struct {
 
     pub fn deinit(self: *SharedRedoOverlay, _: Allocator) void {
         const allocator = owned_allocator;
+        var scopes = self.scope_latest.keyIterator();
+        while (scopes.next()) |scope| allocator.free(scope.*);
+        self.scope_latest.deinit(allocator);
         for (&self.maps, 0..) |*map, root_index| {
             const root: u8 = @intCast(root_index);
             var it = map.iterator();
@@ -500,8 +503,33 @@ pub const SharedRedoOverlay = struct {
         return self.applied_through.load(.acquire);
     }
 
-    pub fn latestSequence(self: *const SharedRedoOverlay, root: u8) u64 {
-        return self.latest_sequence[root].load(.acquire);
+    /// `TransactionWrites.Root.index` in native.zig, and the native catalog
+    /// sink's durable key prefix (`native_catalog_sink.reserved_prefix`).
+    const index_root: u8 = 1;
+    const catalog_key_prefix = "\x00ncat/";
+
+    /// Caller holds `mutex` (or populates before the overlay is shared).
+    fn noteScopeLocked(self: *SharedRedoOverlay, root: u8, key: []const u8, sequence: u64) void {
+        if (root != index_root or !std.mem.startsWith(u8, key, catalog_key_prefix)) return;
+        const rest = key[catalog_key_prefix.len..];
+        const scope = rest[0 .. std.mem.indexOfScalar(u8, rest, 0) orelse return];
+        const gop = self.scope_latest.getOrPut(owned_allocator, scope) catch return;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = owned_allocator.dupe(u8, scope) catch {
+                self.scope_latest.removeByPtr(gop.key_ptr);
+                return;
+            };
+            gop.value_ptr.* = 0;
+        }
+        gop.value_ptr.* = @max(gop.value_ptr.*, sequence);
+    }
+
+    /// Highest sequence of any version under one index scope, from this
+    /// process's own commits or a replay.
+    pub fn scopeLatestSequence(self: *SharedRedoOverlay, io: std.Io, scope: []const u8) u64 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.scope_latest.get(scope) orelse 0;
     }
 
     pub fn replayedSequence(self: *const SharedRedoOverlay, root: u8) u64 {
@@ -522,7 +550,6 @@ pub const SharedRedoOverlay = struct {
     ) !void {
         const allocator = owned_allocator;
         std.debug.assert(root < 3);
-        _ = self.latest_sequence[root].fetchMax(sequence, .acq_rel);
         // perf/lwa-fold-churn: the lock now covers `entry_pool.create` too
         // (moved ahead of where it used to run unlocked) -- the pool's own
         // free list is shared, mutable state this struct's single mutex
@@ -533,6 +560,7 @@ pub const SharedRedoOverlay = struct {
         // inside the same lock -- never race this one.
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        self.noteScopeLocked(root, key, sequence);
         const node = try self.entry_pool.create(allocator);
         errdefer self.entry_pool.destroy(node);
         node.* = .{
@@ -1153,9 +1181,9 @@ pub const SharedRedoOverlay = struct {
             // still the only valid source of a `VersionedOverlayEntry` node:
             // `destroyChain`'s `pool.destroy` elsewhere would otherwise be
             // handed a pointer the pool's own free list does not own.
+            self.noteScopeLocked(root, key, sequence);
             const gop = try self.maps[root].getOrPut(allocator, key);
             _ = self.replayed_sequence[root].fetchMax(sequence, .acq_rel);
-            _ = self.latest_sequence[root].fetchMax(sequence, .acq_rel);
             // A catch-up replays records this overlay may already hold, or
             // ones older than this process's own later appends. Keep each
             // chain newest-first and each sequence once.

@@ -234,7 +234,7 @@ pub const Sink = struct {
         // native.zig's commitTransactionWithDurability's deferred-
         // publication path) -- the ride-along commit this backend's
         // `NamespaceTxn.setDurable(false)` asks for.
-        try self.store.submitIndexMutation(&ctx, ApplyCtx.apply, durable);
+        try self.store.submitIndexMutationForScope(scope, &ctx, ApplyCtx.apply, durable);
     }
 
     /// `native_catalog_backend.Sink.submitDeferred`: like `submit` with
@@ -252,7 +252,7 @@ pub const Sink = struct {
         // later group can carry the serving store's own index commits, built
         // from state that does not include this one. Commit it now, under the
         // writer admission that fences stale snapshot publications.
-        if (self.store.forwardedWriter() != null) {
+        if (self.store.write_target != null) {
             try submit(ptr, scope, mutations, false);
             return .{ .ptr = undefined, .waitFn = completedWait };
         }

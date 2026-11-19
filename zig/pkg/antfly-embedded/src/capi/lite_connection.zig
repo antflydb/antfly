@@ -3288,19 +3288,6 @@ pub const Owner = struct {
         var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
         const file = &root.owned_lite_backend.?.native_docstore.?.file;
-        // A maintenance snapshot's indexes publish from catalogs cached when
-        // it opened. Any index commit since -- the serving root's own inline
-        // publications as much as another process's -- would be overwritten
-        // (deletion bitmaps and segment lists are rewritten whole).
-        if (root != self.current and scope != .reclamation and scope != .allocator_service and
-            file.indexCatalogLatestSequence() > root.lite_runtime_sequence)
-        {
-            if (root.maintenance_publication) |publication| publication.index_inputs_changed = true;
-            if (scope == .index) {
-                self.publication_stats.index_input_refusals +|= 1;
-                return error.EnrichmentWaitCanceled;
-            }
-        }
         if ((try probe.file.stat(probe.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
         if (!std.meta.eql(probe.header, file.header) and scope == .allocator_service) {
             // Bounded allocator/orphan service computes no detached output.
@@ -3380,11 +3367,6 @@ pub const Owner = struct {
         std.debug.assert(root.maintenance_writer_references != 0);
         root.maintenance_writer_references -= 1;
         if (root.maintenance_writer_references != 0) return;
-        // Nothing else committed while this hold had the lease: the
-        // snapshot's indexes include its own commits.
-        if (root != self.current) if (root.maintenance_publication) |publication| if (!publication.index_inputs_changed) {
-            root.lite_runtime_sequence = @max(root.lite_runtime_sequence, root.owned_lite_backend.?.native_docstore.?.file.indexCatalogLatestSequence());
-        };
         var lease = root.maintenance_writer_lease.?;
         root.maintenance_writer_lease = null;
         // Admission alone is not a mutation. Reclamation probes also take
@@ -3471,10 +3453,9 @@ pub const Owner = struct {
                 captured.activeCheckpoint().commit_sequence >= inode_lock.committedSequence(entry)
             else
                 true;
-            // Its indexes cache their catalogs in memory as loaded. Index
-            // commits since then (the serving root's own inline ones
-            // included) are invisible to them.
-            if (captured_is_current and captured.indexCatalogLatestSequence() <= snapshot.lite_runtime_sequence and (!need_database or snapshot.db_live) and std.meta.eql(file.header, captured.header) and
+            // A refused index publication means its cached index catalogs
+            // missed commits since it opened (`submitIndexMutationForScope`).
+            if (captured_is_current and !snapshot.owned_lite_backend.?.native_docstore.?.index_fence_refused.load(.acquire) and (!need_database or snapshot.db_live) and std.meta.eql(file.header, captured.header) and
                 (try file.file.stat(file.runtime())).inode == (try captured.file.stat(captured.runtime())).inode)
             {
                 self.configureRetirementBudget(snapshot.owned_lite_backend.?.native_docstore.?);
@@ -3527,7 +3508,7 @@ pub const Owner = struct {
             break :blk opened;
         };
         snapshot.lease_snapshot = true;
-        snapshot.lite_runtime_sequence = snapshot.owned_lite_backend.?.native_docstore.?.file.committedSequence();
+        snapshot.owned_lite_backend.?.native_docstore.?.index_load_sequence = snapshot.owned_lite_backend.?.native_docstore.?.file.committedSequence();
         snapshot.sql_commit_recovery_needed = foreground.sql_commit_recovery_needed;
         snapshot.sql_ddl_recovery_needed = foreground.sql_ddl_recovery_needed;
         snapshot.sql_ddl_recovery_generation = foreground.sql_ddl_recovery_generation;
