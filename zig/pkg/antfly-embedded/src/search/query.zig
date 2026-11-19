@@ -382,6 +382,8 @@ pub const ExactPredicateProbe = struct {
     range_readers: [16]?*typed_dv.TypedDocValuesReader = @splat(null),
     ranges_opened: [16]bool = @splat(false),
     range_lease: ?index_mod.IndexSnapshot.SegmentLease = null,
+    range_cache: ?*typed_dv.TypedDocValuesReader.PointCache = null,
+    range_cache_attempted: bool = false,
     snapshot: *const index_mod.IndexSnapshot,
     ordinal: usize,
     offset: u32,
@@ -400,6 +402,10 @@ pub const ExactPredicateProbe = struct {
     }
     pub fn destroy(self: *@This()) void {
         for (&self.terms) |*term| if (term.*) |*probe| probe.deinit();
+        if (self.range_cache) |cache| {
+            cache.deinit();
+            self.a.destroy(cache);
+        }
         for (self.range_readers) |optional| if (optional) |reader| {
             reader.deinit();
             self.a.destroy(reader);
@@ -522,7 +528,18 @@ pub const ExactPredicateProbe = struct {
                     if (try self.range_lease.?.entry.reader.typedDocValuesScoped(self.a, range.field)) |opened| {
                         var reader = opened;
                         errdefer reader.deinit();
-                        reader.enablePointCache(64 * 1024) catch {};
+                        if (!self.range_cache_attempted) {
+                            self.range_cache_attempted = true;
+                            if (self.a.create(typed_dv.TypedDocValuesReader.PointCache)) |cache| {
+                                cache.* = .{ .allocator = self.a, .byte_budget = 64 * 1024 };
+                                self.range_cache = cache;
+                            } else |_| {}
+                        }
+                        if (self.range_cache) |cache| {
+                            reader.point_cache = cache;
+                            reader.owns_point_cache = false;
+                            reader.optional_point_cache = true;
+                        }
                         const owned = try self.a.create(typed_dv.TypedDocValuesReader);
                         owned.* = reader;
                         self.range_readers[i] = owned;
@@ -1845,7 +1862,7 @@ pub const RangeFilter = struct {
         errdefer result.deinit();
         var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return result;
         defer reader.deinit();
-        if (scope.cardinality() > 1) reader.enablePointCache(64 * 1024) catch {};
+        if (scope.cardinality() > 1) reader.enableOptionalPointCache(64 * 1024);
         var docs = scope.iterator();
         while (docs.next()) |doc| {
             try self.control.check();
@@ -2512,7 +2529,7 @@ pub const DateRangeFilter = struct {
         defer reader.deinit();
         if (reader.value_type != .u64_val and reader.value_type != .datetime_ns) return result;
         if (scope) |domain| {
-            if (domain.cardinality() > 1) reader.enablePointCache(64 * 1024) catch {};
+            if (domain.cardinality() > 1) reader.enableOptionalPointCache(64 * 1024);
             var docs = domain.iterator();
             while (docs.next()) |doc| {
                 try self.control.check();
@@ -2790,7 +2807,7 @@ pub const BoolFieldFilter = struct {
         defer reader.deinit();
         if (reader.value_type != .bool_val) return result;
         if (scope) |domain| {
-            if (domain.cardinality() > 1) reader.enablePointCache(64 * 1024) catch {};
+            if (domain.cardinality() > 1) reader.enableOptionalPointCache(64 * 1024);
             var docs = domain.iterator();
             while (docs.next()) |doc| {
                 try self.control.check();

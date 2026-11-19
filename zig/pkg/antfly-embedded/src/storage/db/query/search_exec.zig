@@ -9550,7 +9550,16 @@ const IndexedPredicateEvaluator = struct {
     const AppliedGates = std.StringHashMapUnmanaged(enum { exact, necessary });
 
     const LocalCache = IndexedClauseCache;
-    const FrontierProbeInput = struct { attempted: bool = false, docs: ?index_mod.IndexSnapshot.GraphFrontierDocs = null };
+    const FrontierProbeInput = struct {
+        attempted: bool = false,
+        docs: ?index_mod.IndexSnapshot.GraphFrontierDocs = null,
+        covered: ?roaring.RoaringBitmap = null,
+
+        fn deinit(self: *FrontierProbeInput) void {
+            if (self.docs) |*docs| docs.deinit();
+            if (self.covered) |*covered| covered.deinit();
+        }
+    };
 
     fn indexed(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery) !bool {
         return searchQueryCanUseSnapshotWithControl(self.snapshot, query, self.analysis, self.schema, false, self.control);
@@ -9640,10 +9649,35 @@ const IndexedPredicateEvaluator = struct {
 
     fn probeFrontier(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap) !?roaring.RoaringBitmap {
         const memo = self.probe_input orelse return null;
-        if (!memo.attempted) {
-            memo.attempted = true;
-            const frontier = self.frontier orelse return null;
-            memo.docs = try self.snapshot.graphFrontierDocNumsAlloc(self.alloc, frontier, self.control);
+        const frontier = self.frontier orelse return null;
+        memo.attempted = true;
+        if (memo.covered == null) memo.covered = roaring.RoaringBitmap.init(self.alloc);
+        const covered = &memo.covered.?;
+        var missing: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+        defer missing.deinit(self.alloc);
+        var requested = scope.iterator();
+        while (requested.next()) |ordinal| {
+            try self.control.check();
+            if (covered.contains(ordinal)) continue;
+            const key = frontier.get(ordinal) orelse return error.InvalidData;
+            try missing.put(self.alloc, ordinal, key);
+        }
+        if (missing.count() != 0 or memo.docs == null) {
+            var resolved = try self.snapshot.graphFrontierDocNumsAlloc(self.alloc, missing, self.control);
+            var owned = true;
+            defer if (owned) resolved.deinit();
+            if (memo.docs) |*docs| {
+                var pairs = resolved.ordinals.iterator();
+                while (pairs.next()) |pair| {
+                    try self.control.check();
+                    try docs.add(pair.key_ptr.*, pair.value_ptr.*);
+                }
+            } else {
+                memo.docs = resolved;
+                owned = false;
+            }
+            var ordinals = missing.keyIterator();
+            while (ordinals.next()) |ordinal| try covered.add(ordinal.*);
         }
         const filter = (try search_mod.searchQueryToFilterArena(self.scratch, query)).withControl(self.control);
         const frontier_docs = if (memo.docs) |*docs| docs else return null;
@@ -10182,7 +10216,7 @@ pub fn graphIndexedPredicateAlloc(
     if (patternFilterValueHasRole(parsed)) return error.UnsupportedQueryRequest;
     const search_query = try patternFilterValueToSearchQuery(scratch, parsed, entry.text_analysis, entry.runtime_schema);
     var probe_input: IndexedPredicateEvaluator.FrontierProbeInput = .{};
-    defer if (probe_input.docs) |*rows| rows.deinit();
+    defer probe_input.deinit();
     var matcher = IndexedPredicateEvaluator{
         .snapshot = snapshot,
         .analysis = entry.text_analysis,
@@ -12321,13 +12355,17 @@ fn parseStandardRangeObject(
 
     return switch (mapping.field_type) {
         .numeric => numeric: {
+            for ([_]?JsonRangeBound{ lower, upper }) |optional| if (optional) |bound| switch (bound.value) {
+                .integer, .float, .number_string => {},
+                else => return error.InvalidArgument,
+            };
             const min = if (lower) |bound| graph_exec.exactStandardRangeBound(bound.value) else null;
             const max = if (upper) |bound| graph_exec.exactStandardRangeBound(bound.value) else null;
             break :numeric .{ .numeric_range = .{
                 .field = field,
                 .exact_bounds = if ((lower == null or min != null) and (upper == null or max != null)) .{ .min = min, .max = max } else null,
-                .min = if (lower) |bound| try jsonOptionalF64Strict(bound.value) else null,
-                .max = if (upper) |bound| try jsonOptionalF64Strict(bound.value) else null,
+                .min = if (lower) |bound| jsonOptionalF64Strict(bound.value) catch null else null,
+                .max = if (upper) |bound| jsonOptionalF64Strict(bound.value) catch null else null,
                 .inclusive_min = if (lower) |bound| bound.inclusive else true,
                 .inclusive_max = if (upper) |bound| bound.inclusive else false,
             } };
@@ -39755,6 +39793,15 @@ test "optional numeric range covers unsigned values and uses identical stored se
     var above_zero = try graph_exec.PreparedPatternFilter.init(a, "{\"range\":{\"rank\":{\"gt\":0}}}");
     defer above_zero.deinit();
     try std.testing.expect(try above_zero.matchesStored(a, "tiny", "{\"rank\":1e-325}"));
+    try std.testing.expect(try above_zero.matchesStored(a, "tiny", "{\"rank\":1e-9223372036854775809}"));
+    const huge_range = try graph_exec.parsePatternJsonLeaky(compile_arena.allocator(), "{\"range\":{\"rank\":{\"gte\":1e400}}}");
+    const huge_lowered = try patternFilterValueToSearchQuery(compile_arena.allocator(), huge_range, .{}, schema);
+    try std.testing.expect(huge_lowered.numeric_range.stored_standard_range != null);
+    try std.testing.expectError(error.UnsupportedQueryRequest, search_mod.searchQueryToFilterArena(compile_arena.allocator(), huge_lowered));
+    var wide_exponent = try graph_exec.PreparedPatternFilter.init(a, "{\"range\":{\"rank\":{\"gte\":1e10000000000000000000000000000000000000000}}}");
+    defer wide_exponent.deinit();
+    try std.testing.expect(try wide_exponent.matchesStored(a, "equal", "{\"rank\":10e9999999999999999999999999999999999999999}"));
+    try std.testing.expect(!try wide_exponent.matchesStored(a, "lower", "{\"rank\":9e9999999999999999999999999999999999999999}"));
     var fractional_json = try std.json.parseFromSlice(std.json.Value, a, "{\"range\":{\"rank\":{\"gt\":9.5}}}", .{});
     defer fractional_json.deinit();
     var fractional = try graph_exec.PreparedPatternFilter.initValue(a, fractional_json.value);
@@ -39765,11 +39812,12 @@ test "optional numeric range covers unsigned values and uses identical stored se
     var frontier: std.AutoHashMapUnmanaged(doc_set.DocOrdinal, []const u8) = .empty;
     defer frontier.deinit(a);
     try frontier.put(a, 1, "wide");
+    try frontier.put(a, 2, "absent");
     var domain = roaring.RoaringBitmap.init(a);
     defer domain.deinit();
     try domain.add(1);
     var input: IndexedPredicateEvaluator.FrontierProbeInput = .{};
-    defer if (input.docs) |*docs| docs.deinit();
+    defer input.deinit();
     var gates: IndexedPredicateEvaluator.AppliedGates = .empty;
     const evaluator: IndexedPredicateEvaluator = .{
         .snapshot = snapshot,
@@ -39797,6 +39845,7 @@ test "optional numeric range covers unsigned values and uses identical stored se
     var scoped = try bounded.executeIndexedClause(.{ .term = .{ .field = "body", .term = "beacon" } }, &domain, "/first-miss");
     defer scoped.deinit();
     try std.testing.expect(input.attempted);
+    try std.testing.expectEqual(@as(usize, 1), input.covered.?.cardinality());
     try std.testing.expectEqual(@as(usize, 1), scoped.cardinality());
     try std.testing.expect(scoped.contains(1));
 
@@ -39857,7 +39906,7 @@ test "optional numeric range covers unsigned values and uses identical stored se
     try frontier.put(a, 3, "historical");
     try domain.add(3);
     var mixed_input: IndexedPredicateEvaluator.FrontierProbeInput = .{};
-    defer if (mixed_input.docs) |*docs| docs.deinit();
+    defer mixed_input.deinit();
     bounded.snapshot = writer.snapshot();
     bounded.frontier = frontier;
     bounded.probe_input = &mixed_input;
@@ -39877,16 +39926,13 @@ test "optional numeric range covers unsigned values and uses identical stored se
     try std.testing.expectEqual(@as(usize, 1), phrase_and_wildcard.cardinality());
     try std.testing.expect(phrase_and_wildcard.contains(1));
 
-    try frontier.put(a, 2, "absent");
+    try std.testing.expectEqual(@as(usize, 2), mixed_input.covered.?.cardinality());
     try domain.add(2);
-    var later_input: IndexedPredicateEvaluator.FrontierProbeInput = .{};
-    defer if (later_input.docs) |*docs| docs.deinit();
-    bounded.frontier = frontier;
-    bounded.probe_input = &later_input;
     var later = (try bounded.probeFrontier(.{ .term_phrase = .{ .field = "body", .terms = &.{ "beacon", "relay" } } }, &domain)).?;
     defer later.deinit();
     try std.testing.expectEqual(@as(usize, 1), later.cardinality());
     try std.testing.expect(later.contains(2));
+    try std.testing.expectEqual(@as(usize, 3), mixed_input.covered.?.cardinality());
 
     const allocation_check = struct {
         fn run(allocator: Allocator, seg: *const index_mod.SegmentEntry) !void {

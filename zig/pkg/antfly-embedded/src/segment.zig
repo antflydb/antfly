@@ -205,34 +205,66 @@ const NumericRangeDirectory = struct {
         return self.records;
     }
 
+    fn loadWitnessPayload(self: *NumericRangeDirectory, reader: *const SegmentReader, kind: SectionType) ![]u8 {
+        if (reader.native) |native| {
+            const section = native.range.findSection(numeric_range_coverage_field, kind) orelse return &.{};
+            const payload = try self.alloc.alloc(u8, @intCast(section.length));
+            errdefer self.alloc.free(payload);
+            var scratch: [8192]u8 = undefined;
+            _ = try native.range.readSectionInto(numeric_range_coverage_field, kind, 0, payload, &scratch);
+            return payload;
+        }
+        const source = (try reader.getSection(numeric_range_coverage_field, kind)) orelse return &.{};
+        return self.alloc.dupe(u8, source);
+    }
+
+    fn appendWitnessRecords(self: *NumericRangeDirectory, records: *std.ArrayListUnmanaged(NumericRangeWitness), data: []const u8, projected: bool) !void {
+        const start = records.items.len;
+        errdefer records.shrinkRetainingCapacity(start);
+        var iterator = NumericRangeWitnessIterator{ .remaining = data };
+        var previous_records: usize = 0;
+        while (try iterator.next()) |witness| {
+            if (projected) {
+                if (witness.coverage != .projected) return error.InvalidSegment;
+                while (previous_records < start) {
+                    const order = std.mem.order(u8, records.items[previous_records].field, witness.field);
+                    if (order == .eq) return error.InvalidSegment;
+                    if (order == .gt) break;
+                    previous_records += 1;
+                }
+            }
+            try records.append(self.alloc, witness);
+        }
+    }
+
     fn decode(self: *NumericRangeDirectory, reader: *const SegmentReader) !void {
         var payloads: [numeric_witness_sections.len][]u8 = @splat(&.{});
         errdefer for (payloads) |bytes| self.alloc.free(bytes);
         var records: std.ArrayListUnmanaged(NumericRangeWitness) = .empty;
         defer records.deinit(self.alloc);
         var qualified_exact = false;
+        var damaged: ?anyerror = null;
         for (numeric_witness_sections, &payloads) |format, *payload| {
-            payload.* = if (reader.native) |native| data: {
-                const section = native.range.findSection(numeric_range_coverage_field, format.kind) orelse continue;
-                const bytes = try self.alloc.alloc(u8, @intCast(section.length));
-                errdefer self.alloc.free(bytes);
-                var scratch: [8192]u8 = undefined;
-                _ = try native.range.readSectionInto(numeric_range_coverage_field, format.kind, 0, bytes, &scratch);
-                break :data bytes;
-            } else data: {
-                const source = (try reader.getSection(numeric_range_coverage_field, format.kind)) orelse continue;
-                break :data try self.alloc.dupe(u8, source);
+            payload.* = self.loadWitnessPayload(reader, format.kind) catch |err| switch (err) {
+                error.InvalidSegment, error.CrcMismatch => {
+                    damaged = damaged orelse err;
+                    continue;
+                },
+                else => return err,
             };
             if (!std.mem.startsWith(u8, payload.*, format.header)) continue;
+            self.appendWitnessRecords(&records, payload.*[format.header.len..], format.projected) catch |err| switch (err) {
+                error.InvalidSegment => {
+                    damaged = damaged orelse err;
+                    self.alloc.free(payload.*);
+                    payload.* = &.{};
+                    continue;
+                },
+                else => return err,
+            };
             qualified_exact = qualified_exact or format.projected;
-            var iterator = NumericRangeWitnessIterator{ .remaining = payload.*[format.header.len..] };
-            while (try iterator.next()) |witness| {
-                // Accept the earlier development encoding in v3. The
-                // extension itself may only carry projection witnesses.
-                if (format.projected and witness.coverage != .projected) return error.InvalidSegment;
-                try records.append(self.alloc, witness);
-            }
         }
+        if (records.items.len == 0) if (damaged) |err| return err;
         // v3 alone predates exact stored range comparison and can attest
         // projections that previously rounded on both the source and query path.
         if (!qualified_exact) for (records.items) |*witness| {
@@ -13401,6 +13433,12 @@ test "optional numeric range projection extension leaves the v3 witness readable
     try std.testing.expectEqual(.empty, witness.coverage);
     try std.testing.expect((try iterator.next()) == null);
     try std.testing.expectEqual(@as(usize, 2), (try reader.numericRangeWitnesses()).len);
+    const extension = (try reader.getSection(numeric_range_coverage_field, projected_range_coverage_section)).?;
+    bytes[@intFromPtr(extension.ptr) - @intFromPtr(bytes.ptr)] ^= 1;
+    var damaged = try SegmentReader.init(a, bytes);
+    defer damaged.deinit();
+    try std.testing.expectEqual(.empty, (try damaged.numericRangeCoverage("other")).?);
+    try std.testing.expect((try damaged.numericRangeCoverage("rank")) == null);
 
     var old_writer = SegmentWriter.init(a);
     defer old_writer.deinit();
