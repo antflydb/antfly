@@ -95,8 +95,8 @@ test "distributed txn private control wire carries only an isolated DAG source f
     var scan = request;
     scan.dag_source_fence.?.action = .scan;
     scan.dag_source_fence.?.scan = .{ .domain = @splat(4), .owner_epoch = 7, .page = .{
-        .after = "\x00\xff",
-        .next = "\x01\xff",
+        .after = "\x00\x00\x00\x00\x00\x00\xff",
+        .next = "\x00\x00\x00\x00\x00\x01\xff",
         .replacements = &.{.{ .owner = @splat(5), .source = "\xfe", .targets = &.{"\xfd"} }},
     } };
     const scan_encoded = try encodeBatchRequest(alloc, scan);

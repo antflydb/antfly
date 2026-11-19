@@ -154,20 +154,11 @@ pub fn advanceScan(
     var root_index: u32 = 0;
     var physical_after: ?[]const u8 = null;
     if (checkpoint.after) |after| {
-        if (after.len < 5) return error.InvalidDagAuthority;
-        root_index = std.mem.readInt(u32, after[0..4], .big);
-        if (root_index >= roots.len) return error.InvalidDagAuthority;
-        switch (after[4]) {
-            0 => {
-                if (after.len == 5) return error.InvalidDagAuthority;
-                physical_after = after[5..];
-            },
-            1 => {
-                if (after.len != 5) return error.InvalidDagAuthority;
-                root_index += 1;
-            },
-            else => return error.InvalidDagAuthority,
-        }
+        const position = authority.ScanPosition.decode(after) catch return error.InvalidDagAuthority;
+        if (position.root >= roots.len) return error.InvalidDagAuthority;
+        root_index = position.root;
+        physical_after = position.after;
+        if (position.after == null) root_index += 1;
     }
     if (root_index == roots.len) return true;
 

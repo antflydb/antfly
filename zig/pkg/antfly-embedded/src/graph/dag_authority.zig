@@ -71,6 +71,45 @@ pub const SourceFence = struct {
     }
 };
 
+/// An activation cursor visits each root in order. Its terminal marker
+/// sorts after every physical key in that root.
+pub const ScanPosition = struct {
+    root: u32,
+    after: ?[]const u8,
+
+    pub fn decode(bytes: []const u8) !ScanPosition {
+        if (bytes.len < 5) return error.InvalidDagMutation;
+        const root = std.mem.readInt(u32, bytes[0..4], .big);
+        return switch (bytes[4]) {
+            0 => if (bytes.len == 5) error.InvalidDagMutation else .{ .root = root, .after = bytes[5..] },
+            1 => if (bytes.len != 5) error.InvalidDagMutation else .{ .root = root, .after = null },
+            else => error.InvalidDagMutation,
+        };
+    }
+
+    pub fn requireSuccessor(after: ?[]const u8, next: []const u8) !void {
+        const following = try decode(next);
+        const root = if (after) |previous| blk: {
+            const position = try decode(previous);
+            break :blk if (position.after != null) position.root else std.math.add(u32, position.root, 1) catch return error.InvalidDagMutation;
+        } else 0;
+        if (following.root != root) return error.InvalidDagMutation;
+    }
+};
+
+test "DAG ordered scan positions require terminal markers before switching roots" {
+    const first = "\x00\x00\x00\x00\x00key";
+    const first_end = "\x00\x00\x00\x00\x01";
+    const second_end = "\x00\x00\x00\x01\x01";
+    try ScanPosition.requireSuccessor(null, first);
+    try ScanPosition.requireSuccessor(first, first_end);
+    try ScanPosition.requireSuccessor(first_end, second_end);
+    try std.testing.expectError(error.InvalidDagMutation, ScanPosition.requireSuccessor(null, second_end));
+    try std.testing.expectError(error.InvalidDagMutation, ScanPosition.requireSuccessor(first, second_end));
+    try std.testing.expectError(error.InvalidDagMutation, ScanPosition.requireSuccessor(first_end, first));
+    try std.testing.expectError(error.InvalidDagMutation, ScanPosition.requireSuccessor(first, "\x00\x00\x00\x00\x01junk"));
+}
+
 pub const SourceFenceCommand = struct {
     namespace: [24]u8,
     action: enum { acquire, release, scan },
@@ -113,6 +152,7 @@ pub const SourceFenceCommand = struct {
             return;
         }
         if (scan.page) |page| {
+            try ScanPosition.requireSuccessor(page.after, page.next);
             const ScanClock = struct {
                 fn now(_: *anyopaque) u64 {
                     // Raft apply must produce the same result on every replica.

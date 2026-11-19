@@ -156115,11 +156115,13 @@ test "db ordered DAG source fence persists with the apply receipt" {
         }
     };
     const port: Port = .{ .db = &db, .source_page = source_page.value };
-    try std.testing.expect(try effects.advanceScan(a, port, manifest, request.dag_source_fence.?, .{ .owner_epoch = 1, .after = null }));
+    var partial_page = source_page.value;
+    partial_page.exhausted = false;
+    const partial_port: Port = .{ .db = &db, .source_page = partial_page };
+    try std.testing.expect(!try effects.advanceScan(a, partial_port, manifest, request.dag_source_fence.?, .{ .owner_epoch = 1, .after = null }));
     const committed = (try db.dagActivationCheckpoint(a, request.dag_source_fence.?.namespace, domain, fence)).?;
     defer committed.deinit(a);
-    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 1 }, committed.after.?);
-    try std.testing.expect(try effects.advanceScan(a, port, manifest, request.dag_source_fence.?, committed));
+    try std.testing.expectEqualSlices(u8, graph_key, committed.after.?[5..]);
     var changed_root = roots[0];
     changed_root.generation += 1;
     const changed = try effects.ScanManifest.init(&.{.{ .id = domain, .roots = &.{changed_root} }}, namespace, fence.activation);
@@ -156127,9 +156129,11 @@ test "db ordered DAG source fence persists with the apply receipt" {
     const cursor = committed.after.?;
     request.dag_source_fence.?.scan.?.page = .{
         .after = cursor,
-        .next = "\xff",
+        .next = "\x00\x00\x00\x01\x01",
         .replacements = &.{.{ .owner = owner, .source = "b", .targets = &.{"a"} }},
     };
+    try std.testing.expectError(error.InvalidDagMutation, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 4 }, true));
+    request.dag_source_fence.?.scan.?.page.?.next = "\x00\x00\x00\x00\x01";
     try std.testing.expectError(error.GraphCycle, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 4 }, true));
     const checkpoint = (try db.dagActivationCheckpoint(a, request.dag_source_fence.?.namespace, domain, fence)).?;
     defer checkpoint.deinit(a);
