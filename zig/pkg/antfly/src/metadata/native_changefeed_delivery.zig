@@ -96,6 +96,83 @@ pub fn Provider(comptime Policy: type) type {
     return ProviderFor(native_root.Adapter, Policy);
 }
 
+/// The factory binds a selected namespace to a route in the request's
+/// captured generation. A replay dispatches only to the recorded root.
+pub fn ScheduledProvider(comptime Root: type, comptime Factory: type, comptime Policy: type) type {
+    return struct {
+        factory: Factory,
+        policy: *Policy,
+        const Self = @This();
+
+        pub fn authorize(self: *Self, state: control.State, request: anytype) !void {
+            if (state.roots.len == 0) return error.ChangefeedResynchronizationRequired;
+            var root: Root = try self.factory.open(state.roots[0].namespace);
+            var provider: ProviderFor(Root, Policy) = .{ .root = &root, .policy = self.policy };
+            try provider.authorize(state, request);
+        }
+
+        pub fn nowSeconds(self: *Self, request: anytype) !u64 {
+            return self.policy.nowSeconds(request);
+        }
+
+        pub fn prepare(self: *Self, a: A, state: control.State, before: Digest, limits: delivery.Limits, request: anytype) !delivery.Prepared {
+            try self.authorize(state, request);
+            if (state.roots.len == 1) {
+                var root: Root = try self.factory.open(state.roots[0].namespace);
+                var provider: ProviderFor(Root, Policy) = .{ .root = &root, .policy = self.policy };
+                return provider.prepare(a, state, before, limits, request);
+            }
+            const start = state.latest_delivery % state.roots.len;
+            var heartbeat: ?delivery.Prepared = null;
+            var unavailable = false;
+            for (0..state.roots.len) |offset| {
+                try request.ensureActive();
+                const selected = state.roots[(start + offset) % state.roots.len];
+                var root: Root = try self.factory.open(selected.namespace);
+                var provider: ProviderFor(Root, Policy) = .{ .root = &root, .policy = self.policy };
+                var attempt = std.heap.ArenaAllocator.init(a);
+                defer attempt.deinit();
+                const page = provider.prepare(attempt.allocator(), state, before, limits, request) catch |err| switch (err) {
+                    error.ReadUnavailable => {
+                        unavailable = true;
+                        continue;
+                    },
+                    else => return err,
+                };
+                if (page.advances.len != 0) return copyPage(a, page);
+                if (heartbeat == null) heartbeat = try copyPage(a, page);
+            }
+            if (unavailable) return error.ReadUnavailable;
+            return heartbeat orelse error.ChangefeedResynchronizationRequired;
+        }
+
+        fn copyPage(a: A, page: delivery.Prepared) !delivery.Prepared {
+            var result = page;
+            result.body = try a.dupe(u8, page.body);
+            result.provider_context = try a.dupe(u8, page.provider_context);
+            const advances = try a.dupe(control.Advance, page.advances);
+            for (advances) |*advance| if (advance.snapshot) |*position| {
+                position.continuation = try a.dupe(u8, position.continuation);
+            };
+            result.advances = advances;
+            return result;
+        }
+
+        pub fn replay(self: *Self, a: A, state: control.State, receipt: control.Delivery, limits: delivery.Limits, request: anytype) !delivery.Prepared {
+            try self.authorize(state, request);
+            const namespace = switch (receipt.advances.len) {
+                0 => state.roots[0].namespace,
+                1 => receipt.advances[0].namespace,
+                else => return error.ChangefeedResynchronizationRequired,
+            };
+            _ = try state.rootIndex(namespace);
+            var root: Root = try self.factory.open(namespace);
+            var provider: ProviderFor(Root, Policy) = .{ .root = &root, .policy = self.policy };
+            return provider.replay(a, state, receipt, limits, request);
+        }
+    };
+}
+
 pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
     return struct {
         root: *Root,

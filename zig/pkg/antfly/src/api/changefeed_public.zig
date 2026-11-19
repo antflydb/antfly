@@ -187,17 +187,18 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
     defer state.deinit();
     const definition = state.value.definition orelse return error.Forbidden;
     try requireOwner(identity, definition);
-    if (definition.tables.len != 1 or state.value.roots.len != 1) return error.ChangefeedCapabilityUnsupported;
+    if (definition.tables.len != 1) return error.ChangefeedCapabilityUnsupported;
     var captured = try source.capture(a, definition, internal);
     defer captured.deinit();
-    var root = try roots.Routed.init(source, &captured);
+    try captured.validateInitialRoutes(state.value.roots);
+    if (captured.roots.len == 0) return error.ChangefeedResynchronizationRequired;
     const table = captured.roots[0].table_name;
     const permission_name = try resolvePermissionName(api, a, table, internal);
     defer a.free(permission_name);
     const filter = try http.resolveEffectiveRowFilterJson(a, identity, permission_name);
     defer if (filter) |value| a.free(value);
     var policy: Policy = .{ .api = api, .credential = credential, .table = table, .permission_name = permission_name, .filter = filter };
-    var provider: native.ProviderFor(roots.Routed, Policy) = .{ .root = &root, .policy = &policy };
+    var provider: native.ScheduledProvider(roots.Routed, RoutedFactory, Policy) = .{ .factory = .{ .source = source, .captured = &captured }, .policy = &policy };
     if (limits) |bounds|
         return .{ .page = try delivery.pull(&client, &provider, a, selection.id, selection.after, bounds, internal) };
     var confirmed = try delivery.acknowledge(&client, &provider, a, selection.id, selection.after, internal);
@@ -215,10 +216,21 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
         if (active.phase != .streaming or active.epoch != confirmed.value.epoch or !same(active.acknowledged_cursor, selection.after))
             return error.MetadataMutationOutcomeUnknown;
     }
-    try releaseStreamingSnapshot(&client, &driver_policy, a, active, captured.roots[0], internal);
-    _ = try source_api.flushAcknowledged(&client, &driver_policy, a, active, captured.roots[0], internal);
+    for (captured.roots) |root| {
+        try releaseStreamingSnapshot(&client, &driver_policy, a, active, root, internal);
+        _ = try source_api.flushAcknowledged(&client, &driver_policy, a, active, root, internal);
+    }
     return .{ .acknowledged = confirmed.value.acknowledged_cursor };
 }
+
+const RoutedFactory = struct {
+    source: source_api.Source,
+    captured: *const source_api.Captured,
+
+    pub fn open(self: RoutedFactory, namespace: control.Namespace) !roots.Routed {
+        return roots.Routed.initForRoot(self.source, self.captured, namespace);
+    }
+};
 
 pub const Create = struct {
     tables: []const []const u8,

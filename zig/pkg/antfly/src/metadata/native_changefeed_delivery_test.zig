@@ -305,6 +305,7 @@ pub fn coordinated() !void {
     const second_ns = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 7 } ++ @as([16]u8, @splat(2));
     const Root = struct {
         namespace: control.Namespace,
+        reads: *[2]usize,
         pub fn validateScope(_: *@This(), state: control.State) !control.Table {
             try state.validate();
             return state.definition.?.tables[0];
@@ -314,6 +315,7 @@ pub fn coordinated() !void {
         }
         pub fn readProjectedWithContext(self: *@This(), alloc: A, _: control.State, _: control.Digest, _: u64, _: u32, _: u32, _: Request) !Page {
             const visible = std.mem.eql(u8, &self.namespace, &first_ns);
+            self.reads[if (visible) 0 else 1] += 1;
             var arena = std.heap.ArenaAllocator.init(alloc);
             errdefer arena.deinit();
             const scratch = arena.allocator();
@@ -330,6 +332,12 @@ pub fn coordinated() !void {
                 .observed_latest = 1,
                 .caught_up = true,
             };
+        }
+    };
+    const Factory = struct {
+        reads: *[2]usize,
+        pub fn open(self: @This(), namespace: control.Namespace) !Root {
+            return .{ .namespace = namespace, .reads = self.reads };
         }
     };
     var tmp = std.testing.tmpDir(.{});
@@ -353,8 +361,8 @@ pub fn coordinated() !void {
     var state = try svc.load(a);
     defer state.deinit();
     var policy: Policy = .{};
-    var root: Root = .{ .namespace = first_ns };
-    var renderer: provider.ProviderFor(Root, Policy) = .{ .root = &root, .policy = &policy };
+    var reads: [2]usize = @splat(0);
+    var renderer: provider.ScheduledProvider(Root, Factory, Policy) = .{ .factory = .{ .reads = &reads }, .policy = &policy };
     const id = state.value.id;
     var first = try coordinator.pull(&svc, &renderer, a, id, state.value.latest_cursor, .{}, Request{});
     defer first.deinit();
@@ -364,7 +372,6 @@ pub fn coordinated() !void {
     try std.testing.expect(!transaction.get("complete").?.bool);
     try std.testing.expectEqual(@as(usize, 1), initial.value.object.get("events").?.array.items.len);
 
-    root.namespace = second_ns;
     var last = try coordinator.pull(&svc, &renderer, a, id, first.cursor, .{}, Request{});
     defer last.deinit();
     var completed = try body(a, last.body);
@@ -373,8 +380,10 @@ pub fn coordinated() !void {
     try std.testing.expect(ending.get("complete").?.bool);
     try std.testing.expectEqualStrings(transaction.get("transaction_id").?.string, ending.get("transaction_id").?.string);
     try std.testing.expectEqual(@as(usize, 0), completed.value.object.get("events").?.array.items.len);
+    try std.testing.expectEqualDeep([2]usize{ 1, 1 }, reads);
     var replay = try coordinator.pull(&svc, &renderer, a, id, first.cursor, .{}, Request{});
     defer replay.deinit();
     try std.testing.expect(replay.replayed);
     try std.testing.expectEqualStrings(last.body, replay.body);
+    try std.testing.expectEqualDeep([2]usize{ 1, 2 }, reads);
 }
