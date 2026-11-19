@@ -74,7 +74,8 @@ fenced physical root using its owned key range, with bounded row and byte
 counts. The caller supplies the source catalog generation and must establish
 the owner read barrier before either lookup. The scan driver commits one
 page at a time and persists a root-completion cursor even for an empty root,
-so resumption uses the authority checkpoint.
+so resumption uses the authority checkpoint. The fence snapshot digest binds
+the ordered roots and source catalog generations for every activated domain.
 An active source fence allows an ordered catalog change only when activation
 proofs match its pinned snapshot. Raft protocol version 31 gates these commands,
 DAG-bearing transaction prepare, and catalog activation proofs. The source-fence

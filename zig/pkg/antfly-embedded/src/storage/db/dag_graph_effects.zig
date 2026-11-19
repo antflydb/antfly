@@ -69,6 +69,68 @@ pub const ScanPage = struct {
     replacements: []const Replacement,
 };
 
+pub const ScanRoot = struct {
+    namespace: [24]u8,
+    index_name: []const u8,
+    edge_type: []const u8,
+    generation: u64,
+};
+
+pub const ScanDomain = struct {
+    id: authority.Digest,
+    roots: []const ScanRoot,
+};
+
+pub const ScanManifest = struct {
+    domains: []const ScanDomain,
+    authority_namespace: [24]u8,
+    fence: authority.SourceFence,
+
+    /// Borrow the immutable source list in physical traversal order. The
+    /// digest excludes page-local cursors and binds the catalog generations.
+    pub fn init(
+        domains: []const ScanDomain,
+        authority_namespace: [24]u8,
+        activation: authority.Digest,
+    ) !ScanManifest {
+        if (domains.len == 0) return error.InvalidDagMutation;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly/dag-activation/source-manifest/v1");
+        hash.update(&activation);
+        hash.update(&authority_namespace);
+        hashNumber(&hash, domains.len);
+        for (domains, 0..) |domain, index| {
+            if (index != 0 and std.mem.order(u8, &domains[index - 1].id, &domain.id) != .lt)
+                return error.InvalidDagMutation;
+            if (domain.roots.len == 0 or domain.roots.len > std.math.maxInt(u32))
+                return error.InvalidDagMutation;
+            hash.update(&domain.id);
+            hashNumber(&hash, domain.roots.len);
+            for (domain.roots) |root| {
+                if (root.index_name.len == 0 or root.edge_type.len == 0 or root.generation == 0)
+                    return error.InvalidDagMutation;
+                hash.update(&root.namespace);
+                hashNumber(&hash, root.generation);
+                for ([_][]const u8{ root.index_name, root.edge_type }) |name| {
+                    hashNumber(&hash, name.len);
+                    hash.update(name);
+                }
+            }
+        }
+        return .{
+            .domains = domains,
+            .authority_namespace = authority_namespace,
+            .fence = .{ .activation = activation, .snapshot = hash.finalResult() },
+        };
+    }
+};
+
+fn hashNumber(hash: *std.crypto.hash.sha2.Sha256, number: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, number, .big);
+    hash.update(&bytes);
+}
+
 /// Advance a single bounded page on the immutable root list for this fence.
 /// The port reads the pinned source and commits the authority command in order.
 /// Read allocations belong to the caller's scratch arena. A completed-root
@@ -76,14 +138,18 @@ pub const ScanPage = struct {
 pub fn advanceScan(
     alloc: A,
     port: anytype,
-    roots: []const ScanRequest,
+    manifest: ScanManifest,
     authority_command: authority.SourceFenceCommand,
     checkpoint: authority.Contributions.ScanCheckpoint,
 ) !bool {
-    if (roots.len == 0 or roots.len > std.math.maxInt(u32)) return error.InvalidDagMutation;
     var command = authority_command;
     const scan = command.scan orelse return error.InvalidDagMutation;
     if (command.action != .scan or scan.page != null) return error.InvalidDagMutation;
+    if (!std.meta.eql(manifest.fence, command.fence) or
+        !std.mem.eql(u8, &manifest.authority_namespace, &command.namespace)) return error.GraphConstraintRevisionChanged;
+    const roots = for (manifest.domains) |domain| {
+        if (std.mem.eql(u8, &domain.id, &scan.domain)) break domain.roots;
+    } else return error.InvalidDagMutation;
     if (scan.owner_epoch != checkpoint.owner_epoch) return error.GraphConstraintOwnerChanged;
     var root_index: u32 = 0;
     var physical_after: ?[]const u8 = null;
@@ -105,10 +171,15 @@ pub fn advanceScan(
     }
     if (root_index == roots.len) return true;
 
-    var source = roots[root_index];
-    if (!std.meta.eql(source.fence, command.fence) or source.after != null)
-        return error.InvalidDagMutation;
-    source.after = physical_after;
+    const root = roots[root_index];
+    const source: ScanRequest = .{
+        .namespace = root.namespace,
+        .fence = manifest.fence,
+        .index_name = root.index_name,
+        .edge_type = root.edge_type,
+        .generation = root.generation,
+        .after = physical_after,
+    };
     const page = try port.readSource(alloc, source);
     if (page.next) |next| {
         if (next.len == 0 or (physical_after != null and std.mem.order(u8, physical_after.?, next) != .lt))

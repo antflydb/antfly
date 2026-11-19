@@ -156041,13 +156041,22 @@ test "db ordered DAG source fence persists with the apply receipt" {
     var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
     defer db.close();
     const dag = @import("../../graph/dag_authority.zig");
-    const fence: dag.SourceFence = .{ .activation = @splat(3), .snapshot = @splat(4) };
+    const effects = @import("dag_graph_effects.zig");
+    const domain: dag.Digest = @splat(5);
+    const namespace = @import("online_source_contract.zig").namespaceBytes(db.core.identity_namespace);
+    const roots: []const effects.ScanRoot = &.{.{
+        .namespace = namespace,
+        .index_name = "g",
+        .edge_type = "R",
+        .generation = 7,
+    }};
+    const manifest = try effects.ScanManifest.init(&.{.{ .id = domain, .roots = roots }}, namespace, @splat(3));
+    const fence = manifest.fence;
     var request: types.BatchRequest = .{ .dag_source_fence = .{
-        .namespace = @import("online_source_contract.zig").namespaceBytes(db.core.identity_namespace),
+        .namespace = namespace,
         .action = .acquire,
         .fence = fence,
     } };
-    const effects = @import("dag_graph_effects.zig");
     const graph_key = try internal_keys.graphRelationshipArtifactKeyAlloc(a, "producer", "g", "R", "b", "a", "edge");
     defer a.free(graph_key);
     const graph_value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(a, null, 7, 1, 0, 0, "{}");
@@ -156077,7 +156086,6 @@ test "db ordered DAG source fence persists with the apply receipt" {
         defer read.abort();
         try std.testing.expectEqualDeep(fence, (try dag.SourceFence.read(&read)).?);
     }
-    const domain: dag.Digest = @splat(5);
     request.dag_source_fence.?.action = .scan;
     request.dag_source_fence.?.scan = .{ .domain = domain, .owner_epoch = 1 };
     try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 2 }, true);
@@ -156107,18 +156115,15 @@ test "db ordered DAG source fence persists with the apply receipt" {
         }
     };
     const port: Port = .{ .db = &db, .source_page = source_page.value };
-    const roots: []const effects.ScanRequest = &.{.{
-        .namespace = request.dag_source_fence.?.namespace,
-        .fence = fence,
-        .index_name = "g",
-        .edge_type = "R",
-        .generation = 7,
-    }};
-    try std.testing.expect(try effects.advanceScan(a, port, roots, request.dag_source_fence.?, .{ .owner_epoch = 1, .after = null }));
+    try std.testing.expect(try effects.advanceScan(a, port, manifest, request.dag_source_fence.?, .{ .owner_epoch = 1, .after = null }));
     const committed = (try db.dagActivationCheckpoint(a, request.dag_source_fence.?.namespace, domain, fence)).?;
     defer committed.deinit(a);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 1 }, committed.after.?);
-    try std.testing.expect(try effects.advanceScan(a, port, roots, request.dag_source_fence.?, committed));
+    try std.testing.expect(try effects.advanceScan(a, port, manifest, request.dag_source_fence.?, committed));
+    var changed_root = roots[0];
+    changed_root.generation += 1;
+    const changed = try effects.ScanManifest.init(&.{.{ .id = domain, .roots = &.{changed_root} }}, namespace, fence.activation);
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, effects.advanceScan(a, port, changed, request.dag_source_fence.?, committed));
     const cursor = committed.after.?;
     request.dag_source_fence.?.scan.?.page = .{
         .after = cursor,
