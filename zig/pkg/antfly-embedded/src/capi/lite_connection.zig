@@ -2247,12 +2247,15 @@ pub const Owner = struct {
     // allowed to finish when shutdown cancels the remaining maintenance.
     allocator_verification_started: bool = false,
     allocator_verification_active: bool = false,
-    /// When this owner's last reuse proof walk ended. Until
-    /// `reuse_proof_backoff_ns` passes, an unverified pool allocates
-    /// append-only instead of walking the file again: a peer committing
-    /// continuously invalidates each proof, and walking on every write
-    /// starves this owner. Guarded by the gate.
-    last_reuse_proof_ns: i96 = 0,
+    /// When another process last moved the tip during this owner's reuse
+    /// proof, losing it. Until `reuse_proof_backoff_ns` passes, an
+    /// unverified pool allocates append-only instead of walking the file
+    /// again: a peer committing continuously loses every walk, and walking
+    /// before each write starves this owner. Guarded by the gate.
+    reuse_proof_lost_ns: i96 = 0,
+    /// Proofs lost in a row; one is retried at once, a second starts the
+    /// append-only backoff. Reset by a proof that holds.
+    reuse_proofs_lost: u32 = 0,
     // Directory progress belongs to the path owner, not a serving generation.
     artifact_marker_sweep: @FieldType(NativeStore, "artifact_marker_sweep") = .{},
     reader_coordinator: *native.ReaderCoordinator = undefined,
@@ -4491,7 +4494,6 @@ pub const Owner = struct {
         const verified = reader.completeAllocatorVerification();
         const proof_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - proof_started));
         self.gate.mutex.lockUncancelable(io);
-        self.last_reuse_proof_ns = std.Io.Clock.awake.now(io).nanoseconds;
         self.publication_stats.allocator_proof_walks +|= 1;
         self.publication_stats.allocator_proof_ns +|= proof_ns;
         self.publication_stats.allocator_proof_max_ns = @max(self.publication_stats.allocator_proof_max_ns, proof_ns);
@@ -4530,17 +4532,25 @@ pub const Owner = struct {
             // check above.
             if (std.meta.eql(native.NativeFile.allocatorProofIdentity(live.header), native.NativeFile.allocatorProofIdentity(probe.header)) and
                 (try live.file.stat(live.runtime())).inode == (try probe.file.stat(probe.runtime())).inode)
+            {
                 try live.inheritAllocatorVerification(reader);
+                self.reuse_proofs_lost = 0;
+            }
         }
         self.allocator_proof_receipt = null;
     }
 
-    /// A reuse proof walk ended recently (`last_reuse_proof_ns`): allocate
-    /// append-only for now instead of proving again. Capacity-limited
-    /// stores still need their proof.
+    /// A recent reuse proof was lost to another process's commit
+    /// (`reuse_proof_lost_ns`): allocate append-only for now instead of
+    /// proving again. Capacity-limited stores still need their proof.
+    fn noteReuseProofLost(self: *Owner) void {
+        self.reuse_proofs_lost +|= 1;
+        self.reuse_proof_lost_ns = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds;
+    }
+
     fn reuseProofBackoffActive(self: *Owner, root: *h.Handle) bool {
-        if (self.last_reuse_proof_ns == 0 or Connection.usesCapacityAdmission(root)) return false;
-        return std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds - self.last_reuse_proof_ns < Connection.reuse_proof_backoff_ns;
+        if (self.reuse_proofs_lost < 2 or Connection.usesCapacityAdmission(root)) return false;
+        return std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds - self.reuse_proof_lost_ns < Connection.reuse_proof_backoff_ns;
     }
 
     fn deinitMaintenanceSchedules(self: *Owner) void {
@@ -5090,6 +5100,13 @@ pub const Connection = struct {
                 // allocate append-only, and skip proofs for a while, rather
                 // than starve while a peer keeps writing.
                 if (try needsCapacityProof(root)) return error.FileBusy;
+                if (intent == .mutation and try self.needsReuseAdmission(root)) {
+                    // The first loss refuses, as before, so admission retries
+                    // with a fresh proof inside its busy budget; a second loss
+                    // in a row proceeds append-only and starts the backoff.
+                    self.owner.noteReuseProofLost();
+                    if (self.owner.reuse_proofs_lost < 2) return error.FileBusy;
+                }
             }
         }
         self.current = root;

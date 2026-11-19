@@ -7914,6 +7914,14 @@ pub const NativeFile = struct {
     /// content, directly into the (`std.heap.page_allocator`-owned)
     /// shared overlay. A later opener in this process replays only the
     /// records another process appended since (`replayIntoSharedOverlay`).
+    /// The zero block a redo fold erases the used log with (read-only data,
+    /// not a stack or heap buffer).
+    const redo_log_zero_block: [64 * 1024]u8 = @splat(0);
+
+    /// How long a cold open's replay waits for a reader slot to protect
+    /// its log scan before reporting busy.
+    const cold_replay_slot_wait_ms: i64 = 1000;
+
     fn recoverRedoLog(self: *NativeFile, allocator: Allocator, io: std.Io, test_hook: if (builtin.is_test) ?*const fn (?*anyopaque) void else void, test_ctx: if (builtin.is_test) ?*anyopaque else void) !void {
         var checkpoint = self.activeCheckpoint();
         // perf/lwa-fold-boundary: the real, durable fold boundary this
@@ -8006,7 +8014,11 @@ pub const NativeFile = struct {
         var scan_slot: ?u32 = null;
         if (scan_region) |r| {
             const pid: u32 = @bitCast(std.c.getpid());
-            scan_slot = r.claimReaderSlot(pid) catch null;
+            // Without a slot a fold cannot see this scan; never read the
+            // log unprotected. Wait briefly for one, then report busy.
+            scan_slot = r.claimReaderSlotWait(pid, cold_replay_slot_wait_ms) catch |err| switch (err) {
+                error.ReadersExhausted => return error.FileBusy,
+            };
             if (scan_slot) |s| r.pinReader(s, @max(folded_through, 1));
         }
         defer if (scan_slot) |s| if (scan_region) |r| {
@@ -8233,7 +8245,15 @@ pub const NativeFile = struct {
             if (catch_up.outcome.valid_count != 0) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
             shared.noteApplied(catch_up.outcome.last_sequence orelse 0);
         }
-        self.publishRedoLogState();
+        // Only an opener with writer authority publishes the watermark. A
+        // read-only scan can finish behind a live writer and would move it
+        // backwards. The scan may also have accepted records a writer
+        // appended and had not yet synced: make them durable first, since
+        // the watermark advertises durability.
+        if (!self.read_only) {
+            if (!self.no_sync) try self.file.sync(io);
+            self.publishRedoLogState();
+        }
     }
 
     /// Turns every page the redo log's overlay is still carrying into a
@@ -8883,6 +8903,12 @@ pub const NativeFile = struct {
         // one: an externally-pinned backlog never resolves on its own,
         // the same rule every other reader-pin-blocks-reclaim case in
         // this codebase already follows.
+        // Advertise the new checkpoint boundary before deciding whether the
+        // old log may be erased. A cross-process replay that pins after the
+        // frontier scan below then sees this boundary on its post-pin
+        // recheck and adopts the checkpoint instead of reading bytes about
+        // to be zeroed; one that pinned earlier is what the scan defers for.
+        self.publishRedoLogState();
         const blocking_pin: ?u64 = blk: {
             const region = (self.regionForInode() catch break :blk null) orelse break :blk null;
             const min_pinned = region.minimumUncoveredPinnedSequence(antfly_platform.process.currentId() orelse 0, redo.shared.minimumPin(io)) orelse break :blk null;
@@ -8891,10 +8917,17 @@ pub const NativeFile = struct {
         const pinned_below = blocking_pin != null;
         if (!pinned_below) {
             if (old_tail > 0) {
-                const zeros = try self.allocator.alloc(u8, @intCast(old_tail));
-                defer self.allocator.free(zeros);
-                @memset(zeros, 0);
-                try self.file.writePositionalAll(io, zeros, self.header.redo_log_offset);
+                // A fixed zero block, written as many times as the used log
+                // needs: no allocation (which could fail after the
+                // checkpoint advanced) and no transient copy the size of the
+                // log while this writer holds authority.
+                const zeros = &redo_log_zero_block;
+                var written: u64 = 0;
+                while (written < old_tail) {
+                    const len: usize = @intCast(@min(old_tail - written, zeros.len));
+                    try self.file.writePositionalAll(io, zeros[0..len], self.header.redo_log_offset + written);
+                    written += len;
+                }
                 try self.file.sync(io);
             }
             // §9.7f: the same "no cross-process reader pinned below the
@@ -21936,8 +21969,11 @@ pub fn fairWriterLockWithIo(allocator: Allocator, io: std.Io, wait_io: std.Io, p
     // fallback that would likely fail the same way. See
     // `inode_lock.isRegionUnusable`'s own doc comment: every migrated
     // caller, writer or reader side, shares this one check.
-    var region = shared_lock_region.Region.open(std.heap.page_allocator, io, path) catch |err| {
+    // Setup is bounded by this admission's own deadline, not the
+    // region's separate setup budget.
+    var region = shared_lock_region.Region.openUntil(std.heap.page_allocator, io, path, .{ .nanoseconds = deadline_ns }) catch |err| {
         if (inode_lock.isRegionUnusable(err)) return plainWriterLockUntil(allocator, io, wait_io, path, deadline_ns);
+        if (err == error.Timeout) return error.FileBusy;
         return err;
     };
     errdefer region.close();
@@ -21991,8 +22027,9 @@ const stale_writer_recovery_budget_ns: i96 = 250 * std.time.ns_per_ms;
 
 pub fn tryFairWriterLockWithIo(allocator: Allocator, io: std.Io, path: []const u8) !PathWriterLock {
     const pid = antfly_platform.process.currentId() orelse 0;
-    var region = shared_lock_region.Region.open(std.heap.page_allocator, io, path) catch |err| {
+    var region = shared_lock_region.Region.openUntil(std.heap.page_allocator, io, path, std.Io.Clock.awake.now(io).addDuration(.fromNanoseconds(stale_writer_recovery_budget_ns))) catch |err| {
         if (inode_lock.isRegionUnusable(err)) return lockWriterPathWithIo(allocator, io, path);
+        if (err == error.Timeout) return error.WouldBlock;
         return err;
     };
     if (!region.tryAcquireWriterFair(pid)) {
@@ -24959,6 +24996,25 @@ test "lite sidecar wait joins the kernel queue when the region names no writer" 
     const cpu_us = Usage.micros(after) - Usage.micros(before);
     // Spinning on the region word burned the whole wait on CPU.
     try std.testing.expect(cpu_us * 2 < @as(i64, @intCast(wall_us)));
+}
+
+test "lite redo log read-only open never publishes the shared watermark" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-readonly-publish.aflite");
+    defer a.free(path);
+    const io = std.testing.io;
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .no_sync = true });
+    defer writer.close();
+    try writer.putDocument("doc", "value");
+    const region = (try writer.regionForInode()) orelse return error.SkipZigTest;
+    // As if the writer had not published yet: a read-only scan must not
+    // publish its own (possibly stale, possibly unsynced) view.
+    region.resetLogStateForTest();
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reader.close();
+    try std.testing.expectEqual(@as(u64, 0), region.readLogState().durable_sequence);
 }
 
 test "lite fair writer lock grants contended writers in arrival order" {
@@ -35503,7 +35559,7 @@ test "lite redo log cold open stays strict about corruption when the region carr
     // sidecar, carries no log publication. Its zero offset must not read
     // as "everything is past the durable ceiling".
     const region = (try writer.regionForInode()).?;
-    region.publishLogState(.{ .checkpoint_sequence = 0, .durable_sequence = 0, .durable_offset = 0 });
+    region.resetLogStateForTest();
 
     try std.testing.expectError(error.NativeRedoLogCorrupt, NativeFile.openWithIo(a, io, path, .{ .read_only = true }));
 }
