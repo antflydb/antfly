@@ -111,6 +111,47 @@ pub fn acceptBatch(a: A, binding: Binding, unresolved_options: Options, context:
     return acceptResolvedBatch(a, binding, try unresolved_options.resolveOwner(a, context), context, batch);
 }
 
+/// Lower one complete pgoutput transaction to the writable Iceberg row
+/// contract. The caller supplies a fenced source epoch and the Iceberg
+/// equality key. The source checkpoint selects the retry identity. The batch
+/// borrows row images and owns its derived fields in the caller’s arena.
+pub fn postgresBatch(a: A, source: []const u8, epoch: []const u8, previous: ?[]const u8, checkpoint: []const u8, keys: []const []const u8, transaction: []const @import("../foreign/source.zig").ReplicationChange) !Batch {
+    const batch_id = try a.dupe(u8, &catalog.types.digestHex(checkpoint));
+    var changes: std.ArrayList(Batch.Change) = .empty;
+    for (transaction) |change| {
+        if (!std.mem.eql(u8, checkpoint, change.checkpoint)) return error.InvalidReplicationCheckpoint;
+        const row = change.row orelse return error.InvalidReplicationSourceRow;
+        switch (change.op) {
+            .delete => try changes.append(a, .{ .op = .delete, .row = try keyImage(a, keys, row) }),
+            .insert, .update => {
+                if (!change.row_complete) return error.ReplicationProjectionIncomplete;
+                if (change.op == .update) {
+                    // A missing before image cannot prove that a separately
+                    // configured Iceberg equality key stayed the same.
+                    const before = change.before orelse return error.ReplicationProjectionIncomplete;
+                    try changes.append(a, .{ .op = .delete, .row = try keyImage(a, keys, before) });
+                }
+                try changes.append(a, .{ .op = .upsert, .row = row });
+            },
+        }
+        if (changes.items.len > max_group_changes) return error.LakeWriteTooLarge;
+    }
+    const batch: Batch = .{ .batch_id = batch_id, .source = source, .epoch = epoch, .checkpoint = checkpoint, .expected_checkpoint = previous, .key_fields = keys, .changes = changes.items };
+    try batch.validate(max_group_changes);
+    return batch;
+}
+
+fn keyImage(a: A, keys: []const []const u8, row: V) !V {
+    if (row != .object) return error.InvalidReplicationSourceRow;
+    var key: std.json.ObjectMap = .empty;
+    for (keys) |name| {
+        const value = row.object.get(name) orelse return error.ReplicationProjectionIncomplete;
+        if (value == .null) return error.ReplicationProjectionIncomplete;
+        try key.put(a, name, value);
+    }
+    return .{ .object = key };
+}
+
 pub const BatchOutcome = struct {
     accepted_sequence: u64,
     committed: bool,
@@ -703,6 +744,24 @@ test "external lake filesystem WAL group commit folds pending transactions into 
     try std.testing.expectEqual(@as(u64, 9), try coverage(a, polled));
     const polled_root = try catalog.metadata.parse(a, polled.metadata_json);
     try std.testing.expectEqualStrings("8", try catalog.metadata.str(try catalog.metadata.get(try catalog.metadata.get(polled_root, "properties"), "antfly.cdc.checkpoint")));
+    const checkpoint = try a.dupe(u8, "postgres-next");
+    const before = try std.json.parseFromSliceLeaky(V, a, "{\"id\":4,\"body\":\"before\"}", .{});
+    const after = try std.json.parseFromSliceLeaky(V, a, "{\"id\":6,\"body\":\"after\"}", .{});
+    const update: @import("../foreign/source.zig").ReplicationChange = .{ .op = .update, .checkpoint = checkpoint, .before = before, .before_kind = .full, .row = after };
+    const captured = try postgresBatch(a, "s", "1", "8", checkpoint, &.{"id"}, &.{update});
+    try std.testing.expectEqual(@as(usize, 2), captured.changes.len);
+    try std.testing.expectEqual(.delete, captured.changes[0].op);
+    try std.testing.expectEqual(@as(i64, 4), captured.changes[0].row.object.get("id").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), captured.changes[0].row.object.count());
+    try std.testing.expectEqual(.upsert, captured.changes[1].op);
+    try std.testing.expectEqual(@as(i64, 6), captured.changes[1].row.object.get("id").?.integer);
+    try std.testing.expectError(error.InvalidReplicationCheckpoint, postgresBatch(a, "s", "1", "8", "wrong", &.{"id"}, &.{update}));
+    var incomplete = update;
+    incomplete.row_complete = false;
+    try std.testing.expectError(error.ReplicationProjectionIncomplete, postgresBatch(a, "s", "1", "8", checkpoint, &.{"id"}, &.{incomplete}));
+    try std.testing.expectEqual(@as(u64, 10), try acceptBatch(a, binding, options, .{}, captured));
+    try std.testing.expect(try drain(a, binding, options, .{}));
+    try std.testing.expectEqual(BatchOutcome{ .accepted_sequence = 10, .committed = true }, (try observeBatch(a, binding, options, .{}, captured)).?);
     const polled_snapshots = (try catalog.metadata.get(polled_root, "snapshots")).array.items;
     const before_poll = polled_snapshots[polled_snapshots.len - 2];
     const after_poll = polled_snapshots[polled_snapshots.len - 1];
