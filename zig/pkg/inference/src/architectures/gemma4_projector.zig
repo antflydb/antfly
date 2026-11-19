@@ -2516,10 +2516,14 @@ pub fn embeddingGemma2EncodedAudioSequenceBound(bytes: []const u8) !usize {
     return embeddingGemma2EncodedAudioSequenceBoundWithOptions(bytes, .{});
 }
 
-pub fn embeddingGemma2EncodedAudioSequenceBoundWithOptions(bytes: []const u8, options: audio.DecodeOptions) !usize {
+const AudioSampleGeometry = struct { samples: usize, rate: u32 };
+
+/// Trust the same validated sample-count headers for embedding and generation
+/// admission. Unknown transport durations retain the model's declared bound.
+fn encodedAudioSampleGeometry(bytes: []const u8, options: audio.DecodeOptions) !?AudioSampleGeometry {
     const generic = @import("inference_audio");
     const format = generic.detectFormatWithOptions(bytes, options) orelse return error.UnsupportedAudioFormat;
-    const info: ?struct { samples: usize, rate: u32 } = switch (format) {
+    return switch (format) {
         .wav => wav: {
             const parsed = try generic.wav.parseData(bytes);
             const frame_bytes = try std.math.mul(usize, parsed.channels, parsed.format.bits_per_sample / 8);
@@ -2532,6 +2536,10 @@ pub fn embeddingGemma2EncodedAudioSequenceBoundWithOptions(bytes: []const u8, op
         },
         else => null,
     };
+}
+
+pub fn embeddingGemma2EncodedAudioSequenceBoundWithOptions(bytes: []const u8, options: audio.DecodeOptions) !usize {
+    const info = try encodedAudioSampleGeometry(bytes, options);
     if (info) |known| {
         if (known.rate == 0) return error.UnsupportedAudioFormat;
         const samples = (try std.math.mul(u128, known.samples, 16000) + known.rate - 1) / known.rate;
@@ -2540,6 +2548,36 @@ pub fn embeddingGemma2EncodedAudioSequenceBoundWithOptions(bytes: []const u8, op
         return @min(@as(usize, 8192), @as(usize, @intCast((samples + 639) / 640)) + 4);
     }
     return 8192;
+}
+
+/// Upper bound for soft audio rows and prompt wrappers, before projection.
+/// Consume the loaded projector's frontend metadata instead of assuming an
+/// embedding model's sample limit, stride, or raw-waveform layout.
+pub fn projectedAudioPromptTokenAllowance(file: *const gguf_format.File, inputs: []const AudioInput) !usize {
+    return audioPromptTokenAllowanceForConfig(try parseAudioConfig(file), inputs);
+}
+
+fn audioPromptTokenAllowanceForConfig(cfg: AudioConfig, inputs: []const AudioInput) !usize {
+    const stride = if (cfg.direct_unified) cfg.raw_samples_per_token else 640;
+    if (stride == 0) return error.InvalidAudioInput;
+    const maximum = if (cfg.direct_unified) cfg.max_direct_audio_tokens else (cfg.max_audio_samples + 639) / 640;
+    var total: usize = 0;
+    for (inputs) |input| {
+        const geometry: ?AudioSampleGeometry = switch (input) {
+            .encoded => |bytes| try encodedAudioSampleGeometry(bytes, cfg.audio_decode_options),
+            .pcm => |pcm| .{ .samples = pcm.samples.len, .rate = pcm.sample_rate },
+        };
+        var rows = maximum;
+        if (geometry) |known| {
+            if (known.rate == 0) return error.UnsupportedAudioFormat;
+            const samples = (try std.math.mul(u128, known.samples, 16000) + known.rate - 1) / known.rate;
+            // Truncating standard frontends and rejecting raw frontends both
+            // guarantee that every accepted invocation fits this bound.
+            rows = @intCast(@min(@as(u128, maximum), (samples + stride - 1) / stride));
+        }
+        total = try std.math.add(usize, total, try std.math.add(usize, rows, 4));
+    }
+    return total;
 }
 
 pub fn prepareEmbeddingGemma2AudioForBackend(a: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, backend: @import("../backends/backends.zig").BackendType) !PreparedAudio {
@@ -6619,6 +6657,8 @@ fn selfAttentionBatch(
             try cb.scaledDotProductAttentionQwen3VlVision(q, k, v, batch, sequence, cfg.head_count, head_dim)
     else if (cfg.embedding_gemma2_f32_attention)
         try cb.scaledDotProductAttentionEmbeddingGemma2Vision(q, k, v, batch, sequence, cfg.head_count, head_dim)
+    else if (cb.kind() == .cuda)
+        try cb.scaledDotProductAttentionUnmaskedReduced(q, k, v, batch, sequence, cfg.head_count, head_dim)
     else
         try cb.scaledDotProductAttentionUnmaskedF32(q, k, v, batch, sequence, cfg.head_count, head_dim);
     defer cb.free(attn);
@@ -11485,4 +11525,27 @@ test "Gemma4 CUDA fused audio frontend preserves FFT oracle and masked mel rows"
     const rollback = try AudioTestEnv.set(name, "0");
     defer rollback.deinit();
     try std.testing.expect(!cb.supportsAudioLogMel());
+}
+
+test "Gemma4 CUDA audio prompt admission follows loaded frontend geometry" {
+    const a = std.testing.allocator;
+    const samples = @as([6400]f32, @splat(0.125));
+    const bytes = try audio.wav.encodeInterleaved(a, &samples, 1, .{ .audio_format = 3, .sample_rate = 16000, .bits_per_sample = 32 });
+    defer a.free(bytes);
+    var cfg = AudioConfig{ .text_hidden = 4, .audio_hidden = 4, .output_hidden = 4, .intermediate_size = 8, .block_count = 1, .head_count = 1, .mel_bins = 128, .layer_norm_eps = 1e-5 };
+    const encoded = [_]AudioInput{.{ .encoded = bytes }};
+    const pcm = [_]AudioInput{.{ .pcm = .{ .samples = &samples, .sample_rate = 16000 } }};
+    try std.testing.expectEqual(@as(usize, 14), try audioPromptTokenAllowanceForConfig(cfg, &encoded));
+    try std.testing.expectEqual(@as(usize, 14), try audioPromptTokenAllowanceForConfig(cfg, &pcm));
+    cfg.max_audio_samples = 3200;
+    try std.testing.expectEqual(@as(usize, 9), try audioPromptTokenAllowanceForConfig(cfg, &encoded));
+    cfg.direct_unified = true;
+    cfg.raw_samples_per_token = 320;
+    cfg.max_direct_audio_tokens = 100;
+    try std.testing.expectEqual(@as(usize, 24), try audioPromptTokenAllowanceForConfig(cfg, &encoded));
+    const combined = [_]AudioInput{ encoded[0], pcm[0] };
+    try std.testing.expectEqual(@as(usize, 48), try audioPromptTokenAllowanceForConfig(cfg, &combined));
+    cfg.max_direct_audio_tokens = 12;
+    try std.testing.expectEqual(@as(usize, 16), try audioPromptTokenAllowanceForConfig(cfg, &pcm));
+    try std.testing.expectError(error.UnsupportedAudioFormat, audioPromptTokenAllowanceForConfig(cfg, &.{.{ .pcm = .{ .samples = &samples, .sample_rate = 0 } }}));
 }

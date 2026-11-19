@@ -34,7 +34,7 @@
 //
 // Supported contracts are deliberately narrow:
 //   * SM89, batch=1, query heads=8, KV heads=1 (E2B) or 2 (E4B);
-//   * E2B q512/q3 buckets; E4B q2..8192 chunks through 32768 KV tokens;
+//   * E2B q512/q3 buckets; two-KV-head q2..8192 chunks through 128K on qualified SM12, 32K on SM89;
 //   * HD256 with sliding_window=512, or HD512 with global attention;
 //   * contiguous F32 Q and paged F16 K/V, F32 output;
 //   * 16-token pages, either null/identity or explicit page tables.
@@ -89,6 +89,13 @@ static constexpr unsigned kQueryTile = kKvHeads == 2u ? 64u : 16u;
 static constexpr unsigned kKeyTile = 16u;
 static constexpr unsigned kThreads = 256u;
 static constexpr unsigned kWarps = kThreads / 32u;
+// The shared ABI retains the existing L4 envelope. Host dispatch further
+// restricts the expanded SM12 image to the physically qualified GB10 target.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200 && __CUDA_ARCH__ < 1300
+static constexpr unsigned kMaxKvTokens = kKvHeads == 2u ? 131072u : 4096u;
+#else
+static constexpr unsigned kMaxKvTokens = kKvHeads == 2u ? 32768u : 4096u;
+#endif
 static constexpr unsigned kInvalidToken = 0xffffffffu;
 static constexpr float kNegativeInfinity = -3.402823466e+38F;
 
@@ -214,11 +221,11 @@ static __device__ bool validate_launch(
                 head_dim != static_cast<unsigned>(HeadDim) ||
                 (kKvHeads == 1u ? (q_seq_len != 512u && q_seq_len != 3u)
                                   : (q_seq_len < 2u || q_seq_len > 8192u)) ||
-                kv_seq_len == 0u || kv_seq_len > (kKvHeads == 1u ? 4096u : 32768u)) {
+                kv_seq_len == 0u || kv_seq_len > kMaxKvTokens) {
                 error = kStatusUnsupportedShape;
             } else {
                 const bool supported_prefix = kKvHeads == 2u ?
-                    (query_position_offset <= 32768u - q_seq_len) : q_seq_len == 512u
+                    (query_position_offset <= kMaxKvTokens - q_seq_len) : q_seq_len == 512u
                     ? (query_position_offset == 0u || query_position_offset == 512u ||
                           query_position_offset == 1024u || query_position_offset == 1536u)
                     : query_position_offset == 2048u;

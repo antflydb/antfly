@@ -2715,6 +2715,9 @@ pub const ComputeBackend = struct {
         unmaskedF32: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
         unmaskedRetrieval: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
         unmaskedTensorCore: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
+        /// Explicit permission for a qualified reduced-storage schedule;
+        /// providers may retain full precision when the plan is ineligible.
+        unmaskedReduced: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
         tryUnmaskedRetrieval: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!?CT = null,
         /// Complete official EmbeddingGemma2 HF vision encoder. The input and
         /// output are token-major F32 `[sequence, 768]`. A backend may decline
@@ -5322,6 +5325,14 @@ pub const ComputeBackend = struct {
         return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);
     }
 
+    /// Allows a qualified reduced-storage schedule with F32 output. The
+    /// fallback retains the full-precision attention contract.
+    pub fn scaledDotProductAttentionUnmaskedReduced(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
+        if (self.vtable.regions.vision.unmaskedReduced) |f|
+            return self.observeBackendEntry(.encoder_attention, f, .{ self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim });
+        return self.scaledDotProductAttentionUnmaskedF32(Q, K, V, batch, seq_len, num_heads, head_dim);
+    }
+
     /// EmbeddingGemma 2's Gemma4-shaped vision tower requires F32 inputs and
     /// probabilities throughout attention to preserve pretrained retrieval.
     pub fn scaledDotProductAttentionEmbeddingGemma2Vision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
@@ -5331,13 +5342,18 @@ pub const ComputeBackend = struct {
         return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);
     }
 
-    /// Runs Qwen3-VL's unmasked vision attention. Backends that do not expose
-    /// a model-scoped route retain the regular portable implementation.
-    pub fn scaledDotProductAttentionQwen3VlVision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
+    /// Unmasked token-major attention allowing the provider's qualified
+    /// reduced-storage tensor-core schedule; output storage remains F32.
+    pub fn scaledDotProductAttentionUnmaskedTensorCore(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
         if (self.vtable.regions.vision.unmaskedTensorCore) |f| {
             return self.observeBackendEntry(.encoder_attention, f, .{ self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim });
         }
         return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);
+    }
+
+    /// Historical adapter retained for existing architecture callers.
+    pub fn scaledDotProductAttentionQwen3VlVision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
+        return self.scaledDotProductAttentionUnmaskedTensorCore(Q, K, V, batch, seq_len, num_heads, head_dim);
     }
 
     pub fn tryScaledDotProductAttentionEmbeddingGemma2Vision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {

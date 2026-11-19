@@ -87,6 +87,7 @@ fn shouldSkipAutoMtpDraftLoad(opts: Options, draft_cfg: gpt_mod.Config) bool {
 const Options = struct {
     model_dir: []const u8,
     prompt: []const u8,
+    prompt_file: ?[]const u8 = null,
     image_paths: [8][]const u8 = @splat(""),
     image_count: usize = 0,
     video_path: ?[]const u8 = null,
@@ -290,7 +291,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         printUsage();
         return;
     }
-    const opts = try parseArgs(args);
+    var opts = try parseArgs(args);
+    const file_prompt = if (opts.prompt_file) |path| try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024)) else null;
+    defer if (file_prompt) |bytes| allocator.free(bytes);
+    if (file_prompt) |bytes| opts.prompt = bytes;
     try validateVideoOptions(opts);
     const jit_config = try validateKernelJitOptions(io, opts);
     try validateCacheCompactionOption(opts.cache_compaction_ratio);
@@ -507,12 +511,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     else
         try generation.formatMessages(allocator, &messages);
     defer allocator.free(rendered_prompt);
+    const prompt_projector = if (opts.audio_count != 0) try model.ensureProjectorStore() else null;
     const prompt_media_admission = try generation.nativeGenerationMediaAdmissionForBackend(
         allocator,
         opts.model_dir,
         &messages,
         gpt_config,
         if (model.session.backend() == .cuda) .cuda else .generic,
+        if (prompt_projector) |store| &store.gguf.parsed else null,
     );
     const prompt_media_allowance = prompt_media_admission.token_allowance;
     const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(&messages, gpt_config);
@@ -533,11 +539,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     );
     const encoded_prompt_at = std.Io.Timestamp.now(io, .awake);
     defer prompt_encoded.deinit();
-    const prompt_tokens = std.math.add(
-        usize,
+    const prompt_tokens = try generation.estimateNativeGenerationPromptTokenCount(
         countPromptTokens(prompt_encoded.attention_mask),
         prompt_media_allowance,
-    ) catch return error.PromptTooLong;
+        gpt_config,
+        if (draft_model != null and opts.speculation_policy != .off) draft_gpt_config else null,
+        @intCast(@max(opts.max_tokens, 1)),
+        if (draft_model != null and opts.speculation_policy != .off and opts.speculative_k > 0) 1 else 0,
+    );
 
     if (opts.print_chat_template_status) {
         print("chat_template={}\n", .{apply_chat_template});
@@ -706,6 +715,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         else
             requested_draft_kv_dtype;
     } else null;
+    const prepared_prompt_inputs = backend_kind == .cuda and explicit_partition_backend != .pjrt and
+        (opts.image_count != 0 or opts.audio_count != 0 or opts.video_path != null) and
+        @import("execution/gemma4_native_plan.zig").Geometry.resolve(gpt_config) != null;
     var budget_components: [2]runtime.tier.memory.GptGenerationBudgetComponent = undefined;
     budget_components[0] = .{
         .backend = backend_kind,
@@ -715,6 +727,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .workspace_capacity = model.session.generationWorkspaceCapacity(),
         .backend_owns_kv = explicit_partition_backend == .pjrt,
         .fixed_prefill_shape = explicit_partition_backend == .pjrt,
+        .prompt_input_copies = if (prepared_prompt_inputs) 2 else 0,
+        .host_prompt_input_copies = if (prepared_prompt_inputs) 1 else 0,
     };
     var budget_component_count: usize = 1;
     if (draft_gpt_config) |draft_cfg| {
@@ -878,7 +892,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const created_backend_at = std.Io.Timestamp.now(io, .awake);
     defer if (publication_cleanup) |*owner| cb.deinitWithCleanup(.{ .boundary = owner.epoch(), .operation = cb.operationToken() }) else cb.deinit();
     if (opts.debug_gemma4_target) {
-        try printGemma4TargetDebug(&cb, tokenizer, model.manifest, gpt_config, prompt_encoded.ids[0..prompt_tokens]);
+        try printGemma4TargetDebug(&cb, tokenizer, model.manifest, gpt_config, prompt_encoded.ids[0..countPromptTokens(prompt_encoded.attention_mask)]);
     }
     var draft_cb: ?ops.ComputeBackend = if (draft_model) |loaded|
         session_factory.getComputeBackendWithBudget(loaded.session, allocator, &run_budget) catch |err| {
@@ -979,6 +993,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .model_dir = opts.model_dir,
         .artifact_dir = resolved_artifact_dir,
         .gguf_projector_path = model.manifest.gguf_projector_path,
+        .projector_store = prompt_projector,
         .decode_state = &decode_state,
         .scheduler = if (use_scheduler) model.native_generate_coordinator else null,
         .scheduler_lease = if (use_scheduler) if (native_generate_lease) |*lease| lease else null else null,
@@ -7515,13 +7530,18 @@ fn parseArgs(args: []const []const u8) !Options {
 
     var opts = Options{
         .model_dir = args[0],
-        .prompt = args[1],
+        .prompt = if (std.mem.eql(u8, args[1], "--prompt-file")) "" else args[1],
     };
 
-    var i: usize = 2;
+    var i: usize = if (std.mem.eql(u8, args[1], "--prompt-file")) 1 else 2;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--backend")) {
+        if (std.mem.eql(u8, arg, "--prompt-file")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingPromptFile;
+            if (opts.prompt_file != null or opts.prompt.len != 0) return error.ConflictingPromptSources;
+            opts.prompt_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--backend")) {
             i += 1;
             if (i >= args.len) return error.MissingBackendValue;
             opts.backend = parseBackendChoice(args[i]) orelse return error.InvalidBackend;
@@ -8359,9 +8379,10 @@ test "video CLI accepts one clip and rejects conflicting inputs" {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path]... [--audio path] [--video h264.mp4] [--backend auto|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--qwen3vl-parity-json path] [--qwen3vl-parity-patch-f32le path] [--qwen3vl-parity-logits-f32le path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt|--prompt-file path> [--server http://host:port] [--require-server] [--stream] [--image path]... [--audio path] [--video h264.mp4] [--backend auto|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--qwen3vl-parity-json path] [--qwen3vl-parity-patch-f32le path] [--qwen3vl-parity-logits-f32le path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
+        \\  --prompt-file reads up to 16 MiB of text, supporting prompts beyond process argument limits.
         \\  --stream prints generated text incrementally as token deltas arrive.
         \\  --video accepts one progressive 8-bit H.264 MP4 clip on local CUDA Gemma4 (up to 60s, sampled at 1 FPS).
         \\  Video currently excludes audio, mixed image inputs, HDR, rotation, and non-square pixels.
@@ -9621,4 +9642,18 @@ test "native generate admits target draft transients beside residency and shrink
         try std.testing.expectError(error.ResourceTemporarilyUnavailable, acquireCliGenerationResources(&manager, session, session, &components, limits, 256, 1, &chunk, &budget, media_bytes));
         try std.testing.expectEqualDeep(before, manager.currentAdmissionAmounts());
     }
+}
+
+test "native generation file prompts avoid process argument limits" {
+    const file = try parseArgs(&.{ "model", "--prompt-file", "long.txt", "--audio", "clip.wav", "--backend", "cuda" });
+    try std.testing.expectEqualStrings("long.txt", file.prompt_file.?);
+    try std.testing.expectEqualStrings("", file.prompt);
+    try std.testing.expectEqual(@as(usize, 1), file.audio_count);
+    try std.testing.expectEqual(BackendChoice.cuda, file.backend);
+    const ordinary = try parseArgs(&.{ "model", "keep positional prompts" });
+    try std.testing.expect(ordinary.prompt_file == null);
+    try std.testing.expectEqualStrings("keep positional prompts", ordinary.prompt);
+    try std.testing.expectError(error.MissingPromptFile, parseArgs(&.{ "model", "--prompt-file" }));
+    try std.testing.expectError(error.ConflictingPromptSources, parseArgs(&.{ "model", "text", "--prompt-file", "long.txt" }));
+    try std.testing.expectError(error.ConflictingPromptSources, parseArgs(&.{ "model", "--prompt-file", "first.txt", "--prompt-file", "second.txt" }));
 }

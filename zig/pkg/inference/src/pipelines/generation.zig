@@ -257,7 +257,7 @@ pub fn nativeGenerationMediaAdmission(
     messages: []const Message,
     config: gpt_mod.Config,
 ) !NativeGenerationMediaAdmission {
-    return nativeGenerationMediaAdmissionForBackend(allocator, model_dir, messages, config, .generic);
+    return nativeGenerationMediaAdmissionForBackend(allocator, model_dir, messages, config, .generic, null);
 }
 
 pub fn nativeGenerationMediaAdmissionForBackend(
@@ -266,6 +266,7 @@ pub fn nativeGenerationMediaAdmissionForBackend(
     messages: []const Message,
     config: gpt_mod.Config,
     backend: qwen3vl_projector.AdmissionBackend,
+    projector_file: ?*const @import("../gguf/format.zig").File,
 ) !NativeGenerationMediaAdmission {
     if (config.family == .qwen3_vl or config.hasQwen35VisionArchitectureContract()) {
         const images = try collectImagesInPromptOrder(allocator, messages);
@@ -293,6 +294,11 @@ pub fn nativeGenerationMediaAdmissionForBackend(
         return .{ .token_allowance = image_count *| (max_image_tokens +| 1), .host_scratch_bytes = try qwen2vl_mm.imageWorkingBytes(images, prep_config) };
     }
     var admission: NativeGenerationMediaAdmission = .{ .token_allowance = nativeGenerationMediaTokenAllowance(messages, config) };
+    if (projector_file) |file| if (messagesHaveAudio(messages)) {
+        const inputs = try collectAudioInPromptOrder(allocator, messages);
+        defer allocator.free(inputs);
+        admission.token_allowance = try std.math.add(usize, admission.token_allowance, try gemma4_projector.projectedAudioPromptTokenAllowance(file, inputs));
+    };
     // CUDA decodes on the device. Portable decoding runs in host memory, and
     // CUDA's fallback to it admits that memory only when the fallback happens.
     if (backend != .cuda) for (messages) |message| if (message.video_bytes) |bytes| {
@@ -319,6 +325,9 @@ pub fn nativeGenerationAdmissionMediaTokenAllowance(
 /// dynamic image preprocessing determines the exact expanded prompt length.
 pub fn nativeGenerationPreliminaryMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
     if (config.family == .qwen3_5 or config.family == .qwen3_vl) return 0;
+    // Video's sixty-frame allowance is an admission bound, not the clip's
+    // actual expansion. The fully expanded prompt is validated before KV use.
+    for (messages) |message| if (message.video_bytes != null) return 0;
     return nativeGenerationMediaTokenAllowance(messages, config);
 }
 
@@ -346,6 +355,10 @@ pub fn nativeGenerationPrefillChunkCeiling(
     configured_ceiling: usize,
 ) usize {
     const ceiling = @max(configured_ceiling, 1);
+    if (backend == .cuda and @import("../execution/gemma4_native_plan.zig").selected() != null) {
+        if (@import("../execution/gemma4_native_plan.zig").Geometry.resolve(config)) |geometry|
+            return @min(ceiling, geometry.prefillQueryLimit());
+    }
     if (backend == .metal and
         config.family == .gemma and
         config.hasPle() and
@@ -2436,7 +2449,7 @@ pub fn getDecoderRuntimeDebugStats() DecoderRuntimeDebugStats {
     return decoder_runtime_debug_stats;
 }
 
-/// Match the measured E4B text geometry and bounded 32K serving envelope.
+/// Exercise the retained 32K device envelope alongside the extended planner tests.
 /// Reserve multi-chunk prefill and a bounded decode tail. Reserving a large
 /// output limit for a short prompt wastes allocation time on early EOS.
 /// Reservation uses the same 16-token page alignment as request admission.
@@ -2454,21 +2467,21 @@ test "CUDA prefill KV reservation respects admitted length and supported geometr
         .global_head_dim = 512,
         .max_position_embeddings = 32768,
     };
-    try std.testing.expectEqual(@as(?usize, 8208), cudaE4bPrefillKvCapacity(config, 8189, 16));
-    try std.testing.expectEqual(@as(?usize, 32768), cudaE4bPrefillKvCapacity(config, 32752, 16));
-    try std.testing.expectEqual(@as(?usize, 8448), cudaE4bPrefillKvCapacity(config, 8192, 16384));
-    try std.testing.expectEqual(@as(?usize, 8448), cudaE4bPrefillKvCapacity(config, 8192, 257));
-    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 2048, 16384) == null);
-    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 20, 4096) == null);
-    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 32753, 16) == null);
-    try std.testing.expect(cudaE4bPrefillKvCapacity(config, std.math.maxInt(usize), 16) == null);
-    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 1, 0) == null);
+    try std.testing.expectEqual(@as(?usize, 8208), cudaE4bPrefillKvCapacity(config, 8189, 16, 32768));
+    try std.testing.expectEqual(@as(?usize, 32768), cudaE4bPrefillKvCapacity(config, 32752, 16, 32768));
+    try std.testing.expectEqual(@as(?usize, 8448), cudaE4bPrefillKvCapacity(config, 8192, 16384, 32768));
+    try std.testing.expectEqual(@as(?usize, 8448), cudaE4bPrefillKvCapacity(config, 8192, 257, 32768));
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 2048, 16384, 32768) == null);
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 20, 4096, 32768) == null);
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 32753, 16, 32768) == null);
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, std.math.maxInt(usize), 16, 32768) == null);
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 1, 0, 32768) == null);
     var other = config;
     other.num_kv_shared_layers = 0;
-    try std.testing.expect(cudaE4bPrefillKvCapacity(other, 100, 16) == null);
+    try std.testing.expect(cudaE4bPrefillKvCapacity(other, 100, 16, 32768) == null);
     other = config;
     other.max_position_embeddings = 4096;
-    try std.testing.expect(cudaE4bPrefillKvCapacity(other, 8189, 16) == null);
+    try std.testing.expect(cudaE4bPrefillKvCapacity(other, 8189, 16, 32768) == null);
 }
 
 pub const NativeDecodeState = graph_mod.decode_state_runtime.NativeDecodeState;
@@ -3786,7 +3799,7 @@ pub const NativeGenerationPipeline = struct {
                 enableCudaPrefillFirstToken() and enableCudaPrefillGreedyToken(),
             ))
         else if (prepared_multimodal_prompt) |*prepared|
-            try self.executePreparedMultimodalPrefill(prepared, seq_len, decode_state, capture_mtp_prefill_hidden)
+            try self.executePreparedMultimodalPrefill(prepared, seq_len, decode_state, capture_mtp_prefill_hidden, config.prefill_chunk_size)
         else
             try self.executePrefill(prefill_ids, seq_len, cached_prompt_tokens, decode_state, config, allow_prefill_greedy_token, capture_mtp_prefill_hidden);
         if (native_work_enabled) {
@@ -4972,6 +4985,13 @@ pub const NativeGenerationPipeline = struct {
                 .leased_plan = if (self.scheduler_lease) |lease| if (lease.prefill_chunk_plan.isAdmitted()) lease.prefill_chunk_plan else null else null,
                 .configured_chunk_rows = config.prefill_chunk_size,
                 .scheduler_chunk_rows = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
+                .default_chunk_rows = if (comptime build_options.enable_cuda) bounded: {
+                    if (self.cb.kind() == .cuda) {
+                        if (@import("../execution/gemma4_native_plan.zig").Plan.resolve(self.gpt_config)) |plan|
+                            break :bounded plan.geometry.prefillChunkRows(seq_len, 0);
+                    }
+                    break :bounded 0;
+                } else 0,
                 .selected_kv = config.kv_cache_mode == .select_v1,
                 .checkpoint_resume = self.checkpoint_resume != null,
                 .backend = self.cb.kind(),
@@ -5154,6 +5174,7 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         decode_state: *NativeDecodeState,
         capture_last_hidden: bool,
+        admitted_chunk_rows: usize,
     ) !PrefillOutput {
         var numerical = self.prefillRuntime(decode_state, directPrefillExecutionMutex(true, false, false, self.execution_lock));
         var direct_prefill_turn_acquired = false;
@@ -5189,6 +5210,7 @@ pub const NativeGenerationPipeline = struct {
             .token_ids = prepared.ple_token_ids orelse prepared.token_ids,
             .sequence_length = seq_len,
             .capture_hidden = capture_last_hidden,
+            .chunk_rows = admitted_chunk_rows,
             .attention_mask = prepared.attn_or_mask,
         });
         errdefer if (logits.last_logits) |values| self.allocator.free(values);
@@ -8945,6 +8967,23 @@ pub fn nativeGenerationPromptTokenLimit(
     ) catch return error.PromptTooLong;
     if (context_tokens <= reserved_tokens) return error.PromptTooLong;
     return context_tokens - reserved_tokens;
+}
+
+/// Conservative planning count for an accepted dynamically expanded prompt.
+/// Anything beyond the model/output boundary is rejected after expansion, so
+/// no successful request can retain more input than this bounded reservation.
+/// Keep this estimate separate from the exact post-expansion validation.
+pub fn estimateNativeGenerationPromptTokenCount(
+    text_tokens: usize,
+    media_token_allowance: usize,
+    target_config: gpt_mod.Config,
+    draft_config: ?gpt_mod.Config,
+    requested_output_tokens: usize,
+    speculative_bonus_tokens: usize,
+) !usize {
+    const limit = try nativeGenerationPromptTokenLimit(target_config, draft_config, requested_output_tokens, speculative_bonus_tokens, 0);
+    if (text_tokens > limit) return error.PromptTooLong;
+    return @min(text_tokens +| media_token_allowance, limit);
 }
 
 pub fn validateNativeGenerationPromptTokenCount(
@@ -16130,4 +16169,19 @@ test "multimodal messages preserve implicit image and audio parts" {
     const actual = try template.applyWithOptions(a, &messages, .{});
     defer a.free(actual);
     try std.testing.expectEqualStrings("IIAdescribe", actual);
+}
+
+test "native generation dynamic media admission preserves the full context boundary" {
+    const config = gpt_mod.Config{ .max_position_embeddings = 131072 };
+    const messages = [_]Message{.{ .role = "user", .content = "describe", .video_bytes = "clip" }};
+    try std.testing.expectEqual(@as(usize, 0), nativeGenerationPreliminaryMediaTokenAllowance(&messages, config));
+    try std.testing.expectEqual(@as(usize, 4800), nativeGenerationMediaTokenAllowance(&messages, config));
+    try std.testing.expectEqual(@as(usize, 131040), try estimateNativeGenerationPromptTokenCount(130744, 4800, config, null, 32, 0));
+    try std.testing.expectEqual(@as(usize, 4900), try estimateNativeGenerationPromptTokenCount(100, 4800, config, null, 32, 0));
+    try std.testing.expectEqual(@as(usize, 65504), try estimateNativeGenerationPromptTokenCount(65000, 4800, config, .{ .max_position_embeddings = 65536 }, 32, 0));
+    try std.testing.expectError(error.PromptTooLong, estimateNativeGenerationPromptTokenCount(131041, 4800, config, null, 32, 0));
+    // An exact expanded input still must fit; no truncation or spare output
+    // token waiver accompanies the conservative pre-execution estimate.
+    try validateNativeGenerationPromptTokenCount(131040, config, null, 32, 0);
+    try std.testing.expectError(error.PromptTooLong, validateNativeGenerationPromptTokenCount(131041, config, null, 32, 0));
 }

@@ -191,16 +191,41 @@ pub fn wholeModelExecutionPrefillChunkSize(
     return wholeModelPrefillChunkSize(configured_chunk, scheduler_chunk, prompt_tokens);
 }
 
-pub fn cudaE4bPrefillKvCapacity(config: gpt_mod.Config, prompt_tokens: usize, output_tokens: i32) ?usize {
+pub fn cudaE4bPrefillKvCapacity(config: gpt_mod.Config, prompt_tokens: usize, output_tokens: i32, context_limit: usize) ?usize {
     if (config.family != .gemma or config.hidden_size != 2560 or config.num_hidden_layers != 42 or
         config.num_kv_shared_layers != 18 or config.num_attention_heads != 8 or
         config.num_key_value_heads != 2 or config.attention_head_dim != 256 or config.global_head_dim != 512 or
-        config.gemma4_mtp_assistant or config.usesMoe() or config.isMultimodal() or
+        config.gemma4_mtp_assistant or config.usesMoe() or
         prompt_tokens <= 2048 or output_tokens <= 0) return null;
     const tokens = std.math.add(usize, prompt_tokens, @intCast(output_tokens)) catch return null;
-    if (tokens > @min(@as(usize, 32768), config.max_position_embeddings)) return null;
+    if (tokens > @min(context_limit, config.max_position_embeddings)) return null;
     const reserved_tokens = prompt_tokens + @min(@as(usize, @intCast(output_tokens)), 256);
     return std.mem.alignForward(usize, reserved_tokens, 16);
+}
+
+test "native prefill KV reservation honors qualified and model context limits" {
+    var config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .num_kv_shared_layers = 18,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .max_position_embeddings = 131072,
+        .image_token_index = 255,
+        .vision_patch_size = 14,
+    };
+    try std.testing.expect(config.isMultimodal());
+    try std.testing.expectEqual(@as(?usize, 131072), cudaE4bPrefillKvCapacity(config, 131040, 32, 131072));
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 131041, 32, 131072) == null);
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 65536, 32, 32768) == null);
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 65536, -1, 131072) == null);
+    config.max_position_embeddings = 32768;
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 65536, 32, 131072) == null);
+    config.num_key_value_heads = 1;
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 4096, 32, 131072) == null);
 }
 
 pub fn compiledSampleRequestEligible(

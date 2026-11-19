@@ -695,8 +695,20 @@ pub fn prepareWithHostLease(
             // other targets retain their original attention schedule.
             const qualified_warp = cuda_compute.ctx.info.compute_major == 12 and cuda_compute.ctx.info.compute_minor == 1;
             const requested_sm89 = cuda_compute.ctx.info.compute_major == 8 and cuda_compute.ctx.info.compute_minor == 9 and platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_F16_WARP_DECODE");
+            if (qualified_warp and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_TEMP_LRU", true)) {
+                cuda_compute.gemma4_temp_lru = true;
+                cuda_compute.configureBoundedTemporaryReuse();
+            }
+
             plan.warp_decode = plan.warp_decode and (qualified_warp or requested_sm89);
-            if (plan.warp_decode) cuda_compute.kernels.e4b_f16_warp_split_enabled = true;
+            if (plan.warp_decode) {
+                cuda_compute.kernels.e4b_f16_warp_split_enabled = true;
+                cuda_compute.kernels.gqa_score_prework_mode = @import("../ops/cuda/kernels.zig").scorePreworkModeForPartitionedDecode(
+                    cuda_compute.kernels.gqa_score_prework_mode,
+                    cuda_compute.kernels.gqa_score_prework_consumer_mode,
+                    qualified_warp,
+                );
+            }
             std.log.info("cuda_gemma4_native_plan projections={s} donor_layers={d} flash_prefill={} capture_prefill={}", .{
                 @tagName(plan.projection), plan.geometry.donor_layers, plan.flash_prefill, plan.capture_prefill,
             });
@@ -828,11 +840,16 @@ pub fn prepareWithHostLease(
         );
     }
 
-    const gliner_budget = if (host_weights_owner.architecture == .gliner_modern_bert or
+    var generation_budget = if (host_weights_owner.architecture == .gliner_modern_bert or
         (host_weights_owner.architecture == .modern_bert and loaded_model.manifest.gliner_span_encoder_family == .modern_bert))
         try glinerCudaBudgetFloor(host_weights_owner.architecture, try estimateNativeWeightBytes(allocator, model_manifest))
     else
         runtime.tier.memory.Limits{};
+    if (cuda_compute.ctx.info.compute_major == 12 and cuda_compute.ctx.info.compute_minor == 1) {
+        if (cuda_compute.gemma4_native_plan) |plan| {
+            generation_budget = runtime.tier.memory.maxCompositeLimits(generation_budget, try plan.generationBudgetFloor(host_weights_owner.architecture.gpt, runtime.tier.memory.defaultLimitsForBackend(.gpu)));
+        }
+    }
     // Artifact preparation has never been tokenizer-sealed. Publication must
     // independently seal the target owner after parsing its tokenizer snapshot.
     var resolved_arch_config = host_weights_owner.architecture;
@@ -863,7 +880,7 @@ pub fn prepareWithHostLease(
         .span_encoder_family = loaded_model.manifest.gliner_span_encoder_family,
         .decision_identity = host_weights_owner.decision_identity,
         .boundary_identity = host_weights_owner.boundary_identity,
-        .budget_floor = gliner_budget,
+        .budget_floor = generation_budget,
     };
 }
 

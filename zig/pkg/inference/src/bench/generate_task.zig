@@ -123,7 +123,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
                 pipeline.decode_state = state;
             }
             defer pipeline.decode_state = null;
-            break :request try pipeline.generate(&messages, .{ .max_tokens = @intCast(options.generate_tokens), .temperature = 0, .enable_thinking = false });
+            break :request try pipeline.generate(&messages, .{ .max_tokens = @intCast(options.generate_tokens), .temperature = 0, .enable_thinking = false, .prefill_chunk_size = options.generate_prefill_chunk_rows });
         };
         const elapsed = inference.platform.time.awakeNs(init.io) - start;
         if (counts[mode] == 0) cold[mode] = elapsed;
@@ -175,6 +175,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .model_load_in_timing = false,
         .model_context_tokens = config.max_position_embeddings,
         .max_output_tokens = options.generate_tokens,
+        .requested_prefill_chunk_rows = options.generate_prefill_chunk_rows,
         .measurement_control = if (options.generate_control_stdin) "stdin_after_warmup" else "uncontrolled",
         .model_chat_template = model.chat_tmpl != null,
         .runtime_capabilities = if (cache.compiled_model_runtime) |*runtime| runtime.capabilities() else null,

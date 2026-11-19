@@ -100,11 +100,7 @@ pub const LoadedModel = struct {
         errdefer weights.deinit();
         // Reuse parsed GGUF metadata instead of mapping and parsing it again.
         var architecture = try detectArchitectureWithGgufFile(allocator, manifest.source_root orelse path, manifest, weights.ggufFile());
-        if (architecture == .gpt) {
-            if (weights.ggufFile()) |file| {
-                if (weights.ggufArtifactBytes()) |bytes| refineRopeDimFromFreqs(&architecture.gpt, file, bytes);
-            }
-        }
+        if (architecture == .gpt) try refineRopeDimFromStore(allocator, &architecture.gpt, weights);
         return .{ .manifest = manifest, .architecture = architecture, .weights = weights };
     }
 
@@ -526,6 +522,26 @@ fn detectArchitectureFromGgufFile(file: *const gguf_mod.format.File) !?ArchConfi
 /// remaining lanes are ~1e30 (effectively disabling rotation). llama.cpp
 /// consumes both contracts. Count that exact mask-shaped prefix to derive the
 /// active rotary width while preserving the metadata-derived frequency width.
+fn refineRopeDimFromStore(allocator: std.mem.Allocator, config: *gpt_mod.Config, weights: tensor_store_mod.TensorStore) !void {
+    const file = weights.ggufFile() orelse return;
+    const tensor = findGgufTensor(file, "rope_freqs.weight") orelse return;
+    if (tensor.dimensions.len != 1 or tensor.tensor_type != .known or tensor.tensor_type.known != .F32) return;
+    // Composite stores deliberately cannot authenticate one complete artifact.
+    // Read the declared control tensor through its ordinary routed source; do
+    // not reopen a path or weaken ggufArtifactBytes' bundle-identity contract.
+    const count = std.math.cast(usize, tensor.dimensions[0]) orelse return error.InvalidTensorShape;
+    if (count == 0 or count > config.maxHeadDim() / 2) return;
+    const expected_dim = std.math.cast(i64, count) orelse return error.InvalidTensorShape;
+    const bytes = std.math.mul(usize, count, @sizeOf(f32)) catch return error.InvalidTensorShape;
+    var reference = try weights.describeTensor(allocator, "rope_freqs.weight");
+    defer reference.deinit(allocator);
+    var loaded = try weights.loadTensorRef(&reference);
+    defer loaded.deinit();
+    if (loaded.tensor.dtype != .f32 or loaded.tensor.shape.len != 1 or loaded.tensor.shape[0] != expected_dim or loaded.tensor.data.len != bytes)
+        return error.InvalidTensorShape;
+    refineRopeMask(config, loaded.tensor.data, count);
+}
+
 fn refineRopeDimFromFreqs(config: *gpt_mod.Config, file: *const gguf_mod.format.File, raw_data: []const u8) void {
     const tensor = findGgufTensor(file, "rope_freqs.weight") orelse return;
     if (tensor.dimensions.len < 1) return;
@@ -542,7 +558,10 @@ fn refineRopeDimFromFreqs(config: *gpt_mod.Config, file: *const gguf_mod.format.
     const end = std.math.add(usize, byte_offset, byte_len) catch return;
     if (end > raw_data.len) return;
 
-    const factors = raw_data[byte_offset..end];
+    refineRopeMask(config, raw_data[byte_offset..end], n_vals);
+}
+
+fn refineRopeMask(config: *gpt_mod.Config, factors: []const u8, n_vals: usize) void {
     var n_active: u32 = 0;
     for (0..n_vals) |i| {
         const bits = std.mem.readInt(u32, factors[i * @sizeOf(f32) ..][0..4], .little);
@@ -970,4 +989,44 @@ test "GLiNER captured markers ignore later default token overrides" {
     label.gliner_classification_head = .label_marker_mlp;
     try applyGlinerLabelTokenIds(a, root, label, &cfg);
     try std.testing.expectEqual(@as(i64, 6), cfg.classification_token_id);
+}
+
+test "GGUF rotary refinement reads routed tensors without whole bundle exposure" {
+    const a = std.testing.allocator;
+    const Write = struct {
+        fn integer(list: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime T: type, value: T) !void {
+            var bytes: [@sizeOf(T)]u8 = undefined;
+            std.mem.writeInt(T, &bytes, value, .little);
+            try list.appendSlice(allocator, &bytes);
+        }
+    };
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(a);
+    try data.appendSlice(a, "GGUF");
+    try Write.integer(&data, a, u32, 3);
+    try Write.integer(&data, a, u64, 1);
+    try Write.integer(&data, a, u64, 0);
+    const name = "rope_freqs.weight";
+    try Write.integer(&data, a, u64, name.len);
+    try data.appendSlice(a, name);
+    try Write.integer(&data, a, u32, 1);
+    try Write.integer(&data, a, u64, 256);
+    try Write.integer(&data, a, u32, 0);
+    try Write.integer(&data, a, u64, 0);
+    while (data.items.len % 32 != 0) try data.append(a, 0);
+    for (0..256) |i| try Write.integer(&data, a, u32, @bitCast(@as(f32, if (i < 64) 1 else 1e30)));
+    const owner = try tensor_store_mod.GgufStore.initOwnedBytes(a, "rotary-control.gguf", data.items);
+    const original = owner.tensorStore();
+    defer original.deinit();
+    // The routed table still supplies metadata and named tensors, but it is
+    // intentionally not the exact complete-artifact implementation identity.
+    const routed_table = original.vtable.*;
+    var routed = original;
+    routed.vtable = &routed_table;
+    try std.testing.expect(routed.ggufArtifactBytes() == null);
+    var config = gpt_mod.Config{ .family = .gemma, .attention_head_dim = 256, .global_head_dim = 512, .sliding_window = 512, .sliding_window_pattern = 6 };
+    try refineRopeDimFromStore(a, &config, routed);
+    try std.testing.expectEqual(@as(u32, 128), config.rope_dim_override);
+    try std.testing.expectEqual(@as(u32, 128), config.layerRopeActiveDim(5));
+    try std.testing.expectEqual(@as(u32, 512), config.layerRopeFrequencyDim(5));
 }

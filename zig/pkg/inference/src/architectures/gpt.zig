@@ -1360,7 +1360,7 @@ pub fn forwardLastLogitsLastRowTensorFromEmbeddingsWithLayer0Overrides(
                 platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_PREPARED_SHARED_KV_PREFILL", true) and
                 preparedSharedKvPrefillEligible(config, overrides, batch, seq_len, decode_context))) and !disableSharedKvDebug() and
         decode_context != null and
-        decode_context.?.query_sequence_len == seq_len and decode_context.?.total_sequence_len == seq_len and
+        decode_context.?.query_sequence_len > 1 and decode_context.?.query_sequence_len <= seq_len and decode_context.?.total_sequence_len == seq_len and
         sharedKvPrefillBoundary(config, decode_context.?.*) != null)
         .last
     else
@@ -2991,6 +2991,16 @@ test "E4B shared KV prefill prepared rows preserve context and decline other con
     try std.testing.expect(!preparedSharedKvPrefillEligible(config, .{}, 2, 278, &dc));
     try std.testing.expect(!preparedSharedKvPrefillEligible(config, .{}, 1, 279, &dc));
     try std.testing.expect(!preparedSharedKvPrefillEligible(config, .{}, 1, 278, null));
+    var suffix = dc;
+    suffix.total_sequence_len = 131072;
+    suffix.kv_sequence_len = 131072;
+    suffix.query_sequence_len = 278;
+    // The positioned-embedding caller passes the complete absolute extent,
+    // while only query_sequence_len rows are physically present.
+    try std.testing.expect(preparedSharedKvPrefillEligible(config, .{}, 1, 131072, &suffix));
+    const last_suffix = sharedKvLastRowContext(suffix);
+    try std.testing.expectEqual(@as(usize, 131071), positionOffset(131072, last_suffix.query_sequence_len, &last_suffix));
+
     var other = dc;
     other.attn_or_mask = &.{0};
     try std.testing.expect(!preparedSharedKvPrefillEligible(config, .{}, 1, 278, &other));
@@ -3122,7 +3132,15 @@ pub fn tryCudaSharedKvPrefill(
     want_last_logits: bool,
 ) !?SharedKvPrefillResult {
     if (cb.kind() != .cuda or disableSharedKvDebug() or !@import("../ops/cuda/cuda_compute.zig").CudaCompute.gemma4SharedKvPrefillEnabled(cb)) return null;
-    if (config.isMultimodal() or dc.attn_or_mask != null) return null;
+    // This entry consumes actual token embeddings. Prepared media embeddings
+    // use the positioned-embedding entry instead; a checkpoint having a vision
+    // tower must not disable pruning for its ordinary text requests.
+    if (dc.attn_or_mask != null) return null;
+    for (input_ids) |token| {
+        if ((config.image_token_index >= 0 and token == config.image_token_index) or
+            (config.video_token_index >= 0 and token == config.video_token_index) or
+            (config.boi_token_index >= 0 and token == config.boi_token_index)) return null;
+    }
     _ = sharedKvPrefillBoundary(config, dc.*) orelse return null;
     if (input_ids.len != dc.query_sequence_len or seq_len != dc.total_sequence_len) return null;
     const embed_w = try getEmbeddingWeight(cb, config);

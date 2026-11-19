@@ -342,6 +342,8 @@ pub const Estimate = struct {
     /// Independently retained host metadata, even for a backend-resident run.
     /// This is additive to the original KV and execution scratch estimates.
     host_metadata_bytes: usize = 0,
+    /// Full-prompt host input planes retained independently of chunk scratch.
+    host_input_bytes: usize = 0,
 };
 
 pub const EstimateError = error{
@@ -378,11 +380,12 @@ pub const RunBudget = struct {
     }
 
     pub fn reserveEstimate(self: *RunBudget, estimate: Estimate) !void {
+        const host_extra = std.math.add(usize, estimate.host_metadata_bytes, estimate.host_input_bytes) catch return error.ResourceLimitExceeded;
         try self.tryReserve(.{ .kind = .kv, .tier = estimate.kv_tier, .bytes = estimate.kv_bytes });
         errdefer self.release(.{ .kind = .kv, .tier = estimate.kv_tier, .bytes = estimate.kv_bytes });
         try self.tryReserve(.{ .kind = .scratch, .tier = estimate.scratch_tier, .bytes = estimate.scratch_bytes });
         errdefer self.release(.{ .kind = .scratch, .tier = estimate.scratch_tier, .bytes = estimate.scratch_bytes });
-        try self.tryReserve(.{ .kind = .scratch, .tier = .host, .bytes = estimate.host_metadata_bytes });
+        try self.tryReserve(.{ .kind = .scratch, .tier = .host, .bytes = host_extra });
     }
 
     /// Roll back a previously successful reserveEstimate call. Batch admission
@@ -390,6 +393,7 @@ pub const RunBudget = struct {
     /// per-run reservation, so one rejected request cannot consume the local
     /// budget of later requests in the same batch.
     pub fn releaseEstimate(self: *RunBudget, estimate: Estimate) void {
+        self.release(.{ .kind = .scratch, .tier = .host, .bytes = estimate.host_input_bytes });
         self.release(.{ .kind = .scratch, .tier = .host, .bytes = estimate.host_metadata_bytes });
         self.release(.{ .kind = .scratch, .tier = estimate.scratch_tier, .bytes = estimate.scratch_bytes });
         self.release(.{ .kind = .kv, .tier = estimate.kv_tier, .bytes = estimate.kv_bytes });
@@ -641,6 +645,7 @@ pub const AdmissionAmounts = struct {
             .backend => amounts.backend_scratch_bytes = estimate.scratch_bytes,
         }
         amounts.host_scratch_bytes = std.math.add(usize, amounts.host_scratch_bytes, estimate.host_metadata_bytes) catch return error.ResourceLimitExceeded;
+        amounts.host_scratch_bytes = std.math.add(usize, amounts.host_scratch_bytes, estimate.host_input_bytes) catch return error.ResourceLimitExceeded;
         return amounts;
     }
 
@@ -3606,10 +3611,20 @@ pub const GptGenerationBudgetComponent = struct {
     /// A persisted prefill executable has one exact prompt shape; reducing
     /// chunk rows would select a different executable, not a smaller workspace.
     fixed_prefill_shape: bool = false,
+    /// Full-prompt F32 embedding planes live independently of bounded layer
+    /// activations. Callers describe preparation's real retained/staging peak.
+    prompt_input_copies: u8 = 0,
+    host_prompt_input_copies: u8 = 0,
 
     pub fn estimate(self: @This(), prompt_tokens: usize, max_tokens: usize, chunk: usize) !Estimate {
         var result = try estimateGptGenerationForKvPolicy(self.backend, self.kv_dtype, self.config, prompt_tokens, max_tokens, chunk, self.kv_capacity_policy);
         if (self.backend == .native and self.backend_owns_kv) result.kv_bytes = 0;
+        if (self.prompt_input_copies != 0 or self.host_prompt_input_copies != 0) {
+            const input_bytes = checkedProduct(&.{ prompt_tokens, self.config.hidden_size, @sizeOf(f32) }) catch return error.ResourceLimitExceeded;
+            const resident_inputs = std.math.mul(usize, input_bytes, self.prompt_input_copies) catch return error.ResourceLimitExceeded;
+            result.scratch_bytes = std.math.add(usize, result.scratch_bytes, resident_inputs) catch return error.ResourceLimitExceeded;
+            result.host_input_bytes = std.math.mul(usize, input_bytes, self.host_prompt_input_copies) catch return error.ResourceLimitExceeded;
+        }
         return result;
     }
 
@@ -6372,4 +6387,36 @@ test "Gemma4 CUDA host PLE partition owners can retain and release concurrently"
     first.join();
     try std.testing.expectEqual(@as(usize, 1), fixture.releases);
     try std.testing.expectEqual(AdmissionAmounts{}, controller.snapshot());
+}
+
+test "prepared prompt input planes remain admitted when layer chunks shrink" {
+    const config = gpt_mod.Config{ .hidden_size = 8, .num_hidden_layers = 1, .num_attention_heads = 1, .num_key_value_heads = 1, .attention_head_dim = 8, .intermediate_size = 16, .vocab_size = 8, .max_position_embeddings = 131072 };
+    const ordinary = GptGenerationBudgetComponent{ .backend = .cuda, .kv_dtype = .f16, .config = config };
+    var prepared = ordinary;
+    prepared.prompt_input_copies = 2;
+    prepared.host_prompt_input_copies = 1;
+    const base = try ordinary.estimate(65536, 32, 32);
+    const complete = try prepared.estimate(65536, 32, 32);
+    const minimum = try prepared.estimate(65536, 32, 1);
+    const input_bytes: usize = 65536 * 8 * 4;
+    try std.testing.expectEqual(input_bytes, complete.host_input_bytes);
+    try std.testing.expectEqual(input_bytes, minimum.host_input_bytes);
+    try std.testing.expectEqual(base.scratch_bytes + 2 * input_bytes, complete.scratch_bytes);
+    const amounts = try AdmissionAmounts.fromEstimate(complete);
+    try std.testing.expectEqual(base.host_metadata_bytes + input_bytes, amounts.host_scratch_bytes);
+    // Halving layer scratch cannot waive a retained full-prompt input plane.
+    var denied = RunBudget.init(.{ .host_limit_bytes = amounts.host_scratch_bytes - 1 });
+    try std.testing.expectError(error.MemoryBudgetExceeded, reserveGptGenerationAtLargestChunk(&denied, &.{prepared}, 65536, 32, 8192));
+    try std.testing.expectEqual(@as(usize, 0), denied.hostTotalBytes());
+    try std.testing.expectEqual(@as(usize, 0), denied.backendTotalBytes());
+    var exact = RunBudget.init(.{ .host_limit_bytes = amounts.host_scratch_bytes, .backend_limit_bytes = amounts.backendTotalBytes() });
+    try exact.reserveEstimate(complete);
+    exact.releaseEstimate(complete);
+    try std.testing.expectEqual(@as(usize, 0), exact.hostTotalBytes());
+    try std.testing.expectEqual(@as(usize, 0), exact.backendTotalBytes());
+    var overflow = complete;
+    overflow.host_input_bytes = std.math.maxInt(usize);
+    try std.testing.expectError(error.ResourceLimitExceeded, exact.reserveEstimate(overflow));
+    try std.testing.expectError(error.ResourceLimitExceeded, AdmissionAmounts.fromEstimate(overflow));
+    try std.testing.expectEqual(@as(usize, 0), exact.backendTotalBytes());
 }

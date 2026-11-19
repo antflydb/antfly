@@ -6303,12 +6303,14 @@ pub const Node = struct {
             prompt = expanded;
         }
 
+        const audio_projector = if (generation.messagesHaveAudio(messages)) try model.ensureProjectorStore() else null;
         const media_admission = try generation.nativeGenerationMediaAdmissionForBackend(
             allocator,
             model_dir,
             messages,
             gpt_config,
             if (model.session.backend() == .cuda) .cuda else .generic,
+            if (audio_projector) |store| &store.gguf.parsed else null,
         );
         const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(messages, gpt_config);
         const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
@@ -6332,8 +6334,7 @@ pub const Node = struct {
         while (prompt_tokens < encoded.attention_mask.len and encoded.attention_mask[prompt_tokens] != 0) : (prompt_tokens += 1) {}
         if (prompt_tokens == 0) return error.EmptyPrompt;
         return .{
-            .token_count = std.math.add(usize, prompt_tokens, media_admission.token_allowance) catch
-                return error.PromptTooLong,
+            .token_count = try generation.estimateNativeGenerationPromptTokenCount(prompt_tokens, media_admission.token_allowance, gpt_config, null, @intCast(@max(max_tokens, 1)), 0),
             .media_admission = media_admission,
         };
     }
@@ -6609,6 +6610,8 @@ pub const Node = struct {
                 .config = gpt_config,
                 .kv_capacity_policy = kv_capacity_policy,
                 .workspace_capacity = model.session.generationWorkspaceCapacity(),
+                .prompt_input_copies = if (backend_kind == .cuda and preflight.media_count > 0 and @import("../execution/gemma4_native_plan.zig").Geometry.resolve(gpt_config) != null) 2 else 0,
+                .host_prompt_input_copies = if (backend_kind == .cuda and preflight.media_count > 0 and @import("../execution/gemma4_native_plan.zig").Geometry.resolve(gpt_config) != null) 1 else 0,
             },
         };
         const direct_prefill_ceiling = @min(
@@ -6636,17 +6639,9 @@ pub const Node = struct {
             return err;
         };
         generation_config.prefill_chunk_size = admitted_prefill_chunk;
-        const resource_estimate = try runtime.tier.memory.estimateGptGenerationForKvPolicy(
-            backend_kind,
-            kv_dtype,
-            gpt_config,
-            prompt_tokens,
-            @intCast(@max(max_tokens, 1)),
-            admitted_prefill_chunk,
-            kv_capacity_policy,
-        );
+        const resource_estimate = try budget_components[0].estimate(prompt_tokens, @intCast(@max(max_tokens, 1)), admitted_prefill_chunk);
         var admission_amounts = try runtime.tier.memory.AdmissionAmounts.fromEstimate(resource_estimate);
-        if (generation.messagesHaveImages(messages) or generation.messagesHaveAudio(messages)) {
+        if (generateMessagesHaveMedia(messages)) {
             admission_amounts = try admission_amounts.merge(
                 try model_manager_mod.projectorRunAdmissionAmounts(
                     model.manifest,
@@ -9280,7 +9275,7 @@ pub const Node = struct {
         const a = std.heap.smp_allocator;
         const cfg = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
         const control = self.extractionExecutionControl(null);
-        const media = try generation.nativeGenerationMediaAdmissionForBackend(a, model.model_dir, &.{.{ .role = "user", .content = "", .image_bytes = &.{fixture} }}, cfg, if (model.session.backend() == .cuda) .cuda else .generic);
+        const media = try generation.nativeGenerationMediaAdmissionForBackend(a, model.model_dir, &.{.{ .role = "user", .content = "", .image_bytes = &.{fixture} }}, cfg, if (model.session.backend() == .cuda) .cuda else .generic, null);
         const one = try model_manager_mod.projectorRunAdmissionAmounts(model.manifest, if (model.session.backend() == .cuda) .cuda else .metal, media);
         const limits = try session_factory.resolveBudgetLimitsForSessions(&.{model.session}, self.defaultGenerationLimits(.gpu), self.config.generation_budget_overrides.limits());
         const width = qwen3vl_projector.maxResidentVisionBatchItems(if (model.session.backend() == .cuda) .cuda else .metal);
@@ -14882,12 +14877,14 @@ pub const Node = struct {
             allocator.free(prompt);
             prompt = expanded;
         }
+        const audio_projector = if (generation.messagesHaveAudio(messages)) try model.ensureProjectorStore() else null;
         const media_admission = try generation.nativeGenerationMediaAdmissionForBackend(
             allocator,
             model_dir,
             messages,
             gpt_config,
             if (model.session.backend() == .cuda) .cuda else .generic,
+            if (audio_projector) |store| &store.gguf.parsed else null,
         );
         const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(messages, gpt_config);
         const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
@@ -14909,7 +14906,7 @@ pub const Node = struct {
         defer if (encoded_owned) encoded.deinit();
         var count: usize = 0;
         while (count < encoded.attention_mask.len and encoded.attention_mask[count] != 0) : (count += 1) {}
-        const total = std.math.add(usize, count, media_admission.token_allowance) catch return error.PromptTooLong;
+        const total = try generation.estimateNativeGenerationPromptTokenCount(count, media_admission.token_allowance, gpt_config, null, @intCast(@max(max_tokens, 1)), speculative_bonus_tokens);
         if (out_estimate) |out| {
             out.* = .{
                 .allocator = allocator,
@@ -18078,6 +18075,8 @@ pub const Node = struct {
             .config = gpt_config,
             .kv_capacity_policy = target_kv_capacity_policy,
             .workspace_capacity = model.session.generationWorkspaceCapacity(),
+            .prompt_input_copies = if (backend_kind == .cuda and effective_compiled_partition_backend != .pjrt and generateMessagesHaveMedia(effective_messages) and @import("../execution/gemma4_native_plan.zig").Geometry.resolve(gpt_config) != null) 2 else 0,
+            .host_prompt_input_copies = if (backend_kind == .cuda and effective_compiled_partition_backend != .pjrt and generateMessagesHaveMedia(effective_messages) and @import("../execution/gemma4_native_plan.zig").Geometry.resolve(gpt_config) != null) 1 else 0,
         };
         var budget_component_count: usize = 1;
         if (draft_model_for_generation != null) {
@@ -18166,15 +18165,7 @@ pub const Node = struct {
             }
             logAdmittedPrefillChunkPlan(config.prefill_chunk_plan.?);
         }
-        const resource_estimate = try runtime.tier.memory.estimateGptGenerationForKvPolicy(
-            backend_kind,
-            kv_dtype,
-            gpt_config,
-            prompt_tokens,
-            budget_max_tokens,
-            config.prefill_chunk_size,
-            target_kv_capacity_policy,
-        );
+        const resource_estimate = try budget_components[0].estimate(prompt_tokens, budget_max_tokens, config.prefill_chunk_size);
         if (draft_model_for_generation != null) {
             draft_resource_estimate = try runtime.tier.memory.estimateGptGeneration(
                 draft_backend_kind.?,
@@ -18204,7 +18195,7 @@ pub const Node = struct {
         if (native_host_reservation != 0 and !native_resume) {
             admission_requests[0].resources.amounts = try admission_requests[0].resources.amounts.merge(.{ .host_scratch_bytes = native_host_reservation });
         }
-        if (generation.messagesHaveImages(effective_messages) or generation.messagesHaveAudio(effective_messages)) {
+        if (generateMessagesHaveMedia(effective_messages)) {
             admission_requests[0].resources.amounts = try admission_requests[0].resources.amounts.merge(
                 try model_manager_mod.projectorRunAdmissionAmounts(
                     model.manifest,
@@ -19774,6 +19765,7 @@ pub const Node = struct {
             // shared_serial closes each state and its task arena before the
             // next task (see task loop below), so host metadata shares a peak.
             .host_metadata_bytes = @max(existing.host_metadata_bytes, next.host_metadata_bytes),
+            .host_input_bytes = @max(existing.host_input_bytes, next.host_input_bytes),
         };
     }
 
@@ -19783,6 +19775,7 @@ pub const Node = struct {
         total.kv_bytes +|= next.kv_bytes;
         total.scratch_bytes +|= next.scratch_bytes;
         total.host_metadata_bytes +|= next.host_metadata_bytes;
+        total.host_input_bytes +|= next.host_input_bytes;
         total.prompt_tokens +|= next.prompt_tokens;
         total.retained_tokens +|= next.retained_tokens;
         return total;
@@ -20353,9 +20346,7 @@ pub const Node = struct {
                 var group_has_media = false;
                 for (group_indices.items) |idx| {
                     if (!pending[idx]) continue;
-                    if (generation.messagesHaveImages(owned_messages[idx].messages) or
-                        generation.messagesHaveAudio(owned_messages[idx].messages))
-                    {
+                    if (generateMessagesHaveMedia(owned_messages[idx].messages)) {
                         group_has_media = true;
                         break;
                     }
@@ -20540,11 +20531,18 @@ pub const Node = struct {
                     ctx.allocator.free(admissions);
                 }
                 var runnable_count: usize = 0;
-                const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
-                    .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config, .workspace_capacity = model.session.generationWorkspaceCapacity() },
-                };
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
+                    const prepared_inputs = backend_kind == .cuda and generateMessagesHaveMedia(owned_messages[idx].messages) and
+                        @import("../execution/gemma4_native_plan.zig").Geometry.resolve(gpt_config) != null;
+                    const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{.{
+                        .backend = backend_kind,
+                        .kv_dtype = kv_dtype,
+                        .config = gpt_config,
+                        .workspace_capacity = model.session.generationWorkspaceCapacity(),
+                        .prompt_input_copies = if (prepared_inputs) 2 else 0,
+                        .host_prompt_input_copies = if (prepared_inputs) 1 else 0,
+                    }};
                     const scheduler_ceiling = if (model.native_generate_coordinator != null)
                         leases[pos].prefill_chunk_size
                     else
@@ -20623,14 +20621,7 @@ pub const Node = struct {
                         configs[pos].prefill_chunk_plan = standalone_prefill_plans[pos].?;
                     }
                     logAdmittedPrefillChunkPlan(configs[pos].prefill_chunk_plan.?);
-                    const resource_estimate = runtime.tier.memory.estimateGptGeneration(
-                        backend_kind,
-                        kv_dtype,
-                        gpt_config,
-                        prompt_tokens[pos],
-                        budget_max_tokens,
-                        configs[pos].prefill_chunk_size,
-                    ) catch |err| {
+                    const resource_estimate = budget_components[0].estimate(prompt_tokens[pos], budget_max_tokens, configs[pos].prefill_chunk_size) catch |err| {
                         results[idx].@"error" = .{
                             .code = if (err == error.InvalidModelConfig) "INVALID_MODEL" else "MODEL_RESOURCE_LIMIT",
                             .message = @errorName(err),
@@ -20708,7 +20699,7 @@ pub const Node = struct {
                                 mergeCoordinatedBatchEstimate(combined, estimate)
                             else
                                 mergeSerialBatchEstimate(combined, estimate);
-                            const pressure = estimate.kv_bytes +| estimate.scratch_bytes +| estimate.host_metadata_bytes;
+                            const pressure = estimate.kv_bytes +| estimate.scratch_bytes +| estimate.host_metadata_bytes +| estimate.host_input_bytes;
                             if (largest_pos == null or pressure > largest_pressure) {
                                 largest_pos = pos;
                                 largest_pressure = pressure;
@@ -34721,14 +34712,15 @@ test "coordinated Metal batch retains model ownership with an independent step m
 }
 
 test "coordinated batch admission reserves all live KV caches and scratch" {
-    const first = runtime.tier.memory.Estimate{ .prompt_tokens = 100, .retained_tokens = 120, .kv_bytes = 900, .kv_tier = .backend, .scratch_bytes = 200, .scratch_tier = .backend, .host_metadata_bytes = 31 };
-    const second = runtime.tier.memory.Estimate{ .prompt_tokens = 300, .retained_tokens = 320, .kv_bytes = 400, .kv_tier = .backend, .scratch_bytes = 700, .scratch_tier = .backend, .host_metadata_bytes = 79 };
+    const first = runtime.tier.memory.Estimate{ .prompt_tokens = 100, .retained_tokens = 120, .kv_bytes = 900, .kv_tier = .backend, .scratch_bytes = 200, .scratch_tier = .backend, .host_input_bytes = 321, .host_metadata_bytes = 31 };
+    const second = runtime.tier.memory.Estimate{ .prompt_tokens = 300, .retained_tokens = 320, .kv_bytes = 400, .kv_tier = .backend, .scratch_bytes = 700, .scratch_tier = .backend, .host_input_bytes = 123, .host_metadata_bytes = 79 };
     const merged = Node.mergeCoordinatedBatchEstimate(first, second);
     try std.testing.expectEqual(@as(usize, 400), merged.prompt_tokens);
     try std.testing.expectEqual(@as(usize, 440), merged.retained_tokens);
     try std.testing.expectEqual(@as(usize, 1300), merged.kv_bytes);
     try std.testing.expectEqual(@as(usize, 900), merged.scratch_bytes);
     try std.testing.expectEqual(@as(usize, 110), merged.host_metadata_bytes);
+    try std.testing.expectEqual(@as(usize, 444), merged.host_input_bytes);
 }
 
 test "serial batch admission covers each request without summing them" {
@@ -34739,6 +34731,7 @@ test "serial batch admission covers each request without summing them" {
         .kv_tier = .backend,
         .scratch_bytes = 200,
         .scratch_tier = .backend,
+        .host_input_bytes = 321,
         .host_metadata_bytes = 31,
     };
     const second = runtime.tier.memory.Estimate{
@@ -34748,6 +34741,7 @@ test "serial batch admission covers each request without summing them" {
         .kv_tier = .backend,
         .scratch_bytes = 700,
         .scratch_tier = .backend,
+        .host_input_bytes = 123,
         .host_metadata_bytes = 79,
     };
     const merged = Node.mergeSerialBatchEstimate(first, second);
@@ -34756,6 +34750,7 @@ test "serial batch admission covers each request without summing them" {
     try std.testing.expectEqual(@as(usize, 900), merged.kv_bytes);
     try std.testing.expectEqual(@as(usize, 700), merged.scratch_bytes);
     try std.testing.expectEqual(@as(usize, 79), merged.host_metadata_bytes);
+    try std.testing.expectEqual(@as(usize, 321), merged.host_input_bytes);
 }
 
 test "direct generation admission owns capacity exactly once" {

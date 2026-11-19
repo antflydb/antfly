@@ -430,13 +430,13 @@ test "gemma4 video indexing and decoding share one bounded pool" {
 test "gemma4 video reserves portable memory through generation admission" {
     const generation = @import("generation.zig");
     const messages = [_]generation.Message{.{ .role = "user", .content = "describe", .video_bytes = "clip" }};
-    const portable = try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &messages, .{ .family = .gemma }, .generic);
+    const portable = try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &messages, .{ .family = .gemma }, .generic, null);
     try std.testing.expectEqual(portable_host_bytes, portable.host_scratch_bytes);
     try std.testing.expect(portable.token_allowance >= 60 * 80);
-    const cuda = try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &messages, .{ .family = .gemma }, .cuda);
+    const cuda = try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &messages, .{ .family = .gemma }, .cuda, null);
     try std.testing.expectEqual(@as(usize, 0), cuda.host_scratch_bytes);
     const text = [_]generation.Message{.{ .role = "user", .content = "describe" }};
-    try std.testing.expectEqual(@as(usize, 0), (try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &text, .{ .family = .gemma }, .generic)).host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), (try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &text, .{ .family = .gemma }, .generic, null)).host_scratch_bytes);
 }
 
 test "gemma4 video decodes AV1 in MP4 like its WebM route" {
@@ -497,7 +497,7 @@ test "gemma4 video prepays HEVC inspection and admits surfaces after activation"
     try std.testing.expectEqual(@as(usize, 0), reserved.surface_bytes);
     const generation = @import("generation.zig");
     const messages = [_]generation.Message{.{ .role = "user", .content = "describe", .video_bytes = bytes }};
-    const admitted = try generation.nativeGenerationMediaAdmissionForBackend(a, "", &messages, .{ .family = .gemma }, .generic);
+    const admitted = try generation.nativeGenerationMediaAdmissionForBackend(a, "", &messages, .{ .family = .gemma }, .generic, null);
     try std.testing.expectEqual(reserved.host_bytes, admitted.host_scratch_bytes);
     try std.testing.expectEqual(reserved.surface_bytes, admitted.backend_scratch_bytes);
     // Surfaces at 4K Main 10 are the case the portable budget undercounted.

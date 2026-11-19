@@ -9435,9 +9435,7 @@ pub const CudaCompute = struct {
         // Exact-size reuse prevents small decoder temporaries from occupying
         // the much larger buffers needed by the next prefill chunk. Keep the
         // existing byte ceiling while admitting more small cached buffers.
-        if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE") == null)
-            self.runtime_policy.stable_temp_reuse = true;
-        if (self.runtime_policy.max_temp_buffers == null) self.runtime_policy.max_temp_buffers = 2048;
+        self.configureBoundedTemporaryReuse();
         if (self.kernels.gqa_score_prework_mode == .automatic)
             self.kernels.gqa_score_prework_mode = .disabled;
         std.log.info("cuda_gemma4_e4b_policy raw_q4={} cublas_prefill={} cublas_min_rows={d} prefill={s} decode_scores={s} decode_consumer={s} warp_split={}", .{
@@ -9483,10 +9481,35 @@ pub const CudaCompute = struct {
         return capacity;
     }
 
+    /// Reuse the existing bounded cache policy. A larger entry count does not
+    /// increase its byte ceiling, and explicit operator limits stay authoritative.
+    pub fn configureBoundedTemporaryReuse(self: *CudaCompute) void {
+        if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE") == null)
+            self.runtime_policy.stable_temp_reuse = true;
+        if (self.runtime_policy.max_temp_buffers == null) self.runtime_policy.max_temp_buffers = 2048;
+    }
+
+    pub fn nativePrefillContextTokens(cb: *const ops.ComputeBackend) ?usize {
+        if (!acceptsPhysicalImplementation(cb.vtable)) return null;
+        const self: *const CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.gemma4_native_plan == null) return null;
+        return if (self.ctx.info.compute_major == 12 and self.ctx.info.compute_minor == 1)
+            @import("../../graph/quant_kernel_cuda_renderer.zig").FlashPrefillQueryLengthPolicy.paged_f16_q2_to_8192_128k_v2.maxContextTokens()
+        else
+            32768;
+    }
+
+    pub fn nativePrefillChunkRows(cb: *const ops.ComputeBackend, prompt_rows: usize, requested_rows: usize) ?usize {
+        if (!acceptsPhysicalImplementation(cb.vtable)) return null;
+        const self: *const CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const plan = self.gemma4_native_plan orelse return null;
+        return plan.geometry.prefillChunkRows(prompt_rows, requested_rows);
+    }
+
     pub fn gemma4SharedKvPrefillEnabled(cb: *const ops.ComputeBackend) bool {
         if (cb.kind() != .cuda) return false;
         const self: *const CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_SHARED_KV_PREFILL", self.gemma4_e4b_sm89_qualified);
+        return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_SHARED_KV_PREFILL", self.gemma4_e4b_sm89_qualified or self.gemma4_native_plan != null);
     }
 
     pub fn requireProfile(self: *CudaCompute, profile: CapabilityProfile) !void {
@@ -30767,7 +30790,9 @@ fn sdpaQwen3VlVision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize
 
 fn gemma4VisionNormRope(ctx: *anyopaque, input: CT, weight: CT, params: ops.VisionNormRopeParams) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    if (!self.gemma4_e4b_sm89_qualified or self.kernels.gemma4_vision_norm_rope_f32 == null or
+    const planned = self.ctx.info.compute_major == 12 and self.ctx.info.compute_minor == 1 and
+        (if (self.gemma4_native_plan) |plan| plan.vision_f16 else false);
+    if ((!self.gemma4_e4b_sm89_qualified and !planned) or self.kernels.gemma4_vision_norm_rope_f32 == null or
         !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VISION_NORM_ROPE", true)) return null;
     if (params.hidden != 768 or params.head_dim != 64 or params.rows == 0 or params.rows > 4 * 3136 or
         params.stride != 0 or params.start != 0 or params.rotate != 1 or params.weighted != 1 or params.cached_rotary != 0 or
@@ -30849,13 +30874,23 @@ fn tryUnmaskedTiledF32Attention(self: *CudaCompute, q_ct: CT, k_ct: CT, v_ct: CT
     return output.intoTensor();
 }
 
-fn sdpaGemma4Vision(ctx: *anyopaque, q: CT, k: CT, v: CT, batch: usize, seq: usize, heads: usize, dim: usize) anyerror!CT {
-    return sdpaUnmaskedF32(ctx, q, k, v, batch, seq, heads, dim);
+fn sdpaUnmaskedReduced(ctx: *anyopaque, q: CT, k: CT, v: CT, batch: usize, seq: usize, heads: usize, dim: usize) anyerror!CT {
+    return sdpaUnmaskedAttention(ctx, q, k, v, batch, seq, heads, dim, true);
 }
 
 fn sdpaUnmaskedF32(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+    return sdpaUnmaskedAttention(ctx, q_ct, k_ct, v_ct, batch, seq_len, num_heads, head_dim, false);
+}
+
+fn sdpaUnmaskedAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, allow_planned_f16: bool) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    if (cudaF32TiledAttentionEnabled() and seq_len >= 512) {
+    const f16_shape = batch > 0 and batch <= 4 and seq_len > 0 and seq_len <= 3136 and num_heads == 12 and head_dim == 64 and self.kernels.gliner_encoder_attention_tc_f16 != null;
+    const f16_requested = platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VISION_F16", true);
+    // The explicit native plan supplies the reduced-storage contract. Keep
+    // ordinary F32 callers and the historical SM89 selector precedence intact.
+    const planned_f16 = allow_planned_f16 and f16_shape and f16_requested and self.ctx.info.compute_major == 12 and self.ctx.info.compute_minor == 1 and
+        (if (self.gemma4_native_plan) |plan| plan.vision_f16 else false);
+    if (!planned_f16 and cudaF32TiledAttentionEnabled() and seq_len >= 512) {
         if (try tryUnmaskedTiledF32Attention(self, q_ct, k_ct, v_ct, batch, seq_len, num_heads, head_dim)) |result| return result;
     }
     // Reuse the full-precision encoder kernel's warp-reduced scores. The
@@ -30877,15 +30912,15 @@ fn sdpaUnmaskedF32(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize, 
     defer output.deinit();
     var profile = beginPrefillProfile(self, .attention, seq_len);
     defer if (profile) |*scope| scope.end();
-    if (self.gemma4_e4b_sm89_qualified and batch <= 4 and seq_len <= 3136 and
-        num_heads == 12 and head_dim == 64 and self.kernels.gliner_encoder_attention_tc_f16 != null and
-        platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VISION_F16", true))
-    {
+    if ((self.gemma4_e4b_sm89_qualified or planned_f16) and f16_shape and f16_requested) {
         const mask = try self.allocator.alloc(i64, batch * seq_len);
         defer self.allocator.free(mask);
         @memset(mask, 1);
         const mask_device = try uploadCachedAttentionMaskI64(self, mask);
-        if (seq_len >= 2048 and self.kernels.gemma4_vision_attention_registers != null and
+        // GB10's measured crossover is lower than SM89's. Retain the
+        // historical threshold for that separately qualified target.
+        const register_min_rows: usize = if (planned_f16) 512 else 2048;
+        if (seq_len >= register_min_rows and self.kernels.gemma4_vision_attention_registers != null and
             platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VISION_REGISTER_ATTENTION", true))
         {
             try self.kernels.launchGemma4VisionRegisterAttention(&self.ctx, output.buffer, q.buffer, k.buffer, v.buffer, mask_device, batch, seq_len);
@@ -36652,6 +36687,7 @@ const vtable: ops.ComputeBackend.VTable = .{
         .vision = .{
             .unmaskedTensorCore = &sdpaQwen3VlVision,
             .unmaskedF32 = &sdpaUnmaskedF32,
+            .unmaskedReduced = &sdpaUnmaskedReduced,
             .tryUnmaskedRetrieval = &sdpaEmbeddingGemma2Vision,
             .encoderTower = &runEmbeddingGemma2VisionTowerOp,
             .sourceGeometry = &sourceVisionGeometryOp,
@@ -60799,6 +60835,10 @@ test "admitted BF16 singleton mirrors bypass quantized fused gate-up before subm
 }
 
 fn qualifyFunctionalGroupedProgram(compact: bool, owned_inputs: bool, comptime suffix: u2) !void {
+    try qualifyFunctionalGroupedProgramSized(compact, owned_inputs, suffix, null, null);
+}
+
+fn qualifyFunctionalGroupedProgramSized(compact: bool, owned_inputs: bool, comptime suffix: u2, comptime key_count: ?usize, comptime head_dim: ?usize) !void {
     if (comptime !cuda_enabled) return error.SkipZigTest;
     const a = std.testing.allocator;
     const shared = if (owned_inputs) try @import("../../backends/compute_context.zig").SharedBackendContext.init(a, .cuda, null) else null;
@@ -60820,17 +60860,18 @@ fn qualifyFunctionalGroupedProgram(compact: bool, owned_inputs: bool, comptime s
         if (suffix != 0) {
             compute.gemma4_native_plan.?.warp_decode = true;
             compute.kernels.e4b_f16_warp_split_enabled = true;
+            if (key_count != null) compute.kernels.gqa_score_prework_mode = kernels_mod.scorePreworkModeForPartitionedDecode(compute.kernels.gqa_score_prework_mode, .serial, true);
         }
     }
     const cb = compute.computeBackend();
     const ml = @import("ml");
-    const depth = if (suffix == 0) 16 else 96;
+    const depth = if (key_count != null) 2 else if (suffix == 0) 16 else 96;
     const queries: usize = if (suffix == 0) 3 else 1;
-    const keys: usize = if (suffix == 0) 5 else 257;
+    const keys: usize = key_count orelse if (suffix == 0) 5 else 257;
     const heads: usize = if (compact) 8 else 4;
     const kv_heads: usize = 2;
-    const dim: usize = if (compact) 256 else 32;
-    const window: usize = if (suffix == 2) 0 else if (suffix == 1) 129 else if (compact) 512 else 4;
+    const dim: usize = head_dim orelse if (compact) 256 else 32;
+    const window: usize = if (suffix == 2) 0 else if (suffix == 1) (if (key_count != null) @as(usize, 512) else 129) else if (compact) 512 else 4;
     const width = heads * dim;
     const key_width = kv_heads * dim;
     var graph = ml.graph.Graph.init(a);
@@ -60914,7 +60955,7 @@ fn qualifyFunctionalGroupedProgram(compact: bool, owned_inputs: bool, comptime s
         defer result.deinit(&executable.runtime);
         captures += result.stats.physical_graph_captures;
         replays += result.stats.physical_graph_replays;
-        if (owned_inputs and iteration == 3 and (captures == 0 or replays == 0)) {
+        if (key_count == null and owned_inputs and iteration == 3 and (captures == 0 or replays == 0)) {
             std.debug.print("device ingress replay={any} captures={d} replays={d}\n", .{ result.stats.physical_replay, captures, replays });
             return error.DeviceIngressReplayNotObserved;
         }
@@ -60957,15 +60998,16 @@ fn qualifyFunctionalGroupedProgram(compact: bool, owned_inputs: bool, comptime s
             // assigned selector, and the independent F64 oracle below checks
             // the reduction across both local and global window boundaries.
             const chunk: usize = if (suffix == 1) 64 else 128;
-            var acc = if (suffix != 0) try buffer_mod.DeviceBuffer.alloc(&compute.ctx, heads * 3 * dim * 4) else buffer_mod.DeviceBuffer{};
+            const partitions = std.math.divCeil(usize, if (window != 0) @min(keys, window) else keys, chunk) catch unreachable;
+            var acc = if (suffix != 0) try buffer_mod.DeviceBuffer.alloc(&compute.ctx, heads * partitions * dim * 4) else buffer_mod.DeviceBuffer{};
             defer if (suffix != 0) acc.free(&compute.ctx);
-            var meta = if (suffix != 0) try buffer_mod.DeviceBuffer.alloc(&compute.ctx, heads * 3 * 2 * 4) else buffer_mod.DeviceBuffer{};
+            var meta = if (suffix != 0) try buffer_mod.DeviceBuffer.alloc(&compute.ctx, heads * partitions * 2 * 4) else buffer_mod.DeviceBuffer{};
             defer if (suffix != 0) meta.free(&compute.ctx);
             for (0..depth) |layer| {
                 request.dst = tensorFromCt(if (layer % 2 == 0) frozen else frozen_other).buffer;
                 request.q = tensorFromCt(if (layer == 0) q else if (layer % 2 == 0) frozen_other else frozen).buffer;
                 if (suffix != 0) {
-                    try std.testing.expect(try compute.kernels.launchGqaAttentionDecodeTurboquantSplitF32(&compute.ctx, request.dst, acc, meta, request.q, kh, vh, .{}, width, keys, heads, kv_heads, dim, keys - 1, 0, window, key_width * 2, key_width * 2, 0, 16, 2, 2, capacity, .{}, chunk, 3));
+                    try std.testing.expect(try compute.kernels.launchGqaAttentionDecodeTurboquantSplitF32(&compute.ctx, request.dst, acc, meta, request.q, kh, vh, .{}, width, keys, heads, kv_heads, dim, keys - 1, 0, window, key_width * 2, key_width * 2, 0, 16, 2, 2, capacity, .{}, chunk, partitions));
                 } else _ = try compute.kernels.launchGqaAttentionDecodeTurboquantF32(&compute.ctx, &request);
             }
         } else {
@@ -61030,7 +61072,14 @@ fn qualifyFunctionalGroupedProgram(compact: bool, owned_inputs: bool, comptime s
             try std.testing.expectApproxEqAbs(expected, got_sum, @as(f32, if (compact) 0.001 else 0.00001));
         }
     }
-    try std.testing.expect(captures > 0 and replays > 0);
+    if (key_count == null) try std.testing.expect(captures > 0 and replays > 0);
+}
+
+test "CUDA partitioned F16 decode crossover matches frozen and F64 local global attention" {
+    inline for (.{ 513, 2048, 4037 }) |keys| {
+        try qualifyFunctionalGroupedProgramSized(true, false, 1, keys, 256);
+        try qualifyFunctionalGroupedProgramSized(true, false, 2, keys, 512);
+    }
 }
 
 test "CUDA functional grouped prefix captures current values against frozen and F64 attention" {
@@ -61933,10 +61982,11 @@ test "Gemma4 CUDA vision FP16 attention preserves scaled bidirectional rows and 
     const a = std.testing.allocator;
     var compute = try CudaCompute.init(a);
     defer compute.deinit();
-    if (compute.ctx.info.compute_major != 8 or compute.ctx.info.compute_minor != 9) return error.SkipZigTest;
+    const gb10 = compute.ctx.info.compute_major == 12 and compute.ctx.info.compute_minor == 1;
+    if (!gb10 and (compute.ctx.info.compute_major != 8 or compute.ctx.info.compute_minor != 9)) return error.SkipZigTest;
     const cb = compute.computeBackend();
     var rng: u32 = 4937;
-    for ([_]usize{ 31, 33, 127, 2048, 2304, 3136 }) |seq| {
+    for ([_]usize{ 31, 33, 127, 512, 784, 1024, 1152, 1536, 2048, 2304, 3136 }) |seq| {
         const batch: usize = if (seq < 128) 2 else 1;
         const hidden = 12 * 64;
         const count = batch * seq * hidden;
@@ -61958,23 +62008,36 @@ test "Gemma4 CUDA vision FP16 attention preserves scaled bidirectional rows and 
         const vt = try cb.fromFloat32Shape(v, &shape);
         defer cb.free(vt);
         compute.gemma4_e4b_sm89_qualified = false;
-        const reference = try sdpaGemma4Vision(&compute, qt, kt, vt, batch, seq, 12, 64);
+        compute.gemma4_native_plan = null;
+        const reference = try sdpaUnmaskedReduced(&compute, qt, kt, vt, batch, seq, 12, 64);
         defer cb.free(reference);
         const before = compute.stats.gemma4_vision_f16_calls;
-        compute.gemma4_e4b_sm89_qualified = true;
-        const actual_ct = try sdpaGemma4Vision(&compute, qt, kt, vt, batch, seq, 12, 64);
+        compute.gemma4_e4b_sm89_qualified = !gb10;
+        if (gb10) compute.gemma4_native_plan = .{ .projection = .packed_q4, .geometry = .{ .donor_layers = 24 } };
+        const actual_ct = try sdpaUnmaskedReduced(&compute, qt, kt, vt, batch, seq, 12, 64);
         defer cb.free(actual_ct);
         try std.testing.expectEqual(before + 1, compute.stats.gemma4_vision_f16_calls);
         const expected = try cb.toFloat32(reference, a);
         defer a.free(expected);
         const actual = try cb.toFloat32(actual_ct, a);
         defer a.free(actual);
-        if (seq >= 2048) {
+        if (gb10) {
+            // An installed native plan is not permission to round an ordinary
+            // F32 operation. Only the reduced-storage entry may select F16.
+            const calls = compute.stats.gemma4_vision_f16_calls;
+            const full_ct = try cb.scaledDotProductAttentionUnmaskedF32(qt, kt, vt, batch, seq, 12, 64);
+            defer cb.free(full_ct);
+            const full = try cb.toFloat32(full_ct, a);
+            defer a.free(full);
+            try std.testing.expectEqual(calls, compute.stats.gemma4_vision_f16_calls);
+            for (expected, full) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.000001);
+        }
+        if (seq >= (if (gb10) @as(usize, 512) else 2048)) {
             const kernel = compute.kernels.gemma4_vision_attention_registers;
             try std.testing.expect(kernel != null);
             compute.kernels.gemma4_vision_attention_registers = null;
             defer compute.kernels.gemma4_vision_attention_registers = kernel;
-            const legacy_ct = try sdpaGemma4Vision(&compute, qt, kt, vt, batch, seq, 12, 64);
+            const legacy_ct = try sdpaUnmaskedReduced(&compute, qt, kt, vt, batch, seq, 12, 64);
             defer cb.free(legacy_ct);
             const legacy = try cb.toFloat32(legacy_ct, a);
             defer a.free(legacy);
@@ -61989,6 +62052,29 @@ test "Gemma4 CUDA vision FP16 attention preserves scaled bidirectional rows and 
             diff2 += @as(f64, want - got) * (want - got);
             norm2 += @as(f64, want) * want;
         }
+        // Independent full-precision oracle samples all spatial boundaries
+        // and distinct heads; no GPU reduction is used to construct it.
+        for ([_]usize{ 0, seq / 2, seq - 1 }) |row| for ([_]usize{ 0, 5, 11 }) |head| {
+            const scores = try a.alloc(f64, seq);
+            defer a.free(scores);
+            var maximum: f64 = -std.math.inf(f64);
+            for (scores, 0..) |*score, key| {
+                var dot: f64 = 0;
+                for (0..64) |column| dot += @as(f64, q[(row * 12 + head) * 64 + column]) * k[(key * 12 + head) * 64 + column];
+                score.* = dot / 8;
+                maximum = @max(maximum, score.*);
+            }
+            var denominator: f64 = 0;
+            for (scores) |*score| {
+                score.* = @exp(score.* - maximum);
+                denominator += score.*;
+            }
+            for ([_]usize{ 0, 31, 63 }) |column| {
+                var expected_value: f64 = 0;
+                for (scores, 0..) |score, key| expected_value += score / denominator * v[(key * 12 + head) * 64 + column];
+                try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected_value)), actual[(row * 12 + head) * 64 + column], 0.01);
+            }
+        };
         const relative_l2 = @sqrt(diff2 / @max(norm2, 1e-30));
         std.debug.print("gemma4_vision_f16 seq={d} batch={d} max_abs={d} relative_l2={d}\n", .{ seq, batch, max_abs, relative_l2 });
         try std.testing.expect(max_abs < 0.01);
@@ -62189,9 +62275,11 @@ test "Gemma4 CUDA spatial norm rope matches independent F32 pairs and rejects ot
     const a = std.testing.allocator;
     var compute = try CudaCompute.init(a);
     defer compute.deinit();
-    if (compute.ctx.info.compute_major != 8 or compute.ctx.info.compute_minor != 9) return error.SkipZigTest;
+    const gb10 = compute.ctx.info.compute_major == 12 and compute.ctx.info.compute_minor == 1;
+    if (!gb10 and (compute.ctx.info.compute_major != 8 or compute.ctx.info.compute_minor != 9)) return error.SkipZigTest;
     try std.testing.expect(compute.kernels.gemma4_vision_norm_rope_f32 != null);
     try compute.configureGemma4Dense(true, true);
+    if (gb10) compute.gemma4_native_plan = .{ .projection = .packed_q4, .geometry = .{ .donor_layers = 24 } };
     const cb = compute.computeBackend();
     const weights: [64]f32 = blk: {
         var data: [64]f32 = undefined;
@@ -62249,9 +62337,13 @@ test "Gemma4 CUDA spatial norm rope matches independent F32 pairs and rejects ot
             compute.kernels.gemma4_vision_norm_rope_f32 = null;
             try std.testing.expect((try cb.visionNormRope(tensor, weight, params)) == null);
             compute.kernels.gemma4_vision_norm_rope_f32 = original_kernel;
+            const plan = compute.gemma4_native_plan;
+            const legacy = compute.gemma4_e4b_sm89_qualified;
+            compute.gemma4_native_plan = null;
             compute.gemma4_e4b_sm89_qualified = false;
             try std.testing.expect((try cb.visionNormRope(tensor, weight, params)) == null);
-            compute.gemma4_e4b_sm89_qualified = true;
+            compute.gemma4_native_plan = plan;
+            compute.gemma4_e4b_sm89_qualified = legacy;
         }
     }
 }

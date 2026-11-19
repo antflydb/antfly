@@ -52,13 +52,15 @@ fn bundledQ4_0TcHmmaBf16Supported(compute_major: i32, compute_minor: i32) bool {
 // The portable compute_75 PTX exports this symbol with an empty SM80-only
 // body. A non-null symbol is insufficient: require a matching SASS image.
 fn gemma4VisionRegisterArtifactEligible(has_mma_body: bool, compute_major: i32, compute_minor: i32) bool {
-    return has_mma_body and compute_major == 8 and compute_minor == 9;
+    return has_mma_body and ((compute_major == 8 and compute_minor == 9) or (compute_major == 12 and compute_minor == 1));
 }
 
 test "Gemma4 CUDA vision register attention declines portable PTX stubs and other devices" {
     try std.testing.expect(gemma4VisionRegisterArtifactEligible(true, 8, 9));
     try std.testing.expect(!gemma4VisionRegisterArtifactEligible(false, 8, 9));
-    for ([_][2]i32{ .{ 7, 5 }, .{ 8, 0 }, .{ 9, 0 }, .{ 12, 1 }, .{ 13, 0 } }) |cc| {
+    try std.testing.expect(gemma4VisionRegisterArtifactEligible(true, 12, 1));
+    try std.testing.expect(!gemma4VisionRegisterArtifactEligible(false, 12, 1));
+    for ([_][2]i32{ .{ 7, 5 }, .{ 8, 0 }, .{ 9, 0 }, .{ 13, 0 } }) |cc| {
         try std.testing.expect(!gemma4VisionRegisterArtifactEligible(true, cc[0], cc[1]));
         try std.testing.expect(!gemma4VisionRegisterArtifactEligible(false, cc[0], cc[1]));
     }
@@ -232,6 +234,13 @@ pub const GeneratedGqaScorePreworkConsumerMode = enum(u8) {
         return self == .required_tiled64;
     }
 };
+
+/// A qualified partitioned schedule must not silently revert to the slower
+/// automatic chronological route at its bounded score-capacity crossover.
+/// Explicit numerical/consumer profiles remain authoritative.
+pub fn scorePreworkModeForPartitionedDecode(mode: GeneratedGqaScorePreworkMode, consumer: GeneratedGqaScorePreworkConsumerMode, partitioned: bool) GeneratedGqaScorePreworkMode {
+    return if (partitioned and mode == .automatic and consumer == .serial) .disabled else mode;
+}
 
 var generated_gqa_score_prework_invalid_consumer_warned = std.atomic.Value(bool).init(false);
 var generated_gqa_score_prework_consumer_config_log_mask = std.atomic.Value(u8).init(0);
@@ -1503,9 +1512,14 @@ fn gqaFlashPrefillEligibility(request: GqaFlashPrefillRequest) GqaFlashPrefillEl
         return .page_size_ineligible;
     }
     const policy: cuda_kernel_renderer.FlashPrefillQueryLengthPolicy = if (kv_heads == 2)
-        .gemma4_e4b_q2_to_8192_32k_v1
+        .paged_f16_q2_to_8192_128k_v2
     else
         .gemma4_q512_or_q3_v1;
+    // Preserve the physically qualified L4 envelope. The expanded position
+    // contract is selected only on the qualified GB10 target.
+    if (kv_heads == 2 and request.compute_major == 8 and
+        (request.query_position_offset > 32768 or request.base.q_seq_len > 32768 - request.query_position_offset))
+        return .query_length_policy_ineligible;
     if (!policy.accepts(
         request.base.q_seq_len,
         request.query_position_offset,
@@ -7763,7 +7777,7 @@ pub const KernelModule = struct {
 
     pub fn launchGemma4VisionRegisterAttention(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, q: buffer_mod.DeviceBuffer, k: buffer_mod.DeviceBuffer, v: buffer_mod.DeviceBuffer, mask: buffer_mod.DeviceBuffer, batch: usize, seq: usize) driver_mod.Error!void {
         if (!gemma4VisionRegisterArtifactEligible(cuda_artifact.hasBf16WmmaCodeFor(ctx.info.compute_major, ctx.info.compute_minor), ctx.info.compute_major, ctx.info.compute_minor)) return error.CudaKernelUnavailable;
-        if (ctx.info.compute_major != 8 or ctx.info.compute_minor != 9 or batch == 0 or batch > 4 or seq < 2048 or seq > 3136) return error.InvalidCudaState;
+        if (batch == 0 or batch > 4 or seq < 512 or seq > 3136) return error.InvalidCudaState;
         const count = try checkedTensorElements(try checkedTensorElements(batch, seq), 768);
         try checkBytes(dst, count);
         try checkBytes(q, count);
@@ -22890,7 +22904,7 @@ test "E4B Flash selector checks two-head strides and long-context bounds" {
     try std.testing.expect(gqaFlashPrefillEligibility(request) == .base);
     request.base.value_row_bytes = 2048;
     request.query_position_offset += 1;
-    try std.testing.expect(gqaFlashPrefillEligibility(request) == .query_length_policy_ineligible);
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .position_policy_ineligible);
     request.query_position_offset = 30720;
     request.kv_position_offset = 16;
     try std.testing.expect(gqaFlashPrefillEligibility(request) == .position_policy_ineligible);
@@ -22900,6 +22914,20 @@ test "E4B Flash selector checks two-head strides and long-context bounds" {
     try std.testing.expect(gqaFlashPrefillEligibility(request) == .eligible);
     request.query_position_offset = 24575;
     request.base.q_seq_len = 8193;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .query_length_policy_ineligible);
+    request.base.q_seq_len = 65;
+    request.query_position_offset = 131007;
+    request.base.kv_seq_len = 131072;
+    request.total_sequence_len = 131072;
+    request.base.block_count = 8192;
+    request.base.physical_token_capacity = 131072;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .eligible);
+    request.compute_major = 8;
+    request.compute_minor = 9;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .query_length_policy_ineligible);
+    request.compute_major = 12;
+    request.compute_minor = 1;
+    request.query_position_offset += 1;
     try std.testing.expect(gqaFlashPrefillEligibility(request) == .query_length_policy_ineligible);
 }
 
@@ -23535,4 +23563,13 @@ test "CUDA borrowed quantized metadata row softmax declines overlapping banks be
     try std.testing.expectError(error.InvalidCudaState, module.launchRowSoftmaxF32(&ctx, .{ .ptr = 4096, .len = 12300 }, .{ .ptr = 4100, .len = 12300 }, 3, 1025));
     try std.testing.expectError(error.InvalidCudaState, module.launchRowSoftmaxF32(&ctx, .{}, .{}, 1, 8193));
     try std.testing.expectError(error.InvalidCudaState, module.launchRowSoftmaxF32(&ctx, .{}, .{}, 0, 512));
+}
+
+test "partitioned decode preference preserves explicit attention contracts" {
+    try std.testing.expectEqual(GeneratedGqaScorePreworkMode.disabled, scorePreworkModeForPartitionedDecode(.automatic, .serial, true));
+    try std.testing.expectEqual(GeneratedGqaScorePreworkMode.automatic, scorePreworkModeForPartitionedDecode(.automatic, .serial, false));
+    try std.testing.expectEqual(GeneratedGqaScorePreworkMode.explicit, scorePreworkModeForPartitionedDecode(.explicit, .serial, true));
+    try std.testing.expectEqual(GeneratedGqaScorePreworkMode.disabled, scorePreworkModeForPartitionedDecode(.disabled, .serial, true));
+    inline for (.{ GeneratedGqaScorePreworkConsumerMode.tiled64, GeneratedGqaScorePreworkConsumerMode.required_tiled64, GeneratedGqaScorePreworkConsumerMode.invalid }) |consumer|
+        try std.testing.expectEqual(GeneratedGqaScorePreworkMode.automatic, scorePreworkModeForPartitionedDecode(.automatic, consumer, true));
 }

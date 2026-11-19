@@ -52,7 +52,10 @@ pub fn addCudaFlashPrefill(ctx: Context) void {
         .target = ctx.target,
         .optimize = ctx.optimize,
         .link_libc = true,
-        .imports = &.{.{ .name = "build_options", .module = ctx.graph.build_options_mod }},
+        .imports = &.{
+            .{ .name = "build_options", .module = ctx.graph.build_options_mod },
+            .{ .name = "antfly_platform", .module = ctx.graph.platform_mod },
+        },
     });
     const executable = ctx.b.addExecutable(.{ .name = "antfly-cuda-flash-prefill-prototype", .root_module = module });
     ctx.step("build-cuda-flash-prefill-prototype", "Build the shared CUDA Flash-prefill qualification harness").dependOn(&ctx.b.addInstallArtifact(executable, .{}).step);

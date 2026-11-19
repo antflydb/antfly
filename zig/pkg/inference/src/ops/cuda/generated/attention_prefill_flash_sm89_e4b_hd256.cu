@@ -1,5 +1,5 @@
 // Default-off generated Flash prefill from graph/quant_kernel_compiler.zig.
-// plan_id=cuda/attention/prefill_flash/sm89/e4b/hd256/gqa8-kv2/page16/q2-2048-kv32k/swa512/f32q-f16kv-hmma
+// plan_id=cuda/attention/prefill_flash/sm89/e4b/hd256/gqa8-kv2/page16/q2-8192-kv128k/swa512/f32q-f16kv-hmma
 // source_id=antfly_gqa_attention_prefill_flash_sm89_e4b_hd256_swa512_f32_v1
 // kernel_id=antfly_gqa_attention_prefill_flash_sm89_e4b_hd256_swa512_f32_v1
 // production_baseline=termite_gqa_attention_prefill_turboquant_fast_f32

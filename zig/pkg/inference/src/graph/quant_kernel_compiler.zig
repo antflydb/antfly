@@ -3160,7 +3160,7 @@ fn cudaFlashPrefillE4bSchedule(head_dim: u16) KernelSchedule {
     schedule.attention_query_heads_per_kv_head = 4;
     schedule.attention_query_tile = cuda_renderer.generated_flash_prefill_e4b_query_tile;
     schedule.attention_dynamic_shared_memory_bytes = cuda_renderer.generatedFlashPrefillE4bDynamicSharedBytes(head_dim).?;
-    schedule.attention_query_length_policy = .gemma4_e4b_q2_to_8192_32k_v1;
+    schedule.attention_query_length_policy = .paged_f16_q2_to_8192_128k_v2;
     return schedule;
 }
 
@@ -4585,13 +4585,13 @@ pub fn validateGeneratedArtifactRegistry() !void {
                             return error.GeneratedArtifactScheduleInvalid;
                         }
                     } else if (op.kind == .prefill_flash) {
-                        const e4b = op.schedule.attention_query_length_policy == .gemma4_e4b_q2_to_8192_32k_v1;
+                        const e4b = op.schedule.attention_query_length_policy == .paged_f16_q2_to_8192_128k_v2;
                         if (op.schedule.threads_per_threadgroup != cuda_renderer.generated_flash_prefill_threads or
                             op.schedule.attention_serial_threads_per_threadgroup != 0 or
                             op.schedule.attention_stage2_threads_per_threadgroup != 0 or
                             op.schedule.attention_tiled64_threads_per_threadgroup != 0 or
                             op.schedule.attention_kv_splits != 1 or
-                            op.schedule.attention_query_heads_per_kv_head != @as(u8, if (op.schedule.attention_query_length_policy == .gemma4_e4b_q2_to_8192_32k_v1) 4 else 8) or
+                            op.schedule.attention_query_heads_per_kv_head != @as(u8, if (op.schedule.attention_query_length_policy == .paged_f16_q2_to_8192_128k_v2) 4 else 8) or
                             op.schedule.attention_query_tile != (if (e4b) cuda_renderer.generated_flash_prefill_e4b_query_tile else cuda_renderer.generated_flash_prefill_query_tile) or
                             op.schedule.attention_key_tile != cuda_renderer.generated_flash_prefill_key_tile or
                             op.schedule.attention_page_size_tokens != cuda_renderer.generated_flash_prefill_page_size_tokens or
@@ -4599,7 +4599,7 @@ pub fn validateGeneratedArtifactRegistry() !void {
                             op.schedule.attention_required_compute_major != 8 or
                             op.schedule.attention_required_compute_minor != 9 or
                             (op.schedule.attention_query_length_policy != .gemma4_q512_or_q3_v1 and
-                                op.schedule.attention_query_length_policy != .gemma4_e4b_q2_to_8192_32k_v1) or
+                                op.schedule.attention_query_length_policy != .paged_f16_q2_to_8192_128k_v2) or
                             op.schedule.attention_storage != .f32 or
                             op.schedule.attention_key_storage != .paged_f16 or
                             op.schedule.attention_value_storage != .paged_f16 or

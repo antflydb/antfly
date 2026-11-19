@@ -31,6 +31,7 @@ const Options = struct {
     generate_audio: ?[]const u8 = null,
     generate_video: ?[]const u8 = null,
     generate_tokens: usize = 8,
+    generate_prefill_chunk_rows: usize = 0,
     generate_cache_comparison: bool = false,
     generate_control_stdin: bool = false,
     primitive: ?Primitive = null,
@@ -125,6 +126,10 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, arg, "--generate-cache-comparison")) {
             options.generate_cache_comparison = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--generate-prefill-chunk-rows")) {
+            options.generate_prefill_chunk_rows = try std.fmt.parseInt(usize, value, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--generate-tokens")) {
