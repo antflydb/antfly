@@ -4597,11 +4597,32 @@ pub fn encodeQueryResponses(
     return encodeQueryResponsesWithDelivery(alloc, table_name, req, meta, result, null);
 }
 
+test "api query contract response timing includes coordinator planning" {
+    const a = std.testing.allocator;
+    const start = platform_time.monotonicNs() -| (1500 * std.time.ns_per_ms);
+    const result: db_mod.types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0 };
+    const req: db_mod.types.SearchRequest = .{ .public_query_started_ns = start };
+    const wire = try @import("query_execution_contract.zig").encodeStorageKernelQueryRequest(a, req);
+    defer a.free(wire);
+    var worker = try parseQueryRequest(a, null, "docs", wire);
+    defer worker.deinit(a);
+    try std.testing.expect(worker.req.public_query_started_ns == null);
+    const controls = @import("../storage/query_controls.zig");
+    controls.applyExecutionOptions(&worker.req, controls.executionOptions(req));
+    try std.testing.expectEqual(@as(?u64, start), worker.req.public_query_started_ns);
+
+    var encoded = try encodeQueryResponses(a, "docs", worker.req, .{ .took_ms = 1 }, result);
+    defer encoded.deinit(a);
+    const parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, a, encoded.json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.responses.?[0].took >= 1500);
+}
+
 pub fn encodeQueryResponsesWithDelivery(
     alloc: std.mem.Allocator,
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
-    meta: QueryResponseMeta,
+    execution_meta: QueryResponseMeta,
     result: db_mod.types.SearchResult,
     delivery: ?@import("query_response.zig").Delivery,
 ) !QueryResponse {
@@ -4611,6 +4632,10 @@ pub fn encodeQueryResponsesWithDelivery(
         // Do not encode and parse a second public graph representation.
         return .{ .json = try alloc.alloc(u8, 0), .delivered_bytes = 0 };
     };
+    var meta = execution_meta;
+    if (req.public_query_started_ns) |started| {
+        meta.took_ms = @intCast((platform_time.monotonicNs() -| started) / std.time.ns_per_ms);
+    }
     var delivered: ?usize = null;
     var graph_wire_failure: ?anyerror = null;
     var arena_impl = std.heap.ArenaAllocator.init(alloc);

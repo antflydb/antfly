@@ -1418,6 +1418,19 @@ pub const RaftApplyStore = struct {
         };
     }
 
+    pub fn captureCatalogTableProjection(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8, deadline_ns: ?u64) !CatalogProjectionSnapshot {
+        return self.projectionWithAllocator(CatalogProjectionSnapshot, alloc, .{
+            .kind = .catalog_table_projection,
+            .group_id = group_id,
+            .arg0 = deadline_ns orelse 0,
+            .key = .fromSlice(name),
+        }) catch |err| switch (err) {
+            error.InvalidArgument => error.InvalidDerivedCatalogIndex,
+            error.Timeout => error.CatalogRoutingSnapshotTimeout,
+            else => err,
+        };
+    }
+
     pub fn captureCatalogCursor(self: *RaftApplyStore, group_id: u64) !CatalogCursor {
         return try self.projection(CatalogCursor, .{
             .kind = .catalog_cursor,

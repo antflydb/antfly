@@ -1473,8 +1473,10 @@ pub const Owner = struct {
     }
 
     pub fn queryJsonWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, options: QueryOptions) !QueryResponse {
+        var control = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn);
+        control.version = abi.query_request_version;
         return @import("local_query_client").executeOwner(self.handle, .{
-            .control = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+            .control = control,
             .execution_options = options.execution,
         });
     }

@@ -42,7 +42,8 @@ pub const cypher_schema_policy_abi_version: u32 = 121;
 pub const isolated_read_owner_abi_version: u32 = 122;
 /// Combined main direct effects/commit prerequisites and SQL read/owner layouts.
 pub const merged_main_owner_abi_version: u32 = 123;
-pub const abi_version: u32 = merged_main_owner_abi_version;
+/// Distinct metadata projection ordinals for table routing and schema validation.
+pub const abi_version: u32 = 124;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -531,9 +532,10 @@ pub const MetadataProjectionKind = enum(u32) {
     lake_source_owner = 75,
     /// Raw binary schema-publication command; read-only preflight returns JSON
     /// acceptance intent. No ASVI frame is escaped into a JSON envelope.
-    schema_validation_preflight = 77,
+    schema_validation_preflight = 78,
     /// Nonwaiting observation/reconciliation of the shared durable HA outbox.
     poll_ha_outbox = 76,
+    catalog_table_projection = 77,
 };
 
 pub const MetadataHABindRequest = extern struct {
@@ -1979,6 +1981,7 @@ pub extern fn antfly_storage_owner_restore_control_json(
 /// of JSON: process-local callbacks and absolute monotonic deadlines must not
 /// be lost or reconstructed as a fresh timeout at a compiled boundary.
 pub const QueryOperationRequest = query_abi.QueryOperationRequest;
+pub const query_request_version = query_abi.query_request_version;
 
 pub const ArtifactOperation = enum(u32) {
     corrupt_embedding = 0,
@@ -2738,5 +2741,5 @@ pub extern fn antfly_storage_context_pipeline_metrics_json(context: ?*anyopaque,
 test "published metadata outbox polling ordinal remains stable" {
     const std = @import("std");
     try std.testing.expectEqual(@as(u32, 76), @backingInt(MetadataProjectionKind.poll_ha_outbox));
-    try std.testing.expectEqual(@as(u32, 77), @backingInt(MetadataProjectionKind.schema_validation_preflight));
+    try std.testing.expectEqual(@as(u32, 78), @backingInt(MetadataProjectionKind.schema_validation_preflight));
 }

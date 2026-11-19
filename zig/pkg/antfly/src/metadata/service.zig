@@ -7120,6 +7120,7 @@ pub const MetadataService = struct {
         };
         read_tracker_owned = false;
         errdefer service.deinit();
+        if (service.projectedStore()) |store| try store.ensureDerivedCatalogIndexes(metadata_group_id);
         try foreign_mod.registerDefaultPostgresExecutor(alloc, &service.cdc_backfill_registry);
         return service;
     }
@@ -10023,6 +10024,7 @@ pub const MetadataHttpService = struct {
         owned_backend_runtime = null;
         errdefer service.deinit();
         service.publishTransitionMetricsLocked();
+        if (service.projectedStore()) |store| try store.ensureDerivedCatalogIndexes(metadata_group_id);
         try foreign_mod.registerDefaultPostgresExecutor(alloc, &service.cdc_backfill_registry);
         return service;
     }

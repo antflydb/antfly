@@ -29365,6 +29365,7 @@ components:
           description: What to do next.
     TableRepairJobStartRequest:
       type: object
+      x-go-type: RepairJobStartOptions
       description: Starts a durable table repair job. The job advances in bounded passes using the same
         repair request shape as runTableRepair.
       properties:
@@ -29395,8 +29396,8 @@ components:
         advance:
           type: boolean
           default: true
-          description: When true, the server immediately attempts the first bounded repair pass before
-            returning the job.
+          description: When true, the server starts the job and continues bounded passes automatically,
+            including after restart. When false, each pass requires an explicit advance request.
     TableRepairControlJobStartRequest:
       type: object
       description: Starts a durable named-index control traversal. The server advances every bounded pass,

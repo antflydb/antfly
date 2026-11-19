@@ -18,6 +18,8 @@ const cache_budget = @import("antfly_cache_budget");
 const platform_time = @import("antfly_platform").time;
 
 pub const Key = [32]u8;
+pub const Expiration = enum { sliding, fixed };
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const Config = struct {
     enabled: bool = true,
@@ -85,10 +87,30 @@ const Entry = struct {
     vector: []f32,
     charge_bytes: usize,
     expires_at_ns: u64,
+    expiration: Expiration,
     pins: usize = 0,
     retired: bool = false,
     newer: ?*Entry = null,
     older: ?*Entry = null,
+    expiry_prev: ?*Entry = null,
+    expiry_next: ?*Entry = null,
+};
+
+const ExpiryQueue = struct {
+    first: ?*Entry = null,
+    last: ?*Entry = null,
+
+    fn append(self: *ExpiryQueue, entry: *Entry) void {
+        entry.expiry_prev = self.last;
+        entry.expiry_next = null;
+        if (self.last) |last| last.expiry_next = entry else self.first = entry;
+        self.last = entry;
+    }
+
+    fn remove(self: *ExpiryQueue, entry: *Entry) void {
+        if (entry.expiry_prev) |prev| prev.expiry_next = entry.expiry_next else self.first = entry.expiry_next;
+        if (entry.expiry_next) |next| next.expiry_prev = entry.expiry_prev else self.last = entry.expiry_prev;
+    }
 };
 
 const Flight = struct {
@@ -96,6 +118,7 @@ const Flight = struct {
     done: bool = false,
     result: ?[]f32 = null,
     err: ?anyerror = null,
+    retry_not_before_ns: u64 = 0,
     ready: std.Io.Event = .unset,
 };
 
@@ -113,6 +136,8 @@ pub const QueryEmbeddingCache = struct {
     flights: std.AutoHashMapUnmanaged(Key, *Flight) = .empty,
     newest: ?*Entry = null,
     oldest: ?*Entry = null,
+    fixed_expiry: ExpiryQueue = .{},
+    sliding_expiry: ExpiryQueue = .{},
     live_bytes: usize = 0,
     active_pins: usize = 0,
     uncached_inflight: usize = 0,
@@ -197,7 +222,7 @@ pub const QueryEmbeddingCache = struct {
             if (self.nowNs() < entry.expires_at_ns) return;
             self.removeEntryLocked(entry, budget, true);
         }
-        self.admitLocked(key, vector, budget) catch {
+        self.admitLocked(key, vector, budget, .sliding) catch {
             self.counters.rejected_admissions +|= 1;
         };
     }
@@ -211,6 +236,61 @@ pub const QueryEmbeddingCache = struct {
         deadline_ns: ?u64,
         context: *anyopaque,
         compute: ComputeFn,
+    ) ![]f32 {
+        return self.getOrComputeWithCancellation(budget, caller_alloc, key, deadline_ns, .none, context, compute);
+    }
+
+    pub fn getOrComputeWithCancellation(
+        self: *QueryEmbeddingCache,
+        budget: *cache_budget.CacheBudget,
+        caller_alloc: std.mem.Allocator,
+        key: Key,
+        deadline_ns: ?u64,
+        cancellation: CancellationToken,
+        context: *anyopaque,
+        compute: ComputeFn,
+    ) ![]f32 {
+        return self.getOrComputeWithRetryHint(budget, caller_alloc, key, deadline_ns, cancellation, context, compute, null, .sliding);
+    }
+
+    pub fn getOrComputeWithRetryHint(
+        self: *QueryEmbeddingCache,
+        budget: *cache_budget.CacheBudget,
+        caller_alloc: std.mem.Allocator,
+        key: Key,
+        deadline_ns: ?u64,
+        cancellation: CancellationToken,
+        context: *anyopaque,
+        compute: ComputeFn,
+        retry_not_before_ns: ?*u64,
+        expiration: Expiration,
+    ) ![]f32 {
+        while (true) {
+            if (retry_not_before_ns) |hint| hint.* = 0;
+            try cancellation.check();
+            if (deadlineExpiredAt(self.nowNs(), deadline_ns)) return error.Timeout;
+            const vector = self.getOrComputeOnce(budget, caller_alloc, key, deadline_ns, cancellation, context, compute, retry_not_before_ns, expiration) catch |err| {
+                if (err == error.QueryEmbeddingProducerAbandoned) continue;
+                return err;
+            };
+            errdefer caller_alloc.free(vector);
+            try cancellation.check();
+            if (deadlineExpiredAt(self.nowNs(), deadline_ns)) return error.Timeout;
+            return vector;
+        }
+    }
+
+    fn getOrComputeOnce(
+        self: *QueryEmbeddingCache,
+        budget: *cache_budget.CacheBudget,
+        caller_alloc: std.mem.Allocator,
+        key: Key,
+        deadline_ns: ?u64,
+        cancellation: CancellationToken,
+        context: *anyopaque,
+        compute: ComputeFn,
+        retry_not_before_ns: ?*u64,
+        expiration: Expiration,
     ) ![]f32 {
         try self.chargeWork(.request, 1);
         if (deadlineExpiredAt(self.nowNs(), deadline_ns)) return error.Timeout;
@@ -256,6 +336,11 @@ pub const QueryEmbeddingCache = struct {
         }
 
         if (self.flights.get(key)) |flight| {
+            if (flight.done and (if (flight.err) |err| err == error.QueryEmbeddingProducerAbandoned else false)) {
+                self.mutex.unlock(io);
+                try io.sleep(.fromMilliseconds(1), .awake);
+                return error.QueryEmbeddingProducerAbandoned;
+            }
             flight.refs += 1;
             self.counters.coalesced_waiters +|= 1;
             self.mutex.unlock(io);
@@ -265,7 +350,7 @@ pub const QueryEmbeddingCache = struct {
                 self.mutex.unlock(io);
                 return err;
             };
-            self.waitForFlight(flight, deadline_ns) catch |err| {
+            self.waitForFlight(flight, deadline_ns, cancellation) catch |err| {
                 self.mutex.lockUncancelable(io);
                 if (err == error.Timeout) self.counters.waiter_timeouts +|= 1;
                 self.releaseFlightLocked(key, flight);
@@ -273,6 +358,7 @@ pub const QueryEmbeddingCache = struct {
                 return err;
             };
             const result = copyFlightResult(caller_alloc, flight) catch |err| {
+                if (retry_not_before_ns) |hint| hint.* = flight.retry_not_before_ns;
                 self.mutex.lockUncancelable(io);
                 self.releaseFlightLocked(key, flight);
                 self.mutex.unlock(io);
@@ -323,9 +409,11 @@ pub const QueryEmbeddingCache = struct {
             return err;
         };
         const computed = compute(context, self.alloc) catch |err| {
+            const abandoned = ownerStopped(self.nowNs(), deadline_ns, cancellation);
             self.mutex.lockUncancelable(io);
             self.recordProducerDurationLocked(compute_started_ns);
-            flight.err = err;
+            flight.err = if (abandoned) error.QueryEmbeddingProducerAbandoned else err;
+            flight.retry_not_before_ns = if (abandoned) 0 else if (retry_not_before_ns) |hint| hint.* else 0;
             flight.done = true;
             flight.ready.set(io);
             self.releaseFlightLocked(key, flight);
@@ -337,7 +425,7 @@ pub const QueryEmbeddingCache = struct {
         self.recordProducerDurationLocked(compute_started_ns);
         flight.result = computed;
         flight.done = true;
-        self.admitLocked(key, computed, budget) catch {
+        self.admitLocked(key, computed, budget, expiration) catch {
             self.counters.rejected_admissions +|= 1;
         };
         flight.ready.set(io);
@@ -408,7 +496,7 @@ pub const QueryEmbeddingCache = struct {
         const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        self.expireOldestLocked(self.nowNs(), budget, metrics_expire_batch);
+        self.expireDueLocked(self.nowNs(), budget, metrics_expire_batch);
         var result = self.counters;
         result.entries = self.entries.count();
         result.live_bytes = self.live_bytes;
@@ -435,21 +523,23 @@ pub const QueryEmbeddingCache = struct {
         self.mutex.unlock(io);
     }
 
-    fn waitForFlight(self: *QueryEmbeddingCache, flight: *Flight, deadline_ns: ?u64) !void {
-        const deadline = deadline_ns orelse {
-            // A coalesced waiter is not the producer and owns no shared state
-            // that requires an uncancelable region. Let its enclosing std.Io
-            // task be canceled, then release its flight reference through the
-            // caller's existing error path.
-            try flight.ready.wait(self.io);
-            return;
-        };
+    fn ownerStopped(now_ns: u64, deadline_ns: ?u64, cancellation: CancellationToken) bool {
+        cancellation.check() catch return true;
+        return deadlineExpiredAt(now_ns, deadline_ns);
+    }
+
+    fn waitForFlight(self: *QueryEmbeddingCache, flight: *Flight, deadline_ns: ?u64, cancellation: CancellationToken) !void {
+        const cancelable = cancellation.check_fn != null or cancellation.is_cancelled_fn != null;
+        if (deadline_ns == null and !cancelable) return flight.ready.wait(self.io);
         while (!flight.ready.isSet()) {
+            try cancellation.check();
             const now = self.nowNs();
-            if (now >= deadline) return error.Timeout;
+            if (deadlineExpiredAt(now, deadline_ns)) return error.Timeout;
+            const maximum_wait = if (deadline_ns) |deadline| deadline - now else std.math.maxInt(i64);
+            const wait_ns = if (cancelable) @min(maximum_wait, 25 * std.time.ns_per_ms) else maximum_wait;
             flight.ready.waitTimeout(self.io, .{
                 .duration = .{
-                    .raw = std.Io.Duration.fromNanoseconds(@intCast(deadline - now)),
+                    .raw = std.Io.Duration.fromNanoseconds(@intCast(wait_ns)),
                     .clock = .awake,
                 },
             }) catch |err| switch (err) {
@@ -457,6 +547,8 @@ pub const QueryEmbeddingCache = struct {
                 error.Canceled => return error.Canceled,
             };
         }
+        try cancellation.check();
+        if (deadlineExpiredAt(self.nowNs(), deadline_ns)) return error.Timeout;
     }
 
     fn releaseFlightLocked(self: *QueryEmbeddingCache, key: Key, flight: *Flight) void {
@@ -469,24 +561,22 @@ pub const QueryEmbeddingCache = struct {
         self.alloc.destroy(flight);
     }
 
-    fn admitLocked(self: *QueryEmbeddingCache, key: Key, vector: []const f32, budget: *cache_budget.CacheBudget) !void {
+    fn admitLocked(self: *QueryEmbeddingCache, key: Key, vector: []const f32, budget: *cache_budget.CacheBudget, expiration: Expiration) !void {
         if (self.config.max_bytes == 0 or self.config.ttl_ns == 0) return;
         const charge = entryCharge(vector.len);
         if (charge > self.config.max_bytes) {
             self.counters.rejected_admissions +|= 1;
             return;
         }
-        self.expireOldestLocked(self.nowNs(), budget, admission_expire_batch);
+        self.expireDueLocked(self.nowNs(), budget, admission_expire_batch);
         while (self.live_bytes > self.config.max_bytes - charge) {
-            const victim = self.oldest orelse break;
-            self.removeEntryLocked(victim, budget, false);
+            if (!self.reclaimForAdmissionLocked(budget)) break;
         }
         while (!budget.tryReserve(charge)) {
-            const victim = self.oldest orelse {
+            if (!self.reclaimForAdmissionLocked(budget)) {
                 self.counters.rejected_admissions +|= 1;
                 return;
-            };
-            self.removeEntryLocked(victim, budget, false);
+            }
         }
         errdefer budget.release(charge);
 
@@ -499,9 +589,11 @@ pub const QueryEmbeddingCache = struct {
             .vector = owned_vector,
             .charge_bytes = charge,
             .expires_at_ns = self.nowNs() +| self.config.ttl_ns,
+            .expiration = expiration,
         };
         try self.entries.put(self.alloc, key, entry);
         self.linkNewestLocked(entry);
+        self.expiryQueue(expiration).append(entry);
         self.live_bytes += charge;
     }
 
@@ -513,7 +605,13 @@ pub const QueryEmbeddingCache = struct {
     }
 
     fn touchLocked(self: *QueryEmbeddingCache, entry: *Entry, now_ns: u64) void {
-        entry.expires_at_ns = now_ns +| self.config.ttl_ns;
+        if (entry.expiration == .sliding) {
+            entry.expires_at_ns = now_ns +| self.config.ttl_ns;
+            if (self.sliding_expiry.last != entry) {
+                self.sliding_expiry.remove(entry);
+                self.sliding_expiry.append(entry);
+            }
+        }
         if (self.newest == entry) return;
         self.unlinkLocked(entry);
         self.linkNewestLocked(entry);
@@ -533,19 +631,42 @@ pub const QueryEmbeddingCache = struct {
         entry.older = null;
     }
 
-    fn expireOldestLocked(self: *QueryEmbeddingCache, now_ns: u64, budget: *cache_budget.CacheBudget, max_entries: usize) void {
-        var expired: usize = 0;
-        while (expired < max_entries) : (expired += 1) {
-            const entry = self.oldest orelse return;
-            if (now_ns < entry.expires_at_ns) return;
+    fn expiryQueue(self: *QueryEmbeddingCache, expiration: Expiration) *ExpiryQueue {
+        return switch (expiration) {
+            .fixed => &self.fixed_expiry,
+            .sliding => &self.sliding_expiry,
+        };
+    }
+
+    fn expiredEntryLocked(self: *const QueryEmbeddingCache, now_ns: u64) ?*Entry {
+        if (self.fixed_expiry.first) |entry| {
+            if (entry.expires_at_ns <= now_ns) return entry;
+        }
+        if (self.sliding_expiry.first) |entry| {
+            if (entry.expires_at_ns <= now_ns) return entry;
+        }
+        return null;
+    }
+
+    fn expireDueLocked(self: *QueryEmbeddingCache, now_ns: u64, budget: *cache_budget.CacheBudget, max_entries: usize) void {
+        for (0..max_entries) |_| {
+            const entry = self.expiredEntryLocked(now_ns) orelse return;
             self.removeEntryLocked(entry, budget, true);
         }
+    }
+
+    fn reclaimForAdmissionLocked(self: *QueryEmbeddingCache, budget: *cache_budget.CacheBudget) bool {
+        const expired = self.expiredEntryLocked(self.nowNs());
+        const victim = expired orelse self.oldest orelse return false;
+        self.removeEntryLocked(victim, budget, expired != null);
+        return true;
     }
 
     fn removeEntryLocked(self: *QueryEmbeddingCache, entry: *Entry, budget: *cache_budget.CacheBudget, expired: bool) void {
         std.debug.assert(!entry.retired);
         _ = self.entries.remove(entry.key);
         self.unlinkLocked(entry);
+        self.expiryQueue(entry.expiration).remove(entry);
         entry.retired = true;
         if (entry.pins == 0) self.destroyEntryLocked(entry, budget);
         if (expired) self.counters.expirations +|= 1 else self.counters.evictions +|= 1;
@@ -741,6 +862,105 @@ pub fn testConcurrentCoalescing() !void {
 
 test "query embedding cache coalesces concurrent misses" {
     try testConcurrentCoalescing();
+}
+
+test "query embedding waiters can cancel independently and replace an abandoned producer" {
+    try testProducerFailureSharing(true);
+}
+
+test "query embedding waiters share provider cancellation when the producer is live" {
+    try testProducerFailureSharing(false);
+}
+
+fn testProducerFailureSharing(abandon_owner: bool) !void {
+    const Worker = struct {
+        cache: *QueryEmbeddingCache,
+        budget: *cache_budget.CacheBudget,
+        io: std.Io,
+        cancel: std.atomic.Value(bool) = .init(false),
+        entered: std.Io.Event = .unset,
+        block: bool = false,
+        request_can_cancel: bool = true,
+        failure: ?anyerror = null,
+        result: ?[]f32 = null,
+
+        fn compute(ptr: *anyopaque, a: std.mem.Allocator) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.set(self.io);
+            if (self.block) {
+                while (!self.cancel.load(.acquire)) try self.io.sleep(.fromMilliseconds(1), .awake);
+                return error.Canceled;
+            }
+            return a.dupe(f32, &.{2});
+        }
+
+        fn run(self: *@This()) void {
+            const deadline = self.cache.nowNs() + 3 * std.time.ns_per_s;
+            self.result = self.cache.getOrComputeWithCancellation(
+                self.budget,
+                std.heap.page_allocator,
+                @splat(0),
+                deadline,
+                if (self.request_can_cancel) CancellationToken.fromAtomic(&self.cancel) else .none,
+                self,
+                compute,
+            ) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    const a = std.heap.page_allocator;
+    const io = std.testing.io;
+    var budget = cache_budget.CacheBudget.init(1024 * 1024);
+    var cache = QueryEmbeddingCache.init(a, io, .{ .max_inflight = 1 });
+    defer cache.deinit(&budget);
+    var owner: Worker = .{ .cache = &cache, .budget = &budget, .io = io, .block = true, .request_can_cancel = abandon_owner };
+    var owner_task = try io.concurrent(Worker.run, .{&owner});
+    defer {
+        owner.cancel.store(true, .release);
+        owner_task.await(io);
+        if (owner.result) |vector| a.free(vector);
+    }
+    try owner.entered.wait(io);
+
+    var departing: Worker = .{ .cache = &cache, .budget = &budget, .io = io };
+    var departing_task = try io.concurrent(Worker.run, .{&departing});
+    defer {
+        departing.cancel.store(true, .release);
+        departing_task.await(io);
+        if (departing.result) |vector| a.free(vector);
+    }
+    const deadline = cache.nowNs() + std.time.ns_per_s;
+    while (cache.stats(&budget).coalesced_waiters < 1 and cache.nowNs() < deadline)
+        try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats(&budget).coalesced_waiters);
+    departing.cancel.store(true, .release);
+    departing_task.await(io);
+    try std.testing.expectEqual(error.Canceled, departing.failure.?);
+    try std.testing.expectEqual(@as(usize, 1), cache.stats(&budget).inflight);
+
+    var continuing: Worker = .{ .cache = &cache, .budget = &budget, .io = io };
+    var continuing_task = try io.concurrent(Worker.run, .{&continuing});
+    defer {
+        continuing.cancel.store(true, .release);
+        continuing_task.await(io);
+        if (continuing.result) |vector| a.free(vector);
+    }
+    const join_deadline = cache.nowNs() + std.time.ns_per_s;
+    while (cache.stats(&budget).coalesced_waiters < 2 and cache.nowNs() < join_deadline)
+        try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expectEqual(@as(u64, 2), cache.stats(&budget).coalesced_waiters);
+    owner.cancel.store(true, .release);
+    continuing_task.await(io);
+    if (abandon_owner) {
+        try std.testing.expectEqualSlices(f32, &.{2}, continuing.result orelse return error.TestUnexpectedResult);
+    } else {
+        try std.testing.expectEqual(error.Canceled, continuing.failure.?);
+        try std.testing.expect(!continuing.entered.isSet());
+    }
+    owner_task.await(io);
+    try std.testing.expectEqual(error.Canceled, owner.failure.?);
 }
 
 pub fn testInflightAdmissionBound() !void {
@@ -1010,6 +1230,63 @@ pub fn testStatsExpireIdleEntries() !void {
     try std.testing.expectEqual(@as(u64, 0), current.expirations);
     try std.testing.expectEqual(@as(u64, 0), current.rejected_admissions);
     try std.testing.expectEqual(@as(usize, 0), budget.stats().used_bytes);
+}
+
+test "query embedding cache fixed TTL survives hot hits without renewal" {
+    const alloc = std.testing.allocator;
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer clock.deinit();
+    var budget = cache_budget.CacheBudget.init(1024 * 1024);
+    var cache = QueryEmbeddingCache.init(alloc, clock.io(), .{ .ttl_ns = 50 });
+    defer cache.deinit(&budget);
+    var compute = TestCompute{ .value = 3 };
+    const key: Key = @splat(7);
+
+    alloc.free(try cache.getOrComputeWithRetryHint(&budget, alloc, key, null, .none, &compute, TestCompute.run, null, .fixed));
+    compute.value = 4;
+    for (0..4) |_| {
+        try clock.advance(10);
+        const hit = try cache.getOrComputeWithRetryHint(&budget, alloc, key, null, .none, &compute, TestCompute.run, null, .fixed);
+        defer alloc.free(hit);
+        try std.testing.expectEqual(@as(f32, 3), hit[0]);
+    }
+    try std.testing.expectEqual(@as(u64, 1), cache.stats(&budget).producer_computations);
+
+    try clock.advance(10);
+    const recomputed = try cache.getOrComputeWithRetryHint(&budget, alloc, key, null, .none, &compute, TestCompute.run, null, .fixed);
+    defer alloc.free(recomputed);
+    try std.testing.expectEqual(@as(f32, 4), recomputed[0]);
+    try std.testing.expectEqual(@as(u64, 2), cache.stats(&budget).producer_computations);
+}
+
+test "query embedding cache reclaims a hot expired fixed entry before a live sliding entry" {
+    const alloc = std.testing.allocator;
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer clock.deinit();
+    const capacity = 2 * QueryEmbeddingCache.entryChargeBytes(2);
+    var budget = cache_budget.CacheBudget.init(capacity);
+    var cache = QueryEmbeddingCache.init(alloc, clock.io(), .{ .ttl_ns = 50, .max_bytes = capacity });
+    defer cache.deinit(&budget);
+    var compute = TestCompute{ .value = 3 };
+    const fixed: Key = @splat(1);
+    const sliding: Key = @splat(2);
+    const incoming: Key = @splat(3);
+
+    alloc.free(try cache.getOrComputeWithRetryHint(&budget, alloc, fixed, null, .none, &compute, TestCompute.run, null, .fixed));
+    try clock.advance(10);
+    alloc.free(try cache.getOrCompute(&budget, alloc, sliding, null, &compute, TestCompute.run));
+    try clock.advance(30);
+    alloc.free((try cache.lookup(&budget, alloc, fixed)).?);
+    try std.testing.expectEqual(cache.entries.get(sliding), cache.oldest);
+    try clock.advance(10);
+    alloc.free(try cache.getOrCompute(&budget, alloc, incoming, null, &compute, TestCompute.run));
+
+    try std.testing.expect(!cache.entries.contains(fixed));
+    try std.testing.expect(cache.entries.contains(sliding));
+    try std.testing.expect(cache.entries.contains(incoming));
+    const stats = cache.stats(&budget);
+    try std.testing.expectEqual(@as(u64, 1), stats.expirations);
+    try std.testing.expectEqual(@as(u64, 0), stats.evictions);
 }
 
 test "query embedding cache skips zero TTL retention" {

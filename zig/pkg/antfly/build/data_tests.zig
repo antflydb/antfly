@@ -280,6 +280,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "remote metadata deadline ",
         "native index claims data receiver",
         "boundary dispatcher preserves native index claim",
+        "remote repair routing ",
     };
     const lib_data_runtime_tests = @import("linked_tests.zig").add(b, .{
         .name = "data-runtime-tests",

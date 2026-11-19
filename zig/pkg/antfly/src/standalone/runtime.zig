@@ -7658,6 +7658,21 @@ pub fn runFromIterator(
     const sql_session_store = if (lite_session_store) |*store| store else if (native_sessions) |*store| store else null;
     local_metadata.bindSqlCommandStore(sql_session_store);
     defer local_metadata.bindSqlCommandStore(null);
+    const repair_job_namespace = "system/api-repair-jobs";
+    var kernel_repair_job_backend: ?antfly.storage_backend_erased.Store = null;
+    defer if (kernel_repair_job_backend) |*store| store.deinit();
+    const lite_repair_job_store = if (lite_path == null) null else if (comptime control_only_storage_sources) blk: {
+        kernel_repair_job_backend = try storage_kernel_context.systemStore(alloc, repair_job_namespace);
+        break :blk &kernel_repair_job_backend.?;
+    } else if (lite_backend) |*backend|
+        try backend.runtimeStoreForNamespace(repair_job_namespace)
+    else
+        null;
+    const repair_job_root = if (lite_path == null)
+        try std.fmt.allocPrint(alloc, "{s}/api-repair-jobs", .{resolved.replica_root_dir})
+    else
+        null;
+    defer if (repair_job_root) |path| alloc.free(path);
     const synced_extension_packages = if (hot_standby_role_requested)
         0
     else
@@ -7860,6 +7875,8 @@ pub fn runFromIterator(
             .session_store = sql_session_store,
             .restore_job_store = if (local_metadata.lifecycle_store == null) restore_job_store else null,
             .research_job_store = if (research_job_store) |*store| store else null,
+            .repair_job_store = lite_repair_job_store,
+            .repair_job_store_path = repair_job_root,
             .incoming_graph_route_store = incoming_graph_route_store,
             .session_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.ttl_seconds * std.time.ns_per_s else standalone_session_ttl_ns,
             .session_cleanup_interval_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_interval_seconds * std.time.ns_per_s else standalone_session_cleanup_interval_ns,
