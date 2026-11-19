@@ -4998,35 +4998,32 @@ pub fn validateStagedBlock(store: *const Store, staged: StagedBlock) !ValidatedB
 fn readBlockValidated(store: *const Store, descriptor: vector_manifest.Segment) !ValidatedBlock {
     const path = try store.blockPathAlloc(descriptor.generation, descriptor.shard_id);
     defer store.alloc.free(path);
-    const mapped = store.storage.mapImmutableArtifact(store.alloc, path) catch |err| switch (err) {
-        error.MappedArtifactUnsupported, error.MappedArtifactUnavailable => null,
+    const mapped = store.storage.mapValidatedImmutableArtifact(store.alloc, path, false, descriptor, vector_block.Reader, validateBlockBytes) catch |err| switch (err) {
         error.FileNotFound => return error.MissingVectorBlock,
         error.EmptySegment => return error.VectorBlockDescriptorMismatch,
         else => return err,
     };
-    if (mapped) |artifact| {
-        var owned = artifact;
+    if (mapped) |validated| {
+        var owned = validated.artifact;
         errdefer owned.deinit();
-        if (artifact.bytes.len != descriptor.bytes) return error.VectorBlockDescriptorMismatch;
-        const reader = try vector_block.Reader.init(artifact.bytes);
-        if (reader.generation != descriptor.generation or reader.shard_id != descriptor.shard_id or
-            reader.covered_source_sequence != descriptor.covered_source_sequence or reader.admissionChecksum() != descriptor.admission_checksum)
-            return error.VectorBlockDescriptorMismatch;
-        return .{ .block = try RetainedBlock.init(store.alloc, .{ .mapped = artifact }), .reader = reader };
+        return .{ .block = try RetainedBlock.init(store.alloc, .{ .mapped = owned }), .reader = validated.reader };
     }
     const bytes = store.storage.readFileAlloc(store.alloc, path, boundedReadLimit(max_block_bytes)) catch |err| switch (err) {
         error.FileNotFound => return error.MissingVectorBlock,
         else => return err,
     };
     errdefer store.alloc.free(bytes);
+    const reader = try validateBlockBytes(bytes, descriptor);
+    return .{ .block = try RetainedBlock.init(store.alloc, .{ .heap = bytes }), .reader = reader };
+}
+
+fn validateBlockBytes(bytes: []const u8, descriptor: vector_manifest.Segment) !vector_block.Reader {
     if (bytes.len != descriptor.bytes) return error.VectorBlockDescriptorMismatch;
     const reader = try vector_block.Reader.init(bytes);
     if (reader.generation != descriptor.generation or reader.shard_id != descriptor.shard_id or
         reader.covered_source_sequence != descriptor.covered_source_sequence or reader.admissionChecksum() != descriptor.admission_checksum)
-    {
         return error.VectorBlockDescriptorMismatch;
-    }
-    return .{ .block = try RetainedBlock.init(store.alloc, .{ .heap = bytes }), .reader = reader };
+    return reader;
 }
 
 fn boundedReadLimit(max_bytes: usize) usize {
@@ -5035,6 +5032,39 @@ fn boundedReadLimit(max_bytes: usize) usize {
 
 fn atomicReplace(alloc: Allocator, storage: lsm_backend.Storage, path: []const u8, contents: []const u8) !void {
     try generation_publication.replaceImmutable(alloc, storage, path, contents);
+}
+
+test "vector block store remaps stale descriptors after cross-view replacement" {
+    if (builtin.os.tag != .linux and (builtin.os.tag != .macos or !builtin.link_libc)) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("vector-remap");
+    defer directory.cleanup();
+    const root = directory.path();
+    var reader_storage = try lsm_backend.NativeStorage.init(alloc, .threaded);
+    defer reader_storage.deinit();
+    var writer_storage = try lsm_backend.NativeStorage.init(alloc, .threaded);
+    defer writer_storage.deinit();
+
+    var store = try Store.open(alloc, writer_storage.storage(), root);
+    defer store.deinit();
+    const path = try store.blockPathAlloc(1, 0);
+    defer alloc.free(path);
+    try writer_storage.storage().writeFileAbsolute(path, "stale");
+    _ = try reader_storage.storage().fileSize(path);
+
+    var block_writer = try vector_block.Writer.init(alloc, 1, 0, 1, 0);
+    defer block_writer.deinit();
+    try block_writer.appendVector("artifact-a", 0, 1, &.{ 1.0, 2.0 });
+    const bytes = try block_writer.build();
+    defer alloc.free(bytes);
+    try store.publishGeneration(1, 0, &.{.{ .shard_id = 0, .bytes = bytes }}, true);
+
+    var opened = try Store.openWithBlocks(alloc, reader_storage.storage(), root);
+    defer opened.deinit();
+    try std.testing.expect(opened.blocks[0].shared.payload == .mapped);
+    const vector = (try opened.get("artifact-a", 0, 1)).vector;
+    var decoded: [2]f32 = undefined;
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, try vector.decodeExactInto(&decoded));
 }
 
 test "vector block store publishes base and replays committed WAL" {

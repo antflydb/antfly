@@ -742,6 +742,41 @@ pub const Storage = struct {
         return BoundaryAbi.call("map_fresh_immutable_artifact", self.boundary_dispatch, map, .{ self.ptr, allocator, path });
     }
 
+    /// Validate the immutable artifact against its publication descriptor.
+    /// A cached inode can be stale after a replacement through another view.
+    /// Retry the current pathname once, without converting operational errors
+    /// into a buffered read. Validation callbacks only examine the bytes.
+    pub fn mapValidatedImmutableArtifact(
+        self: Storage,
+        allocator: Allocator,
+        path: []const u8,
+        direct_only: bool,
+        descriptor: anytype,
+        comptime Reader: type,
+        comptime validate: anytype,
+    ) !?struct { artifact: @import("../../segment_source.zig").MappedArtifact, reader: Reader } {
+        const can_refresh = self.vtable.map_fresh_immutable_artifact != null;
+        var fresh = false;
+        while (true) : (fresh = true) {
+            var artifact = (if (fresh)
+                self.mapFreshImmutableArtifact(allocator, path)
+            else if (direct_only)
+                self.mapDirectImmutableArtifact(allocator, path)
+            else
+                self.mapImmutableArtifact(allocator, path)) catch |err| switch (err) {
+                error.MappedArtifactUnsupported, error.MappedArtifactUnavailable => return null,
+                error.EmptySegment => if (!fresh and can_refresh) continue else return err,
+                else => return err,
+            };
+            const reader = validate(artifact.bytes, descriptor) catch |err| {
+                artifact.deinit();
+                if (!fresh and can_refresh) continue;
+                return err;
+            };
+            return .{ .artifact = artifact, .reader = reader };
+        }
+    }
+
     pub fn openLeasedImmutableSource(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").Source {
         const open = self.vtable.open_leased_immutable_source orelse return error.ImmutableReadSourceUnsupported;
         return BoundaryAbi.call("open_leased_immutable_source", self.boundary_dispatch, open, .{ self.ptr, allocator, path });

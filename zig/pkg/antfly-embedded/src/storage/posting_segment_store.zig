@@ -1462,27 +1462,16 @@ pub const Store = struct {
     fn readSegmentRetainedFor(self: *Store, descriptor: posting_wal.Checkpoint.Segment) !RetainedSegment {
         const path = try self.segmentPathAlloc(descriptor.generation);
         defer self.alloc.free(path);
-        if (self.storage.mapDirectImmutableArtifact(self.alloc, path)) |artifact| {
-            var mapped = artifact;
-            if (validateSegment(mapped.bytes, descriptor)) |reader| {
-                errdefer mapped.deinit();
-                return RetainedSegment.share(self.alloc, .{ .mapped = mapped }, self.root_dir, descriptor, reader);
-            } else |_| {
-                mapped.deinit();
-            }
-            // Another storage view can replace the cached pathname. Resolve
-            // the live inode once before treating the segment as corrupt.
-            if (self.storage.mapFreshImmutableArtifact(self.alloc, path)) |fresh| {
-                var replacement = fresh;
-                errdefer replacement.deinit();
-                const reader = try validateSegment(replacement.bytes, descriptor);
-                return RetainedSegment.share(self.alloc, .{ .mapped = replacement }, self.root_dir, descriptor, reader);
-            } else |err| switch (err) {
-                error.MappedArtifactUnsupported, error.MappedArtifactUnavailable => {},
-                error.FileNotFound => return error.MissingPostingSegment,
-                else => return err,
-            }
-        } else |_| {}
+        const mapped = self.storage.mapValidatedImmutableArtifact(self.alloc, path, true, descriptor, posting_segment.Reader, validateSegment) catch |err| switch (err) {
+            error.FileNotFound => return error.MissingPostingSegment,
+            error.EmptySegment => return error.CorruptedPostingSegment,
+            else => return err,
+        };
+        if (mapped) |validated| {
+            var payload = RetainedSegment{ .mapped = validated.artifact };
+            errdefer payload.deinit(self.alloc);
+            return RetainedSegment.share(self.alloc, payload, self.root_dir, descriptor, validated.reader);
+        }
         var payload = RetainedSegment{ .heap = try self.readSegmentBytes(path) };
         errdefer payload.deinit(self.alloc);
         const reader = try validateSegment(payload.bytes(), descriptor);
@@ -1879,6 +1868,32 @@ test "storage.posting retained generations share payload verification" {
     defer reused.deinit();
     try std.testing.expectEqual(original.verification.ptr, reused.verification.ptr);
     try std.testing.expectEqualStrings("shared segment", (try reused.getBase(3)).?);
+}
+
+test "storage.posting mapping operational errors skip buffered fallback" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var store = try Store.open(alloc, memory.storage(), "/posting-map-errors");
+    defer store.deinit();
+    const Fault = struct {
+        fn read(_: *anyopaque, _: Allocator, _: []const u8, _: usize) ![]u8 {
+            return error.UnexpectedBufferedRead;
+        }
+    };
+    inline for (.{ error.ProcessFdQuotaExceeded, error.OutOfMemory, error.Canceled }) |injected| {
+        const Mapper = struct {
+            fn map(_: *anyopaque, _: Allocator, _: []const u8) !@import("../segment_source.zig").MappedArtifact {
+                return injected;
+            }
+        };
+        var vtable = memory.storage().vtable.*;
+        vtable.direct_immutable_mapping = true;
+        vtable.map_immutable_artifact = Mapper.map;
+        vtable.read_file_alloc = Fault.read;
+        store.storage.vtable = &vtable;
+        try std.testing.expectError(injected, store.readSegmentRetainedFor(.{ .generation = 1 }));
+    }
 }
 
 test "storage.posting validation skips materializing mappings" {
