@@ -46710,11 +46710,98 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         var scope = try self.broadLiveDocSetCachedAllocControlled(alloc, generation, control);
         errdefer scope.deinit(alloc);
-        if (scope == .all) return null;
-        if (ttlDurationNs(self) == 0) return scope;
-        const visible = try self.ttlVisibleResolvedDocSetNoLockAlloc(alloc, &scope, generation, ttlDurationNs(self));
+        if (scope == .all) {
+            const Scan = struct {
+                alloc: Allocator,
+                control: db_query_search.QueryExecutionControl,
+                keys: std.ArrayListUnmanaged([]const u8) = .empty,
+
+                fn collect(ctx_raw: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                    const state: *@This() = @ptrCast(@alignCast(ctx_raw.?));
+                    try state.control.check();
+                    const id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.alloc, key)) orelse return .@"continue";
+                    errdefer state.alloc.free(id);
+                    try state.keys.append(state.alloc, id);
+                    return .@"continue";
+                }
+            };
+            var state = Scan{ .alloc = alloc, .control = control };
+            errdefer {
+                for (state.keys.items) |key| alloc.free(key);
+                state.keys.deinit(alloc);
+            }
+            const lower = [_]u8{internal_keys.user_namespace};
+            const upper = [_]u8{internal_keys.user_namespace + 1};
+            try self.core.store.scanWithContext(&lower, &upper, .{}, &state, Scan.collect);
+            scope = .{ .doc_keys = try state.keys.toOwnedSlice(alloc) };
+        }
+        const duration = ttlDurationNs(self);
+        if (duration == 0 and scope != .doc_keys) return scope;
+        const visible = try self.primaryResidualVisibleBatches(alloc, &scope, generation, duration, control);
         scope.deinit(alloc);
         return visible;
+    }
+
+    fn primaryResidualVisibleBatches(
+        self: *DB,
+        alloc: Allocator,
+        scope: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+        duration: u64,
+        control: db_query_search.QueryExecutionControl,
+    ) !doc_set.ResolvedDocSet {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const now = currentTimeNs();
+        if (scope.* == .doc_keys) {
+            var kept: std.ArrayListUnmanaged([]const u8) = .empty;
+            errdefer {
+                for (kept.items) |key| alloc.free(key);
+                kept.deinit(alloc);
+            }
+            var start: usize = 0;
+            while (start < scope.doc_keys.len) {
+                try control.check();
+                _ = scratch.reset(.retain_capacity);
+                const portion = scope.doc_keys[start..@min(start + 64, scope.doc_keys.len)];
+                start += portion.len;
+                const a = scratch.allocator();
+                const visible = try self.resolveDocSetForIdsNoLockAtGenerationAlloc(a, portion, generation);
+                const ids = (try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(a, &visible, generation)) orelse return error.StorageReadTemporarilyUnavailable;
+                const timestamps = if (duration != 0) try loadDocumentTimestampsMany(self, a, ids) else null;
+                for (ids, 0..) |id, index| {
+                    try control.check();
+                    if (timestamps) |values| if (values[index]) |ts| if (ttl_mod.isExpired(ts, duration, now)) continue;
+                    const copy = try alloc.dupe(u8, id);
+                    errdefer alloc.free(copy);
+                    try kept.append(alloc, copy);
+                }
+            }
+            if (kept.items.len == 0) return .none;
+            return .{ .doc_keys = try kept.toOwnedSlice(alloc) };
+        }
+        if (scope.* == .none) return .none;
+        if (scope.* != .ordinal_bitmap) return error.InvalidData;
+        var visible = @import("../../encoding/roaring.zig").RoaringBitmap.init(alloc);
+        errdefer visible.deinit();
+        var iter = scope.ordinal_bitmap.iterator();
+        while (true) {
+            try control.check();
+            _ = scratch.reset(.retain_capacity);
+            var ordinals: [64]doc_set.DocOrdinal = undefined;
+            var count: usize = 0;
+            while (count < ordinals.len) : (count += 1) ordinals[count] = iter.next() orelse break;
+            if (count == 0) break;
+            const portion = doc_set.ResolvedDocSet{ .ordinals = ordinals[0..count] };
+            const a = scratch.allocator();
+            const ids = (try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(a, &portion, generation)) orelse return error.StorageReadTemporarilyUnavailable;
+            const timestamps = try loadDocumentTimestampsMany(self, a, ids);
+            for (ordinals[0..count], timestamps) |ordinal, ts| {
+                if (ts != null and ttl_mod.isExpired(ts.?, duration, now)) continue;
+                try visible.add(ordinal);
+            }
+        }
+        return .{ .ordinal_bitmap = visible };
     }
 
     fn liveFilterDocSetCallback(
@@ -156556,6 +156643,20 @@ test "optional numeric range prefilters dense search without a text index" {
         .{ .key = "a", .value = "{\"rank\":9007199254740992,\"_embeddings\":{\"dv\":[1,0]}}" },
         .{ .key = "b", .value = "{\"rank\":9007199254740993,\"_embeddings\":{\"dv\":[0.9,0.1]}}" },
     } });
+
+    // Keep the physical row and its vector while removing one primary
+    // identity mapping, as on legacy stores with incomplete coverage.
+    const identity_key = try internal_keys.identityDocToOrdinalKeyAlloc(a, "a");
+    defer a.free(identity_key);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(identity_key);
+        try txn.commit();
+    }
+    var scope = (try DB.primaryResidualScopeCallback(&db, a, null, .{})).?;
+    defer scope.deinit(a);
+    try std.testing.expect(scope == .doc_keys);
 
     for ([_][]const []const u8{ &.{}, &.{ "a", "b" } }) |ids| {
         var result = try db.searchDenseProfiled(a, .{
