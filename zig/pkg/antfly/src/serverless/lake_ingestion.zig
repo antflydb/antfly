@@ -250,7 +250,7 @@ pub const StreamOwner = struct {
                 page_digest.?.* = try writeBootstrapPage(a, bound.binding, options, context, snapshot, rows);
             } else {
                 if (mode != .stage_bootstrap or request.snapshot_rows != null) return error.InvalidReplicationCheckpoint;
-                try sealBootstrapPages(a, bound.binding, options, context, snapshot, request.snapshot_chunks.?);
+                try sealBootstrapPages(a, bound.binding, options, context, snapshot, request.snapshot_chunks.?, request.cutover.snapshot_offset);
             }
             return .accepted;
         }
@@ -361,15 +361,43 @@ fn writeBootstrapPage(a: A, binding: Binding, options: Options, context: Context
     return digest;
 }
 
-fn sealBootstrapPages(a: A, binding: Binding, options: Options, context: Context, batch: Batch, pages: []const [32]u8) !void {
+fn sealBootstrapPages(a: A, binding: Binding, options: Options, context: Context, batch: Batch, pages: []const [32]u8, expected_rows: u64) !void {
     if (pages.len > max_bootstrap_pages) return error.LakeWriteTooLarge;
     var opened = try openQueue(a, binding, options);
     defer opened.deinit();
     const base = try prefix(a, opened.prefix, binding, options);
     const stage = try bootstrapStageKey(a, base, batch);
     const manifest = try std.fmt.allocPrint(a, "{s}.manifest", .{stage});
+    var client = opened.client;
+    var total_bytes: usize = 0;
+    var total_rows: usize = 0;
+    for (pages) |digest| {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        var page = try readBootstrapPage(scratch.allocator(), &client, opened.bucket, context, stage, digest);
+        defer page.deinit(client.allocator);
+        if (page.body.len > catalog.types.max_commit_bytes - total_bytes) return error.LakeWriteTooLarge;
+        total_bytes += page.body.len;
+        const rows = try std.json.parseFromSliceLeaky([]const V, scratch.allocator(), page.body, .{});
+        if (rows.len == 0 or rows.len > max_group_changes or rows.len > catalog.row_commit.max_bootstrap_rows - total_rows)
+            return error.InvalidReplicationCheckpoint;
+        total_rows += rows.len;
+    }
+    if (total_rows != expected_rows) return error.InvalidReplicationCheckpoint;
     const bytes = try std.json.Stringify.valueAlloc(a, pages, .{});
     try writeImmutableBootstrap(&opened, context, manifest, bytes);
+}
+
+fn readBootstrapPage(a: A, client: *@import("objectstore").Client, bucket: []const u8, context: Context, stage: []const u8, digest: [32]u8) !@import("objectstore").GetResult {
+    try context.ensureActive();
+    const key = try std.fmt.allocPrint(a, "{s}.pages/{s}", .{ stage, &std.fmt.bytesToHex(digest, .lower) });
+    defer a.free(key);
+    var page = try client.getObject(bucket, key, .{ .cancellation = catalog.types.contextCancellation(&context) });
+    errdefer page.deinit(client.allocator);
+    var actual: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(page.body, &actual, .{});
+    if (!std.mem.eql(u8, &digest, &actual)) return error.ArtifactIntegrityMismatch;
+    return page;
 }
 
 fn readBootstrapPages(a: A, opened: *local.serverless_object_store_support.OpenedObjectStore, context: Context, stage: []const u8, expected: Batch) !?Batch {
@@ -386,15 +414,10 @@ fn readBootstrapPages(a: A, opened: *local.serverless_object_store_support.Opene
     var changes: std.ArrayList(Batch.Change) = .empty;
     var total_bytes: usize = 0;
     for (pages) |digest| {
-        try context.ensureActive();
-        const key = try std.fmt.allocPrint(a, "{s}.pages/{s}", .{ stage, &std.fmt.bytesToHex(digest, .lower) });
-        var page = try client.getObject(opened.bucket, key, .{ .cancellation = cancellation });
+        var page = try readBootstrapPage(a, &client, opened.bucket, context, stage, digest);
         defer page.deinit(client.allocator);
         if (page.body.len > catalog.types.max_commit_bytes - total_bytes) return error.LakeWriteTooLarge;
         total_bytes += page.body.len;
-        var actual: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(page.body, &actual, .{});
-        if (!std.mem.eql(u8, &digest, &actual)) return error.ArtifactIntegrityMismatch;
         const rows = try std.json.parseFromSliceLeaky([]const V, a, page.body, .{ .allocate = .alloc_always });
         if (rows.len > catalog.row_commit.max_bootstrap_rows - changes.items.len) return error.LakeWriteTooLarge;
         for (rows) |row| try changes.append(a, .{ .op = .upsert, .row = row });
@@ -1356,7 +1379,11 @@ test "external lake filesystem WAL applies the managed PostgreSQL stream owner p
     try std.testing.expect(!try port.bootstrap_committed.?(port.ptr, alloc, recovery));
     var seal = snapshot;
     seal.snapshot_rows = null;
+    seal.snapshot_chunks = &.{@splat(0)};
+    try std.testing.expectError(error.FileNotFound, port.stage_bootstrap.?(port.ptr, alloc, seal));
     seal.snapshot_chunks = &.{digest};
+    try std.testing.expectError(error.InvalidReplicationCheckpoint, port.stage_bootstrap.?(port.ptr, alloc, seal));
+    seal.cutover.snapshot_offset = 1;
     try port.stage_bootstrap.?(port.ptr, alloc, seal);
     var queue = try openQueue(a, bound.binding, options);
     defer queue.deinit();
