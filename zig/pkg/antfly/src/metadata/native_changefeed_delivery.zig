@@ -210,7 +210,7 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
         }
 
         fn renderSnapshot(self: *Self, a: A, state: control.State, root: control.Root, other_roots_done: bool, original: ?control.Delivery, limits: delivery.Limits, request: anytype) !delivery.Prepared {
-            if (comptime !@hasDecl(Root, "readBootstrap") or !@hasDecl(Policy, "snapshotImage")) return error.ChangefeedCapabilityUnsupported;
+            if (comptime !@hasDecl(Root, "readBootstrap") or (!@hasDecl(Policy, "snapshotImage") and !@hasDecl(Policy, "snapshotImageFor"))) return error.ChangefeedCapabilityUnsupported;
             const pin = root.snapshot orelse return error.ChangefeedResynchronizationRequired;
             const position = root.snapshot_delivered;
             if (position.done) return error.ChangefeedBackpressure;
@@ -248,7 +248,11 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
             for (page.rows) |row| {
                 try request.ensureActive();
                 const document = try page_types.documentId(a, row.key);
-                const image = try self.policy.snapshotImage(a, state, document, try parseImage(a, row.value), request);
+                const snapshot_value = try parseImage(a, row.value);
+                const image = if (@hasDecl(Policy, "snapshotImageFor"))
+                    try self.policy.snapshotImageFor(a, state, table.table_id, document, snapshot_value, request)
+                else
+                    try self.policy.snapshotImage(a, state, document, snapshot_value, request);
                 if (try projection.project(a, table, projected, .{}, image)) |effect| {
                     const ordinal = start + consumed;
                     const event: SnapshotEvent = .{

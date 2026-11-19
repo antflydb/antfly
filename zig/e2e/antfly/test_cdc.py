@@ -2596,3 +2596,117 @@ def test_public_changefeed_bootstraps_multiple_partitions_and_replays():
             call("DELETE", feed)
     finally:
         server.stop()
+
+
+def test_public_changefeed_multiple_tables_use_independent_row_filters():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as admin, requests.Session() as reader:
+            admin.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            reader.auth = ("reader", "reader")
+            tables = {"feed_gold": "gold", "feed_silver": "silver"}
+            feeds = f"{server.api_url}/changefeeds"
+            grants = [
+                {"resource": table, "resource_type": "table", "type": "replicate"}
+                for table in tables
+            ]
+            expected = {}
+            for table, expected_tier in tables.items():
+                url = f"{server.api_url}/tables/{table}"
+                admin.post(url, json={"num_shards": 1}, timeout=30).raise_for_status()
+                status = admin.get(url, timeout=15)
+                status.raise_for_status()
+                expected[str(status.json()["table_id"])] = expected_tier
+                admin.post(
+                    f"{url}/batch",
+                    json={
+                        "inserts": {tier: {"tier": tier} for tier in tables.values()}
+                    },
+                    timeout=15,
+                ).raise_for_status()
+            users = f"{server.url}/auth/v1/users"
+            admin.post(
+                f"{users}/limited",
+                json={"password": "limited", "initial_policies": grants[:1]},
+                timeout=15,
+            ).raise_for_status()
+            admin.post(
+                f"{users}/reader",
+                json={"password": "reader", "initial_policies": grants},
+                timeout=15,
+            ).raise_for_status()
+            for table, tier in tables.items():
+                admin.put(
+                    f"{users}/reader/row-filters/{table}",
+                    json={"term": {"tier": tier}},
+                    timeout=15,
+                ).raise_for_status()
+
+            definition = {
+                "tables": list(tables),
+                "start": "snapshot_then_changes",
+                "include": "rows",
+            }
+            headers = {"Idempotency-Key": "multi-table-snapshot"}
+            assert (
+                reader.post(
+                    feeds,
+                    auth=("limited", "limited"),
+                    json=definition,
+                    headers=headers,
+                    timeout=15,
+                ).status_code
+                == 403
+            )
+
+            def call(method, url, **options):
+                deadline = time.monotonic() + 30
+                while True:
+                    reply = reader.request(method, url, timeout=15, **options)
+                    if (
+                        reply.status_code != 503
+                        and not (
+                            reply.status_code == 409
+                            and "changefeed_retry_required" in reply.text
+                        )
+                    ) or time.monotonic() >= deadline:
+                        reply.raise_for_status()
+                        return reply
+                    time.sleep(0.2)
+
+            enrollment = call("POST", feeds, json=definition, headers=headers).json()
+            definition["tables"].reverse()
+            assert (
+                call("POST", feeds, json=definition, headers=headers).json()
+                == enrollment
+            )
+            feed = f"{feeds}/{enrollment['id']}"
+            cursor = enrollment["cursor"]
+            seen = {}
+            for _ in range(6):
+                reply = call(
+                    "GET", f"{feed}/events", params={"after": cursor, "limit": 1}
+                )
+                page = reply.json()
+                cursor = reply.headers["Antfly-Changefeed-Cursor"]
+                for event in page["events"]:
+                    assert event["table_id"] not in seen
+                    seen[event["table_id"]] = event["after"]["tier"]
+                call("POST", f"{feed}/ack", json={"cursor": cursor})
+                if page["snapshot"]["complete"]:
+                    break
+            else:
+                pytest.fail(server.debug_logs())
+            assert seen == expected
+
+            admin.put(
+                f"{users}/reader/row-filters/feed_silver",
+                json={"term": {"tier": "gold"}},
+                timeout=15,
+            ).raise_for_status()
+            denied = reader.get(f"{feed}/events", params={"after": cursor}, timeout=15)
+            assert denied.status_code == 409, denied.text
+            assert "events" not in denied.json()
+    finally:
+        server.stop()
