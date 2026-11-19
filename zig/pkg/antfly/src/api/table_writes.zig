@@ -32909,7 +32909,7 @@ fn encodeRemoteBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReq
     // Both routed and legacy group endpoints consume the internal batch wire
     // contract. A separate document-only serializer silently dropped topology
     // authority (and ordinary predicates, timestamps, and sync requirements).
-    return try batch_api.encodeBatchRequest(alloc, req);
+    return try batch_api.encodeRoutedBatchRequest(alloc, req);
 }
 
 /// Encodes the canonical internal batch wire contract for the compiled storage

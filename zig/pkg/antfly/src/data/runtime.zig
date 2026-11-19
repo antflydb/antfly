@@ -14648,8 +14648,7 @@ pub const DataServer = struct {
             return error.OnlineMergeArtifactCatalogUncoordinated;
         const raft = self.data_raft orelse return error.UnsupportedOperation;
         var proposal_req = req;
-        const completion_begin = if (req.transaction) |txn| txn == .begin and txn.begin.completion_owner != null else false;
-        const minimum_protocol_version = if (completion_begin or data_raft_batch.isFrozenPrepare(req))
+        const minimum_protocol_version = if (@import("antfly_local_sources").api_internal_batch.requiresExactPrepareProtocol(req))
             data_raft_batch.exact_prepare_protocol_version
         else
             try requiredRaftBatchProtocolVersion(alloc, req);
@@ -15267,7 +15266,7 @@ pub const DataServer = struct {
                                     self.api_server_cfg.internal_service_secret,
                                     self.api_server_cfg.internal_service_issuer,
                                 );
-                                const body = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(alloc, proposal_req);
+                                const body = try @import("antfly_local_sources").api_internal_batch.encodeRoutedBatchRequest(alloc, proposal_req);
                                 defer alloc.free(body);
                                 const forwarding = self.nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse {
                                     try self.sleepDataRaftBatchLeaderRetry();
@@ -15490,7 +15489,7 @@ pub const DataServer = struct {
             self.api_server_cfg.internal_service_secret,
             self.api_server_cfg.internal_service_issuer,
         );
-        const body = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(alloc, req);
+        const body = try @import("antfly_local_sources").api_internal_batch.encodeRoutedBatchRequest(alloc, req);
         defer alloc.free(body);
         const forwarding = self.nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse return false;
         const encoded_route_fence = if (route.write_route_fence) |fence|

@@ -655,8 +655,26 @@ pub fn parseBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatch
     return takePublic(&owned);
 }
 
+const exact_prepare_envelope = "exact-prepare-batch-v1";
+
+pub fn requiresExactPrepareProtocol(request: db_mod.types.BatchRequest) bool {
+    return switch (request.transaction orelse return false) {
+        .begin => |begin| begin.completion_owner != null,
+        .prepare => |prepare| prepare.completion_owner != null,
+        else => false,
+    };
+}
+
 pub fn parseInternalBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatchRequest {
-    return parsePrivateBatchRequest(alloc, body, false);
+    if (!std.mem.startsWith(u8, body, "[\"" ++ exact_prepare_envelope ++ "\","))
+        return parsePrivateBatchRequest(alloc, body, false);
+    const envelope = std.json.parseFromSlice([2][]const u8, alloc, body, .{}) catch |err|
+        return if (err == error.OutOfMemory) err else error.InvalidBatchRequest;
+    defer envelope.deinit();
+    var parsed = try parsePrivateBatchRequest(alloc, envelope.value[1], false);
+    errdefer parsed.deinit(alloc);
+    if (!requiresExactPrepareProtocol(parsed.req)) return error.InvalidBatchRequest;
+    return parsed;
 }
 
 /// Only the local owner entry point may evaluate predicates without a
@@ -1977,6 +1995,16 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         error.WriteFailed => error.OutOfMemory,
         else => err,
     };
+}
+
+/// A pre-upgrade leader rejects the new envelope before proposing anything.
+/// Preserve the plan's numeric tokens and let the aware proposer enforce the
+/// exact PREPARE floor for every applying Raft voter.
+pub fn encodeRoutedBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
+    const body = try encodeBatchRequest(alloc, req);
+    if (!requiresExactPrepareProtocol(req)) return body;
+    defer alloc.free(body);
+    return std.json.Stringify.valueAlloc(alloc, [2][]const u8{ exact_prepare_envelope, body }, .{});
 }
 
 /// A local compiled owner evaluates optimistic predicates under its apply
@@ -4121,6 +4149,13 @@ test "completion begin wire carries matching v2 routed owner and rejects missing
     var parsed = try parseInternalBatchRequest(a, encoded);
     defer parsed.deinit(a);
     try std.testing.expectEqualDeep(owner, parsed.req.transaction.?.begin.completion_owner.?);
+    const routed = try encodeRoutedBatchRequest(a, request);
+    defer a.free(routed);
+    var routed_request = try parseInternalBatchRequest(a, routed);
+    defer routed_request.deinit(a);
+    try std.testing.expectEqualDeep(owner, routed_request.req.transaction.?.begin.completion_owner.?);
+    try std.testing.expectError(error.InvalidBatchRequest, parseOwnerBatchRequest(a, routed));
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, "[\"exact-prepare-batch-v1\",\"{}\"]"));
     request.transaction.?.begin.completion_owner = null;
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, request));
     request.transaction.?.begin.completion_owner = owner;
@@ -4161,6 +4196,13 @@ test "completion begin wire prepare owner survives guarded replay and refuses le
         const replay = try completionPrepareInput(a, parsed.req);
         defer a.free(replay);
         try std.testing.expectEqualStrings(encoded, replay);
+        const routed = try encodeRoutedBatchRequest(a, request);
+        defer a.free(routed);
+        var routed_request = try parseInternalBatchRequest(a, routed);
+        defer routed_request.deinit(a);
+        const routed_prepare = try completionPrepareInput(a, routed_request.req);
+        defer a.free(routed_prepare);
+        try std.testing.expectEqualStrings(encoded, routed_prepare);
         const downgraded = try std.mem.replaceOwned(u8, a, encoded, "prepare_completion_v1", "prepare");
         defer a.free(downgraded);
         try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, downgraded));
