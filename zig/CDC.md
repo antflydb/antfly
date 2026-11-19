@@ -22,6 +22,11 @@ transactions in `pgoutput` format and advances retention after durable client
 feedback. This deployment path currently serves one native history root and
 requires slot creation with `NOEXPORT_SNAPSHOT`.
 
+The production e2e test uses PostgreSQL 18.6 `pg_recvlogical` with
+`proto_version=1`. It creates a publication and slot, streams and acknowledges
+a coordinated SQL insert, restarts both Antfly processes, verifies that the
+acknowledged transaction is not replayed, and drops the slot.
+
 Provision a dedicated mounted directory for the slot spool. Every data node
 serving the publication or reclaiming its spool must see the same files and
 fencing inventory. The filesystem must provide cross-node advisory locking,
