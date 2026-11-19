@@ -343,6 +343,7 @@ pub const CatalogReplicationSlots = struct {
     database_name: []const u8,
     database: control.Digest,
     system_identifier: u64,
+    database_oid: ?u32 = null,
 
     pub fn open(server: *http.ApiHttpServer, identity: ReplicationIdentity, a: std.mem.Allocator, database_name: []const u8, context: operation.RequestContext) !CatalogReplicationSlots {
         var authenticated = try identity.read(identity.context, a);
@@ -351,7 +352,7 @@ pub const CatalogReplicationSlots = struct {
         const cut = try readDatabaseCut(server, a, database_name, context);
         const cluster = control.hash(.{ .domain = "antfly:pg-system-identity:v1", .group = cut.metadata_group_id, .incarnation = cut.metadata_incarnation });
         const system = @max(1, std.mem.readInt(u64, cluster[0..8], .big));
-        return .{ .server = server, .identity = identity, .database_name = database_name, .database = publicationDatabaseKey(cut), .system_identifier = system };
+        return .{ .server = server, .identity = identity, .database_name = database_name, .database = publicationDatabaseKey(cut), .system_identifier = system, .database_oid = std.math.cast(u32, cut.database_id) };
     }
 
     fn readDatabase(server: *http.ApiHttpServer, a: std.mem.Allocator, name: []const u8, context: operation.RequestContext) !control.Digest {
@@ -2955,6 +2956,7 @@ const GuardedCatalog = struct {
         try self.checkTableRead(table);
         if (system.isRoles(table)) return system.scanRole(alloc, request, try self.catalogRole());
         if (system.isEmpty(table)) return .{ .rows = &.{} };
+        if (system.isReplicationSlots(table)) return self.replicationSlotPage(alloc, request);
         if (system.isNamespaces(table)) {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
@@ -3106,6 +3108,7 @@ const GuardedCatalog = struct {
     fn openSystemScan(self: *GuardedCatalog, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {
         if (system.isRoles(table)) return system.openRole(alloc, request, try self.catalogRole());
         if (system.isEmpty(table)) return system.openEmpty(self);
+        if (system.isReplicationSlots(table)) return system.openReplicationSlot(alloc, try self.replicationSlotPage(alloc, request));
         if (system.isNamespaces(table)) {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
@@ -3113,6 +3116,36 @@ const GuardedCatalog = struct {
         }
         return system.open(alloc, request);
     }
+    fn replicationSlotPage(self: *GuardedCatalog, alloc: std.mem.Allocator, request: catalog.Scan) !catalog.Page {
+        const name = (try system.slotName(request)) orelse return .{ .rows = &.{} };
+        if (!publication_control.pg_slot.validName(name) or request.limit == 0 or request.after != null) return .{ .rows = &.{} };
+        const server = self.authority.server orelse return error.UnsupportedReplicationMode;
+        if (server.source.changefeeds == null) return .{ .rows = &.{} };
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const identity: ReplicationIdentity = .{ .context = self.authority.credential, .read = Adapter.replicationIdentity };
+        const context = try self.authority.context();
+        const slots = try CatalogReplicationSlots.open(server, identity, a, self.authority.request.database orelse "default", context);
+        var observed = slots.readOwned(a, name, context) catch |err| switch (err) {
+            error.ReplicationSlotNotFound, error.Forbidden => return .{ .rows = &.{} },
+            else => return err,
+        };
+        defer observed.deinit();
+        const slot = observed.value.slot.?;
+        const phase = observed.value.phase;
+        if (phase == .deleted) return .{ .rows = &.{} };
+        const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_s;
+        return system.replicationSlotPage(alloc, request, .{
+            .name = slot.name,
+            .database = slots.database_name,
+            .database_oid = slots.database_oid,
+            .confirmed_lsn = slot.confirmed_lsn,
+            .active = slot.session != null and slot.session_expires_at > now,
+            .lost = phase == .reset_required or phase == .closing or observed.value.expiryDue(now),
+        });
+    }
+
     fn settingCapture(self: *GuardedCatalog, alloc: std.mem.Allocator, adapter: *execution.Adapter, compiled: *const compiler.Compiled) !@FieldType(catalog.Backend, "setting_capture") {
         if (!compiled.uses_current_setting) return null;
         var capture = adapter.settingCapture().?;

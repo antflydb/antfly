@@ -25,6 +25,7 @@ const pg_type_storage = "\x00pg_catalog.pg_type";
 const pg_catalog_oid = 11;
 const pg_namespace_storage = "\x00pg_catalog.pg_namespace";
 const pg_auth_members_storage = "\x00pg_catalog.pg_auth_members";
+const pg_replication_slots_storage = "\x00pg_catalog.pg_replication_slots";
 const pg_enum_storage = "\x00pg_catalog.pg_enum";
 const pg_roles_storage = "\x00pg_catalog.pg_roles";
 pub const Role = struct {
@@ -37,7 +38,8 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
     const members = std.mem.eql(u8, name.table, "pg_auth_members");
     const namespaces = std.mem.eql(u8, name.table, "pg_namespace");
     const enums = std.mem.eql(u8, name.table, "pg_enum");
-    if (!roles and !members and !namespaces and !enums and !std.mem.eql(u8, name.table, pg_type_name)) return null;
+    const slots = std.mem.eql(u8, name.table, "pg_replication_slots");
+    if (!roles and !members and !namespaces and !enums and !slots and !std.mem.eql(u8, name.table, pg_type_name)) return null;
     if (name.namespace) |namespace| if (!std.mem.eql(u8, namespace, "pg_catalog")) return null;
     if (name.database) |qualified| if (!std.mem.eql(u8, qualified, database)) return error.Forbidden;
     if (action != .read) return error.SqlReadOnlyTransaction;
@@ -49,6 +51,30 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
         .columns = &.{
             .{ .name = "oid", .path = "oid", .type = .integer, .nullable = false },
             .{ .name = "nspname", .path = "nspname", .type = .string, .nullable = false },
+        },
+    };
+    if (slots) return .{
+        .id = 12001,
+        .physical_name = pg_replication_slots_storage,
+        .schema_version = 1,
+        .scope = .{ .database = database, .namespace = "pg_catalog", .name = "pg_replication_slots", .revision = 1 },
+        .columns = &.{
+            .{ .name = "slot_name", .path = "slot_name", .type = .string, .nullable = false },
+            .{ .name = "plugin", .path = "plugin", .type = .string, .nullable = false },
+            .{ .name = "slot_type", .path = "slot_type", .type = .string, .nullable = false },
+            .{ .name = "datoid", .path = "datoid", .type = .integer, .nullable = true },
+            .{ .name = "database", .path = "database", .type = .string, .nullable = false },
+            .{ .name = "temporary", .path = "temporary", .type = .boolean, .nullable = false },
+            .{ .name = "active", .path = "active", .type = .boolean, .nullable = false },
+            .{ .name = "active_pid", .path = "active_pid", .type = .integer, .nullable = true },
+            .{ .name = "xmin", .path = "xmin", .type = .integer, .nullable = true },
+            .{ .name = "catalog_xmin", .path = "catalog_xmin", .type = .integer, .nullable = true },
+            .{ .name = "restart_lsn", .path = "restart_lsn", .type = .string, .nullable = true },
+            .{ .name = "confirmed_flush_lsn", .path = "confirmed_flush_lsn", .type = .string, .nullable = true },
+            .{ .name = "wal_status", .path = "wal_status", .type = .string, .nullable = false },
+            .{ .name = "safe_wal_size", .path = "safe_wal_size", .type = .integer, .nullable = true },
+            .{ .name = "two_phase", .path = "two_phase", .type = .boolean, .nullable = false },
+            .{ .name = "conflicting", .path = "conflicting", .type = .boolean, .nullable = false },
         },
     };
     if (enums) return .{
@@ -116,7 +142,87 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
 }
 
 pub fn owns(table: catalog.Table) bool {
-    return std.mem.eql(u8, table.physical_name, pg_type_storage) or isRoles(table) or isEmpty(table) or isNamespaces(table);
+    return std.mem.eql(u8, table.physical_name, pg_type_storage) or isRoles(table) or isEmpty(table) or isNamespaces(table) or isReplicationSlots(table);
+}
+
+pub fn isReplicationSlots(table: catalog.Table) bool {
+    return std.mem.eql(u8, table.physical_name, pg_replication_slots_storage);
+}
+
+pub const ReplicationSlot = struct {
+    name: []const u8,
+    database: []const u8,
+    database_oid: ?u32,
+    confirmed_lsn: u64,
+    active: bool,
+    lost: bool,
+};
+
+pub fn slotName(request: catalog.Scan) !?[]const u8 {
+    if (request.search != null) return error.UnsupportedSqlShape;
+    var name: ?[]const u8 = null;
+    for (request.conditions) |condition| {
+        if (condition.op != .eq or !std.mem.eql(u8, condition.column, "slot_name")) continue;
+        if (condition.value == .null) return null;
+        if (condition.value != .string) return error.SqlTypeMismatch;
+        if (name) |prior| if (!std.mem.eql(u8, prior, condition.value.string)) return null;
+        name = condition.value.string;
+    }
+    return name orelse error.UnsupportedSqlShape;
+}
+
+pub fn replicationSlotPage(a: std.mem.Allocator, request: catalog.Scan, item: ?ReplicationSlot) !catalog.Page {
+    const slot = item orelse return .{ .rows = &.{} };
+    if (try startOf(request.after, 1) != 0 or request.limit == 0) return .{ .rows = &.{} };
+    var arena = std.heap.ArenaAllocator.init(a);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+    const formatLsn = @import("../pgwire/replication_commands.zig").formatLsn;
+    const confirmed = try formatLsn(alloc, @fromBackingInt(@intCast(slot.confirmed_lsn)));
+    var row_value: std.json.ObjectMap = .empty;
+    try row_value.put(alloc, "slot_name", .{ .string = try alloc.dupe(u8, slot.name) });
+    try row_value.put(alloc, "plugin", .{ .string = "pgoutput" });
+    try row_value.put(alloc, "slot_type", .{ .string = "logical" });
+    try row_value.put(alloc, "database", .{ .string = try alloc.dupe(u8, slot.database) });
+    try row_value.put(alloc, "active", .{ .bool = slot.active });
+    try row_value.put(alloc, "wal_status", .{ .string = if (slot.lost) "lost" else "reserved" });
+    try row_value.put(alloc, "restart_lsn", if (slot.lost) .null else .{ .string = confirmed });
+    try row_value.put(alloc, "confirmed_flush_lsn", .{ .string = confirmed });
+    inline for (.{ "temporary", "two_phase", "conflicting" }) |flag| try row_value.put(alloc, flag, .{ .bool = false });
+    try row_value.put(alloc, "datoid", if (slot.database_oid) |oid| .{ .integer = oid } else .null);
+    inline for (.{ "active_pid", "xmin", "catalog_xmin", "safe_wal_size" }) |field| try row_value.put(alloc, field, .null);
+    for (request.conditions) |condition| {
+        if (try conditionMatches(row_value.get(condition.column) orelse return error.InvalidSqlBackendResponse, condition)) continue;
+        arena.deinit();
+        return .{ .rows = &.{} };
+    }
+    const rows = try alloc.alloc(catalog.Row, 1);
+    rows[0] = .{ .id = row_value.get("slot_name").?.string, .version = 1, .value = .{ .object = row_value } };
+    return .{ .rows = rows, .owned_arena = arena };
+}
+
+pub fn openReplicationSlot(a: std.mem.Allocator, snapshot: catalog.Page) !catalog.Cursor {
+    const Single = struct {
+        allocator: std.mem.Allocator,
+        page: catalog.Page,
+        fn next(raw: *anyopaque, _: std.mem.Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (limit == 0) return .{ .rows = &.{} };
+            const result = self.page;
+            self.page = .{ .rows = &.{} };
+            return result;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.page.deinit();
+            self.allocator.destroy(self);
+        }
+    };
+    const owned = snapshot;
+    errdefer owned.deinit();
+    const cursor = try a.create(Single);
+    cursor.* = .{ .allocator = a, .page = owned };
+    return .{ .ptr = cursor, .next = Single.next, .close = Single.close, .estimated_rows = @intCast(snapshot.rows.len) };
 }
 
 pub fn isNamespaces(table: catalog.Table) bool {
@@ -134,22 +240,27 @@ pub fn namespaceMatches(item: Namespace, conditions: []const catalog.Condition) 
             .{ .string = item.name }
         else
             return error.InvalidSqlBackendResponse;
-        if (condition.op == .is_null) return false;
-        if (condition.op == .is_not_null) continue;
-        if (condition.value == .null) return false;
-        const order = try local.sql_scalar.compare(value, condition.value);
-        if (!switch (condition.op) {
-            .eq => order == .eq,
-            .neq => order != .eq,
-            .lt => order == .lt,
-            .lte => order != .gt,
-            .gt => order == .gt,
-            .gte => order != .lt,
-            .is_null, .is_not_null => unreachable,
-        }) return false;
+        if (!try conditionMatches(value, condition)) return false;
     }
     return true;
 }
+
+fn conditionMatches(value: std.json.Value, condition: catalog.Condition) !bool {
+    if (condition.op == .is_null) return value == .null;
+    if (condition.op == .is_not_null) return value != .null;
+    if (value == .null or condition.value == .null) return false;
+    const order = try local.sql_scalar.compare(value, condition.value);
+    return switch (condition.op) {
+        .eq => order == .eq,
+        .neq => order != .eq,
+        .lt => order == .lt,
+        .lte => order != .gt,
+        .gt => order == .gt,
+        .gte => order != .lt,
+        .is_null, .is_not_null => unreachable,
+    };
+}
+
 pub fn namespaceOid(id: u64) u32 {
     if (id == local.system_catalog_domain.default_namespace_id) return 2200;
     var encoded: [8]u8 = undefined;
@@ -432,6 +543,34 @@ test "pgwire pg_roles describes only the supplied authenticated role" {
     var exhausted = try cursor.next(cursor.ptr, a, 1);
     defer exhausted.deinit();
     try std.testing.expectEqual(@as(usize, 0), exhausted.rows.len);
+}
+
+test "pgwire pg_replication_slots keyed catalog applies every pushed condition" {
+    const a = std.testing.allocator;
+    const name: ast.Name = .{ .namespace = "pg_catalog", .table = "pg_replication_slots" };
+    const table = (try resolve(name, .read, "default")).?;
+    try std.testing.expect(owns(table));
+    try std.testing.expect(isReplicationSlots(table));
+    try std.testing.expectError(error.SqlReadOnlyTransaction, resolve(name, .write, "default"));
+    const lookup: catalog.Scan = .{ .fields = &.{}, .limit = 10, .conditions = &.{
+        .{ .column = "slot_name", .op = .eq, .value = .{ .string = "docs" } },
+        .{ .column = "database", .op = .eq, .value = .{ .string = "default" } },
+        .{ .column = "plugin", .op = .eq, .value = .{ .string = "pgoutput" } },
+    } };
+    try std.testing.expectEqualStrings("docs", (try slotName(lookup)).?);
+    const saved: ReplicationSlot = .{ .name = "docs", .database = "default", .database_oid = 1, .confirmed_lsn = 0x1_00000004, .active = true, .lost = false };
+    const cursor = try openReplicationSlot(a, try replicationSlotPage(a, lookup, saved));
+    defer cursor.close(cursor.ptr);
+    const first = try cursor.next(cursor.ptr, a, 1);
+    defer first.deinit();
+    const attrs = first.rows[0].value.object;
+    try std.testing.expect(attrs.get("active").?.bool);
+    try std.testing.expectEqualStrings("1/4", attrs.get("confirmed_flush_lsn").?.string);
+    try std.testing.expectEqualStrings("reserved", attrs.get("wal_status").?.string);
+    try std.testing.expectEqual(@as(usize, 0), (try cursor.next(cursor.ptr, a, 1)).rows.len);
+    var other_database = saved;
+    other_database.database = "other";
+    try std.testing.expectEqual(@as(usize, 0), (try replicationSlotPage(a, lookup, other_database)).rows.len);
 }
 
 test "pgwire pg_enum resolves as a read-only catalog with an empty cursor" {

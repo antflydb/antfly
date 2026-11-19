@@ -77,6 +77,23 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             timeout=40,
         )
 
+    def catalog_slot(name="smoke_slot", plugin="pgoutput"):
+        result = subprocess.check_output(
+            [psql, *connection, "-XAt", "-v", "ON_ERROR_STOP=1"],
+            input=(
+                "SELECT * FROM pg_replication_slots WHERE slot_name = $1 AND database = $2 AND plugin = $3 "
+                f"\\bind {name} default {plugin}\n\\g\n"
+            ),
+            text=True,
+            env=env,
+            timeout=40,
+        ).splitlines()
+        columns = (0, 1, 6, 10, 11, 12)
+        return [
+            [fields[column] for column in columns]
+            for fields in (line.split("|") for line in result)
+        ]
+
     @contextmanager
     def stream(output):
         with output.with_suffix(".log").open("wb") as log:
@@ -248,6 +265,7 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
         if export_snapshot:
             sql("ALTER TABLE smoke REPLICA IDENTITY FULL")
         sql("CREATE PUBLICATION changes FOR TABLE smoke")
+        assert catalog_slot() == []
         if export_snapshot:
             sql("INSERT INTO smoke (id, content) VALUES (6, 'snapshot-before-cut')")
             exporter_connection = [
@@ -309,6 +327,11 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             ]
         else:
             slot("--create-slot", "--plugin=pgoutput")
+        (created,) = catalog_slot()
+        assert created[:3] == ["smoke_slot", "pgoutput", "f"]
+        assert created[3] == created[4] and "/" in created[4]
+        assert created[5] == "reserved"
+        assert catalog_slot(plugin="wrong_plugin") == []
         first = tmp_path / "first.bin"
         with stream(first) as reader:
             sql("INSERT INTO smoke (id, content) VALUES (7, 'retained-stream-smoke')")
@@ -330,6 +353,9 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             time.sleep(12)
 
         server.restart()
+        (recovered,) = catalog_slot()
+        assert recovered[:3] == ["smoke_slot", "pgoutput", "f"]
+        assert recovered[4] != created[4]
         resumed = tmp_path / "resumed.bin"
         with stream(resumed) as reader:
             time.sleep(4)
@@ -337,6 +363,7 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             assert resumed.is_file()
         assert resumed.read_bytes() == b""
         slot("--drop-slot")
+        assert catalog_slot() == []
     except Exception:
         print(server.debug_logs())
         raise
