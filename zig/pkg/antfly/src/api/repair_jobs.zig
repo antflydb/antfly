@@ -1141,30 +1141,42 @@ pub const Store = struct {
     // cursor. Retired epochs and cancelled jobs are reclaimed incrementally.
     fn cleanupParkedPagesLocked(self: *Store) !void {
         const queue = self.parkedStoreLocked() orelse return;
-        const results = try queue.scanPrefixPage(self.alloc, ParkedPageKey.prefix, if (self.parked_page_cleanup_cursor) |*key| key else null, durable_cleanup_scan_limit);
-        defer docstore_mod.DocStore.freeResults(self.alloc, results);
+        const keys = try queue.scanPrefixKeysPage(self.alloc, ParkedPageKey.prefix, if (self.parked_page_cleanup_cursor) |*key| key else null, durable_cleanup_scan_limit);
+        defer {
+            for (keys) |key| self.alloc.free(key);
+            self.alloc.free(keys);
+        }
         var deletes: [durable_cleanup_scan_limit][]const u8 = undefined;
         var count: usize = 0;
-        for (results) |entry| {
+        var previous_job_id: ?u64 = null;
+        var live_epoch: ?u64 = null;
+        for (keys) |key| {
             const prefix_len = ParkedPageKey.prefix.len;
             const stale = blk: {
-                if (entry.key.len != @sizeOf(ParkedPageKey.Key)) break :blk true;
-                const job_id = std.mem.readInt(u64, entry.key[prefix_len..][0..8], .big);
-                const epoch = std.mem.readInt(u64, entry.key[prefix_len + 8 ..][0..8], .big);
-                const encoded = (try self.loadJobLocked(job_id)) orelse break :blk true;
-                var parsed = try std.json.parseFromSlice(JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
-                defer parsed.deinit();
-                break :blk parsed.value.document_page_epoch != epoch or parsed.value.cancel_requested or isTerminalPhase(parsed.value.phase);
+                if (key.len != @sizeOf(ParkedPageKey.Key)) break :blk true;
+                const job_id = std.mem.readInt(u64, key[prefix_len..][0..8], .big);
+                const epoch = std.mem.readInt(u64, key[prefix_len + 8 ..][0..8], .big);
+                if (previous_job_id == null or previous_job_id.? != job_id) {
+                    previous_job_id = job_id;
+                    live_epoch = null;
+                    if (try self.loadJobLocked(job_id)) |encoded| {
+                        var parsed = try std.json.parseFromSlice(JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
+                        defer parsed.deinit();
+                        if (!parsed.value.cancel_requested and !isTerminalPhase(parsed.value.phase))
+                            live_epoch = parsed.value.document_page_epoch;
+                    }
+                }
+                break :blk live_epoch == null or live_epoch.? != epoch;
             };
             if (stale) {
-                deletes[count] = entry.key;
+                deletes[count] = key;
                 count += 1;
             }
         }
         if (count != 0) try queue.putBatch(&.{}, deletes[0..count]);
         self.parked_page_cleanup_cursor = null;
-        if (results.len == durable_cleanup_scan_limit) {
-            const last = results[results.len - 1].key;
+        if (keys.len == durable_cleanup_scan_limit) {
+            const last = keys[keys.len - 1];
             if (last.len == @sizeOf(ParkedPageKey.Key)) self.parked_page_cleanup_cursor = last[0..@sizeOf(ParkedPageKey.Key)].*;
         }
     }
@@ -3070,8 +3082,19 @@ test "table repair job persists a large parked backlog separately across restart
     defer reset_state.deinit();
     try std.testing.expectEqual(selected.value.document_page_epoch + 1, reset_state.value.document_page_epoch);
     try std.testing.expect(!reset_state.value.resume_document_page and reset_state.value.cursor == null);
+    const active_prefix = ParkedPageKey.jobEpoch(job_id, reset_state.value.document_page_epoch);
+    const active_key = ParkedPageKey.encode(active_prefix, 0, reset_state.value.attempt_id, 0);
+    const queue = store.opened_store.?.docstore;
+    try queue.putBatch(&.{.{ .key = &active_key, .value = long_cursor }}, &.{});
     store.cleanupExpiredJobs();
     const retired = try store.opened_store.?.docstore.scanPrefixPage(alloc, &prefix, null, 1);
     defer docstore_mod.DocStore.freeResults(alloc, retired);
     try std.testing.expectEqual(@as(usize, 0), retired.len);
+    const active = try queue.scanPrefixKeysPage(alloc, &active_prefix, null, 1);
+    defer {
+        for (active) |key| alloc.free(key);
+        alloc.free(active);
+    }
+    try std.testing.expectEqual(@as(usize, 1), active.len);
+    try std.testing.expectEqualSlices(u8, &active_key, active[0]);
 }

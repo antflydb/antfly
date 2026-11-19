@@ -146,8 +146,7 @@ fn resolveCatalogGroupsFencedEventually(
             defer plan.deinit(alloc);
             const ids = try plan.groupIdsAllocUntil(alloc, budget);
             if (routing_fence) |fence| {
-                var digest = std.hash.Wyhash.init(plan.topology_epoch);
-                digest.update(std.mem.asBytes(&plan.table_id));
+                var digest = table_catalog.repairFenceDigest(plan.topology_epoch, plan.table_id);
                 digest.update(std.mem.sliceAsBytes(ids));
                 fence.* = digest.final();
             }
@@ -1027,6 +1026,64 @@ fn parseArtifactRepairTableCursor(cursor: ?[]const u8) !?ArtifactRepairTableCurs
     const sep = std.mem.indexOfScalar(u8, raw, ':') orelse return error.InvalidArgument;
     const group_id = try std.fmt.parseUnsigned(u64, raw[0..sep], 10);
     return .{ .group_id = group_id, .local_cursor = raw[sep + 1 ..] };
+}
+
+const ArtifactRepairRouting = struct {
+    group_ids: []u64,
+    fence: ?u64,
+};
+
+const ArtifactRepairRouteSelection = union(enum) {
+    all,
+    group: u64,
+    fence_only,
+};
+
+fn resolveArtifactRepairRouting(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    selection: ArtifactRepairRouteSelection,
+) !ArtifactRepairRouting {
+    const timeout_ns = 5 * std.time.ns_per_s;
+    if (selection != .all) {
+        if (catalog.vtable.acquire_routing_generation) |acquire| {
+            const budget = catalog.budget(catalog.budget(null).nowNs() +| timeout_ns);
+            // The remote route authority normally supplies the full span.
+            // Preserve its read barrier while reusing the retained indexes.
+            const authoritative = catalog.vtable.await_route != null;
+            const generation = try acquire(catalog.ptr, budget, authoritative);
+            var session = generation.session(alloc, catalog, authoritative);
+            defer session.deinit();
+            if (try session.repairRoutingView(table_name, budget)) |view| {
+                const group_ids: []u64 = switch (selection) {
+                    .group => |group_id| blk: {
+                        _ = session.rangeForGroup(view.table_id, group_id, budget) catch |err| switch (err) {
+                            error.TopologyChanged => break :blk &.{},
+                            else => return err,
+                        };
+                        break :blk try alloc.dupe(u64, &.{group_id});
+                    },
+                    else => &.{},
+                };
+                return .{ .group_ids = group_ids, .fence = view.fence };
+            }
+        }
+    }
+
+    // Keep the standard publication wait for a missing table and for
+    // catalog sources without a retained routing generation.
+    var fence: u64 = 0;
+    const ids = try resolveCatalogGroupsFencedEventually(alloc, catalog, table_name, "", "", timeout_ns, 10, &fence);
+    if (selection == .all) return .{ .group_ids = ids, .fence = if (ids.len != 0) fence else null };
+    defer alloc.free(ids);
+    return .{
+        .group_ids = switch (selection) {
+            .group => |group_id| if (std.mem.indexOfScalar(u64, ids, group_id) != null) try alloc.dupe(u64, &.{group_id}) else &.{},
+            else => &.{},
+        },
+        .fence = if (ids.len != 0) fence else null,
+    };
 }
 
 fn formatArtifactRepairTableCursorAlloc(alloc: std.mem.Allocator, group_id: u64, local_cursor: ?[]const u8) ![]u8 {
@@ -24485,26 +24542,22 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
 
-        var routing_fence: u64 = 0;
-        const current_group_ids = try resolveCatalogGroupsFencedEventually(
-            alloc,
-            self.catalog,
-            table_name,
-            "",
-            "",
-            5 * std.time.ns_per_s,
-            10,
-            &routing_fence,
-        );
+        const parked_cursor = if (options.resume_document_page)
+            (try parseArtifactRepairTableCursor(req.cursor)) orelse return error.InvalidArgument
+        else
+            null;
+        const routing = try resolveArtifactRepairRouting(alloc, self.catalog, table_name, if (parked_cursor) |cursor| .{ .group = cursor.group_id } else .all);
+        const current_group_ids = routing.group_ids;
         defer alloc.free(current_group_ids);
-        if (current_group_ids.len == 0) return null;
-        const group_ids = options.observe_index_groups orelse current_group_ids;
+        if (routing.fence == null) return null;
+        const observe_groups = if (parked_cursor != null) null else options.observe_index_groups;
+        const group_ids = observe_groups orelse current_group_ids;
         var pass_request = req;
-        pass_request.observe_index_repair = options.observe_index_groups != null;
+        pass_request.observe_index_repair = observe_groups != null;
         pass_request.resume_document_repair = options.resume_document_page;
         const durable_index_job = req.target == .index and req.repair_job_id != null;
         const track_pending = durable_index_job and req.control == null;
-        const repair_groups: ?u64 = if (durable_index_job) routing_fence else null;
+        const repair_groups: ?u64 = if (durable_index_job) routing.fence else null;
         if (options.expected_repair_groups != null and !std.meta.eql(options.expected_repair_groups, repair_groups))
             return .{ .observed_only = true, .observation_changed = true, .repair_groups = repair_groups };
 
@@ -24513,7 +24566,7 @@ pub const ProvisionedTableWriteSource = struct {
         var pending_pages: std.ArrayList([]u8) = .empty;
         defer freePendingRepairPages(alloc, &pending_pages);
 
-        const parsed_cursor = try parseArtifactRepairTableCursor(req.cursor);
+        const parsed_cursor = if (options.resume_document_page) parked_cursor else try parseArtifactRepairTableCursor(req.cursor);
         var start_index: usize = 0;
         var start_cursor: ?[]const u8 = null;
         if (parsed_cursor) |cursor| {
@@ -24528,10 +24581,9 @@ pub const ProvisionedTableWriteSource = struct {
         var total = db_mod.types.ArtifactRepairResult{ .limit = req.limit, .observed_only = pass_request.observe_index_repair or options.resume_document_page, .repair_groups = repair_groups };
         errdefer total.deinit(alloc);
         var groups_scanned: usize = 0;
-        const traversal = if (options.resume_document_page) group_ids[start_index..][0..1] else group_ids[start_index..];
-        for (traversal, start_index..) |group_id, idx| {
+        for (group_ids[start_index..], start_index..) |group_id, idx| {
             if (options.cancelled()) return error.Canceled;
-            if (options.observe_index_groups != null and std.mem.indexOfScalar(u64, current_group_ids, group_id) == null) {
+            if (observe_groups != null and std.mem.indexOfScalar(u64, current_group_ids, group_id) == null) {
                 total.observation_changed = true;
                 break;
             }
@@ -24568,10 +24620,8 @@ pub const ProvisionedTableWriteSource = struct {
         }
         if (durable_index_job) {
             if (!total.has_more and !total.observation_changed and total.in_progress == 0) {
-                var current_fence: u64 = 0;
-                const verified = try resolveCatalogGroupsFencedEventually(alloc, self.catalog, table_name, "", "", 5 * std.time.ns_per_s, 10, &current_fence);
-                defer alloc.free(verified);
-                total.observation_changed = verified.len == 0 or current_fence != routing_fence;
+                const verified = try resolveArtifactRepairRouting(alloc, self.catalog, table_name, .fence_only);
+                total.observation_changed = verified.fence != routing.fence;
             }
             if (track_pending) {
                 total.pending_index_groups = try pending.toOwnedSlice(alloc);
@@ -27436,26 +27486,22 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?db_mod.types.ArtifactRepairResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (options.cancelled()) return error.Canceled;
-        var routing_fence: u64 = 0;
-        const current_group_ids = try resolveCatalogGroupsFencedEventually(
-            alloc,
-            self.catalog,
-            table_name,
-            "",
-            "",
-            5 * std.time.ns_per_s,
-            10,
-            &routing_fence,
-        );
+        const parked_cursor = if (options.resume_document_page)
+            (try parseArtifactRepairTableCursor(req.cursor)) orelse return error.InvalidArgument
+        else
+            null;
+        const routing = try resolveArtifactRepairRouting(alloc, self.catalog, table_name, if (parked_cursor) |cursor| .{ .group = cursor.group_id } else .all);
+        const current_group_ids = routing.group_ids;
         defer alloc.free(current_group_ids);
-        if (current_group_ids.len == 0) return null;
-        const group_ids = options.observe_index_groups orelse current_group_ids;
+        if (routing.fence == null) return null;
+        const observe_groups = if (parked_cursor != null) null else options.observe_index_groups;
+        const group_ids = observe_groups orelse current_group_ids;
         var pass_request = req;
-        pass_request.observe_index_repair = options.observe_index_groups != null;
+        pass_request.observe_index_repair = observe_groups != null;
         pass_request.resume_document_repair = options.resume_document_page;
         const durable_index_job = req.target == .index and req.repair_job_id != null;
         const track_pending = durable_index_job and req.control == null;
-        const repair_groups: ?u64 = if (durable_index_job) routing_fence else null;
+        const repair_groups: ?u64 = if (durable_index_job) routing.fence else null;
         if (options.expected_repair_groups != null and !std.meta.eql(options.expected_repair_groups, repair_groups))
             return .{ .observed_only = true, .observation_changed = true, .repair_groups = repair_groups };
 
@@ -27464,7 +27510,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         var pending_pages: std.ArrayList([]u8) = .empty;
         defer freePendingRepairPages(alloc, &pending_pages);
 
-        const parsed_cursor = try parseArtifactRepairTableCursor(req.cursor);
+        const parsed_cursor = if (options.resume_document_page) parked_cursor else try parseArtifactRepairTableCursor(req.cursor);
         var start_index: usize = 0;
         var start_cursor: ?[]const u8 = null;
         if (parsed_cursor) |cursor| {
@@ -27484,10 +27530,9 @@ pub const HostedProvisionedTableWriteSource = struct {
             repair_cancel_base_uri = try self.router.nodeBaseUri(alloc, self.router.localNodeId());
         }
         var groups_scanned: usize = 0;
-        const traversal = if (options.resume_document_page) group_ids[start_index..][0..1] else group_ids[start_index..];
-        for (traversal, start_index..) |group_id, idx| {
+        for (group_ids[start_index..], start_index..) |group_id, idx| {
             if (options.cancelled()) return error.Canceled;
-            if (options.observe_index_groups != null and std.mem.indexOfScalar(u64, current_group_ids, group_id) == null) {
+            if (observe_groups != null and std.mem.indexOfScalar(u64, current_group_ids, group_id) == null) {
                 total.observation_changed = true;
                 break;
             }
@@ -27550,10 +27595,8 @@ pub const HostedProvisionedTableWriteSource = struct {
 
         if (durable_index_job) {
             if (!total.has_more and !total.observation_changed and total.in_progress == 0) {
-                var current_fence: u64 = 0;
-                const verified = try resolveCatalogGroupsFencedEventually(alloc, self.catalog, table_name, "", "", 5 * std.time.ns_per_s, 10, &current_fence);
-                defer alloc.free(verified);
-                total.observation_changed = verified.len == 0 or current_fence != routing_fence;
+                const verified = try resolveArtifactRepairRouting(alloc, self.catalog, table_name, .fence_only);
+                total.observation_changed = verified.fence != routing.fence;
             }
             if (track_pending) {
                 total.pending_index_groups = try pending.toOwnedSlice(alloc);
@@ -61194,10 +61237,11 @@ fn implementationTests() type {
             defer alloc.free(path);
 
             const Catalog = struct {
-                fn iface() table_catalog.CatalogSource {
+                fn iface(routing: *table_catalog.RoutingGeneration) table_catalog.CatalogSource {
                     return .{
-                        .ptr = undefined,
+                        .ptr = routing,
                         .vtable = &.{
+                            .acquire_routing_generation = if (scenario == .parked_documents) acquireGeneration else null,
                             .admin_snapshot = adminSnapshot,
                             .free_admin_snapshot = freeAdminSnapshot,
                             .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
@@ -61205,6 +61249,12 @@ fn implementationTests() type {
                             .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                         },
                     };
+                }
+
+                fn acquireGeneration(ptr: *anyopaque, _: table_catalog.RoutingBudget, _: bool) !*table_catalog.RoutingGeneration {
+                    const routing: *table_catalog.RoutingGeneration = @ptrCast(@alignCast(ptr));
+                    routing.retain();
+                    return routing;
                 }
 
                 fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
@@ -61293,15 +61343,23 @@ fn implementationTests() type {
                         "{\"scanned\":1,\"indexes_rebuilt\":1}"
                     else
                         return error.UnexpectedHttpRequest;
-                    const stale = std.mem.indexOf(u8, req.body, "\"resume_document_repair\":true") != null;
+                    const stale = std.mem.indexOf(u8, req.body, "\"resume_document_repair\":true") != null and
+                        std.mem.indexOf(u8, req.uri, "/7001/") != null;
                     const content_type = try request_alloc.dupe(u8, "application/json");
                     errdefer request_alloc.free(content_type);
                     return .{ .status = if (stale) 404 else 200, .content_type = content_type, .body = try request_alloc.dupe(u8, body) };
                 }
             };
 
+            const snapshot = try Catalog.adminSnapshot(undefined);
+            const routing = try table_catalog.RoutingGeneration.create(alloc, .{
+                .metadata_group_id = snapshot.status.metadata_group_id,
+                .tables = snapshot.tables,
+                .ranges = snapshot.ranges,
+            }, .{});
+            defer routing.release();
             var generation: u64 = 1;
-            var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), Router.iface(), Executor.iface());
+            var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(routing), Router.iface(), Executor.iface());
             _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
             defer source.invalidateManagedCache("docs");
 
@@ -61320,6 +61378,27 @@ fn implementationTests() type {
                 try std.testing.expectEqual(@as(usize, 1), result.pending_document_pages.?.len);
                 try std.testing.expectEqualStrings("7001:", result.pending_document_pages.?[0]);
                 try std.testing.expect(result.next_cursor == null);
+
+                const routed = try resolveArtifactRepairRouting(alloc, source.catalog, "docs", .{ .group = 7001 });
+                defer alloc.free(routed.group_ids);
+                try std.testing.expectEqual(result.repair_groups, routed.fence);
+                try std.testing.expectEqualSlices(u64, &.{7001}, routed.group_ids);
+                const missing = try resolveArtifactRepairRouting(alloc, source.catalog, "docs", .{ .group = 7003 });
+                defer alloc.free(missing.group_ids);
+                try std.testing.expectEqual(result.repair_groups, missing.fence);
+                try std.testing.expectEqual(@as(usize, 0), missing.group_ids.len);
+
+                var settled = (try source.source().repairArtifactIssuesControlled(alloc, "docs", .{
+                    .target = .index,
+                    .index_name = "text",
+                    .operator_initiated = true,
+                    .repair_job_id = 1,
+                    .repair_job_created_at_ms = 1,
+                    .cursor = "7002:",
+                }, .{ .resume_document_page = true, .observe_index_groups = &.{7001}, .expected_repair_groups = result.repair_groups })).?;
+                defer settled.deinit(alloc);
+                try std.testing.expectEqual(@as(u64, 1), settled.groups_scanned);
+                try std.testing.expect(!settled.observation_changed);
 
                 // A route can move between the fence check and the shard RPC.
                 var moved = (try source.source().repairArtifactIssuesControlled(alloc, "docs", .{

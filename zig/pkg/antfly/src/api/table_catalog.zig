@@ -405,6 +405,12 @@ pub const RoutingGeneration = struct {
     }
 };
 
+pub fn repairFenceDigest(topology_epoch: u64, table_id: u64) std.hash.Wyhash {
+    var digest = std.hash.Wyhash.init(topology_epoch);
+    digest.update(std.mem.asBytes(&table_id));
+    return digest;
+}
+
 /// Immutable request-scoped catalog capability. A session captures one
 /// projection and uses it for every table touched by the request,
 /// including graph targets discovered after the source table was admitted.
@@ -414,6 +420,7 @@ pub const RoutingSession = struct {
     const TableRangeIndex = struct {
         ranges: []const *const metadata_table_manager.RangeRecord,
         covers_keyspace: bool,
+        repair_fence: u64,
     };
     alloc: std.mem.Allocator,
     base: CatalogSource,
@@ -543,15 +550,19 @@ pub const RoutingSession = struct {
             var end = first + 1;
             while (end < range_refs.len and range_refs[end].table_id == range_refs[first].table_id) : (end += 1) {}
             const table_id = range_refs[first].table_id;
+            const table_index = self.table_id_indexes.get(table_id) orelse return error.InvalidCatalogProjection;
+            const epoch = try topologyEpochFromSortedRangesWithBudget(snapshot.value.tables[table_index], range_refs[first..end], budget);
+            var digest = repairFenceDigest(epoch, table_id);
+            for (range_refs[first..end], 0..) |range, index| {
+                try budget.checkpointIndex(index);
+                digest.update(std.mem.asBytes(&range.group_id));
+            }
             self.table_range_refs.putAssumeCapacity(table_id, .{
                 .ranges = range_refs[first..end],
                 .covers_keyspace = try completeKeyspace(range_refs[first..end], budget),
+                .repair_fence = digest.final(),
             });
-            const table_index = self.table_id_indexes.get(table_id) orelse return error.InvalidCatalogProjection;
-            self.topology_epochs.putAssumeCapacity(
-                table_id,
-                try topologyEpochFromSortedRangesWithBudget(snapshot.value.tables[table_index], range_refs[first..end], budget),
-            );
+            self.topology_epochs.putAssumeCapacity(table_id, epoch);
             first = end;
         }
         for (snapshot.value.tables, 0..) |table, index| {
@@ -595,6 +606,18 @@ pub const RoutingSession = struct {
         const index = self.table_indexes.get(table_name) orelse return error.TableNotFound;
         const id = self.snapshot.value.tables[index].table_id;
         return .{ .table_id = id, .topology_epoch = self.topology_epochs.get(id).?, .covers_keyspace = if (self.table_range_refs.get(id)) |entry| entry.covers_keyspace else false };
+    }
+
+    pub const RepairRoutingView = struct { table_id: u64, fence: u64 };
+
+    /// Full-span repair fence, calculated once with the same ordered group
+    /// IDs as the persisted repair job cursor.
+    pub fn repairRoutingView(self: *const RoutingSession, table_name: []const u8, budget: RoutingBudget) !?RepairRoutingView {
+        try budget.checkpoint();
+        const index = self.table_indexes.get(table_name) orelse return null;
+        const table_id = self.snapshot.value.tables[index].table_id;
+        const ranges = self.table_range_refs.get(table_id) orelse return null;
+        return .{ .table_id = table_id, .fence = ranges.repair_fence };
     }
 
     /// A published group identifies exactly one range in a generation; setup
