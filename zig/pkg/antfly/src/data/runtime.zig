@@ -1981,8 +1981,11 @@ const RaftTableApplyStateMachine = struct {
         req: antfly.db.types.BatchRequest,
         storage_owner_descriptor: ?kernel_owner_descriptor.Descriptor,
         history_commit_time_ns: ?i64,
+        exact_prepare: bool,
     ) !void {
-        const required_protocol = if (history_commit_time_ns != null)
+        const required_protocol = if (exact_prepare)
+            data_raft_batch.exact_prepare_protocol_version
+        else if (history_commit_time_ns != null)
             @import("history_clock_entry.zig").required_protocol_version
         else
             try @import("../common/data_raft_protocol.zig").completionProtocolVersion(self.alloc, req);
@@ -2528,7 +2531,7 @@ const RaftTableApplyStateMachine = struct {
                         // Advance the native marker without its effects before
                         // publishing the same typed outcome to the proposer.
                         if (batchRequiresDocumentDbApply(decoded.batch.req)) {
-                            self.applyDocumentBatchForEntry(group_id, entry.index, entry.term, decoded.table_name, .{}, if (decoded.storage_owner_descriptor) |*value| value.view() else null, null) catch |err| switch (err) {
+                            self.applyDocumentBatchForEntry(group_id, entry.index, entry.term, decoded.table_name, .{}, if (decoded.storage_owner_descriptor) |*value| value.view() else null, null, false) catch |err| switch (err) {
                                 error.RaftApplyWriterUnavailable, error.StorageOwnerAdmissionPending, error.RetainedEffectsFull, error.OnlineSourcePinPending, error.ResourceBudgetExceeded, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
                                 else => return err,
                             };
@@ -2560,6 +2563,7 @@ const RaftTableApplyStateMachine = struct {
                         decoded.batch.req,
                         if (decoded.storage_owner_descriptor) |*value| value.view() else null,
                         decoded.history_commit_time_ns,
+                        decoded.exact_prepare,
                     ) catch |err| {
                         // Writer contention can arise during receipt recovery
                         // or lifecycle publication, beyond mutation admission.
@@ -2570,10 +2574,11 @@ const RaftTableApplyStateMachine = struct {
                             // results, not state-machine failures. Every replica
                             // rejects the prepare at this log index and continues.
                             self.recordApplyFailure(group_id, entry.index, entry.term, failure);
-                            std.log.debug("data raft document apply rejected group_id={} index={} table={s} err={s}", .{
+                            std.log.debug("data raft document apply rejected group_id={} index={} table={s} transaction_phase={s} err={s}", .{
                                 group_id,
                                 entry.index,
                                 decoded.table_name,
+                                if (decoded.batch.req.transaction) |transaction| @tagName(transaction) else "none",
                                 @errorName(err),
                             });
                         } else if (err == error.RaftApplyWriterUnavailable or
@@ -14643,7 +14648,11 @@ pub const DataServer = struct {
             return error.OnlineMergeArtifactCatalogUncoordinated;
         const raft = self.data_raft orelse return error.UnsupportedOperation;
         var proposal_req = req;
-        const minimum_protocol_version = try requiredRaftBatchProtocolVersion(alloc, req);
+        const completion_begin = if (req.transaction) |txn| txn == .begin and txn.begin.completion_owner != null else false;
+        const minimum_protocol_version = if (completion_begin or data_raft_batch.isFrozenPrepare(req))
+            data_raft_batch.exact_prepare_protocol_version
+        else
+            try requiredRaftBatchProtocolVersion(alloc, req);
         var required_protocol_version = minimum_protocol_version;
         const deadline_ns = @min(route.admission_deadline_ns orelse std.math.maxInt(u64), self.dataRaftMonotonicNs() +| leader_wait_ns);
         const completion_command = @import("antfly_local_sources").api_internal_batch.requiresCompletionProtocol(req);
@@ -45810,7 +45819,7 @@ fn consumerTests() type {
                 const current_owner = frozen.participants[0].owner;
                 producer_closure_owner = current_owner;
                 const txn_id = plan.transaction_id;
-                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
 
                 const positive_input: resolution_operations.Request = .{ .version = 1, .authority = .raft, .namespace = namespace, .transaction_id = txn_id, .owner_fence = current_owner.digest(), .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 };
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
@@ -45915,10 +45924,10 @@ fn consumerTests() type {
                 try std.testing.expectEqual(.complete, try recovery.run(a, current_owner, route.fence().?, "docs", txn_id, .{}));
                 try server.completionParticipantPort().submit(a, &frozen, 0, route.fence().?, .{ .publish = certificate_bytes }, .{});
                 try remote_participant.submit(a, &frozen, 0, route.fence().?, .{ .publish = certificate_bytes }, .{});
-                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
                 // An idle root must remain readable after an ordered protocol
                 // barrier, without requiring another document mutation.
-                const idle_barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", @import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version);
+                const idle_barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", @import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version);
                 defer a.free(idle_barrier);
                 const idle_barrier_index = blk: {
                     lockAtomic(&server.data_raft_mutex);
@@ -46252,7 +46261,7 @@ fn consumerTests() type {
             try std.testing.expect(policy_applied.outcome.?.applied.consumer == null);
             const policy_observed = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect_policy = .{ .namespace = namespace, .authority = ref.authority } });
             try std.testing.expectEqualDeep(policy_applied.outcome.?.applied.policy, policy_observed.outcome.?.applied.policy);
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
             const ClosureHarness = struct {
                 pub fn inventoryRpc(alloc: std.mem.Allocator, node: *DataServer, captured: antfly.metadata_api.CatalogRouteFence, input: @import("source_legacy_inventory_http_wire.zig").Request) !@import("source_legacy_inventory_http_wire.zig").Reply {
                     return @import("source_legacy_inventory_http_native_test.zig").read(alloc, node, captured, input);
@@ -46277,9 +46286,9 @@ fn consumerTests() type {
                 }
             };
             try @import("source_producer_closure_proposal_native_test.zig").run(a, server, route.fence().?, producer_closure_owner orelse return error.TestExpectedProducerOwner, DataRequestLifecycleEvent, ClosureHarness);
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
             try @import("source_legacy_terminal_proposal_native_test.zig").run(a, server, route.fence().?, producer_closure_owner orelse return error.TestExpectedProducerOwner, DataRequestLifecycleEvent, ClosureHarness);
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
 
             const ClockHarness = struct {
                 noinline fn run(allocator: std.mem.Allocator, node: *DataServer, kernel: *antfly.public_api.ProvisionedKernelOwnerSource, captured: antfly.metadata_api.CatalogRouteFence, consumer: control.Reference) !void {
@@ -46302,7 +46311,7 @@ fn consumerTests() type {
                 }
             };
             try ClockHarness.run(a, server, &owner, route.fence().?, ref);
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
         }
 
         test "data raft ordered history table producer capability refuses lossy fallback" {

@@ -40,7 +40,9 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 50;
+pub const batch_protocol_version: u16 = 51;
+/// Version 51 preserves frozen PREPARE bytes in the Raft envelope.
+pub const batch_exact_prepare_protocol_version: u16 = 51;
 /// Version 50 atomically captures and releases bootstrap images in data Raft.
 pub const batch_history_bootstrap_protocol_version: u16 = 50;
 /// Frozen completion BEGIN and owner/input-fenced PREPARE require durable
