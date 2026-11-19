@@ -1996,22 +1996,31 @@ pub const WriterLane = struct {
 
     /// Takes this lane's idle parked lease for another owner on this path.
     /// That owner's waits share this process's pid, so the foreign-waiter
-    /// release never sees them. The lane stays checked out until
-    /// `finishLocalPeerRelease`.
+    /// release never sees them. The lane stays checked out, and pinned
+    /// against its owner's teardown (`Owner.deinit` waits for
+    /// `local_reader_activity`), until `finishLocalPeerRelease`: the release
+    /// runs without the path gate, so the peer's last handle can close
+    /// meanwhile.
     fn takeParkedForLocalPeer(self: *WriterLane) ?PeerRelease {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.checked_out or self.reading or self.local_reader_activity.count != 0) return null;
+        if (self.closing or self.checked_out or self.reading or self.local_reader_activity.count != 0) return null;
         const lease = self.parked orelse return null;
         self.parked = null;
         self.foreign_release_due = false;
         self.checked_out = true;
         self.holder = std.Thread.getCurrentId();
+        self.local_reader_activity.begin();
         const store = self.parked_store;
         self.parked_store = null;
         return .{ .lane = self, .lease = lease, .store = store };
     }
+
+    /// Test-only: `finishLocalPeerRelease` signals `reached` and waits for
+    /// `resume` after checking the lane in, before unpinning it, so a test
+    /// can act while only the pin keeps the peer alive.
+    var test_peer_release_pause: if (h.builtin.is_test) ?struct { reached: *std.Io.Event, @"resume": *std.Io.Event } else void = if (h.builtin.is_test) null else {};
 
     /// Drains and syncs the store, which can enter maintenance writer
     /// admission and take the path gate: the caller must not hold it.
@@ -2027,6 +2036,14 @@ pub const WriterLane = struct {
         self.checked_out = false;
         self.mutex.unlock(io);
         self.signalReleased(io);
+        if (comptime h.builtin.is_test) if (test_peer_release_pause) |pause| {
+            pause.reached.set(io);
+            pause.@"resume".waitUncancelable(io);
+        };
+        // Last use of the lane: its owner may be freed once this unpins.
+        self.mutex.lockUncancelable(io);
+        self.local_reader_activity.finish(io);
+        self.mutex.unlock(io);
     }
 
     pub fn maintainParkedLease(self: *WriterLane) ?i96 {
@@ -9111,6 +9128,62 @@ test "capi path gate peer handoff survives maintenance admission on the parked s
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     thread.join();
+    try std.testing.expectEqual(@as(i32, @backingInt(h.capi.ErrorCode.ok)), vacuum.code.load(.acquire));
+}
+
+// The handoff drains the peer's store with the path gate unlocked, so the
+// peer's last handle can close meanwhile. Teardown must wait for the release
+// to finish rather than free the lane and store under it.
+test "capi path gate peer handoff keeps the peer alive through its last close" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var tmp = try api.TestDirectory.init("peer-owner-handoff-close");
+    defer tmp.cleanup();
+    const io = h.handleLockIo();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/database.aflite", .{tmp.path()});
+    defer std.testing.allocator.free(path);
+
+    const first = try api.publishHandle(try open(path, .{ .profile = .hosted, .busy_timeout_ms = 10_000 }, true));
+    var first_open = true;
+    defer if (first_open) api.antfly_db_close(first);
+    const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("doc:seed"), .value = .fromSlice("{\"text\":\"seed\"}"), .is_delete = false }};
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(first, &writes, writes.len, null, 0, 0, 0));
+
+    var reached: std.Io.Event = .unset;
+    var resume_release: std.Io.Event = .unset;
+    WriterLane.test_peer_release_pause = .{ .reached = &reached, .@"resume" = &resume_release };
+    defer WriterLane.test_peer_release_pause = null;
+
+    const peer = try api.publishHandle(try open(path, .{ .profile = .hosted, .no_sync = true, .busy_timeout_ms = 10_000 }, false));
+    defer api.antfly_db_close(peer);
+    const Call = struct {
+        id: ?*anyopaque,
+        code: std.atomic.Value(i32) = .init(-1),
+        fn vacuum(self: *@This()) void {
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&out);
+            self.code.store(@backingInt(api.antfly_lite_vacuum_json(self.id, &out)), .release);
+        }
+        fn close(self: *@This()) void {
+            api.antfly_db_close(self.id);
+            self.code.store(0, .release);
+        }
+    };
+    var vacuum: Call = .{ .id = peer };
+    const vacuum_thread = try std.Thread.spawn(.{}, Call.vacuum, .{&vacuum});
+    reached.waitUncancelable(io);
+
+    // The handoff has checked the first owner's lane back in but still uses
+    // it; only its pin keeps that owner alive.
+    var closer: Call = .{ .id = first };
+    first_open = false;
+    const close_thread = try std.Thread.spawn(.{}, Call.close, .{&closer});
+    io.sleep(.fromMilliseconds(200), .awake) catch {};
+    const closed_early = closer.code.load(.acquire) != -1;
+    resume_release.set(io);
+    close_thread.join();
+    vacuum_thread.join();
+    try std.testing.expect(!closed_early);
     try std.testing.expectEqual(@as(i32, @backingInt(h.capi.ErrorCode.ok)), vacuum.code.load(.acquire));
 }
 
