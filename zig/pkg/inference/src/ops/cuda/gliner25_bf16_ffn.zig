@@ -21,6 +21,8 @@ pub fn planWithFloatDot(rows: usize, hidden: usize, intermediate: usize, float_d
 fn check(buffer: Buffer, bytes: usize) !void {
     if (buffer.ptr == 0 or buffer.len < bytes) return error.InvalidCudaState;
 }
+// Serving plans use heuristics on first use; exact row counts must not
+// trigger synchronous GPU autotuning while the model execution lane is held.
 pub fn run(ctx: *Context, lt: *Lt, kernels: *Kernels, workspace: Buffer, output: Buffer, temporary: [4]Buffer, inputs: [8]Buffer, input_native: bool, output_mirror: Buffer, rows: usize, hidden: usize, intermediate: usize, eps: f32, exact: bool) !void {
     _ = try runWithReference(ctx, lt, kernels, workspace, output, temporary, inputs, input_native, output_mirror, rows, hidden, intermediate, eps, exact, null, .{}, null);
 }
@@ -39,29 +41,17 @@ pub fn runWithReference(ctx: *Context, lt: *Lt, kernels: *Kernels, workspace: Bu
     if (biased_dot) try check(first_bias_bf16, intermediate * 2);
     if (!input_native) try kernels.launchF32ToBf16(ctx, temporary[0], inputs[0], rows * hidden);
     if (biased_dot) {
-        _ = (lt.matmulBf16WeightBiasBf16OutWithTuning(ctx, temporary[1], temporary[0], inputs[2], first_bias_bf16, workspace, rows, hidden, intermediate, .{ .enabled = true, .candidate_count = 16, .warmups = 2, .iterations = 5 }) catch |err| switch (err) {
-            error.CublasLtUnsupported, error.CublasLtTuningInsufficientCandidates => try lt.matmulBf16WeightBiasBf16OutWithTuning(ctx, temporary[1], temporary[0], inputs[2], first_bias_bf16, workspace, rows, hidden, intermediate, .{}),
-            else => return err,
-        });
+        _ = try lt.matmulBf16WeightBiasBf16OutWithTuning(ctx, temporary[1], temporary[0], inputs[2], first_bias_bf16, workspace, rows, hidden, intermediate, .{});
     } else if (float_dot) {
-        _ = (lt.matmulBf16WeightF32OutWithTuning(ctx, temporary[1], temporary[0], inputs[2], workspace, rows, hidden, intermediate, .{ .enabled = true, .candidate_count = 16, .warmups = 2, .iterations = 5 }) catch |err| switch (err) {
-            error.CublasLtUnsupported, error.CublasLtTuningInsufficientCandidates => try lt.matmulBf16WeightF32OutWithTuning(ctx, temporary[1], temporary[0], inputs[2], workspace, rows, hidden, intermediate, .{}),
-            else => return err,
-        });
-    } else _ = (lt.matmulBf16WeightBf16OutWithTuning(ctx, temporary[1], temporary[0], inputs[2], workspace, rows, hidden, intermediate, .{ .enabled = true, .candidate_count = 16, .warmups = 2, .iterations = 5 }) catch |err| switch (err) {
-        error.CublasLtUnsupported, error.CublasLtTuningInsufficientCandidates => try lt.matmulBf16WeightBf16OutWithTuning(ctx, temporary[1], temporary[0], inputs[2], workspace, rows, hidden, intermediate, .{}),
-        else => return err,
-    });
+        _ = try lt.matmulBf16WeightF32OutWithTuning(ctx, temporary[1], temporary[0], inputs[2], workspace, rows, hidden, intermediate, .{});
+    } else _ = try lt.matmulBf16WeightBf16OutWithTuning(ctx, temporary[1], temporary[0], inputs[2], workspace, rows, hidden, intermediate, .{});
     if (reference) |ref| try ref.gelu(ctx, temporary[2], temporary[1], inputs[3], rows * intermediate, intermediate, exact) else try kernels.launchGliner25FfnGeluBiasBf16(ctx, temporary[2], temporary[1], inputs[3], rows, intermediate, exact);
     const separate_bias = if (reference) |ref| ref.flags & @import("gliner25_bf16_full.zig").separate_output_bias_flag != 0 else false;
     if (separate_bias) {
         const blas = classic orelse return error.UnsupportedCublasBf16;
         try blas.bindWorkspace(ctx.stream, @ptrFromInt(workspace.ptr), workspace.len);
         try blas.linearBf16(ctx.stream, @ptrFromInt(temporary[3].ptr), @ptrFromInt(temporary[2].ptr), @ptrFromInt(inputs[4].ptr), rows, intermediate, hidden);
-    } else _ = (lt.matmulBf16WeightBiasF32OutWithTuning(ctx, temporary[3], temporary[2], inputs[4], inputs[5], workspace, rows, intermediate, hidden, .{ .enabled = true, .candidate_count = 16, .warmups = 2, .iterations = 5 }) catch |err| switch (err) {
-        error.CublasLtUnsupported, error.CublasLtTuningInsufficientCandidates => try lt.matmulBf16WeightBiasF32OutWithTuning(ctx, temporary[3], temporary[2], inputs[4], inputs[5], workspace, rows, intermediate, hidden, .{}),
-        else => return err,
-    });
+    } else _ = try lt.matmulBf16WeightBiasF32OutWithTuning(ctx, temporary[3], temporary[2], inputs[4], inputs[5], workspace, rows, intermediate, hidden, .{});
     if (reference) |ref| {
         if (separate_bias) try ref.normDotBias(ctx, output, output_mirror, .{ temporary[3], inputs[5], inputs[1], inputs[6], inputs[7] }, rows, hidden, eps) else try ref.norm(ctx, output, output_mirror, .{ temporary[3], inputs[1], inputs[6], inputs[7] }, rows, hidden, eps);
     } else if (output_mirror.ptr != 0) {
@@ -237,4 +227,5 @@ test "GLiNER BF16 FFN CPU oracle includes bias GELU residual and norm" {
             }
         }
     }
+    try std.testing.expectEqual(@as(usize, 0), lt.matmul_tuning_searches);
 }

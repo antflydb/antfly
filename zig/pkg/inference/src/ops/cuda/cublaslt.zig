@@ -83,11 +83,10 @@ const maximum_matmul_tuning_iterations: u8 = 10;
 
 /// Bounded first-use tuning for tensor-core GEMMs. Candidate counts are
 /// normalized to 1...16, warmups to 0...4, and timed iterations to 1...10.
-/// The default preserves the
-/// existing single-heuristic behavior. Qualified model profiles may opt in
-/// during excluded warm requests; the same enabled policy must remain active
-/// afterward so the selected plan's complete tuning fingerprint is reused and
-/// measured inference performs no timing work.
+/// The default preserves single-heuristic behavior. Enabled tuning can
+/// synchronize the GPU on every unseen exact shape, even after warmup; reserve
+/// it for controlled tuning campaigns. GLiNER serving uses the default so new
+/// sequence lengths and microbatches do not run timing trials in the lane.
 pub const MatmulTuning = struct {
     enabled: bool = false,
     candidate_count: u8 = 8,
@@ -281,6 +280,8 @@ pub const CublasLt = struct {
     plan_cache_misses: usize = 0,
     uncached_plans: usize = 0,
     plan_cache_refreshes: usize = 0,
+    /// GPU-timed algorithm searches, including searches that fail.
+    matmul_tuning_searches: usize = 0,
     // Bias pointers are invocation data in a cached descriptor. Serialize
     // biased submissions through the API call that consumes that descriptor;
     // ordinary serving plans never share this descriptor kind.
@@ -968,6 +969,7 @@ pub const CublasLt = struct {
         var timed_candidate_count: usize = 0;
         var selected_elapsed_us: u64 = 0;
         if (tuning.enabled and checked_count > 1) {
+            self.matmul_tuning_searches += 1;
             const fastest = try self.selectFastestTensorCoreAlgorithm(
                 ctx,
                 plan,

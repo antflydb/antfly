@@ -419,7 +419,8 @@
       "cubin_reproducibility": "pass",
       "loaded_pipeline_cases": 89,
       "batch32_observed_forwards": 4
-    }
+    },
+    "gemm_selection": "Historical tuned profile: excludes synchronous tuning on first-seen shapes. Superseded for serving by heuristic plans; see serving_heuristic_validation."
   },
   "post_merge_validation": {
     "commit": "b8c7ae5e50",
@@ -820,5 +821,109 @@
     "core_benchmark_build": "pass",
     "artifact_source_policy": "pass",
     "benchmark_source_sha256": "93dea065ae759802b214d457471c20dac78515e233607450573b809aec55cf94"
+  },
+  "serving_heuristic_validation": {
+    "time_utc": "2026-11-18T23:24:21.696707+00:00",
+    "scope": "One fresh Debug process per arm; identical ordered public pipeline requests, one first call and two warm repeats per case; excludes HTTP; exploratory latency check, release follow-up separate.",
+    "runtime": {
+      "gpu": "NVIDIA L4 SM89",
+      "cublas_version": 130401
+    },
+    "capability_regression": "Missing optional gliner25_attention_softmax_f32 rejects BF16 before upload and at projection/compact-attention dispatch.",
+    "public_pipeline": {
+      "cases": 89,
+      "samples_per_case": 2,
+      "passed": true,
+      "max_confidence_delta": 0.009570133540495629,
+      "max_confidence_delta_limit": 0.02,
+      "prepared_token_ids": "exact",
+      "batch32_physical_forwards": 4
+    },
+    "variable_requests": {
+      "request_shapes": 19,
+      "measured_calls_per_arm": 57,
+      "batch_sizes": [
+        1,
+        5,
+        8,
+        32
+      ],
+      "before_tuning_searches": 84,
+      "after_plan_cache_misses": 84,
+      "after_tuning_searches": 0,
+      "before_first_median_ms": 23.866414,
+      "after_first_median_ms": 14.046698,
+      "before_first_max_ms": 318.496683,
+      "after_first_max_ms": 154.165769
+    },
+    "focused_cuda_tests": 41,
+    "python_tests": 29,
+    "cuda_type_check": "pass",
+    "binaries": {
+      ".tools/gliner25-qualified-pipeline-debug": "4064463f285115fe58922ec51f25ddd6b5f323f80374468848dc0e736874cb48",
+      ".tools/gliner25-p2-pipeline-debug": "be4361cd55d611d29ae81c190bd5d88a2fead6262bd89f838b93f458fea60a7b"
+    },
+    "release_qualification": {
+      "scope": "Six fresh ReleaseFast processes, three per qualified runtime; 89 varied cases, two native and two Python outputs per case; automatic profile; unchanged 0.02 confidence gate and bounded threshold/tie decisions.",
+      "runs": [
+        {
+          "runtime": 130400,
+          "round": 0,
+          "passed": true,
+          "max_confidence_delta": 0.009570133540495629
+        },
+        {
+          "runtime": 130400,
+          "round": 1,
+          "passed": true,
+          "max_confidence_delta": 0.009570133540495629
+        },
+        {
+          "runtime": 130400,
+          "round": 2,
+          "passed": true,
+          "max_confidence_delta": 0.009570133540495629
+        },
+        {
+          "runtime": 130401,
+          "round": 0,
+          "passed": true,
+          "max_confidence_delta": 0.010363273249720473
+        },
+        {
+          "runtime": 130401,
+          "round": 1,
+          "passed": true,
+          "max_confidence_delta": 0.009570133540495629
+        },
+        {
+          "runtime": 130401,
+          "round": 2,
+          "passed": true,
+          "max_confidence_delta": 0.009570133540495629
+        }
+      ],
+      "max_confidence_delta": 0.010363273249720473,
+      "tuning_searches": 0,
+      "binary_sha256": "85466b7149a8bfdae8a28a061204ef6e3d9e99a5e35b1c49d9677998c31f349f"
+    },
+    "base_fp32_regression": {
+      "cases": 42,
+      "passed": true,
+      "max_abs_output_error": 0.00011491775512695312,
+      "exact_decisions": true,
+      "encoder_dtype": "f32",
+      "bf16_attention_ffn_calls": 0
+    },
+    "rejected_measurements": [
+      "qual-130401-r0: unexpected GPU PID 864689; excluded from six accepted runs",
+      "release-registered/performance-r0-after: unexpected GPU PID 866005; rejected timing; no accepted warm comparison derived from this pair",
+      "release-final/performance-r0-before: unexpected GPU PID 866594; rejected timing"
+    ],
+    "warm_remeasurement": {
+      "status": "incomplete: no uncontaminated paired warm campaign after heuristic selection",
+      "reason": "Independent Gemma GPU jobs did not acquire the shared lock and repeatedly overlapped attempted timings. Rejected runs are excluded.",
+      "historical_tables": "decide_bf16 latency and memory describe the earlier tuned profile, not the current heuristic default."
+    }
   }
 }

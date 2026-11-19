@@ -29,7 +29,10 @@ Base remains slower than PJRT BF16: a separate classification characterization
 measured a 1.5–2.9× PJRT advantage. Base BF16 still exceeds the approved confidence
 band and changes some entity selections; it remains gated.
 
-## Decide BF16 qualification
+## Historical tuned Decide BF16 qualification
+
+This initial campaign predates heuristic selection; current revalidation is
+reported under [heuristic serving](#heuristic-serving-and-first-seen-shapes).
 
 - 89 deterministic classification cases pass in three fresh processes on each
   of cuBLAS 13.4.0 and 13.4.1, with two native and two Python samples per case.
@@ -53,7 +56,52 @@ band is 0.02; an argmax change permits a reference gap <= 0.04 because each labe
 may move by 0.02. See [GLINER25.md](GLINER25.md#automatic-decide-bf16-qualification)
 for reproducible fixture preparation and qualification commands.
 
-## Decide BF16 latency
+## Heuristic serving and first-seen shapes
+
+BF16 load-time preparation and projection/attention dispatch now use the same
+complete capability check. Missing the optional FP32 softmax symbol keeps
+automatic loading on FP32 before weights are uploaded; the GPU regression
+explicitly removes that symbol and checks rejection before operand access.
+
+GLiNER BF16 projection, FFN and classifier GEMM misses use cuBLASLt heuristics.
+They no longer time candidate GEMMs while holding the serving execution lane.
+Ragged-shape and full-cache regressions assert zero timed searches. The public
+pipeline benchmark preserves `first_forward_ms` and reports plan-cache misses
+and timed-search counters instead of hiding first-use costs in warmup.
+
+An exploratory loaded-pipeline comparison uses one fresh **Debug** process per
+arm, 19 ordered request shapes (batch 1/5/8/32, varying lengths and schemas), one
+first call and two immediate repeats per shape. Includes rendering, tokenization,
+decoding and synchronized readback; excludes HTTP and model loading.
+
+| Variable-request metric | Frozen tuned profile | Heuristic serving |
+|---|---:|---:|
+| Median first forward | 23.87 ms | 14.05 ms |
+| Maximum first forward | 318.50 ms | 154.17 ms |
+| Timed tuning searches | 84 | 0 |
+
+The new arm records 84 actual plan-cache misses. These are diagnostic cold-shape
+results, separate from the ReleaseFast warm measurements. All 89 public-pipeline
+cases still pass the fixed Python CUDA BF16 gate (two outputs per case), maximum
+confidence drift 0.009570; token IDs match and batch 32 uses four physical forwards.
+Base's 42 CPU FP32 regression cases pass with maximum raw error 0.00011492.
+Decide also passes all 89 cases in three fresh ReleaseFast processes on each of
+cuBLAS 13.4.0 and 13.4.1, with two outputs per case. Across all six accepted runs,
+maximum confidence drift is 0.010364, below the unchanged 0.02 limit; decisions
+outside the approved threshold/tie band match. A run with overlapping Gemma GPU
+work was rejected and replaced. All accepted runs record zero timed searches.
+All 41 focused GPU tests, 29 Python tests, CUDA type checking, source-policy and
+format/whitespace checks pass.
+
+The fresh paired ReleaseFast warm/PJRT campaign is not yet qualified: independent
+Gemma jobs repeatedly overlapped GPU execution without taking the shared lock.
+Affected attempts were rejected and are excluded. The historical warm tables
+below must not be treated as measurements of the new heuristic default.
+
+## Historical tuned Decide BF16 latency
+
+The following retained campaign predates heuristic serving. Its warm timings
+exclude synchronous first-shape tuning and do not describe serving cache misses.
 
 Medians in milliseconds on L4 with cuBLAS 13.4.1. Three rotated fresh-process
 rounds, eight measured forwards per geometry per arm. Both native arms use the
@@ -78,7 +126,7 @@ The 512-token single-item case is effectively parity: a 0.6% pooled median edge,
 with native faster in two of three rounds. The other cases improve over PJRT
 by 6–64%. These prepared-input timings do not establish HTTP speedups.
 
-## Decide BF16 memory
+## Historical tuned Decide BF16 memory
 
 Median of three whole-campaign process peaks, in MiB. Includes startup/loading,
 warmup and inference; sampled every 0.2 seconds using process-tree PSS plus NVML.
@@ -119,8 +167,8 @@ merge. A cleanup regression rerun passes all 42 Base CPU FP32 cases (maximum
 raw error 0.00011492) and all 89 Decide Python CUDA BF16 cases
 (maximum confidence drift 0.009570, batch 32 uses four forwards). The
 trimmed core benchmark builds, all 29 Python tests and artifact source-policy
-checks pass. Performance campaigns were not rerun; production kernels and
-recorded timings are unchanged.
+checks pass. That cleanup did not rerun performance or change production kernels;
+the subsequent serving changes and their validation are described above.
 
 ## Latest published CUDA card: snapshot comparison
 

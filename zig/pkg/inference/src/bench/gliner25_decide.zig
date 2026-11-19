@@ -159,12 +159,14 @@ fn runCase(io: std.Io, pipeline: *gliner.GlinerPipeline, selected: []const u8, p
     };
     const samples = try a.alloc(f64, reps);
     defer a.free(samples);
+    var first_forward_ms: f64 = 0;
     const stats_before = factory.getCudaRuntimeStats(pipeline.session);
     for (0..warmup + reps) |i| {
         if (pipeline.execution_control) |*control| control.deadline_ns = inference.platform.time.monotonicNs() + 120 * std.time.ns_per_s;
         const start = inference.platform.time.monotonicNs();
         const result = try pipeline.decideBatch(requests);
         const elapsed_ns = inference.platform.time.monotonicNs() - start;
+        if (i == 0) first_forward_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
         if (cases_path == null and (result.len != 1 or result[0].tasks.len != 2 or
             result[0].tasks[0].selections[0].label_index != 0 or
             result[0].tasks[1].selections[0].label_index != 0))
@@ -177,7 +179,7 @@ fn runCase(io: std.Io, pipeline: *gliner.GlinerPipeline, selected: []const u8, p
         }
         if (i >= warmup) samples[i - warmup] = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     }
-    const CudaEvidence = struct { kernel_launches: usize, h2d_bytes: usize, d2h_bytes: usize, downloads: usize, stream_f32_attention_calls: usize, materialized_f16_attention_calls: usize, f16_cublaslt_linear_calls: usize, bf16_attention_calls: usize, bf16_ffn_calls: usize };
+    const CudaEvidence = struct { plan_cache_misses: usize, matmul_tuning_searches: usize, kernel_launches: usize, h2d_bytes: usize, d2h_bytes: usize, downloads: usize, stream_f32_attention_calls: usize, materialized_f16_attention_calls: usize, f16_cublaslt_linear_calls: usize, bf16_attention_calls: usize, bf16_ffn_calls: usize };
     const cuda_transfers: ?CudaEvidence = if (comptime factory.CudaRuntimeStats != void) blk: {
         const before = stats_before orelse break :blk null;
         factory.drainCudaProfile(pipeline.session);
@@ -186,7 +188,7 @@ fn runCase(io: std.Io, pipeline: *gliner.GlinerPipeline, selected: []const u8, p
             var buffer: [768]u8 = undefined;
             std.debug.print("{s}\n", .{factory.formatCudaPrefillProfileLine(&buffer, delta)});
         }
-        break :blk .{ .kernel_launches = delta.kernel_launches, .h2d_bytes = delta.h2d_bytes, .d2h_bytes = delta.d2h_bytes, .downloads = delta.to_float32_calls, .stream_f32_attention_calls = delta.deberta_stream_f32_attention_calls, .materialized_f16_attention_calls = delta.deberta_materialized_f16_attention_calls, .f16_cublaslt_linear_calls = delta.f16_cublaslt_linear_calls, .bf16_attention_calls = delta.gliner25_bf16_attention_calls, .bf16_ffn_calls = delta.gliner25_bf16_ffn_calls };
+        break :blk .{ .plan_cache_misses = delta.cublaslt_plan_cache_misses, .matmul_tuning_searches = delta.cublaslt_matmul_tuning_searches, .kernel_launches = delta.kernel_launches, .h2d_bytes = delta.h2d_bytes, .d2h_bytes = delta.d2h_bytes, .downloads = delta.to_float32_calls, .stream_f32_attention_calls = delta.deberta_stream_f32_attention_calls, .materialized_f16_attention_calls = delta.deberta_materialized_f16_attention_calls, .f16_cublaslt_linear_calls = delta.f16_cublaslt_linear_calls, .bf16_attention_calls = delta.gliner25_bf16_attention_calls, .bf16_ffn_calls = delta.gliner25_bf16_ffn_calls };
     } else null;
     std.mem.sort(f64, samples, {}, struct {
         fn less(_: void, left: f64, right: f64) bool {
@@ -234,6 +236,7 @@ fn runCase(io: std.Io, pipeline: *gliner.GlinerPipeline, selected: []const u8, p
         .effective_cpu_threads = linalg.pool.cachedCpuCount(),
         .warmup = warmup,
         .reps = reps,
+        .first_forward_ms = first_forward_ms,
         .median_ms = median,
         .p95_ms = p95,
         .min_ms = samples[0],

@@ -117,6 +117,18 @@ checkpoint's 24 FFN layers, enabling a batch-32/four-forward check. Its public
 pipeline includes rendering, tokenization and decoding, and excludes HTTP.
 Automatic production selection ignores diagnostic semantic flags.
 
+To expose first-seen request costs, run a variable-length public-cases file with
+`--all-cases 1 --warmup 0 --reps 3`. Its format is
+`{"format_version":1,"cases":[{"id":"short","texts":["Room 12 needs towels"],"tasks":{"intent":["maintenance","other"]}}]}`;
+add different text lengths, schemas and batch sizes to the cases array. This is
+the public request format, separate from the prepared-tensor manifest above.
+`first_forward_ms` records the first invocation before sorting samples, including
+the first warmup when warmup is enabled. `cuda_transfers.plan_cache_misses` and
+`matmul_tuning_searches` report per-case deltas across warmup and measured calls.
+GLiNER serving uses heuristic plans: new shapes can miss the cache, but must
+record zero timed tuning searches. Retain cold latency separately from warm
+medians; model loading and HTTP remain outside this benchmark.
+
 ```sh
 python -m unittest discover -s zig/lib/pjrt/tools -p 'test_*.py'
 ```

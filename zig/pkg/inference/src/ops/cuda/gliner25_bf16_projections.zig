@@ -21,6 +21,8 @@ pub fn needsTemporary(native_input: Buffer, cached_biases: [3]Buffer, projection
     for (cached_biases[0..projections]) |bias| if (bias.ptr == 0) return true;
     return false;
 }
+// Serving plans use heuristics on first use; exact row counts must not
+// trigger synchronous GPU autotuning while the model execution lane is held.
 pub fn run(ctx: *Context, lt: *Lt, kernels: *Kernels, workspace: Buffer, outputs: [3]Buffer, temporary: Buffer, input: Buffer, weights: [3]Buffer, biases: [3]Buffer, cached_biases: [3]Buffer, native_input: Buffer, rows: usize, hidden: usize, projections: usize) !void {
     const p = plan(rows, hidden, projections) orelse return error.InvalidCudaState;
     try check(input, p.input_bytes * 2);
@@ -35,10 +37,7 @@ pub fn run(ctx: *Context, lt: *Lt, kernels: *Kernels, workspace: Buffer, outputs
         const bias = if (cached_biases[i].ptr != 0) cached_biases[i] else Buffer{ .ptr = temporary.ptr + p.input_bytes + i * p.bias_stride, .len = hidden * 2 };
         try check(bias, hidden * 2);
         if (cached_biases[i].ptr == 0) try kernels.launchF32ToBf16(ctx, bias, biases[i], hidden);
-        _ = (lt.matmulBf16WeightBiasBf16OutWithTuning(ctx, outputs[i], staged, weights[i], bias, workspace, rows, hidden, hidden, .{ .enabled = true, .candidate_count = 16, .warmups = 2, .iterations = 5 }) catch |err| switch (err) {
-            error.CublasLtUnsupported, error.CublasLtTuningInsufficientCandidates => try lt.matmulBf16WeightBiasBf16OutWithTuning(ctx, outputs[i], staged, weights[i], bias, workspace, rows, hidden, hidden, .{}),
-            else => return err,
-        });
+        _ = try lt.matmulBf16WeightBiasBf16OutWithTuning(ctx, outputs[i], staged, weights[i], bias, workspace, rows, hidden, hidden, .{});
     }
 }
 fn round(x: f32) f32 {
@@ -57,6 +56,8 @@ test "GLiNER BF16 projections share input and match rounded CPU oracle" {
     defer kernels.unload(&ctx);
     var lt = try Lt.openWithAllocator(a, &ctx);
     defer lt.deinit();
+    // Force misses after cache saturation as well as new ragged row counts.
+    try lt.setPlanCacheCapacity(2);
     const rows = 128;
     const hidden = 64;
     const host = try a.alloc(f32, rows * hidden);
@@ -132,4 +133,7 @@ test "GLiNER BF16 projections share input and match rounded CPU oracle" {
     try std.testing.expect(plan(129, hidden, 3) != null);
     try std.testing.expect(plan(4097, hidden, 3) == null);
     try std.testing.expect(plan(rows, hidden, 1) == null);
+    try std.testing.expect(lt.plan_cache_misses > 2);
+    try std.testing.expect(lt.uncached_plans > 0);
+    try std.testing.expectEqual(@as(usize, 0), lt.matmul_tuning_searches);
 }

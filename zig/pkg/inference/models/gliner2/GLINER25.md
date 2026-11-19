@@ -822,6 +822,13 @@ preparation happens before weight upload; failure preserves the FP32 route.
 `ANTFLY_INFERENCE_CUDA_DISABLE_GLINER_BF16=1` selects the accurate FP32 fallback.
 Diagnostic BF16 semantic flags cannot alter the automatic profile.
 
+Load-time qualification and BF16 projection/attention dispatch share the same
+compact-attention capability check, including the optional FP32 softmax symbol.
+An incomplete kernel module keeps automatic loading on FP32 before upload.
+GLiNER's BF16 GEMM cache misses use cuBLASLt heuristics, without synchronous
+candidate timing. New padded sequence lengths and microbatch sizes therefore
+do not launch autotuning trials while holding the model execution lane.
+
 Projection weights use BF16 storage. Rounded linear, residual, attention and
 GELU boundaries follow the qualified profile, with FP32 reductions and output
 buffers. Physical forwards remain limited to eight rows and 512 tokens;

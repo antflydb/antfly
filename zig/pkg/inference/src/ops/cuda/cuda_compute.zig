@@ -1533,6 +1533,8 @@ pub const RuntimeStats = struct {
     bf16_cublaslt_activation_staging_calls: usize = 0,
     bf16_cublaslt_activation_mirror_hits: usize = 0,
     bf16_cublaslt_fallbacks: usize = 0,
+    cublaslt_plan_cache_misses: usize = 0,
+    cublaslt_matmul_tuning_searches: usize = 0,
     bf16_cublaslt_tuning_tuned_calls: usize = 0,
     bf16_cublaslt_tuning_heuristic_calls: usize = 0,
     bf16_cublaslt_tuning_api_fallbacks: usize = 0,
@@ -4158,14 +4160,23 @@ pub const CudaCompute = struct {
         return output;
     }
 
+    // BF16 QKV tensors have no FP32 legacy-attention fallback. Check the
+    // complete compact-attention dependency chain before lowering weights,
+    // and use this same predicate before dispatching BF16 projections.
+    fn gliner25Bf16CapabilitiesAvailable(self: *const CudaCompute) bool {
+        return gliner25CompactAttentionAvailable(self) and self.cublaslt != null and
+            self.kernels.gliner25_norm_bf16_mirror != null and
+            self.kernels.gliner25_ffn_bias_gelu_bf16 != null and
+            self.kernels.gliner25_attention_stage_bf16 != null and
+            self.kernels.gliner25_attention_softmax_bf16 != null and
+            self.kernels.gliner25_attention_pointer_views_bf16 != null;
+    }
+
     /// Prepare only the runtime used by the qualified serving profile. Failure
     /// leaves the FP32 policy in place before any model weights are uploaded.
     pub fn prepareQualifiedGlinerBf16(self: *CudaCompute) bool {
         const policy = @import("../../models/gliner25_bf16_policy.zig");
-        if (self.cublaslt == null or self.kernels.gliner25_norm_bf16_mirror == null or
-            self.kernels.gliner25_ffn_bias_gelu_bf16 == null or
-            self.kernels.gliner25_attention_softmax_bf16 == null or
-            self.kernels.gliner25_attention_pointer_views_bf16 == null) return false;
+        if (!self.gliner25Bf16CapabilitiesAvailable()) return false;
         const blas = trainingBlas(self) catch return false;
         if (!policy.runtimeEligible(self.ctx.info.nameSlice(), self.ctx.info.compute_major, self.ctx.info.compute_minor, self.ctx.info.driver_version, blas.version) or
             !blas.supportsWorkspace() or !blas.supportsBf16PointerBatches() or !blas.supportsBf16Linears()) return false;
@@ -6188,6 +6199,10 @@ pub const CudaCompute = struct {
 
     pub fn snapshotStats(self: *const CudaCompute) RuntimeStats {
         var stats = self.stats;
+        if (self.cublaslt) |blas| {
+            stats.cublaslt_plan_cache_misses = blas.plan_cache_misses;
+            stats.cublaslt_matmul_tuning_searches = blas.matmul_tuning_searches;
+        }
         stats.kernel_launches = self.ctx.stats.kernel_launches;
         stats.stream_syncs = self.ctx.stats.stream_syncs;
         for (self.temp_buffers.buffers.items) |buffer| {
@@ -20128,14 +20143,12 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
             errdefer releaseDeviceBuffer(self, &device);
             const workspace = try self.cublaslt_workspace_scratch.acquire(&self.ctx, @import("gliner25_bf16_attention.zig").workspace_limit);
             var contracted = false;
-            for ([_]bool{ true, false }) |tune| {
-                if (self.cublaslt.?.matmulBf16WeightBiasF32OutWithTuning(&self.ctx, device, staged, weight_tensor.buffer, bias_tensor.buffer, workspace, rows, in_dim, out_dim, .{ .enabled = tune, .candidate_count = 16, .warmups = 2, .iterations = 5 })) |_| {
-                    contracted = true;
-                    break;
-                } else |err| switch (err) {
-                    error.CublasLtUnsupported, error.CublasLtTuningInsufficientCandidates => {},
-                    else => return err,
-                }
+            // Serving cache misses use a vendor heuristic, never timed GEMMs.
+            if (self.cublaslt.?.matmulBf16WeightBiasF32OutWithTuning(&self.ctx, device, staged, weight_tensor.buffer, bias_tensor.buffer, workspace, rows, in_dim, out_dim, .{})) |_| {
+                contracted = true;
+            } else |err| switch (err) {
+                error.CublasLtUnsupported => {},
+                else => return err,
             }
             if (!contracted) {
                 // Small entity-scoring matrices can have unaligned K.
@@ -20173,7 +20186,7 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
                 errdefer releaseDeviceBuffer(self, &device);
                 const shape = try allocShape2(self.allocator, rows, out_dim);
                 errdefer self.allocator.free(shape);
-                _ = try blas.matmulBf16WeightBiasF32OutWithTuning(&self.ctx, device, staged, weight_tensor.buffer, bias_tensor.buffer, workspace, rows, in_dim, out_dim, .{ .enabled = true, .candidate_count = 16, .warmups = 2, .iterations = 5 });
+                _ = try blas.matmulBf16WeightBiasF32OutWithTuning(&self.ctx, device, staged, weight_tensor.buffer, bias_tensor.buffer, workspace, rows, in_dim, out_dim, .{});
                 self.stats.gliner25_bf16_bias_calls += 1;
                 self.stats.bf16_cublaslt_linear_calls += 1;
                 self.dispatch_stats.note(self.allocator, .linear, .bf16, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
@@ -27736,8 +27749,40 @@ fn relativePositionBias(_: *anyopaque, _: CT, _: usize, _: usize, _: usize, _: u
 }
 fn gliner25Bf16FfnAvailable(ctx: *anyopaque) bool {
     const self: *const CudaCompute = @ptrCast(@alignCast(ctx));
-    return self.gliner_deberta_bf16 and self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9 and self.cublaslt != null and
-        self.kernels.gliner25_ffn_bias_gelu_bf16 != null and !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active;
+    return self.gliner_deberta_bf16 and self.gliner25Bf16CapabilitiesAvailable();
+}
+
+test "GLiNER BF16 optional FP32 softmax is required before upload and dispatch" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = CudaCompute.init(std.testing.allocator) catch |err| {
+        if (platform.env.getenvBool("TERMITE_REQUIRE_CUDA_TESTS")) return err;
+        return error.SkipZigTest;
+    };
+    defer compute.deinit();
+    const policy = @import("../../models/gliner25_bf16_policy.zig");
+    const blas = try trainingBlas(&compute);
+    if (!policy.runtimeEligible(compute.ctx.info.nameSlice(), compute.ctx.info.compute_major, compute.ctx.info.compute_minor, compute.ctx.info.driver_version, blas.version)) return error.SkipZigTest;
+    try std.testing.expect(compute.prepareQualifiedGlinerBf16());
+    const saved = compute.kernels.gliner25_attention_softmax_f32;
+    compute.kernels.gliner25_attention_softmax_f32 = null;
+    defer compute.kernels.gliner25_attention_softmax_f32 = saved;
+    try std.testing.expect(!compute.prepareQualifiedGlinerBf16());
+    compute.gliner_deberta_bf16 = true;
+    try std.testing.expect(!gliner25Bf16FfnAvailable(&compute));
+    try std.testing.expect(!compactDebertaRelativeProjectionEnabled(&compute, 128));
+    // The projections must decline before reading or allocating operands:
+    // emitting BF16 QKV here would strand inference on the F32-only fallback.
+    try std.testing.expectEqual(@as(?ops.DebertaBf16ProjectionsResult, null), try gliner25Bf16Projections(&compute, &.{
+        .input = undefined,
+        .weights = undefined,
+        .biases = undefined,
+        .count = 3,
+        .rows = 128,
+        .hidden = 768,
+        .batch = 1,
+        .sequence = 128,
+    }));
+    try std.testing.expect(!try tryGliner25Bf16Attention(&compute, .{}, @splat(.{}), 1, 128, 12, 255, false, true));
 }
 
 test "GLiNER BF16 projections narrow scoring fallback rounds activations" {
@@ -27963,9 +28008,7 @@ fn gliner25BorrowRelative(self: *CudaCompute, buffers: [2]buffer_mod.DeviceBuffe
 fn gliner25Bf16Projections(ctx: *anyopaque, request: *const ops.DebertaBf16ProjectionsRequest) anyerror!?ops.DebertaBf16ProjectionsResult {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const helper = @import("gliner25_bf16_projections.zig");
-    if (!self.gliner_deberta_bf16 or self.ctx.info.compute_major != 8 or self.ctx.info.compute_minor != 9 or
-        platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_GLINER_FP32_ATTENTION") or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or self.cublaslt == null or
-        self.kernels.gliner25_attention_softmax_bf16 == null or self.kernels.gliner25_attention_pointer_views_bf16 == null or
+    if (!self.gliner_deberta_bf16 or !self.gliner25Bf16CapabilitiesAvailable() or
         request.batch == 0 or request.batch > 8 or request.sequence == 0 or request.sequence > 512 or (!self.gliner_bf16_reference and request.sequence % 8 != 0) or
         helper.plan(request.rows, request.hidden, request.count) == null) return null;
     const blas = trainingBlas(self) catch return null;
@@ -28037,9 +28080,7 @@ fn gliner25BoundaryFusedFfn(ctx: *anyopaque, request: *const ops.gliner_boundary
 
 fn tryGliner25Bf16Attention(self: *CudaCompute, output: buffer_mod.DeviceBuffer, inputs: [7]buffer_mod.DeviceBuffer, batch: usize, sequence: usize, heads: usize, relative: usize, boundary: bool, native: bool) !bool {
     const attention = @import("gliner25_bf16_attention.zig");
-    if (self.ctx.info.compute_major != 8 or self.ctx.info.compute_minor != 9 or
-        self.kernels.gliner25_attention_stage_bf16 == null or self.kernels.gliner25_attention_pointer_views_bf16 == null or self.kernels.gliner25_attention_softmax_bf16 == null or
-        self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or attention.planWithReference(batch, sequence, heads, 64, relative, native, self.gliner_bf16_reference) == null) return false;
+    if (!self.gliner25Bf16CapabilitiesAvailable() or attention.planWithReference(batch, sequence, heads, 64, relative, native, self.gliner_bf16_reference) == null) return false;
     const blas = trainingBlas(self) catch return false;
     if (!blas.supportsWorkspace() or !blas.supportsBf16PointerBatches()) return false;
     const workspace = self.cublaslt_workspace_scratch.acquire(&self.ctx, attention.workspace_limit) catch return false;
@@ -28051,9 +28092,7 @@ fn tryGliner25Bf16Attention(self: *CudaCompute, output: buffer_mod.DeviceBuffer,
 fn tryGliner25GemmAttention(self: *CudaCompute, output: buffer_mod.DeviceBuffer, inputs: [7]buffer_mod.DeviceBuffer, batch: usize, sequence: usize, heads: usize, relative: usize, boundary: bool) !bool {
     if (self.gliner_deberta_bf16) return tryGliner25Bf16Attention(self, output, inputs, batch, sequence, heads, relative, boundary, false);
     const attention = @import("gliner25_fp32_attention.zig");
-    if (self.ctx.info.compute_major != 8 or self.ctx.info.compute_minor != 9 or
-        self.kernels.gliner25_attention_softmax_f32 == null or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
-        platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_GLINER_FP32_ATTENTION")) return false;
+    if (!gliner25CompactAttentionAvailable(self)) return false;
     _ = attention.plan(batch, sequence, heads, 64, relative) orelse return false;
     // The same 32 MiB serves projection GEMMs and attention sequentially on
     // ctx.stream. Growth is admitted by the shared physical allocation ledger;
@@ -28067,22 +28106,26 @@ fn tryGliner25GemmAttention(self: *CudaCompute, output: buffer_mod.DeviceBuffer,
     return true;
 }
 
-fn compactDebertaRelativeProjectionEnabled(ctx: *anyopaque, sequence: usize) bool {
-    const self: *const CudaCompute = @ptrCast(@alignCast(ctx));
-    return (self.qualified_decide_fp32 or self.gliner_boundary_inference or self.gliner_deberta_bf16) and sequence > 0 and sequence <= 512 and
-        self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9 and
+fn gliner25CompactAttentionAvailable(self: *const CudaCompute) bool {
+    return self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9 and
         self.kernels.gliner25_attention_softmax_f32 != null and
         !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active and
         !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_GLINER_FP32_ATTENTION");
+}
+
+fn compactDebertaRelativeProjectionEnabled(ctx: *anyopaque, sequence: usize) bool {
+    const self: *const CudaCompute = @ptrCast(@alignCast(ctx));
+    return (self.qualified_decide_fp32 or self.gliner_boundary_inference or self.gliner_deberta_bf16) and sequence > 0 and sequence <= 512 and
+        gliner25CompactAttentionAvailable(self) and
+        (!self.gliner_deberta_bf16 or self.gliner25Bf16CapabilitiesAvailable());
 }
 
 fn debertaDisentangledAttentionCompact(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q_r_ct: CT, k_r_ct: CT, relative_ids: []const i64, mask: []const i64, batch: usize, sequence: usize, heads: usize, head_dim: usize) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const attention = @import("gliner25_fp32_attention.zig");
     if ((!self.qualified_span_fp32 and !self.qualified_decide_fp32 and !self.gliner_deberta_bf16) or
-        self.ctx.info.compute_major != 8 or self.ctx.info.compute_minor != 9 or
-        self.kernels.gliner25_attention_softmax_f32 == null or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
-        platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_GLINER_FP32_ATTENTION") or
+        !gliner25CompactAttentionAvailable(self) or
+        (self.gliner_deberta_bf16 and !self.gliner25Bf16CapabilitiesAvailable()) or
         attention.plan(batch, sequence, heads, head_dim, 1) == null) return null;
     const hidden = heads * head_dim;
     const q = tensorFromCt(q_ct);
