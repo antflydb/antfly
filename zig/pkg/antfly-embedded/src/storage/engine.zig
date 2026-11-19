@@ -579,9 +579,8 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     };
     return &Holder.fields;
 }
-// Main privacy callbacks/options plus native policy, layout and retained-status
-// contracts require the combined Engine62 profile.
-pub const descriptor_version: u32 = 63;
+// Schema-owner preparation and commit dispatch through the storage archive.
+pub const descriptor_version: u32 = 64;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,
@@ -765,19 +764,19 @@ pub fn descriptorForValidation() *const Descriptor {
     return antfly_storage_engine_get_descriptor_v37();
 }
 pub fn validateCheckedNativeAtomicContract(version: u32, contract: native.TypeContract) !void {
-    if (version != 63 or !contract.matches(checked_native_atomic_layout)) return error.UnsupportedVersion;
+    if (version != descriptor_version or !contract.matches(checked_native_atomic_layout)) return error.UnsupportedVersion;
 }
 pub fn validateLookupOptionsContract(version: u32, contract: native.TypeContract) !void {
-    if (version != 63 or !contract.matches(lookup_options_layout)) return error.UnsupportedVersion;
+    if (version != descriptor_version or !contract.matches(lookup_options_layout)) return error.UnsupportedVersion;
 }
 pub fn validateRowPolicyInstalledContract(version: u32, contract: native.TypeContract) !void {
-    if (version != 63 or !contract.matches(row_policy_installed_layout)) return error.UnsupportedVersion;
+    if (version != descriptor_version or !contract.matches(row_policy_installed_layout)) return error.UnsupportedVersion;
 }
 pub fn validatePhysicalRowLayoutContract(version: u32, contract: native.TypeContract) !void {
-    if (version != 63 or !contract.matches(physical_row_layout)) return error.UnsupportedVersion;
+    if (version != descriptor_version or !contract.matches(physical_row_layout)) return error.UnsupportedVersion;
 }
 pub fn validateExternalRetentionContract(version: u32, contract: native.TypeContract) !void {
-    if (version != 63 or !contract.matches(external_retention_layout)) return error.UnsupportedVersion;
+    if (version != descriptor_version or !contract.matches(external_retention_layout)) return error.UnsupportedVersion;
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
     // Check the fixed prefix before reading any later versioned field.

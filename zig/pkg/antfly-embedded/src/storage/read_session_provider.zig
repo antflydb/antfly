@@ -139,9 +139,9 @@ pub fn validateExportedRow(row: anytype) !void {
     if (row.typed_cells) |cells| {
         if (cells.columnar != null) return error.UnsupportedVersion;
         for (cells.values) |datum| {
-            if (datum.patterns != null) return error.UnsupportedVersion;
+            if (datum.extension_kind == .patterns) return error.UnsupportedVersion;
             if (datum.array) |array| for (array.elements) |element| {
-                if (element.patterns != null or element.array != null) return error.UnsupportedVersion;
+                if (element.extension_kind == .patterns or element.array != null) return error.UnsupportedVersion;
             };
         }
     }

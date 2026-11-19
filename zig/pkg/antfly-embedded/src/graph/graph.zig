@@ -1527,7 +1527,7 @@ pub const GraphIndex = struct {
         }
         pub fn getPageDirected(self: *@This(), alloc: Allocator, key: []const u8, edge_types: []const []const u8, direction: EdgeDirection, cursor: ?EdgeScanCursor, limits: EdgePageLimits, now_ns: u64) !EdgePage {
             if (cursor) |continuation| try self.context.validateContinuation(continuation);
-            var page = try getEdgesByTypesPageInRead(&self.definition, alloc, key, edge_types, direction, cursor, limits, now_ns, null, &self.context.reads);
+            var page = try getEdgesByTypesPageInRead(&self.definition, alloc, key, edge_types, direction, cursor, limits, now_ns, null, &self.context.reads, true);
             if (page.next_cursor) |*continuation| self.context.bindContinuation(continuation);
             return page;
         }
