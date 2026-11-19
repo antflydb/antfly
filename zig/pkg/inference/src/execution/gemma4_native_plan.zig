@@ -28,7 +28,7 @@ pub const Plan = struct {
     /// addition to the existing auxiliary/media envelope. These are automatic
     /// category floors, not reservations: callers still admit actual amounts,
     /// apply operator overrides last, and retain physical/process admission.
-    pub fn generationBudgetFloor(self: Plan, config: Config, auxiliary: @import("../runtime/tier/memory.zig").Limits) !@import("../runtime/tier/memory.zig").Limits {
+    pub fn generationBudgetFloor(self: Plan, config: Config, backend_residency_bytes: usize, auxiliary: @import("../runtime/tier/memory.zig").Limits) !@import("../runtime/tier/memory.zig").Limits {
         const memory = @import("../runtime/tier/memory.zig");
         const context_tokens = @min(@as(usize, config.max_position_embeddings), @import("../graph/quant_kernel_cuda_renderer.zig").FlashPrefillQueryLengthPolicy.paged_f16_q2_to_8192_128k_v2.maxContextTokens());
         if (context_tokens < 2) return error.InvalidModelConfig;
@@ -41,7 +41,7 @@ pub const Plan = struct {
         };
         const estimate = try component.estimate(context_tokens - 1, 1, self.geometry.prefillChunkRows(context_tokens, 0));
         const host = try std.math.add(usize, estimate.host_input_bytes, estimate.host_metadata_bytes);
-        const backend = try std.math.add(usize, estimate.kv_bytes, estimate.scratch_bytes);
+        const backend = try std.math.add(usize, backend_residency_bytes, try std.math.add(usize, estimate.kv_bytes, estimate.scratch_bytes));
         return .{
             .host_limit_bytes = try std.math.add(usize, auxiliary.host_limit_bytes, host),
             .backend_limit_bytes = try std.math.add(usize, auxiliary.backend_limit_bytes, backend),
@@ -143,14 +143,20 @@ test "Gemma4 CUDA full window budget floor preserves explicit limits" {
     const config = Config{ .family = .gemma, .hidden_size = 2560, .num_hidden_layers = 42, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 512, .intermediate_size = 10240, .num_kv_shared_layers = 18, .sliding_window = 512, .sliding_window_pattern = 6, .ple_hidden_size = 256, .vocab_size = 262144, .max_position_embeddings = 131072 };
     const plan = Plan{ .projection = .bf16_donors, .geometry = .{ .donor_layers = 24 } };
     const auxiliary = memory.Limits{ .host_limit_bytes = 3 << 30, .backend_limit_bytes = 9 << 30, .combined_limit_bytes = 12 << 30, .kv_limit_bytes = 3 << 30, .scratch_limit_bytes = 2 << 30 };
-    const floor = try plan.generationBudgetFloor(config, auxiliary);
+    const resident_bytes: usize = 13 << 30;
+    const floor = try plan.generationBudgetFloor(config, resident_bytes, auxiliary);
     const component = memory.GptGenerationBudgetComponent{ .backend = .cuda, .kv_dtype = .f16, .config = config, .prompt_input_copies = 2, .host_prompt_input_copies = 1 };
     const required = try component.estimate(131040, 32, 2048);
     try std.testing.expect(floor.kv_limit_bytes >= required.kv_bytes);
     try std.testing.expect(floor.backend_limit_bytes >= required.kv_bytes + required.scratch_bytes);
     var admitted = memory.RunBudget.init(floor);
+    // Persistent weights share the model domain with each request. The
+    // automatic floor must admit the planned chunk beside real residency.
+    try admitted.tryReserve(.{ .kind = .weight, .tier = .backend, .bytes = resident_bytes });
     try admitted.reserveEstimate(required);
     admitted.releaseEstimate(required);
+    try std.testing.expectEqual(resident_bytes, admitted.backendTotalBytes());
+    admitted.release(.{ .kind = .weight, .tier = .backend, .bytes = resident_bytes });
     try std.testing.expectEqual(@as(usize, 0), admitted.backendTotalBytes());
     try std.testing.expectEqual(@as(usize, 0), admitted.hostTotalBytes());
     // The same request must still fail an operator's explicit KV cap. A

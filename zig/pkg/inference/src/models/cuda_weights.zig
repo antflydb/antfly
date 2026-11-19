@@ -847,7 +847,7 @@ pub fn prepareWithHostLease(
         runtime.tier.memory.Limits{};
     if (cuda_compute.ctx.info.compute_major == 12 and cuda_compute.ctx.info.compute_minor == 1) {
         if (cuda_compute.gemma4_native_plan) |plan| {
-            generation_budget = runtime.tier.memory.maxCompositeLimits(generation_budget, try plan.generationBudgetFloor(host_weights_owner.architecture.gpt, runtime.tier.memory.defaultLimitsForBackend(.gpu)));
+            generation_budget = runtime.tier.memory.maxCompositeLimits(generation_budget, try plan.generationBudgetFloor(host_weights_owner.architecture.gpt, cuda_compute.ctx.device_allocations.snapshot().live, runtime.tier.memory.defaultLimitsForBackend(.gpu)));
         }
     }
     // Artifact preparation has never been tokenizer-sealed. Publication must
