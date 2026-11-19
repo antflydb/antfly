@@ -919,7 +919,19 @@ const Builder = struct {
         result.columns = try projections.toOwnedSlice(self.alloc);
         result.predicate = if (statement.predicate) |input| try self.predicate(source.columns, input) else null;
         const groups = try self.alloc.alloc(*const ast.Scalar, statement.group_by.len);
-        for (statement.group_by, groups) |input, *out| out.* = try self.expression(source.columns, input, if (input.* == .column) result.columns else &.{});
+        for (statement.group_by, groups) |input, *out| {
+            out.* = self.expression(source.columns, input, &.{}) catch |err| fallback: {
+                if (err != error.UndefinedColumn or input.* != .column) return err;
+                var found: ?*const ast.Scalar = null;
+                for (result.columns) |projection| {
+                    if (!std.mem.eql(u8, projection.alias orelse projection.field, input.column)) continue;
+                    const candidate = projection.expression orelse try self.scalarNode(.{ .column = projection.field });
+                    if (found) |prior| if (!@import("aggregate_binding.zig").same(prior, candidate)) return error.AmbiguousSqlColumn;
+                    found = candidate;
+                }
+                break :fallback found orelse return err;
+            };
+        }
         result.group_by = groups;
         result.having = if (statement.having) |input| try self.expression(source.columns, input, &.{}) else null;
         const window_orders = @import("window_binding.zig").accepts(statement);

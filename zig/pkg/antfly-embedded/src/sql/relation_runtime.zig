@@ -736,6 +736,23 @@ test "SQL generate_series accepts expression bounds and alias columns" {
     try std.testing.expectError(error.SqlZeroSeriesStep, @import("runtime.zig").execute(allocator, backend.backend(), &zero, &.{}, .{}));
 }
 
+test "SQL derived GROUP BY resolves output aliases after source fields" {
+    const a = std.testing.allocator;
+    var backend: SetTestBackend = .{};
+    for ([_][]const u8{
+        "SELECT e.id, e.label_count FROM (SELECT t.enumtypid AS id, count(t.enumlabel) AS label_count FROM (VALUES (3,'label')) t(enumtypid,enumlabel) GROUP BY id) e",
+        "SELECT e.id, e.label_count FROM (SELECT t.enumtypid AS id, count(t.enumlabel) AS label_count FROM (VALUES (3,'label')) t(enumtypid,enumlabel) GROUP BY t.enumtypid) e",
+    }) |sql| {
+        var compiled = try @import("compiler.zig").compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(a, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("3", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("1", result.output.rows[0][1].string);
+    }
+}
+
 test "SQL JOIN USING merges shared keys and preserves qualified inputs" {
     const allocator = std.testing.allocator;
     var backend: SetTestBackend = .{};
