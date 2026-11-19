@@ -1048,27 +1048,23 @@ fn resolveArtifactRepairRouting(
     const deadline_ns = catalog.budget(null).nowNs() +| 5 * std.time.ns_per_s;
     const budget = catalog.budget(deadline_ns);
     if (selection != .all) {
-        const generation: ?*table_catalog.RoutingGeneration = if (catalog.vtable.acquire_table_routing_generation) |acquire|
-            try acquire(catalog.ptr, table_name, budget)
-        else if (catalog.vtable.await_route == null and catalog.vtable.acquire_routing_generation != null)
-            try catalog.vtable.acquire_routing_generation.?(catalog.ptr, budget, false)
-        else
-            null;
-        if (generation) |retained| {
-            defer retained.release();
-            const session = &retained.indexed;
-            if (try session.repairRoutingView(table_name, budget)) |view| {
-                const group_ids: []u64 = switch (selection) {
-                    .group => |group_id| blk: {
-                        _ = session.rangeForGroup(view.table_id, group_id, budget) catch |err| switch (err) {
-                            error.TopologyChanged => break :blk &.{},
-                            else => return err,
-                        };
-                        break :blk try alloc.dupe(u64, &.{group_id});
-                    },
-                    else => &.{},
+        const group_id: ?u64 = if (selection == .group) selection.group else null;
+        if (catalog.vtable.repair_route) |resolve| {
+            const route = (try resolve(catalog.ptr, table_name, group_id, budget)) orelse
+                return .{ .group_ids = &.{}, .fence = null };
+            return .{
+                .group_ids = if (route.group_present) try alloc.dupe(u64, &.{group_id.?}) else &.{},
+                .fence = route.fence,
+            };
+        }
+        if (catalog.vtable.await_route == null) {
+            if (catalog.vtable.acquire_routing_generation) |acquire| {
+                const generation = try acquire(catalog.ptr, budget, false);
+                defer generation.release();
+                if (try generation.indexed.repairRoute(table_name, group_id, budget)) |route| return .{
+                    .group_ids = if (route.group_present) try alloc.dupe(u64, &.{group_id.?}) else &.{},
+                    .fence = route.fence,
                 };
-                return .{ .group_ids = group_ids, .fence = view.fence };
             }
         }
     }
@@ -61243,7 +61239,7 @@ fn implementationTests() type {
                     return .{
                         .ptr = routing,
                         .vtable = &.{
-                            .acquire_table_routing_generation = if (scenario == .parked_documents) acquireGeneration else null,
+                            .repair_route = if (scenario == .parked_documents) repairRoute else null,
                             .admin_snapshot = adminSnapshot,
                             .free_admin_snapshot = freeAdminSnapshot,
                             .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
@@ -61253,11 +61249,10 @@ fn implementationTests() type {
                     };
                 }
 
-                fn acquireGeneration(ptr: *anyopaque, table_name: []const u8, _: table_catalog.RoutingBudget) !*table_catalog.RoutingGeneration {
+                fn repairRoute(ptr: *anyopaque, table_name: []const u8, group_id: ?u64, budget: table_catalog.RoutingBudget) !?table_catalog.RepairRoute {
                     try std.testing.expectEqualStrings("docs", table_name);
                     const routing: *table_catalog.RoutingGeneration = @ptrCast(@alignCast(ptr));
-                    routing.retain();
-                    return routing;
+                    return routing.indexed.repairRoute(table_name, group_id, budget);
                 }
 
                 fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {

@@ -226,6 +226,7 @@ pub const AdminSource = struct {
         routing_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = unsupportedRoutingSnapshot,
         table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
+        linearizable_routing_generation: ?*const fn (*anyopaque, operation.RequestContext) anyerror!*api_table_catalog.RoutingGeneration = null,
         linearizable_table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         linearizable_routing_token: ?*const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.CatalogRoutingChangeToken = null,
         owner_readiness: ?*const fn (*anyopaque, metadata_api.OwnerReadinessRequest, operation.RequestContext) anyerror!metadata_api.OwnerReadiness = null,
@@ -658,6 +659,7 @@ pub const AdminSource = struct {
                 .routing_snapshot = metadataServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
+                .linearizable_routing_generation = metadataServiceLinearizableRoutingGeneration,
                 .linearizable_table_routing_snapshot = metadataServiceLinearizableTableRoutingSnapshot,
                 .linearizable_routing_token = metadataServiceRoutingToken,
                 .owner_readiness = metadataServiceOwnerReadiness,
@@ -733,6 +735,7 @@ pub const AdminSource = struct {
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
+                .linearizable_routing_generation = metadataHttpServiceLinearizableRoutingGeneration,
                 .linearizable_table_routing_snapshot = metadataHttpServiceLinearizableTableRoutingSnapshot,
                 .linearizable_routing_token = metadataHttpServiceRoutingToken,
                 .owner_readiness = metadataHttpServiceOwnerReadiness,
@@ -964,6 +967,12 @@ pub const AdminSource = struct {
     fn metadataServiceLinearizableRoutingSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         return try service.linearizableCatalogRoutingSnapshot(service.MetadataService, svc, request);
+    }
+
+    fn metadataServiceLinearizableRoutingGeneration(ptr: *anyopaque, request: operation.RequestContext) !*api_table_catalog.RoutingGeneration {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLinearizableReadWithContext(request);
+        return svc.acquireCatalogRoutingGenerationWithBudget(.{ .deadline_ns = request.deadline_ns, .io = request.deadline_io, .cancellation = request.cancellation });
     }
 
     fn metadataServiceLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
@@ -1503,6 +1512,12 @@ pub const AdminSource = struct {
     fn metadataHttpServiceLinearizableRoutingSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         return try service.linearizableCatalogRoutingSnapshot(service.MetadataHttpService, svc, request);
+    }
+
+    fn metadataHttpServiceLinearizableRoutingGeneration(ptr: *anyopaque, request: operation.RequestContext) !*api_table_catalog.RoutingGeneration {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLinearizableReadWithContext(request);
+        return svc.acquireCatalogRoutingGenerationWithBudget(.{ .deadline_ns = request.deadline_ns, .io = request.deadline_io, .cancellation = request.cancellation });
     }
 
     fn metadataHttpServiceLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
@@ -2665,6 +2680,30 @@ pub const MetadataHttpServer = struct {
         return self.trackedJson(ctx, result);
     }
 
+    fn captureAwaitRoute(
+        self: *MetadataHttpServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        query: api_table_catalog.RouteQuery,
+        request: operation.RequestContext,
+    ) !struct { token: metadata_api.CatalogRoutingChangeToken, plan: ?api_table_catalog.CatalogRoutePlan } {
+        const budget: api_table_catalog.RoutingBudget = .{ .deadline_ns = request.deadline_ns, .io = request.deadline_io, .cancellation = request.cancellation };
+        if (if (query == .all_ranges) self.source.vtable.linearizable_routing_generation else null) |capture| {
+            const generation = try capture(self.source.ptr, request);
+            defer generation.release();
+            return .{
+                .token = generation.indexed.snapshot.value.change_token,
+                .plan = try generation.indexed.routePlan(alloc, table_name, query, budget),
+            };
+        }
+        var snapshot = try self.source.linearizableRoutingSnapshot(request);
+        defer self.source.freeRoutingSnapshot(&snapshot);
+        return .{
+            .token = snapshot.change_token,
+            .plan = try api_table_catalog.routePlanFromSnapshotWithBudget(alloc, snapshot, table_name, query, budget),
+        };
+    }
+
     fn metadataAwaitRoute(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
         const body = (try ctx.body()) orelse "";
@@ -2678,28 +2717,12 @@ pub const MetadataHttpServer = struct {
             if (platform_time.monotonicNs() >= deadline_ns) {
                 return self.trackedJson(ctx, metadata_api.CatalogRouteResolveResult{ .disposition = .timed_out });
             }
-            var snapshot = self.source.linearizableRoutingSnapshot(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+            const capture = self.captureAwaitRoute(ctx.allocator, parsed.value.query.table_name, query, requestContext(ctx)) catch |err| switch (err) {
                 error.CatalogRoutingSnapshotTimeout, error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return self.trackedJson(ctx, metadata_api.CatalogRouteResolveResult{ .disposition = .timed_out }),
                 else => return metadataReadError(ctx, err),
             };
-            const token = snapshot.change_token;
-            var local_plan = api_table_catalog.routePlanFromSnapshotUntil(
-                ctx.allocator,
-                snapshot,
-                parsed.value.query.table_name,
-                query,
-                deadline_ns,
-            ) catch |err| switch (err) {
-                error.CatalogRoutingSnapshotTimeout => {
-                    self.source.freeRoutingSnapshot(&snapshot);
-                    return self.trackedJson(ctx, metadata_api.CatalogRouteResolveResult{ .disposition = .timed_out });
-                },
-                else => {
-                    self.source.freeRoutingSnapshot(&snapshot);
-                    return metadataReadError(ctx, err);
-                },
-            };
-            self.source.freeRoutingSnapshot(&snapshot);
+            const token = capture.token;
+            var local_plan = capture.plan;
             if (local_plan) |*plan| {
                 defer plan.deinit(ctx.allocator);
                 var wire_plan = cloneRoutePlanForWireUntil(ctx.allocator, plan.*, deadline_ns) catch |err| switch (err) {
@@ -5695,6 +5718,7 @@ test "metadata routing server converts relative budget to local deadline" {
         observed_change_token: ?metadata_api.CatalogRoutingChangeToken = null,
         observed_confirm_absence: bool = false,
         observed_table_name: bool = false,
+        generation_reads: usize = 0,
 
         fn iface(self: *@This()) AdminSource {
             return .{ .ptr = self, .vtable = &.{
@@ -5704,6 +5728,7 @@ test "metadata routing server converts relative budget to local deadline" {
                 .routing_snapshot = routingSnapshot,
                 .table_routing_snapshot = tableRoutingSnapshot,
                 .linearizable_routing_snapshot = linearizableRoutingSnapshot,
+                .linearizable_routing_generation = linearizableRoutingGeneration,
                 .linearizable_table_routing_snapshot = linearizableTableRoutingSnapshot,
                 .free_routing_snapshot = freeRoutingSnapshot,
                 .wait_for_routing_change = waitForRoutingChange,
@@ -5734,6 +5759,18 @@ test "metadata routing server converts relative budget to local deadline" {
 
         fn linearizableRoutingSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
             return routingSnapshot(ptr, request.deadline_ns);
+        }
+
+        fn linearizableRoutingGeneration(ptr: *anyopaque, request: operation.RequestContext) !*api_table_catalog.RoutingGeneration {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.generation_reads += 1;
+            return api_table_catalog.RoutingGeneration.create(std.testing.allocator, .{
+                .metadata_group_id = 1,
+                .catalog_revision = 9,
+                .change_token = .{ .metadata_group_id = 1, .revision = 9 },
+                .tables = @constCast(&tables),
+                .ranges = @constCast(&ranges),
+            }, .{ .deadline_ns = request.deadline_ns });
         }
 
         fn tableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
@@ -5893,6 +5930,8 @@ test "metadata routing server converts relative budget to local deadline" {
     defer parsed_route.deinit();
     try std.testing.expectEqual(metadata_api.CatalogRouteResolveResult.Disposition.found, parsed_route.value.disposition);
     try std.testing.expectEqual(@as(u64, 71), parsed_route.value.plan.?.groups[0].group_id);
+    try std.testing.expectEqual(@as(usize, 1), source.generation_reads);
+    try std.testing.expect(source.observed_deadline_ns == null);
 }
 
 test "metadata http server serves status and filtered admin routes" {

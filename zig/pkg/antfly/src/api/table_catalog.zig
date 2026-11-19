@@ -105,9 +105,8 @@ pub const CatalogSource = struct {
         /// owned by the caller. Authoritative captures must still cross the
         /// source's read barrier; an eventual cache hit never proves absence.
         acquire_routing_generation: ?*const fn (ptr: *anyopaque, budget: RoutingBudget, authoritative: bool) anyerror!*RoutingGeneration = null,
-        /// An authoritative retained generation for one table. Remote sources
-        /// refresh through table-scoped metadata reads on a cache miss.
-        acquire_table_routing_generation: ?*const fn (ptr: *anyopaque, table_name: []const u8, budget: RoutingBudget) anyerror!*RoutingGeneration = null,
+        /// Authoritative table fence and membership of an optional parked group.
+        repair_route: ?*const fn (ptr: *anyopaque, table_name: []const u8, group_id: ?u64, budget: RoutingBudget) anyerror!?RepairRoute = null,
         /// Allocation-efficient point projection used by mutation routing.
         /// It returns the same owned wire type with zero or one table.
         table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
@@ -408,6 +407,11 @@ pub const RoutingGeneration = struct {
     }
 };
 
+pub const RepairRoute = struct {
+    fence: u64,
+    group_present: bool = false,
+};
+
 pub fn repairFenceDigest(topology_epoch: u64, table_id: u64) std.hash.Wyhash {
     var digest = std.hash.Wyhash.init(topology_epoch);
     digest.update(std.mem.asBytes(&table_id));
@@ -611,16 +615,26 @@ pub const RoutingSession = struct {
         return .{ .table_id = id, .topology_epoch = self.topology_epochs.get(id).?, .covers_keyspace = if (self.table_range_refs.get(id)) |entry| entry.covers_keyspace else false };
     }
 
-    pub const RepairRoutingView = struct { table_id: u64, fence: u64 };
+    const RepairRoutingView = struct { table_id: u64, fence: u64 };
 
     /// Full-span repair fence, calculated once with the same ordered group
     /// IDs as the persisted repair job cursor.
-    pub fn repairRoutingView(self: *const RoutingSession, table_name: []const u8, budget: RoutingBudget) !?RepairRoutingView {
+    fn repairRoutingView(self: *const RoutingSession, table_name: []const u8, budget: RoutingBudget) !?RepairRoutingView {
         try budget.checkpoint();
         const index = self.table_indexes.get(table_name) orelse return null;
         const table_id = self.snapshot.value.tables[index].table_id;
         const ranges = self.table_range_refs.get(table_id) orelse return null;
         return .{ .table_id = table_id, .fence = ranges.repair_fence };
+    }
+
+    pub fn repairRoute(self: *const RoutingSession, table_name: []const u8, group_id: ?u64, budget: RoutingBudget) !?RepairRoute {
+        const view = (try self.repairRoutingView(table_name, budget)) orelse return null;
+        const id = group_id orelse return .{ .fence = view.fence };
+        _ = self.rangeForGroup(view.table_id, id, budget) catch |err| switch (err) {
+            error.TopologyChanged => return .{ .fence = view.fence },
+            else => return err,
+        };
+        return .{ .fence = view.fence, .group_present = true };
     }
 
     /// A published group identifies exactly one range in a generation; setup
@@ -825,7 +839,7 @@ pub const RoutingSession = struct {
         };
     }
 
-    fn routePlan(self: *const RoutingSession, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, budget: RoutingBudget) !?CatalogRoutePlan {
+    pub fn routePlan(self: *const RoutingSession, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, budget: RoutingBudget) !?CatalogRoutePlan {
         try budget.checkpoint();
         const table_index = self.table_indexes.get(table_name) orelse return null;
         const table = &self.snapshot.value.tables[table_index];
