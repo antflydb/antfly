@@ -223,6 +223,24 @@ var text_doc_scratch_retained_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_segment_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_projection_source_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var sparse_replay_profile_enabled_cache: std.atomic.Value(u8) = .init(0);
+fn isPostingStartupOperationalError(err: anyerror) bool {
+    if (@import("../derived/catch_up_policy.zig").isRecoverableAdmissionError(err)) return true;
+    return switch (err) {
+        error.Canceled,
+        error.OutOfMemory,
+        error.InputOutput,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.ReadOnlyFileSystem,
+        error.NoSpaceLeft,
+        error.DiskQuota,
+        error.DurableFileSyncUnsupported,
+        error.DurableDirectorySyncUnsupported,
+        => true,
+        else => false,
+    };
+}
+
 const default_merge_policy = merger_mod.MergePolicy{
     .max_segments_per_tier = 10,
     .max_segment_size = 5 * 1024 * 1024 * 1024,
@@ -24370,6 +24388,7 @@ pub const IndexManager = struct {
                     .storage = self.effectiveDenseStorage(),
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
+                    .retain_native_posting_startup_snapshot = dense_cfg.leann == null,
                 });
                 index_open = true;
                 index.setIo(self.io);
@@ -24465,6 +24484,7 @@ pub const IndexManager = struct {
                         // Any source journal tail above this sequence is replayed
                         // normally after the index has opened.
                         posting_sequence = index.activateExperimentalPostingReadsAtOrAfter(0) catch |err| {
+                            if (isPostingStartupOperationalError(err)) return err;
                             std.log.err("dense posting WAL startup validation failed index={s} err={s}", .{
                                 cfg.name,
                                 @errorName(err),
@@ -24501,6 +24521,7 @@ pub const IndexManager = struct {
                                 };
                             },
                             else => {
+                                if (isPostingStartupOperationalError(err)) return err;
                                 std.log.warn("dense posting sidecar startup validation failed index={s} err={s}", .{ cfg.name, @errorName(err) });
                                 if (!read_only) index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
                                     std.log.warn("dense posting sidecar startup invalidation failed index={s} err={s}", .{ cfg.name, @errorName(invalidate_err) });
@@ -39225,6 +39246,20 @@ test "fresh dense admission reclaims a certified generation orphaned before cata
         error.FileNotFound,
         std.Io.Dir.cwd().access(std.testing.io, orphan_path, .{}),
     );
+}
+
+test "posting startup preserves operational errors without classifying corruption as retryable" {
+    for ([_]anyerror{
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.PersistentDescriptorAdmissionExhausted,
+        error.StorageDescriptorPressure,
+        error.InputOutput,
+        error.OutOfMemory,
+        error.Canceled,
+    }) |err| try std.testing.expect(isPostingStartupOperationalError(err));
+    try std.testing.expect(!isPostingStartupOperationalError(error.PostingSegmentChecksumMismatch));
+    try std.testing.expect(!isPostingStartupOperationalError(error.PostingWalShorterThanCheckpoint));
 }
 
 test "fresh native dense backfill certifies one pinned source snapshot" {

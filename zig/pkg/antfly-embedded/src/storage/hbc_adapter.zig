@@ -5239,6 +5239,7 @@ pub const HBCIndex = struct {
     experimental_posting_reads_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     experimental_posting_sidecar_managed: bool = false,
     experimental_posting_read_generation: ?*ExperimentalPostingReadGeneration = null,
+    native_posting_startup_snapshot: ?posting_segment_store_mod.OpenedWithSegment = null,
     experimental_posting_read_generation_mu: std.atomic.Mutex = .unlocked,
     experimental_posting_delta_base_state: ?*ExperimentalPostingReadState = null,
     experimental_posting_write_store: ?posting_segment_store_mod.Store = null,
@@ -6379,14 +6380,22 @@ pub const HBCIndex = struct {
         return try openWithLsmOptions(alloc, path, config, .{ .storage = lsm_storage });
     }
 
-    fn loadNativeIndexMetadata(alloc: Allocator, backend: *hbc_backend.NativeBackend) !IndexMetadata {
+    fn openNativePostingStartupSnapshot(alloc: Allocator, backend: *hbc_backend.NativeBackend, authoritative: bool) !posting_segment_store_mod.OpenedWithSegment {
         const posting_root = try std.fs.path.join(alloc, &.{ backend.root_dir, "posting-segments" });
         defer alloc.free(posting_root);
-        var opened = if (backend.read_only) try posting_segment_store_mod.Store.openReadOnlyWithSegmentAlloc(alloc, backend.storage, posting_root) else try posting_segment_store_mod.Store.openWithSegmentAlloc(alloc, backend.storage, posting_root);
-        defer opened.deinit();
+        var opened = if (authoritative)
+            try posting_segment_store_mod.Store.openAuthoritativeWithSegmentAlloc(alloc, backend.storage, posting_root, backend.read_only)
+        else if (backend.read_only)
+            try posting_segment_store_mod.Store.openReadOnlyWithSegmentAlloc(alloc, backend.storage, posting_root)
+        else
+            try posting_segment_store_mod.Store.openWithSegmentAlloc(alloc, backend.storage, posting_root);
         if (!backend.read_only) _ = opened.store.reclaimUnreferencedFiles() catch |err| {
             std.log.warn("posting startup cleanup deferred root={s} err={s}", .{ posting_root, @errorName(err) });
         };
+        return opened;
+    }
+
+    fn loadNativeIndexMetadata(alloc: Allocator, opened: *const posting_segment_store_mod.OpenedWithSegment) !IndexMetadata {
         var current: ?[]const u8 = null;
         var segment_index = opened.segments.len;
         while (segment_index > 0) {
@@ -6404,8 +6413,7 @@ pub const HBCIndex = struct {
         var current_bytes = current orelse return error.MissingHbcNativeMetadata;
         var owned: ?[]u8 = null;
         defer if (owned) |bytes| alloc.free(bytes);
-        var wal = try opened.takeWal();
-        defer wal.deinit();
+        const wal = if (opened.wal) |*wal| wal else return error.MissingPostingCheckpoint;
         for (wal.replay.records.items) |record| {
             if (record.posting_id != 0) continue;
             switch (record.kind) {
@@ -6436,9 +6444,12 @@ pub const HBCIndex = struct {
         var store = try openVectorIndexStore(alloc, opened);
         errdefer store.deinit();
 
-        const metadata = if (opened == .native)
-            try loadNativeIndexMetadata(alloc, opened.native)
-        else if (lsm_options.backend_options.backend.read_only) blk: {
+        var posting_snapshot: ?posting_segment_store_mod.OpenedWithSegment = null;
+        defer if (posting_snapshot) |*snapshot| snapshot.deinit();
+        const metadata = if (opened == .native) blk: {
+            posting_snapshot = try openNativePostingStartupSnapshot(alloc, opened.native, lsm_options.retain_native_posting_startup_snapshot);
+            break :blk try loadNativeIndexMetadata(alloc, &posting_snapshot.?);
+        } else if (lsm_options.backend_options.backend.read_only) blk: {
             var txn = try store.beginRead();
             defer txn.abort();
             const existing = txn.get(.meta, meta_key) catch |err| switch (err) {
@@ -6678,6 +6689,10 @@ pub const HBCIndex = struct {
             alloc,
             max_cached_search_scratches - 1,
         );
+        if (lsm_options.retain_native_posting_startup_snapshot) {
+            idx.native_posting_startup_snapshot = posting_snapshot;
+            posting_snapshot = null;
+        }
         return idx;
     }
 
@@ -8431,6 +8446,8 @@ pub const HBCIndex = struct {
     }
 
     fn deinitWithBackendDisposition(self: *HBCIndex, abandon_after_crash: bool) void {
+        if (self.native_posting_startup_snapshot) |*snapshot| snapshot.deinit();
+        self.native_posting_startup_snapshot = null;
         if (self.leann) |store| {
             store.deinit();
             self.leann = null;
@@ -12781,6 +12798,14 @@ pub const HBCIndex = struct {
         return state;
     }
 
+    fn takePostingActivationSnapshot(self: *HBCIndex, authoritative: bool) !posting_segment_store_mod.OpenedWithSegment {
+        if (self.native_posting_startup_snapshot) |snapshot| {
+            self.native_posting_startup_snapshot = null;
+            return snapshot;
+        }
+        return self.openExperimentalPostingStoreWithSegment(authoritative);
+    }
+
     /// Activates a previously published segment plus its committed WAL tail
     /// only when it exactly covers the caller's authoritative source sequence.
     /// Captured posting mutations leave the last committed immutable generation
@@ -12788,7 +12813,7 @@ pub const HBCIndex = struct {
     /// old generations remain valid for transactions already in flight.
     pub fn activateExperimentalPostingReads(self: *HBCIndex, expected_source_sequence: u64) !void {
         if (self.experimentalPostingReadGenerationLoaded()) return error.ExperimentalPostingReadsAlreadyLoaded;
-        const opened = try self.openExperimentalPostingStoreWithSegment(self.experimentalPostingWalAuthoritative());
+        const opened = try self.takePostingActivationSnapshot(self.experimentalPostingWalAuthoritative());
         const state = try self.loadExperimentalPostingStateFromOpened(opened, expected_source_sequence);
         try self.activateExperimentalPostingReadState(state);
     }
@@ -12799,7 +12824,7 @@ pub const HBCIndex = struct {
     /// is valid prepared state. Falling behind the catalog is never valid.
     pub fn activateExperimentalPostingReadsAtOrAfter(self: *HBCIndex, minimum_source_sequence: u64) !u64 {
         if (self.experimentalPostingReadGenerationLoaded()) return error.ExperimentalPostingReadsAlreadyLoaded;
-        const state = try self.loadExperimentalPostingStateFromOpened(try self.openExperimentalPostingStoreWithSegment(true), null);
+        const state = try self.loadExperimentalPostingStateFromOpened(try self.takePostingActivationSnapshot(true), null);
         const covered_source_sequence = state.covered_source_sequence;
         if (covered_source_sequence < minimum_source_sequence) {
             state.deinit();
@@ -27964,7 +27989,7 @@ test "authoritative external-vector HBC detaches legacy LSM and reopens native f
         try std.testing.expectEqual(@as(usize, 2), complete_results.items.items.len);
     }
 
-    var reopened = try HBCIndex.open(alloc, path, .{
+    var reopened = try HBCIndex.openWithLsmOptions(alloc, path, .{
         .dims = 2,
         .leaf_size = 8,
         .branching_factor = 2,
@@ -27972,17 +27997,34 @@ test "authoritative external-vector HBC detaches legacy LSM and reopens native f
         .use_quantization = true,
         .centroid_directory_mode = .flat_exact,
         .storage_backend = .lsm,
-    });
+    }, .{ .retain_native_posting_startup_snapshot = true });
     defer reopened.close();
     try std.testing.expect(reopened.env_owner == .native);
     reopened.setExternalVectorLoader(&loader_context, Loader.load);
-    try std.testing.expectEqual(@as(u64, 3), try reopened.activateExperimentalPostingReadsAtOrAfter(3));
+    const startup_bytes = reopened.native_posting_startup_snapshot.?.segments[0].bytes();
+    {
+        const Fault = struct {
+            fn rejectRead(_: *anyopaque, _: Allocator, _: []const u8, _: usize) ![]u8 {
+                return error.ProcessFdQuotaExceeded;
+            }
+        };
+        const storage = &reopened.env_owner.native.storage;
+        const original_vtable = storage.vtable;
+        var fault_vtable = original_vtable.*;
+        fault_vtable.read_file_alloc = Fault.rejectRead;
+        storage.vtable = &fault_vtable;
+        defer storage.vtable = original_vtable;
+        try std.testing.expectEqual(@as(u64, 3), try reopened.activateExperimentalPostingReadsAtOrAfter(3));
+    }
+    try std.testing.expect(reopened.native_posting_startup_snapshot == null);
     try std.testing.expectEqual(@as(u64, 4), reopened.stats().active_count);
     var results = try reopened.search(&.{ 0.0, 1.0 }, 2);
     defer results.deinit();
     try std.testing.expectEqual(@as(usize, 2), results.items.items.len);
     try std.testing.expectEqualStrings("doc:2", results.items.items[0].metadata.?);
     const search_generation = reopened.experimental_posting_read_generation.?;
+    const activated = experimentalPostingRootState(search_generation).?;
+    try std.testing.expectEqual(startup_bytes.ptr, activated.retained_segments[0].bytes().ptr);
     const routing_directory = search_generation.routing_directory orelse
         return error.TestUnexpectedResult;
     // The mmap backing retain is transferred to the generation that owns the
