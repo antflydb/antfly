@@ -116,6 +116,7 @@ pub const Session = struct {
     namespace: ?[]u8 = null,
     session_id: ?[]u8 = null,
     status: backend.TransactionStatus = .idle,
+    snapshot_import_allowed: bool = false,
     prepared: std.StringHashMapUnmanaged(Prepared) = .empty,
     // Results borrow their portal allocator until release. Registry growth and
     // removal must never move that allocator.
@@ -587,6 +588,7 @@ pub const Session = struct {
         defer if (self.identity.?.renewable) {
             if (self.source.vtable.pin_completion) |pin| pin(self.source.context, self.alloc, &self.completion);
         };
+        self.snapshot_import_allowed = false;
         var result = try self.source.vtable.execute(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req);
         errdefer result.deinit();
         if (result.mutation_outcome == .committed_pending or result.mutation_outcome == .committed_repair_required or
@@ -610,6 +612,7 @@ pub const Session = struct {
         self.session_id = session;
         self.status = result.transaction_status;
         if (previous_status == .idle and self.status == .in_transaction) {
+            self.snapshot_import_allowed = true;
             try self.settingsState().begin();
             self.timeout_transaction = .{ .before = self.statement_timeout, .committed = self.statement_timeout, .namespace_before = self.namespace_setting, .namespace_committed = self.namespace_setting, .application_before = self.application_name, .application_committed = self.application_name, .lake_before = self.lake_visibility, .lake_committed = self.lake_visibility };
             self.transaction_namespace = try commands.Namespace.init(req.namespace orelse "public");
@@ -668,6 +671,7 @@ pub const Session = struct {
     fn importSnapshot(self: *Session, alloc: std.mem.Allocator, statement: []const u8, name: []const u8) !backend.Result {
         if (self.status == .failed) return error.InFailedSqlTransaction;
         if (self.status != .in_transaction or self.session_id == null) return error.NoActiveSqlTransaction;
+        if (!self.snapshot_import_allowed) return error.ActiveSqlTransaction;
         const attach = self.source.vtable.import_snapshot orelse return error.UnsupportedReplicationOption;
         const identity = self.identity orelse return error.AuthenticationFailed;
         self.cancel_requested.store(false, .release);
@@ -676,6 +680,7 @@ pub const Session = struct {
         const req = self.request(statement, &.{}, &.{});
         try req.check();
         try attach(self.source.context, alloc, identity, req, name);
+        self.snapshot_import_allowed = false;
         return .{ .command_tag = "SET", .transaction_status = self.status, .session_id = self.session_id };
     }
 
@@ -1394,6 +1399,7 @@ pub const Session = struct {
                         req.binding_guard = portal.description.binding_guard;
                         req.setting_epoch = portal.description.setting_epoch;
                         portal.stream = try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req);
+                        if (portal.stream != null) self.snapshot_import_allowed = false;
                     };
                 }
                 if (portal.stream != null or portal.stream_complete) {
@@ -1562,6 +1568,7 @@ pub const Session = struct {
         req.setting_epoch = description.setting_epoch;
         try req.check();
         const identity = self.identity orelse return error.AuthenticationFailed;
+        self.snapshot_import_allowed = false;
         const stream = if (self.source.vtable.open_stream) |open| try open(self.source.context, self.alloc, identity, req) else null;
         var stream_moved = false;
         defer if (!stream_moved) if (stream) |opened| opened.close(opened.context);
@@ -1945,6 +1952,7 @@ pub const Session = struct {
         req.binding_guard = binding_guard;
         req.setting_epoch = setting_epoch;
         const stream = (try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req)) orelse return false;
+        self.snapshot_import_allowed = false;
         var portal = Portal{
             .arena = std.heap.ArenaAllocator.init(self.alloc),
             .statement = statement,

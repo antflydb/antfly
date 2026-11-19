@@ -3270,6 +3270,10 @@ test "pgwire snapshot imports dispatch only inside the current transaction" {
     try frame(&input.writer, 'Q', "BEGIN\x00");
     try frame(&input.writer, 'Q', "SET TRANSACTION SNAPSHOT 'qualified-snapshot'\x00");
     try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try frame(&input.writer, 'Q', "SELECT 1\x00");
+    try frame(&input.writer, 'Q', "SET TRANSACTION SNAPSHOT 'qualified-snapshot'\x00");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
     try frame(&input.writer, 'X', "");
     var mock: Mock = .{};
     var source = mock.source();
@@ -3283,8 +3287,8 @@ test "pgwire snapshot imports dispatch only inside the current transaction" {
     defer session.deinit();
     try session.run();
     try std.testing.expectEqual(@as(usize, 1), mock.setting_stream_opens);
-    try std.testing.expectEqual(@as(usize, 2), mock.executions);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "25001") == null);
+    try std.testing.expectEqual(@as(usize, 5), mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "25001") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "25P01") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "SET\x00") != null);
 }
