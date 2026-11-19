@@ -22,6 +22,7 @@ pub const Id = [16]u8;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
 pub const protocol_version: u16 = 109;
+pub const verified_bootstrap_protocol_version: u16 = 111;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
@@ -247,6 +248,38 @@ pub const State = struct {
         };
     }
 
+    /// Bind the cutover receipt to every durably acknowledged root snapshot.
+    /// The issuing service obtains the snapshot pins from their native owners.
+    pub fn bootstrapCompletionProof(self: State) !Digest {
+        if (self.phase != .bootstrap or self.roots.len == 0 or
+            self.latest_delivery != self.acknowledged_delivery) return error.ChangefeedConflict;
+        var digest = hash(.{
+            .domain = "antfly:changefeed-bootstrap-completion:v1",
+            .authority = self.authority,
+            .feed = self.id,
+            .epoch = self.epoch,
+            .definition = (self.definition orelse return error.ChangefeedConflict).identity(),
+            .cut = self.cut,
+            .cursor = self.acknowledged_cursor,
+            .delivery = self.acknowledged_delivery,
+        });
+        for (self.roots) |root| {
+            const snapshot = root.snapshot orelse return error.ChangefeedConflict;
+            if (!root.snapshot_acknowledged.done or root.snapshot_released or root.released)
+                return error.ChangefeedConflict;
+            digest = hash(.{
+                .previous = digest,
+                .namespace = root.namespace,
+                .ownership_epoch = root.ownership_epoch,
+                .consumer_epoch = root.consumer_epoch,
+                .start = root.start,
+                .snapshot = snapshot,
+                .position = root.snapshot_acknowledged,
+            });
+        }
+        return digest;
+    }
+
     pub fn consumerId(self: State) Id {
         return hash(.{ .domain = "antfly:changefeed-consumer:v1", .authority = self.authority, .id = self.id, .epoch = self.epoch })[0..16].*;
     }
@@ -423,7 +456,9 @@ pub const Mutation = union(enum) {
     issue: Delivery,
     acknowledge: Digest,
     reclaimed: struct { namespace: Namespace, consumer_epoch: u64, previous: u64, next: u64 },
+    // Retained for replay of entries admitted before certified cutover.
     finish_bootstrap: struct { proof: Digest },
+    finish_verified_bootstrap: struct { proof: Digest },
     release_snapshot: struct { namespace: Namespace, snapshot_id: Id, proof: Digest },
     renew: struct { now: u64, expires_at: u64 },
     expire: u64,
@@ -432,6 +467,10 @@ pub const Mutation = union(enum) {
     release_root: struct { namespace: Namespace, ownership_epoch: u64, proof: Digest },
     finish_close,
     restart: struct { definition: Definition, now: u64, expires_at: u64, bootstrap_expires_at: u64 = 0 },
+    pub fn requiredProtocol(self: Mutation) u16 {
+        return if (self == .finish_verified_bootstrap) verified_bootstrap_protocol_version else protocol_version;
+    }
+
     pub fn validate(self: Mutation) !void {
         switch (self) {
             .root_control => |v| {
@@ -475,6 +514,7 @@ pub const Mutation = union(enum) {
             .acknowledge => |value| if (!nz(value)) return error.InvalidChangefeed,
             .reclaimed => |value| if (!nz(value.namespace) or value.consumer_epoch == 0 or value.next < value.previous) return error.InvalidChangefeed,
             .finish_bootstrap => |value| if (!nz(value.proof)) return error.InvalidChangefeed,
+            .finish_verified_bootstrap => |value| if (!nz(value.proof)) return error.InvalidChangefeed,
             .release_snapshot => |value| if (!nz(value.namespace) or !nz(value.snapshot_id) or !nz(value.proof)) return error.InvalidChangefeed,
             .renew => |value| try lease(value.now, value.expires_at),
             .expire => |value| if (value == 0) return error.InvalidChangefeed,
@@ -817,6 +857,10 @@ pub const Mutation = union(enum) {
                 for (state.roots) |root| if (!root.snapshot_acknowledged.done) return error.ChangefeedConflict;
                 next.phase = .streaming;
             },
+            .finish_verified_bootstrap => |completion| {
+                if (!equal(completion.proof, try state.bootstrapCompletionProof())) return error.ChangefeedConflict;
+                next.phase = .streaming;
+            },
             .release_snapshot => |release| {
                 const index = try state.rootIndex(release.namespace);
                 const root = state.roots[index];
@@ -1057,6 +1101,12 @@ pub fn encodeWrite(a: A, write: Write) ![]u8 {
     if (bytes.len > max_state_bytes) return error.InvalidChangefeed;
     return bytes;
 }
+pub fn requiredProtocolEncoded(bytes: []const u8) u16 {
+    var write = parseWrite(std.heap.page_allocator, bytes) catch return verified_bootstrap_protocol_version;
+    defer write.deinit();
+    return write.value.mutation.requiredProtocol();
+}
+
 pub fn parseWrite(a: A, bytes: []const u8) !std.json.Parsed(Write) {
     if (bytes.len == 0 or bytes.len > max_state_bytes) return error.InvalidChangefeed;
     var parsed = std.json.parseFromSlice(Write, a, bytes, .{ .allocate = .alloc_always, .parse_numbers = false }) catch |err| switch (err) {
@@ -1197,9 +1247,31 @@ test "changefeed control bootstrap completes only after snapshot ACK and retains
     try std.testing.expectError(error.InvalidChangefeed, step(scratch, state, .{ .issue = testDelivery(state, &.{.{ .namespace = testNamespace(7), .position = .{ .sequence = 11 } }}) }));
     const page = testDelivery(state, &.{.{ .namespace = testNamespace(7), .position = .{ .sequence = 10 }, .snapshot = .{ .page = 1, .continuation = "opaque-page-cut", .done = true } }});
     state = try step(scratch, state, .{ .issue = page });
-    try std.testing.expectError(error.ChangefeedConflict, step(scratch, state, .{ .finish_bootstrap = .{ .proof = @splat(1) } }));
+    try std.testing.expectError(error.ChangefeedConflict, step(scratch, state, .{ .finish_verified_bootstrap = .{ .proof = @splat(1) } }));
     state = try step(scratch, state, .{ .acknowledge = page.cursor });
-    state = try step(scratch, state, .{ .finish_bootstrap = .{ .proof = @splat(1) } });
+    const proof = try state.bootstrapCompletionProof();
+    const legacy_finish: Mutation = .{ .finish_bootstrap = .{ .proof = @splat(1) } };
+    const verified_finish: Mutation = .{ .finish_verified_bootstrap = .{ .proof = proof } };
+    try std.testing.expectEqual(protocol_version, legacy_finish.requiredProtocol());
+    const definition = state.definition.?;
+    const verified_bytes = try encodeWrite(scratch, .{
+        .id = state.id,
+        .authority = state.authority,
+        .owner = definition.owner,
+        .authorization = definition.authorization,
+        .expected_revision = state.revision,
+        .expected_epoch = state.epoch,
+        .mutation = verified_finish,
+    });
+    try std.testing.expectEqual(verified_bootstrap_protocol_version, requiredProtocolEncoded(verified_bytes));
+    var different_cut = state;
+    different_cut.cut[0] ^= 1;
+    var different_epoch = state;
+    different_epoch.epoch += 1;
+    try std.testing.expectError(error.ChangefeedConflict, step(scratch, state, .{ .finish_verified_bootstrap = .{ .proof = try different_cut.bootstrapCompletionProof() } }));
+    try std.testing.expectError(error.ChangefeedConflict, step(scratch, state, .{ .finish_verified_bootstrap = .{ .proof = try different_epoch.bootstrapCompletionProof() } }));
+    try std.testing.expectEqual(Phase.streaming, (try step(scratch, state, legacy_finish)).phase);
+    state = try step(scratch, state, verified_finish);
     try std.testing.expectEqual(Phase.streaming, state.phase);
     try std.testing.expect(!state.roots[0].snapshot_released);
     state = try step(scratch, state, .{ .release_snapshot = .{ .namespace = testNamespace(7), .snapshot_id = @splat(5), .proof = @splat(1) } });
@@ -1271,10 +1343,11 @@ pub fn readOnService(svc: anytype, a: A, id: Id, request: anytype) ![]u8 {
     return store.getChangefeedControl(a, svc.metadata_group_id, id);
 }
 pub fn mutateOnService(svc: anytype, a: A, write: Write, request: anytype) !void {
+    if (write.mutation == .finish_bootstrap) return error.InvalidChangefeed;
     if (comptime @hasDecl(@typeInfo(@TypeOf(svc)).pointer.child, "mutateChangefeedState")) return svc.mutateChangefeedState(a, write, request);
     try write.validate();
     try request.ensureActive();
-    _ = try svc.ensureTableTopologyProtocolReadyWithContext(request, protocol_version);
+    _ = try svc.ensureTableTopologyProtocolReadyWithContext(request, write.mutation.requiredProtocol());
     try svc.ensureLinearizableReadWithContext(request);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const bytes = try store.getChangefeedControl(a, svc.metadata_group_id, write.id);

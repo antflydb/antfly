@@ -3686,7 +3686,7 @@ fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16
         else => {},
     }
     if (command == .apply_source_control) return @import("source_control.zig").requiredProtocolEncoded(command.apply_source_control);
-    if (command == .apply_changefeed_control) return metadata_topology_protocol.changefeed_control_version;
+    if (command == .apply_changefeed_control) return @import("changefeed_control.zig").requiredProtocolEncoded(command.apply_changefeed_control);
     if (command == .apply_pg_publication) return metadata_topology_protocol.pg_publication_version;
     if (command == .apply_transaction_sessions) return metadata_topology_protocol.transaction_sessions_version;
     if (command == .apply_system_catalog) {
@@ -24068,7 +24068,7 @@ test "source control requires its coordinated decoder floor before metadata prop
 }
 
 test "changefeed control requires its coordinated decoder floor before metadata proposal" {
-    try std.testing.expectEqual(metadata_topology_protocol.changefeed_control_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_changefeed_control = "{}" }));
+    try std.testing.expectEqual(@import("changefeed_control.zig").verified_bootstrap_protocol_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_changefeed_control = "{}" }));
     try std.testing.expectEqual(metadata_topology_protocol.pg_publication_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_pg_publication = "{}" }));
 }
 
