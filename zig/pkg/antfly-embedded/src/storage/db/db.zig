@@ -10599,6 +10599,11 @@ pub const DB = struct {
         var summary = try context_dependency_db.applyNoticesConsuming(self.alloc, self.core.store, self.core.index_manager, @ptrCast(collect.values.items), @ptrCast(collect.keys.items), contextNowMs(), range.start, range.end);
         defer summary.deinit(self.alloc);
         try self.journalContextRebuilds(&summary);
+        if (summary.processed < collect.keys.items.len) {
+            // The rest did not fit one command; come back for it.
+            self.context_inbox_pending.store(true, .release);
+            return collect.limit;
+        }
         return collect.keys.items.len;
     }
 
@@ -157788,4 +157793,115 @@ test "db ordered context-bound publication requires its promoted dependency inte
     // Outputs that are not context-bound keep the old, optional promotion.
     command.execution_identity = null;
     try db.promoteContextIntentsTxn(alloc, &txn, command);
+}
+
+test "db replicated inbox apply splits high fan-out notices across bounded commands" {
+    const alloc = std.testing.allocator;
+    const command_mod = @import("enrichment/context_dependency_command.zig");
+    var leader_dir = try TestDirectory.init("context-inbox-budget-leader");
+    defer leader_dir.cleanup();
+    var follower_dir = try TestDirectory.init("context-inbox-budget-follower");
+    defer follower_dir.cleanup();
+    var leader = try DB.open(alloc, leader_dir.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer leader.close();
+    var follower = try DB.open(alloc, follower_dir.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer follower.close();
+    const declaration = try contextSourcesTestDeclarationAlloc(alloc,
+        \\{"peers":{"query":{"filter_query":{"field":"org","term":{"$source":"/org"}}},"fields":["title"],"max_documents":10}}
+    );
+    defer alloc.free(declaration);
+    for ([_]*DB{ &leader, &follower }) |db| {
+        try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .context_sources_json = declaration });
+    }
+    var pair = ContextReplicaPair{ .leader = &leader, .follower = &follower };
+    leader.setContextReplication(.{ .ptr = &pair, .propose_fn = ContextReplicaPair.propose, .is_owner_fn = ContextReplicaPair.isLeader });
+    follower.setContextReplication(.{ .ptr = &pair, .propose_fn = ContextReplicaPair.propose, .is_owner_fn = ContextReplicaPair.isFollowerOwner });
+    for ([_]*DB{ &leader, &follower }) |db| try db.setContextDependencyHost("t1", &.{}, null, .{ .ptr = &pair, .deliver = ContextReplicaPair.deliver });
+    try pair.apply(.{ .writes = &.{.{ .key = "n:1", .value = "{\"org\":\"o1\",\"title\":\"a\"}" }} });
+    while (try leader.runContextMaintenance()) {}
+
+    // 60 dependents all read org o1.
+    const Register = struct {
+        doc: []const u8,
+        config: *const @import("enrichment/context_sources.zig").Config,
+        fn run(p: *anyopaque, a: Allocator, reader: context_dependency_store.Reader, plan: *context_dependency_store.Plan) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const doc = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"org\":\"o1\"}", .{});
+            var bindings = try @import("enrichment/context_sources.zig").bindForKeyAlloc(a, self.config, self.doc, doc);
+            defer bindings.deinit();
+            const tuples = try bindings.allTuplesAlloc(a);
+            defer a.free(tuples);
+            const capture = try context_dependency_store.planRegister(a, reader, plan, self.doc, "summary", tuples, self.config.digest());
+            _ = try context_dependency_store.planPublish(a, reader, plan, self.doc, "summary", .{ .capture = capture, .tuples = tuples, .input_fingerprint = @splat(1) });
+        }
+    };
+    var config = try @import("enrichment/context_sources.zig").parseStoredJson(alloc, declaration);
+    defer config.deinit();
+    const committer = leader.core.index_manager.context_committer.?;
+    var names: [60][16]u8 = undefined;
+    for (&names, 0..) |*buf, i| {
+        const doc = try std.fmt.bufPrint(buf, "doc:{d:0>3}", .{i});
+        var register = Register{ .doc = doc, .config = &config };
+        try committer.commit(alloc, .{ .ptr = &register, .plan_fn = Register.run });
+    }
+
+    // Two separate source changes: two notices of 60 dependents each. With
+    // the threshold below one notice's effects, they cannot share a command.
+    context_dependency_db.test_plan_threshold = 50;
+    defer context_dependency_db.test_plan_threshold = null;
+    try pair.apply(.{ .writes = &.{.{ .key = "n:2", .value = "{\"org\":\"o1\",\"title\":\"b\"}" }} });
+    try pair.apply(.{ .writes = &.{.{ .key = "n:3", .value = "{\"org\":\"o1\",\"title\":\"c\"}" }} });
+    const inbox_prefix = context_dependency_store.familyPrefix(command_mod.inbox_family);
+    var inbox_hex: [inbox_prefix.len * 2]u8 = undefined;
+    _ = std.fmt.bufPrint(&inbox_hex, "{x}", .{&inbox_prefix}) catch unreachable;
+    var inbox_commands: usize = 0;
+    var passes: usize = 0;
+    while (passes < 64) : (passes += 1) {
+        var collector = context_dependency_db.Collector{ .alloc = alloc };
+        defer collector.deinit();
+        context_dependency_db.active_collector = &collector;
+        const more = leader.runContextMaintenance() catch |err| {
+            context_dependency_db.active_collector = null;
+            return err;
+        };
+        context_dependency_db.active_collector = null;
+        for (collector.commands.items) |encoded| {
+            var parsed = try std.json.parseFromSlice(command_mod.Command, alloc, encoded, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            var consumes_inbox = false;
+            for (parsed.value.deletes) |key| {
+                if (std.mem.startsWith(u8, key, &inbox_hex)) consumes_inbox = true;
+            }
+            if (consumes_inbox) {
+                inbox_commands += 1;
+                // At most one notice beyond the threshold per command.
+                try std.testing.expect(parsed.value.puts.len + parsed.value.deletes.len <= 50 + 2 * 60 + 16);
+            }
+            try pair.apply(.{ .context_dependency = parsed.value });
+        }
+        for (collector.deliveries.items) |d| try ContextReplicaPair.deliver(&pair, alloc, d.dependent, d.notice);
+        if (collector.deliveries.items.len != 0) {
+            var acks = std.ArrayListUnmanaged([]const u8).empty;
+            defer {
+                for (acks.items) |digest| alloc.free(digest);
+                acks.deinit(alloc);
+            }
+            for (collector.deliveries.items) |d| try acks.append(alloc, try command_mod.ackDigestHexAlloc(alloc, d.notice));
+            try pair.apply(.{ .context_dependency = .{ .acks = acks.items } });
+        }
+        if (!more and collector.isEmpty() and !leader.contextInboxPending()) break;
+    }
+    try std.testing.expect(passes < 64);
+    // The two notices were applied by separate, bounded commands, and the
+    // inbox fully drained: every dependent is stale on both replicas.
+    try std.testing.expect(inbox_commands >= 2);
+    var stale: usize = 0;
+    for (0..60) |i| {
+        var buf: [16]u8 = undefined;
+        const doc = try std.fmt.bufPrint(&buf, "doc:{d:0>3}", .{i});
+        if (try contextSourcesTestFreshness(&leader, alloc, doc) == .stale) stale += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 60), stale);
 }

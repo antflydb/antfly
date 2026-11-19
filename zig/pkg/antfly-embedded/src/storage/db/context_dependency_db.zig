@@ -541,6 +541,9 @@ pub fn backfillShadowPageWithCursor(alloc: Allocator, primary: *docstore_mod.Doc
 
 pub const ApplySummary = struct {
     rebuild_refs: []enrichment_types.GeneratedEnrichmentRef = &.{},
+    /// Leading notices planned and consumed. The rest did not fit one
+    /// command's effect budget and remain for the next pass.
+    processed: usize = 0,
     invalidated: usize = 0,
     debounced: usize = 0,
     stale_only: usize = 0,
@@ -610,6 +613,24 @@ pub fn applyNotices(
 
 /// Apply notices and, in the same commit, delete the store keys they were
 /// read from (a replicated dependent's inbox).
+/// Worst-case effects of planning one more notice (or one debounced page):
+/// each of up to `default_fanout_page` dependents writes its state and may
+/// add a debounce entry, plus a continuation and the consumed inbox key.
+const notice_effect_headroom: usize = 2 * notices.default_fanout_page + 16;
+
+/// Tests lower the threshold to exercise splitting without thousands of
+/// dependents.
+pub var test_plan_threshold: ?usize = null;
+
+/// Plan more only while one more notice still fits a command.
+fn planThreshold() usize {
+    return test_plan_threshold orelse command_mod.max_effects - notice_effect_headroom;
+}
+
+fn planEffects(plan: *const store.Plan) usize {
+    return plan.puts.items.len + plan.deletes.items.len;
+}
+
 pub fn applyNoticesConsuming(
     alloc: Allocator,
     primary: *docstore_mod.DocStore,
@@ -629,6 +650,7 @@ pub fn applyNoticesConsuming(
         upper: []const u8,
         refs: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef) = .empty,
         summary: ApplySummary = .{},
+        budgeted: bool,
 
         fn rebuilds(p: *anyopaque) []const enrichment_types.GeneratedEnrichmentRef {
             const self: *@This() = @ptrCast(@alignCast(p));
@@ -647,6 +669,10 @@ pub fn applyNoticesConsuming(
             var lookup = SourceCache(@TypeOf(self.manager)){ .alloc = a, .manager = self.manager };
             defer lookup.deinit();
             for (self.encoded, 0..) |raw, i| {
+                // One replicated command carries at most `max_effects`. Stop
+                // before a notice that might not fit; it stays in the inbox.
+                if (self.budgeted and i != 0 and planEffects(plan) > planThreshold()) break;
+                self.summary.processed = i + 1;
                 var decoded = try notices.decodeNoticeAlloc(a, raw);
                 defer decoded.deinit();
                 var applied = try notices.planApplyNoticeWithSources(a, reader, plan, decoded.notice, self.now_ms, self.lower, self.upper, notices.default_fanout_page, lookup.sources());
@@ -668,14 +694,18 @@ pub fn applyNoticesConsuming(
                     }
                 }
             }
-            for (self.consumed) |key| try plan.delete(key);
-            // Debounced rebuilds that are due join this journal record.
+            // Consume only what was planned.
+            for (self.consumed[0..@min(self.consumed.len, self.summary.processed)]) |key| try plan.delete(key);
+            // Debounced rebuilds that are due join this journal record when
+            // they fit; otherwise the next pass drains them.
+            if (self.budgeted and planEffects(plan) > planThreshold()) return;
             const due = try store.planDrainDebounced(a, reader, plan, self.now_ms, notices.default_fanout_page);
             defer store.freeTargets(a, due);
             for (due) |t| try appendRef(a, &self.refs, t.artifact, t.doc_key);
         }
     };
-    var pass = Pass{ .manager = manager, .encoded = encoded, .consumed = consumed_keys, .now_ms = now_ms, .lower = range_lower, .upper = range_upper };
+    // Replicated plans travel as one bounded command; local commits are not.
+    var pass = Pass{ .manager = manager, .encoded = encoded, .consumed = consumed_keys, .now_ms = now_ms, .lower = range_lower, .upper = range_upper, .budgeted = manager.context_replication != null };
     errdefer {
         Pass.reset(&pass, alloc);
         pass.refs.deinit(alloc);
