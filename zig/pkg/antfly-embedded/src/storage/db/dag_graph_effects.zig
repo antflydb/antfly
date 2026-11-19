@@ -123,6 +123,23 @@ pub const ScanManifest = struct {
             .fence = .{ .activation = activation, .snapshot = hash.finalResult() },
         };
     }
+
+    pub fn beginScanCommand(self: ScanManifest, id: authority.Digest, owner_epoch: u64) !authority.SourceFenceCommand {
+        const roots = try self.domainRoots(id);
+        return .{
+            .namespace = self.authority_namespace,
+            .fence = self.fence,
+            .action = .scan,
+            .scan = .{ .domain = id, .owner_epoch = owner_epoch, .root_count = @intCast(roots.len) },
+        };
+    }
+
+    fn domainRoots(self: ScanManifest, id: authority.Digest) ![]const ScanRoot {
+        for (self.domains) |domain| {
+            if (std.mem.eql(u8, &domain.id, &id)) return domain.roots;
+        }
+        return error.InvalidDagMutation;
+    }
 };
 
 fn hashNumber(hash: *std.crypto.hash.sha2.Sha256, number: u64) void {
@@ -147,9 +164,10 @@ pub fn advanceScan(
     if (command.action != .scan or scan.page != null) return error.InvalidDagMutation;
     if (!std.meta.eql(manifest.fence, command.fence) or
         !std.mem.eql(u8, &manifest.authority_namespace, &command.namespace)) return error.GraphConstraintRevisionChanged;
-    const roots = for (manifest.domains) |domain| {
-        if (std.mem.eql(u8, &domain.id, &scan.domain)) break domain.roots;
-    } else return error.InvalidDagMutation;
+    const roots = try manifest.domainRoots(scan.domain);
+    if (!std.meta.eql(checkpoint.fence, manifest.fence) or
+        !std.mem.eql(u8, &checkpoint.domain, &scan.domain) or
+        checkpoint.root_count != @as(u32, @intCast(roots.len))) return error.GraphConstraintRevisionChanged;
     if (scan.owner_epoch != checkpoint.owner_epoch) return error.GraphConstraintOwnerChanged;
     var root_index: u32 = 0;
     var physical_after: ?[]const u8 = null;
@@ -187,6 +205,7 @@ pub fn advanceScan(
         .next = next,
         .replacements = page.replacements,
     };
+    command.scan.?.root_count = null;
     try port.writePage(command);
     return page.exhausted and root_index + 1 == roots.len;
 }

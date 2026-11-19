@@ -1252,6 +1252,9 @@ pub const Contributions = struct {
     }
 
     pub const ScanCheckpoint = struct {
+        domain: Digest,
+        fence: SourceFence,
+        root_count: ?u32,
         owner_epoch: u64,
         /// Owned by the caller. Null means the scan is pinned before its first page.
         after: ?[]u8,
@@ -1271,9 +1274,13 @@ pub const Contributions = struct {
             return err;
         };
         if (state.phase != .validating or state.revision != 0) return error.GraphConstraintNotReady;
+        const root_count = try activationRootCount(txn, id);
         const progress = (try readActivationProgress(txn, id)) orelse return null;
         if (!std.mem.eql(u8, &progress.snapshot, &fence.snapshot)) return error.GraphConstraintRevisionChanged;
         return .{
+            .domain = id,
+            .fence = current,
+            .root_count = root_count,
             .owner_epoch = state.owner_epoch,
             .after = if (progress.after) |after| try alloc.dupe(u8, after) else null,
         };

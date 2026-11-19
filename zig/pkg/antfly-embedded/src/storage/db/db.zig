@@ -156086,8 +156086,7 @@ test "db ordered DAG source fence persists with the apply receipt" {
         defer read.abort();
         try std.testing.expectEqualDeep(fence, (try dag.SourceFence.read(&read)).?);
     }
-    request.dag_source_fence.?.action = .scan;
-    request.dag_source_fence.?.scan = .{ .domain = domain, .owner_epoch = 1, .root_count = 1 };
+    request.dag_source_fence = try manifest.beginScanCommand(domain, 1);
     try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 2 }, true);
     request.dag_source_fence.?.scan.?.root_count = null;
     const owner: dag.Digest = @splat(6);
@@ -156119,7 +156118,12 @@ test "db ordered DAG source fence persists with the apply receipt" {
     var partial_page = source_page.value;
     partial_page.exhausted = false;
     const partial_port: Port = .{ .db = &db, .source_page = partial_page };
-    try std.testing.expect(!try effects.advanceScan(a, partial_port, manifest, request.dag_source_fence.?, .{ .owner_epoch = 1, .after = null }));
+    const initial_checkpoint = (try db.dagActivationCheckpoint(a, namespace, domain, fence)).?;
+    defer initial_checkpoint.deinit(a);
+    var mismatched = initial_checkpoint;
+    mismatched.root_count = 2;
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, effects.advanceScan(a, partial_port, manifest, request.dag_source_fence.?, mismatched));
+    try std.testing.expect(!try effects.advanceScan(a, partial_port, manifest, request.dag_source_fence.?, initial_checkpoint));
     const committed = (try db.dagActivationCheckpoint(a, request.dag_source_fence.?.namespace, domain, fence)).?;
     defer committed.deinit(a);
     try std.testing.expectEqualSlices(u8, graph_key, committed.after.?[5..]);
