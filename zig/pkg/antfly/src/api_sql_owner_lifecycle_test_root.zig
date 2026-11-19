@@ -89,6 +89,11 @@ test {
     _ = @import("system_catalog/graph_preparation_service.zig");
     _ = @import("api/sql/testing/lifecycle/sql_graph_schemaless_integration_test.zig");
     _ = @import("api/sql/testing/lifecycle/sql_trigger_raw_integration_test.zig");
+    _ = @import("api/backups.zig");
+    _ = @import("api/restore_jobs.zig");
+    _ = @import("api/restore_staging_driver.zig");
+    _ = @import("metadata/restore_staging.zig");
+    _ = @import("metadata/service.zig");
     _ = @import("api/restore_routine_mapping.zig");
     _ = @import("api/native_artifact_restore_admission.zig");
     _ = @import("metadata/trigger_restore_claims.zig");

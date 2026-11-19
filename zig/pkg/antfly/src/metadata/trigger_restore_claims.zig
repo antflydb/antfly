@@ -54,10 +54,11 @@ fn resources(a: A, txn: anytype, group: u64, plan: stages.Plan) ![]Resource {
         slot.value_ptr.* = claim;
         var function = (try storage.getById(a, txn, group, .routine, claim.destination.id)) orelse return error.CatalogGenerationChanged;
         defer function.deinit();
+        if (function.value.parent_id != claim.destination.namespace_id) return error.CatalogGenerationChanged;
         try storage.requireScopeResourceWritable(a, txn, group, function.value, try storage.readMeta(a, txn, group));
         var record = try routines.Record.decode(a, function.value.source_json);
         defer record.deinit();
-        if (function.value.parent_id != claim.destination.namespace_id or record.value.id != claim.destination.id or record.value.generation != claim.destination_generation or record.value.kind != .function or !record.value.definition.returns_trigger or record.value.definition.arguments.len != 0) return error.CatalogGenerationChanged;
+        if (record.value.id != claim.destination.id or record.value.generation != claim.destination_generation or record.value.kind != .function or !record.value.definition.returns_trigger or record.value.definition.arguments.len != 0) return error.CatalogGenerationChanged;
         var namespace = (try storage.getById(a, txn, group, .namespace, function.value.parent_id)) orelse return error.CatalogGenerationChanged;
         defer namespace.deinit();
         var database = (try storage.getById(a, txn, group, .database, namespace.value.parent_id)) orelse return error.CatalogGenerationChanged;

@@ -524,7 +524,7 @@ test "UNLOGGED schema only restore uses a fresh native descriptor with no artifa
     var replacement = (try buildPlan(a, @splat(1), @splat(2), &.{source}, &.{old}, &old_ranges, "overwrite")).plan.?;
     var targets = try a.dupe(staging.Target, replacement.targets);
     const actual_old = targets[0].replace.?;
-    const fence: @import("antfly_local_sources").storage_db_relational_integrity_topology.Fence = .{ .transition_id = std.mem.readInt(u64, (@as([16]u8, @splat(1)))[0..8], .little), .attempt = std.mem.readInt(u64, (@as([16]u8, @splat(1)))[8..16], .little), .admission_epoch = 1, .owner_group_id = 401, .peer_group_id = 401, .role = .backup_snapshot, .namespace = .{ .table_id = 19, .shard_id = 401, .range_id = 401 }, .catalog_digest = @splat(4) };
+    const fence: @import("antfly_local_sources").storage_db_relational_integrity_topology.Fence = .{ .transition_id = std.mem.readInt(u64, (@as([16]u8, @splat(1)))[0..8], .little), .attempt = std.mem.readInt(u64, (@as([16]u8, @splat(1)))[8..16], .little), .admission_epoch = 1, .owner_group_id = 401, .peer_group_id = 401, .role = .rewrite_source, .namespace = .{ .table_id = 19, .shard_id = 401, .range_id = 401 }, .catalog_digest = @splat(4) };
     targets[0].replace = actual_old;
     targets[0].replace.?.fences = &.{fence};
     replacement.targets = targets;

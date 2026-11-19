@@ -2401,11 +2401,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const graph_trigger_public_filters: []const []const u8 = &.{ "mounted PostgreSQL original trigger attachment replacement and retirement preserve default statement semantics across native cold restart", "mounted PostgreSQL original ordinary trigger supersessions preserve events predicates arguments and cold activation", "mounted ordinary single owner graph transforms remain available without trigger state or preparation grants across cold restart", "mounted raw trigger transforms FK cascades and graph effects share RLS constraints one atomic decision and cold no refire", "mounted coordinated graph rows use genuine trigger absence RLS atomicity lost replies and cold prepared image replay", "mounted default dynamic document graph transactions coalesce once enforce credential filters and recover exact cold images", "mounted trigger logical relation identity survives TRUNCATE cold restart and fresh same-name CREATE gets a new identity", "mounted SQL original canonical MATCH", "mounted SQL graph joined hits" };
     const native_explicit_pk_filters: []const []const u8 = &.{ "mounted native explicit primary key command stages unique admission after real activation and preserves rollback and cold commit", "SQL relation lifetime native frozen lock delivery reaches the receiving owner before ABORT fallback" };
     const extension_original_filters: []const []const u8 = &.{ "postgres executor registration map failure preserves caller ownership and frees allocated wrapper", "API owned foreign registry publishes one complete lazy factory and releases every failed allocation", "API concurrent foreign registry initialization shares one process owner", "SQL extension native adapter preserves control rejection identities and owned cold receipts", "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart", "SQL WASM statement shares actual immutable modules across exports and retains one bounded reservation", "SQL WASM typed callable JSON preserves null exact numbers arrays temporal and range domains", "wasmtime SQL statement retains verified compiled pure module and rejects artifact import and type substitutions" };
+    const trigger_restore_contract_filters: []const []const u8 = &.{ "public table and cluster restore own explicit routine identity mappings", "restore routine mappings survive retries takeover and bind idempotency", "restore trigger actor incarnation", "restore routine mapping preserves", "staged trigger handoff", "restore trigger user authorization", "SQL table trigger restore and backup", "trigger restore callable leases", "UNLOGGED schema only", "native artifact restore admission" };
     // Compile the expensive linked-control owner once; each gate selects its
     // own runtime campaign and independently requires no skips.
     const sql_owner_lifecycle_tests = b.addTest(.{
         .root_module = sql_owner_lifecycle_test_mod,
-        .filters = compileFiltersWithAnchors(b, std.mem.concat(b.allocator, []const u8, &.{ graph_trigger_public_filters, native_explicit_pk_filters, extension_original_filters }) catch @panic("OOM"), selectTestFilters(b, &.{
+        .filters = compileFiltersWithAnchors(b, std.mem.concat(b.allocator, []const u8, &.{ graph_trigger_public_filters, native_explicit_pk_filters, extension_original_filters, trigger_restore_contract_filters }) catch @panic("OOM"), selectTestFilters(b, &.{
             "mounted SQL LIKE declaration copies retain grants constraints isolation and cold owners",
             "mounted SQL LIKE full ownership lifetime retires borrowed defaults and fresh identities through cold owners",
             "mounted SQL original prepared transactions retain multi-owner intents across complete cold restart",
@@ -2955,9 +2956,25 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     preparation_authority_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-preparation-authority-test", "Verify private SQL authority persistence, native admission and isolation from public and transport authentication").dependOn(&preparation_authority_run.step);
     b.step("antfly-api-sql-trigger-restore-compile", "Type-check mounted trigger and cross-realm restore campaigns before runtime activation").dependOn(&sql_owner_lifecycle_tests.step);
-    const trigger_restore_contract_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "public table and cluster restore own explicit routine identity mappings", "restore routine mappings survive retries takeover and bind idempotency", "restore trigger actor incarnation", "restore routine mapping preserves", "staged trigger handoff", "restore trigger user authorization", "SQL table trigger restore and backup", "trigger restore callable leases", "SQL trigger staged restore", "SQL trigger restore source directory", "UNLOGGED schema only", "native artifact restore admission" });
+    const trigger_restore_contract_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, trigger_restore_contract_filters);
     trigger_restore_contract_run.addArg("--require-no-skips");
-    b.step("antfly-api-sql-trigger-restore-contract-test", "Verify typed routine mapping, native handoff, immutable actor and transactional callable leases").dependOn(&trigger_restore_contract_run.step);
+    const trigger_restore_embedded_filters: []const []const u8 = &.{ "SQL trigger staged restore", "SQL trigger restore source directory" };
+    const trigger_restore_embedded_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/sql_trigger_restore_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configureEmbedded(b, trigger_restore_embedded_mod, true);
+    const trigger_restore_embedded_tests = b.addTest(.{
+        .root_module = trigger_restore_embedded_mod,
+        .filters = trigger_restore_embedded_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const trigger_restore_embedded_run = addFilteredTestRunArtifactWithRuntimeFilters(b, trigger_restore_embedded_tests, trigger_restore_embedded_filters);
+    trigger_restore_embedded_run.addArg("--require-no-skips");
+    const trigger_restore_contract_step = b.step("antfly-api-sql-trigger-restore-contract-test", "Verify typed routine mapping, native handoff, immutable actor and transactional callable leases");
+    trigger_restore_contract_step.dependOn(&trigger_restore_contract_run.step);
+    trigger_restore_contract_step.dependOn(&trigger_restore_embedded_run.step);
     const case_cohort_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL document view guards", "mounted SQL original canonical MATCH", "mounted SQL graph joined hits", "SQL native graph", "retained graph", "SQL policy publication", "SQL relation lifetime" });
     case_cohort_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-case-cohort-test", "Verify original graph and document view case cohorts across native owners").dependOn(&case_cohort_run.step);
