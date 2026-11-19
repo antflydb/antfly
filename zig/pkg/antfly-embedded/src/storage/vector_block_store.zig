@@ -715,7 +715,10 @@ pub const Store = struct {
             self.alloc.free(merged);
             return false;
         }
-        const owned = try self.alloc.realloc(merged, merged_count);
+        const owned = self.alloc.realloc(merged, merged_count) catch |err| {
+            self.alloc.free(merged);
+            return err;
+        };
         errdefer self.alloc.free(owned);
         var next = manifest;
         next.coverages = owned;
@@ -4702,32 +4705,38 @@ fn openInternalWithState(
     var wal_bytes = try store.readWalBytes(true);
     errdefer alloc.free(wal_bytes);
     var wal = try vector_wal.Replay.parse(alloc, wal_bytes);
-    errdefer wal.deinit();
+    var wal_owned = true;
+    errdefer if (wal_owned) wal.deinit();
     if (wal.committed_bytes < store.wal_committed_bytes) return error.VectorWalShorterThanManifest;
+    const sealed = if (store.manifest) |*manifest| manifest.sealed_wals.slice() else &.{};
     const sealed_bytes: usize = @intCast(if (store.manifest) |manifest| try manifest.sealed_wals.bytes() else 0);
-    var active_replay = try vector_wal.Replay.parse(alloc, wal_bytes[sealed_bytes..]);
-    defer active_replay.deinit();
+    const last_sealed_batch = if (sealed.len == 0) null else sealed[sealed.len - 1].last_batch;
     store.active_wal_min_mutation_sequence = null;
-    for (active_replay.records.items) |record| if (record.kind == .upsert or record.kind == .reference or record.kind == .tombstone) {
-        store.active_wal_min_mutation_sequence = @min(store.active_wal_min_mutation_sequence orelse record.source_sequence, record.source_sequence);
-    };
     for (wal.records.items) |record| {
         if (record.kind != .coverage and record.source_sequence < store.segment_covered_source_sequence) return error.VectorWalOverlapsCheckpoint;
         if (record.kind == .upsert or record.kind == .reference or record.kind == .tombstone) {
             store.wal_has_mutations = true;
             store.wal_latest_mutation_sequence = @max(store.wal_latest_mutation_sequence, record.source_sequence);
+            if (last_sealed_batch == null or record.batch_id > last_sealed_batch.?) {
+                store.active_wal_min_mutation_sequence = @min(store.active_wal_min_mutation_sequence orelse record.source_sequence, record.source_sequence);
+            }
         }
     }
     if (wal_bytes.len != wal.committed_bytes) {
-        const committed = try alloc.dupe(u8, wal_bytes[0..wal.committed_bytes]);
-        errdefer alloc.free(committed);
-        var replacement = try vector_wal.Replay.parse(alloc, committed);
-        errdefer replacement.deinit();
-        if (!read_only) try atomicReplace(alloc, storage, wal_path, committed[sealed_bytes..]);
-        wal.deinit();
-        alloc.free(wal_bytes);
-        wal_bytes = committed;
-        wal = replacement;
+        const len = wal.committed_bytes;
+        if (alloc.resize(wal_bytes, len)) {
+            wal_bytes = if (len == 0) &.{} else wal_bytes[0..len];
+            wal.valid_bytes = len;
+        } else {
+            wal.deinit();
+            wal_owned = false;
+            const committed = try alloc.dupe(u8, wal_bytes[0..len]);
+            alloc.free(wal_bytes);
+            wal_bytes = committed;
+            wal = try vector_wal.Replay.parse(alloc, wal_bytes);
+            wal_owned = true;
+        }
+        if (!read_only) try atomicReplace(alloc, storage, wal_path, wal_bytes[sealed_bytes..]);
     } else if (prepared == null and !read_only and wal.committed_bytes > sealed_bytes) {
         // A complete frame may still be in the page cache after failed sync.
         // Establish durability before a writable owner can reuse that payload.
@@ -5842,7 +5851,10 @@ test "vector WAL tail repair unwinds allocation failures" {
             defer alloc.free(path);
             try memory.storage().appendFileAbsolute(alloc, path, "torn", false);
 
-            var recovered = try Store.openWithBlocks(recovery_alloc, memory.storage(), root);
+            // Force the copy fallback so allocation injection covers its
+            // replacement parser even on allocators that can shrink in place.
+            var no_resize = std.testing.FailingAllocator.init(recovery_alloc, .{ .resize_fail_index = 0 });
+            var recovered = try Store.openWithBlocks(no_resize.allocator(), memory.storage(), root);
             defer recovered.deinit();
             try std.testing.expectEqual(store.wal_committed_bytes, try memory.storage().fileSize(path));
             try std.testing.expectEqualSlices(f32, &.{2.0}, (try recovered.get("a", 1, 1)).vector.vectorView().?);

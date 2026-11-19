@@ -4333,22 +4333,24 @@ pub const IndexManager = struct {
         if (self.acquireVectorBlockGeneration()) |current| {
             defer current.release();
             if (!vectorBlockGenerationExactAtSequence(current, snapshot_sequence)) return false;
-            var writer = try vector_block_store_mod.Store.open(self.alloc, storage, root);
-            defer writer.deinit();
-            if (writer.covered_source_sequence != snapshot_sequence) return false;
-            const changed = try writer.declareArtifactScopes(scope_hashes);
-            if (changed) {
-                var opened = try vector_block_store_mod.Store.openWithBlocksReusing(
-                    self.alloc,
-                    storage,
-                    root,
-                    &current.opened,
-                );
-                var opened_owned = true;
-                errdefer if (opened_owned) opened.deinit();
-                const generation = try self.createVectorBlockGeneration(opened);
-                opened_owned = false;
+            var opened = try vector_block_store_mod.Store.openWithBlocksReusing(
+                self.alloc,
+                storage,
+                root,
+                &current.opened,
+            );
+            var opened_owned = true;
+            defer if (opened_owned) opened.deinit();
+            if (opened.store.covered_source_sequence != snapshot_sequence) return false;
+            // Scope declaration changes only CURRENT. The blocks and fenced
+            // WAL already held by this view remain valid for the new scopes.
+            const generation = try self.createVectorBlockGeneration(opened);
+            opened_owned = false;
+            var generation_owned = true;
+            defer if (generation_owned) generation.release();
+            if (try generation.opened.store.declareArtifactScopes(scope_hashes)) {
                 self.installVectorBlockGeneration(generation);
+                generation_owned = false;
             }
             self.vector_block_projection_dirty.store(false, .release);
             return true;
