@@ -41,6 +41,7 @@ pub const Request = struct {
             hash.update(&bytes);
         }
         if (self.identity.include_bootstrap) hash.update("\x01");
+        if (self.identity.include_cut) hash.update("\x02");
         return hash.finalResult();
     }
 };
@@ -65,6 +66,9 @@ pub const Reply = struct {
                 if (!std.mem.eql(u8, &consumer.id, &request.identity.consumer) or consumer.epoch == 0 or consumer.expires_at_seconds == 0 or
                     consumer.policy_revision != request.identity.policy_revision or consumer.acknowledged < consumer.start or value.limit == 0 or value.grant == 0) return error.HistoryCorrupt;
                 if ((value.grant == request.identity.sequence) != (self.observation == .active)) return error.HistoryCorrupt;
+                if (value.quiescent_latest) |latest| {
+                    if (!request.identity.include_cut or self.observation != .active or latest < consumer.acknowledged) return error.HistoryCorrupt;
+                }
                 if (value.bootstrap) |pin| {
                     if (!request.identity.include_bootstrap or self.observation != .active or pin.expires_at_seconds == 0 or
                         pin.expires_at_seconds > consumer.expires_at_seconds or std.mem.allEqual(u8, &pin.digest, 0)) return error.HistoryCorrupt;
@@ -118,6 +122,15 @@ pub const test_support = if (@import("builtin").is_test) struct {
         reply.observation = .{ .absent = maximum };
         try std.testing.expectError(error.HistoryCorrupt, reply.validate(request));
         const original_request = try decodeRequest(a, encoded);
+        var cut_request = original_request;
+        cut_request.identity.include_cut = true;
+        var cut_reply = try Reply.init(original_request, .{ .active = .{ .grant = maximum, .limit = maximum, .consumer = .{ .id = request.identity.consumer, .epoch = 1, .start = 0, .acknowledged = 1, .expires_at_seconds = maximum, .policy_revision = maximum } } });
+        cut_reply.observation.active.quiescent_latest = 1;
+        try std.testing.expectError(error.HistoryCorrupt, cut_reply.validate(original_request));
+        cut_reply.request_digest = cut_request.digest();
+        try cut_reply.validate(cut_request);
+        cut_reply.observation.active.quiescent_latest = 0;
+        try std.testing.expectError(error.HistoryCorrupt, cut_reply.validate(cut_request));
         try std.testing.expectError(error.HistoryCorrupt, decodeReply(a, "{}", original_request));
         try std.testing.expectError(error.InvalidHistoryAdmission, decodeRequest(a, "{}"));
         const duplicate = try std.fmt.allocPrint(a, "{s},\"version\":1}}", .{encoded[0 .. encoded.len - 1]});

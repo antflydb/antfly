@@ -40870,6 +40870,12 @@ fn implementationTests() type {
             const observed = try db.orderedHistoryGrant(identity, 2);
             try std.testing.expectEqualDeep(admitted.applied.consumer.?, observed.active.consumer);
             try std.testing.expectEqual(grant.limit, observed.active.limit);
+            try std.testing.expectEqual(null, observed.active.quiescent_latest);
+            var cut_identity = identity;
+            cut_identity.include_cut = true;
+            const admitted_marker = try db.orderedApplyReceipt();
+            try std.testing.expectEqual(@as(?u64, admitted.applied.consumer.?.start), (try db.orderedHistoryGrant(cut_identity, 2)).active.quiescent_latest);
+            try std.testing.expectEqualDeep(admitted_marker, try db.orderedApplyReceipt());
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.orderedHistoryGrant(identity, 3));
             try std.testing.expectError(error.OnlineSourceScopeChanged, db.nativeHistoryGrant(identity));
             var different = identity;

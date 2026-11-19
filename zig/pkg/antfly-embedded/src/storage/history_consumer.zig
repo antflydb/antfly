@@ -174,6 +174,7 @@ pub const GrantIdentity = struct {
     sequence: u64,
     policy_revision: u64,
     include_bootstrap: bool = false,
+    include_cut: bool = false,
 
     pub fn jsonStringify(self: GrantIdentity, jw: anytype) !void {
         try jw.beginObject();
@@ -183,6 +184,10 @@ pub const GrantIdentity = struct {
         }
         if (self.include_bootstrap) {
             try jw.objectField("include_bootstrap");
+            try jw.write(true);
+        }
+        if (self.include_cut) {
+            try jw.objectField("include_cut");
             try jw.write(true);
         }
         try jw.endObject();
@@ -211,6 +216,7 @@ pub const GrantObservation = union(enum) {
         consumer: history.Consumer,
         limit: u64,
         bootstrap: ?BootstrapObservation = null,
+        quiescent_latest: ?u64 = null,
 
         pub fn jsonStringify(self: Active, jw: anytype) !void {
             try jw.beginObject();
@@ -221,6 +227,10 @@ pub const GrantObservation = union(enum) {
             if (self.bootstrap) |pin| {
                 try jw.objectField("bootstrap");
                 try jw.write(pin);
+            }
+            if (self.quiescent_latest) |latest| {
+                try jw.objectField("quiescent_latest");
+                try jw.write(latest);
             }
             try jw.endObject();
         }
@@ -253,6 +263,10 @@ pub fn observeGrant(txn: anytype, requested: GrantIdentity) !GrantObservation {
                 result.bootstrap = .{ .digest = pin.digest, .expires_at_seconds = pin.expires_at_seconds };
             }
         }
+        if (requested.include_cut) result.quiescent_latest = history.requireBootstrapCut(txn, requested.namespace) catch |err| switch (err) {
+            error.HistoryPreparedTransactionsPresent => null,
+            else => return err,
+        };
         return .{ .active = result };
     }
     if (native) |value| for (value.consumers) |consumer| {

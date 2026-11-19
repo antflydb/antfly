@@ -253,6 +253,57 @@ pub const Source = struct {
 const MetadataClient = @import("changefeed_metadata.zig").Client;
 const enrollment = @import("../metadata/root_control_driver.zig");
 
+/// Two complete scans with unchanged monotonic heads prove an interval shared
+/// by every enrolled root. The first scan also requires each root to have no
+/// unpublished coordinated effects. An advanced head invalidates this round.
+pub fn qualifyEnrollmentCut(a: A, source: Source, policy: anytype, captured: *const Captured, state: control.State, request: Context) !control.Digest {
+    try state.validate();
+    if (state.phase != .enrolling or state.roots.len == 0) return error.ChangefeedConflict;
+    try captured.validateInitialRoutes(state.roots);
+    const definition = state.definition.?;
+    const identity = definition.identity();
+    var proof = control.hash(.{ .domain = "antfly:coherent-enrollment-cut:v1", .consumer = state.consumerId(), .definition = identity });
+    for (0..2) |scan| {
+        for (captured.roots, state.roots) |route, root| {
+            try request.ensureActive();
+            if (root.consumer_epoch == 0 or root.pending_control != null) return error.ChangefeedConflict;
+            const table = for (definition.tables) |table| {
+                if (table.table_id == route.fence.table_id) break table;
+            } else return error.ChangefeedResynchronizationRequired;
+            try policy.authorizeRoot(state, root.namespace, request);
+            try policy.validateRoot(state, root.namespace, route.fence, route.table_name, request);
+            const observation = try source.grants.read(a, route.fence, route.table_name, .{
+                .version = 1,
+                .identity = .{
+                    .namespace = root.namespace,
+                    .authority = state.authority,
+                    .consumer = state.consumerId(),
+                    .definition = identity,
+                    .sequence = root.grant_sequence,
+                    .policy_revision = table.policy_revision,
+                    .include_bootstrap = root.snapshot != null,
+                    .include_cut = true,
+                },
+            }, request);
+            if (observation != .active) return error.ChangefeedResynchronizationRequired;
+            const grant = observation.active;
+            if (grant.consumer.epoch != root.consumer_epoch or grant.consumer.start != root.start or
+                grant.consumer.acknowledged != root.start or grant.consumer.expires_at_seconds != state.expires_at)
+                return error.ChangefeedResynchronizationRequired;
+            if (root.snapshot) |pin| {
+                const observed = grant.bootstrap orelse return error.ChangefeedResynchronizationRequired;
+                if (!std.meta.eql(observed.digest, pin.digest) or observed.expires_at_seconds != pin.expires_at)
+                    return error.ChangefeedResynchronizationRequired;
+            }
+            const latest = grant.quiescent_latest orelse return error.ReadUnavailable;
+            if (latest != root.start) return error.ChangefeedResynchronizationRequired;
+            if (scan == 0) proof = control.hash(.{ .proof = proof, .namespace = root.namespace, .grant = root.grant_sequence, .epoch = root.consumer_epoch, .sequence = root.start, .pin = root.snapshot });
+        }
+    }
+    try request.ensureActive();
+    return proof;
+}
+
 /// Propagate whole-frame client ACKs through receipt-qualified owner controls.
 /// Partial-frame cursors can be durable without moving the native floor.
 pub fn flushAcknowledged(client: *MetadataClient, policy: anytype, a: A, confirmed: control.State, root: Root, request: Context) !bool {
@@ -468,7 +519,48 @@ pub const test_support = if (@import("builtin").is_test) struct {
         var wrong_fence = root.fence;
         wrong_fence.metadata_incarnation = @splat(9);
         try std.testing.expectError(error.ChangefeedResynchronizationRequired, allocation_fixture.source().validate(a, state, root.namespace, wrong_fence, root.table_name, .{}));
+        try enrollmentCut(a, arena.allocator(), state, &captured, allocation_fixture.source());
         try std.testing.checkAllAllocationFailures(a, captureAllocations, .{ &allocation_fixture, definition });
+    }
+
+    fn enrollmentCut(a: A, scratch: A, planned: control.State, captured: *const Captured, source: Source) !void {
+        var state = planned;
+        for (planned.roots, 0..) |root, ordinal| {
+            state = try (control.Mutation{ .enroll = .{ .namespace = root.namespace, .ownership_epoch = 1, .grant_sequence = root.grant_sequence, .consumer_epoch = 1, .start = 5 } }).apply(scratch, state, .{ .incarnation = state.authority, .sequence = 3 + ordinal });
+        }
+        const grants = @import("history_grant_operations.zig");
+        const GrantFixture = struct {
+            calls: usize = 0,
+            fail_at: ?usize = null,
+            moved: bool = false,
+            fn read(raw: *anyopaque, _: A, _: metadata.CatalogRouteFence, _: []const u8, request: grants.Request, _: Context) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantObservation {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                try std.testing.expect(request.identity.include_cut);
+                return .{ .active = .{
+                    .grant = request.identity.sequence,
+                    .consumer = .{ .id = request.identity.consumer, .epoch = 1, .start = 5, .acknowledged = 5, .expires_at_seconds = 1000, .policy_revision = request.identity.policy_revision },
+                    .limit = 1024,
+                    .quiescent_latest = if (self.calls == self.fail_at) (if (self.moved) @as(?u64, 6) else null) else 5,
+                } };
+            }
+        };
+        const Policy = struct {
+            pub fn authorizeRoot(_: *@This(), _: control.State, _: control.Namespace, _: Context) !void {}
+            pub fn validateRoot(_: *@This(), _: control.State, _: control.Namespace, _: metadata.CatalogRouteFence, _: []const u8, _: Context) !void {}
+        };
+        var policy: Policy = .{};
+        var fixture: GrantFixture = .{};
+        var reader = source;
+        reader.grants = .{ .ptr = &fixture, .read_fn = GrantFixture.read };
+        const proof = try qualifyEnrollmentCut(a, reader, &policy, captured, state, .{});
+        try std.testing.expectEqual(captured.roots.len * 2, fixture.calls);
+        fixture = .{};
+        try std.testing.expectEqual(proof, try qualifyEnrollmentCut(a, reader, &policy, captured, state, .{}));
+        fixture = .{ .fail_at = 1 };
+        try std.testing.expectError(error.ReadUnavailable, qualifyEnrollmentCut(a, reader, &policy, captured, state, .{}));
+        fixture = .{ .fail_at = captured.roots.len + 1, .moved = true };
+        try std.testing.expectError(error.ChangefeedResynchronizationRequired, qualifyEnrollmentCut(a, reader, &policy, captured, state, .{}));
     }
     fn captureAllocations(a: A, fixture: *Fixture, definition: control.Definition) !void {
         var owned = try fixture.source().capture(a, definition, .{});
