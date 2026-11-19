@@ -16505,6 +16505,7 @@ pub const ProvisionedTableWriteSource = struct {
             stats.fd_persistent_descriptors = @max(stats.fd_persistent_descriptors, entry_stats.fd_persistent_descriptors);
             stats.fd_admission_capacity = @max(stats.fd_admission_capacity, entry_stats.fd_admission_capacity);
             stats.fd_persistent_reserve = @max(stats.fd_persistent_reserve, entry_stats.fd_persistent_reserve);
+            stats.fd_mapping_reserve = @max(stats.fd_mapping_reserve, entry_stats.fd_mapping_reserve);
             stats.fd_admission_waiters = @max(stats.fd_admission_waiters, entry_stats.fd_admission_waiters);
             stats.fd_admission_waits = @max(stats.fd_admission_waits, entry_stats.fd_admission_waits);
             stats.fd_persistent_admission_failures = @max(stats.fd_persistent_admission_failures, entry_stats.fd_persistent_admission_failures);

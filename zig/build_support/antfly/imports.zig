@@ -530,6 +530,11 @@ pub const AntflyRootImports = struct {
                 self.filesystem_capacity_source_file,
                 self.platform_target,
             );
+            // The platform module already provides the anchor on Linux even
+            // when it was configured without libc.
+            if (self.platform_target.result.os.tag != .linux) {
+                platform_build.addNativeFdCacheSource(mod, self.filesystem_capacity_source_file, self.platform_target);
+            }
         }
         mod.link_libc = link_libc;
     }

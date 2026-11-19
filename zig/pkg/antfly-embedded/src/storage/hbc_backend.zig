@@ -160,6 +160,8 @@ pub const LsmOptions = struct {
     storage: ?lsm_backend.Storage = null,
     cache: ?*lsm_backend.Cache = null,
     root_generation: u64 = 0,
+    /// Catalog startup activates posting reads before publishing the index.
+    retain_native_posting_startup_snapshot: bool = false,
 };
 
 pub fn openBackendWithLsmOptions(alloc: Allocator, path: [*:0]const u8, config: anytype, lsm_options: LsmOptions) !OpenedBackend {
