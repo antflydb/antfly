@@ -310,7 +310,11 @@ fn start(p: *Parser) !Start {
             version = true;
         } else if (std.mem.eql(u8, option, "publication_names")) {
             names = try publications(p.a, value orelse return error.InvalidReplicationOption);
-        } else if (std.mem.eql(u8, option, "binary") or std.mem.eql(u8, option, "messages") or std.mem.eql(u8, option, "two_phase") or std.mem.eql(u8, option, "streaming")) {
+        } else if (std.mem.eql(u8, option, "messages")) {
+            // Antfly has no producer for PostgreSQL logical messages. Both
+            // modes return the same committed row stream.
+            _ = try boolean(value orelse "true");
+        } else if (std.mem.eql(u8, option, "binary") or std.mem.eql(u8, option, "two_phase") or std.mem.eql(u8, option, "streaming")) {
             if (value) |v| if (std.mem.eql(u8, option, "streaming") and std.ascii.eqlIgnoreCase(v, "parallel")) return error.UnsupportedReplicationOption;
             try requireFalse(value);
         } else if (std.mem.eql(u8, option, "origin")) {
@@ -390,7 +394,7 @@ test "replication commands parse pgoutput client create and start with stable na
     defer created.deinit();
     try std.testing.expectEqualStrings("debezium", created.command.create_slot.slot);
     try std.testing.expectEqual(Snapshot.export_snapshot, created.command.create_slot.snapshot);
-    var stream = (try parse(a, "START_REPLICATION SLOT \"debezium\" LOGICAL 1/aB (\"proto_version\" '1', \"publication_names\" '\"Mixed,Name\", public_rows', streaming 'off', binary 'false', messages 'false', two_phase 'false', origin 'any')")).?;
+    var stream = (try parse(a, "START_REPLICATION SLOT \"debezium\" LOGICAL 1/aB (\"proto_version\" '1', \"publication_names\" '\"Mixed,Name\", public_rows', streaming 'off', binary 'false', messages 'true', two_phase 'false', origin 'any')")).?;
     defer stream.deinit();
     try std.testing.expectEqual(@as(u64, 0x1000000ab), @backingInt(stream.command.start.position));
     try std.testing.expectEqualStrings("Mixed,Name", stream.command.start.publications[0]);
@@ -421,11 +425,12 @@ test "replication commands negotiate snapshots and reject unimplemented guarante
     try std.testing.expectError(error.UnsupportedReplicationOption, parse(a, "CREATE_REPLICATION_SLOT s LOGICAL pgoutput TWO_PHASE"));
     try std.testing.expectError(error.DuplicateReplicationOption, parse(a, "CREATE_REPLICATION_SLOT s LOGICAL pgoutput EXPORT_SNAPSHOT NOEXPORT_SNAPSHOT"));
     try std.testing.expectError(error.UnsupportedReplicationMode, parse(a, "START_REPLICATION 0/0"));
-    for ([_][]const u8{ "binary 'true'", "messages 'on'", "two_phase '1'", "streaming 'parallel'", "origin 'none'", "unknown 'off'" }) |option| {
+    for ([_][]const u8{ "binary 'true'", "two_phase '1'", "streaming 'parallel'", "origin 'none'", "unknown 'off'" }) |option| {
         const text = try std.fmt.allocPrint(a, "START_REPLICATION SLOT s LOGICAL 0/0 (proto_version '1', publication_names 'p', {s})", .{option});
         defer a.free(text);
         try std.testing.expectError(error.UnsupportedReplicationOption, parse(a, text));
     }
+    try std.testing.expectError(error.InvalidReplicationOption, parse(a, "START_REPLICATION SLOT s LOGICAL 0/0 (proto_version '1', publication_names 'p', messages 'maybe')"));
     try std.testing.expectError(error.UnsupportedReplicationOption, parse(a, "START_REPLICATION SLOT s LOGICAL 0/0 (proto_version '2', publication_names 'p')"));
     try std.testing.expectError(error.DuplicateReplicationOption, parse(a, "START_REPLICATION SLOT s LOGICAL 0/0 (proto_version '1', proto_version '1', publication_names 'p')"));
     try std.testing.expectError(error.InvalidReplicationOption, parse(a, "START_REPLICATION SLOT s LOGICAL 0/0 (publication_names 'p')"));
