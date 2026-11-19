@@ -10375,6 +10375,28 @@ pub const DB = struct {
         reader: ?@import("enrichment/context_resolution.zig").Reader,
         dispatcher: ?context_dependency_db.Dispatcher,
     ) !void {
+        try self.installContextDependencyHostInMemory(table_id, inbound, reader, dispatcher);
+        // Persist the topology so a reopened source table stages notices for
+        // dependents in tables the host has not opened yet. A read-only
+        // handle, or an unchanged topology, writes nothing.
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
+        const Persisted = struct { table_id: []const u8, inbound: []const @import("enrichment/context_notices.zig").DeclaredConfig };
+        const encoded = try std.json.Stringify.valueAlloc(self.alloc, Persisted{ .table_id = table_id, .inbound = inbound }, .{});
+        defer self.alloc.free(encoded);
+        const current = try self.core.getStoreValue(self.alloc, context_dependency_host_key);
+        defer if (current) |value| self.alloc.free(value);
+        if (current) |value| if (std.mem.eql(u8, value, encoded)) return;
+        try self.core.store.put(context_dependency_host_key, encoded);
+    }
+
+    /// Install the topology for this handle only, without touching storage.
+    fn installContextDependencyHostInMemory(
+        self: *DB,
+        table_id: []const u8,
+        inbound: []const @import("enrichment/context_notices.zig").DeclaredConfig,
+        reader: ?@import("enrichment/context_resolution.zig").Reader,
+        dispatcher: ?context_dependency_db.Dispatcher,
+    ) !void {
         self.core.lockApply();
         defer self.core.unlockApply();
         try self.core.index_manager.setContextDependencyHost(table_id, inbound);
@@ -10382,12 +10404,6 @@ pub const DB = struct {
         self.context_source_host_reader = reader;
         self.context_notice_dispatcher = dispatcher;
         self.core.index_manager.context_drain = .{ .ptr = self, .drain_fn = drainContextHook };
-        // Persist the topology so a reopened source table stages notices for
-        // dependents in tables the host has not opened yet.
-        const Persisted = struct { table_id: []const u8, inbound: []const @import("enrichment/context_notices.zig").DeclaredConfig };
-        const encoded = try std.json.Stringify.valueAlloc(self.alloc, Persisted{ .table_id = table_id, .inbound = inbound }, .{});
-        defer self.alloc.free(encoded);
-        try self.core.store.put(context_dependency_host_key, encoded);
     }
 
     const context_dependency_host_key = "\x00\x00__metadata__:context_dependency:host";
@@ -10622,7 +10638,9 @@ pub const DB = struct {
         const Persisted = struct { table_id: []const u8, inbound: []const @import("enrichment/context_notices.zig").DeclaredConfig };
         const parsed = std.json.parseFromSlice(Persisted, self.alloc, raw, .{ .ignore_unknown_fields = true }) catch return false;
         defer parsed.deinit();
-        try self.setContextDependencyHost(parsed.value.table_id, parsed.value.inbound, reader, dispatcher);
+        // Restoring reinstalls what is already stored: never write, so a
+        // read-only handle can open a table with context topology.
+        try self.installContextDependencyHostInMemory(parsed.value.table_id, parsed.value.inbound, reader, dispatcher);
         return true;
     }
 
@@ -157717,4 +157735,27 @@ test "privacy scoped readiness status isolates shared catch-up telemetry" {
     pending.projection_checkpoint_status = "rebuilding";
     try std.testing.expect(DB.denseCatchUpAffectsIndex(pending, progress));
     try std.testing.expect(!DB.denseCatchUpAffectsIndex(pending, .{}));
+}
+
+test "db read-only reopen restores context topology without writing it" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("context-topology-readonly");
+    defer tmp.cleanup();
+    const inbound = [_]@import("enrichment/context_notices.zig").DeclaredConfig{.{ .dependent_table_id = "lite:2", .artifact = "summary", .stored_json = "{\"sources\":{}}" }};
+    {
+        var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try db.setContextDependencyHost("lite:1", &inbound, null, null);
+        // Reinstalling the same topology writes nothing.
+        const before = db.core.store.lastReplaySequence(0);
+        try db.setContextDependencyHost("lite:1", &inbound, null, null);
+        try std.testing.expectEqual(before, db.core.store.lastReplaySequence(0));
+    }
+    var readonly = try DB.open(alloc, tmp.path(), .{ .open_mode = .query_readonly, .start_optional_runtimes = false, .start_index_workers = false });
+    defer readonly.close();
+    try std.testing.expect(try readonly.restoreContextDependencyHost(null, null));
+    try std.testing.expectEqualStrings("lite:1", readonly.contextSourceTableId());
+    try std.testing.expect(readonly.core.index_manager.hasContextDependents());
+    // Installing on a read-only handle is in-memory only.
+    try readonly.setContextDependencyHost("lite:1", &inbound, null, null);
 }
