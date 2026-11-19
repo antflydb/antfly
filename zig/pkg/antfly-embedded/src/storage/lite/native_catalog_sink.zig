@@ -286,6 +286,7 @@ pub const Sink = struct {
 
     fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
         const self: *Sink = @ptrCast(@alignCast(ptr));
+        if (self.store.write_target != null) self.store.noteLoadedIndexScope(scope);
         var txn = try self.store.beginRead();
         defer txn.abort();
         const file = try txn.readFile();

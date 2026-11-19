@@ -1064,6 +1064,19 @@ fn maybeReleaseAssumeLocked(entry: *Entry, io: Io) void {
     entry.last_transition_ns = now;
 }
 
+/// Drops the kernel lock an idle entry keeps parked, so another fd of this
+/// process can lock the file (a reader fence restored after a writer
+/// window). No-op while any in-process grant is outstanding.
+pub fn cedeParked(entry: *Entry, io: Io) void {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    if (entry.shared_count != 0 or entry.exclusive_count != 0 or entry.state == .none) return;
+    const fd = entry.fd orelse return;
+    fd.unlock(io);
+    entry.state = .none;
+    entry.last_transition_ns = Io.Clock.awake.now(io).nanoseconds;
+}
+
 fn ensureFd(entry: *Entry, io: Io) !Io.File {
     if (entry.fd) |fd| return fd;
     // No `.lock` here: every acquisition above takes the lock explicitly,

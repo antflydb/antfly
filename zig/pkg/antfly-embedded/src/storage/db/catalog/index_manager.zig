@@ -21748,6 +21748,17 @@ pub const IndexManager = struct {
 
     pub fn runTextMergeScheduler(self: *IndexManager, max_steps: usize) !usize {
         var completed: usize = 0;
+        // Indexes whose publication was refused this pass. A refusal
+        // (`EnrichmentWaitCanceled`) can be scoped to one index whose inputs
+        // changed under a maintenance snapshot; the other indexes still merge.
+        var refused: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (refused.items) |name| {
+                if (self.textIndexEntry(name)) |entry| TextMergeScheduler.schedule(entry);
+                self.alloc.free(name);
+            }
+            refused.deinit(self.alloc);
+        }
         while (completed < max_steps) {
             var task = (try self.beginTextMergeTask()) orelse break;
             defer task.deinit(self.alloc);
@@ -21761,19 +21772,32 @@ pub const IndexManager = struct {
                 else => return err,
             };
             defer result.deinit(self.alloc);
-            while (true) {
-                _ = self.finishTextMergeTask(&task, &result) catch |err| {
-                    if (err != error.TextMergePublicationLookupRequired) return err;
+            const published = while (true) {
+                _ = self.finishTextMergeTask(&task, &result) catch |err| switch (err) {
                     // This synchronous scheduler does not acquire the runtime's
                     // database-wide apply lock. Prepare outside IndexManager's
                     // short per-index publication critical section and retry.
-                    try prepareTextMergeTaskPublicationLookup(&task, &result);
-                    continue;
+                    error.TextMergePublicationLookupRequired => {
+                        try prepareTextMergeTaskPublicationLookup(&task, &result);
+                        continue;
+                    },
+                    error.EnrichmentWaitCanceled => break false,
+                    else => return err,
                 };
-                break;
+                break true;
+            };
+            if (!published) {
+                // Park the index (pending cleared) until the pass ends so
+                // `select` moves on; the deferred reschedule restores it.
+                try refused.ensureUnusedCapacity(self.alloc, 1);
+                refused.appendAssumeCapacity(try self.alloc.dupe(u8, task.index_name));
+                self.completeTextMergeTaskTracking(&task);
+                if (self.textIndexEntry(task.index_name)) |entry| TextMergeScheduler.noteComplete(entry);
+                continue;
             }
             completed += 1;
         }
+        if (completed == 0 and refused.items.len != 0) return error.EnrichmentWaitCanceled;
         return completed;
     }
 

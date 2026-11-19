@@ -1625,7 +1625,12 @@ pub const Region = struct {
                 self.ticketAbandonedFlags()[my_ticket % hdr.max_readers].store(1, .release);
                 return error.Timeout;
             }
-            countedFutexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, head, deadline) catch return error.Canceled;
+            // A canceled waiter gives its ticket up like a timed-out one:
+            // its owner stays alive, so nobody else would ever skip it.
+            countedFutexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, head, deadline) catch {
+                self.ticketAbandonedFlags()[my_ticket % hdr.max_readers].store(1, .release);
+                return error.Canceled;
+            };
             const head2 = hdr.writer_ticket_head.load(.acquire);
             if (head2 == head) self.tryHelpDeadTicketAt(head2);
         }
@@ -1655,7 +1660,10 @@ pub const Region = struct {
                 const step_deadline = Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(dead_ticket_check_step_ms));
                 break :blk if (step_deadline.compare(.lt, deadline)) step_deadline else deadline;
             } else deadline;
-            countedFutexWaitSharedBounded(io, &hdr.writer_release_epoch.raw, epoch, wait_deadline) catch return error.Canceled;
+            countedFutexWaitSharedBounded(io, &hdr.writer_release_epoch.raw, epoch, wait_deadline) catch {
+                self.advanceHeadPastAbandoned();
+                return error.Canceled;
+            };
         }
     }
 
@@ -3941,6 +3949,63 @@ test "shared lock region: acquireWriterFairBounded succeeds once free and times 
 // must still make progress once it's skipped -- not wedge forever, which
 // is exactly what would happen if whoever eventually reaches the
 // abandoned ticket's position in `head` didn't know to continue past it.
+test "shared lock region: a canceled fair waiter gives up its ticket" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{ .concurrent_limit = .limited(4) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-cancel.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+    var region = try Region.open(a, io, db_path);
+    defer region.close();
+    const pid: u32 = @bitCast(std.c.getpid());
+    const Waiter = struct {
+        fn run(r: *Region, wio: Io, owner: u32) !bool {
+            return r.acquireWriterFairBounded(wio, owner, Io.Clock.now(.awake, wio).addDuration(.fromSeconds(30)), null);
+        }
+        fn queued(r: *Region, wio: Io, tickets: u32) !void {
+            var waited_ms: u32 = 0;
+            while (r.header().writer_ticket_tail.load(.monotonic) -% r.header().writer_ticket_head.load(.monotonic) < tickets) : (waited_ms += 5) {
+                if (waited_ms > 5000) return error.TestTimeout;
+                try wio.sleep(.fromMilliseconds(5), .awake);
+            }
+            try wio.sleep(.fromMilliseconds(20), .awake);
+        }
+    };
+    const soon = struct {
+        fn at(wio: Io) Io.Timestamp {
+            return Io.Clock.now(.awake, wio).addDuration(.fromMilliseconds(500));
+        }
+    }.at;
+
+    // At the head, waiting for the ticketless holder to leave.
+    try std.testing.expect(region.tryAcquireWriterFair(pid));
+    var head = try std.Io.concurrent(io, Waiter.run, .{ &region, io, pid });
+    try Waiter.queued(&region, io, 1);
+    try std.testing.expectError(error.Canceled, head.cancel(io));
+    region.releaseWriter();
+    _ = try region.acquireWriterFairBounded(io, pid, soon(io), null);
+    region.releaseWriter();
+
+    // Queued behind a live ticket.
+    try std.testing.expect(region.tryAcquireWriterFair(pid));
+    var first = try std.Io.concurrent(io, Waiter.run, .{ &region, io, pid });
+    try Waiter.queued(&region, io, 1);
+    var second = try std.Io.concurrent(io, Waiter.run, .{ &region, io, pid });
+    try Waiter.queued(&region, io, 2);
+    try std.testing.expectError(error.Canceled, second.cancel(io));
+    region.releaseWriter();
+    _ = try first.await(io);
+    region.releaseWriter();
+    _ = try region.acquireWriterFairBounded(io, pid, soon(io), null);
+    region.releaseWriter();
+}
+
 test "shared lock region: an abandoned ticket does not wedge an earlier or a later one" {
     if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
     const a = std.testing.allocator;

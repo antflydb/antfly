@@ -10634,7 +10634,7 @@ pub const NativeFile = struct {
         self.epoch_window = null;
         self.minimum_reader_sequence = self.reader_window_previous_frontier;
         self.minimum_metadata_reader_sequence = self.reader_window_previous_metadata_frontier;
-        self.reader_coordinator.?.end();
+        self.reader_coordinator.?.endCeding(self.inode_lock_ref.load(.acquire));
     }
 
     fn invalidateLedger(self: *NativeFile) void {

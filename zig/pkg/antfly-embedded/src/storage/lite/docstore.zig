@@ -97,6 +97,45 @@ test "lite detached writer admission fences documents and index catalogs" {
     try std.testing.expectEqual(@as(usize, 0), admission.active);
 }
 
+test "lite physical catalog change fences only the changed index scope" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "scope-physical-fence.aflite");
+    defer a.free(path);
+    const quiet = "t/indexes/quiet_text/index";
+    const busy = "t/indexes/busy_text/index";
+    var writer = try native.NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer writer.close();
+    try writer.putIndexCatalogBatch(&.{
+        .{ .key = "t/indexes/quiet_text/def", .value = "quiet" },
+        .{ .key = "t/indexes/busy_text/def", .value = "busy" },
+        .{ .key = native_catalog_sink_prefix ++ quiet ++ "\x00ns\x00seg", .value = "q0" },
+        .{ .key = native_catalog_sink_prefix ++ busy ++ "\x00ns\x00seg", .value = "b0" },
+    });
+    // The snapshot's view, captured before the writer moves on.
+    var store = try Store.openWithOptions(a, path, .{ .read_only = true, .io = std.testing.io });
+    defer store.close();
+    // Nothing loaded: the caller must fall back to the whole table.
+    try std.testing.expect(!try store.markChangedIndexScopes(&writer));
+    store.noteLoadedIndexScope(quiet);
+    store.noteLoadedIndexScope(busy);
+    try std.testing.expect(try store.markChangedIndexScopes(&writer));
+    try std.testing.expect(!store.indexScopeStale(quiet) and !store.indexScopeStale(busy));
+
+    // The busy index's records move (a fold publishes them into the tree);
+    // the quiet index in the same table keeps publishing.
+    try writer.putIndexCatalogRecord(native_catalog_sink_prefix ++ busy ++ "\x00ns\x00seg", "b1");
+    try std.testing.expect(try store.markChangedIndexScopes(&writer));
+    try std.testing.expect(store.indexScopeStale(busy));
+    try std.testing.expect(!store.indexScopeStale(quiet));
+
+    // A definition change under the quiet index fences it too.
+    try writer.putIndexCatalogRecord("t/indexes/quiet_text/def", "quiet v2");
+    try std.testing.expect(try store.markChangedIndexScopes(&writer));
+    try std.testing.expect(store.indexScopeStale(quiet));
+}
+
 test "lite empty write commits preserve checkpoints and release writer admission" {
     const Admission = struct {
         entered: usize = 0,
@@ -3002,6 +3041,9 @@ const PublicationMutex = struct {
     }
 };
 
+/// `native_catalog_sink.reserved_prefix`; that module imports this one.
+const native_catalog_sink_prefix = "\x00ncat/";
+
 pub const Store = struct {
     score_cache_owner: u64 = 0,
     allocator: Allocator,
@@ -3220,6 +3262,13 @@ pub const Store = struct {
     index_load_sequence: u64 = 0,
     index_scope_commits: std.StringHashMapUnmanaged(u64) = .empty,
     index_fence_mutex: std.Io.Mutex = .init,
+    /// Index scopes whose catalogs this store's sink has loaded into memory,
+    /// and those a physical catalog change has since made stale. Under
+    /// `index_fence_mutex`; keys owned. `index_scopes_untracked` makes
+    /// physical comparisons fall back to the whole table.
+    loaded_index_scopes: std.StringHashMapUnmanaged(void) = .empty,
+    stale_index_scopes: std.StringHashMapUnmanaged(void) = .empty,
+    index_scopes_untracked: bool = false,
     /// Set when the fence refused a publication: this snapshot's catalogs
     /// are stale and its owner must reopen it.
     index_fence_refused: std.atomic.Value(bool) = .init(false),
@@ -3783,6 +3832,11 @@ pub const Store = struct {
         var scopes = self.index_scope_commits.keyIterator();
         while (scopes.next()) |scope| self.allocator.free(scope.*);
         self.index_scope_commits.deinit(self.allocator);
+        for ([_]*std.StringHashMapUnmanaged(void){ &self.loaded_index_scopes, &self.stale_index_scopes }) |set| {
+            var keys = set.keyIterator();
+            while (keys.next()) |scope| self.allocator.free(scope.*);
+            set.deinit(self.allocator);
+        }
         self.stopRideAlongFlush();
         if (self.artifact_registry) |registry| registry.detach();
         self.stopMaintenance();
@@ -6379,7 +6433,7 @@ pub const Store = struct {
         defer admission.leave(admission.ptr);
         const io = self.file.runtime();
         const shared = if (self.file.redo) |*redo| redo.shared else return self.submitIndexMutation(context, apply, durable);
-        if (shared.scopeLatestSequence(io, scope) > self.indexScopeFence(scope)) {
+        if (shared.scopeLatestSequence(io, scope) > self.indexScopeFence(scope) or self.indexScopeStale(scope)) {
             self.index_fence_refused.store(true, .release);
             return error.EnrichmentWaitCanceled;
         }
@@ -6388,6 +6442,61 @@ pub const Store = struct {
         try self.reserveIndexScope(scope);
         try self.submitIndexMutation(context, apply, durable);
         self.noteIndexScopeCommit(scope, shared.scopeLatestSequence(io, scope));
+    }
+
+    fn indexScopeStale(self: *Store, scope: []const u8) bool {
+        const io = self.file.runtime();
+        self.index_fence_mutex.lockUncancelable(io);
+        defer self.index_fence_mutex.unlock(io);
+        return self.stale_index_scopes.contains(scope);
+    }
+
+    /// Records an index scope whose catalog the sink loaded into memory.
+    pub fn noteLoadedIndexScope(self: *Store, scope: []const u8) void {
+        const io = self.file.runtime();
+        self.index_fence_mutex.lockUncancelable(io);
+        defer self.index_fence_mutex.unlock(io);
+        addScope(self.allocator, &self.loaded_index_scopes, scope) catch {
+            self.index_scopes_untracked = true;
+        };
+    }
+
+    fn addScope(allocator: Allocator, set: *std.StringHashMapUnmanaged(void), scope: []const u8) !void {
+        const gop = try set.getOrPut(allocator, scope);
+        if (gop.found_existing) return;
+        gop.key_ptr.* = allocator.dupe(u8, scope) catch |err| {
+            set.removeByPtr(gop.key_ptr);
+            return err;
+        };
+    }
+
+    /// After a physical catalog change (`latest` is the newer file), marks
+    /// each loaded index scope whose definitions or records changed as stale,
+    /// so only that index's publications are refused. Returns false when the
+    /// scopes cannot account for the change (none loaded, or tracking
+    /// failed): the caller must compare the whole table instead.
+    pub fn markChangedIndexScopes(self: *Store, latest: *native.NativeFile) !bool {
+        const io = self.file.runtime();
+        self.index_fence_mutex.lockUncancelable(io);
+        defer self.index_fence_mutex.unlock(io);
+        if (self.index_scopes_untracked or self.loaded_index_scopes.count() == 0) return false;
+        var scopes = self.loaded_index_scopes.keyIterator();
+        while (scopes.next()) |scope_ptr| {
+            const scope = scope_ptr.*;
+            // `<base>/indexes/<name>/index`: the index's own definitions sit
+            // under `<base>/indexes/<name>/`, its sink records under the
+            // sink's durable prefix for the scope.
+            const definitions = scope[0 .. (std.mem.lastIndexOfScalar(u8, scope, '/') orelse scope.len) + 1];
+            const records = try std.mem.concat(self.allocator, u8, &.{ native_catalog_sink_prefix, scope, &.{0} });
+            defer self.allocator.free(records);
+            const unchanged = (try self.file.indexCatalogPrefixUnchanged(latest, definitions)) and
+                (try self.file.indexCatalogPrefixUnchanged(latest, records));
+            if (!unchanged) addScope(self.allocator, &self.stale_index_scopes, scope) catch {
+                self.index_scopes_untracked = true;
+                return false;
+            };
+        }
+        return true;
     }
 
     fn indexScopeFence(self: *Store, scope: []const u8) u64 {
