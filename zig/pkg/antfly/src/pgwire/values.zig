@@ -880,17 +880,23 @@ fn encodeInteger(alloc: std.mem.Allocator, value: i64) ![]const u8 {
 }
 
 fn timestampText(alloc: std.mem.Allocator, value: std.json.Value) ![]const u8 {
-    // ISO strings remain strings; integer cells are the native nanosecond
-    // representation, not PostgreSQL's microseconds-since-2000 wire value.
-    if (value == .string and std.mem.indexOfScalar(u8, value.string, 'T') != null)
-        return alloc.dupe(u8, value.string);
+    // The native SQL runtime uses ISO 8601. PostgreSQL text rows use a
+    // space before the time and a numeric zone, which pgjdbc expects.
+    if (value == .string) {
+        const separator = std.mem.indexOfScalar(u8, value.string, 'T') orelse return error.InvalidResult;
+        const date = value.string[0..separator];
+        const time = value.string[separator + 1 ..];
+        if (std.mem.endsWith(u8, time, "Z"))
+            return std.fmt.allocPrint(alloc, "{s} {s}+00", .{ date, time[0 .. time.len - 1] });
+        return std.fmt.allocPrint(alloc, "{s} {s}", .{ date, time });
+    }
     const ns = try timestampNanos(value);
     if (@mod(ns, 1000) != 0) return error.UnsupportedResultPrecision;
     const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(@divTrunc(ns, std.time.ns_per_s)) };
     const year_day = epoch.getEpochDay().calculateYearDay();
     const month_day = year_day.calculateMonthDay();
     const seconds = epoch.getDaySeconds();
-    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}Z", .{
+    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}+00", .{
         year_day.year,                                                    month_day.month.numeric(),    month_day.day_index + 1,
         seconds.getHoursIntoDay(),                                        seconds.getMinutesIntoHour(), seconds.getSecondsIntoMinute(),
         @as(u32, @intCast(@divTrunc(@mod(ns, std.time.ns_per_s), 1000))),
@@ -1044,7 +1050,8 @@ test "pgwire timestamp conversion uses postgres epoch and refuses precision loss
     defer arena.deinit();
     const alloc = arena.allocator();
     const value = std.json.Value{ .integer = 946684800000000000 };
-    try std.testing.expectEqualStrings("2000-01-01T00:00:00.000000Z", try encode(alloc, .datetime, 0, value));
+    try std.testing.expectEqualStrings("2000-01-01 00:00:00.000000+00", try encode(alloc, .datetime, 0, value));
+    try std.testing.expectEqualStrings("2000-01-01 00:00:00.123456+00", try encode(alloc, .datetime, 0, .{ .string = "2000-01-01T00:00:00.123456Z" }));
     const binary = try encode(alloc, .datetime, 1, value);
     try std.testing.expectEqual(@as(i64, 0), std.mem.readInt(i64, binary[0..8], .big));
     try std.testing.expectEqual(value.integer, (try decode(alloc, 1184, 1, binary)).integer);

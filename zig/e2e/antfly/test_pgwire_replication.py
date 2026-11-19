@@ -439,7 +439,8 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             copied_lines = copied.stdout.splitlines()
             xid = int(copied_lines[4])
             timestamp = copied_lines[6]
-            assert timestamp and timestamp == copied_lines[7]
+            assert "T" not in timestamp and timestamp.endswith("+00")
+            assert timestamp == copied_lines[7]
             assert 3 <= xid <= (1 << 63) - 1
             assert copied_lines == [
                 "BEGIN",
