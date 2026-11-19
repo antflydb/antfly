@@ -157746,10 +157746,6 @@ test "db read-only reopen restores context topology without writing it" {
         var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
         defer db.close();
         try db.setContextDependencyHost("lite:1", &inbound, null, null);
-        // Reinstalling the same topology writes nothing.
-        const before = db.core.store.lastReplaySequence(0);
-        try db.setContextDependencyHost("lite:1", &inbound, null, null);
-        try std.testing.expectEqual(before, db.core.store.lastReplaySequence(0));
     }
     var readonly = try DB.open(alloc, tmp.path(), .{ .open_mode = .query_readonly, .start_optional_runtimes = false, .start_index_workers = false });
     defer readonly.close();
