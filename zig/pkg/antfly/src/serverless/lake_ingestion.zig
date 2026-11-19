@@ -228,6 +228,8 @@ pub const StreamOwner = struct {
                 .key_fields = identity.key_columns,
                 .changes = &.{},
             });
+            const bootstrap = try bootstrapIdentity(a, source, epoch, request.checkpoint, identity.key_columns);
+            retireBootstrapStage(a, bound.binding, options, context, bootstrap);
             try context.ensureActive();
             return .committed;
         }
@@ -238,15 +240,8 @@ pub const StreamOwner = struct {
             if (rows.len > max_group_changes) return error.LakeWriteTooLarge;
             const changes = try a.alloc(Batch.Change, rows.len);
             for (rows, changes) |row, *change| change.* = .{ .op = .upsert, .row = row };
-            const snapshot: Batch = .{
-                .batch_id = try std.fmt.allocPrint(a, "antfly-bootstrap-{s}", .{&catalog.types.digestHex(request.checkpoint)}),
-                .source = source,
-                .epoch = epoch,
-                .checkpoint = request.checkpoint,
-                .key_fields = identity.key_columns,
-                .changes = changes,
-                .bootstrap = true,
-            };
+            var snapshot = try bootstrapIdentity(a, source, epoch, request.checkpoint, identity.key_columns);
+            snapshot.changes = changes;
             try snapshot.validate(max_group_changes);
             break :blk snapshot;
         } else blk: {
@@ -258,9 +253,49 @@ pub const StreamOwner = struct {
             return .accepted;
         }
         const outcome = try applyBatch(a, bound.binding, options, context, batch);
+        if (outcome.committed and batch.bootstrap) retireBootstrapStage(a, bound.binding, options, context, batch);
         return if (outcome.committed) .committed else .accepted;
     }
 };
+
+fn bootstrapIdentity(a: A, source: []const u8, epoch: []const u8, checkpoint: []const u8, keys: []const []const u8) !Batch {
+    return .{
+        .batch_id = try std.fmt.allocPrint(a, "antfly-bootstrap-{s}", .{&catalog.types.digestHex(checkpoint)}),
+        .source = source,
+        .epoch = epoch,
+        .checkpoint = checkpoint,
+        .key_fields = keys,
+        .changes = &.{},
+        .bootstrap = true,
+    };
+}
+
+// The committed cut and WAL receipt are sufficient for recovery once the
+// stage is retired. Cleanup failure must not change the committed outcome.
+fn retireBootstrapStage(a: A, binding: Binding, options: Options, context: Context, batch: Batch) void {
+    removeBootstrapStage(a, binding, options, context, batch) catch |err|
+        std.log.warn("Iceberg bootstrap stage retirement deferred table_id={d} err={s}", .{ options.catalog_table_id, @errorName(err) });
+}
+
+fn removeBootstrapStage(a: A, binding: Binding, options: Options, context: Context, batch: Batch) !void {
+    try context.ensureActive();
+    var opened = try openQueue(a, binding, options);
+    defer opened.deinit();
+    const base = try prefix(a, opened.prefix, binding, options);
+    const key = try bootstrapStageKey(a, base, batch);
+    var client = opened.client;
+    const cancellation = catalog.types.contextCancellation(&context);
+    var current = client.statObjectWithOptions(opened.bucket, key, .{ .cancellation = cancellation }) catch |err| switch (err) {
+        error.NotFound, error.ObjectNotFound, error.FileNotFound => return,
+        else => return err,
+    };
+    defer current.deinit(client.allocator);
+    try context.ensureActive();
+    client.compareAndDelete(opened.bucket, key, current.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = cancellation }) catch |err| switch (err) {
+        error.NotFound, error.ObjectNotFound, error.FileNotFound => {},
+        else => return err,
+    };
+}
 
 fn bootstrapStageKey(a: A, base: []const u8, batch: Batch) ![]u8 {
     // WAL initialization owns its prefix and rejects pre-existing objects.
@@ -296,15 +331,7 @@ fn recoverPendingBootstrap(a: A, binding: Binding, unresolved: Options, context:
     const base = try prefix(a, opened.prefix, binding, options);
     defer a.free(base);
     const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null };
-    const expected: Batch = .{
-        .batch_id = try std.fmt.allocPrint(a, "antfly-bootstrap-{s}", .{&catalog.types.digestHex(checkpoint)}),
-        .source = source,
-        .epoch = epoch,
-        .checkpoint = checkpoint,
-        .key_fields = keys,
-        .changes = &.{},
-        .bootstrap = true,
-    };
+    const expected = try bootstrapIdentity(a, source, epoch, checkpoint, keys);
     const record = try store.next(a, 0);
     const bytes = if (record) |accepted| accepted.payload else blk: {
         var client = opened.client;
@@ -327,6 +354,7 @@ fn recoverPendingBootstrap(a: A, binding: Binding, unresolved: Options, context:
     }
     const outcome = try applyBatch(a, binding, options, context, batch);
     if (record) |accepted| if (outcome.accepted_sequence != accepted.lsn) return error.LakeWalCoverageGap;
+    if (outcome.committed) retireBootstrapStage(a, binding, options, context, batch);
     return outcome.committed;
 }
 
@@ -1215,6 +1243,12 @@ test "external lake filesystem WAL applies the managed PostgreSQL stream owner p
     try std.testing.expect(!try port.bootstrap_committed.?(port.ptr, alloc, recovery));
     try port.stage_bootstrap.?(port.ptr, alloc, snapshot);
     try port.stage_bootstrap.?(port.ptr, alloc, snapshot);
+    var queue = try openQueue(a, bound.binding, options);
+    defer queue.deinit();
+    const queue_prefix = try prefix(a, queue.prefix, bound.binding, options);
+    const staged_key = try bootstrapStageKey(a, queue_prefix, try bootstrapIdentity(a, "postgres:9:2", "12", "cut", &.{"id"}));
+    var staged_object = try queue.client.statObject(queue.bucket, staged_key);
+    staged_object.deinit(queue.client.allocator);
     try std.testing.expectEqual(@as(u64, 0), try watermark(a, bound.binding, options, .{}));
     try std.testing.expectEqual(@as(u64, 0), try coverage(a, try managed.load(a)));
     var wrong_cut = recovery;
@@ -1222,7 +1256,10 @@ test "external lake filesystem WAL applies the managed PostgreSQL stream owner p
     wrong_cut.cutover.prepared_checkpoint = "other";
     try std.testing.expect(!try port.bootstrap_committed.?(port.ptr, alloc, wrong_cut));
     try std.testing.expectEqual(@as(u64, 0), try coverage(a, try managed.load(a)));
+    staged_object = try queue.client.statObject(queue.bucket, staged_key);
+    staged_object.deinit(queue.client.allocator);
     try std.testing.expect(try port.bootstrap_committed.?(port.ptr, alloc, recovery));
+    try std.testing.expectError(error.FileNotFound, queue.client.statObject(queue.bucket, staged_key));
     try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, snapshot));
     try std.testing.expect(try port.bootstrap_committed.?(port.ptr, alloc, recovery));
     try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, request));
