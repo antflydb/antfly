@@ -3134,7 +3134,9 @@ const GuardedCatalog = struct {
         defer observed.deinit();
         const slot = observed.value.slot.?;
         const phase = observed.value.phase;
-        if (phase == .deleted) return .{ .rows = &.{} };
+        // DROP becomes visible at the closing transition. Physical spool
+        // reclamation and the final tombstone can follow independently.
+        if (phase == .closing or phase == .deleted) return .{ .rows = &.{} };
         const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_s;
         return system.replicationSlotPage(alloc, request, .{
             .name = slot.name,
@@ -3142,7 +3144,7 @@ const GuardedCatalog = struct {
             .database_oid = slots.database_oid,
             .confirmed_lsn = slot.confirmed_lsn,
             .active = slot.session != null and slot.session_expires_at > now,
-            .lost = phase == .reset_required or phase == .closing or observed.value.expiryDue(now),
+            .lost = phase == .reset_required or observed.value.expiryDue(now),
         });
     }
 
