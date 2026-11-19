@@ -1539,7 +1539,7 @@ pub const PersistentIndex = struct {
                     error.NotFound => null,
                     else => return err,
                 };
-                var segment_data: ?index_mod.SegmentData = if (seg_bytes) |bytes| blk: {
+                const segment_data: index_mod.SegmentData = if (seg_bytes) |bytes| blk: {
                     break :blk if (segment_files) |*store|
                         try store.publishExisting(seg_id, bytes)
                     else
@@ -1568,15 +1568,20 @@ pub const PersistentIndex = struct {
                         };
                         break :blk index_mod.SegmentData.fromNative(source);
                     }
-                    if (store.storage.vtable.map_immutable_artifact != null) {
-                        const artifact = store.storage.mapImmutableArtifact(alloc, segment_path) catch |err| switch (err) {
+                    if (store.storage.vtable.map_fresh_immutable_artifact != null or store.storage.vtable.map_immutable_artifact != null) {
+                        // The active ID has no content fingerprint to
+                        // distinguish an old, valid inode from its replacement.
+                        const artifact = (if (store.storage.vtable.map_fresh_immutable_artifact != null)
+                            store.storage.mapFreshImmutableArtifact(alloc, segment_path)
+                        else
+                            store.storage.mapImmutableArtifact(alloc, segment_path)) catch |err| switch (err) {
                             error.FileNotFound => {
                                 try stale_active_ids.append(alloc, seg_id);
                                 continue;
                             },
                             // Read-only filesystems still support the existing
                             // heap-backed reader when no private view is possible.
-                            error.MappedArtifactUnavailable => null,
+                            error.MappedArtifactUnavailable, error.MappedArtifactUnsupported => null,
                             else => return err,
                         };
                         if (artifact) |view| break :blk index_mod.SegmentData.fromMappedArtifact(view);
@@ -1593,18 +1598,14 @@ pub const PersistentIndex = struct {
                     try stale_active_ids.append(alloc, seg_id);
                     continue;
                 };
-                segment_data.?.madviseAccessPattern();
-                errdefer if (segment_data) |*data| data.deinit(alloc);
-                writer.addSegmentWithIdData(seg_id, segment_data.?) catch |err| {
+                segment_data.madviseAccessPattern();
+                writer.addSegmentWithIdData(seg_id, segment_data) catch |err| {
                     if (isStaleActiveSegmentDataError(err)) {
-                        segment_data.?.deinit(alloc);
-                        segment_data = null;
                         try stale_active_ids.append(alloc, seg_id);
                         continue;
                     }
                     return err;
                 };
-                segment_data = null;
 
                 const deletion_bytes = read_txn.get(.deletions, &seg_key) catch |err| switch (err) {
                     error.NotFound => null,
@@ -4805,6 +4806,97 @@ test "persistent index open prunes stale active segment references" {
         defer alloc.free(active_ids);
         try std.testing.expectEqual(@as(usize, 0), active_ids.len);
     }
+}
+
+test "persistent index writable open maps the current active segment pathname" {
+    if (builtin.os.tag != .linux and (builtin.os.tag != .macos or !builtin.link_libc)) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    const bytes = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    defer alloc.free(bytes);
+    {
+        var index = try PersistentIndex.open(alloc, .{ .path = path });
+        defer index.close();
+        try index.indexSegment(bytes);
+        try index.syncMain(true);
+    }
+
+    var reader_storage = try storage_io.NativeStorage.init(alloc, .threaded);
+    defer reader_storage.deinit();
+    var publisher_storage = try storage_io.NativeStorage.init(alloc, .threaded);
+    defer publisher_storage.deinit();
+    const segment_path = try std.fmt.allocPrint(alloc, "{s}/segments/1.seg", .{path});
+    defer alloc.free(segment_path);
+    const replacement_path = try std.fmt.allocPrint(alloc, "{s}.replacement", .{segment_path});
+    defer alloc.free(replacement_path);
+
+    const publisher = publisher_storage.storage();
+    try publisher.renameAbsolute(segment_path, replacement_path);
+    try publisher.writeFileAbsolute(segment_path, "stale");
+    const reader = reader_storage.storage();
+    _ = try reader.fileSize(segment_path);
+    try publisher.renameAbsolute(replacement_path, segment_path);
+    {
+        var stale = try reader.mapImmutableArtifact(alloc, segment_path);
+        defer stale.deinit();
+        try std.testing.expectEqualStrings("stale", stale.bytes);
+    }
+
+    var index = try PersistentIndex.open(alloc, .{ .path = path, .main_lsm_storage = reader });
+    defer index.close();
+    try std.testing.expectEqual(@as(usize, 1), index.snapshot().segments.len);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(alloc, index.snapshot(), "alpha"));
+    var txn = try index.beginReadMainTxn();
+    defer txn.abort();
+    const ids = try index.loadActiveSegmentIds(&txn, alloc);
+    defer alloc.free(ids);
+    try std.testing.expectEqualSlices(u64, &.{1}, ids);
+}
+
+test "persistent index open releases a rejected segment mapping exactly once" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const Fault = struct {
+        var closes: usize = 0;
+
+        fn map(_: *anyopaque, _: Allocator, path: []const u8) !@import("../segment_source.zig").MappedArtifact {
+            return .{ .bytes = try mapSegmentFile(path), .context = &closes, .release = close };
+        }
+
+        fn close(raw: *anyopaque) void {
+            const count: *usize = @ptrCast(@alignCast(raw));
+            count.* += 1;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    {
+        var index = try PersistentIndex.open(alloc, .{ .path = path });
+        defer index.close();
+        const bytes = try buildSimpleSegment(alloc, "doc:a", "alpha");
+        defer alloc.free(bytes);
+        try index.indexSegment(bytes);
+        try index.syncMain(true);
+    }
+
+    var native = try storage_io.NativeStorage.init(alloc, .threaded);
+    defer native.deinit();
+    var storage = native.storage();
+    const segment_path = try std.fmt.allocPrint(alloc, "{s}/segments/1.seg", .{path});
+    defer alloc.free(segment_path);
+    try storage.writeFileAbsolute(segment_path, "corrupt segment");
+    var vtable = storage.vtable.*;
+    vtable.map_fresh_immutable_artifact = Fault.map;
+    storage.vtable = &vtable;
+    Fault.closes = 0;
+    var index = try PersistentIndex.open(alloc, .{ .path = path, .main_lsm_storage = storage, .read_only = true });
+    defer index.close();
+    try std.testing.expectEqual(@as(usize, 0), index.snapshot().segments.len);
+    try std.testing.expectEqual(@as(usize, 1), Fault.closes);
 }
 
 test "persistent index open keeps recovered segment ownership on later catalog error" {
