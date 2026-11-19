@@ -5913,6 +5913,7 @@ test "metadata routing server converts relative budget to local deadline" {
     try std.testing.expect(parsed_change.value.changed);
     try std.testing.expectEqual(@as(u64, 9), parsed_change.value.token.revision);
 
+    source.observed_deadline_ns = null;
     var route_request = try httpx.Request.init(
         std.testing.allocator,
         .POST,
