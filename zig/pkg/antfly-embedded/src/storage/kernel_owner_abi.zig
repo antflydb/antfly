@@ -491,6 +491,7 @@ pub const MetadataProjectionKind = enum(u32) {
     lake_source_owner = 75,
     /// Nonwaiting observation/reconciliation of the shared durable HA outbox.
     poll_ha_outbox = 76,
+    catalog_table_projection = 77,
     /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
     secret_collection = 42,
 };
@@ -1594,6 +1595,7 @@ pub extern fn antfly_storage_owner_restore_control_json(
 /// of JSON: process-local callbacks and absolute monotonic deadlines must not
 /// be lost or reconstructed as a fresh timeout at a compiled boundary.
 pub const QueryOperationRequest = query_abi.QueryOperationRequest;
+pub const query_request_version = query_abi.query_request_version;
 
 pub const ArtifactOperation = enum(u32) {
     corrupt_embedding = 0,

@@ -431,13 +431,24 @@ def query(session, url, vector):
         raise RuntimeError(f"self-query did not recover first document: {hits}")
 
 
-def wait_visible(session, url, count, *, check_health, failure_event):
-    deadline = time.monotonic() + 300
+def wait_visible(
+    session,
+    url,
+    count,
+    *,
+    check_health,
+    failure_event,
+    index_name="vec",
+    require_query_visible_count=True,
+    deadline=None,
+):
+    if deadline is None:
+        deadline = time.monotonic() + 300
     while True:
         check_health()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise RuntimeError(f"index visibility did not reach {count}")
+            raise RuntimeError(f"{index_name} index visibility did not reach {count}")
         # Status reads are small and read-only. Bound each request separately
         # from the overall visibility deadline so health failures surface soon.
         try:
@@ -445,7 +456,7 @@ def wait_visible(session, url, count, *, check_health, failure_event):
                 session,
                 url,
                 "GET",
-                "/tables/documents/indexes/vec",
+                f"/tables/documents/indexes/{index_name}",
                 timeout=min(5, remaining),
             ).get("status", {})
         except (requests.Timeout, requests.ConnectionError) as exc:
@@ -462,14 +473,18 @@ def wait_visible(session, url, count, *, check_health, failure_event):
             failure_event.wait(min(0.25, max(0, deadline - time.monotonic())))
             continue
         check_health()
-        if (
-            state.get("total_indexed") == count
-            and state.get("query_visible_doc_count") == count
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"{index_name} index visibility did not reach {count}: {state}"
+            )
+        if state.get("total_indexed") == count and (
+            state.get("query_visible_doc_count") == count
+            if require_query_visible_count
+            else state.get("readiness", {}).get("complete") is True
         ):
             return state
-        if time.monotonic() >= deadline:
-            raise RuntimeError(f"index visibility did not reach {count}: {state}")
-        failure_event.wait(min(0.25, max(0, deadline - time.monotonic())))
+        failure_event.wait(min(0.25, remaining))
 
 
 def write_server_wrapper(path, binary, limit):
