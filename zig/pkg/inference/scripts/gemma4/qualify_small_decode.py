@@ -24,7 +24,118 @@ from pathlib import Path
 
 import numpy as np
 from gguf import GGUFReader
-from qualify_gemma4_head import Cuda, identical, quantize
+
+
+class Cuda:
+    def __init__(self):
+        self.lib = c.CDLL("libcuda.so.1")
+        signatures = {
+            "cuInit": [c.c_uint],
+            "cuDeviceGet": [c.POINTER(c.c_int), c.c_int],
+            "cuCtxCreate_v2": [c.POINTER(c.c_void_p), c.c_uint, c.c_int],
+            "cuCtxDestroy_v2": [c.c_void_p],
+            "cuCtxSynchronize": [],
+            "cuMemAlloc_v2": [c.POINTER(c.c_uint64), c.c_size_t],
+            "cuMemFree_v2": [c.c_uint64],
+            "cuMemcpyHtoD_v2": [c.c_uint64, c.c_void_p, c.c_size_t],
+            "cuMemcpyDtoH_v2": [c.c_void_p, c.c_uint64, c.c_size_t],
+            "cuModuleLoadDataEx": [
+                c.POINTER(c.c_void_p),
+                c.c_void_p,
+                c.c_uint,
+                c.c_void_p,
+                c.c_void_p,
+            ],
+            "cuModuleGetFunction": [c.POINTER(c.c_void_p), c.c_void_p, c.c_char_p],
+            "cuLaunchKernel": [
+                c.c_void_p,
+                *([c.c_uint] * 7),
+                c.c_void_p,
+                c.POINTER(c.c_void_p),
+                c.c_void_p,
+            ],
+        }
+        for name, args in signatures.items():
+            fn = getattr(self.lib, name)
+            fn.argtypes = args
+            fn.restype = c.c_int
+        self.call("cuInit", 0)
+        device = c.c_int()
+        self.call("cuDeviceGet", c.byref(device), 0)
+        self.ctx = c.c_void_p()
+        self.call("cuCtxCreate_v2", c.byref(self.ctx), 0, device)
+        self.owned = []
+        self.modules = []
+
+    def call(self, name, *args):
+        code = getattr(self.lib, name)(*args)
+        if code:
+            raise RuntimeError(f"{name}: CUDA error {code}")
+
+    def array(self, values):
+        values = np.ascontiguousarray(values)
+        ptr = c.c_uint64()
+        self.call("cuMemAlloc_v2", c.byref(ptr), values.nbytes)
+        self.owned.append(ptr)
+        self.upload(ptr, values)
+        return ptr
+
+    def upload(self, ptr, values):
+        values = np.ascontiguousarray(values)
+        self.call("cuMemcpyHtoD_v2", ptr, c.c_void_p(values.ctypes.data), values.nbytes)
+
+    def read(self, ptr, count, dtype):
+        values = np.empty(count, dtype=dtype)
+        self.call("cuMemcpyDtoH_v2", c.c_void_p(values.ctypes.data), ptr, values.nbytes)
+        return values
+
+    def function(self, path, name):
+        module = c.c_void_p()
+        data = c.create_string_buffer(path.read_bytes())
+        self.call("cuModuleLoadDataEx", c.byref(module), data, 0, None, None)
+        self.modules.append(module)
+        fn = c.c_void_p()
+        self.call("cuModuleGetFunction", c.byref(fn), module, name.encode())
+        return fn
+
+    def launch(self, fn, args, blocks, threads):
+        params = (c.c_void_p * len(args))(
+            *[c.cast(c.byref(a), c.c_void_p) for a in args]
+        )
+        self.call(
+            "cuLaunchKernel", fn, blocks, 1, 1, threads, 1, 1, 0, None, params, None
+        )
+
+    def close(self):
+        for ptr in reversed(self.owned):
+            self.call("cuMemFree_v2", ptr)
+        self.call("cuCtxDestroy_v2", self.ctx)
+
+
+def quantize(values):
+    # Preparation is identical for both CUDA arms; this is not a test of the
+    # production quantizer. Scale/sum are FP16, followed by 32 signed bytes.
+    blocks = values.reshape(-1, 32)
+    maximum = np.max(abs(blocks), axis=1)
+    scale = maximum / 127
+    inverse = np.divide(127, maximum, out=np.zeros_like(maximum), where=maximum != 0)
+    integers = np.rint(blocks * inverse[:, None]).astype(np.int8)
+    result = np.zeros((len(blocks), 36), np.uint8)
+    result[:, :2] = (
+        np.ascontiguousarray(scale.astype("<f2")).view(np.uint8).reshape(-1, 2)
+    )
+    result[:, 2:4] = (
+        np.ascontiguousarray((scale * integers.sum(axis=1)).astype("<f2"))
+        .view(np.uint8)
+        .reshape(-1, 2)
+    )
+    result[:, 4:] = integers.view(np.uint8)
+    return result
+
+
+def identical(actual, expected, context):
+    if not np.array_equal(actual.view(np.uint32), expected.view(np.uint32)):
+        raise ValueError("Bitwise mismatch: " + context)
 
 
 def digest(path):

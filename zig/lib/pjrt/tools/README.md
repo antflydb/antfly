@@ -44,11 +44,6 @@ architecture was measured.
 The exporters can run on CPU; they trace parameterized shapes rather than
 embedding model weights or input token values in the graph:
 
-The text-only `prepare_gemma4.py` command below produces version 1 artifacts for
-`model-runner`. For text, image, audio and video with version 2 artifacts, use
-`prepare_gemma4_multimodal.py` and `gemma4-runner` as described in
-[the multimodal Gemma 4 guide](GEMMA4.md). The manifest formats and workers differ.
-
 ```sh
 JAX_PLATFORMS=cpu JAX_ENABLE_X64=1 python zig/lib/pjrt/tools/prepare_gemma4.py \
   --config zig/lib/pjrt/tools/gemma4_config.json \
