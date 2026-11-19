@@ -660,6 +660,35 @@ pub const Store = struct {
         );
     }
 
+    /// Both the manifest and the requested scope hashes are sorted.
+    pub fn hasArtifactScopes(self: *const Store, scope_hashes: []const u64) bool {
+        const manifest = self.manifest orelse return false;
+        var requested: usize = 0;
+        for (manifest.coverages) |coverage| {
+            if (requested == scope_hashes.len) return true;
+            if (coverage.scope_hash == scope_hashes[requested]) requested += 1;
+        }
+        return requested == scope_hashes.len;
+    }
+
+    pub fn artifactScopesMatch(self: *const Store, other: *const Store) bool {
+        const ours = self.manifest orelse return false;
+        const theirs = other.manifest orelse return false;
+        if (ours.coverages.len != theirs.coverages.len) return false;
+        for (ours.coverages, theirs.coverages) |left, right| {
+            if (!std.meta.eql(left, right)) return false;
+        }
+        return true;
+    }
+
+    /// Resolve an already-visible control file before installing a recovered view.
+    pub fn fenceCurrent(self: *const Store) !void {
+        const path = try self.currentPathAlloc();
+        defer self.alloc.free(path);
+        try self.storage.syncFileContentsAbsolute(path);
+        try self.storage.syncParentAbsolute(path);
+    }
+
     /// Adds logical artifact scopes to an already-authoritative generation.
     /// Scope declaration is a checksummed CURRENT-only transaction: immutable
     /// blocks and the committed WAL prefix do not change, so existing query

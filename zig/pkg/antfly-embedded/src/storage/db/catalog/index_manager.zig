@@ -4341,16 +4341,20 @@ pub const IndexManager = struct {
             );
             var opened_owned = true;
             defer if (opened_owned) opened.deinit();
-            if (opened.store.covered_source_sequence != snapshot_sequence) return false;
-            // Scope declaration changes only CURRENT. The blocks and fenced
-            // WAL already held by this view remain valid for the new scopes.
-            const generation = try self.createVectorBlockGeneration(opened);
-            opened_owned = false;
-            var generation_owned = true;
-            defer if (generation_owned) generation.release();
-            if (try generation.opened.store.declareArtifactScopes(scope_hashes)) {
+            if (!openedVectorBlockGenerationExactAtSequence(&opened, snapshot_sequence)) return false;
+            const needs_declaration = !opened.store.hasArtifactScopes(scope_hashes);
+            if (needs_declaration or !opened.store.artifactScopesMatch(&current.opened.store)) {
+                // A failed control publication can leave the new scopes
+                // visible on disk while the old generation still serves.
+                if (!needs_declaration) try opened.store.fenceCurrent();
+
+                // Prepare the serving view before changing CURRENT. A scope
+                // declaration preserves the blocks and fenced WAL it owns.
+                const generation = try self.createVectorBlockGeneration(opened);
+                opened_owned = false;
+                errdefer generation.release();
+                if (needs_declaration) _ = try generation.opened.store.declareArtifactScopes(scope_hashes);
                 self.installVectorBlockGeneration(generation);
-                generation_owned = false;
             }
             self.vector_block_projection_dirty.store(false, .release);
             return true;
@@ -39328,6 +39332,37 @@ test "fresh native dense backfill extends a shared vector generation without a s
     const second_scope = IndexManager.denseVectorArtifactScopeHashAt(manager.denseIndex(second.name).?, 0);
     try std.testing.expectEqual(@as(u64, 0), generation.opened.baseOnlyCoverage(first_scope).?.vector_count);
     try std.testing.expectEqual(@as(u64, 1), generation.opened.baseOnlyCoverage(second_scope).?.vector_count);
+
+    const entry = manager.denseIndex(second.name).?;
+    const sequence = generation.opened.store.covered_source_sequence;
+    try std.testing.expect(try manager.tryPrepareFreshDenseVectorCaptureBase(entry, sequence));
+    {
+        const unchanged = manager.acquireVectorBlockGeneration().?;
+        defer unchanged.release();
+        try std.testing.expectEqual(generation, unchanged);
+    }
+
+    // Simulate a scope publication whose CURRENT rename became visible
+    // before the caller received a durable acknowledgement.
+    const control = @import("../../generation_publication.zig");
+    const extra_scope = std.math.maxInt(u64);
+    const root = try manager.vectorBlockRootAlloc();
+    defer alloc.free(root);
+    {
+        var writer = try vector_block_store_mod.Store.open(alloc, manager.vector_block_storage.?, root);
+        defer writer.deinit();
+        @import("antfly_test_error_logs").expectErrorLogs(1);
+        control.injectPostPublishFailuresForTest(2);
+        defer control.injectPostPublishFailuresForTest(0);
+        try std.testing.expectError(error.GenerationPublicationDurabilityUncertain, writer.declareArtifactScopes(&.{extra_scope}));
+    }
+
+    try std.testing.expect(!generation.opened.store.hasArtifactScopes(&.{extra_scope}));
+    try std.testing.expect(try manager.tryPrepareFreshDenseVectorCaptureBase(entry, sequence));
+    const recovered = manager.acquireVectorBlockGeneration().?;
+    defer recovered.release();
+    try std.testing.expect(recovered.opened.store.hasArtifactScopes(&.{extra_scope}));
+    try std.testing.expect(!generation.opened.store.hasArtifactScopes(&.{extra_scope}));
 }
 
 test "standalone dense native migration still requires an explicit physical generation" {
