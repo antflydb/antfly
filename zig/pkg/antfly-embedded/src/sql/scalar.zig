@@ -26,6 +26,12 @@ const Allocator = std.mem.Allocator;
 const Json = std.json.Value;
 pub const postgres_compat_version = "16.0";
 const postgres_version_banner = "PostgreSQL " ++ postgres_compat_version ++ " compatibility (Antfly)";
+fn scopeField(name: []const u8) ?enum { database, principal } {
+    if (std.mem.eql(u8, name, "$current_user")) return .principal;
+    if (std.mem.eql(u8, name, "current_database") or std.mem.eql(u8, name, "$current_catalog")) return .database;
+    return null;
+}
+
 pub const PatternSet = struct {
     ptr: *anyopaque,
     count: usize,
@@ -2752,9 +2758,9 @@ const Binder = struct {
                     for (call.args) |arg| _ = try self.infer(arg, depth + 1);
                     break :blk .{ .kind = .integer, .nullable = false };
                 }
-                if (std.mem.eql(u8, call.name, "version")) {
+                if (std.mem.eql(u8, call.name, "version") or scopeField(call.name) != null) {
                     if (call.args.len != 0) return error.SqlUndefinedFunction;
-                    break :blk .{ .kind = .string, .nullable = false };
+                    break :blk .{ .kind = .string, .element_type = .text, .nullable = false };
                 }
                 const function = try functionId(call.name);
                 try validateFunctionArity(function, call.args.len);
@@ -3218,6 +3224,15 @@ const Binder = struct {
                 }
                 if (std.mem.eql(u8, call.name, "version"))
                     break :blk .{ .literal = .{ .string = postgres_version_banner } };
+                if (scopeField(call.name)) |field| {
+                    if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };
+                    const view = self.settings orelse return error.SettingCatalogUnavailable;
+                    const value = switch (field) {
+                        .database => view.scope.database,
+                        .principal => view.scope.principal,
+                    };
+                    break :blk .{ .literal = .{ .string = try self.alloc.dupe(u8, value) } };
+                }
                 const function = try functionId(call.name);
                 if (function == .current_setting) {
                     if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };

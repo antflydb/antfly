@@ -466,6 +466,7 @@ pub const Session = struct {
                 .formatting => |value| if (value.action == .show) try alloc.dupe(backend.Column, &.{.{ .name = value.kind.name(), .type = .string }}) else &.{},
                 .client_encoding => |value| if (value == .show) &.{.{ .name = "client_encoding", .type = .string }} else &.{},
                 .catalog => |value| if (value == .show) &.{.{ .name = value.show, .type = .string }} else &.{},
+                .wal_level => &.{.{ .name = "wal_level", .type = .string }},
                 .transaction_snapshot, .transaction_options => &.{},
                 .reset_all => &.{},
                 .discard_all => &.{},
@@ -556,6 +557,7 @@ pub const Session = struct {
                 .formatting => |value| self.executeFormattingSetting(alloc, value),
                 .client_encoding => |value| self.executeEncodingSetting(alloc, value),
                 .catalog => |value| self.executeCatalogSetting(alloc, statement, value),
+                .wal_level => self.showWalLevel(alloc),
                 .transaction_snapshot => |name| self.importSnapshot(alloc, statement, name),
                 .transaction_options => |options| self.setTransactionOptions(statement, options),
                 .reset_all => self.executeResetAll(),
@@ -667,6 +669,19 @@ pub const Session = struct {
         };
         if (self.status == .idle) self.finishSqlCursors(std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT"));
         return result;
+    }
+
+    fn showWalLevel(self: *Session, alloc: std.mem.Allocator) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        const level = if (self.source.vtable.open_replication_session != null) "logical" else "minimal";
+        const row = try alloc.dupe(std.json.Value, &.{.{ .string = level }});
+        return .{
+            .columns = &.{.{ .name = "wal_level", .type = .string }},
+            .rows = try alloc.dupe([]const std.json.Value, &.{row}),
+            .command_tag = "SHOW",
+            .transaction_status = self.status,
+            .session_id = self.session_id,
+        };
     }
 
     fn setTransactionOptions(self: *Session, statement: []const u8, options: backend.TransactionOptions) !backend.Result {

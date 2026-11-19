@@ -2139,6 +2139,31 @@ test "SQL version advertises PostgreSQL compatibility and the actual engine" {
     try std.testing.expectEqualStrings("PostgreSQL " ++ @import("scalar.zig").postgres_compat_version ++ " compatibility (Antfly)", result.output.rows[0][0].string);
 }
 
+test "SQL catalog identity uses the authorized statement scope" {
+    const settings = @import("setting_catalog.zig");
+    const Owner = struct {
+        fn load(_: *anyopaque, _: std.mem.Allocator, scope: settings.Scope) !settings.RawSnapshot {
+            return .{ .scope = scope, .epoch = 1, .definitions = &.{} };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var fixture: TestBackend = .{};
+    var backend = fixture.iface();
+    backend.setting_capture = .{ .owner = .{ .ptr = &fixture, .load = Owner.load }, .scope = .{ .database = "analytics", .principal = "replicator" } };
+    var compiled = try compiler.compile(alloc, "SELECT current_user, current_database(), current_catalog", .{});
+    defer compiled.deinit();
+    try std.testing.expect(compiled.uses_current_setting);
+    var result = try execute(alloc, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("current_user", result.output.columns[0].name);
+    try std.testing.expectEqualStrings("current_database", result.output.columns[1].name);
+    try std.testing.expectEqualStrings("current_catalog", result.output.columns[2].name);
+    const cells = result.output.rows[0];
+    try std.testing.expectEqualStrings("replicator", cells[0].string);
+    try std.testing.expectEqualStrings("analytics", cells[1].string);
+    try std.testing.expectEqualStrings("analytics", cells[2].string);
+}
+
 test "SQL NUMERIC insert literals preserve decimals at the mutation boundary" {
     const Fixture = struct {
         fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {

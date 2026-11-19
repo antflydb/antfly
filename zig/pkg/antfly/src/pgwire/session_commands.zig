@@ -94,6 +94,7 @@ pub const Setting = union(enum) {
     application_name: ApplicationNameSetting,
     client_encoding: EncodingSetting,
     catalog: CatalogSetting,
+    wal_level,
     transaction_snapshot: []const u8,
     transaction_options: @import("backend.zig").TransactionOptions,
     reset_all,
@@ -157,6 +158,13 @@ pub fn settingCommand(alloc: std.mem.Allocator, input: []const u8) !?Setting {
     if (try applicationNameSetting(alloc, input)) |value| return .{ .application_name = value };
     if (try encodingSetting(alloc, input)) |value| return .{ .client_encoding = value };
     var p: Parser = .{ .alloc = alloc, .input = input };
+    if (std.ascii.eqlIgnoreCase(p.word() catch return null, "show")) {
+        if (std.ascii.eqlIgnoreCase(p.word() catch return null, "wal_level")) {
+            try p.finish();
+            return .wal_level;
+        }
+    }
+    p.pos = 0;
     if (std.ascii.eqlIgnoreCase(p.word() catch return null, "reset")) {
         if (std.ascii.eqlIgnoreCase(p.word() catch return null, "all")) {
             try p.finish();

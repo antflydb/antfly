@@ -128,6 +128,26 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
         },
     )
     try:
+        discovery = subprocess.check_output(
+            [
+                psql,
+                *connection,
+                "-XAt",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                "SHOW wal_level",
+                "-c",
+                "SELECT version(), current_user, current_database(), current_catalog",
+            ],
+            env=env,
+            text=True,
+            timeout=40,
+        ).splitlines()
+        assert discovery == [
+            "logical",
+            "PostgreSQL 16.0 compatibility (Antfly)|admin|default|default",
+        ]
         sql("CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT)")
         if export_snapshot:
             sql("ALTER TABLE smoke REPLICA IDENTITY FULL")

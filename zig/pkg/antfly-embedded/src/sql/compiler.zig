@@ -50,6 +50,7 @@ pub const Compiled = struct {
     arena: std.heap.ArenaAllocator,
     statement: ast.Statement,
     parameter_count: u32,
+    /// The statement binds settings or identity from the authorized SQL scope.
     uses_current_setting: bool = false,
 
     pub fn deinit(self: *Compiled) void {
@@ -539,7 +540,7 @@ const Parser = struct {
             const name_value = try self.alloc.dupe(u8, function.text);
             if (!function.owned) _ = std.ascii.lowerString(name_value, name_value);
             if (std.mem.startsWith(u8, name_value, "$")) return self.fail(error.UnsupportedSqlShape, "compiler-owned helper functions cannot be called from SQL");
-            if (std.mem.eql(u8, name_value, "current_setting")) self.uses_current_setting = true;
+            if (std.mem.eql(u8, name_value, "current_setting") or std.mem.eql(u8, name_value, "current_database")) self.uses_current_setting = true;
             var args: std.ArrayList(*const ast.Scalar) = .empty;
             const distinct = self.keyword(.distinct);
             const star = self.take(.star);
@@ -604,6 +605,12 @@ const Parser = struct {
             if (row and (distinct or star or filter != null or window_spec != null or within_group != null)) return self.fail(error.InvalidSqlSyntax, "ROW constructor does not accept aggregate modifiers");
             if (row and args.items.len > 256) return self.fail(error.SqlLimitExceeded, "row expression exceeds column limit");
             left = try self.scalarNode(.{ .call = .{ .name = if (row) "$row" else name_value, .args = try args.toOwnedSlice(self.alloc), .star = star, .distinct = distinct, .filter = filter, .window = window_spec, .within_group = within_group } });
+        } else if (self.ddlWord("current_user")) {
+            self.uses_current_setting = true;
+            left = try self.scalarNode(.{ .call = .{ .name = "$current_user", .args = &.{} } });
+        } else if (self.ddlWord("current_catalog")) {
+            self.uses_current_setting = true;
+            left = try self.scalarNode(.{ .call = .{ .name = "$current_catalog", .args = &.{} } });
         } else if (self.peek(.identifier) and !self.tokens[self.pos].isKeyword(.null) and !self.tokens[self.pos].isKeyword(.true) and !self.tokens[self.pos].isKeyword(.false)) {
             left = try self.scalarNode(.{ .column = try self.field() });
         } else left = try self.scalarNode(.{ .literal = try self.value() });
@@ -1734,7 +1741,11 @@ const Parser = struct {
         // Keep the original PostgreSQL function/CASE label before lowering
         // replaces expressions with internal columns or aggregate slots.
         const label = alias orelse switch (expression.*) {
-            .call => |call| if (std.mem.eql(u8, call.name, "$regex_operator")) "?column?" else if (std.mem.startsWith(u8, call.name, "$")) null else call.name,
+            .call => |call| blk: {
+                if (std.mem.eql(u8, call.name, "$regex_operator")) break :blk "?column?";
+                if (std.mem.eql(u8, call.name, "$current_user") or std.mem.eql(u8, call.name, "$current_catalog")) break :blk call.name[1..];
+                break :blk if (std.mem.startsWith(u8, call.name, "$")) null else call.name;
+            },
             .case_when => "case",
             else => null,
         };
