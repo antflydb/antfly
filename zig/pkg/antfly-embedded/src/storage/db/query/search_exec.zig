@@ -2330,15 +2330,7 @@ fn deriveNativeDocIdConstraintsAlloc(
             };
             try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, &filter, active_executor);
         } else {
-            if (out.positive_filter) {
-                const intersected = try intersectDocIdsAlloc(alloc, out.filter_doc_ids, req.filter_doc_ids);
-                if (out.filter_doc_ids_owned) freeDocIdSlice(alloc, out.filter_doc_ids);
-                out.filter_doc_ids = intersected;
-                out.filter_doc_ids_owned = true;
-            } else {
-                out.filter_doc_ids = req.filter_doc_ids;
-            }
-            out.positive_filter = true;
+            try mergeNativePositiveKeys(alloc, &out, req.filter_doc_ids, false);
         }
         out.resolved_stored_filters = true;
     }
@@ -2433,16 +2425,7 @@ fn deriveNativeDocIdConstraintsAlloc(
             try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, &filter, application);
             out.filter_query_json_resolved = true;
         } else if (try collectStructuredFilterDocIdsAlloc(alloc, req, active_executor, req.filter_query_json)) |doc_ids| {
-            if (out.positive_filter) {
-                const intersected = try intersectDocIdsAlloc(alloc, out.filter_doc_ids, doc_ids);
-                if (out.filter_doc_ids_owned) freeDocIdSlice(alloc, out.filter_doc_ids);
-                freeDocIdSlice(alloc, doc_ids);
-                out.filter_doc_ids = intersected;
-            } else {
-                out.filter_doc_ids = doc_ids;
-            }
-            out.filter_doc_ids_owned = true;
-            out.positive_filter = true;
+            try mergeNativePositiveKeys(alloc, &out, doc_ids, true);
             out.resolved_stored_filters = true;
             out.filter_query_json_resolved = true;
         } else {
@@ -2458,16 +2441,7 @@ fn deriveNativeDocIdConstraintsAlloc(
                 if (!exact) doc_ids.clearRetainingCapacity();
                 if (exact or try collectPositiveDocIdSuperset(arena_alloc, compiled, &doc_ids)) {
                     const owned_doc_ids = try dupeDocIdSliceAlloc(alloc, doc_ids.items);
-                    if (out.positive_filter) {
-                        const intersected = try intersectDocIdsAlloc(alloc, out.filter_doc_ids, owned_doc_ids);
-                        if (out.filter_doc_ids_owned) freeDocIdSlice(alloc, out.filter_doc_ids);
-                        freeDocIdSlice(alloc, owned_doc_ids);
-                        out.filter_doc_ids = intersected;
-                    } else {
-                        out.filter_doc_ids = owned_doc_ids;
-                    }
-                    out.filter_doc_ids_owned = true;
-                    out.positive_filter = true;
+                    try mergeNativePositiveKeys(alloc, &out, owned_doc_ids, true);
                     if (exact) {
                         out.filter_query_json_resolved = true;
                         out.resolved_stored_filters = true;
@@ -2645,16 +2619,7 @@ fn applyResolvedTextDocNumFilterAlloc(
         .all => {},
         .doc_nums => |doc_nums| {
             const owned = try alloc.dupe(u32, doc_nums);
-            if (out.positive_filter and out.filter_doc_nums.len > 0) {
-                const intersected = try intersectDocNumsAlloc(alloc, out.filter_doc_nums, owned);
-                if (out.filter_doc_nums_owned and out.filter_doc_nums.len > 0) alloc.free(@constCast(out.filter_doc_nums));
-                alloc.free(owned);
-                out.filter_doc_nums = intersected;
-            } else {
-                out.filter_doc_nums = owned;
-            }
-            out.filter_doc_nums_owned = true;
-            out.positive_filter = true;
+            try mergeNativePositiveNumbers(alloc, out, owned);
             out.resolved_stored_filters = true;
         },
     }
@@ -2703,32 +2668,14 @@ fn applyResolvedDocFilterAlloc(
     var include_represented = include_set.* == .all;
     if (executor.project_ordinals_to_doc_ids or resolvedSetHasDocKeys(include_set)) {
         if (try docIdsForResolvedDocSetAlloc(alloc, include_set, executor)) |ids| {
-            if (out.positive_filter) {
-                const intersected = try intersectDocIdsAlloc(alloc, out.filter_doc_ids, ids);
-                if (out.filter_doc_ids_owned) freeDocIdSlice(alloc, out.filter_doc_ids);
-                freeDocIdSlice(alloc, ids);
-                out.filter_doc_ids = intersected;
-            } else {
-                out.filter_doc_ids = ids;
-            }
-            out.filter_doc_ids_owned = true;
-            out.positive_filter = true;
+            try mergeNativePositiveKeys(alloc, out, ids, true);
             out.resolved_stored_filters = true;
             include_represented = true;
         }
     }
     if (!executor.project_ordinals_to_doc_ids) {
         if (try docNumsForResolvedDocSetWithExecutorAlloc(alloc, include_set, executor)) |doc_nums| {
-            if (out.positive_filter and out.filter_doc_nums.len > 0) {
-                const intersected = try intersectDocNumsAlloc(alloc, out.filter_doc_nums, doc_nums);
-                if (out.filter_doc_nums_owned and out.filter_doc_nums.len > 0) alloc.free(@constCast(out.filter_doc_nums));
-                alloc.free(doc_nums);
-                out.filter_doc_nums = intersected;
-            } else {
-                out.filter_doc_nums = doc_nums;
-            }
-            out.filter_doc_nums_owned = true;
-            out.positive_filter = true;
+            try mergeNativePositiveNumbers(alloc, out, doc_nums);
             out.resolved_stored_filters = true;
             include_represented = true;
         }
@@ -2869,6 +2816,69 @@ fn applyResolvedDocFilterToNativeConstraintsAlloc(
     return try applyResolvedDocFilterAlloc(alloc, out, filter, executor);
 }
 
+// A positive constraint with neither representation is the canonical empty
+// set. Populated representations are independent conjuncts.
+fn mergeNativePositiveKeys(alloc: Allocator, out: *NativeDocIdConstraints, keys: []const []const u8, owned: bool) !void {
+    if (keys.len == 0 or (out.positive_filter and out.filter_doc_ids.len == 0 and out.filter_doc_nums.len == 0)) {
+        if (owned) freeDocIdSlice(alloc, keys);
+        markNativeDocIdConstraintsEmpty(out, alloc);
+        return;
+    }
+    if (out.filter_doc_ids.len != 0) {
+        defer if (owned) freeDocIdSlice(alloc, keys);
+        const intersection = try intersectDocIdsAlloc(alloc, out.filter_doc_ids, keys);
+        if (intersection.len == 0) {
+            freeDocIdSlice(alloc, intersection);
+            markNativeDocIdConstraintsEmpty(out, alloc);
+            return;
+        }
+        if (out.filter_doc_ids_owned) freeDocIdSlice(alloc, out.filter_doc_ids);
+        out.filter_doc_ids = intersection;
+        out.filter_doc_ids_owned = true;
+    } else {
+        out.filter_doc_ids = keys;
+        out.filter_doc_ids_owned = owned;
+    }
+    out.positive_filter = true;
+}
+
+fn mergeNativePositiveNumbers(alloc: Allocator, out: *NativeDocIdConstraints, numbers: []const u32) !void {
+    if (numbers.len == 0 or (out.positive_filter and out.filter_doc_ids.len == 0 and out.filter_doc_nums.len == 0)) {
+        alloc.free(numbers);
+        markNativeDocIdConstraintsEmpty(out, alloc);
+        return;
+    }
+    if (out.filter_doc_nums.len != 0) {
+        defer alloc.free(numbers);
+        const intersection = try intersectDocNumsAlloc(alloc, out.filter_doc_nums, numbers);
+        if (intersection.len == 0) {
+            alloc.free(intersection);
+            markNativeDocIdConstraintsEmpty(out, alloc);
+            return;
+        }
+        if (out.filter_doc_nums_owned) alloc.free(out.filter_doc_nums);
+        out.filter_doc_nums = intersection;
+    } else out.filter_doc_nums = numbers;
+    out.filter_doc_nums_owned = true;
+    out.positive_filter = true;
+}
+
+test "optional numeric range intersects native constraints across identity representations" {
+    const alloc = std.testing.allocator;
+    var constraints = NativeDocIdConstraints{};
+    defer constraints.deinit(alloc);
+    try mergeNativePositiveNumbers(alloc, &constraints, try alloc.dupe(u32, &.{ 3, 5 }));
+    try mergeNativePositiveKeys(alloc, &constraints, &.{ "b", "c" }, false);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 5 }, constraints.filter_doc_nums);
+    try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_ids.len);
+
+    try mergeNativePositiveKeys(alloc, &constraints, &.{"different"}, false);
+    try mergeNativePositiveNumbers(alloc, &constraints, try alloc.dupe(u32, &.{3}));
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_nums.len);
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_ids.len);
+}
+
 fn markNativeDocIdConstraintsEmpty(out: *NativeDocIdConstraints, alloc: Allocator) void {
     if (out.filter_doc_ids_owned) freeDocIdSlice(alloc, out.filter_doc_ids);
     if (out.exclude_doc_ids_owned) freeDocIdSlice(alloc, out.exclude_doc_ids);
@@ -2914,16 +2924,7 @@ fn applyResolvedDocFilterToTextDocNumsAlloc(
     var include_represented = include_set.* == .all;
     if (can_project_ordinals) {
         if (try textDocNumsForResolvedDocSetAlloc(alloc, snapshot, include_set)) |doc_nums| {
-            if (out.positive_filter and out.filter_doc_nums.len > 0) {
-                const intersected = try intersectDocNumsAlloc(alloc, out.filter_doc_nums, doc_nums);
-                if (out.filter_doc_nums_owned and out.filter_doc_nums.len > 0) alloc.free(@constCast(out.filter_doc_nums));
-                alloc.free(doc_nums);
-                out.filter_doc_nums = intersected;
-            } else {
-                out.filter_doc_nums = doc_nums;
-            }
-            out.filter_doc_nums_owned = true;
-            out.positive_filter = true;
+            try mergeNativePositiveNumbers(alloc, out, doc_nums);
             out.resolved_stored_filters = true;
             include_represented = true;
         }
@@ -2931,16 +2932,7 @@ fn applyResolvedDocFilterToTextDocNumsAlloc(
 
     if (!include_represented) {
         if (try docIdsForResolvedDocSetAlloc(alloc, include_set, executor)) |ids| {
-            if (out.positive_filter) {
-                const intersected = try intersectDocIdsAlloc(alloc, out.filter_doc_ids, ids);
-                if (out.filter_doc_ids_owned) freeDocIdSlice(alloc, out.filter_doc_ids);
-                freeDocIdSlice(alloc, ids);
-                out.filter_doc_ids = intersected;
-            } else {
-                out.filter_doc_ids = ids;
-            }
-            out.filter_doc_ids_owned = true;
-            out.positive_filter = true;
+            try mergeNativePositiveKeys(alloc, out, ids, true);
             out.resolved_stored_filters = true;
             include_represented = true;
         }
@@ -9646,6 +9638,7 @@ const IndexedPredicateEvaluator = struct {
     missing_rows: ?*roaring.RoaringBitmap = null,
     key_domain: ?*const std.StringHashMapUnmanaged(u32) = null,
     skip_unmapped: bool = false,
+    verify_mixed_ranges_from_primary: bool = false,
     local_cache: ?LocalCache = null,
     probe_input: ?*FrontierProbeInput = null,
     applied_gates: ?*AppliedGates = null,
@@ -9796,6 +9789,7 @@ const IndexedPredicateEvaluator = struct {
     }
 
     fn indexed(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery) !bool {
+        if (self.verify_mixed_ranges_from_primary and structuredRangeLeaves(query).range) return false;
         return searchQueryCanUseSnapshotWithControl(self.snapshot, query, self.analysis, self.schema, false, self.control);
     }
 
@@ -9840,6 +9834,13 @@ const IndexedPredicateEvaluator = struct {
         defer flight.unlock();
         if (try cache.getScoped(self.alloc, key, self.control, scope)) |rows| return rows;
         var all = self.executeIndexed(query) catch |err| {
+            if (err == error.UnsupportedQueryRequest and scope != null and !self.skip_unmapped) {
+                var ordinal_only = self;
+                ordinal_only.skip_unmapped = true;
+                var matched = try ordinal_only.executeIndexed(query);
+                defer matched.deinit();
+                return self.copyMembership(&matched, scope);
+            }
             if (err == error.OutOfMemory) if (scope) |domain| {
                 if (try self.probeFrontier(query, domain)) |rows| return rows;
             };
@@ -10176,7 +10177,7 @@ const IndexedPredicateEvaluator = struct {
         if (requiresTextPosting(query) and try self.indexed(query)) return self.executeIndexedClause(query, scope, path);
         return switch (query) {
             .bool_query => |boolean| self.executeBoolean(boolean, scope, path),
-            .numeric_range => |range| self.executeStoredRange((range.stored_standard_range orelse return error.UnsupportedQueryRequest).*, scope),
+            .numeric_range => self.executeMixedRange(query, scope, path),
             else => error.UnsupportedQueryRequest,
         };
     }
@@ -10355,6 +10356,29 @@ const IndexedPredicateEvaluator = struct {
                 _ = counts.remove(doc);
             }
         }
+    }
+
+    /// A witness covers the rows represented by this snapshot. A primary
+    /// candidate missing from the snapshot still needs stored evaluation.
+    fn executeMixedRange(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap, path: []const u8) !roaring.RoaringBitmap {
+        const stored = (query.numeric_range.stored_standard_range orelse return error.UnsupportedQueryRequest).*;
+        if (!self.verify_mixed_ranges_from_primary or !try searchQueryCanUseSnapshotWithControl(self.snapshot, query, self.analysis, self.schema, false, self.control)) {
+            return self.executeStoredRange(stored, scope);
+        }
+
+        var covered = try self.executeIndexedClause(.{ .match_all = {} }, scope, "/range-coverage");
+        defer covered.deinit();
+        if (covered.cardinality() == 0) return self.executeStoredRange(stored, scope);
+        var typed_matches = try self.executeIndexedClause(query, &covered, path);
+        errdefer typed_matches.deinit();
+        if (covered.cardinality() == scope.cardinality()) return typed_matches;
+        var missing = try scope.cloneExact(self.alloc);
+        defer missing.deinit();
+        missing.andNotWith(&covered);
+        var residual = try self.executeStoredRange(stored, &missing);
+        defer residual.deinit();
+        try typed_matches.orWith(&residual);
+        return typed_matches;
     }
 
     fn executeStoredRange(self: IndexedPredicateEvaluator, range: std.json.Value, scope: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
@@ -10812,7 +10836,6 @@ fn structuredRangeLeaves(query: search_mod.SearchQuery) struct { range: bool, ot
             }
             return .{ .range = range, .other = other };
         },
-        .match_all, .match_none => return .{ .range = false, .other = false },
         else => return .{ .range = false, .other = true },
     }
 }
@@ -10836,7 +10859,9 @@ fn collectStructuredFilterResolvedDocSetAlloc(
         if (query) |search_query| {
             const finite = req.filter_doc_ids_positive or req.filter_doc_ids.len != 0 or
                 (if (resolvedDocFilterFromRequest(req)) |prior| prior.include != .all else false);
-            if (!finite) if (try collectSearchQueryResolvedDocSetAlloc(
+            const leaves = structuredRangeLeaves(search_query);
+            const mixed_range = leaves.range and (leaves.other or has_match);
+            if (!finite and !mixed_range) if (try collectSearchQueryResolvedDocSetAlloc(
                 alloc,
                 scratch,
                 executor,
@@ -10846,17 +10871,16 @@ fn collectStructuredFilterResolvedDocSetAlloc(
                 .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
                 null,
             )) |native| return native;
-            const leaves = structuredRangeLeaves(search_query);
             const analyzed_policy = leaves.range and req.authorization_filter_query_json.len != 0 and
                 try patternFilterContainsMatch(try graph_exec.parsePatternJsonLeaky(scratch, req.authorization_filter_query_json), 0);
-            const searchable_finite = finite and capable: {
+            const searchable_finite = finite and !mixed_range and capable: {
                 if (!leaves.range) break :capable true;
                 const snapshot = text_entry.persistent.acquireSnapshot();
                 defer snapshot.release();
                 break :capable try searchQueryCanUseSnapshotWithControl(snapshot, search_query, text_entry.text_analysis, text_entry.runtime_schema, false, .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns });
             };
             if (has_match or analyzed_policy or (leaves.range and (leaves.other or (!finite and executor.primary_residual_scope == null))) or searchable_finite) {
-                if (collectMixedStructuredFilterAlloc(alloc, scratch, req, executor, text_entry, search_query, filter_query_json, false)) |mixed| {
+                if (collectMixedStructuredFilterAlloc(alloc, scratch, req, executor, text_entry, search_query, filter_query_json, false, false)) |mixed| {
                     if (executor.structured_visibility_verified) |verified| verified.* = true;
                     return mixed;
                 } else |err| if (err != error.UnsupportedQueryRequest) return err;
@@ -10916,6 +10940,7 @@ fn collectMixedStructuredFilterAlloc(
     query: search_mod.SearchQuery,
     filter_json: []const u8,
     skip_unmapped: bool,
+    scope_already_visible: bool,
 ) anyerror!doc_set.ResolvedDocSet {
     if (executor.load_many_stored_values == null or executor.resolve_doc_set_doc_ids == null or executor.live_filter_doc_set == null or
         req.resolved_text_doc_filter != null or
@@ -10928,6 +10953,7 @@ fn collectMixedStructuredFilterAlloc(
         deletions.update(std.mem.asBytes(&revision));
     }
     const cache_prefix = try std.fmt.allocPrint(scratch, "{d}:{d}:{d}:{d}:{s}:{s}", .{ entry.instance_id, entry.projection_revision, executor.identity_read_generation orelse 0, deletions.final(), if (skip_unmapped) "ordinal" else "complete", filter_json });
+    const leaves = structuredRangeLeaves(query);
     var missing_rows = roaring.RoaringBitmap.init(alloc);
     defer missing_rows.deinit();
     const matcher = IndexedPredicateEvaluator{
@@ -10942,6 +10968,7 @@ fn collectMixedStructuredFilterAlloc(
         .cache_prefix = cache_prefix,
         .missing_rows = &missing_rows,
         .skip_unmapped = skip_unmapped,
+        .verify_mixed_ranges_from_primary = leaves.range and leaves.other,
     };
     const identity = ResidualIdentityContext{ .executor = executor, .alloc = alloc, .control = matcher.control };
     const original = if (std.mem.eql(u8, filter_json, req.filter_query_json))
@@ -11019,13 +11046,13 @@ fn collectMixedStructuredFilterAlloc(
                 primary.include = .{ .ordinal_bitmap = ordinals };
                 var ordinal_req = req;
                 ordinal_req.resolved_doc_filter = &primary;
-                var known = try collectMixedStructuredFilterAlloc(alloc, scratch, ordinal_req, executor, entry, query, filter_json, true);
+                var known = try collectMixedStructuredFilterAlloc(alloc, scratch, ordinal_req, executor, entry, query, filter_json, true, true);
                 errdefer known.deinit(alloc);
                 if (exceptional.items.len == 0) return known;
                 var key_req = req;
                 key_req.filter_doc_ids = exceptional.items;
                 key_req.filter_doc_ids_positive = true;
-                var legacy = try collectMixedStructuredFilterAlloc(alloc, scratch, key_req, executor, entry, query, filter_json, false);
+                var legacy = try collectMixedStructuredFilterAlloc(alloc, scratch, key_req, executor, entry, query, filter_json, false, true);
                 defer legacy.deinit(alloc);
                 if (legacy == .none) return known;
                 const project = executor.resolve_doc_set_doc_ids.?;
@@ -11041,7 +11068,7 @@ fn collectMixedStructuredFilterAlloc(
                 break :domain ordinals;
             } else |err| if (err != error.UnsupportedQueryRequest) return err;
         }
-        owned_keys = try collectPrimaryResidualKeys(identity, req, seed, seed == &owned_scope, null, null);
+        owned_keys = try collectPrimaryResidualKeys(identity, req, seed, scope_already_visible or seed == &owned_scope, null, null);
         if (owned_keys == .none) return .none;
         var slots = roaring.RoaringBitmap.init(alloc);
         errdefer slots.deinit();
@@ -11068,7 +11095,7 @@ fn collectMixedStructuredFilterAlloc(
             const exclude = doc_set.ResolvedDocSet{ .doc_keys = req.exclude_doc_ids };
             try restrictMixedFilterScope(identity, &domain, &exclude, false);
         }
-        if (finite or owned_scope == .none) {
+        if (!scope_already_visible and (finite or owned_scope == .none)) {
             const candidate = doc_set.ResolvedDocSet{ .ordinal_bitmap = domain };
             var visible = try executor.live_filter_doc_set.?(executor.ctx, alloc, &candidate, executor.identity_read_generation);
             defer visible.deinit(alloc);
@@ -14051,25 +14078,13 @@ const NativeSortPredicate = struct {
             else => return err,
         };
         if (witness != .populated) return false;
-        if (!segment.reader.hasCheapTypedNavigation(field)) return false;
-        var typed = (segment.reader.typedDocValuesScoped(segment.reader.alloc, field) catch |err| switch (err) {
-            error.CrcMismatch, error.InvalidSegment, error.InvalidData, error.OutOfMemory, error.StorageReadTemporarilyUnavailable => return false,
+        return segment.hasDenseNumericNavigation(field, .{
+            .cancellation = req.cancellation,
+            .deadline_ns = req.execution_deadline_ns,
+        }) catch |err| switch (err) {
+            error.CrcMismatch, error.InvalidSegment, error.InvalidData, error.OutOfMemory, error.StorageReadTemporarilyUnavailable => false,
             else => return err,
-        }) orelse return false;
-        defer typed.deinit();
-        if (typed.value_type != .numeric_val) return false;
-
-        // Indexed chunks attest increasing IDs. Contiguous first/last/count
-        // entries establish density without opening their compressed payloads.
-        var next: u64 = 0;
-        for (0..typed.num_chunks) |chunk| {
-            try checkSearchRequestDeadline(req);
-            const info = typed.chunkInfo(@intCast(chunk)) orelse return false;
-            if (info.count == 0 or info.first != next) return false;
-            next += info.count;
-            if (next != @as(u64, info.last) + 1 or next > segment.reader.doc_count) return false;
-        }
-        return next == segment.reader.doc_count;
+        };
     }
 
     /// Each key is monotone only inside a constant preceding-key group. Exact

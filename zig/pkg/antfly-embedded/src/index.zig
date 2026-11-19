@@ -328,6 +328,7 @@ pub const TypedDocValuesFieldCoverage = struct {
     membership_is_missing: bool = true,
     missing_live_count: std.atomic.Value(u32) = .init(0),
     initialized: std.atomic.Value(bool) = .init(false),
+    dense_numeric_navigation: std.atomic.Value(enum(u8) { unknown, sparse, dense }) = .init(.unknown),
     initialization_mutex: std.Io.Mutex = .init,
 
     fn lockInitialization(self: *TypedDocValuesFieldCoverage) void {
@@ -785,6 +786,48 @@ pub const SegmentEntry = struct {
             }
         }
         return null;
+    }
+
+    /// Prove physical density once for this immutable column. A cold source
+    /// requiring a whole-column checksum can become eligible on a later read.
+    pub fn hasDenseNumericNavigation(self: *const SegmentEntry, field: []const u8, control: query_mod.ExecutionControl) !bool {
+        var low: usize = 0;
+        var high = self.shared.typed_doc_values_coverage.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const coverage = &self.shared.typed_doc_values_coverage[mid];
+            switch (std.mem.order(u8, coverage.field, field)) {
+                .lt => low = mid + 1,
+                .gt => high = mid,
+                .eq => {
+                    switch (coverage.dense_numeric_navigation.load(.acquire)) {
+                        .dense => return true,
+                        .sparse => return false,
+                        .unknown => {},
+                    }
+                    if (!self.reader.hasCheapTypedNavigation(field)) return false;
+                    const dense = try self.checkDenseNumericNavigation(field, control);
+                    coverage.dense_numeric_navigation.store(if (dense) .dense else .sparse, .release);
+                    return dense;
+                },
+            }
+        }
+        return false;
+    }
+
+    fn checkDenseNumericNavigation(self: *const SegmentEntry, field: []const u8, control: query_mod.ExecutionControl) !bool {
+        var typed = (try self.reader.typedDocValuesScoped(self.reader.alloc, field)) orelse return false;
+        defer typed.deinit();
+        if (typed.value_type != .numeric_val) return false;
+        var next: u64 = 0;
+        for (0..typed.num_chunks) |chunk| {
+            try control.check();
+            const info = typed.chunkInfo(@intCast(chunk)) orelse return false;
+            if (info.count == 0 or info.first != next) return false;
+            next += info.count;
+            if (next != @as(u64, info.last) + 1 or next > self.reader.doc_count) return false;
+        }
+        return next == self.reader.doc_count;
     }
 
     pub const DeletionSummary = struct {
