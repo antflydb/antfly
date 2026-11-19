@@ -780,6 +780,9 @@ fn countedWriterFutexWakeShared(ptr: *const u32) void {
 
 pub const Region = struct {
     mapping: []align(std.heap.page_size_min) u8,
+    /// Test support: runs in `tryClaimTicket` between a competing claim's
+    /// death probe and its published check.
+    test_after_claim_death_probe: ?*const fn (*Region) void = null,
     /// This handle's own reference into `fd_registry` -- this process's
     /// *shared* `FdEntry` for the region's inode (see
     /// `acquireProcessFd`'s own doc comment). Its `fd` is reused for
@@ -957,11 +960,16 @@ pub const Region = struct {
         // is a no-op) and then release that other handle's real lock out
         // from under it, same failure shape `own_liveness_slot` alone
         // guarded against for the single-handle case.
+        //
+        // The probe stays under the registry mutex: a handle of this
+        // process claiming `slot_index` after the check (`claimLivenessSlot`
+        // holds the same mutex) would otherwise have its new lock released
+        // by the probe's unlock.
         fd_registry_mutex.lockUncancelable(self.io);
+        defer fd_registry_mutex.unlock(self.io);
         const mine = for (self.fd_entry.claimed_slots.items) |claimed| {
             if (claimed == slot_index) break true;
         } else false;
-        fd_registry_mutex.unlock(self.io);
         if (mine) return false;
         return probeDead(self.fd_entry.fd, livenessByteOffset(self.header().max_readers, slot_index));
     }
@@ -1043,6 +1051,10 @@ pub const Region = struct {
         fd_registry_mutex.lockUncancelable(io);
         defer fd_registry_mutex.unlock(io);
         const pid = antfly_platform.process.currentId() orelse 0;
+        // Reserve the bookkeeping first: a byte locked without its
+        // `claimed_slots` entry would stay locked for the shared fd's life
+        // and read as a live claimant to every peer.
+        entry.claimed_slots.ensureUnusedCapacity(std.heap.page_allocator, 1) catch return RegionError.LivenessSlotsExhausted;
         const start: u32 = @intCast((@as(u64, pid) *% 2654435761) % max_readers);
         var scanned: u32 = 0;
         next_index: while (scanned < max_readers) : (scanned += 1) {
@@ -1051,7 +1063,7 @@ pub const Region = struct {
                 if (claimed == i) continue :next_index;
             }
             if (fcntlTryLock(entry.fd, livenessByteOffset(max_readers, i), std.c.F.WRLCK)) {
-                entry.claimed_slots.append(std.heap.page_allocator, i) catch return RegionError.LivenessSlotsExhausted;
+                entry.claimed_slots.appendAssumeCapacity(i);
                 // Bump unconditionally, on *every* claim of this index --
                 // including this process's own very first claim of a
                 // never-before-claimed slot (0 -> 1): what matters is that
@@ -1428,9 +1440,11 @@ pub const Region = struct {
         // needs a *bounded* step at all now, not a true indefinite park.
         var backoff_ms: u32 = ring_full_backoff_initial_ms;
         const my_ticket: u32 = while (true) {
-            if (!self.ringHasRoom()) {
-                countedRawFutexWaitShared(&hdr.writer_ticket_head.raw, hdr.writer_ticket_head.load(.monotonic), backoff_ms);
+            const ring_head = hdr.writer_ticket_head.load(.acquire);
+            if (!self.ringHasRoomAt(ring_head)) {
+                countedRawFutexWaitShared(&hdr.writer_ticket_head.raw, ring_head, backoff_ms);
                 backoff_ms = @min(backoff_ms * 2, ring_full_backoff_max_ms);
+                self.skipResolvedHeads();
                 continue;
             }
             // `tryClaimTicket` publishes the owner atomically with the
@@ -1610,9 +1624,16 @@ pub const Region = struct {
         const hdr = self.header();
         if (hdr.writer_ticket_head.load(.monotonic) == @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))) and self.tryAcquireWriter(pid)) return false;
         const my_ticket: u32 = while (true) {
-            if (!self.ringHasRoom()) {
-                if (Io.Clock.now(.awake, io).compare(.gte, deadline)) return error.Timeout;
-                countedFutexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, hdr.writer_ticket_head.load(.monotonic), deadline) catch return error.Canceled;
+            const ring_head = hdr.writer_ticket_head.load(.acquire);
+            if (!self.ringHasRoomAt(ring_head)) {
+                const now = Io.Clock.now(.awake, io);
+                if (now.compare(.gte, deadline)) return error.Timeout;
+                // Wait on the same head sample the check used, and retire a
+                // dead head ourselves on a short step: a full ring of dead
+                // tickets has no live owner to advance it.
+                const step_deadline = now.addDuration(.fromMilliseconds(dead_ticket_check_step_ms));
+                countedFutexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, ring_head, if (step_deadline.compare(.lt, deadline)) step_deadline else deadline) catch return error.Canceled;
+                self.skipResolvedHeads();
                 continue;
             }
             // See `acquireWriter`'s own identical claim loop:
@@ -1737,11 +1758,16 @@ pub const Region = struct {
     /// that fails safe (backs off; never silently corrupts a ring slot)
     /// if a future caller ever doesn't.
     fn ringHasRoom(self: *const Region) bool {
+        return self.ringHasRoomAt(self.header().writer_ticket_head.load(.monotonic));
+    }
+
+    /// `ringHasRoom` against a `head` the caller also waits on, so a head
+    /// advance between the check and the wait cannot be missed. Counted in
+    /// `head`'s 32-bit width: past 2^32 turns the 64-bit `tail` would
+    /// otherwise read as a permanently full ring.
+    fn ringHasRoomAt(self: *const Region, head: u32) bool {
         const hdr = self.header();
-        // In `head`'s 32-bit width: past 2^32 turns the full 64-bit `tail`
-        // would otherwise read as a permanently full ring.
-        const outstanding = @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))) -% hdr.writer_ticket_head.load(.monotonic);
-        return outstanding < hdr.max_readers;
+        return @as(u32, @truncate(hdr.writer_ticket_tail.load(.acquire))) -% head < hdr.max_readers;
     }
 
     const ring_full_backoff_initial_ms: u32 = 5;
@@ -2004,8 +2030,14 @@ pub const Region = struct {
             // publishing it. Once `tail` has moved past it the ticket is
             // published: only the head-advance path may retire it, so this
             // stale contender must leave it.
-            const dead_unpublished = prior == ticket and hdr.writer_ticket_tail.load(.acquire) == t and
-                self.isReferenceDead(ticketWordLivenessSlot(existing), ticketWordGeneration(existing));
+            // Death first: a dead owner can no longer publish, so `tail`
+            // read afterwards cannot move past this ticket. Read the other
+            // way round, the owner could publish and die in between.
+            const dead_unpublished = prior == ticket and blk: {
+                if (!self.isReferenceDead(ticketWordLivenessSlot(existing), ticketWordGeneration(existing))) break :blk false;
+                if (comptime builtin.is_test) if (self.test_after_claim_death_probe) |hook| hook(self);
+                break :blk hdr.writer_ticket_tail.load(.acquire) == t;
+            };
             if (behind or dead_unpublished) _ = slot.cmpxchgStrong(existing, 0, .acq_rel, .monotonic);
             return null;
         }
@@ -4077,6 +4109,48 @@ test "shared lock region: a stale claimant leaves a published dead ticket for th
     _ = try region.acquireWriterFairBounded(std.testing.io, pid, Io.Clock.now(.awake, std.testing.io).addDuration(.fromSeconds(1)), null);
     region.releaseWriter();
     try std.testing.expectEqual(@as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))), hdr.writer_ticket_head.load(.monotonic));
+}
+
+test "shared lock region: a stale claimant checks publication only after the owner's death" {
+    var fixture = try TicketFixture.init("region-claim-order.aflite");
+    defer fixture.deinit();
+    const region = &fixture.region;
+    const hdr = region.header();
+    const pid: u32 = @bitCast(std.c.getpid());
+    // A competing claim of ticket `t`, not yet published. In the window
+    // between the stale contender's death probe and its published check,
+    // the claim is published (the owner published, then died).
+    const t = hdr.writer_ticket_tail.load(.monotonic);
+    const ticket: u32 = @truncate(t);
+    const dead = packTicketWord(ticket, pid +% 1, region.own_liveness_slot, region.own_liveness_generation +% 1);
+    region.ticketSlots()[ticket % hdr.max_readers].store(dead, .release);
+    const Publish = struct {
+        fn run(r: *Region) void {
+            const h = r.header();
+            h.writer_ticket_tail.store(h.writer_ticket_tail.load(.monotonic) +% 1, .release);
+        }
+    };
+    region.test_after_claim_death_probe = Publish.run;
+    try std.testing.expectEqual(@as(?u32, null), region.tryClaimTicket(t, pid));
+    region.test_after_claim_death_probe = null;
+    // Published, so the stale contender left it for the head path.
+    try std.testing.expectEqual(dead, region.ticketSlots()[ticket % hdr.max_readers].load(.acquire));
+    _ = try region.acquireWriterFairBounded(std.testing.io, pid, Io.Clock.now(.awake, std.testing.io).addDuration(.fromSeconds(1)), null);
+    region.releaseWriter();
+}
+
+test "shared lock region: a stale claimant frees a dead claim that was never published" {
+    var fixture = try TicketFixture.init("region-claim-unpublished.aflite");
+    defer fixture.deinit();
+    const region = &fixture.region;
+    const hdr = region.header();
+    const pid: u32 = @bitCast(std.c.getpid());
+    const t = hdr.writer_ticket_tail.load(.monotonic);
+    const ticket: u32 = @truncate(t);
+    region.ticketSlots()[ticket % hdr.max_readers].store(packTicketWord(ticket, pid +% 1, region.own_liveness_slot, region.own_liveness_generation +% 1), .release);
+    try std.testing.expectEqual(@as(?u32, null), region.tryClaimTicket(t, pid));
+    try std.testing.expectEqual(@as(u128, 0), region.ticketSlots()[ticket % hdr.max_readers].load(.acquire));
+    try std.testing.expectEqual(ticket, region.tryClaimTicket(t, pid).?);
 }
 
 test "shared lock region: the queue keeps admitting contended writers across the 32-bit head wrap" {
