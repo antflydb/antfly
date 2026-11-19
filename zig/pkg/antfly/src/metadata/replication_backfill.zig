@@ -190,6 +190,7 @@ pub const SnapshotBackfillRunner = struct {
     io: std.Io = std.Options.debug_io,
     registry: *foreign_mod.Registry,
     write_source: table_writes_api.TableWriteSource,
+    external_destination: ?ExternalStreamDestination = null,
     secret_store: ?*secrets.FileStore = null,
     batch_size: usize = 256,
     prepared_snapshot_timeout_ns: u64 = default_prepared_snapshot_timeout_ns,
@@ -392,6 +393,39 @@ pub const SnapshotBackfillRunner = struct {
         try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
         var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer);
         defer parsed.deinit(self.alloc);
+        var external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json);
+        defer if (external) |*binding| binding.deinit(self.alloc);
+        if (external) |binding| {
+            if (binding.binding.format != .iceberg or binding.binding.write_policy != .iceberg_writer or
+                parsed.routes.len != 0 or parsed.on_update_json != null or parsed.on_delete_json != null) return error.UnsupportedReplicationRoute;
+            const owner = self.external_destination orelse return error.UnsupportedReplicationRoute;
+            const observed = owner.bootstrap_committed orelse return error.UnsupportedReplicationRoute;
+            var status = existing_status orelse return error.UnsupportedReplicationRoute;
+            if (status.table_id != table.table_id or status.source_ordinal != source_ordinal or
+                !exactCutoverIntentOwnsConfig(status, parsed, exactCutoverConfigFingerprint(table.table_id, source_ordinal, parsed)) or
+                !std.mem.eql(u8, status.cutover_mode, cutover_mode_exported_snapshot) or status.prepared_checkpoint.len == 0)
+                return error.UnsupportedReplicationRoute;
+            try callCheckCutoverAuthority(status_sink, table.replication_sources_json, status);
+            if (!try observed(owner.ptr, self.alloc, .{
+                .table = table,
+                .cutover = status,
+                .previous_checkpoint = null,
+                .checkpoint = status.prepared_checkpoint,
+                .changes = &.{},
+                .deadline_ns = try self.workDeadlineNs(),
+            })) return error.SourceOutcomeUnresolved;
+            try self.checkpointWork();
+            try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
+            try callCheckCutoverAuthority(status_sink, table.replication_sources_json, status);
+            status.phase = "cutover_prepared";
+            status.last_error = "";
+            status.failure_class = "";
+            status.consecutive_failures = 0;
+            status.last_success_at_ms = ioNowMillis(self.io);
+            status.updated_at_ms = status.last_success_at_ms;
+            try callUpsertStatus(status_sink, status);
+            return .{ .final_offset = @intCast(status.snapshot_offset), .snapshot_complete = true };
+        }
 
         var resolved_dsn = try secrets.resolveReferenceWithGenerationOwned(self.alloc, self.secret_store, parsed.dsn);
         defer resolved_dsn.deinit(self.alloc);
@@ -7300,6 +7334,14 @@ test "metadata replication stream resumes complete durable transactions while de
         polls: usize = 0,
         resumed: bool = false,
         external_calls: usize = 0,
+        bootstrap_proven: bool = false,
+
+        fn observeBootstrap(raw: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) !bool {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("initial", request.checkpoint);
+            try std.testing.expectEqual(@as(u64, 9), request.cutover.cutover_authority_id);
+            return self.bootstrap_proven;
+        }
 
         fn external(raw: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) !ExternalStreamDestination.Outcome {
             const self: *Self = @ptrCast(@alignCast(raw));
@@ -7432,6 +7474,33 @@ test "metadata replication stream resumes complete durable transactions while de
     try std.testing.expectEqualStrings("second-commit", sink.records.items[sink.records.items.len - 1].checkpoint);
     try std.testing.expectEqual(@as(usize, 3), state.external_calls);
     try std.testing.expectEqual(@as(usize, 3), state.calls);
+    var bootstrap_runner: SnapshotBackfillRunner = .{
+        .alloc = alloc,
+        .registry = &registry,
+        .write_source = runner.write_source,
+        .external_destination = .{ .ptr = &state, .apply = State.external, .bootstrap_committed = State.observeBootstrap },
+    };
+    var config = try parseReplicationSourceConfig(alloc, external_table.name, external_table.replication_sources_json, 0, null);
+    defer config.deinit(alloc);
+    var slot: [postgres_identifier_max_len]u8 = undefined;
+    var publication: [postgres_identifier_max_len]u8 = undefined;
+    status.cutover_intent_id = 8;
+    status.cutover_mode = cutover_mode_exported_snapshot;
+    status.phase = "snapshot";
+    status.external_table = config.postgres_table;
+    status.slot_name = exactCutoverPhysicalResourceName(&slot, config.slot_name, 8, 9);
+    status.publication_name = exactCutoverPhysicalResourceName(&publication, config.publication_name, 8, 9);
+    status.prepared_checkpoint = "initial";
+    status.stream_checkpoint = "";
+    status.cutover_config_fingerprint = exactCutoverConfigFingerprint(table.table_id, 0, config);
+    status.cutover_provider_identity = @splat(7);
+    try std.testing.expectError(error.SourceOutcomeUnresolved, bootstrap_runner.runTableSourceFromStatus(&sink, external_table, 0, 0, status));
+    state.bootstrap_proven = true;
+    const recovered = try bootstrap_runner.runTableSourceFromStatus(&sink, external_table, 0, 0, status);
+    try std.testing.expect(recovered.snapshot_complete);
+    const durable = sink.records.items[sink.records.items.len - 1];
+    try std.testing.expectEqualStrings("cutover_prepared", durable.phase);
+    try std.testing.expectEqualStrings("initial", durable.prepared_checkpoint);
 }
 
 test "metadata replication stream applies insert update and delete through bound write source" {

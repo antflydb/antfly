@@ -3985,11 +3985,17 @@ const LocalStandaloneMetadata = struct {
         var cursors = self.cdc.loadCursors();
         defer self.cdc.storeCursors(cursors.snapshot, cursors.streaming);
 
+        var lake_owner: @import("../serverless/lake_ingestion.zig").StreamOwner = .{
+            .ptr = self,
+            .resolve = resolveLakeStreamOwner,
+            .check = checkLakeStreamOwner,
+        };
         const summary = backfill.runSnapshotRound(self.alloc, service, .{
             .alloc = self.alloc,
             .io = io,
             .registry = &self.cdc.registry,
             .write_source = write_source,
+            .external_destination = lake_owner.port(),
             .secret_store = server.write_source.secret_store,
             .work_permit = self.cdcWorkPermit(),
             .destination_authorizer = server.write_source.destination_authorizer,
@@ -4002,11 +4008,6 @@ const LocalStandaloneMetadata = struct {
             "standalone cdc snapshot round tables={d} sources={d} started={d} resumed={d} completed={d} yielded={d} failed={d}",
             .{ summary.tables_considered, summary.sources_considered, summary.sources_started, summary.sources_resumed, summary.sources_completed, summary.sources_yielded, summary.sources_failed },
         );
-        var lake_owner: @import("../serverless/lake_ingestion.zig").StreamOwner = .{
-            .ptr = self,
-            .resolve = resolveLakeStreamOwner,
-            .check = checkLakeStreamOwner,
-        };
         const stream_summary = backfill.runStreamingRound(self.alloc, service, .{
             .alloc = self.alloc,
             .io = io,
