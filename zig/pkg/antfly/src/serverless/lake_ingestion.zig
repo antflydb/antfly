@@ -163,7 +163,7 @@ pub const StreamOwner = struct {
     check: *const fn (*anyopaque, Port.Request) anyerror!void,
 
     pub fn port(self: *StreamOwner) Port {
-        return .{ .ptr = self, .apply = apply, .bootstrap_committed = bootstrapCommitted };
+        return .{ .ptr = self, .apply = apply, .bootstrap_committed = bootstrapCommitted, .stage_bootstrap = stageBootstrap };
     }
 
     const Guard = struct {
@@ -186,7 +186,12 @@ pub const StreamOwner = struct {
         return (try self.execute(backing, request, .observe_bootstrap)) == .committed;
     }
 
-    fn execute(self: *StreamOwner, backing: A, request: Port.Request, mode: enum { apply, observe_bootstrap }) !Port.Outcome {
+    fn stageBootstrap(raw: *anyopaque, backing: A, request: Port.Request) !void {
+        const self: *StreamOwner = @ptrCast(@alignCast(raw));
+        _ = try self.execute(backing, request, .stage_bootstrap);
+    }
+
+    fn execute(self: *StreamOwner, backing: A, request: Port.Request, mode: enum { apply, observe_bootstrap, stage_bootstrap }) !Port.Outcome {
         if (request.table.table_id == 0 or request.table.table_id != request.cutover.table_id or request.cutover.cutover_authority_id == 0) return error.UnsupportedReplicationRoute;
         var arena = std.heap.ArenaAllocator.init(backing);
         defer arena.deinit();
@@ -226,6 +231,7 @@ pub const StreamOwner = struct {
             try context.ensureActive();
             return .committed;
         }
+        if (mode == .stage_bootstrap and request.snapshot_rows == null) return error.InvalidReplicationCheckpoint;
         const batch = if (request.snapshot_rows) |rows| blk: {
             if (request.previous_checkpoint != null or request.changes.len != 0 or
                 !std.mem.eql(u8, request.checkpoint, request.cutover.prepared_checkpoint)) return error.InvalidReplicationCheckpoint;
@@ -247,10 +253,40 @@ pub const StreamOwner = struct {
             const previous = request.previous_checkpoint orelse return error.InvalidReplicationCheckpoint;
             break :blk try postgresBatch(a, source, epoch, previous, request.checkpoint, identity.key_columns, request.changes);
         };
+        if (mode == .stage_bootstrap) {
+            try writeBootstrapStage(a, bound.binding, options, context, batch);
+            return .accepted;
+        }
         const outcome = try applyBatch(a, bound.binding, options, context, batch);
         return if (outcome.committed) .committed else .accepted;
     }
 };
+
+fn bootstrapStageKey(a: A, base: []const u8, batch: Batch) ![]u8 {
+    // WAL initialization owns its prefix and rejects pre-existing objects.
+    return std.fmt.allocPrint(a, "{s}-bootstrap/{s}.json", .{ base, &std.fmt.bytesToHex(try batch.identity(a), .lower) });
+}
+
+fn writeBootstrapStage(a: A, binding: Binding, options: Options, context: Context, batch: Batch) !void {
+    var opened = try openQueue(a, binding, options);
+    defer opened.deinit();
+    const base = try prefix(a, opened.prefix, binding, options);
+    const key = try bootstrapStageKey(a, base, batch);
+    const bytes = try std.json.Stringify.valueAlloc(a, batch, .{});
+    var client = opened.client;
+    try context.ensureActive();
+    var stored = client.putObject(opened.bucket, key, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
+        error.PreconditionFailed, error.ObjectAlreadyExists => {
+            var existing = try client.getObject(opened.bucket, key, .{ .cancellation = catalog.types.contextCancellation(&context) });
+            defer existing.deinit(client.allocator);
+            if (!std.mem.eql(u8, bytes, existing.body)) return error.WalIdempotencyConflict;
+            return context.ensureActive();
+        },
+        else => return err,
+    };
+    defer stored.deinit(client.allocator);
+    try context.ensureActive();
+}
 
 /// Resume only the first admitted bootstrap for the requested incarnation.
 fn recoverPendingBootstrap(a: A, binding: Binding, unresolved: Options, context: Context, source: []const u8, epoch: []const u8, checkpoint: []const u8, keys: []const []const u8) !bool {
@@ -260,15 +296,37 @@ fn recoverPendingBootstrap(a: A, binding: Binding, unresolved: Options, context:
     const base = try prefix(a, opened.prefix, binding, options);
     defer a.free(base);
     const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null };
-    const record = (try store.next(a, 0)) orelse return false;
-    const batch = try std.json.parseFromSliceLeaky(Batch, a, record.payload, .{});
+    const expected: Batch = .{
+        .batch_id = try std.fmt.allocPrint(a, "antfly-bootstrap-{s}", .{&catalog.types.digestHex(checkpoint)}),
+        .source = source,
+        .epoch = epoch,
+        .checkpoint = checkpoint,
+        .key_fields = keys,
+        .changes = &.{},
+        .bootstrap = true,
+    };
+    const record = try store.next(a, 0);
+    const bytes = if (record) |accepted| accepted.payload else blk: {
+        var client = opened.client;
+        const key = try bootstrapStageKey(a, base, expected);
+        var staged = client.getObject(opened.bucket, key, .{ .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
+            error.NotFound, error.ObjectNotFound, error.FileNotFound => return false,
+            else => return err,
+        };
+        defer staged.deinit(client.allocator);
+        break :blk try a.dupe(u8, staged.body);
+    };
+    const batch = try std.json.parseFromSliceLeaky(Batch, a, bytes, .{});
     if (!batch.bootstrap or batch.expected_checkpoint != null or
-        !std.mem.eql(u8, batch.source, source) or !std.mem.eql(u8, batch.epoch, epoch) or
-        !std.mem.eql(u8, batch.checkpoint, checkpoint) or !keyFieldsEqual(batch.key_fields, keys)) return false;
-    const observed = (try observeBatch(a, binding, options, context, batch)) orelse return error.LakeWalCoverageGap;
-    if (observed.accepted_sequence != record.lsn) return error.LakeWalCoverageGap;
+        !std.mem.eql(u8, batch.batch_id, expected.batch_id) or !std.mem.eql(u8, batch.source, source) or
+        !std.mem.eql(u8, batch.epoch, epoch) or !std.mem.eql(u8, batch.checkpoint, checkpoint) or
+        !keyFieldsEqual(batch.key_fields, keys)) return false;
+    if (record) |accepted| {
+        const observed = (try observeBatch(a, binding, options, context, batch)) orelse return error.LakeWalCoverageGap;
+        if (observed.accepted_sequence != accepted.lsn) return error.LakeWalCoverageGap;
+    }
     const outcome = try applyBatch(a, binding, options, context, batch);
-    if (outcome.accepted_sequence != record.lsn) return error.LakeWalCoverageGap;
+    if (record) |accepted| if (outcome.accepted_sequence != accepted.lsn) return error.LakeWalCoverageGap;
     return outcome.committed;
 }
 
@@ -1155,17 +1213,9 @@ test "external lake filesystem WAL applies the managed PostgreSQL stream owner p
     var recovery = snapshot;
     recovery.snapshot_rows = null;
     try std.testing.expect(!try port.bootstrap_committed.?(port.ptr, alloc, recovery));
-    // Simulate process loss after WAL admission and before catalog commit.
-    const retained_snapshot: Batch = .{
-        .batch_id = try std.fmt.allocPrint(a, "antfly-bootstrap-{s}", .{&catalog.types.digestHex("cut")}),
-        .source = "postgres:9:2",
-        .epoch = "12",
-        .checkpoint = "cut",
-        .key_fields = &.{"id"},
-        .changes = &.{.{ .op = .upsert, .row = initial_row }},
-        .bootstrap = true,
-    };
-    try std.testing.expectEqual(@as(u64, 1), try acceptBatch(a, bound.binding, options, .{}, retained_snapshot));
+    try port.stage_bootstrap.?(port.ptr, alloc, snapshot);
+    try port.stage_bootstrap.?(port.ptr, alloc, snapshot);
+    try std.testing.expectEqual(@as(u64, 0), try watermark(a, bound.binding, options, .{}));
     try std.testing.expectEqual(@as(u64, 0), try coverage(a, try managed.load(a)));
     var wrong_cut = recovery;
     wrong_cut.checkpoint = "other";

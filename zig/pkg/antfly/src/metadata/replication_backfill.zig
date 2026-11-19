@@ -1232,10 +1232,8 @@ pub const SnapshotBackfillRunner = struct {
                 .cutover_provider_identity = progress_cutover_provider_identity.*,
                 .updated_at_ms = ioNowMillis(self.io),
             };
-            try callUpsertStatus(status_sink, pending);
-            progress_offset.* = summary.final_offset;
-            lake_publish_pending.* = true;
-            const outcome = try owner.apply(owner.ptr, self.alloc, .{
+            const stage = owner.stage_bootstrap orelse return error.UnsupportedReplicationRoute;
+            const request: ExternalStreamDestination.Request = .{
                 .table = table,
                 .cutover = pending,
                 .previous_checkpoint = null,
@@ -1243,7 +1241,15 @@ pub const SnapshotBackfillRunner = struct {
                 .changes = &.{},
                 .snapshot_rows = lake_rows.items,
                 .deadline_ns = try self.workDeadlineNs(),
-            });
+            };
+            try stage(owner.ptr, self.alloc, request);
+            try self.checkpointWork();
+            try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
+            try callCheckCutoverAuthority(status_sink, table.replication_sources_json, pending);
+            try callUpsertStatus(status_sink, pending);
+            progress_offset.* = summary.final_offset;
+            lake_publish_pending.* = true;
+            const outcome = try owner.apply(owner.ptr, self.alloc, request);
             if (outcome != .committed) return error.SourceOutcomeUnresolved;
             try self.checkpointWork();
             try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
@@ -1703,6 +1709,7 @@ pub const ExternalStreamDestination = struct {
     /// Positive catalog evidence for the exact prepared cut. Absence does
     /// not authorize retiring a slot or replacing a pending admission.
     bootstrap_committed: ?*const fn (*anyopaque, Allocator, Request) anyerror!bool = null,
+    stage_bootstrap: ?*const fn (*anyopaque, Allocator, Request) anyerror!void = null,
 
     pub const Outcome = enum { accepted, committed };
     pub const Request = struct {
@@ -4746,6 +4753,11 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
     try std.testing.expect(std.mem.indexOf(u8, final_status.slot_name, "_af_") != null);
 
     const Lake = struct {
+        fn stage(raw: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) !void {
+            const sink: *StatusSink = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("snapshot", sink.records.items[sink.records.items.len - 1].phase);
+            try std.testing.expectEqual(@as(usize, 2), request.snapshot_rows.?.len);
+        }
         fn apply(raw: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) !ExternalStreamDestination.Outcome {
             const sink: *StatusSink = @ptrCast(@alignCast(raw));
             const pending = sink.records.items[sink.records.items.len - 1];
@@ -4760,7 +4772,7 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
             return error.UnexpectedBootstrapRecovery;
         }
     };
-    runner.external_destination = .{ .ptr = &status_sink, .apply = Lake.apply, .bootstrap_committed = Lake.observe };
+    runner.external_destination = .{ .ptr = &status_sink, .apply = Lake.apply, .bootstrap_committed = Lake.observe, .stage_bootstrap = Lake.stage };
     const captured = try runner.runTableSource(&status_sink, .{
         .table_id = 12,
         .name = "lake",
