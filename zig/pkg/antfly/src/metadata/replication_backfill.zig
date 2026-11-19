@@ -1583,7 +1583,8 @@ pub const SnapshotBackfillCoordinator = struct {
                 self.cursor = .{ .valid = true, .table_id = table.table_id, .source_ordinal = @intCast(range.begin) };
                 return summary;
             }
-            const table_ready = tableReadyForReplication(&readiness_snapshot, table.table_id);
+            const table_ready = (table.storage.engine == .object and self.runner.external_destination != null) or
+                tableReadyForReplication(&readiness_snapshot, table.table_id);
             const has_existing_status = tableHasReplicationSourceStatus(statuses, table.table_id);
             if (!table_ready and !has_existing_status) {
                 if (!is_wrap) std.log.info("metadata cdc snapshot skip table not ready table={s}", .{table.name});
@@ -2217,7 +2218,8 @@ pub const StreamingReplicationCoordinator = struct {
                 self.cursor = .{ .valid = true, .table_id = table.table_id, .source_ordinal = @intCast(range.begin) };
                 return summary;
             }
-            const table_ready = tableReadyForReplication(&readiness_snapshot, table.table_id);
+            const table_ready = (table.storage.engine == .object and self.runner.external_destination != null) or
+                tableReadyForReplication(&readiness_snapshot, table.table_id);
             const status_allows_streaming = tableHasStreamingEligibleStatus(statuses, table.table_id);
             if (!table_ready and !status_allows_streaming) {
                 if (!is_wrap) std.log.info("metadata cdc stream skip table not ready table={s}", .{table.name});

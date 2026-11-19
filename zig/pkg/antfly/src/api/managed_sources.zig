@@ -39,9 +39,13 @@ pub fn configure(a: A, server: *api.ApiHttpServer, physical: []const u8, bound_i
     if (table.table_id != parsed.value.table_id or (bound_id != null and bound_id.? != table.table_id)) return error.TableGenerationChanged;
     const hash = sourcesHash(table.replication_sources_json);
     if (!std.mem.eql(u8, &hash, parsed.value.expected_sources_hash)) return error.TableGenerationChanged;
-    // Managed PostgreSQL currently uses the native CDC executor. Object
-    // notifications use lake reconciliation, not a synthetic replication slot.
-    if (table.storage.engine == .object) return error.UnsupportedOperation;
+    if (table.storage.engine == .object) {
+        if (server.cfg.deployment_mode != .standalone or !try server.source.replicationSourcesSupported()) return error.UnsupportedOperation;
+        var source = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse return error.UnsupportedOperation;
+        defer source.deinit(a);
+        if (source.binding.format != .iceberg or source.binding.write_policy != .iceberg_writer or source.binding.row_identity == null) return error.UnsupportedOperation;
+        try source.binding.validateSupported();
+    }
     for (parsed.value.replication_sources.array.items) |source| {
         if (source != .object) return error.InvalidCreateTableRequest;
     }
@@ -132,4 +136,14 @@ test "lake SQL managed source replacement checks native definition hash and tabl
     const wrong = "{\"table_id\":7,\"expected_sources_hash\":\"stale\",\"replication_sources\":[]}";
     try std.testing.expectError(error.TableGenerationChanged, configure(a, &server, "hn", 7, null, .{}, wrong));
     try std.testing.expectEqual(@as(usize, 1), source.replacements);
+
+    source.table[0].storage.engine = .object;
+    source.table[0].schema_json =
+        \\{"base_source":{"kind":"external","table_id":"hn","uri":"file:///lake","format":"iceberg","write_policy":"iceberg_writer","catalog":{"type":"managed"},"row_identity":{"key_columns":["id"]}}}
+    ;
+    try std.testing.expectError(error.UnsupportedOperation, configure(a, &server, "hn", 7, null, .{}, body));
+    server.cfg.deployment_mode = .standalone;
+    const iceberg_result = try configure(a, &server, "hn", 7, null, .{}, body);
+    defer a.free(iceberg_result);
+    try std.testing.expectEqual(@as(usize, 2), source.replacements);
 }

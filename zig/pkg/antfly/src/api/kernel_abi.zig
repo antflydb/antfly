@@ -207,6 +207,7 @@ pub const Capability = struct {
     pub const route_manifest: u64 = 1 << 3;
     pub const inference_admission_stats: u64 = 1 << 4;
     pub const internal_service_ingress: u64 = 1 << 5;
+    pub const lake_stream_owner: u64 = 1 << 6;
 };
 
 /// The sole discovery point for the API-kernel ABI. Keeping the table itself
@@ -242,6 +243,7 @@ pub const FunctionTable = extern struct {
     handler_destroy: *const fn (*anyopaque) callconv(.c) void,
     inference_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
     handler_authorize_internal_service: *const fn (*const InternalServiceAuthContext) callconv(.c) Status,
+    lake_stream_owner_options: *const fn (*const CallContext) callconv(.c) Status,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
@@ -263,7 +265,7 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
     const known = Capability.core |
         Capability.route_manifest |
         Capability.inference_admission_stats |
-        Capability.internal_service_ingress;
+        Capability.internal_service_ingress | Capability.lake_stream_owner;
     if (required_capabilities & ~known != 0) return null;
     var required = functionTableFieldEnd("capabilities");
     if (required_capabilities & Capability.core != 0)
@@ -274,6 +276,8 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
         required = @max(required, functionTableFieldEnd("inference_admission_stats"));
     if (required_capabilities & Capability.internal_service_ingress != 0)
         required = @max(required, functionTableFieldEnd("handler_authorize_internal_service"));
+    if (required_capabilities & Capability.lake_stream_owner != 0)
+        required = @max(required, functionTableFieldEnd("lake_stream_owner_options"));
     return required;
 }
 

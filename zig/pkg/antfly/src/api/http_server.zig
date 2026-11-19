@@ -5375,6 +5375,10 @@ pub const ApiHttpServer = struct {
         // admitted requests leave sixteen workers of completion headroom.
         requests: @import("httpx").RequestLimit = .{ .capacity = 8, .max_bytes = 64 * 1024 * 1024 },
     };
+    pub fn lakeStreamOwnerOptions(self: *ApiHttpServer, input: @import("lake_source_owner.zig").OptionsInput) !@import("lake_source_owner.zig").Options {
+        return @import("lake_source_owner.zig").options(input.allocator, self, input.table, input.request);
+    }
+
     pub fn lakeProviderTransport(self: *ApiHttpServer) !@import("antfly_local_sources").serverless_object_store_support.Transport {
         platform_sync.lockYielding(&self.lake_transport_mutex);
         defer self.lake_transport_mutex.unlock();

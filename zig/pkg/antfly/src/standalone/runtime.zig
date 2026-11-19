@@ -3962,7 +3962,7 @@ const LocalStandaloneMetadata = struct {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(raw));
         const data = self.data_server orelse return error.UnsupportedReplicationRoute;
         const server = if (data.http_server) |*api| api else return error.UnsupportedReplicationRoute;
-        return @import("../api/lake_source_owner.zig").options(a, server, request.table, .{ .deadline_ns = request.deadline_ns });
+        return server.lakeStreamOwnerOptions(.{ .allocator = a, .table = request.table, .request = .{ .deadline_ns = request.deadline_ns } });
     }
 
     /// One snapshot round then one streaming round, the same sequence and

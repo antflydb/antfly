@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -2354,3 +2355,133 @@ def test_standalone_postgres_cdc_snapshot_completes_with_embeddings_index(
     _wait_until_absent(
         stateful_api, table_name, "user-2", timeout_s=30.0, interval_s=0.25
     )
+
+
+def test_standalone_postgres_bootstraps_and_streams_to_writable_iceberg(
+    pg_cdc_source, tmp_path
+):
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    config = tmp_path / "antfly.json"
+    config.write_text(
+        json.dumps(
+            {
+                "deployment_mode": "standalone",
+                "storage": {
+                    "engine": "local",
+                    "local": {"base_dir": str(tmp_path / "native")},
+                },
+            }
+        )
+    )
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0, config_path=config)
+    table = "/tables/cdc_iceberg"
+    provider = pg_cdc_source["table_name"]
+
+    def call(method, path, body=None):
+        reply = requests.request(method, server.api_url + path, json=body, timeout=15)
+        assert reply.ok, (
+            f"{method} {path} {reply.status_code} {reply.text}\n{server.debug_logs()}"
+        )
+        return reply.json()
+
+    def committed(minimum):
+        properties = call("GET", table + "/lake/catalog")["metadata"]["properties"]
+        return (
+            properties
+            if int(properties.get("antfly.wal.coverage", 0)) >= minimum
+            else None
+        )
+
+    def rows():
+        return call("POST", "/sql", {"statement": "SELECT id, name FROM cdc_iceberg"})[
+            "rows"
+        ]
+
+    try:
+        _run_psql(f"alter table {provider} replica identity full")
+        call(
+            "POST",
+            table,
+            {
+                "storage": {"engine": "object"},
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "row",
+                    "enforce_types": True,
+                    "document_schemas": {
+                        "row": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    name: {"type": "string"}
+                                    for name in ("id", "name", "tier")
+                                },
+                                "required": ["id", "name", "tier"],
+                                "additionalProperties": False,
+                            }
+                        },
+                    },
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "cdc-iceberg",
+                        "format": "iceberg",
+                        "uri": (tmp_path / "warehouse").as_uri(),
+                        "write_policy": "iceberg_writer",
+                        "catalog": {"type": "managed"},
+                        "row_identity": {"key_columns": ["id"]},
+                    },
+                },
+            },
+        )
+        call(
+            "POST",
+            table + "/lake/catalog",
+            {
+                "commit_id": "initialize",
+                "schema": {
+                    "type": "struct",
+                    "schema-id": 0,
+                    "fields": [
+                        {"id": index, "name": name, "required": True, "type": "string"}
+                        for index, name in enumerate(("id", "name", "tier"), 1)
+                    ],
+                },
+            },
+        )
+        attached = call("GET", table + "/sources/managed")
+        call(
+            "POST",
+            table + "/sources/managed",
+            {
+                "table_id": attached["table_id"],
+                "expected_sources_hash": attached["sources_hash"],
+                "replication_sources": [
+                    {
+                        "type": "postgres",
+                        "dsn": _pg_dsn(),
+                        "postgres_table": provider,
+                        "key_template": "id",
+                        "slot_name": pg_cdc_source["slot_name"],
+                        "publication_name": pg_cdc_source["publication_name"],
+                    }
+                ],
+            },
+        )
+        initial = wait_until(lambda: committed(1), timeout_s=60, interval_s=0.5)
+        assert initial, server.debug_logs()
+        cut = initial["antfly.cdc.bootstrap-cut"]
+        assert cut == initial["antfly.cdc.checkpoint"]
+        assert rows() == [["user-1", "Alice"]]
+
+        server.pause(crash=True)
+        _run_psql(
+            f"update {provider} set id = 'user-2', name = 'Bob' where id = 'user-1'"
+        )
+        server.resume()
+        resumed = wait_until(lambda: committed(2), timeout_s=60, interval_s=0.5)
+        assert resumed, server.debug_logs()
+        assert resumed["antfly.cdc.bootstrap-cut"] == cut
+        assert resumed["antfly.cdc.checkpoint"] != cut
+        assert rows() == [["user-2", "Bob"]]
+    finally:
+        server.stop()

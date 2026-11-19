@@ -64,6 +64,9 @@ pub fn lookup(a: A, server: *server_api.ApiHttpServer, table: Table, request: Re
 }
 /// Writes install this even if the configuration switch is subsequently off:
 /// turning off an optimization cannot un-fence a durably owned physical source.
+pub const OptionsInput = struct { allocator: A, table: Table, request: Request };
+pub const Options = configured.BindingObjectStoreOpenOptions;
+
 pub fn options(backing: A, server: *server_api.ApiHttpServer, table: Table, request: Request) !configured.BindingObjectStoreOpenOptions {
     var arena = std.heap.ArenaAllocator.init(backing);
     defer arena.deinit();
