@@ -758,6 +758,9 @@ pub const CatalogRetainedStream = struct {
     }
 
     pub fn failedOpen(self: *CatalogRetainedStream) void {
+        const io = self.policy.io;
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
         retained.releaseActor(self.service, self, self.allocator, self.id, self.actor, closeContext()) catch |err| {
             std.log.warn("logical slot lease release after failed open deferred: {s}", .{@errorName(err)});
         };
@@ -770,6 +773,9 @@ pub const CatalogRetainedStream = struct {
             worker.deinit();
             self.publication_worker = null;
         }
+        const io = self.policy.io;
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
         owner.release(self.service, self, self.allocator, closeContext()) catch |err| {
             std.log.warn("logical slot lease release deferred: {s}", .{@errorName(err)});
         };

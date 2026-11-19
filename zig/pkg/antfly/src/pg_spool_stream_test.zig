@@ -257,6 +257,7 @@ pub fn run(svc: anytype, registry: anytype, clock: u64, metadata_path: []const u
     var rewind = try retained.Owner.open(svc, registry, &host, a, svc.id, "upload_slot", @splat(4), 22, selected, host.config, Request{});
     try std.testing.expectEqual(@as(u64, 1), rewind.initial_lsn);
     try std.testing.expectEqual(@as(u64, 22), rewind.resume_lsn);
+    try std.testing.expectError(error.ReplicationSlotActive, retained.Owner.open(svc, registry, &host, a, svc.id, "upload_slot", @splat(5), 0, selected, host.config, Request{}));
     try rewind.feedback(svc, &host, a, .{ .written = 22, .flushed = 22, .applied = 22 }, Request{});
     var begin = try rewind.poll(svc, registry, &host, a, 1, 1024, Request{});
     defer begin.deinit();

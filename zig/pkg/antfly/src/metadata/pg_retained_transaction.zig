@@ -40,15 +40,31 @@ pub const Encoded = struct {
 
 /// The caller must qualify complete publication membership and replica
 /// identity. Only one immutable historical layout is interpreted per frame.
+fn commitTime(page: history.Page) !i64 {
+    const header = page.header orelse return error.InvalidPgSpool;
+    switch (header.transaction_scope) {
+        .root_local => {
+            if (page.completion != null or header.committed_at_ns <= 0) return error.ChangefeedCapabilityUnsupported;
+            return header.committed_at_ns;
+        },
+        .coordinated => {
+            const proof = page.completion orelse return error.ReadUnavailable;
+            if (proof.commit_version == 0 or std.mem.allEqual(u8, &proof.certificate_digest, 0)) return error.HistoryCorrupt;
+            return std.math.cast(i64, proof.commit_version) orelse error.HistoryCorrupt;
+        },
+        .unknown => return error.ChangefeedCapabilityUnsupported,
+    }
+}
+
 pub fn encode(a: A, state: feeds.State, page: history.Page, relation: relation_values.HistoricalRelation, issued_at: u64, byte_limit: usize) !Encoded {
     try state.validate();
     const slot = state.slot orelse return error.ChangefeedCapabilityUnsupported;
     const binding = slot.binding orelse return error.ChangefeedCapabilityUnsupported;
     const header = page.header orelse return error.InvalidPgSpool;
+    const commit_time_ns = try commitTime(page);
     if (state.phase != .streaming or issued_at == 0 or issued_at >= state.expires_at or
         state.roots.len != 1 or state.definition.?.tables.len != 1 or
         state.definition.?.tables[0].contract != .native_relational or
-        header.transaction_scope != .root_local or header.committed_at_ns <= 0 or
         !std.meta.eql(header.namespace, state.roots[0].namespace))
         return error.ChangefeedCapabilityUnsupported;
     if (page.events.len == 0 or page.first_ordinal != 0 or page.frame_events != page.events.len or page.events.len > 65533 or
@@ -91,7 +107,7 @@ pub fn encode(a: A, state: feeds.State, page: history.Page, relation: relation_v
     }
     const end_lsn = std.math.add(u64, slot.next_lsn, bytes) catch return error.InvalidPgSpool;
     const commit_lsn: output.Lsn = @fromBackingInt(end_lsn - 26);
-    const time = try output.postgresTime(header.committed_at_ns);
+    const time = try output.postgresTime(commit_time_ns);
     const staged = for (state.cursors) |receipt| {
         if (std.meta.eql(receipt.before, slot.mapped_cursor)) break receipt;
     } else null;
@@ -107,7 +123,7 @@ pub fn encode(a: A, state: feeds.State, page: history.Page, relation: relation_v
     var candidate: upload.Candidate = .{
         .delivery = .{ .sequence = sequence, .before = slot.mapped_cursor, .cursor = @splat(0), .authority = @splat(0), .issued_at = original_issued_at, .advances = advances },
         .projection = binding.projection,
-        .completion = feeds.hash(.{ .domain = "antfly:pgoutput-root-local-completion:v1", .header = header, .events = page.events }),
+        .completion = if (page.completion) |proof| proof.certificate_digest else feeds.hash(.{ .domain = "antfly:pgoutput-root-local-completion:v1", .header = header, .events = page.events }),
         .wire = hash.final(),
         .messages = @intCast(messages.len),
         .visible_events = @intCast(page.events.len),
@@ -159,12 +175,12 @@ pub fn Producer(comptime Policy: type) type {
             var relation_arena = std.heap.ArenaAllocator.init(a);
             defer relation_arena.deinit();
             const relation = try self.policy.relation(relation_arena.allocator(), state, header, request);
-            if (now >= state.expires_at or now < state.created_at or header.committed_at_ns <= 0)
+            if (now >= state.expires_at or now < state.created_at)
                 return error.ChangefeedResynchronizationRequired;
             // Preflight runs again before an issue receipt exists. Tie its
             // timestamp to immutable source evidence so crossing a clock
             // tick cannot move the cursor between prepare and verify.
-            const commit_seconds = @as(u64, @intCast(header.committed_at_ns)) / std.time.ns_per_s;
+            const commit_seconds = @as(u64, @intCast(try commitTime(page))) / std.time.ns_per_s;
             const issued_at = @max(state.created_at, commit_seconds);
             var encoded = try encode(a, state, page, relation, issued_at, self.byte_limit);
             errdefer encoded.deinit();
@@ -261,6 +277,17 @@ pub fn testRetainedTransaction() !void {
         .caught_up = true,
     };
     const relation: relation_values.HistoricalRelation = .{ .oid = 42, .namespace = "public", .name = "rows", .identity = .default, .key_ordinals = &.{0} };
+    {
+        var coordinated = page;
+        coordinated.header.?.transaction_scope = .coordinated;
+        coordinated.header.?.committed_at_ns = 0;
+        try std.testing.expectError(error.ReadUnavailable, encode(a, state, coordinated, relation, 111, 1024));
+        coordinated.completion = .{ .certificate_digest = @splat(8), .commit_version = 946684801000000000 };
+        var qualified = try encode(a, state, coordinated, relation, 111, 1024);
+        defer qualified.deinit();
+        try std.testing.expectEqual(@as(i64, 1_000_000), qualified.candidate.commit_time);
+        try std.testing.expectEqual(coordinated.completion.?.certificate_digest, qualified.candidate.completion);
+    }
     var first = try encode(a, state, page, relation, 111, 1024);
     defer first.deinit();
     state = try (feeds.Mutation{ .issue = first.candidate.delivery }).apply(scratch, state, .{ .incarnation = @splat(4), .sequence = 5 });

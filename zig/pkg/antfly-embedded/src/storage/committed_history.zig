@@ -412,6 +412,50 @@ pub fn readCompletionPublication(a: A, txn: anytype, physical_namespace: frame.N
     return CompletionPublicationObservation.init(query, cut, try completionPublication(a, txn, physical_namespace, physical_root_generation, query.owner, raw, cut, false, false));
 }
 
+pub const FrameCompletion = struct {
+    certificate_digest: frame.Digest,
+    commit_version: u64,
+};
+
+/// Qualify the exact frame against its retained all-participant certificate
+/// under the same read transaction that supplied the authenticated descriptor.
+/// The caller decides which effects belong to the subscription.
+pub fn readFrameCompletion(a: A, txn: anytype, root_generation: u64, header: frame.Header, descriptor: frame.Descriptor) !?FrameCompletion {
+    if (header.transaction_scope != .coordinated or !std.mem.eql(u8, &header.namespace, &descriptor.namespace) or
+        header.sequence != descriptor.sequence) return error.InvalidHistoryAdmission;
+    const raw = (try optional(txn, &completionCertificateKey(header.transaction_id))) orelse {
+        if (try optional(txn, &completionRetainedKey(header.transaction_id)) != null) return error.HistoryCorrupt;
+        return null;
+    };
+    var parsed = try completion.parse(a, raw);
+    defer parsed.deinit();
+    const certificate = parsed.value.certificate;
+    const manifest = certificate.manifest;
+    if (!std.mem.eql(u8, &manifest.transaction_id, &header.transaction_id)) return error.HistoryCorrupt;
+    const owner = try manifest.admission().recoveryOwner(header.namespace);
+    const acknowledgement = try readCompletionPublication(a, txn, header.namespace, root_generation, .{
+        .version = 1,
+        .owner = owner,
+        .transaction_id = header.transaction_id,
+        .manifest_digest = manifest.digest(),
+        .commit_version = manifest.commit_version,
+        .minimum_applied_index = 1,
+    });
+    const publication = acknowledgement.publication orelse return error.HistoryCorrupt;
+    for (certificate.resolutions) |resolution| {
+        if (!std.mem.eql(u8, &resolution.namespace, &header.namespace)) continue;
+        const effects = switch (resolution.outcome) {
+            .effects => |effects| effects,
+            .no_effect => return error.HistoryCorrupt,
+        };
+        if (effects.sequence != header.sequence or
+            !std.mem.eql(u8, &effects.frame_digest, &frame.digest(descriptor.raw)) or
+            !std.mem.eql(u8, &resolution.source_position, &header.source_position)) return error.HistoryCorrupt;
+        return .{ .certificate_digest = publication.digest, .commit_version = manifest.commit_version };
+    }
+    return error.HistoryCorrupt;
+}
+
 fn completionPublication(a: A, txn: anytype, physical_namespace: frame.Namespace, physical_root_generation: u64, owner: completion.RoutedOwner, raw: []const u8, position: CompletionPublicationPosition, allow_create: bool, comptime writable: bool) !CompletionPublication {
     try owner.validate();
     if (position.term == 0 or position.index == 0) return error.InvalidHistoryAdmission;
@@ -877,4 +921,23 @@ pub fn ChunkSource(comptime Txn: type) type {
             return .{ .context = self, .read = get };
         }
     };
+}
+
+test "native history consumer control coordinated frame completion distinguishes absent evidence from a corrupt publication" {
+    const Store = struct {
+        retained_only: bool = false,
+
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            if (self.retained_only and std.mem.startsWith(u8, key, completion_retained_prefix)) return "invalid retained record";
+            return error.NotFound;
+        }
+    };
+    var store: Store = .{};
+    const header: frame.Header = .{ .namespace = @splat(1), .sequence = 7, .transaction_id = @splat(2), .transaction_scope = .coordinated };
+    var descriptor: frame.Descriptor = .{ .raw = "", .namespace = header.namespace, .sequence = header.sequence, .total = 0, .count = 0, .events = 0 };
+    try std.testing.expectEqual(null, try readFrameCompletion(std.testing.allocator, &store, 1, header, descriptor));
+    store.retained_only = true;
+    try std.testing.expectError(error.HistoryCorrupt, readFrameCompletion(std.testing.allocator, &store, 1, header, descriptor));
+    descriptor.sequence += 1;
+    try std.testing.expectError(error.InvalidHistoryAdmission, readFrameCompletion(std.testing.allocator, &store, 1, header, descriptor));
 }

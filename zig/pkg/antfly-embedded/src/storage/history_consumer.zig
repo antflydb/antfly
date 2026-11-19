@@ -43,6 +43,22 @@ pub const Grant = struct {
     /// Authorization/projection generation, independent of root retention revision.
     policy_revision: u64,
     limit: u64 = history.default_limit,
+    /// Establish the timestamped row-write protocol before recording the cut.
+    require_commit_clock: bool = false,
+
+    pub fn jsonStringify(self: Grant, jw: anytype) !void {
+        try jw.beginObject();
+        inline for (.{ "namespace", "authority", "sequence", "consumer", "definition", "expires_at_seconds", "policy_revision", "limit" }) |field| {
+            try jw.objectField(field);
+            try jw.write(@field(self, field));
+        }
+        if (self.require_commit_clock) {
+            try jw.objectField("require_commit_clock");
+            try jw.write(true);
+        }
+        try jw.endObject();
+    }
+
     pub fn validate(self: Grant) !void {
         if (!nonzero(self.namespace) or !nonzero(self.authority) or self.sequence == 0 or !nonzero(self.consumer) or !nonzero(self.definition) or self.expires_at_seconds == 0 or self.policy_revision == 0) return error.InvalidHistoryAdmission;
     }

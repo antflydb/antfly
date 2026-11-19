@@ -143,11 +143,13 @@ pub const Source = struct {
             .now_seconds = now,
             .max_events = max_events_per_page,
             .max_bytes = history.pages.max_source_bytes,
+            .include_completion = true,
         } };
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
         const scratch = arena.allocator();
         var header: ?frame.Header = null;
+        var completion: @FieldType(history.pages.Page, "completion") = null;
         var header_digest: control.Digest = undefined;
         var events: []frame.Event = &.{};
         var bytes: usize = 0;
@@ -164,17 +166,22 @@ pub const Source = struct {
                 arena.deinit();
                 return null;
             };
-            if (current.transaction_scope != .root_local) return error.ChangefeedCapabilityUnsupported;
+            switch (current.transaction_scope) {
+                .root_local => {},
+                .coordinated => if (page.completion == null) return error.ReadUnavailable,
+                .unknown => return error.ChangefeedCapabilityUnsupported,
+            }
             const digest = control.hash(current);
             if (header == null) {
                 header = current;
+                completion = page.completion;
                 header.?.schema_before = try duplicateOptional(scratch, current.schema_before);
                 header.?.schema_after = try duplicateOptional(scratch, current.schema_after);
                 header_digest = digest;
                 events = try scratch.alloc(frame.Event, page.frame_events);
                 bytes = (if (current.schema_before) |value| value.len else 0) +
                     (if (current.schema_after) |value| value.len else 0);
-            } else if (!std.meta.eql(digest, header_digest) or page.frame_events != events.len) {
+            } else if (!std.meta.eql(digest, header_digest) or page.frame_events != events.len or !std.meta.eql(completion, page.completion)) {
                 return error.ChangefeedResynchronizationRequired;
             }
             for (page.events, page.first_ordinal..) |event, index| {
@@ -192,7 +199,7 @@ pub const Source = struct {
             if (page.next.event == 0) {
                 _ = try frame.encodedLength(header.?, events);
                 try self.validate(a, state, root.namespace, root.fence, root.table_name, context);
-                return .{ .arena = arena, .header = header, .events = events, .frame_events = page.frame_events, .next = page.next, .observed_latest = latest, .caught_up = page.caught_up };
+                return .{ .arena = arena, .header = header, .completion = completion, .events = events, .frame_events = page.frame_events, .next = page.next, .observed_latest = latest, .caught_up = page.caught_up };
             }
             input.request.after = page.next;
         }
@@ -288,6 +295,7 @@ pub fn enrollRoot(client: *MetadataClient, policy: anytype, a: A, state: control
             .sequence = item.grant_sequence,
             .expires_at_seconds = state.expires_at,
             .policy_revision = policy_revision,
+            .require_commit_clock = state.definition.?.tables[0].contract == .native_relational,
         } },
     }, context);
 }

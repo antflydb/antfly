@@ -3075,7 +3075,7 @@ pub const ApiHttpClient = struct {
         var response = self.executeRequest(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .headers = &.{
             .{ .name = route_metadata_api.catalog_route_fence_header, .value = encoded_fence },
             .{ .name = route_metadata_api.catalog_route_deadline_ms_header, .value = budget },
-        }, .timeout_ms = timeout, .cancellation = &cancellation, .max_response_bytes = contract.wire.prefix_bytes + @as(usize, input.request.max_bytes) }) catch |err| return switch (err) {
+        }, .timeout_ms = timeout, .cancellation = &cancellation, .max_response_bytes = contract.wire.prefixSize(input.request) + @as(usize, input.request.max_bytes) }) catch |err| return switch (err) {
             error.OutOfMemory, error.Canceled, error.Cancelled, error.DeadlineExceeded => err,
             else => error.ReadUnavailable,
         };

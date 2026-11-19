@@ -39,10 +39,25 @@ pub const Request = struct {
     /// descriptor and result-struct overhead. A large event requires an explicit
     /// larger budget; it is never allocated before this limit is checked.
     max_bytes: u32 = 1024 * 1024,
+    include_completion: bool = false,
+
+    pub fn jsonStringify(self: Request, jw: anytype) !void {
+        try jw.beginObject();
+        inline for (.{ "reference", "after", "now_seconds", "max_events", "max_bytes" }) |field| {
+            try jw.objectField(field);
+            try jw.write(@field(self, field));
+        }
+        if (self.include_completion) {
+            try jw.objectField("include_completion");
+            try jw.write(true);
+        }
+        try jw.endObject();
+    }
 };
 pub const Page = struct {
     arena: std.heap.ArenaAllocator,
     header: ?frame.Header = null,
+    completion: ?history.FrameCompletion = null,
     events: []const frame.Event = &.{},
     first_ordinal: u32 = 0,
     frame_events: u32 = 0,
@@ -58,6 +73,11 @@ pub const Page = struct {
 /// page-owned, so neither transaction teardown nor backend scratch reuse can
 /// invalidate them. Descriptor and chunk buffers have independent ownership.
 pub fn read(a: std.mem.Allocator, txn: anytype, request: Request) !Page {
+    return readWithCompletion(a, txn, request, null);
+}
+
+pub fn readWithCompletion(a: std.mem.Allocator, txn: anytype, request: Request, root_generation: ?u64) !Page {
+    if (request.include_completion and root_generation == null) return error.ChangefeedCapabilityUnsupported;
     if (request.now_seconds == 0 or request.max_events == 0 or request.max_events > 1024 or request.max_bytes == 0 or request.max_bytes > frame.max_bytes) return error.InvalidHistoryAdmission;
     const consumer = try control.inspect(txn, request.reference);
     if (request.now_seconds >= consumer.expires_at_seconds or request.after.sequence < consumer.acknowledged) return error.HistoryResynchronizationRequired;
@@ -78,6 +98,10 @@ pub fn read(a: std.mem.Allocator, txn: anytype, request: Request) !Page {
     defer chunks.deinit();
     var reader: frame.Reader = .{ .descriptor = descriptor, .source = chunks.source() };
     const header = try reader.seek(scratch, request.after.event);
+    const completion = if (request.include_completion and header.transaction_scope == .coordinated)
+        try history.readFrameCompletion(a, txn, root_generation.?, header, descriptor)
+    else
+        null;
     const capacity = @min(request.max_events, descriptor.events - request.after.event);
     const events = try scratch.alloc(frame.Event, capacity);
     var bytes: u32 = header_bytes;
@@ -95,5 +119,5 @@ pub fn read(a: std.mem.Allocator, txn: anytype, request: Request) !Page {
     }
     const complete = request.after.event + count == descriptor.events;
     const next: Position = if (complete) .{ .sequence = descriptor.sequence } else .{ .sequence = request.after.sequence, .event = request.after.event + count };
-    return .{ .arena = arena, .header = header, .events = events[0..count], .first_ordinal = request.after.event, .frame_events = descriptor.events, .next = next, .observed_latest = native.latest, .caught_up = complete and descriptor.sequence == native.latest };
+    return .{ .arena = arena, .header = header, .completion = completion, .events = events[0..count], .first_ordinal = request.after.event, .frame_events = descriptor.events, .next = next, .observed_latest = native.latest, .caught_up = complete and descriptor.sequence == native.latest };
 }

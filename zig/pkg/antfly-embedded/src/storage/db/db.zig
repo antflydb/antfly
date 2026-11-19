@@ -26679,7 +26679,7 @@ pub const DB = struct {
         if (!std.mem.eql(u8, &namespace, &request.reference.namespace)) return error.HistoryResynchronizationRequired;
         _ = try @import("../source_authority.zig").require(&txn, kind, namespace);
         if (kind == .raft) _ = try orderedHistoryReadCut(&txn, minimum_applied_index);
-        return @import("../history_page.zig").read(allocator, &txn, request);
+        return @import("../history_page.zig").readWithCompletion(allocator, &txn, request, if (kind == .raft) self.core.root_generation else null);
     }
 
     pub fn nativeHistoryGrant(self: *DB, requested: @import("../history_consumer.zig").GrantIdentity) !@import("../history_consumer.zig").GrantObservation {

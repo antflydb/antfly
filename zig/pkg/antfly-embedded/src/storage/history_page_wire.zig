@@ -19,7 +19,16 @@ const std = @import("std");
 const pages = @import("history_page.zig");
 const frame = @import("committed_frame.zig");
 pub const prefix_bytes = 96;
-pub const max_bytes = prefix_bytes + frame.max_bytes;
+const completion_bytes = 40;
+pub const max_bytes = prefix_bytes + completion_bytes + frame.max_bytes;
+
+pub fn prefixSize(request: pages.Request) usize {
+    return prefix_bytes + if (request.include_completion) @as(usize, completion_bytes) else 0;
+}
+
+fn magic(request: pages.Request) *const [4]u8 {
+    return if (request.include_completion) "HPG2" else "HPG1";
+}
 pub const OrderedRead = struct { request: pages.Request, minimum_applied_index: u64 };
 
 fn checksum(prefix: []const u8, payload: []const u8, request: pages.Request) [32]u8 {
@@ -41,6 +50,11 @@ fn checksum(prefix: []const u8, payload: []const u8, request: pages.Request) [32
 pub fn validate(page: pages.Page, request: pages.Request) !void {
     if (request.max_events == 0 or request.max_events > 1024 or request.max_bytes == 0 or request.max_bytes > frame.max_bytes) return error.InvalidHistoryAdmission;
     if (page.events.len > request.max_events or page.first_ordinal != request.after.event) return error.HistoryCorrupt;
+    if (page.completion) |proof| {
+        const header = page.header orelse return error.HistoryCorrupt;
+        if (!request.include_completion or header.transaction_scope != .coordinated or
+            std.mem.allEqual(u8, &proof.certificate_digest, 0) or proof.commit_version == 0) return error.HistoryCorrupt;
+    }
     if (page.header) |header| {
         if (!std.mem.eql(u8, &header.namespace, &request.reference.namespace) or request.after.sequence == std.math.maxInt(u64) or
             header.sequence != request.after.sequence + 1 or header.sequence > page.observed_latest or
@@ -59,9 +73,14 @@ pub fn encode(a: std.mem.Allocator, page: pages.Page, request: pages.Request) ![
     const payload = if (page.header) |header| try frame.encode(a, header, page.events) else null;
     defer if (payload) |bytes| a.free(bytes);
     const size = if (payload) |bytes| bytes.len else 0;
-    const out = try a.alloc(u8, prefix_bytes + size);
-    @memset(out[0..prefix_bytes], 0);
-    @memcpy(out[0..4], "HPG1");
+    const prefix = prefixSize(request);
+    const out = try a.alloc(u8, prefix + size);
+    @memset(out[0..prefix], 0);
+    @memcpy(out[0..4], magic(request));
+    if (page.completion) |proof| {
+        @memcpy(out[96..128], &proof.certificate_digest);
+        std.mem.writeInt(u64, out[128..136], proof.commit_version, .little);
+    }
     out[4] = @intFromBool(page.header != null);
     out[5] = @intFromBool(page.caught_up);
     std.mem.writeInt(u32, out[8..12], page.first_ordinal, .little);
@@ -70,24 +89,28 @@ pub fn encode(a: std.mem.Allocator, page: pages.Page, request: pages.Request) ![
     std.mem.writeInt(u32, out[24..28], page.next.event, .little);
     std.mem.writeInt(u32, out[28..32], @intCast(size), .little);
     std.mem.writeInt(u64, out[32..40], page.observed_latest, .little);
-    if (payload) |bytes| @memcpy(out[prefix_bytes..], bytes);
+    if (payload) |bytes| @memcpy(out[prefix..], bytes);
     @memcpy(out[64..96], &checksum(out[0..64], out[prefix_bytes..], request));
     return out;
 }
 
 pub fn decode(a: std.mem.Allocator, raw: []const u8, request: pages.Request) !pages.Page {
     if (request.max_events == 0 or request.max_events > 1024 or request.max_bytes == 0 or request.max_bytes > frame.max_bytes) return error.InvalidHistoryAdmission;
-    if (raw.len < prefix_bytes or raw.len > prefix_bytes + @as(usize, request.max_bytes) or
-        !std.mem.eql(u8, raw[0..4], "HPG1") or raw[4] > 1 or raw[5] > 1 or
+    const prefix = prefixSize(request);
+    if (raw.len < prefix or raw.len > prefix + @as(usize, request.max_bytes) or
+        !std.mem.eql(u8, raw[0..4], magic(request)) or raw[4] > 1 or raw[5] > 1 or
         !std.mem.allEqual(u8, raw[6..8], 0) or !std.mem.allEqual(u8, raw[40..64], 0) or
-        std.mem.readInt(u32, raw[28..32], .little) != raw.len - prefix_bytes or
+        std.mem.readInt(u32, raw[28..32], .little) != raw.len - prefix or
         !std.mem.eql(u8, raw[64..96], &checksum(raw[0..64], raw[prefix_bytes..], request))) return error.HistoryCorrupt;
     var arena = std.heap.ArenaAllocator.init(a);
     errdefer arena.deinit();
     const scratch = arena.allocator();
     var page: pages.Page = .{ .arena = arena, .first_ordinal = std.mem.readInt(u32, raw[8..12], .little), .frame_events = std.mem.readInt(u32, raw[12..16], .little), .next = .{ .sequence = std.mem.readInt(u64, raw[16..24], .little), .event = std.mem.readInt(u32, raw[24..28], .little) }, .observed_latest = std.mem.readInt(u64, raw[32..40], .little), .caught_up = raw[5] == 1 };
+    if (request.include_completion and !std.mem.allEqual(u8, raw[96..136], 0)) {
+        page.completion = .{ .certificate_digest = raw[96..128].*, .commit_version = std.mem.readInt(u64, raw[128..136], .little) };
+    }
     if (raw[4] == 1) {
-        const payload = raw[prefix_bytes..];
+        const payload = raw[prefix..];
         if (payload.len < 112) return error.HistoryCorrupt;
         const count = std.mem.readInt(u32, payload[96..100], .little);
         if (count == 0 or count > request.max_events or request.after.sequence == std.math.maxInt(u64)) return error.HistoryCorrupt;
@@ -109,7 +132,7 @@ pub fn decode(a: std.mem.Allocator, raw: []const u8, request: pages.Request) !pa
         for (events) |*event| event.* = (reader.next(scratch) catch |err| return if (err == error.OutOfMemory) err else error.HistoryCorrupt) orelse return error.HistoryCorrupt;
         if (try reader.next(scratch) != null) return error.HistoryCorrupt;
         page.events = events;
-    } else if (raw.len != prefix_bytes) return error.HistoryCorrupt;
+    } else if (raw.len != prefix) return error.HistoryCorrupt;
     validate(page, request) catch return error.HistoryCorrupt;
     // ArenaAllocator is a value: publish its current state after allocations.
     page.arena = arena;
@@ -132,6 +155,37 @@ fn roundTrip(a: std.mem.Allocator) !void {
     try std.testing.expectEqual(page.frame_events, decoded.frame_events);
 }
 
+fn completionRoundTrip() !void {
+    const a = std.testing.allocator;
+    const request: pages.Request = .{
+        .reference = .{ .namespace = @splat(1), .authority = @splat(2), .consumer = @splat(3), .epoch = 4, .grant = 5, .definition = @splat(6) },
+        .after = .{ .sequence = 4 },
+        .now_seconds = 10,
+        .include_completion = true,
+    };
+    const page: pages.Page = .{
+        .arena = undefined,
+        .header = .{ .namespace = @splat(1), .sequence = 5, .transaction_id = @splat(7), .transaction_scope = .coordinated },
+        .completion = .{ .certificate_digest = @splat(8), .commit_version = 12 },
+        .events = &.{.{ .key = "key", .before = null, .after = "value" }},
+        .frame_events = 1,
+        .next = .{ .sequence = 5 },
+        .observed_latest = 5,
+        .caught_up = true,
+    };
+    const raw = try encode(a, page, request);
+    defer a.free(raw);
+    var decoded = try decode(a, raw, request);
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(page.completion, decoded.completion);
+    var legacy = request;
+    legacy.include_completion = false;
+    try std.testing.expectError(error.HistoryCorrupt, decode(a, raw, legacy));
+    try std.testing.expectError(error.HistoryCorrupt, encode(a, page, legacy));
+    raw[prefix_bytes] ^= 1;
+    try std.testing.expectError(error.HistoryCorrupt, decode(a, raw, request));
+}
+
 pub const test_support = if (@import("builtin").is_test) struct {
     pub fn allocationFailures() !void {
         try roundTrip(std.testing.allocator);
@@ -139,6 +193,7 @@ pub const test_support = if (@import("builtin").is_test) struct {
     }
 
     pub fn malformedPages() !void {
+        try completionRoundTrip();
         const a = std.testing.allocator;
         const request: pages.Request = .{ .reference = .{ .namespace = @splat(1), .authority = @splat(2), .consumer = @splat(3), .epoch = 4, .grant = 5, .definition = @splat(6) }, .after = .{ .sequence = 4 }, .now_seconds = 10 };
         var arena = std.heap.ArenaAllocator.init(a);

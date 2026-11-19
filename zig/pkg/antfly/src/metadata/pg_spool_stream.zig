@@ -119,6 +119,10 @@ pub const Owner = struct {
         _ = try slot.restartAt(requested);
         try registry.qualify(before.value, config.require_shared, request);
         const expires = @min(before.value.expires_at, now +| config.lease_seconds);
+        if (slot.session) |current_session| {
+            if (now < slot.session_expires_at and !same(current_session.actor, actor))
+                return error.ReplicationSlotActive;
+        }
         try mutate(svc, a, before.value, .{ .acquire = .{ .actor = actor, .expected = slot.fence, .now = now, .expires = @max(slot.session_expires_at, expires) } }, request);
         var acquired = try load(svc, a, id, request);
         defer acquired.deinit();
@@ -126,7 +130,8 @@ pub const Owner = struct {
         const session = acquired.value.slot.?.session orelse return error.ChangefeedConflict;
         if (!same(session.actor, actor)) return error.ChangefeedConflict;
         try acquired.value.slot.?.verifySession(session, acquired_now);
-        try mutate(svc, a, acquired.value, .{ .bind = .{ .session = session, .now = acquired_now, .binding = binding } }, request);
+        if (acquired.value.slot.?.binding == null)
+            try mutate(svc, a, acquired.value, .{ .bind = .{ .session = session, .now = acquired_now, .binding = binding } }, request);
         var observed = try load(svc, a, id, request);
         defer observed.deinit();
         const observed_now = try active(policy, observed.value, binding, request);
