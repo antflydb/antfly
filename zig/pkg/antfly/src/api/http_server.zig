@@ -26159,6 +26159,7 @@ pub const ApiHttpServer = struct {
             state.pending_observation = null;
             state.pending_index_groups = null;
             state.pending_document_pages = null;
+            state.document_page_retry_at_millis = null;
             state.resume_document_page = false;
             state.observe_index_groups = null;
             state.result.terminal_error = null;

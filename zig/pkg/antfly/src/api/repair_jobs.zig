@@ -118,6 +118,8 @@ pub const JobState = struct {
     observe_index_groups: ?[]const u64 = null,
     /// Parked document cursors, excluding the cursor currently being resumed.
     pending_document_pages: ?[]const []const u8 = null,
+    /// Aligned with pending_document_pages. Legacy cursors are ready now.
+    document_page_retry_at_millis: ?[]const u64 = null,
     resume_document_page: bool = false,
     repair_groups: ?u64 = null,
     result: db_mod.types.ArtifactRepairResult = .{},
@@ -427,6 +429,7 @@ pub const Store = struct {
                 .pending_index_groups = current.pending_index_groups,
                 .observe_index_groups = current.observe_index_groups,
                 .pending_document_pages = null,
+                .document_page_retry_at_millis = null,
                 .resume_document_page = false,
                 .repair_groups = current.repair_groups,
                 .control = current.control,
@@ -461,6 +464,7 @@ pub const Store = struct {
             .pending_index_groups = previous.pending_index_groups,
             .observe_index_groups = previous.observe_index_groups,
             .pending_document_pages = previous.pending_document_pages,
+            .document_page_retry_at_millis = previous.document_page_retry_at_millis,
             .resume_document_page = previous.resume_document_page,
             .repair_groups = previous.repair_groups,
             .control = previous.control,
@@ -516,6 +520,7 @@ pub const Store = struct {
             .pending_index_groups = current.pending_index_groups,
             .observe_index_groups = current.observe_index_groups,
             .pending_document_pages = current.pending_document_pages,
+            .document_page_retry_at_millis = current.document_page_retry_at_millis,
             .resume_document_page = current.resume_document_page,
             .repair_groups = current.repair_groups,
             .control = current.control,
@@ -553,6 +558,7 @@ pub const Store = struct {
             previous.pending_index_groups = null;
             previous.observe_index_groups = null;
             previous.pending_document_pages = null;
+            previous.document_page_retry_at_millis = null;
             previous.resume_document_page = false;
             previous.cursor = null;
             // Failures from the retired topology cannot describe the current
@@ -580,11 +586,30 @@ pub const Store = struct {
                 if (std.mem.indexOfScalar(u64, pending_groups.items, group) == null) try pending_groups.append(alloc, group);
             }
         }
+        const now_ms = nowMillis();
         var document_pages: std.ArrayList([]const u8) = .empty;
         defer document_pages.deinit(alloc);
-        if (previous.pending_document_pages) |pages| try document_pages.appendSlice(alloc, pages);
+        var page_retry_times: std.ArrayList(u64) = .empty;
+        defer page_retry_times.deinit(alloc);
+        if (previous.pending_document_pages) |pages| {
+            try document_pages.appendSlice(alloc, pages);
+            if (previous.document_page_retry_at_millis) |times| {
+                try page_retry_times.appendSlice(alloc, times);
+            } else {
+                try page_retry_times.appendNTimes(alloc, 0, pages.len);
+            }
+        }
         if (pass.pending_document_pages) |pages| {
-            for (pages) |page| try document_pages.append(alloc, page);
+            for (pages) |page| {
+                const still_pending = previous.resume_document_page and pass.in_progress != 0 and
+                    std.mem.eql(u8, previous.cursor orelse "", page);
+                const retry_at = if (previous.auto_advance == true and still_pending)
+                    now_ms +| repairObservationDelayMs(previous.job_id)
+                else
+                    0;
+                try document_pages.append(alloc, page);
+                try page_retry_times.append(alloc, retry_at);
+            }
         }
         const tracks_groups = pass.pending_index_groups != null or previous.observe_index_groups != null or previous.pending_index_groups != null;
         var pending_observation = previous.pending_observation;
@@ -594,13 +619,22 @@ pub const Store = struct {
         }
         const revisit = !pass.has_more and pending_observation != null;
         const resume_document_page = !pass.has_more and !revisit and document_pages.items.len != 0;
+        var document_retry_at: u64 = 0;
+        const document_cursor: ?[]const u8 = if (resume_document_page) blk: {
+            var earliest: usize = 0;
+            for (page_retry_times.items, 0..) |retry_at, index| {
+                if (retry_at < page_retry_times.items[earliest]) earliest = index;
+            }
+            document_retry_at = page_retry_times.orderedRemove(earliest);
+            break :blk document_pages.orderedRemove(earliest);
+        } else null;
         const observe_groups = !pass.has_more and !revisit and !resume_document_page and pending_groups.items.len != 0;
         const rewind_cursor = if (revisit) blk: {
             const cursor = pending_observation.?.cursor orelse break :blk null;
             break :blk try alloc.dupe(u8, cursor);
         } else null;
         defer if (rewind_cursor) |cursor| alloc.free(cursor);
-        const next_cursor = if (revisit or observe_groups) rewind_cursor else if (resume_document_page) document_pages.items[0] else pass.next_cursor;
+        const next_cursor = if (revisit or observe_groups) rewind_cursor else if (resume_document_page) document_cursor else pass.next_cursor;
 
         var total = previous.result;
         total.scanned +|= pass.scanned;
@@ -637,7 +671,7 @@ pub const Store = struct {
         total.has_more = pass.has_more or revisit or observe_groups or resume_document_page;
         // A later page may succeed while documents on an earlier page still
         // failed. Keep that outcome when the traversal reaches its last page.
-        total.debt_remaining = pass.debt_remaining or pending_observation != null or pending_groups.items.len != 0 or document_pages.items.len != 0 or (previous.control == null and
+        total.debt_remaining = pass.debt_remaining or pending_observation != null or pending_groups.items.len != 0 or resume_document_page or document_pages.items.len != 0 or (previous.control == null and
             (total.failed != 0 or total.unsupported != 0 or total.missing_source_docs != 0));
         total.next_cursor = if (next_cursor) |value| @constCast(value) else null;
         total.pending_index_groups = null;
@@ -673,7 +707,6 @@ pub const Store = struct {
             "repair_debt_remaining"
         else
             null;
-        const now_ms = nowMillis();
 
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -697,6 +730,7 @@ pub const Store = struct {
                 .pending_index_groups = current.pending_index_groups,
                 .observe_index_groups = current.observe_index_groups,
                 .pending_document_pages = null,
+                .document_page_retry_at_millis = null,
                 .resume_document_page = false,
                 .repair_groups = current.repair_groups,
                 .control = current.control,
@@ -732,7 +766,8 @@ pub const Store = struct {
             .pending_observation = if (final_phase == .queued and !revisit) pending_observation else null,
             .pending_index_groups = if (final_phase == .queued and !observe_groups and pending_groups.items.len != 0) pending_groups.items else null,
             .observe_index_groups = if (final_phase != .queued) null else if (observe_groups) pending_groups.items else previous.observe_index_groups,
-            .pending_document_pages = if (final_phase != .queued or document_pages.items.len == @intFromBool(resume_document_page)) null else document_pages.items[@intFromBool(resume_document_page)..],
+            .pending_document_pages = if (final_phase == .queued and document_pages.items.len != 0) document_pages.items else null,
+            .document_page_retry_at_millis = if (final_phase == .queued and page_retry_times.items.len != 0) page_retry_times.items else null,
             .resume_document_page = final_phase == .queued and resume_document_page,
             .repair_groups = pass.repair_groups orelse previous.repair_groups,
             .control = previous.control,
@@ -749,7 +784,11 @@ pub const Store = struct {
             .result = total,
             .last_error = final_last_error,
             .cancel_requested = cancel_requested,
-            .next_retry_at_millis = if (previous.auto_advance == true and final_phase == .queued and (revisit or observe_groups or (retryable_in_progress and (stationary_page or (previous.resume_document_page and resume_document_page)))))
+            .next_retry_at_millis = if (previous.auto_advance != true or final_phase != .queued)
+                0
+            else if (resume_document_page)
+                document_retry_at
+            else if (revisit or observe_groups or (retryable_in_progress and stationary_page))
                 now_ms +| repairObservationDelayMs(previous.job_id)
             else
                 0,
@@ -801,6 +840,7 @@ pub const Store = struct {
             .pending_index_groups = current.pending_index_groups,
             .observe_index_groups = current.observe_index_groups,
             .pending_document_pages = current.pending_document_pages,
+            .document_page_retry_at_millis = current.document_page_retry_at_millis,
             .resume_document_page = current.resume_document_page,
             .repair_groups = current.repair_groups,
             .control = current.control,
@@ -852,6 +892,7 @@ pub const Store = struct {
             .pending_index_groups = current.pending_index_groups,
             .observe_index_groups = current.observe_index_groups,
             .pending_document_pages = current.pending_document_pages,
+            .document_page_retry_at_millis = current.document_page_retry_at_millis,
             .resume_document_page = current.resume_document_page,
             .repair_groups = current.repair_groups,
             .control = current.control,
@@ -904,6 +945,7 @@ pub const Store = struct {
             .pending_index_groups = current.pending_index_groups,
             .observe_index_groups = current.observe_index_groups,
             .pending_document_pages = if (durable_cancel) null else current.pending_document_pages,
+            .document_page_retry_at_millis = if (durable_cancel) null else current.document_page_retry_at_millis,
             .resume_document_page = !durable_cancel and current.resume_document_page,
             .repair_groups = current.repair_groups,
             .control = current.control,
@@ -968,6 +1010,7 @@ pub const Store = struct {
             .pending_index_groups = current.pending_index_groups,
             .observe_index_groups = current.observe_index_groups,
             .pending_document_pages = current.pending_document_pages,
+            .document_page_retry_at_millis = current.document_page_retry_at_millis,
             .resume_document_page = current.resume_document_page,
             .repair_groups = pass.repair_groups orelse current.repair_groups,
             .control = current.control,
@@ -1226,6 +1269,7 @@ pub const Store = struct {
                     .pending_index_groups = parsed.value.pending_index_groups,
                     .observe_index_groups = parsed.value.observe_index_groups,
                     .pending_document_pages = if (durable_cancel) null else parsed.value.pending_document_pages,
+                    .document_page_retry_at_millis = if (durable_cancel) null else parsed.value.document_page_retry_at_millis,
                     .resume_document_page = !durable_cancel and parsed.value.resume_document_page,
                     .repair_groups = parsed.value.repair_groups,
                     .control = parsed.value.control,
@@ -1325,6 +1369,7 @@ pub const Store = struct {
             .pending_index_groups = current.pending_index_groups,
             .observe_index_groups = current.observe_index_groups,
             .pending_document_pages = current.pending_document_pages,
+            .document_page_retry_at_millis = current.document_page_retry_at_millis,
             .resume_document_page = current.resume_document_page,
             .repair_groups = current.repair_groups,
             .control = current.control,
@@ -1412,6 +1457,10 @@ fn validateJobState(state: JobState) !void {
         if (value.len > max_job_string_bytes) return error.InvalidRepairJobState;
     }
     if (state.resume_document_page and state.cursor == null) return error.InvalidRepairJobState;
+    if (state.document_page_retry_at_millis) |times| {
+        const pages = state.pending_document_pages orelse return error.InvalidRepairJobState;
+        if (times.len != pages.len) return error.InvalidRepairJobState;
+    }
     if (state.pending_document_pages) |pages| {
         for (pages) |page| {
             if (page.len == 0 or page.len > max_job_string_bytes) return error.InvalidRepairJobState;
@@ -1912,6 +1961,7 @@ test "durable cancellation scan rotates past a backed off head window" {
             .pending_index_groups = current.pending_index_groups,
             .observe_index_groups = current.observe_index_groups,
             .pending_document_pages = current.pending_document_pages,
+            .document_page_retry_at_millis = current.document_page_retry_at_millis,
             .resume_document_page = current.resume_document_page,
             .repair_groups = current.repair_groups,
             .control = current.control,
@@ -2681,10 +2731,18 @@ test "table index repair rediscovers groups when observation becomes stale" {
 }
 
 test "table repair job dispatches later shards before resuming parked document pages" {
+    try testParkedDocumentPageScheduling(false);
+}
+
+test "table repair job backs off only the parked shard that is still pending" {
+    try testParkedDocumentPageScheduling(true);
+}
+
+fn testParkedDocumentPageScheduling(automatic: bool) !void {
     const alloc = std.testing.allocator;
     var store = Store.init(alloc, .{});
     defer store.deinit();
-    var state = try store.startJob(alloc, "docs", .{ .target = "index", .index = "semantic", .limit = 1, .force = true, .advance = false });
+    var state = try store.startJob(alloc, "docs", .{ .target = "index", .index = "semantic", .limit = 1, .force = true, .advance = automatic });
     defer alloc.free(state);
 
     var shard_one = "1:".*;
@@ -2707,6 +2765,14 @@ test "table repair job dispatches later shards before resuming parked document p
         try std.testing.expectEqualDeep(cursor, current.value.cursor);
         try std.testing.expectEqual(i >= 3, current.value.resume_document_page);
         try std.testing.expectEqual(i < 3, current.value.force);
+
+        if (automatic) {
+            if (i == 5) {
+                try std.testing.expect(current.value.next_retry_at_millis > current.value.last_updated_at_millis);
+                return;
+            }
+            try std.testing.expectEqual(@as(u64, 0), current.value.next_retry_at_millis);
+        }
 
         const claim = try store.beginAdvance(alloc, current.value);
         defer alloc.free(claim.encoded);

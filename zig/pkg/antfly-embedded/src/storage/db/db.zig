@@ -17633,6 +17633,23 @@ pub const DB = struct {
         options: types.ArtifactRepairRunOptions,
         lease_authority: IndexRepairLeaseAuthority,
     ) anyerror!types.ArtifactRepairResult { // explicit: re-enters the artifact repair dispatch
+        if (req.resume_document_repair and req.operator_initiated and req.control == null) {
+            var observation: types.ArtifactRepairResult = .{
+                .limit = if (req.limit == 0) 100 else req.limit,
+                .scanned = 1,
+                .observed_only = true,
+            };
+            var owns_observation = true;
+            defer if (owns_observation) observation.deinit(alloc);
+            try self.observeIndexDocumentRepairs(alloc, req, options, &observation);
+            if (observation.document_replay_in_progress != 0) {
+                // Only poll the existing replay while this page is parked.
+                // Unsupported rows and missing sources are revisited once the
+                // replay settles, so polls do not mutate their diagnostics.
+                owns_observation = false;
+                return observation;
+            }
+        }
         // Operator continuations carry an artifact-ledger cursor. Generation
         // repair has no local cursor and must retain its own request validation.
         var generation_req = req;
@@ -101617,6 +101634,34 @@ test "db managed index repair keeps failed OCR manifests as debt" {
         try std.testing.expect(pending.observed_only and pending.has_more);
         try std.testing.expectEqual(@as(u64, 1), pending.document_replay_in_progress);
         try std.testing.expectEqual(@as(u64, 0), pending.failed);
+        try std.testing.expectEqual(before, db.core.nextEnrichmentSequence());
+
+        var unsupported = issue;
+        unsupported.doc_key = "doc:unsupported";
+        unsupported.artifact_name = "unsupported_units";
+        unsupported.repairable = false;
+        try db.recordArtifactRepairIssue(alloc, unsupported);
+        var resume_request = observation;
+        resume_request.observe_index_repair = false;
+        resume_request.resume_document_repair = true;
+        for (0..2) |_| {
+            var poll = try db.repairArtifactIssuesWithRequestOptions(alloc, resume_request, deferred);
+            defer poll.deinit(alloc);
+            try std.testing.expect(poll.observed_only and poll.has_more);
+            try std.testing.expectEqual(@as(u64, 1), poll.document_replay_in_progress);
+            try std.testing.expectEqual(@as(u64, 0), poll.unsupported);
+        }
+        const checked = try db.listArtifactRepairIssuesPage(alloc, .{ .index_name = "consumer" });
+        defer types.freeArtifactRepairIssues(alloc, checked.issues);
+        defer if (checked.next_cursor) |cursor| alloc.free(cursor);
+        var found_unsupported = false;
+        for (checked.issues) |row| {
+            if (!std.mem.eql(u8, row.doc_key, unsupported.doc_key)) continue;
+            try std.testing.expectEqual(@as(u64, 0), row.attempts);
+            try std.testing.expect(try db.clearArtifactRepairIssueIfCurrent(alloc, row, DB.ArtifactRepairIssueRevision.capture(row)));
+            found_unsupported = true;
+        }
+        try std.testing.expect(found_unsupported);
         try std.testing.expectEqual(before, db.core.nextEnrichmentSequence());
 
         try enrichment_state.saveAppliedSequence(db.core.store, enrichment_runtime_mod.scope_name, 5);

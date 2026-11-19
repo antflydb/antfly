@@ -1010,7 +1010,7 @@ fn mergeArtifactRepairResult(dst: *db_mod.types.ArtifactRepairResult, src: *db_m
 }
 
 fn canRediscoverArtifactRepairGroup(req: db_mod.types.ArtifactRepairRunRequest, err: anyerror) bool {
-    return req.observe_index_repair and switch (err) {
+    return (req.observe_index_repair or req.resume_document_repair) and switch (err) {
         error.NotFound, error.UnknownGroup, error.TableNotFound, error.TopologyChanged => true,
         else => false,
     };
@@ -1099,6 +1099,7 @@ fn artifactRepairRunRequestForShard(
         .repair_cancel_base_uri = req.repair_cancel_base_uri,
         .operator_initiated = req.operator_initiated,
         .observe_index_repair = req.observe_index_repair,
+        .resume_document_repair = req.resume_document_repair,
     };
 }
 
@@ -24500,6 +24501,7 @@ pub const ProvisionedTableWriteSource = struct {
         const group_ids = options.observe_index_groups orelse current_group_ids;
         var pass_request = req;
         pass_request.observe_index_repair = options.observe_index_groups != null;
+        pass_request.resume_document_repair = options.resume_document_page;
         const durable_index_job = req.target == .index and req.repair_job_id != null;
         const track_pending = durable_index_job and req.control == null;
         const repair_groups: ?u64 = if (durable_index_job) routing_fence else null;
@@ -24523,7 +24525,7 @@ pub const ProvisionedTableWriteSource = struct {
             start_cursor = cursor.local_cursor;
         }
 
-        var total = db_mod.types.ArtifactRepairResult{ .limit = req.limit, .observed_only = pass_request.observe_index_repair, .repair_groups = repair_groups };
+        var total = db_mod.types.ArtifactRepairResult{ .limit = req.limit, .observed_only = pass_request.observe_index_repair or options.resume_document_page, .repair_groups = repair_groups };
         errdefer total.deinit(alloc);
         var groups_scanned: usize = 0;
         const traversal = if (options.resume_document_page) group_ids[start_index..][0..1] else group_ids[start_index..];
@@ -27450,6 +27452,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const group_ids = options.observe_index_groups orelse current_group_ids;
         var pass_request = req;
         pass_request.observe_index_repair = options.observe_index_groups != null;
+        pass_request.resume_document_repair = options.resume_document_page;
         const durable_index_job = req.target == .index and req.repair_job_id != null;
         const track_pending = durable_index_job and req.control == null;
         const repair_groups: ?u64 = if (durable_index_job) routing_fence else null;
@@ -27473,7 +27476,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             start_cursor = cursor.local_cursor;
         }
 
-        var total = db_mod.types.ArtifactRepairResult{ .limit = req.limit, .observed_only = pass_request.observe_index_repair, .repair_groups = repair_groups };
+        var total = db_mod.types.ArtifactRepairResult{ .limit = req.limit, .observed_only = pass_request.observe_index_repair or options.resume_document_page, .repair_groups = repair_groups };
         errdefer total.deinit(alloc);
         var repair_cancel_base_uri: ?[]u8 = null;
         defer if (repair_cancel_base_uri) |uri| alloc.free(uri);
@@ -27841,7 +27844,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 options,
             );
         }
-        if (!req.observe_index_repair) self.invalidateManagedCache(table_name);
+        if (!req.observe_index_repair and !req.resume_document_repair) self.invalidateManagedCache(table_name);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
@@ -61290,9 +61293,10 @@ fn implementationTests() type {
                         "{\"scanned\":1,\"indexes_rebuilt\":1}"
                     else
                         return error.UnexpectedHttpRequest;
+                    const stale = std.mem.indexOf(u8, req.body, "\"resume_document_repair\":true") != null;
                     const content_type = try request_alloc.dupe(u8, "application/json");
                     errdefer request_alloc.free(content_type);
-                    return .{ .status = 200, .content_type = content_type, .body = try request_alloc.dupe(u8, body) };
+                    return .{ .status = if (stale) 404 else 200, .content_type = content_type, .body = try request_alloc.dupe(u8, body) };
                 }
             };
 
@@ -61316,6 +61320,18 @@ fn implementationTests() type {
                 try std.testing.expectEqual(@as(usize, 1), result.pending_document_pages.?.len);
                 try std.testing.expectEqualStrings("7001:", result.pending_document_pages.?[0]);
                 try std.testing.expect(result.next_cursor == null);
+
+                // A route can move between the fence check and the shard RPC.
+                var moved = (try source.source().repairArtifactIssuesControlled(alloc, "docs", .{
+                    .target = .index,
+                    .index_name = "text",
+                    .operator_initiated = true,
+                    .repair_job_id = 1,
+                    .repair_job_created_at_ms = 1,
+                    .cursor = result.pending_document_pages.?[0],
+                }, .{ .resume_document_page = true, .expected_repair_groups = result.repair_groups })).?;
+                defer moved.deinit(alloc);
+                try std.testing.expect(moved.observation_changed);
                 return;
             }
 

@@ -4280,6 +4280,7 @@ pub const ArtifactRepairRunRequest = struct {
     /// no model calls.
     operator_initiated: bool = false,
     observe_index_repair: bool = false,
+    resume_document_repair: bool = false,
 };
 
 pub const RepairCancelCheck = struct {
