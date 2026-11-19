@@ -25,6 +25,7 @@ const pg_type_storage = "\x00pg_catalog.pg_type";
 const pg_catalog_oid = 11;
 const pg_namespace_storage = "\x00pg_catalog.pg_namespace";
 const pg_auth_members_storage = "\x00pg_catalog.pg_auth_members";
+const pg_enum_storage = "\x00pg_catalog.pg_enum";
 const pg_roles_storage = "\x00pg_catalog.pg_roles";
 pub const Role = struct {
     name: []const u8,
@@ -35,7 +36,8 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
     const roles = std.mem.eql(u8, name.table, "pg_roles");
     const members = std.mem.eql(u8, name.table, "pg_auth_members");
     const namespaces = std.mem.eql(u8, name.table, "pg_namespace");
-    if (!roles and !members and !namespaces and !std.mem.eql(u8, name.table, pg_type_name)) return null;
+    const enums = std.mem.eql(u8, name.table, "pg_enum");
+    if (!roles and !members and !namespaces and !enums and !std.mem.eql(u8, name.table, pg_type_name)) return null;
     if (name.namespace) |namespace| if (!std.mem.eql(u8, namespace, "pg_catalog")) return null;
     if (name.database) |qualified| if (!std.mem.eql(u8, qualified, database)) return error.Forbidden;
     if (action != .read) return error.SqlReadOnlyTransaction;
@@ -47,6 +49,18 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
         .columns = &.{
             .{ .name = "oid", .path = "oid", .type = .integer, .nullable = false },
             .{ .name = "nspname", .path = "nspname", .type = .string, .nullable = false },
+        },
+    };
+    if (enums) return .{
+        .id = 3501,
+        .physical_name = pg_enum_storage,
+        .schema_version = 1,
+        .scope = .{ .database = database, .namespace = "pg_catalog", .name = "pg_enum", .revision = 1 },
+        .columns = &.{
+            .{ .name = "oid", .path = "oid", .type = .integer, .nullable = false },
+            .{ .name = "enumtypid", .path = "enumtypid", .type = .integer, .nullable = false },
+            .{ .name = "enumsortorder", .path = "enumsortorder", .type = .number, .element_type = .float32, .nullable = false },
+            .{ .name = "enumlabel", .path = "enumlabel", .type = .string, .nullable = false },
         },
     };
     if (members) return .{
@@ -102,7 +116,7 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
 }
 
 pub fn owns(table: catalog.Table) bool {
-    return std.mem.eql(u8, table.physical_name, pg_type_storage) or isRoles(table) or isMemberships(table) or isNamespaces(table);
+    return std.mem.eql(u8, table.physical_name, pg_type_storage) or isRoles(table) or isEmpty(table) or isNamespaces(table);
 }
 
 pub fn isNamespaces(table: catalog.Table) bool {
@@ -192,13 +206,13 @@ pub fn openNamespaces(a: std.mem.Allocator, request: catalog.Scan, items: []cons
     return .{ .ptr = cursor, .next = Namespaces.next, .close = Namespaces.close, .estimated_rows = items.len - start };
 }
 
-pub fn isMemberships(table: catalog.Table) bool {
-    return std.mem.eql(u8, table.physical_name, pg_auth_members_storage);
+/// Antfly's PostgreSQL catalog exposes built-in types and the session's
+/// effective role. It has no enum type declarations or separate role grants.
+pub fn isEmpty(table: catalog.Table) bool {
+    return std.mem.eql(u8, table.physical_name, pg_auth_members_storage) or std.mem.eql(u8, table.physical_name, pg_enum_storage);
 }
 
-/// The session role projects effective Antfly grants. There are no
-/// independently assumable PostgreSQL roles in the projected catalog.
-pub fn openMemberships(context: *anyopaque) catalog.Cursor {
+pub fn openEmpty(context: *anyopaque) catalog.Cursor {
     const Empty = struct {
         fn next(_: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
             return .{ .rows = &.{} };
@@ -418,6 +432,22 @@ test "pgwire pg_roles describes only the supplied authenticated role" {
     var exhausted = try cursor.next(cursor.ptr, a, 1);
     defer exhausted.deinit();
     try std.testing.expectEqual(@as(usize, 0), exhausted.rows.len);
+}
+
+test "pgwire pg_enum resolves as a read-only catalog with an empty cursor" {
+    const name: ast.Name = .{ .namespace = "pg_catalog", .table = "pg_enum" };
+    const table = (try resolve(name, .read, "default")).?;
+    try std.testing.expectEqual(@as(u64, 3501), table.id);
+    try std.testing.expect(owns(table));
+    try std.testing.expect(isEmpty(table));
+    try std.testing.expectEqualStrings("enumtypid", table.columns[1].name);
+    try std.testing.expectEqual(Element.float32, table.columns[2].element_type.?);
+    try std.testing.expectEqualStrings("enumlabel", table.columns[3].name);
+    try std.testing.expectError(error.SqlReadOnlyTransaction, resolve(name, .write, "default"));
+    var context: u8 = 0;
+    const cursor = openEmpty(&context);
+    defer cursor.close(cursor.ptr);
+    try std.testing.expectEqual(@as(usize, 0), (try cursor.next(cursor.ptr, std.testing.allocator, 20)).rows.len);
 }
 
 test "pgwire pg_namespace OIDs join type rows and cursors own the captured names" {

@@ -166,6 +166,12 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             "FROM generate_series(1, array_upper(current_schemas(false), 1)) s(r)) r USING (nspname)) sp "
             "ON sp.nspoid = typnamespace WHERE pg_type.oid IN (23, 1007) ORDER BY typname, sp.r, pg_type.oid"
         )
+        type_registry_query = (
+            "SELECT t.oid, t.typname, t.typelem, t.typbasetype, t.typtypmod, t.typcategory, e.values "
+            "FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid "
+            "LEFT JOIN (SELECT t.enumtypid AS id, array_agg(t.enumlabel) AS values FROM pg_catalog.pg_enum t "
+            "GROUP BY id) e ON t.oid = e.id WHERE n.nspname != 'pg_toast' AND t.oid IN (23,1007) ORDER BY t.oid"
+        )
         discovery = subprocess.check_output(
             [
                 psql,
@@ -210,6 +216,7 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                     namespace_query,
                     type_query,
                     type_search_path_query,
+                    type_registry_query,
                     "SELECT current_schemas(false), pg_catalog.current_schemas(true), current_schemas(NULL)",
                     "SELECT (ARRAY['pg_catalog', 'public'])[oid - 2198] "
                     "FROM pg_catalog.pg_namespace WHERE oid = 2200",
@@ -229,6 +236,8 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             *discovery[2:4],
             "_int4|t|b||1007",
             "int4|f|b||23",
+            "23|int4|0|0|-1|N|",
+            "1007|_int4|23|0|-1|A|",
             '{"public"}|{"pg_catalog","public"}|',
             "public",
             "public",

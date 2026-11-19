@@ -2954,7 +2954,7 @@ const GuardedCatalog = struct {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try self.checkTableRead(table);
         if (system.isRoles(table)) return system.scanRole(alloc, request, try self.catalogRole());
-        if (system.isMemberships(table)) return .{ .rows = &.{} };
+        if (system.isEmpty(table)) return .{ .rows = &.{} };
         if (system.isNamespaces(table)) {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
@@ -3105,7 +3105,7 @@ const GuardedCatalog = struct {
     }
     fn openSystemScan(self: *GuardedCatalog, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {
         if (system.isRoles(table)) return system.openRole(alloc, request, try self.catalogRole());
-        if (system.isMemberships(table)) return system.openMemberships(self);
+        if (system.isEmpty(table)) return system.openEmpty(self);
         if (system.isNamespaces(table)) {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
