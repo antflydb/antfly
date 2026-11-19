@@ -105,6 +105,8 @@ pub const CatalogSource = struct {
         /// owned by the caller. Authoritative captures must still cross the
         /// source's read barrier; an eventual cache hit never proves absence.
         acquire_routing_generation: ?*const fn (ptr: *anyopaque, budget: RoutingBudget, authoritative: bool) anyerror!*RoutingGeneration = null,
+        /// Authoritative table fence and membership of an optional parked group.
+        repair_route: ?*const fn (ptr: *anyopaque, table_name: []const u8, group_id: ?u64, budget: RoutingBudget) anyerror!?RepairRoute = null,
         /// Allocation-efficient point projection used by mutation routing.
         /// It returns the same owned wire type with zero or one table.
         table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
@@ -405,6 +407,17 @@ pub const RoutingGeneration = struct {
     }
 };
 
+pub const RepairRoute = struct {
+    fence: u64,
+    group_present: bool = false,
+};
+
+pub fn repairFenceDigest(topology_epoch: u64, table_id: u64) std.hash.Wyhash {
+    var digest = std.hash.Wyhash.init(topology_epoch);
+    digest.update(std.mem.asBytes(&table_id));
+    return digest;
+}
+
 /// Immutable request-scoped catalog capability. A session captures one
 /// projection and uses it for every table touched by the request,
 /// including graph targets discovered after the source table was admitted.
@@ -414,6 +427,7 @@ pub const RoutingSession = struct {
     const TableRangeIndex = struct {
         ranges: []const *const metadata_table_manager.RangeRecord,
         covers_keyspace: bool,
+        repair_fence: u64,
     };
     alloc: std.mem.Allocator,
     base: CatalogSource,
@@ -543,15 +557,19 @@ pub const RoutingSession = struct {
             var end = first + 1;
             while (end < range_refs.len and range_refs[end].table_id == range_refs[first].table_id) : (end += 1) {}
             const table_id = range_refs[first].table_id;
+            const table_index = self.table_id_indexes.get(table_id) orelse return error.InvalidCatalogProjection;
+            const epoch = try topologyEpochFromSortedRangesWithBudget(snapshot.value.tables[table_index], range_refs[first..end], budget);
+            var digest = repairFenceDigest(epoch, table_id);
+            for (range_refs[first..end], 0..) |range, index| {
+                try budget.checkpointIndex(index);
+                digest.update(std.mem.asBytes(&range.group_id));
+            }
             self.table_range_refs.putAssumeCapacity(table_id, .{
                 .ranges = range_refs[first..end],
                 .covers_keyspace = try completeKeyspace(range_refs[first..end], budget),
+                .repair_fence = digest.final(),
             });
-            const table_index = self.table_id_indexes.get(table_id) orelse return error.InvalidCatalogProjection;
-            self.topology_epochs.putAssumeCapacity(
-                table_id,
-                try topologyEpochFromSortedRangesWithBudget(snapshot.value.tables[table_index], range_refs[first..end], budget),
-            );
+            self.topology_epochs.putAssumeCapacity(table_id, epoch);
             first = end;
         }
         for (snapshot.value.tables, 0..) |table, index| {
@@ -595,6 +613,28 @@ pub const RoutingSession = struct {
         const index = self.table_indexes.get(table_name) orelse return error.TableNotFound;
         const id = self.snapshot.value.tables[index].table_id;
         return .{ .table_id = id, .topology_epoch = self.topology_epochs.get(id).?, .covers_keyspace = if (self.table_range_refs.get(id)) |entry| entry.covers_keyspace else false };
+    }
+
+    const RepairRoutingView = struct { table_id: u64, fence: u64 };
+
+    /// Full-span repair fence, calculated once with the same ordered group
+    /// IDs as the persisted repair job cursor.
+    fn repairRoutingView(self: *const RoutingSession, table_name: []const u8, budget: RoutingBudget) !?RepairRoutingView {
+        try budget.checkpoint();
+        const index = self.table_indexes.get(table_name) orelse return null;
+        const table_id = self.snapshot.value.tables[index].table_id;
+        const ranges = self.table_range_refs.get(table_id) orelse return null;
+        return .{ .table_id = table_id, .fence = ranges.repair_fence };
+    }
+
+    pub fn repairRoute(self: *const RoutingSession, table_name: []const u8, group_id: ?u64, budget: RoutingBudget) !?RepairRoute {
+        const view = (try self.repairRoutingView(table_name, budget)) orelse return null;
+        const id = group_id orelse return .{ .fence = view.fence };
+        _ = self.rangeForGroup(view.table_id, id, budget) catch |err| switch (err) {
+            error.TopologyChanged => return .{ .fence = view.fence },
+            else => return err,
+        };
+        return .{ .fence = view.fence, .group_present = true };
     }
 
     /// A published group identifies exactly one range in a generation; setup
@@ -2052,6 +2092,25 @@ pub fn tableGroupDescriptorProjection(
 /// One catalog-clock budget covers eventual capture, authoritative miss
 /// confirmation, and projection. Cancellation prevents admission after a
 /// completed capture; the original deadline bounds capture I/O itself.
+/// Capture the applied point projection without a quorum barrier or an admin
+/// scan. Storage owner admission can already hold a structural read lease.
+pub fn appliedTableGroupDescriptor(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    budget: RoutingBudget,
+) !?TableGroupDescriptorProjection {
+    try budget.checkpoint();
+    const capture = catalog.vtable.table_routing_snapshot orelse return error.CatalogRoutingUnavailable;
+    if (catalog.vtable.free_routing_snapshot == unsupportedFreeRoutingSnapshot)
+        return error.CatalogRoutingUnavailable;
+    var snapshot = try capture(catalog.ptr, table_name, budget.deadline_ns);
+    defer catalog.vtable.free_routing_snapshot(catalog.ptr, &snapshot);
+    try budget.checkpoint();
+    return descriptorProjectionFromRoutingSnapshot(alloc, snapshot, table_name, group_id);
+}
+
 pub fn tableGroupDescriptorProjectionControlled(
     alloc: std.mem.Allocator,
     catalog: CatalogSource,
@@ -2115,7 +2174,7 @@ pub fn tableGroupDescriptorProjectionControlled(
                 metadata_table_manager.rangeDocIdentityShardId(range),
                 metadata_table_manager.rangeDocIdentityRangeId(range),
                 table.schema_json,
-                table.indexes_json,
+                if (table.query_indexes_json.len != 0) table.query_indexes_json else table.indexes_json,
                 table.storage,
                 .{ .start = range.start_key, .end = range.end_key orelse "" },
                 restoreIdentityFromRange(range),
@@ -2182,7 +2241,7 @@ fn descriptorProjectionFromRoutingSnapshot(
             metadata_table_manager.rangeDocIdentityShardId(range),
             metadata_table_manager.rangeDocIdentityRangeId(range),
             table.schema_json,
-            table.indexes_json,
+            if (table.query_indexes_json.len != 0) table.query_indexes_json else table.indexes_json,
             table.storage,
             .{ .start = range.start_key, .end = range.end_key orelse "" },
             restoreIdentityFromRange(range),
@@ -2216,6 +2275,20 @@ test "owner descriptor projection retains the catalog observation with the physi
     try std.testing.expectEqualStrings(tables[0].indexes_json, projection.indexes_json);
 }
 
+test "index alias owner descriptors exclude query pointers and receipt history" {
+    const a = std.testing.allocator;
+    const tables = [_]metadata_table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = "unparsed receipt history",
+        .query_indexes_json = "{\"model_a\":{\"type\":\"embeddings\"},\"_index_aliases\":{\"live\":{\"index\":\"model_a\"}}}",
+    }};
+    const ranges = [_]metadata_table_manager.RangeRecord{.{ .table_id = 7, .group_id = 7001, .range_id = 1, .start_key = "" }};
+    var projection = (try descriptorProjectionFromRoutingSnapshot(a, .{ .tables = @constCast(&tables), .ranges = @constCast(&ranges) }, "docs", 7001)).?;
+    defer projection.deinit(a);
+    try std.testing.expectEqualStrings("{\"model_a\":{\"type\":\"embeddings\"}}", projection.indexes_json);
+}
+
 fn descriptorProjectionFromValues(
     alloc: std.mem.Allocator,
     table_id: u64,
@@ -2231,7 +2304,7 @@ fn descriptorProjectionFromValues(
     errdefer alloc.free(owned_schema_json);
     const owned_initial_range = try @import("../storage/kernel_owner_descriptor.zig").cloneInitialRange(alloc, initial_range);
     errdefer @import("../storage/kernel_owner_descriptor.zig").freeInitialRange(alloc, owned_initial_range);
-    const owned_indexes_json = try alloc.dupe(u8, indexes_json);
+    const owned_indexes_json = try @import("antfly_local_sources").api_index_metadata.aliases.physicalProjection(alloc, indexes_json);
     errdefer alloc.free(owned_indexes_json);
     return .{
         .table_id = table_id,
@@ -3221,7 +3294,7 @@ fn metadataServerValidateGroupRetirement(
 }
 
 fn sortRangeRefs(ranges: []const *const metadata_table_manager.RangeRecord) void {
-    std.sort.insertion(*const metadata_table_manager.RangeRecord, @constCast(ranges), {}, struct {
+    std.sort.block(*const metadata_table_manager.RangeRecord, @constCast(ranges), {}, struct {
         fn lessThan(_: void, a: *const metadata_table_manager.RangeRecord, b: *const metadata_table_manager.RangeRecord) bool {
             return std.mem.order(u8, a.start_key, b.start_key) == .lt;
         }

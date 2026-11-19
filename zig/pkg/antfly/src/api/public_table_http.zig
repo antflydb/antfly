@@ -215,6 +215,11 @@ pub const TableApi = struct {
         IncompletePublishedSnapshot,
         ReembedBudgetExceeded,
         ReembedSetupRetry,
+        ForeignConnectionFailed,
+        ForeignQueryFailed,
+        ForeignAuthFailed,
+        ForeignTableNotFound,
+        LibpqUnavailable,
         InternalFailure,
     };
 
@@ -417,6 +422,7 @@ pub const TableApi = struct {
         ReadUnavailable,
         StorageReadTemporarilyUnavailable,
         InternalFailure,
+        ResourceBudgetExceeded,
     };
 
     pub const ExecuteDocumentArtifactManifestsError = error{
@@ -918,6 +924,35 @@ test "highlight query cancellation classification preserves deadline identity be
     try std.testing.expectEqual(error.Canceled, queryCancellationError(error.Cancelled).?);
     try std.testing.expect(queryCancellationError(error.ConnectionResetByPeer) == null);
     try std.testing.expect(queryCancellationError(error.OutOfMemory) == null);
+}
+
+/// Do not expose libpq's raw diagnostic: it can contain a credential-bearing DSN.
+pub const ForeignSourceFailure = enum { connection, driver, execution, authentication, missing_relation };
+
+pub fn foreignSourceFailureOwnedResponse(alloc: std.mem.Allocator, source: []const u8, failure: ForeignSourceFailure) !OwnedResponse {
+    const code, const message = switch (failure) {
+        .driver => .{ "foreign_source_driver_unavailable", "PostgreSQL foreign source driver is unavailable on this server" },
+        .connection => .{ "foreign_source_unavailable", "foreign source could not connect; check the source connection and availability" },
+        .execution => .{ "foreign_source_query_failed", "foreign source could not execute the query; check the remote relation and permissions" },
+        .authentication => .{ "foreign_source_auth_failed", "foreign source rejected authentication; check the configured credentials" },
+        .missing_relation => .{ "foreign_source_relation_not_found", "foreign source relation was not found; check the configured remote schema and table" },
+    };
+    // libpq does not expose a reliable SQLSTATE for startup failures.
+    // A failed connection can therefore be a permanent credential rejection.
+    return .{
+        .status = switch (failure) {
+            .connection, .driver => 503,
+            else => 502,
+        },
+        .body = try std.json.Stringify.valueAlloc(alloc, .{
+            .code = code,
+            .@"error" = code,
+            .source = source,
+            .message = message,
+            .retryable = false,
+        }, .{}),
+        .json = true,
+    };
 }
 
 pub fn queryDependencyErrorOwnedResponse(
@@ -2109,11 +2144,15 @@ pub fn handleTableQueryRequest(
                 return try queryDependencyErrorOwnedResponse(alloc, 429, "query_embedding_overloaded", "query embedding overloaded", true);
             },
             error.EmbedRateLimited => {
-                return try queryDependencyErrorOwnedResponse(alloc, 429, "query_embedding_rate_limited", "query embedding rate limited", true);
+                var response = try queryDependencyErrorOwnedResponse(alloc, 429, "query_embedding_rate_limited", "query embedding rate limited", true);
+                if (api.request.diagnostics) |diagnostics| response.retry_after_seconds = operation.remainingRetryAfterSeconds(diagnostics.query_embedding_retry_not_before_ns) orelse response.retry_after_seconds;
+                return response;
             },
             error.EmbedTransientFailure => {
                 std.log.warn("public table query embedding temporarily unavailable table={s}", .{table_name});
-                return try queryTemporarilyUnavailableOwnedResponse(alloc, .query_embedding_temporarily_unavailable);
+                var response = try queryTemporarilyUnavailableOwnedResponse(alloc, .query_embedding_temporarily_unavailable);
+                if (api.request.diagnostics) |diagnostics| response.retry_after_seconds = operation.remainingRetryAfterSeconds(diagnostics.query_embedding_retry_not_before_ns) orelse response.retry_after_seconds;
+                return response;
             },
             error.EmbedUpstreamFailure => {
                 std.log.warn("public table query embedding upstream failure table={s}", .{table_name});
@@ -2177,6 +2216,11 @@ pub fn handleTableQueryRequest(
             },
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.ForeignConnectionFailed => return try foreignSourceFailureOwnedResponse(alloc, table_name, .connection),
+            error.ForeignQueryFailed => return try foreignSourceFailureOwnedResponse(alloc, table_name, .execution),
+            error.ForeignAuthFailed => return try foreignSourceFailureOwnedResponse(alloc, table_name, .authentication),
+            error.ForeignTableNotFound => return try foreignSourceFailureOwnedResponse(alloc, table_name, .missing_relation),
+            error.LibpqUnavailable => return try foreignSourceFailureOwnedResponse(alloc, table_name, .driver),
             error.InternalFailure => {
                 std.log.err("public table query failed table={s} err={}", .{ table_name, err });
                 return .{ .status = 500, .body = try alloc.dupe(u8, "query failed") };
@@ -2716,6 +2760,16 @@ pub fn handleDocumentArtifactManifest(
         error.ReadRequiresPrimary => return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") },
         error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
         error.StorageReadTemporarilyUnavailable => return try storageReadTemporarilyUnavailableOwnedResponse(alloc),
+        error.ResourceBudgetExceeded => return .{
+            .status = 413,
+            .json = true,
+            .body = try std.json.Stringify.valueAlloc(alloc, .{
+                .code = "inspection_limit_exceeded",
+                .retryable = false,
+                .message = "Dense index inspection exceeds supported limits; use a smaller source or recipe.",
+                .limits = db_mod.types.dense_index_inspection_limits,
+            }, .{}),
+        },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact manifest lookup failed") },
     };
     defer manifest.deinit(alloc);
@@ -6550,6 +6604,7 @@ test "public document artifact manifest handler returns summary and raw state" {
         ) TableApi.ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
             if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
             if (!std.mem.eql(u8, doc_key, "doc:a")) return error.InternalFailure;
+            if (std.mem.eql(u8, artifact_name, "oversized")) return error.ResourceBudgetExceeded;
             if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return error.InternalFailure;
             return makeManifest(alloc, doc_key, artifact_name);
         }
@@ -6574,6 +6629,15 @@ test "public document artifact manifest handler returns summary and raw state" {
             };
         }
     };
+
+    var limited = try handleDocumentArtifactManifest(std.testing.allocator, "docs", "doc:a", "oversized", .{ .detail = .raw }, Backend.iface());
+    defer limited.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 413), limited.status);
+    const limit_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, limited.body, .{});
+    defer limit_json.deinit();
+    try std.testing.expectEqualStrings("inspection_limit_exceeded", limit_json.value.object.get("code").?.string);
+    try std.testing.expect(!limit_json.value.object.get("retryable").?.bool);
+    try std.testing.expectEqual(@as(i64, 512), limit_json.value.object.get("limits").?.object.get("scan_visits").?.integer);
 
     var resp = try handleDocumentArtifactManifest(
         std.testing.allocator,

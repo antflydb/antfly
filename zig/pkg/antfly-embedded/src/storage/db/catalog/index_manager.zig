@@ -224,6 +224,31 @@ var text_doc_scratch_retained_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_segment_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_projection_source_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var sparse_replay_profile_enabled_cache: std.atomic.Value(u8) = .init(0);
+const index_open_descriptor_errors = [_]anyerror{
+    error.StorageDescriptorPressure,
+    error.ProcessFdQuotaExceeded,
+    error.SystemFdQuotaExceeded,
+    error.PersistentDescriptorAdmissionExhausted,
+};
+
+fn isPostingStartupOperationalError(err: anyerror) bool {
+    if (@import("../derived/catch_up_policy.zig").isRecoverableAdmissionError(err)) return true;
+    return switch (err) {
+        error.Canceled,
+        error.OutOfMemory,
+        error.InputOutput,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.ReadOnlyFileSystem,
+        error.NoSpaceLeft,
+        error.DiskQuota,
+        error.DurableFileSyncUnsupported,
+        error.DurableDirectorySyncUnsupported,
+        => true,
+        else => false,
+    };
+}
+
 const default_merge_policy = merger_mod.MergePolicy{
     .max_segments_per_tier = 10,
     .max_segment_size = 5 * 1024 * 1024 * 1024,
@@ -332,7 +357,11 @@ pub var test_inject_index_open_error: ?anyerror = null;
 pub var test_inject_index_removal_cleanup_error: ?anyerror = null;
 pub var test_inject_generated_artifact_cleanup_error: ?anyerror = null;
 pub var test_generated_artifact_cleanup_failures_remaining: std.atomic.Value(u32) = .init(0);
-pub var test_vector_block_primary_snapshot_builds: usize = 0;
+pub var test_dense_checkpoint_name_visits: std.atomic.Value(usize) = .init(0);
+pub var test_vector_publication_catalog_visits: std.atomic.Value(usize) = .init(0);
+pub var test_vector_publication_entry_visits: std.atomic.Value(usize) = .init(0);
+pub var test_vector_block_primary_snapshot_builds: std.atomic.Value(usize) = .init(0);
+pub const test_vector_block_native_merge_builds = &vector_block_store_mod.test_native_base_build_attempts;
 pub var test_before_vector_block_primary_snapshot_build: ?struct {
     ctx: *anyopaque,
     call: *const fn (*anyopaque) anyerror!void,
@@ -4357,21 +4386,27 @@ pub const IndexManager = struct {
         if (self.acquireVectorBlockGeneration()) |current| {
             defer current.release();
             if (!vectorBlockGenerationExactAtSequence(current, snapshot_sequence)) return false;
-            var writer = try vector_block_store_mod.Store.open(self.alloc, storage, root);
-            defer writer.deinit();
-            if (writer.covered_source_sequence != snapshot_sequence) return false;
-            const changed = try writer.declareArtifactScopes(scope_hashes);
-            if (changed) {
-                var opened = try vector_block_store_mod.Store.openWithBlocksReusing(
-                    self.alloc,
-                    storage,
-                    root,
-                    &current.opened,
-                );
-                var opened_owned = true;
-                errdefer if (opened_owned) opened.deinit();
+            var opened = try vector_block_store_mod.Store.openWithBlocksReusing(
+                self.alloc,
+                storage,
+                root,
+                &current.opened,
+            );
+            var opened_owned = true;
+            defer if (opened_owned) opened.deinit();
+            if (!openedVectorBlockGenerationExactAtSequence(&opened, snapshot_sequence)) return false;
+            const needs_declaration = !opened.store.hasArtifactScopes(scope_hashes);
+            if (needs_declaration or !opened.store.artifactScopesMatch(&current.opened.store)) {
+                // A failed control publication can leave the new scopes
+                // visible on disk while the old generation still serves.
+                if (!needs_declaration) try opened.store.fenceCurrent();
+
+                // Prepare the serving view before changing CURRENT. A scope
+                // declaration preserves the blocks and fenced WAL it owns.
                 const generation = try self.createVectorBlockGeneration(opened);
                 opened_owned = false;
+                errdefer generation.release();
+                if (needs_declaration) _ = try generation.opened.store.declareArtifactScopes(scope_hashes);
                 self.installVectorBlockGeneration(generation);
             }
             self.vector_block_projection_dirty.store(false, .release);
@@ -4560,9 +4595,13 @@ pub const IndexManager = struct {
     }
 
     pub fn vectorBlockReadyForDenseIndex(self: *IndexManager, name: []const u8) bool {
-        if (self.denseIndex(name)) |leann_entry| if (!denseIndexUsesVectorBlocks(leann_entry)) return true;
-        if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
         const entry = self.denseIndex(name) orelse return false;
+        return self.vectorBlockReadyForDenseEntry(entry);
+    }
+
+    pub fn vectorBlockReadyForDenseEntry(self: *IndexManager, entry: *DenseIndex) bool {
+        if (!denseIndexUsesVectorBlocks(entry)) return true;
+        if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
         if (self.vectorBlockStableTipFinalizingEntry(entry)) return false;
         if (entry.native_physical_v2 and entry.index.stats().active_count != 0 and
             !entry.index.nativePostingBaseHasVectors()) return false;
@@ -4611,9 +4650,13 @@ pub const IndexManager = struct {
         source_sequence: u64,
         expected_count: u64,
     ) bool {
-        if (self.denseIndex(name)) |leann_entry| if (!denseIndexUsesVectorBlocks(leann_entry)) return true;
-        if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
         const entry = self.denseIndex(name) orelse return false;
+        return self.vectorBlockReadyForDenseEntryAtSequence(entry, source_sequence, expected_count);
+    }
+
+    pub fn vectorBlockReadyForDenseEntryAtSequence(self: *IndexManager, entry: *DenseIndex, source_sequence: u64, expected_count: u64) bool {
+        if (!denseIndexUsesVectorBlocks(entry)) return true;
+        if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
         if (self.vectorBlockStableTipFinalizingEntry(entry)) return false;
         if (entry.native_physical_v2 and expected_count != 0 and
             !entry.index.nativePostingBaseHasVectors()) return false;
@@ -5136,7 +5179,7 @@ pub const IndexManager = struct {
     }
 
     pub fn ensureVectorBlockBaseAtAppliedSequence(self: *IndexManager, name: []const u8, applied_sequence: u64) !void {
-        return self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(name, applied_sequence, false);
+        return self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(name, applied_sequence, false, true);
     }
 
     fn vectorBlockUsesDesiredEncoding(self: *IndexManager) bool {
@@ -5155,10 +5198,16 @@ pub const IndexManager = struct {
         return true;
     }
 
-    fn ensureVectorBlockBaseAtAppliedSequenceWithEncoding(self: *IndexManager, name: []const u8, applied_sequence: u64, require_storage_encoding: bool) !void {
+    fn ensureVectorBlockBaseAtAppliedSequenceWithEncoding(self: *IndexManager, name: []const u8, applied_sequence: u64, require_storage_encoding: bool, allow_primary_snapshot: bool) !void {
+        if (self.vector_block_storage == null) return;
+        const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        return self.ensureVectorBlockBaseForEntryAtAppliedSequenceWithEncoding(entry, applied_sequence, require_storage_encoding, allow_primary_snapshot);
+    }
+
+    fn ensureVectorBlockBaseForEntryAtAppliedSequenceWithEncoding(self: *IndexManager, entry: *DenseIndex, applied_sequence: u64, require_storage_encoding: bool, allow_primary_snapshot: bool) !void {
+        const name = entry.config.name;
         if (self.vector_block_storage == null) return;
         const converting = require_storage_encoding and !self.vectorBlockUsesDesiredEncoding();
-        const entry = self.denseIndex(name) orelse return error.IndexNotFound;
         if (!denseIndexUsesVectorBlocks(entry)) return;
         if (entry.index.experimentalPostingDurableAppliedSequence()) |posting_sequence| {
             // A stable source snapshot may legitimately be ahead of the last
@@ -5227,6 +5276,12 @@ pub const IndexManager = struct {
         // sequence-mismatched native state falls through to the pinned primary
         // snapshot repair path below.
         if (!converting and try self.compactVectorBlockGenerationAtStableTip(entry, applied_sequence)) return;
+
+        // A gap in provider work is not a completed corpus. Keep exact
+        // fallback available while producers fill it, and permit native WAL
+        // reuse/compaction above, without rescanning all primary artifacts
+        // after every partial output batch.
+        if (!allow_primary_snapshot) return error.VectorBlockSourceCoveragePending;
 
         // Only one snapshot builder may reserve the next immutable generation.
         // Ordinary WAL appends continue under vector_block_build_mu while the
@@ -5349,7 +5404,7 @@ pub const IndexManager = struct {
         if (builtin.is_test) if (test_before_vector_block_primary_snapshot_build) |hook|
             try hook.call(hook.ctx);
         const started = platform_time.monotonicNs();
-        if (builtin.is_test) test_vector_block_primary_snapshot_builds += 1;
+        if (builtin.is_test) _ = test_vector_block_primary_snapshot_builds.fetchAdd(1, .monotonic);
         std.log.debug(
             "shared vector-block primary snapshot build started index={s} generation={} sequence={} vectors={}",
             .{ entry.config.name, generation, applied_sequence, entry.index.stats().active_count },
@@ -7743,8 +7798,9 @@ pub const IndexManager = struct {
         {
             return .rebuild_from_artifacts;
         }
-        if (std.mem.eql(u8, err_name, "TableReadChurn")) {
-            return .retry_open;
+        if (std.mem.eql(u8, err_name, "TableReadChurn")) return .retry_open;
+        inline for (index_open_descriptor_errors) |err| {
+            if (std.mem.eql(u8, err_name, @errorName(err))) return .retry_open;
         }
         return .manual_intervention;
     }
@@ -8621,9 +8677,12 @@ pub const IndexManager = struct {
     /// quarantining everything — the writer cannot race its own (not yet
     /// started) reclaim, so FileNotFound there is persistent damage, and
     /// the writer's self-heal worker covers the unlikely transient case.
-    /// Only meaningful now that the LSM run-table loader classifies
-    /// FileNotFound separately from UnsupportedVersion.
+    /// Descriptor pressure follows the same read-open retry contract.
+    /// Writable opens put it on the retry queue and keep other indexes usable.
     fn indexOpenErrorIsTransientRead(err: anyerror) bool {
+        for (index_open_descriptor_errors) |descriptor_err| {
+            if (err == descriptor_err) return true;
+        }
         return switch (err) {
             error.FileNotFound, error.EndOfStream, error.TableReadChurn => true,
             else => false,
@@ -10281,8 +10340,14 @@ pub const IndexManager = struct {
         index_name: []const u8,
     ) ?apply_state.ProjectionCheckpoint {
         const entry = for (self.dense_indexes.items) |*candidate| {
+            if (builtin.is_test) _ = test_dense_checkpoint_name_visits.fetchAdd(1, .monotonic);
             if (std.mem.eql(u8, candidate.config.name, index_name)) break candidate;
         } else return null;
+        return denseProjectionCheckpointMetadataForEntry(entry);
+    }
+
+    /// The caller pins the catalog lifetime of entry. No catalog lookup is needed.
+    pub fn denseProjectionCheckpointMetadataForEntry(entry: *const DenseIndex) ?apply_state.ProjectionCheckpoint {
         // LEANN's file and generic replay checkpoint own its durability;
         // the empty HBC wrapper cannot certify a posting generation.
         if (entry.index.leann != null) return null;
@@ -10339,6 +10404,7 @@ pub const IndexManager = struct {
         stats.fd_persistent_descriptors = @max(stats.fd_persistent_descriptors, entry.fd_persistent_descriptors);
         stats.fd_admission_capacity = @max(stats.fd_admission_capacity, entry.fd_admission_capacity);
         stats.fd_persistent_reserve = @max(stats.fd_persistent_reserve, entry.fd_persistent_reserve);
+        stats.fd_mapping_reserve = @max(stats.fd_mapping_reserve, entry.fd_mapping_reserve);
         stats.fd_admission_waiters = @max(stats.fd_admission_waiters, entry.fd_admission_waiters);
         stats.fd_admission_waits = @max(stats.fd_admission_waits, entry.fd_admission_waits);
         stats.fd_persistent_admission_failures = @max(stats.fd_persistent_admission_failures, entry.fd_persistent_admission_failures);
@@ -12186,6 +12252,10 @@ pub const IndexManager = struct {
         /// clean marker still require the final source/identity revalidation.
         covered_rebuilding_index: ?[]const u8 = null,
         only_index: ?[]const u8 = null,
+        /// The owning DB has terminal outcomes for the source corpus. False
+        /// still permits exact native WAL reuse and compaction; only the
+        /// corpus-wide primary repair scan is deferred.
+        allow_primary_snapshot: bool = true,
         /// Recurring work debounces quiet gaps in streaming input; explicit
         /// repair handoffs may immediately attempt their committed boundary.
         require_quiescence: bool = true,
@@ -12214,86 +12284,106 @@ pub const IndexManager = struct {
         self: *IndexManager,
         options: OnlineVectorBlockPublicationOptions,
     ) !OnlineVectorBlockPublicationResult {
+        if (self.vector_block_storage == null or self.primary_store == null) return .{};
+        var combined: OnlineVectorBlockPublicationResult = .{};
+        for (self.dense_indexes.items) |*entry| {
+            if (builtin.is_test) _ = test_vector_publication_catalog_visits.fetchAdd(1, .monotonic);
+            if (options.cancel_check) |check| if (check.requested()) return .{ .published = combined.published, .deferred = true };
+            const result = try self.publishVectorBlockBaseForEntryOnlineReported(entry, options);
+            combined.published += result.published;
+            combined.deferred = combined.deferred or result.deferred;
+        }
+        return combined;
+    }
+
+    /// Caller pins this entry's catalog lifetime and owns DB projection
+    /// finalization. Entry-based dispatch avoids rescanning the catalog when
+    /// the DB applies different primary-repair admission to each index.
+    pub fn publishVectorBlockBaseForEntryOnlineReported(
+        self: *IndexManager,
+        entry: *DenseIndex,
+        options: OnlineVectorBlockPublicationOptions,
+    ) !OnlineVectorBlockPublicationResult {
         if (self.vector_block_storage == null) return .{};
         const primary = self.primary_store orelse return .{};
+        if (builtin.is_test) _ = test_vector_publication_entry_visits.fetchAdd(1, .monotonic);
         var published: usize = 0;
         var deferred = false;
-        for (self.dense_indexes.items) |*entry| {
-            if (options.cancel_check) |check| if (check.requested()) return .{ .published = published, .deferred = true };
-            if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) continue;
-            if (!denseIndexUsesVectorBlocks(entry)) continue;
-            if (self.repairUnavailable(entry.config.name) and
-                !(options.covered_rebuilding_index != null and std.mem.eql(u8, options.covered_rebuilding_index.?, entry.config.name))) continue;
-            const healthy = self.vectorBlockReadyForDenseIndex(entry.config.name);
-            if (healthy and !entry.index.nativePostingAccelerationPending() and
-                (!options.require_storage_encoding or self.vectorBlockUsesDesiredEncoding())) continue;
-            const sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse continue;
-            if (sequence != primary.lastReplaySequence(0)) {
-                deferred = true;
-                continue;
-            }
-            if (options.require_quiescence and entry.index.stats().active_count > vector_block_immediate_bootstrap_max_vectors) {
-                const now = platform_time.monotonicNs();
-                if (self.vector_block_candidate_sequence.load(.acquire) != sequence) {
-                    self.vector_block_candidate_sequence.store(sequence, .release);
-                    self.vector_block_candidate_since_ns.store(now, .release);
-                    deferred = true;
-                    continue;
-                }
-                const since = self.vector_block_candidate_since_ns.load(.acquire);
-                if (since == 0 or now -| since < vector_block_quiescence_ns) {
-                    deferred = true;
-                    continue;
-                }
-            }
-            // Healthy replacements are serialized by the DB projection owner
-            // and base-staging reservation. They do not close serving admission.
-            if (!healthy) {
-                if (self.vector_block_stable_tip_finalizing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
-                    return .{ .published = published, .deferred = true };
-                self.vector_block_stable_tip_index.store(@intFromPtr(entry), .release);
-                self.vector_block_stable_tip_sequence.store(sequence, .release);
-            }
-            defer if (!healthy) {
-                self.vector_block_stable_tip_sequence.store(0, .release);
-                self.vector_block_stable_tip_index.store(0, .release);
-                self.vector_block_stable_tip_finalizing.store(false, .release);
-            };
-            self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(entry.config.name, sequence, options.require_storage_encoding) catch |err| switch (err) {
-                error.PostingCheckpointSequenceMismatch,
-                error.VectorBlockSnapshotAdvancedWithoutWal,
-                error.VectorBlockGenerationReservationLost,
-                => {
-                    deferred = true;
-                    continue;
-                },
-                else => return err,
-            };
-            // Vector files alone do not establish the posting-local scan
-            // plane. Schedule its first full base without joining the builder
-            // under any apply fence. Later WAL/delta consolidation is optional
-            // and must not make readiness flap on every source mutation.
-            if (entry.native_physical_v2 and
-                (!entry.index.nativePostingBaseHasVectors() or entry.index.nativePostingAccelerationPending()))
-            {
-                if (!entry.apply_mutex.tryLock()) {
-                    deferred = true;
-                    continue;
-                }
-                defer entry.apply_mutex.unlock();
-                if (try entry.index.publishReadyExperimentalPostingCheckpointForRecovery()) published += 1;
-                if (try entry.index.requestNativePostingAcceleration()) published += 1;
-                // Backoff means waiting for projection inputs, not ready.
-                // Keep the scheduler/lifecycle obligation alive even when
-                // there is intentionally no worker or publication in flight.
-                if (entry.index.experimentalPostingCheckpointBuildPresent() or
-                    entry.index.nativePostingAccelerationPending()) deferred = true;
-                continue;
-            }
-            if (entry.index.experimentalPostingDurableAppliedSequence() == sequence and
-                self.vectorBlockReadyAtSequenceAndCount(sequence, entry, entry.index.stats().active_count))
-                published += 1;
+        if (options.cancel_check) |check| if (check.requested()) return .{ .published = published, .deferred = true };
+        if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) return .{ .published = published, .deferred = deferred };
+        if (!denseIndexUsesVectorBlocks(entry)) return .{ .published = published, .deferred = deferred };
+        if (self.repairUnavailable(entry.config.name) and
+            !(options.covered_rebuilding_index != null and std.mem.eql(u8, options.covered_rebuilding_index.?, entry.config.name))) return .{ .published = published, .deferred = deferred };
+        const healthy = self.vectorBlockReadyForDenseEntry(entry);
+        if (healthy and !entry.index.nativePostingAccelerationPending() and
+            (!options.require_storage_encoding or self.vectorBlockUsesDesiredEncoding())) return .{ .published = published, .deferred = deferred };
+        const sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse return .{ .published = published, .deferred = deferred };
+        if (sequence != primary.lastReplaySequence(0)) {
+            deferred = true;
+            return .{ .published = published, .deferred = deferred };
         }
+        if (options.require_quiescence and entry.index.stats().active_count > vector_block_immediate_bootstrap_max_vectors) {
+            const now = platform_time.monotonicNs();
+            if (self.vector_block_candidate_sequence.load(.acquire) != sequence) {
+                self.vector_block_candidate_sequence.store(sequence, .release);
+                self.vector_block_candidate_since_ns.store(now, .release);
+                deferred = true;
+                return .{ .published = published, .deferred = deferred };
+            }
+            const since = self.vector_block_candidate_since_ns.load(.acquire);
+            if (since == 0 or now -| since < vector_block_quiescence_ns) {
+                deferred = true;
+                return .{ .published = published, .deferred = deferred };
+            }
+        }
+        // Healthy replacements are serialized by the DB projection owner
+        // and base-staging reservation. They do not close serving admission.
+        if (!healthy) {
+            if (self.vector_block_stable_tip_finalizing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
+                return .{ .published = published, .deferred = true };
+            self.vector_block_stable_tip_index.store(@intFromPtr(entry), .release);
+            self.vector_block_stable_tip_sequence.store(sequence, .release);
+        }
+        defer if (!healthy) {
+            self.vector_block_stable_tip_sequence.store(0, .release);
+            self.vector_block_stable_tip_index.store(0, .release);
+            self.vector_block_stable_tip_finalizing.store(false, .release);
+        };
+        self.ensureVectorBlockBaseForEntryAtAppliedSequenceWithEncoding(entry, sequence, options.require_storage_encoding, options.allow_primary_snapshot) catch |err| switch (err) {
+            error.PostingCheckpointSequenceMismatch,
+            error.VectorBlockSnapshotAdvancedWithoutWal,
+            error.VectorBlockGenerationReservationLost,
+            error.VectorBlockSourceCoveragePending,
+            => {
+                deferred = true;
+                return .{ .published = published, .deferred = deferred };
+            },
+            else => return err,
+        };
+        // Vector files alone do not establish the posting-local scan
+        // plane. Schedule its first full base without joining the builder
+        // under any apply fence. Later WAL/delta consolidation is optional
+        // and must not make readiness flap on every source mutation.
+        if (entry.native_physical_v2 and
+            (!entry.index.nativePostingBaseHasVectors() or entry.index.nativePostingAccelerationPending()))
+        {
+            if (!entry.apply_mutex.tryLock()) {
+                deferred = true;
+                return .{ .published = published, .deferred = deferred };
+            }
+            defer entry.apply_mutex.unlock();
+            if (try entry.index.publishReadyExperimentalPostingCheckpointForRecovery()) published += 1;
+            if (try entry.index.requestNativePostingAcceleration()) published += 1;
+            // Backoff means waiting for projection inputs, not ready.
+            // Keep the scheduler/lifecycle obligation alive even when
+            // there is intentionally no worker or publication in flight.
+            if (entry.index.experimentalPostingCheckpointBuildPresent() or
+                entry.index.nativePostingAccelerationPending()) deferred = true;
+            return .{ .published = published, .deferred = deferred };
+        }
+        if (entry.index.experimentalPostingDurableAppliedSequence() == sequence and
+            self.vectorBlockReadyAtSequenceAndCount(sequence, entry, entry.index.stats().active_count))
+            published += 1;
         return .{ .published = published, .deferred = deferred };
     }
 
@@ -18403,6 +18493,35 @@ pub const IndexManager = struct {
         return containsOwnedString(refs.source_artifact_names, candidate);
     }
 
+    /// Quarantined indexes have a config but no resident entry. Use the same
+    /// cardinality authority as activation without opening native storage.
+    pub fn denseConfigUsesArtifactTarget(self: *const IndexManager, cfg: types.IndexConfig) !bool {
+        if (cfg.kind != .dense_vector) return false;
+        const dense = try parseDenseConfig(self.alloc, cfg.config_json);
+        defer dense.deinit(self.alloc);
+        if (dense.external or dense.embedding_names.len > 1) return true;
+        const generator = try parseDenseGeneratorConfig(self.alloc, cfg.config_json);
+        defer if (generator) |value| value.deinit(self.alloc);
+        return self.denseChunkSourceName(dense, generator) != null;
+    }
+
+    // Keep resident construction, quarantine accounting and artifact references
+    // on the same grammar, including a single member of the sources array.
+    fn denseChunkSourceName(self: *const IndexManager, dense: DenseConfig, generator: ?GeneratorConfig) ?[]const u8 {
+        if (generator) |value| return if (generatorHasChunking(value)) value.artifact_name else null;
+        if (!dense.external) if (dense.embedding_name) |name| {
+            if (self.getEnrichment(.embedding, name)) |embedding| {
+                if (embedding.source_artifact_name.len > 0) return embedding.source_artifact_name;
+            }
+        };
+        for (dense.embedding_names) |name| {
+            if (self.getEnrichment(.embedding, name)) |embedding| {
+                if (embedding.source_artifact_name.len > 0) return embedding.source_artifact_name;
+            }
+        }
+        return null;
+    }
+
     fn artifactRefsFromConfig(self: *const IndexManager, cfg: types.IndexConfig) !ArtifactRefs {
         switch (cfg.kind) {
             .full_text => {
@@ -18420,17 +18539,8 @@ pub const IndexManager = struct {
                 defer dense_cfg.deinit(self.alloc);
                 const dense_generator = try parseDenseGeneratorConfig(self.alloc, cfg.config_json);
                 defer if (dense_generator) |generator| generator.deinit(self.alloc);
-                const referenced_embedding = if (dense_generator == null and dense_cfg.embedding_name != null and !dense_cfg.external)
-                    self.getEnrichment(.embedding, dense_cfg.embedding_name.?)
-                else
-                    null;
                 return .{
-                    .chunk_name = if (dense_generator) |generator|
-                        if (generatorHasChunking(generator)) try self.alloc.dupe(u8, generator.artifact_name) else null
-                    else if (referenced_embedding) |embedding_cfg|
-                        if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
-                    else
-                        null,
+                    .chunk_name = if (self.denseChunkSourceName(dense_cfg, dense_generator)) |name| try self.alloc.dupe(u8, name) else null,
                     .embedding_name = if (dense_generator) |generator|
                         if (generator.embedding_name) |embedding_name| try self.alloc.dupe(u8, embedding_name) else try self.alloc.dupe(u8, cfg.name)
                     else if (dense_cfg.embedding_name) |embedding_name|
@@ -19523,26 +19633,19 @@ pub const IndexManager = struct {
             // derived posting commit. A busy source continually moves this
             // candidate, while posting catch-up to an already-stable tip can
             // publish immediately once the exact sequence boundary matches.
-            // Do not hold vector_block_build_mu here: the builder acquires it
-            // after pinning the entry mutation epoch. Re-entering that mutex
-            // would deadlock every finite bulk load at its first quiet tip.
             if (self.primary_store) |primary| {
                 const source_sequence = primary.lastReplaySequence(0);
                 if (self.vector_block_candidate_sequence.load(.acquire) != source_sequence) {
                     self.vector_block_candidate_sequence.store(source_sequence, .release);
                     self.vector_block_candidate_since_ns.store(platform_time.monotonicNs(), .release);
                 }
-                _ = self.maintainVectorBlockBaseIfQuiescent(entry) catch |err| blk: {
-                    // Native exact-vector publication is an optimization;
-                    // the primary artifact store remains the correctness
-                    // fallback when a snapshot cannot be built yet.
-                    std.log.warn("shared vector-block maintenance deferred index={s} sequence={} err={s}", .{
-                        name,
-                        source_sequence,
-                        @errorName(err),
-                    });
-                    break :blk false;
-                };
+                // A fixed primary tip does not mean enrichment/backfill is
+                // idle: many small derived batches can share that source cut.
+                // Never stage a corpus snapshot from this replay commit path
+                // while its caller holds apply admission. The native mutation
+                // chain above remains incremental; a fenced/missing generation
+                // stays on exact primary fallback until the existing online
+                // maintenance owner or explicit idle drain repairs it once.
             }
         }
     }
@@ -24288,13 +24391,7 @@ pub const IndexManager = struct {
                     cfg,
                     runtime_schema,
                 );
-                const historical_projection = [_]TextProjectionProvenance{
-                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 0),
-                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 1),
-                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 2),
-                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 3),
-                };
-                ensureTextProjectionProvenance(self.alloc, &persistent, projection_provenance, historical_projection, read_only) catch |err| {
+                ensureTextProjectionProvenance(self.alloc, &persistent, projection_provenance, cfg, runtime_schema, read_only) catch |err| {
                     std.log.warn("full_text open failed step=projection_provenance name={s} err={s}", .{
                         cfg.name,
                         @errorName(err),
@@ -24427,7 +24524,6 @@ pub const IndexManager = struct {
                         return error.InvalidIndexConfig;
                     }
                 }
-                var first_multi_source_embedding: ?*const enrichment_catalog.EnrichmentConfig = null;
                 var multi_source_supports_unit_grouping = dense_cfg.embedding_names.len > 0;
                 var multi_source_vector_space: ?[]const u8 = null;
                 var multi_source_has_implicit_vector_space = false;
@@ -24451,9 +24547,6 @@ pub const IndexManager = struct {
                                 multi_source_vector_space = embedding_cfg.vector_space;
                             }
                         }
-                    }
-                    if (first_multi_source_embedding == null and embedding_cfg.source_artifact_name.len > 0) {
-                        first_multi_source_embedding = embedding_cfg;
                     }
                     multi_source_supports_unit_grouping = multi_source_supports_unit_grouping and
                         self.embeddingSourceSupportsUnitGrouping(embedding_cfg);
@@ -24515,6 +24608,7 @@ pub const IndexManager = struct {
                     .storage = self.effectiveDenseStorage(),
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
+                    .retain_native_posting_startup_snapshot = dense_cfg.leann == null,
                 });
                 index_open = true;
                 index.setIo(self.io);
@@ -24610,6 +24704,7 @@ pub const IndexManager = struct {
                         // Any source journal tail above this sequence is replayed
                         // normally after the index has opened.
                         posting_sequence = index.activateExperimentalPostingReadsAtOrAfter(0) catch |err| {
+                            if (isPostingStartupOperationalError(err)) return err;
                             std.log.err("dense posting WAL startup validation failed index={s} err={s}", .{
                                 cfg.name,
                                 @errorName(err),
@@ -24646,6 +24741,7 @@ pub const IndexManager = struct {
                                 };
                             },
                             else => {
+                                if (isPostingStartupOperationalError(err)) return err;
                                 std.log.warn("dense posting sidecar startup validation failed index={s} err={s}", .{ cfg.name, @errorName(err) });
                                 if (!read_only) index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
                                     std.log.warn("dense posting sidecar startup invalidation failed index={s} err={s}", .{ cfg.name, @errorName(invalidate_err) });
@@ -24698,14 +24794,7 @@ pub const IndexManager = struct {
                     .leann_transient = leann_transient,
                     .leann_text_only = leann_storage == .auto,
                     .leann_media_int8 = leann_transient and if (dense_cfg.leann) |leann_opts| leann_opts.media_int8 else false,
-                    .chunk_name = if (dense_generator) |generator|
-                        if (generatorHasChunking(generator)) try self.alloc.dupe(u8, generator.artifact_name) else null
-                    else if (referenced_embedding) |embedding_cfg|
-                        if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
-                    else if (first_multi_source_embedding) |embedding_cfg|
-                        if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
-                    else
-                        null,
+                    .chunk_name = if (self.denseChunkSourceName(dense_cfg, dense_generator)) |name| try self.alloc.dupe(u8, name) else null,
                     .embedding_name = if (dense_generator) |generator|
                         if (generator.embedding_name) |embedding_name| try self.alloc.dupe(u8, embedding_name) else try self.alloc.dupe(u8, cfg.name)
                     else if (dense_cfg.embedding_name) |embedding_name|
@@ -39415,6 +39504,96 @@ test "fresh dense admission reclaims a certified generation orphaned before cata
     );
 }
 
+test "native posting startup retries descriptor pressure across catalog opens" {
+    const Fault = struct {
+        var original_read: @FieldType(lsm_backend_mod.Storage.VTable, "read_file_alloc") = undefined;
+        var pressured: std.atomic.Value(bool) = .init(false);
+
+        fn read(ptr: *anyopaque, alloc: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+            if (pressured.load(.acquire) and std.mem.endsWith(u8, path, "/posting-segments/CURRENT")) {
+                return error.ProcessFdQuotaExceeded;
+            }
+            return original_read(ptr, alloc, path, max_bytes);
+        }
+
+        fn publicationFence(_: *anyopaque) void {}
+    };
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "posting-fd-open-retry");
+    defer cleanupIndexManagerDir(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    const names = [_][]const u8{ "first_dense", "second_dense" };
+    {
+        var initial = try IndexManager.init(alloc, std.mem.span(path));
+        defer initial.deinit();
+        initial.updateRange(.{ .start = "", .end = "" });
+        for (names) |name| try initial.addManaged(&store, .{
+            .name = name,
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+        }, null);
+        for (names) |name| try std.testing.expect(initial.denseIndex(name).?.index.experimentalPostingWalAuthoritative());
+    }
+
+    var native = try lsm_backend_mod.NativeStorage.init(alloc, .threaded);
+    defer native.deinit();
+    var storage = native.storage();
+    var vtable = storage.vtable.*;
+    Fault.original_read = vtable.read_file_alloc;
+    vtable.read_file_alloc = Fault.read;
+    storage.vtable = &vtable;
+    Fault.pressured.store(true, .release);
+    defer Fault.pressured.store(false, .release);
+
+    // Cover serial and parallel read catalog loading, including cleanup.
+    for ([_]usize{ 1, 2 }) |parallelism| {
+        var reader = try IndexManager.init(alloc, std.mem.span(path));
+        defer reader.deinit();
+        reader.setDenseLsmStorage(storage);
+        reader.load_parallelism = parallelism;
+        reader.io = std.testing.io;
+        try std.testing.expectError(error.ProcessFdQuotaExceeded, reader.loadNoBackfill(&store));
+        try std.testing.expect(!reader.hasLoadFailures());
+    }
+
+    var writer = try IndexManager.init(alloc, std.mem.span(path));
+    defer writer.deinit();
+    writer.updateRange(.{ .start = "", .end = "" });
+    writer.setDenseLsmStorage(storage);
+    try writer.load(&store);
+    try std.testing.expectEqual(names.len, writer.failedIndexLoadSummary().retry_open);
+    try std.testing.expectEqual(@as(usize, 0), writer.failedIndexLoadSummary().manual_intervention);
+
+    Fault.pressured.store(false, .release);
+    var fence_context: u8 = 0;
+    const retry = try writer.retryFailedIndexLoads(&store, nowNs(), true, null, names.len, .{
+        .ptr = &fence_context,
+        .lock_fn = Fault.publicationFence,
+        .unlock_fn = Fault.publicationFence,
+    });
+    try std.testing.expectEqual(names.len, retry.recovered);
+    try std.testing.expect(!writer.hasLoadFailures());
+    for (names) |name| try std.testing.expect(writer.denseIndex(name) != null);
+}
+
+test "posting startup preserves operational errors without classifying corruption as retryable" {
+    for ([_]anyerror{
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.PersistentDescriptorAdmissionExhausted,
+        error.StorageDescriptorPressure,
+        error.InputOutput,
+        error.OutOfMemory,
+        error.Canceled,
+    }) |err| try std.testing.expect(isPostingStartupOperationalError(err));
+    try std.testing.expect(!isPostingStartupOperationalError(error.PostingSegmentChecksumMismatch));
+    try std.testing.expect(!isPostingStartupOperationalError(error.PostingWalShorterThanCheckpoint));
+}
+
 test "fresh native dense backfill certifies one pinned source snapshot" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -39438,7 +39617,7 @@ test "fresh native dense backfill certifies one pinned source snapshot" {
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"embedding_name\":\"source_vectors\",\"external\":true}",
     };
-    test_vector_block_primary_snapshot_builds = 0;
+    test_vector_block_primary_snapshot_builds.store(0, .release);
     try manager.add(&store, cfg);
 
     const entry = manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
@@ -39446,7 +39625,7 @@ test "fresh native dense backfill certifies one pinned source snapshot" {
     try std.testing.expect(entry.index.experimentalPostingWalAuthoritative());
     try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
     try std.testing.expectEqual(@as(?u64, snapshot_sequence), entry.index.experimentalPostingDurableAppliedSequence());
-    try std.testing.expectEqual(@as(usize, 0), test_vector_block_primary_snapshot_builds);
+    try std.testing.expectEqual(@as(usize, 0), test_vector_block_primary_snapshot_builds.load(.acquire));
     const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:1", "source_vectors");
     defer alloc.free(artifact_key);
     const artifact = try store.get(alloc, artifact_key);
@@ -39491,9 +39670,9 @@ test "fresh native dense backfill extends a shared vector generation without a s
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
     };
-    test_vector_block_primary_snapshot_builds = 0;
+    test_vector_block_primary_snapshot_builds.store(0, .release);
     try manager.addManaged(&store, first, null);
-    try std.testing.expectEqual(@as(usize, 0), test_vector_block_primary_snapshot_builds);
+    try std.testing.expectEqual(@as(usize, 0), test_vector_block_primary_snapshot_builds.load(.acquire));
     const document_key = try internal_keys.documentKeyAlloc(alloc, "doc:shared");
     defer alloc.free(document_key);
     try store.put(document_key, "{\"embedding\":[3.0,4.0]}");
@@ -39503,9 +39682,9 @@ test "fresh native dense backfill extends a shared vector generation without a s
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
     };
-    test_vector_block_primary_snapshot_builds = 0;
+    test_vector_block_primary_snapshot_builds.store(0, .release);
     try manager.add(&store, second);
-    try std.testing.expectEqual(@as(usize, 0), test_vector_block_primary_snapshot_builds);
+    try std.testing.expectEqual(@as(usize, 0), test_vector_block_primary_snapshot_builds.load(.acquire));
     try std.testing.expect(manager.vectorBlockReadyForDenseIndex(second.name));
     try std.testing.expectError(
         error.InvalidFreshDenseVectorCaptureCapability,
@@ -39520,6 +39699,37 @@ test "fresh native dense backfill extends a shared vector generation without a s
     const second_scope = IndexManager.denseVectorArtifactScopeHashAt(manager.denseIndex(second.name).?, 0);
     try std.testing.expectEqual(@as(u64, 0), generation.opened.baseOnlyCoverage(first_scope).?.vector_count);
     try std.testing.expectEqual(@as(u64, 1), generation.opened.baseOnlyCoverage(second_scope).?.vector_count);
+
+    const entry = manager.denseIndex(second.name).?;
+    const sequence = generation.opened.store.covered_source_sequence;
+    try std.testing.expect(try manager.tryPrepareFreshDenseVectorCaptureBase(entry, sequence));
+    {
+        const unchanged = manager.acquireVectorBlockGeneration().?;
+        defer unchanged.release();
+        try std.testing.expectEqual(generation, unchanged);
+    }
+
+    // Simulate a scope publication whose CURRENT rename became visible
+    // before the caller received a durable acknowledgement.
+    const control = @import("../../generation_publication.zig");
+    const extra_scope = std.math.maxInt(u64);
+    const root = try manager.vectorBlockRootAlloc();
+    defer alloc.free(root);
+    {
+        var writer = try vector_block_store_mod.Store.open(alloc, manager.vector_block_storage.?, root);
+        defer writer.deinit();
+        @import("antfly_test_error_logs").expectErrorLogs(1);
+        control.injectPostPublishFailuresForTest(2);
+        defer control.injectPostPublishFailuresForTest(0);
+        try std.testing.expectError(error.GenerationPublicationDurabilityUncertain, writer.declareArtifactScopes(&.{extra_scope}));
+    }
+
+    try std.testing.expect(!generation.opened.store.hasArtifactScopes(&.{extra_scope}));
+    try std.testing.expect(try manager.tryPrepareFreshDenseVectorCaptureBase(entry, sequence));
+    const recovered = manager.acquireVectorBlockGeneration().?;
+    defer recovered.release();
+    try std.testing.expect(recovered.opened.store.hasArtifactScopes(&.{extra_scope}));
+    try std.testing.expect(!generation.opened.store.hasArtifactScopes(&.{extra_scope}));
 }
 
 test "standalone dense native migration still requires an explicit physical generation" {
@@ -40169,11 +40379,27 @@ fn saveTextProjectionProvenance(
     try persistent.writeGenerationMetadata(persistent_mod.text_projection_provenance_meta_key, data);
 }
 
+// Embedded files without an explicit public schema use the schema-less
+// mapper. Adoption supplies the public default schema. Qualify only that exact
+// transition for a private rebuild; arbitrary schema or analyzer drift must
+// continue to fail closed.
+fn embeddedSchemalessProjectionWitness(alloc: Allocator, cfg: types.IndexConfig, schema: ?schema_mod.TableSchema, expected: TextProjectionProvenance) !TextProjectionProvenance {
+    const current = schema orelse return expected;
+    const tables = @import("../../../api/tables.zig");
+    var public = try tables.parseValidatedTableSchema(alloc, tables.default_schema_json);
+    defer public.deinit(alloc);
+    const defaults = try tables.deriveRuntimeTableSchema(alloc, public);
+    defer schema_mod.freeSchema(alloc, defaults);
+    if (!try schema_mod.schemasEqualForPublicBinding(alloc, current, defaults)) return expected;
+    return try TextProjectionProvenance.fromRuntimeSchema(alloc, cfg, null);
+}
+
 fn ensureTextProjectionProvenance(
     alloc: Allocator,
     persistent: *persistent_mod.PersistentIndex,
     expected: TextProjectionProvenance,
-    historical: [4]TextProjectionProvenance,
+    cfg: types.IndexConfig,
+    runtime_schema: ?schema_mod.TableSchema,
     read_only: bool,
 ) !void {
     const encoded = try persistent.readGenerationMetadataAlloc(
@@ -40187,9 +40413,16 @@ fn ensureTextProjectionProvenance(
     if (persistent.hasPhysicalSegments()) {
         // Only the exact prior projection witness authorizes an automatic
         // private replacement. Unknown drift remains manual repair debt.
-        if (persisted) |witness| for (historical) |prior| {
-            if (!prior.eql(expected) and witness.eql(prior)) return error.TextProjectionUpgradeRequired;
-        };
+        if (persisted) |witness| {
+            // Qualify migration witnesses only after the common matching and
+            // empty-generation paths. Healthy opens never derive old schemas.
+            const schemaless = try embeddedSchemalessProjectionWitness(alloc, cfg, runtime_schema, expected);
+            if (!schemaless.eql(expected) and witness.eql(schemaless)) return error.TextProjectionUpgradeRequired;
+            inline for (0..4) |minor| {
+                const prior = try TextProjectionProvenance.fromRuntimeSchemaSemantics(alloc, cfg, runtime_schema, 2, minor);
+                if (!prior.eql(expected) and witness.eql(prior)) return error.TextProjectionUpgradeRequired;
+            }
+        }
         // There is no trustworthy upgrade witness for legacy postings. Keep
         // the configured index visible through load status, but do not attach
         // analyzers that may interpret its postings under different semantics.

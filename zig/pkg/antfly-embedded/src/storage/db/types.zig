@@ -2143,6 +2143,8 @@ pub const SearchRequest = struct {
     graph_query_diagnostic_sink: ?GraphQueryDiagnosticSink = null,
     identity_read_generation: ?u64 = null,
     execution_deadline_ns: ?u64 = null,
+    /// Local coordinator clock, used to include query planning in response timing.
+    public_query_started_ns: ?u64 = null,
     /// Borrowed listener lifecycle signal. It is request-local and must never
     /// be retained by asynchronous work after query execution returns.
     cancellation: ?CancellationToken = null,
@@ -2215,6 +2217,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "resolved_doc_filter_wire_context",
     "identity_read_generation",
     "execution_deadline_ns",
+    "public_query_started_ns",
     "cancellation",
     "graph_query_diagnostic_sink",
     "graph_execution_limits",
@@ -4286,6 +4289,8 @@ pub const ArtifactRepairRunRequest = struct {
     /// the pass. Automatic and structural repair never set it, so they make
     /// no model calls.
     operator_initiated: bool = false,
+    observe_index_repair: bool = false,
+    resume_document_repair: bool = false,
 };
 
 pub const RepairCancelCheck = struct {
@@ -4375,6 +4380,11 @@ pub const RepairCapacityCheck = struct {
 };
 
 pub const ArtifactRepairRunOptions = struct {
+    /// Coordinator-only filter for already-dispatched index repair work.
+    observe_index_groups: ?[]const u64 = null,
+    expected_repair_groups: ?u64 = null,
+    /// Continue exactly one shard from its parked document-ledger cursor.
+    resume_document_page: bool = false,
     /// Lite's live coordinator may enqueue a bounded source page or retire a
     /// proven canonical initial build. It must never construct/activate a
     /// shadow while holding the short connection publication fence.
@@ -4472,7 +4482,24 @@ pub const ArtifactRepairResult = struct {
     has_more: bool = false,
     debt_remaining: bool = false,
 
+    /// The document-replay subset of in_progress. Document replay stays on
+    /// its ledger cursor while generation work can be observed by shard.
+    document_replay_in_progress: u64 = 0,
+    /// Coordinator-owned group IDs that still need index repair observation.
+    pending_index_groups: ?[]u64 = null,
+    pending_document_pages: ?[][]u8 = null,
+    terminal_error: ?[]u8 = null,
+    observed_only: bool = false,
+    observation_changed: bool = false,
+    repair_groups: ?u64 = null,
+
     pub fn deinit(self: *ArtifactRepairResult, alloc: Allocator) void {
+        if (self.pending_index_groups) |groups| alloc.free(groups);
+        if (self.pending_document_pages) |pages| {
+            for (pages) |page| alloc.free(page);
+            alloc.free(pages);
+        }
+        if (self.terminal_error) |message| alloc.free(message);
         if (self.next_cursor) |value| alloc.free(value);
         self.* = undefined;
     }
@@ -5207,6 +5234,7 @@ pub const DerivedWorkerStats = struct {
     workers: u64 = 0,
     failed_workers: u64 = 0,
     workers_with_replay_debt: u64 = 0,
+    workers_waiting_for_replay_input: u64 = 0,
     max_replay_lag_sequences: u64 = 0,
     recoverable_retries: u64 = 0,
     writer_locked_retries: u64 = 0,
@@ -5738,3 +5766,15 @@ fn testResolverDiagnosticOwnership(a: Allocator) !void {
 test "resolver diagnostics cloning owns every textual fence under allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testResolverDiagnosticOwnership, .{});
 }
+
+/// Fixed administrator inspection limits, shared by storage and HTTP errors.
+pub const dense_index_inspection_limits = .{
+    .producers = 16,
+    .vectors = 128,
+    .float_values = 65536,
+    .source_bytes = 1048576,
+    .identity_bytes = 4096,
+    .producer_config_bytes = 1048576,
+    .scan_visits = 512,
+    .scan_bytes = 2097152,
+};

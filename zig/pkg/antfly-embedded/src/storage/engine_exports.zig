@@ -1942,8 +1942,8 @@ fn writeConfigureStorageKernelOwnerDbAtOpen(alloc: std.mem.Allocator, database: 
     return .{ .value = @import("write.zig").configureStorageKernelOwnerDbAtOpen(alloc, database, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, inference, installed, historical_ordered_apply) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn writeOpenStorageKernelRestoreDb(alloc: std.mem.Allocator, path: []const u8, indexes_json: []const u8, lsm_root_generation: u64, backend_runtime: *@import("db/mod.zig").background_runtime.BackendRuntime, identity_namespace: ?@import("db/doc_identity.zig").Namespace, prepared_restore: *const @import("backup_restore.zig").PreparedRestore) engine.Outcome(@import("db/mod.zig").DB) {
-    return .{ .value = @import("write.zig").openStorageKernelRestoreDb(alloc, path, indexes_json, lsm_root_generation, backend_runtime, identity_namespace, prepared_restore) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn writeOpenStorageKernelRestoreDb(alloc: std.mem.Allocator, path: []const u8, schema_json: []const u8, indexes_json: []const u8, lsm_root_generation: u64, backend_runtime: *@import("db/mod.zig").background_runtime.BackendRuntime, identity_namespace: ?@import("db/doc_identity.zig").Namespace, prepared_restore: *const @import("backup_restore.zig").PreparedRestore) engine.Outcome(@import("db/mod.zig").DB) {
+    return .{ .value = @import("write.zig").openStorageKernelRestoreDb(alloc, path, schema_json, indexes_json, lsm_root_generation, backend_runtime, identity_namespace, prepared_restore) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn writeRepairStorageKernelRestoreDb(alloc: std.mem.Allocator, database: *@import("db/mod.zig").DB, group_id: u64, schema_json: []const u8, indexes_json: []const u8, cancellation: @import("db/mod.zig").types.CancellationToken) engine.Outcome(void) {

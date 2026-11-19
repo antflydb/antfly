@@ -249,6 +249,9 @@ pub const RaftApplyStore = struct {
         }
         self.hot_standby_adapter = next;
     }
+    pub fn pollHotStandbyOutbox(self: *RaftApplyStore) !void {
+        _ = try self.projection(bool, .{ .kind = .poll_ha_outbox });
+    }
     pub fn flushHotStandbyOutbox(self: *RaftApplyStore) !void {
         _ = try self.projection(bool, .{ .kind = .flush_ha_outbox });
     }
@@ -583,6 +586,9 @@ pub const RaftApplyStore = struct {
     pub fn hasIndexAliases(self: *RaftApplyStore, group_id: u64) !bool {
         return self.catalogProjection(bool, self.alloc, group_id, .has_index_aliases);
     }
+    pub fn hasIndexAliasLifecycleState(self: *RaftApplyStore, group_id: u64) !bool {
+        return self.catalogProjection(bool, self.alloc, group_id, .has_index_alias_lifecycle_state);
+    }
     pub fn validateTableIndexMutation(self: *RaftApplyStore, group_id: u64, before: metadata.TableRecord, after: metadata.TableRecord) !void {
         const result = try self.catalogProjection(contract.TableIndexMutationValidation, self.alloc, group_id, .{ .validate_table_index_mutation = .{ .before = before, .after = after } });
         try result.requireValid();
@@ -759,6 +765,19 @@ pub const RaftApplyStore = struct {
             .group_id = group_id,
             .arg0 = deadline_ns orelse 0,
         }) catch |err| switch (err) {
+            error.Timeout => error.CatalogRoutingSnapshotTimeout,
+            else => err,
+        };
+    }
+
+    pub fn captureCatalogTableProjection(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8, deadline_ns: ?u64) !CatalogProjectionSnapshot {
+        return self.projectionWithAllocator(CatalogProjectionSnapshot, alloc, .{
+            .kind = .catalog_table_projection,
+            .group_id = group_id,
+            .arg0 = deadline_ns orelse 0,
+            .key = .fromSlice(name),
+        }) catch |err| switch (err) {
+            error.InvalidArgument => error.InvalidDerivedCatalogIndex,
             error.Timeout => error.CatalogRoutingSnapshotTimeout,
             else => err,
         };
@@ -1050,6 +1069,12 @@ pub const RaftApplyStore = struct {
         defer abi.antfly_storage_owner_buffer_destroy(&response);
         if (response.len == 0) return null;
         return try alloc.dupe(u8, response.slice());
+    }
+
+    pub fn getRestoreJobRecord(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
+        // arg0 selects the compact row for checkpoint acknowledgement without
+        // transporting or hashing the immutable inputs again.
+        return try self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .restore_job_value, .group_id = group_id, .key = .fromSlice(logical_key), .arg0 = 1 });
     }
 
     pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {

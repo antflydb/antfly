@@ -2888,6 +2888,10 @@ pub const BackupInfo = struct {
     timestamp: []const u8,
     /// Tables included in the backup
     tables: []const []const u8,
+    /// Exact restore selectors paired with display names, in the same order as tables. Use selector in ClusterRestoreRequest.table_names to disambiguate identical display names.
+    table_selectors: ?[]const std.json.Value = null,
+    /// True when the listing returned only backup metadata because table details exceeded the page size.
+    table_details_omitted: ?bool = null,
     /// Storage location of the backup
     location: []const u8,
     /// Antfly version that created the backup
@@ -2900,6 +2904,8 @@ pub const BackupInfo = struct {
         .{ "backup_id", "backup_id", false },
         .{ "timestamp", "timestamp", false },
         .{ "tables", "tables", false },
+        .{ "table_selectors", "table_selectors", true },
+        .{ "table_details_omitted", "table_details_omitted", true },
         .{ "location", "location", false },
         .{ "antfly_version", "antfly_version", true },
         .{ "format", "format", true },
@@ -2921,6 +2927,14 @@ pub const BackupInfo = struct {
         try jw.write(self.timestamp);
         try jw.objectField("tables");
         try jw.write(self.tables);
+        if (self.table_selectors) |value| {
+            try jw.objectField("table_selectors");
+            try jw.write(value);
+        }
+        if (self.table_details_omitted) |value| {
+            try jw.objectField("table_details_omitted");
+            try jw.write(value);
+        }
         try jw.objectField("location");
         try jw.write(self.location);
         if (self.antfly_version) |value| {
@@ -3082,7 +3096,7 @@ pub const BackupOutcomeAmbiguousConflict = struct {
 pub const BackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
+    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: an absolute `file:///path/inside/connection/root` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
     location: []const u8,
     /// ID of a configured `external_io` connection. Required for every network API backup and restore. Object locations enforce bucket and prefix scopes; filesystem URI paths resolve beneath the connection root.
     connection: []const u8,
@@ -6039,7 +6053,7 @@ pub const CloudflareSTTConfig = struct {
 pub const ClusterBackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
+    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: an absolute `file:///path/inside/connection/root` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
     location: []const u8,
     /// Required configured `external_io` connection with the `backup.write` capability.
     connection: []const u8,
@@ -20720,7 +20734,7 @@ pub const ForeignSource = struct {
     dsn: []const u8,
     /// Name of the table or view in the foreign PostgreSQL database to query.
     postgres_table: []const u8,
-    /// Optional column definitions for the foreign table. If omitted, columns are auto-discovered from `information_schema.columns` on first query.
+    /// Optional column definitions for the foreign table. If omitted, columns are auto-discovered from the PostgreSQL catalog (`pg_attribute`) on first query.
     columns: ?[]const ForeignColumn = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -22387,7 +22401,7 @@ pub const GlobalStatefulQueryRequest = struct {
     pruner: ?Pruner = null,
     /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
     join: ?JoinClause = null,
-    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
+    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, filter_prefix, field selection, order_by, limit/offset, joins (including nested joins and joins between two foreign tables), and the `stats`, `terms`, `count`, `sum`, `avg`, `min`, and `max` aggregations, which run as SQL in PostgreSQL. Other aggregation types and sub-aggregations return 422. **Not supported when the foreign table drives the query:** full_text_search, semantic_search, graph_queries, reranker, search_after. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
     foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
     /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected. Legacy operation names remain opaque and byte-for-byte compatible; canonical GraphIdentifier rules apply only to `graph_queries`. The request-wide limit of 64 operations also applies here to bound execution work during the compatibility window.
     graph_searches: ?std.json.ArrayHashMap(LegacyGraphQuery) = null,
@@ -48349,7 +48363,7 @@ pub const QueryRequest = struct {
     pruner: ?Pruner = null,
     /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
     join: ?JoinClause = null,
-    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
+    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, filter_prefix, field selection, order_by, limit/offset, joins (including nested joins and joins between two foreign tables), and the `stats`, `terms`, `count`, `sum`, `avg`, `min`, and `max` aggregations, which run as SQL in PostgreSQL. Other aggregation types and sub-aggregations return 422. **Not supported when the foreign table drives the query:** full_text_search, semantic_search, graph_queries, reranker, search_after. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
     foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -58109,7 +58123,7 @@ pub const StatefulQueryRequest = struct {
     pruner: ?Pruner = null,
     /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
     join: ?JoinClause = null,
-    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
+    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, filter_prefix, field selection, order_by, limit/offset, joins (including nested joins and joins between two foreign tables), and the `stats`, `terms`, `count`, `sum`, `avg`, `min`, and `max` aggregations, which run as SQL in PostgreSQL. Other aggregation types and sub-aggregations return 422. **Not supported when the foreign table drives the query:** full_text_search, semantic_search, graph_queries, reranker, search_after. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
     foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
     /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected. Legacy operation names remain opaque and byte-for-byte compatible; canonical GraphIdentifier rules apply only to `graph_queries`. The request-wide limit of 64 operations also applies here to bound execution work during the compatibility window.
     graph_searches: ?std.json.ArrayHashMap(LegacyGraphQuery) = null,
@@ -59376,7 +59390,7 @@ pub const TableRepairJobStartRequest = struct {
     force: ?bool = null,
     /// Maximum artifact repair records to attempt per pass. For target=index, any positive value permits one named index repair.
     limit: ?u32 = null,
-    /// When true, the server immediately attempts the first bounded repair pass before returning the job.
+    /// When true, the server starts the job and continues bounded passes automatically, including after restart. When false, each pass requires an explicit advance request.
     advance: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -62099,8 +62113,6 @@ pub const UpdatePasswordRequest = struct {
 
 pub const User = struct {
     username: []const u8,
-    /// Base64 encoded password hash. Exposing this is a security risk.
-    password_hash: []const u8,
     /// Server-side auth metadata available to stored row-filter policies through $auth metadata paths.
     metadata: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
 
@@ -62108,8 +62120,6 @@ pub const User = struct {
         try jw.beginObject();
         try jw.objectField("username");
         try jw.write(self.username);
-        try jw.objectField("password_hash");
-        try jw.write(self.password_hash);
         switch (self.metadata) {
             .absent => {},
             .null_value => {

@@ -500,6 +500,18 @@ fn rerankDocumentsRequestJsonAlloc(
     return try output.toOwnedSlice();
 }
 
+pub const EmbeddingWorkload = enum {
+    query,
+    document,
+
+    pub fn headerValue(self: EmbeddingWorkload) []const u8 {
+        return switch (self) {
+            .query => "read-heavy",
+            .document => "write-heavy",
+        };
+    }
+};
+
 pub const Provider = struct {
     model_identity: ?[]const u8 = null,
     requested_dense_dimensions: ?u32 = null,
@@ -507,14 +519,17 @@ pub const Provider = struct {
     allocator: std.mem.Allocator,
     http: *httpx.Client,
     attempt_observer: ?httpx.AttemptObserver = null,
+    retry_after_ms: ?*u64 = null,
     base_url: []const u8,
     cancellation: ?CancellationToken = null,
     request_timeout_ms: ?u64 = null,
     auth_header: ?[2][]const u8 = null,
     source_table: ?[]u8 = null,
+    request_id: []const u8 = "",
+    embedding_workload: ?EmbeddingWorkload = null,
     capability_token: ?[]u8 = null,
     capability_revision: ?[]u8 = null,
-    request_header_storage: [6][2][]const u8 = undefined,
+    request_header_storage: [8][2][]const u8 = undefined,
     response_format_json: ?[]const u8 = null,
     logprobs: bool = false,
     tools_json: ?[]const u8 = null,
@@ -731,6 +746,14 @@ pub const Provider = struct {
             self.request_header_storage[count] = .{ "X-Antfly-Capability-Revision", revision };
             count += 1;
         }
+        if (self.embedding_workload) |workload| {
+            self.request_header_storage[count] = .{ "X-Antfly-Inference-Workload-Type", workload.headerValue() };
+            count += 1;
+        }
+        if (self.request_id.len > 0) {
+            self.request_header_storage[count] = .{ "X-Antfly-Parent-Request-ID", self.request_id };
+            count += 1;
+        }
         return if (count == 0) null else self.request_header_storage[0..count];
     }
 
@@ -776,7 +799,7 @@ pub const Provider = struct {
         if (!resp.ok()) {
             logEmbedFailure("sparse", url, resp.status.code, resp.body);
             if (isCapabilityStaleResponse(resp)) return error.InferenceCapabilitiesStale;
-            return mapEmbedResponse(alloc, resp.status.code, resp.body);
+            return self.embedResponseError(alloc, resp);
         }
 
         try self.validateRevisionResponse(resp);
@@ -878,6 +901,14 @@ pub const Provider = struct {
         return self.embedBody(alloc, self.controlledJsonRequest(json_body, null), expected_count);
     }
 
+    fn embedResponseError(self: *const Provider, alloc: std.mem.Allocator, response: httpx.Response) anyerror {
+        const retry_after_seconds = if (response.headers.get("Retry-After")) |value|
+            std.fmt.parseUnsigned(u64, std.mem.trim(u8, value, " \t"), 10) catch 0
+        else
+            0;
+        return classifyEmbedResponse(alloc, response.status.code, response.body, self.retry_after_ms, retry_after_seconds *| 1000);
+    }
+
     fn validateRevisionResponse(self: *const Provider, response: httpx.Response) !void {
         const expected = self.model_revision orelse return;
         const raw = response.headers.get(httpx.embedding_revision.response_header) orelse return error.InferenceCapabilitiesStale;
@@ -900,7 +931,7 @@ pub const Provider = struct {
         if (!resp.ok()) {
             logEmbedFailure("dense", url, resp.status.code, resp.body);
             if (isCapabilityStaleResponse(resp)) return error.InferenceCapabilitiesStale;
-            return mapEmbedResponse(alloc, resp.status.code, resp.body);
+            return self.embedResponseError(alloc, resp);
         }
 
         try self.validateRevisionResponse(resp);
@@ -909,7 +940,7 @@ pub const Provider = struct {
             // Numeric frames carry no model identity. A server ignoring JSON
             // negotiation must not bypass a caller's pinned vector space.
             if (self.model_identity != null) return error.InvalidEmbeddingIdentity;
-            const view = try httpx.numeric_response.parse(body, .dense, expected_count, self.numeric_dense_dimensions);
+            const view = httpx.numeric_response.parse(body, .dense, expected_count, self.numeric_dense_dimensions) catch return error.InvalidEmbeddingResponse;
             return .{ .vectors = try view.denseAlloc(alloc), .dimension = view.columns, .allocator = alloc };
         };
 
@@ -1120,19 +1151,30 @@ pub const Provider = struct {
 // Interpret only Antfly's explicit resource envelope. Bare HTTP 503/507 and
 // malformed bodies retain ordinary provider-failure accounting.
 fn mapEmbedResponse(alloc: std.mem.Allocator, status: u16, body: ?[]const u8) anyerror {
+    return classifyEmbedResponse(alloc, status, body, null, 0);
+}
+
+fn classifyEmbedResponse(alloc: std.mem.Allocator, status: u16, body: ?[]const u8, retry_hint: ?*u64, header_retry_ms: u64) anyerror {
+    if (retry_hint) |hint| hint.* = header_retry_ms;
     if (body) |bytes| {
         if (bytes.len > 4096) return mapEmbedStatus(status);
         const parsed = std.json.parseFromSlice(struct {
             @"error": []const u8 = "",
             reason: ?[]const u8 = null,
             retryable: ?bool = null,
+            retry_after_ms: ?u64 = null,
         }, alloc, bytes, .{ .ignore_unknown_fields = true }) catch return mapEmbedStatus(status);
         defer parsed.deinit();
+        if (retry_hint) |hint| hint.* = @max(hint.*, parsed.value.retry_after_ms orelse 0);
         const code = parsed.value.@"error";
         if (status == 503 and parsed.value.retryable == true and std.mem.eql(u8, parsed.value.reason orelse "", "inference_admission"))
             return error.QueueFull;
-        if (status == 503 and parsed.value.retryable == true and std.mem.eql(u8, code, "MODEL_RESOURCE_BUSY"))
-            return error.EmbedAdmissionRefused;
+        if (status == 503 and parsed.value.retryable == true) {
+            if (std.mem.eql(u8, code, "MODEL_RESOURCE_BUSY")) return error.EmbedAdmissionRefused;
+            if (std.mem.eql(u8, code, "INFERENCE_STARTING") or
+                std.mem.eql(u8, parsed.value.reason orelse "", "inference_capacity"))
+                return error.InferenceCapacityUnavailable;
+        }
         if (parsed.value.retryable != true) {
             if (status == 400 and std.mem.eql(u8, code, "MODEL_RESOURCE_LIMIT")) return error.ResourceLimitExceeded;
             if (status == 507 and std.mem.eql(u8, code, "MEMORY_BUDGET_EXCEEDED")) return error.MemoryBudgetExceeded;
@@ -1951,6 +1993,8 @@ test "antfly embed treats service unavailability as transient" {
 
 test "embedding HTTP preserves admission and permanent resource identities" {
     const a = std.testing.allocator;
+    try std.testing.expectEqual(error.InferenceCapacityUnavailable, mapEmbedResponse(a, 503, "{\"error\":\"SERVICE_UNAVAILABLE\",\"reason\":\"inference_capacity\",\"retryable\":true,\"retry_after_ms\":1000}"));
+    try std.testing.expectEqual(error.InferenceCapacityUnavailable, mapEmbedResponse(a, 503, "{\"error\":\"INFERENCE_STARTING\",\"retryable\":true}"));
     try std.testing.expectEqual(error.EmbedAdmissionRefused, mapEmbedResponse(a, 503, "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":true}"));
     try std.testing.expectEqual(error.QueueFull, mapEmbedResponse(a, 503, "{\"error\":\"SERVICE_UNAVAILABLE\",\"reason\":\"inference_admission\",\"retryable\":true}"));
     try std.testing.expectEqual(error.EmbedTransientFailure, mapEmbedResponse(a, 503, "{\"error\":\"SERVICE_UNAVAILABLE\",\"reason\":\"inference_admission\",\"retryable\":false}"));
@@ -2100,4 +2144,13 @@ pub fn testGroupedEmbeddingSingleton() !void {
     var framed_group = try embedPartsAttachmentEnvelopeAlloc(a, "clip", &parts, null, null, null, null, null, .group);
     defer framed_group.deinit(a);
     try std.testing.expectEqualStrings(framed_item.metadata, framed_group.metadata);
+}
+
+test "embedding retry hints preserve the longer upstream delay" {
+    var retry_ms: u64 = 0;
+    const body = "{\"error\":\"INFERENCE_STARTING\",\"retryable\":true,\"retry_after_ms\":3500}";
+    try std.testing.expectEqual(error.InferenceCapacityUnavailable, classifyEmbedResponse(std.testing.allocator, 503, body, &retry_ms, 2000));
+    try std.testing.expectEqual(@as(u64, 3500), retry_ms);
+    try std.testing.expectEqual(error.InferenceCapacityUnavailable, classifyEmbedResponse(std.testing.allocator, 503, body, &retry_ms, 4000));
+    try std.testing.expectEqual(@as(u64, 4000), retry_ms);
 }

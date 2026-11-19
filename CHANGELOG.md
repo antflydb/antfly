@@ -2,19 +2,171 @@
 
 All notable changes to Antfly will be documented in this file.
 
-## Roadmap
+## 0.3 series — release draft
 
-### 0.3.x
+This overview covers the 0.3 development line through `26f2ec0b7e`, including
+changes after the `v0.3.0` tag. It describes the series as a whole, rather than
+assigning every change to a published patch release. SDKs, embedded libraries,
+and companion applications have independent release versions.
 
-- **SQL and the Postgres wire protocol** — DDL and DML over Antfly tables, a `psql`-compatible server, and a REPL
-- **Relational storage** — closed schemas with foreign keys and PostgreSQL-compatible types, with full-text, vector, sparse, graph, and algebraic indexes derived over the same rows
-- **Lake tables** — Iceberg and Parquet queried in place over object storage
-- **Graph analytics** — PageRank and eigenvector centrality in graph indexes
-- **Build system** — shorter compile times and lower build memory
+### Highlights
+
+- **SQL over search and relational data** — native SQL execution, an opt-in
+  PostgreSQL-compatible connection protocol for `psql` and drivers, and typed
+  relational tables with constraints and search indexes over the same rows.
+- **Query your lake in place** — read-only Parquet and Iceberg attachments,
+  filtering and column selection close to the source, and search indexes
+  stored alongside your data in object storage.
+- **One engine from a local file to a cluster** — Antfly Lite gains independent
+  connections, multi-table SQL drivers, database backups, and in-process
+  inference. The server extends SQL and search serving over object storage;
+  serverless deployment remains in development.
+- **More capable local AI** — structured classification with confidence scores,
+  escalation to stronger models, document extraction, OCR, transcription, and
+  expanded CPU, Metal, and CUDA execution.
+- **Agents with evidence and memory** — durable research jobs, graph navigation,
+  and long-term memory with historical recall and source citations.
+- **Apache-2.0** — all first-party Antfly code, including the server, local
+  engine, SQL, inference, SDKs, and bindings, now shares the Apache-2.0 license.
+  Model weights and third-party components retain their own licenses.
+
+### Database, SQL, and lake tables
+
+- Add databases, scoped tables, tablespaces, and a system catalog. Relational
+  tables store typed rows with declared schemas, relational indexes,
+  foreign-key constraints, and row query and mutation APIs.
+- Execute SQL as native typed plans across embedded, standalone, distributed,
+  and serverless runtimes. Add PostgreSQL wire transactions, savepoints,
+  prepared statements, cursors, and supported session settings. SQL support is
+  bounded by the implemented dialect; the wire protocol does not imply full
+  PostgreSQL compatibility. See the [pgwire guide](zig/pkg/antfly/src/pgwire/README.md).
+- Query read-only Parquet and Iceberg sources without importing all rows.
+  Read only the needed columns and file ranges, cache remote indexes, and
+  resume interrupted bulk vector builds. Lake writes and broader ingestion remain
+  in development; see [lake query mode](zig/LAKES.md).
+- Add LEANN dense indexes and more vector compression options, including
+  multi-bit RaBitQ for HBC indexes. Support temporary vector storage, resumable
+  storage migration, and index aliases that let applications switch models
+  without changing the index name used in queries.
+- Add a `substring` field type and match highlighting for substring search.
+- Add graph metric maintenance and queries, including PageRank and eigenvector
+  centrality, automatic edge expiration, and improved graph traversal limits.
+  Extend graph querying with Cypher against named graphs; support follows the
+  implemented subset of the language.
+- Add [time-series helpers](docs/guides/time-series.mdx) for ordinary tables,
+  timestamped ingestion, retention, and accelerated time-bucket aggregations.
+
+### Inference, documents, and agents
+
+- Add a [decisions API](docs/reference/decisions.md) for structured answers with
+  confidence scores, also available in SQL and enrichment pipelines. Cascades
+  escalate uncertain inputs to stronger models and can require agreement
+  before accepting an answer. Add native GLiDE and GLiNER2.5 model support.
+- Expand Gemma 4, Whisper, embedding, and reranking execution on CPU, Metal,
+  and CUDA; supported models and backends vary. Add automatic batching and
+  shared serving pools, with CPU and memory limits covering both model execution
+  and media preparation.
+- Add OpenRouter and native Claude generation, provider tool-calling
+  improvements, ChatGPT sign-in, local Google/AWS login, and Apple native
+  providers on supported macOS systems.
+- Add declarative document processing and shared source management, combining
+  extraction, entity discovery, graph discovery, and retrieval. Entity resolvers
+  reconcile repeated mentions into canonical entities for knowledge graphs.
+  Improve PDF reading order and font decoding, preserve OCR text locations on
+  the page, and expand transcription, speaker-turn chunking, and video support.
+- Add durable research jobs with resumable budgets and evidence citations.
+  Retrieval agents gain tree and graph navigation, opt-in web fetching, and
+  compact document rendering with TOON or custom Handlebars templates.
+- Add [agent memory](docs/guides/agent-memory.mdx) with evidence-backed claims,
+  historical recall, session briefs, consolidation review, and agent tools.
+- Add [table privacy](docs/reference/table-privacy.md) previews, monitoring,
+  rescans, and redaction for search and AI. Originals remain stored;
+  redaction before storage is not yet supported.
+
+### Clients and operations
+
+- Extend Lite bindings and SQL drivers across languages, including browser
+  WASM. Keep local storage and inference independently buildable from server
+  coordination code.
+- Add typed search and schema workflows in Kysely, LangChain.js retrieval and
+  memory integrations, a Vercel AI SDK provider and tools, and React components
+  for streaming research reports.
+- Add [Better Auth integration](docs/guides/app-login.mdx) for application login,
+  sessions, and user-owned documents, using embedded or remote Antfly. The
+  initial integration is a release candidate.
+- Add explicit secret sources and encrypted secret records in Lite's private
+  metadata catalog. This protects stored credentials, rather than encrypting
+  the entire database file.
+- Add CLI output formats for agents and human-readable tables. Extend SDK
+  mutation results and per-item inference errors so callers can distinguish
+  committed writes, pending work, and partial failures.
+- Add planned standby switchover and configuration-driven standby management.
+  Strengthen replication, transaction recovery, checkpoint publication, and
+  restart behavior under contention and interrupted I/O.
+- Reduce repeated Zig compilation and bound build memory. Reduce storage read
+  copies, replay allocations, remote metadata work, and query working memory.
+- Add separately released companion tools, including Antfly Grep and the
+  Apple Silicon Dictation app; consult their releases for packaging and versions.
+
+### Reliability and performance fixes
+
+- Fix aggregations that failed on hybrid and semantic queries, correct facet
+  completion and vector result-count reporting, and preserve search effort
+  across internal query requests.
+- Preserve committed write outcomes during retries and recovery. Improve
+  concurrent Lite writer progress, resumable full-text indexing, and cleanup
+  of storage no longer in use.
+- Prevent stale embedding work from publishing into newer index generations;
+  repair sparse-vector reuse, tokenizer consistency, and graph filtering.
+- Preserve media decoding, OCR, and inference budget errors instead of reporting
+  partial output as success. Improve cancellation, request deadlines, and
+  credential handling for remote content.
+
+### Upgrade compatibility
+
+- **Standby naming:** prefer `antfly standby`, `hot_standby:` configuration,
+  `/admin/v1/standby/...` routes, and `antfly_standby_*` metrics. Legacy `ha`
+  spellings remain compatibility aliases for one minor release. The server
+  migrates the old data directory when configured for the new layout; see the
+  detailed entries below for paths and mixed-version behavior.
+- **Reranking:** use `/ai/v1/rerank` with `documents` for text and images.
+  `/ai/v1/rerank_multimodal` is removed, and generated SDK operation names
+  change to `rerankDocuments`. Text-only `prompts` remains deprecated input.
+- **Embedding configuration:** replace the `multimodal` flag with discovered
+  model capabilities or an explicit `inputs` list. Stored `multimodal` values
+  are ignored.
+- **PostgreSQL extension:** `pgaf` becomes the `antfly-postgres` Cargo package
+  and `antfly_postgres` extension/schema. Enable it with
+  `CREATE EXTENSION antfly_postgres;`.
+- **Native packaging:** install the CLI separately from embedded packages.
+  The embedded archive provides `libantfly`, headers, runtime assets, and
+  notices, with no executable; language packages retain their existing
+  `antfly-embedded` / `@antfly/embedded` names.
+- **Admin credentials:** auth-enabled instances using the legacy `admin:admin`
+  credentials refuse to start until `ANTFLY_BOOTSTRAP_ADMIN_PASSWORD` supplies
+  a unique password. Existing non-default passwords are preserved. See
+  [secure deployment](docs/reference/auth.md#secure-deployment).
+- **Authorization:** trusted-principal requests require a configured verifier;
+  matching scope row filters combine with AND. MCP sessions cannot retain a
+  previous request's broader permissions.
+- **On-disk compatibility:** enabling new catalog features can make stored state
+  unreadable by older binaries. Cascade decisions require reader epoch 30 and
+  agreement guards require epoch 31; these epochs are storage compatibility
+  versions. Verify compatibility before attempting a downgrade.
+- **Mutation retries:** inspect write status before retrying. A missing response
+  does not prove a write failed; SDKs expose pending and repair-required outcomes.
+- **Deployment tooling:** hosted operations and managed operator/proxy code move
+  to Colony. This repository retains the database, CLI, and embedded library.
+- Remove the unused `go/pkg/evalaf` module and its Antfly plugin.
 
 ## Releases
 
 ### [Unreleased]
+
+These detailed entries retain their existing release assignments. They overlap
+with the series overview above and are not a complete version-by-version record
+of 0.3. Changes must be assigned to their release tags before publishing final
+versioned notes.
 
 - **GLiDE typed decisions** — Fastino `GLiDE-0.4B`, `GLiDE-0.8B` and
   `GLiDE-2B` checkpoints serve through `/ai/v1/decisions` and appear under

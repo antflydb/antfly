@@ -202,22 +202,26 @@ pub const Buffer = struct {
     }
 
     pub fn toFloat32(self: *const Buffer, allocator: std.mem.Allocator) ![]f32 {
-        return self.downloadFloat32(allocator, allocator, null);
+        return self.downloadTyped(f32, .float32, allocator, allocator, null);
     }
 
     pub fn toFloat32WithShape(self: *const Buffer, allocator: std.mem.Allocator, expected: []const i64) ![]f32 {
-        return self.downloadFloat32(allocator, allocator, expected);
+        return self.downloadTyped(f32, .float32, allocator, allocator, expected);
     }
 
     pub fn toFloat32WithShapeAndScratch(self: *const Buffer, allocator: std.mem.Allocator, scratch: std.mem.Allocator, expected: []const i64) ![]f32 {
-        return self.downloadFloat32(allocator, scratch, expected);
+        return self.downloadTyped(f32, .float32, allocator, scratch, expected);
     }
 
-    fn downloadFloat32(self: *const Buffer, allocator: std.mem.Allocator, scratch: std.mem.Allocator, expected: ?[]const i64) ![]f32 {
+    pub fn toInt64WithShape(self: *const Buffer, allocator: std.mem.Allocator, expected: []const i64) ![]i64 {
+        return self.downloadTyped(i64, .int64, allocator, allocator, expected);
+    }
+
+    fn downloadTyped(self: *const Buffer, comptime T: type, comptime buffer_type: c.BufferType, allocator: std.mem.Allocator, scratch: std.mem.Allocator, expected: ?[]const i64) ![]T {
         if (!self.api.hasBufferReadback()) return error.UnsupportedPjrtFeature;
         var kind = c.BufferElementTypeArgs{ .struct_size = @sizeOf(c.BufferElementTypeArgs), .extension_start = null, .buffer = self.handle, .buffer_type = .invalid };
         try checkError(self.api, self.api.bufferElementType(&kind));
-        if (kind.buffer_type != .float32) return error.PjrtApiError;
+        if (kind.buffer_type != buffer_type) return error.PjrtApiError;
         var dims = std.mem.zeroes(c.BufferDimensionsArgs);
         dims.struct_size = @sizeOf(@TypeOf(dims));
         dims.buffer = self.handle;
@@ -253,9 +257,9 @@ pub const Buffer = struct {
         }
         if (query.event) |event| try awaitAndDestroyEvent(self.api, event);
         const size = query.dst_size;
-        if (size != try std.math.mul(usize, elements, @sizeOf(f32))) return error.PjrtApiError;
-        const num_floats = size / @sizeOf(f32);
-        const result = try allocator.alloc(f32, num_floats);
+        if (size != try std.math.mul(usize, elements, @sizeOf(T))) return error.PjrtApiError;
+        const num_elements = size / @sizeOf(T);
+        const result = try allocator.alloc(T, num_elements);
         errdefer allocator.free(result);
 
         var args = c.BufferToHostBufferArgs{
@@ -606,16 +610,6 @@ pub const Client = struct {
     /// `num_outputs` is the number of output buffers the program produces
     /// (1 for single-output, N for tuple-root programs).
     pub fn compile(self: *const Client, hlo_bytes: []const u8, num_outputs: usize) PjrtError!LoadedExecutable {
-        const format = "hlo";
-        var program = c.Program{
-            .struct_size = @sizeOf(c.Program),
-            .extension_start = null,
-            .code = @constCast(hlo_bytes.ptr),
-            .code_size = hlo_bytes.len,
-            .format = format,
-            .format_size = format.len,
-        };
-
         // Build CompileOptionsProto: { executable_build_options(3): { num_replicas(4): 1, num_partitions(5): 1 } }
         const compile_options = comptime blk: {
             // ExecutableBuildOptionsProto
@@ -628,17 +622,23 @@ pub const Client = struct {
             break :blk tag ++ len ++ build_opts;
         };
 
+        return self.compileWithOptions(hlo_bytes, num_outputs, &compile_options);
+    }
+
+    /// Compile an artifact with explicit, retained compiler options.
+    pub fn compileWithOptions(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, compile_options: []const u8) PjrtError!LoadedExecutable {
+        const format = "hlo";
+        var program = c.Program{ .struct_size = @sizeOf(c.Program), .extension_start = null, .code = @constCast(hlo_bytes.ptr), .code_size = hlo_bytes.len, .format = format, .format_size = format.len };
         var args = c.ClientCompileArgs{
             .struct_size = @sizeOf(c.ClientCompileArgs),
             .extension_start = null,
             .client = self.handle,
             .program = &program,
-            .compile_options = &compile_options,
+            .compile_options = compile_options.ptr,
             .compile_options_size = compile_options.len,
             .executable = null,
         };
         try checkError(self.api, self.api.clientCompile(&args));
-
         return self.validateLoadedOutputs(args.executable orelse return PjrtError.PjrtApiError, self.device, num_outputs);
     }
 
@@ -722,6 +722,17 @@ pub const Client = struct {
         return self.uploadBuffer(@ptrCast(data.ptr), .float32, dims, self.device);
     }
 
+    /// Upload IEEE bfloat16 payloads without expanding them to host/device f32.
+    pub fn bufferFromHostBFloat16(self: *const Client, data: []const u16, dims: []const i64) !Buffer {
+        var elements: usize = 1;
+        for (dims) |dim| {
+            const n = std.math.cast(usize, dim) orelse return error.InvalidDimensions;
+            elements = try std.math.mul(usize, elements, n);
+        }
+        if (elements != data.len) return error.InvalidDimensions;
+        return self.uploadBufferWithSemantics(@ptrCast(data.ptr), .bfloat16, dims, self.device, .immutable_until_transfer_completes);
+    }
+
     /// Upload i64 data from host to device, returning a Buffer handle.
     pub fn bufferFromHostInt64(
         self: *const Client,
@@ -759,6 +770,10 @@ pub const Client = struct {
     /// can fail after a valid buffer has been returned, and callers cannot
     /// release a buffer that this helper never returns to them.
     fn uploadBuffer(self: *const Client, data: *const anyopaque, kind: c.BufferType, dims: []const i64, device: *c.PjrtDevice) PjrtError!Buffer {
+        return self.uploadBufferWithSemantics(data, kind, dims, device, .immutable_only_during_call);
+    }
+
+    fn uploadBufferWithSemantics(self: *const Client, data: *const anyopaque, kind: c.BufferType, dims: []const i64, device: *c.PjrtDevice, semantics: c.HostBufferSemantics) PjrtError!Buffer {
         var args = std.mem.zeroes(c.ClientBufferFromHostBufferArgs);
         args.struct_size = @sizeOf(@TypeOf(args));
         args.client = self.handle;
@@ -766,7 +781,7 @@ pub const Client = struct {
         args.buffer_type = kind;
         args.dims = dims.ptr;
         args.num_dims = dims.len;
-        args.host_buffer_semantics = .immutable_only_during_call;
+        args.host_buffer_semantics = semantics;
         args.device = device;
         try checkError(self.api, self.api.clientBufferFromHostBuffer(&args));
         defer if (args.done_with_host_buffer) |event| destroyEvent(self.api, event);
@@ -1391,7 +1406,11 @@ test "row major readback canonicalizes native layout and KV shape ignores paddin
             std.debug.assert(layout.layout.tiled.num_tiles == 0);
             std.debug.assert(std.mem.eql(i64, layout.layout.tiled.minor_to_major.?[0..2], &.{ 1, 0 }));
             if (args.dst == null) {
-                args.dst_size = 16;
+                args.dst_size = if (kind == .int64) 32 else 16;
+                return null;
+            }
+            if (kind == .int64) {
+                @memcpy(@as([*]u8, @ptrCast(args.dst.?))[0..32], std.mem.sliceAsBytes(&[_]i64{ (1 << 40) + 1, 0, -(1 << 45) + 3, 1 }));
                 return null;
             }
             // Native column-major storage would be [10,20,0,1]. The requested
@@ -1419,4 +1438,17 @@ test "row major readback canonicalizes native layout and KV shape ignores paddin
     defer std.testing.allocator.free(values);
     try std.testing.expectEqualSlices(f32, &.{ 10, 0, 20, 1 }, values);
     try std.testing.expect(values[2] > values[3]);
+    Fake.kind = .int64;
+    const tokens = try buffer.toInt64WithShape(std.testing.allocator, &.{ 2, 2 });
+    defer std.testing.allocator.free(tokens);
+    try std.testing.expectEqualSlices(i64, &.{ (1 << 40) + 1, 0, -(1 << 45) + 3, 1 }, tokens);
+    try std.testing.expectError(error.PjrtApiError, buffer.toInt64WithShape(std.testing.allocator, &.{4}));
+    try std.testing.expectError(error.PjrtApiError, buffer.toFloat32WithShape(std.testing.allocator, &.{ 2, 2 }));
+}
+
+test "BF16 upload rejects invalid shape before accessing the provider" {
+    const client = Client{ .lib = undefined, .api = undefined, .handle = undefined, .device = undefined };
+    try std.testing.expectError(error.InvalidDimensions, client.bufferFromHostBFloat16(&.{0x3f80}, &.{2}));
+    try std.testing.expectError(error.InvalidDimensions, client.bufferFromHostBFloat16(&.{0x3f80}, &.{-1}));
+    try std.testing.expectError(error.Overflow, client.bufferFromHostBFloat16(&.{0x3f80}, &.{ std.math.maxInt(i64), 3 }));
 }

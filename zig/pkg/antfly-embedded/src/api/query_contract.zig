@@ -635,6 +635,8 @@ pub const QueryResponseMeta = struct {
     took_ms: i64 = 0,
     /// Borrowed execution fence; response encoding copies it before return.
     remote_snapshot: ?[]const u8 = null,
+    /// Borrowed concrete execution sources; encoding copies and deduplicates.
+    resolved_indexes: ?[]const []const u8 = null,
     shard_count: u32 = 1,
     merged: bool = false,
     reranker: ?RerankerProfile = null,
@@ -4197,6 +4199,27 @@ pub fn resolvedIndexNames(a: std.mem.Allocator, req: db_mod.types.SearchRequest)
     return try names.toOwnedSlice(a);
 }
 
+fn responseResolvedIndexNames(a: std.mem.Allocator, req: db_mod.types.SearchRequest, meta: QueryResponseMeta) !?[]const []const u8 {
+    const selected = meta.resolved_indexes orelse return resolvedIndexNames(a, req);
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    for (selected) |name| try appendUniqueOwnedString(a, &names, name);
+    if (names.items.len == 0) return null;
+    return try names.toOwnedSlice(a);
+}
+
+test "index alias response metadata reports concrete execution sources" {
+    const a = std.testing.allocator;
+    const selected = [_][]const u8{ "model_b", "model_b", "text" };
+    var response = try encodeQueryResponses(a, "docs", .{ .count_only = true, .index_name = "unused_request_target" }, .{ .resolved_indexes = &selected }, .{ .alloc = a, .hits = &.{}, .total_hits = 0 });
+    defer response.deinit(a);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.json, .{});
+    defer parsed.deinit();
+    const names = parsed.value.object.get("responses").?.array.items[0].object.get("resolved_indexes").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("model_b", names[0].string);
+    try std.testing.expectEqualStrings("text", names[1].string);
+}
+
 fn toOpenApiHitForWire(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: *db_mod.types.SearchHit, projection: ?*const field_projection.Plan) !metadata_openapi.QueryHit {
     const ready = try preparedComputedOutput(a, req, hit.*, projection);
     if (ready != null and (field_projection.storageEligible(req) or field_projection.hydrationEligible(req)) and hit.source_value == null and hit.column_source == null) {
@@ -4574,14 +4597,39 @@ pub fn encodeQueryResponses(
     return encodeQueryResponsesWithDelivery(alloc, table_name, req, meta, result, null);
 }
 
+test "api query contract response timing includes coordinator planning" {
+    const a = std.testing.allocator;
+    const start = platform_time.monotonicNs() -| (1500 * std.time.ns_per_ms);
+    const result: db_mod.types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0 };
+    const req: db_mod.types.SearchRequest = .{ .public_query_started_ns = start };
+    const wire = try @import("query_execution_contract.zig").encodeStorageKernelQueryRequest(a, req);
+    defer a.free(wire);
+    var worker = try parseQueryRequest(a, null, "docs", wire);
+    defer worker.deinit(a);
+    try std.testing.expect(worker.req.public_query_started_ns == null);
+    const controls = @import("../storage/query_controls.zig");
+    controls.applyExecutionOptions(&worker.req, controls.executionOptions(req));
+    try std.testing.expectEqual(@as(?u64, start), worker.req.public_query_started_ns);
+
+    var encoded = try encodeQueryResponses(a, "docs", worker.req, .{ .took_ms = 1 }, result);
+    defer encoded.deinit(a);
+    const parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, a, encoded.json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.responses.?[0].took >= 1500);
+}
+
 pub fn encodeQueryResponsesWithDelivery(
     alloc: std.mem.Allocator,
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
-    meta: QueryResponseMeta,
+    execution_meta: QueryResponseMeta,
     result: db_mod.types.SearchResult,
     delivery: ?@import("query_response.zig").Delivery,
 ) !QueryResponse {
+    var meta = execution_meta;
+    if (req.public_query_started_ns) |started| {
+        meta.took_ms = @intCast((platform_time.monotonicNs() -| started) / std.time.ns_per_ms);
+    }
     var delivered: ?usize = null;
     var graph_wire_failure: ?anyerror = null;
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
@@ -4646,7 +4694,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
                 .live_read = if (req.response_live_read) true else null,
-                .resolved_indexes = try resolvedIndexNames(arena, req),
+                .resolved_indexes = try responseResolvedIndexNames(arena, req, meta),
             };
             if (graph_results == null and typed_delivery) if (delivery) |sink| if (sink.typed_result) |target| {
                 if (sink.hydrator != null) return error.InvalidArgument;
@@ -4687,7 +4735,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
                 .live_read = if (req.response_live_read) true else null,
-                .resolved_indexes = try resolvedIndexNames(arena, req),
+                .resolved_indexes = try responseResolvedIndexNames(arena, req, meta),
             };
             break :blk if (hasColumnSources(emitted_hits) or hasFinalizedWireSources(req, emitted_hits, projection) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, null, req, query_results[0], emitted_hits, delivery, &delivered, projection) else try std.json.Stringify.valueAlloc(
                 alloc,

@@ -20,6 +20,10 @@ const metadata = @import("../metadata/table_manager.zig");
 const A = std.mem.Allocator;
 
 pub fn execute(server: anytype, a: A, table: []const u8, name: []const u8, body: ?[]const u8, context: local.api_operation.RequestContext) ![]u8 {
+    return executeObserved(server, a, table, name, body, context, null);
+}
+
+pub fn executeObserved(server: anytype, a: A, table: []const u8, name: []const u8, body: ?[]const u8, context: local.api_operation.RequestContext, etag: ?*?[]u8) ![]u8 {
     try context.ensureActive();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -29,11 +33,19 @@ pub fn execute(server: anytype, a: A, table: []const u8, name: []const u8, body:
     if (body == null) {
         const aliases = root.object.get(catalog.key) orelse return error.IndexAliasNotFound;
         const resource = aliases.object.get(name) orelse return error.IndexAliasNotFound;
-        return std.json.Stringify.valueAlloc(a, resource, .{});
+        const response = try std.json.Stringify.valueAlloc(a, resource, .{});
+        errdefer a.free(response);
+        if (etag) |out| out.* = try catalog.catalogResourceEtag(a, root, resource);
+        return response;
     }
     const request = std.json.parseFromSliceLeaky(catalog.Request, scratch, body.?, .{ .allocate = .alloc_always }) catch return error.InvalidIndexAliasRequest;
-    if (try catalog.replay(scratch, root, name, request)) |committed|
-        return std.json.Stringify.valueAlloc(a, committed, .{});
+    if (try catalog.replay(scratch, root, name, request)) |committed| {
+        const response = try std.json.Stringify.valueAlloc(a, committed, .{});
+        errdefer a.free(response);
+        if (comptime @hasDecl(@TypeOf(server.*), "acknowledgeIndexAliasReplay"))
+            try server.acknowledgeIndexAliasReplay(context);
+        return response;
+    }
     if (comptime @hasDecl(@TypeOf(server.*), "ensureIndexAliasAdmission")) try server.ensureIndexAliasAdmission(context);
     const relational = @import("relational_index_mutation.zig");
     if (try relational.contains(scratch, before.schema_json, name)) return error.IndexAliasNameConflict;
@@ -49,7 +61,17 @@ pub fn execute(server: anytype, a: A, table: []const u8, name: []const u8, body:
         const after = (try server.loadOwnedTableRecord(scratch, table)) orelse return error.TableGenerationChanged;
         if (!metadata.tableDefinitionsEqual(before, after)) return error.TableGenerationChanged;
     }
-    const next = try catalog.put(scratch, before.indexes_json, name, request, readiness, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+    var next = try catalog.put(scratch, before.indexes_json, name, request, readiness, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+    if (root.object.get("_index_alias_epoch") == null) {
+        // Table IDs are name-derived. Establish a fresh lifecycle identity on
+        // the first alias write, even if a recreated table repeats its name,
+        // alias request and wall-clock timestamp.
+        var io_impl = std.Io.Threaded.init(a, .{});
+        defer io_impl.deinit();
+        var nonce: [32]u8 = undefined;
+        try @import("antfly_platform").entropy.fill(io_impl.io(), &nonce);
+        next = try catalog.renewRestoreEpoch(scratch, next, &std.fmt.bytesToHex(nonce, .lower));
+    }
     const updated = try std.json.parseFromSliceLeaky(std.json.Value, scratch, next, .{});
     // Allocate the success observation before entering the commit boundary.
     const response = try std.json.Stringify.valueAlloc(a, updated.object.get(catalog.key).?.object.get(name).?, .{});
@@ -60,6 +82,23 @@ pub fn execute(server: anytype, a: A, table: []const u8, name: []const u8, body:
         try context.ensureActive();
         try server.source.replaceTableDefinition(before, replacement);
     }
+    return response;
+}
+
+pub fn remove(server: anytype, a: A, table: []const u8, name: []const u8, if_match: ?[]const u8, context: local.api_operation.RequestContext) ![]u8 {
+    try context.ensureActive();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const before = (try server.loadOwnedTableRecord(scratch, table)) orelse return error.TableNotFound;
+    if (comptime @hasDecl(@TypeOf(server.*), "ensureIndexAliasAdmission")) try server.ensureIndexAliasAdmission(context);
+    const updated = try catalog.remove(scratch, before.indexes_json, name, if_match);
+    const response = try a.dupe(u8, "{}");
+    errdefer a.free(response);
+    var replacement = before;
+    replacement.indexes_json = updated;
+    try context.ensureActive();
+    try server.source.replaceTableDefinition(before, replacement);
     return response;
 }
 

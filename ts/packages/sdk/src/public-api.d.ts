@@ -1152,10 +1152,16 @@ export interface paths {
         put?: never;
         /**
          * Execute a SQL statement
-         * @description Executes the bounded relational SELECT, INSERT, UPDATE, and DELETE
-         *     subset through the current catalog and native row execution contracts.
-         *     Parameters are bound separately from statement text. Document, graph,
-         *     and lake SQL sources, DDL, and SQL sessions are not yet supported.
+         * @description Executes one statement of the implemented SQL dialect (SELECT, INSERT,
+         *     UPDATE, DELETE, transaction control, and DDL) through the current
+         *     catalog and native typed plans, including reads over read-only lake
+         *     attachments. Parameters are bound separately from statement text.
+         *     DDL returns a durable `ddl_receipt`; a 202 response means the
+         *     declaration was admitted and validation is pending, and admitted DDL
+         *     must not be replayed. BEGIN starts a SQL session: send the returned
+         *     `session_id` with later statements until COMMIT or ROLLBACK. Open a
+         *     connection with `/sql/connections` to keep scope and settings across
+         *     requests, and use `/sql/prepared` for prepared statements.
          *     Reads inherit native owner-local consistency, not a global SQL
          *     transaction snapshot. Statements requiring a retained multi-page
          *     statement snapshot fail when that capability is unavailable.
@@ -2504,6 +2510,18 @@ export interface paths {
          *     such as the document-unit hierarchy extracted from a PDF, HTML page, or
          *     text field. The route is shard-aware; hosted deployments route the
          *     request to the data group that owns the source document key.
+         *
+         *     On a privacy-protected table, a dense index name without a same-named
+         *     asset also selects its stored text-chunk vectors for administrator
+         *     inspection. The response uses route_type `dense_index_inspection` and
+         *     manifest_version 1; raw manifest_json carries the versioned
+         *     `antfly.dense-index-inspection.v1` snapshot. Its current flag, policy,
+         *     index recipe, sanitized source and vector publication evidence belong
+         *     to one publication-fenced storage cut. The top-level artifact_id is empty;
+         *     member artifact IDs are included in the raw snapshot. This bounded
+         *     inspection does not re-embed missing vectors and does not alter normal
+         *     protected search projection permissions. See the table privacy guide
+         *     for the raw payload and supported recipe limits.
          */
         get: operations["getDocumentArtifactManifest"];
         put?: never;
@@ -2569,7 +2587,11 @@ export interface paths {
          */
         put: operations["putTableIndexAlias"];
         post?: never;
-        delete?: never;
+        /**
+         * Conditionally delete an index alias
+         * @description Requires table administration and the exact ETag returned by GET. The whole table-definition CAS prevents concurrent swaps or recreations from being deleted. Physical indexes and retained PUT idempotency receipts remain unchanged. A retry after successful deletion returns 404; a stale validator against a recreated alias returns 412.
+         */
+        delete: operations["deleteTableIndexAlias"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2595,7 +2617,11 @@ export interface paths {
          */
         put: operations["putNamespaceTableIndexAlias"];
         post?: never;
-        delete?: never;
+        /**
+         * Conditionally delete an index alias
+         * @description Requires table administration and the exact ETag returned by GET. The whole table-definition CAS prevents concurrent swaps or recreations from being deleted. Physical indexes and retained PUT idempotency receipts remain unchanged. A retry after successful deletion returns 404; a stale validator against a recreated alias returns 412.
+         */
+        delete: operations["deleteNamespaceTableIndexAlias"];
         options?: never;
         head?: never;
         patch?: never;
@@ -9504,7 +9530,7 @@ export interface components {
              */
             limit?: number;
             /**
-             * @description When true, the server immediately attempts the first bounded repair pass before returning the job.
+             * @description When true, the server starts the job and continues bounded passes automatically, including after restart. When false, each pass requires an explicit advance request.
              * @default true
              */
             advance?: boolean;
@@ -11803,7 +11829,7 @@ export interface components {
             backup_id: string;
             /**
              * @description Storage location for the backup. Supports multiple backends:
-             *     - Scoped filesystem connection: `file:///logical/path`
+             *     - Scoped filesystem connection: an absolute `file:///path/inside/connection/root`
              *     - Amazon S3: `s3://bucket-name/path/to/backup`
              *     - Google Cloud Storage: `gs://bucket-name/path/to/backup`
              *
@@ -11865,7 +11891,7 @@ export interface components {
             backup_id: string;
             /**
              * @description Storage location for the backup. Supports multiple backends:
-             *     - Scoped filesystem connection: `file:///logical/path`
+             *     - Scoped filesystem connection: an absolute `file:///path/inside/connection/root`
              *     - Amazon S3: `s3://bucket-name/path/to/backup`
              *     - Google Cloud Storage: `gs://bucket-name/path/to/backup`
              *
@@ -12129,6 +12155,15 @@ export interface components {
              *     ]
              */
             tables: string[];
+            /** @description Exact restore selectors paired with display names, in the same order as tables. Use selector in ClusterRestoreRequest.table_names to disambiguate identical display names. */
+            table_selectors?: {
+                /** @description Display name of the backed-up table. */
+                name: string;
+                /** @description Opaque identifier accepted by restore for this backup. */
+                selector: string;
+            }[];
+            /** @description True when the listing returned only backup metadata because table details exceeded the page size. */
+            table_details_omitted?: boolean;
             /**
              * @description Storage location of the backup
              * @example s3://mybucket/antfly-backups/cluster/2025-01-15
@@ -14218,8 +14253,12 @@ export interface components {
              *     This enables joining Antfly search results with structured relational data (customer records,
              *     product catalogs, etc.) without ingesting that data into Antfly.
              *
-             *     **Supported operations on foreign tables:** filter_query, field selection, limit/offset.
-             *     **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker.
+             *     **Supported operations on foreign tables:** filter_query, filter_prefix, field selection,
+             *     order_by, limit/offset, joins (including nested joins and joins between two foreign tables),
+             *     and the `stats`, `terms`, `count`, `sum`, `avg`, `min`, and `max` aggregations, which run as
+             *     SQL in PostgreSQL. Other aggregation types and sub-aggregations return 422.
+             *     **Not supported when the foreign table drives the query:** full_text_search, semantic_search,
+             *     graph_queries, reranker, search_after.
              *
              *     **Example - Join Antfly products with Postgres customers:**
              *     ```json
@@ -15678,7 +15717,7 @@ export interface components {
             postgres_table: string;
             /**
              * @description Optional column definitions for the foreign table. If omitted, columns are
-             *     auto-discovered from `information_schema.columns` on first query.
+             *     auto-discovered from the PostgreSQL catalog (`pg_attribute`) on first query.
              */
             columns?: components["schemas"]["ForeignColumn"][];
         };
@@ -15921,12 +15960,6 @@ export interface components {
         User: {
             /** @example johndoe */
             username: string;
-            /**
-             * Format: byte
-             * @description Base64 encoded password hash. Exposing this is a security risk.
-             * @example JGFyZ29uMm...
-             */
-            password_hash: string;
             /**
              * @description Server-side auth metadata available to stored row-filter policies through $auth metadata paths.
              * @example {
@@ -37608,6 +37641,28 @@ export interface operations {
             };
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
+            /**
+             * @description Dense inspection exceeds fixed payload or traversal limits. The JSON
+             *     response has code `inspection_limit_exceeded`, retryable `false`,
+             *     and a `limits` object. Reduce the source or selected index recipe.
+             */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        code: "inspection_limit_exceeded";
+                        /** @enum {boolean} */
+                        retryable: false;
+                        message: string;
+                        limits: {
+                            [key: string]: number;
+                        };
+                    };
+                };
+            };
             500: components["responses"]["InternalServerError"];
             503: components["responses"]["ServiceUnavailable"];
         };
@@ -37658,6 +37713,8 @@ export interface operations {
             /** @description Current alias and committed readiness proof */
             200: {
                 headers: {
+                    /** @description Strong validator required by conditional alias deletion */
+                    ETag?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -37720,6 +37777,60 @@ export interface operations {
             };
         };
     };
+    deleteTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header: {
+                "If-Match": string;
+            };
+            path: {
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Alias deleted; physical indexes remain available by name */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Concurrent catalog change or a dependent catalog binding */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Alias changed since the supplied ETag was read */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description If-Match is required */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description The metadata runtime does not support alias mutations */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     getNamespaceTableIndexAlias: {
         parameters: {
             query?: never;
@@ -37737,6 +37848,8 @@ export interface operations {
             /** @description Current alias and committed readiness proof */
             200: {
                 headers: {
+                    /** @description Strong validator required by conditional alias deletion */
+                    ETag?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -37793,6 +37906,62 @@ export interface operations {
             };
             500: components["responses"]["InternalServerError"];
             /** @description This index kind or runtime does not support alias mutations */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    deleteNamespaceTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header: {
+                "If-Match": string;
+            };
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Alias deleted; physical indexes remain available by name */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Concurrent catalog change or a dependent catalog binding */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Alias changed since the supplied ETag was read */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description If-Match is required */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description The metadata runtime does not support alias mutations */
             501: {
                 headers: {
                     [name: string]: unknown;

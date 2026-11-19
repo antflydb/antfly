@@ -379,8 +379,12 @@ class QueryRequest:
             This enables joining Antfly search results with structured relational data (customer records,
             product catalogs, etc.) without ingesting that data into Antfly.
 
-            **Supported operations on foreign tables:** filter_query, field selection, limit/offset.
-            **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker.
+            **Supported operations on foreign tables:** filter_query, filter_prefix, field selection,
+            order_by, limit/offset, joins (including nested joins and joins between two foreign tables),
+            and the `stats`, `terms`, `count`, `sum`, `avg`, `min`, and `max` aggregations, which run as
+            SQL in PostgreSQL. Other aggregation types and sub-aggregations return 422.
+            **Not supported when the foreign table drives the query:** full_text_search, semantic_search,
+            graph_queries, reranker, search_after.
 
             **Example - Join Antfly products with Postgres customers:**
             ```json

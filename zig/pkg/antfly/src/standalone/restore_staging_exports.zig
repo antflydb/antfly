@@ -38,6 +38,9 @@ pub fn create(context: *const bridge.CreateContext) callconv(.c) c_int {
         .staged = restore_staging.stageInputRestoreBackup(allocator, input_path, table_name, backup_id, location) catch |err| switch (err) {
             error.OutOfMemory => return bridge.Status.out_of_memory,
             error.InvalidArguments => return bridge.Status.invalid_arguments,
+            error.UnsupportedEmbeddedLiteIndex => return bridge.Status.unsupported_index,
+            error.UnsupportedEmbeddedLiteSchema => return bridge.Status.unsupported_schema,
+            error.UnsupportedBackupMigrationState => return bridge.Status.unsupported_migration,
             else => return bridge.Status.failed,
         },
     };

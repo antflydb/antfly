@@ -1982,6 +1982,10 @@ pub fn metadataApplyStoreProjection(
             };
             break :blk metadataProjectionJson(alloc, out_json, result);
         },
+        .poll_ha_outbox => blk: {
+            handle.store.pollHotStandbyOutbox() catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, true);
+        },
         .flush_ha_outbox => blk: {
             handle.store.flushHotStandbyOutbox() catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);
@@ -2313,6 +2317,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.hasIndexAliases(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .has_index_alias_lifecycle_state => {
+                    const value = handle.store.hasIndexAliasLifecycleState(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .validate_table_index_mutation => |input| {
                     const Validation = @import("../metadata/storage/raft_apply_contract.zig").TableIndexMutationValidation;
                     const result: Validation = result: {
@@ -2475,6 +2483,20 @@ pub fn metadataApplyStoreProjection(
                 .timeout
             else
                 storageOwnerStatusFromError(err);
+            defer handle.store.freeTables(alloc, value.tables);
+            defer handle.store.freeRanges(alloc, value.ranges);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .catalog_table_projection => blk: {
+            const value = handle.store.captureCatalogTableProjection(
+                alloc,
+                request.group_id,
+                request.key.slice(),
+                if (request.arg0 == 0) null else request.arg0,
+            ) catch |err| break :blk if (err == error.CatalogRoutingSnapshotTimeout)
+                .timeout
+            else
+                metadataProjectionStatusFromError(err);
             defer handle.store.freeTables(alloc, value.tables);
             defer handle.store.freeRanges(alloc, value.ranges);
             break :blk metadataProjectionJson(alloc, out_json, value);
@@ -2723,7 +2745,10 @@ pub fn metadataApplyStoreProjection(
             break :blk .ok;
         },
         .restore_job_value => blk: {
-            const value = handle.store.getRestoreJobValue(alloc, request.group_id, request.key.slice()) catch |err|
+            const value = (if (request.arg0 == 1)
+                handle.store.getRestoreJobRecord(alloc, request.group_id, request.key.slice())
+            else
+                handle.store.getRestoreJobValue(alloc, request.group_id, request.key.slice())) catch |err|
                 break :blk storageOwnerStatusFromError(err);
             defer if (value) |bytes| alloc.free(bytes);
             break :blk metadataProjectionJson(alloc, out_json, value);
@@ -3853,7 +3878,19 @@ pub fn storageOwnerOpen(
         const bootstrap = restore_bootstrap.?.value;
         bootstrap.validate() catch |err| return storageOwnerStatusFromError(err);
         const namespace = identity_namespace orelse return .invalid_argument;
-        if (!namespace.eql(bootstrap.scope.target_namespace) or !std.mem.eql(u8, bootstrap.table_name, table_name) or !std.mem.eql(u8, bootstrap.schema_json, request.schema_json.slice()) or !std.mem.eql(u8, bootstrap.indexes_json, request.indexes_json.slice())) return storageOwnerStatusFromError(error.RestoreStagingScopeChanged);
+        if (!namespace.eql(bootstrap.scope.target_namespace) or !std.mem.eql(u8, bootstrap.table_name, table_name) or !std.mem.eql(u8, bootstrap.schema_json, request.schema_json.slice()))
+            return storageOwnerStatusFromError(error.RestoreStagingScopeChanged);
+        if (!std.mem.eql(u8, bootstrap.indexes_json, request.indexes_json.slice())) {
+            // The immutable bootstrap binds the full metadata definition.
+            // A storage owner receives its cached physical projection, which
+            // excludes aliases, receipts and other metadata-only controls.
+            const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+            const physical = (aliases.physicalProjectionIfNeeded(alloc, bootstrap.indexes_json) catch |err| return storageOwnerStatusFromError(err)) orelse
+                return storageOwnerStatusFromError(error.RestoreStagingScopeChanged);
+            defer alloc.free(physical);
+            if (!std.mem.eql(u8, physical, request.indexes_json.slice()))
+                return storageOwnerStatusFromError(error.RestoreStagingScopeChanged);
+        }
     }
     var initial_child_bootstrap: ?std.json.Parsed(antfly.capi_dependencies.storage_db_relational_initial_child_publication.Bootstrap) = null;
     defer if (initial_child_bootstrap) |*parsed| parsed.deinit();
@@ -5026,6 +5063,7 @@ pub fn prepareStorageRestore(
     var db = try local_write.openStorageKernelRestoreDb(
         alloc,
         staged.path(),
+        scope.manifest.value.schema_json,
         scope.manifest.value.indexes_json,
         request.lsm_root_generation,
         backend_runtime.ptr(),
@@ -5055,6 +5093,7 @@ pub fn prepareStorageRestore(
         var verify_db = try local_write.openStorageKernelRestoreDb(
             alloc,
             staged.path(),
+            scope.manifest.value.schema_json,
             scope.manifest.value.indexes_json,
             request.lsm_root_generation,
             backend_runtime.ptr(),
@@ -5596,7 +5635,7 @@ pub fn storageOwnerQueryJson(
 ) callconv(.c) kernel_owner_abi.Status {
     out_response.* = .{};
     out_failure.* = .{};
-    if (request.control.version != kernel_owner_abi.query_abi_version)
+    if (request.control.version != kernel_owner_abi.query_request_version)
         return localOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
     const handle = asHandle(owner) orelse
         return localOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);

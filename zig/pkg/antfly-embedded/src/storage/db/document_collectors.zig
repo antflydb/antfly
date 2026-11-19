@@ -27,7 +27,6 @@ const relational_store = @import("relational_store.zig");
 const doc_identity = @import("doc_identity.zig");
 const lookup_key_scratch = @import("lookup_key_scratch.zig");
 const document_read_scratch = @import("document_read_scratch.zig");
-const resource_manager_mod = @import("../resource_manager.zig");
 fn monotonicTimeNs() u64 {
     return @import("antfly_platform").time.monotonicNs();
 }
@@ -59,12 +58,6 @@ pub const CollectDocumentWritesProfile = struct {
 pub const CollectTextDocumentWritesOptions = struct {
     prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
     relational_base_rows: bool = false,
-    /// Set once replay of this window has retried error.ReplayDocumentNotVisible
-    /// past the bounded limit (see ResourceManager.shouldEscalateReplayDocumentNotVisible).
-    /// A document that is still missing is then skipped and logged once
-    /// instead of counted toward missing_required, so the window can advance
-    /// instead of retrying forever.
-    tolerate_missing_replay_documents: bool = false,
 };
 
 pub const CollectDocumentWritesOptions = struct {
@@ -233,6 +226,7 @@ pub fn collectDocumentWritesProfiled(
 
     const materialize_start_ns = if (profile != null) monotonicTimeNs() else 0;
     for (pending.items, 0..) |item, i| {
+        if (read_values[i] == null and try replayDocumentIsDurablyDeleted(alloc, &txn, item.doc_key)) continue;
         const value = if (read_values[i]) |store_value| blk: {
             if (profile) |p| p.store_hits += 1;
             break :blk store_value;
@@ -240,7 +234,6 @@ pub fn collectDocumentWritesProfiled(
             if (profile) |p| p.inline_hits += 1;
             break :blk inline_value;
         } else {
-            if (try replayDocumentIsDurablyDeleted(alloc, &txn, item.doc_key)) continue;
             missing_required += 1;
             continue;
         };
@@ -422,16 +415,8 @@ pub fn collectTextDocumentWritesForIndex(
     var document_bytes_offset: usize = 0;
 
     for (pending.items, 0..) |item, i| {
+        if (read_values[i] == null and try replayDocumentIsDurablyDeleted(alloc, &txn, item.doc_key)) continue;
         const value = read_values[i] orelse item.inline_value orelse {
-            if (try replayDocumentIsDurablyDeleted(alloc, &txn, item.doc_key)) continue;
-            if (opts.tolerate_missing_replay_documents) {
-                std.log.warn(
-                    "full-text replay giving up on a document with no visible content after bounded retries index={s} key={s}",
-                    .{ index_name, item.doc_key },
-                );
-                if (index_manager.resource_manager) |manager| manager.recordReplayDocumentNotVisibleSkipped(resource_manager_mod.replayOwnerIdFromPtr(index_manager), index_name);
-                continue;
-            }
             result.missing_required += 1;
             continue;
         };
@@ -498,9 +483,25 @@ pub fn replayDocumentKeyInRange(byte_range: types.ByteRange, key: []const u8) bo
 }
 
 pub fn replayDocumentIsDurablyDeleted(alloc: Allocator, txn: anytype, doc_key: []const u8) !bool {
-    const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, txn, doc_key)) orelse return false;
-    const state = (try doc_identity.lookupStateTxn(txn, ordinal)) orelse return false;
-    return !state.isLive();
+    // Derived documents can be chunk/unit keys. Their liveness belongs to
+    // the primary parent, not to an identity named by the encoded artifact.
+    const parent = try internal_keys.decodeDocumentComponentAlloc(alloc, doc_key);
+    defer if (parent) |key| alloc.free(key);
+    const source = parent orelse doc_key;
+    if (try doc_identity.lookupOrdinalTxn(alloc, txn, source)) |ordinal| {
+        if (try doc_identity.lookupStateTxn(txn, ordinal)) |state| {
+            if (!state.isLive()) return true;
+        }
+    }
+    // A newer immutable chunk head certifies absence beyond its cardinality.
+    // Missing rows INSIDE the head still fail as corruption; an absent head
+    // alone is never evidence that an unresolved producer input was retired.
+    if (internal_keys.isChunkArtifactRecordKey(internal_keys.mediaWindowParent(doc_key))) {
+        var input = try @import("artifact_chunk_generation.zig").captureInput(alloc, txn, doc_key);
+        defer input.deinit();
+        return input.head_value != null and input.value == null;
+    }
+    return false;
 }
 
 pub fn textualAssetFullTextProjectionAlloc(

@@ -2139,6 +2139,12 @@ pub const MetadataHttpClient = struct {
 
     fn mapResponseStatus(resp: http_common.HttpResponse, bad_request_err: ?anyerror, not_found_err: ?anyerror, conflict_err: ?anyerror) !void {
         if (resp.status == 409) {
+            // Domain rejections are definite, not optimistic CAS races. In
+            // particular a privacy caller must not retry the same alias fence
+            // eight times and erase the actionable identity on its public API.
+            inline for (.{ error.IndexReferencedByAlias, error.IndexAliasGraphConflict, error.PrivacyManagedGraph, error.PrivacyUnknownArtifactSource }) |err| {
+                if (std.mem.eql(u8, resp.body, @errorName(err))) return err;
+            }
             for (resp.headers) |header| {
                 if (std.ascii.eqlIgnoreCase(header.name, routes.Routes.table_mutation_error_header) and
                     std.mem.eql(u8, header.value, routes.Routes.table_mutation_error_artifact_dependency))
@@ -4928,8 +4934,9 @@ test "index alias definition conflicts remain definite across metadata forwardin
     for ([_][]const u8{ "IndexReferencedByAlias", "IndexAliasGraphConflict" }) |body| {
         executor.body = body;
         const before = executor.calls;
-        try std.testing.expectError(error.TableGenerationChanged, client.replaceTableDefinition("http://metadata.invalid", "docs", "{}"));
-        try std.testing.expectError(error.TableGenerationChanged, client.replaceTableDefinitionStamped("http://metadata.invalid", "docs", "{}"));
+        const expected: anyerror = if (std.mem.eql(u8, body, "IndexReferencedByAlias")) error.IndexReferencedByAlias else error.IndexAliasGraphConflict;
+        try std.testing.expectError(expected, client.replaceTableDefinition("http://metadata.invalid", "docs", "{}"));
+        try std.testing.expectError(expected, client.replaceTableDefinitionStamped("http://metadata.invalid", "docs", "{}"));
         try std.testing.expectEqual(before + 2, executor.calls);
     }
 }

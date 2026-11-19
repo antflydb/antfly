@@ -269,6 +269,7 @@ class StandaloneAuthServer:
                 command.extend(["--storage-engine", storage_engine])
                 if storage_engine == "lite":
                     command.extend(["--storage-path", str(root / "db.aflite")])
+            self.command = tuple(command)
             self.proc: subprocess.Popen[str] | None = None
             setup.pop_all()
         try:
@@ -307,6 +308,30 @@ class StandaloneAuthServer:
     def debug_logs(self) -> str:
         self.log_file.flush()
         return _read_log_tail(self.log_path)
+
+    def restart(self) -> None:
+        """Crash and reopen the same owned database without removing its root."""
+        assert self.proc is not None
+        self.proc.kill()
+        self.proc.wait(timeout=10)
+        self.proc = subprocess.Popen(
+            self.command,
+            env={
+                **os.environ,
+                "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD": AUTH_BOOTSTRAP_PASSWORD,
+            },
+            stdout=self.log_file,
+            stderr=subprocess.STDOUT,
+            cwd=self.root,
+        )
+        if not wait_for_server(
+            self.api_url, allow_unauthorized=True, processes=[("server", self.proc)]
+        ):
+            raise RuntimeError(f"Auth standalone restart failed\n{self.debug_logs()}")
+        if not _wait_for_admin_auth(AuthApi._auth_url_from_db_url(self.api_url)):
+            raise RuntimeError(
+                f"Auth standalone restart authentication failed\n{self.debug_logs()}"
+            )
 
     def _poll_metadata_admin_url(self) -> str:
         deadline = time.monotonic() + 5.0
@@ -423,6 +448,8 @@ def test_standalone_auth_user_and_api_key_flow(auth_api: AuthApi):
         },
     )
     assert created["username"] == "alice"
+    assert "password_hash" not in created
+    assert "password_hash" not in auth_api.get("/auth/v1/users/alice")
 
     row_filter = auth_api.put(
         "/auth/v1/users/alice/row-filters/docs", {"term": {"tier": "gold"}}
@@ -1618,3 +1645,88 @@ def test_privacy_scoped_routes_and_permissions(request, fixture_name):
         assert response.status_code == 202, response.text
         assert api.get(path + "/scans/" + saved["scan_id"])["phase"] == "superseded"
     assert api.get(path)["policy_version"] == saved["policy_version"]
+
+
+def test_malformed_credentials_are_unauthorized(auth_api):
+    root = auth_api.url.removesuffix("/db/v1")
+    for scheme in ("Basic", "Bearer", "ApiKey"):
+        for token in ("garbage", "!!!!", "YQ==", ""):
+            for method, path, body in [
+                ("GET", "/auth/v1/me", None),
+                ("GET", "/db/v1/tables", None),
+                (
+                    "POST",
+                    "/mcp/v1",
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "clientInfo": {"name": "regression", "version": "1"},
+                        },
+                    },
+                ),
+            ]:
+                response = requests.request(
+                    method,
+                    root + path,
+                    json=body,
+                    headers={"Authorization": f"{scheme} {token}"},
+                    timeout=10,
+                )
+                assert response.status_code == 401, response.text
+
+
+def test_auth_create_file_owns_nested_strings(auth_api, tmp_path):
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    source = tmp_path / "user.json"
+    source.write_text(
+        json.dumps(
+            {
+                "password": "file-password-123",
+                "metadata": {"tenant_id": "acme"},
+                "initial_policies": [
+                    {"resource": "docs", "resource_type": "table", "type": "read"}
+                ],
+            }
+        )
+    )
+    root = auth_api.url.removesuffix("/db/v1")
+    result = subprocess.run(
+        [
+            binary,
+            "--no-agent",
+            "auth",
+            "users",
+            "create",
+            "file-user",
+            "--file",
+            str(source),
+            "--url",
+            root,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={
+            **os.environ,
+            "ANTFLY_USERNAME": "admin",
+            "ANTFLY_PASSWORD": AUTH_BOOTSTRAP_PASSWORD,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    user = requests.get(
+        root + "/auth/v1/users/file-user",
+        auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+        timeout=10,
+    )
+    assert user.status_code == 200, user.text
+    assert user.json()["metadata"]["tenant_id"] == "acme"
+    assert "password_hash" not in user.json()
+    me = requests.get(
+        root + "/auth/v1/me", auth=("file-user", "file-password-123"), timeout=10
+    )
+    assert me.status_code == 200, me.text
+    assert any(p["resource"] == "docs" for p in me.json()["permissions"])

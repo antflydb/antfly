@@ -200,6 +200,9 @@ tmp_symbols="$tmp_root/kernels.symbols"
 trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89" "$tmp_symbols"; rmdir "$tmp_root"' EXIT
 
 required_symbols=(
+  antfly_gemma4_vision_norm_rope_f32
+  antfly_gemma4_vision_attention_registers
+  antfly_linear_gemma4_q4_0_bf16_raw
   antfly_audio_logmel_f32
   antfly_audio_fft512_f32
   antfly_audio_conv_tiled_f32
@@ -234,6 +237,7 @@ required_symbols=(
   termite_embedding_gemma2_attention_bf16
   termite_embedding_gemma2_attention_local_flash_bf16
   termite_embedding_gemma2_attention_softmax_bf16
+  termite_embedding_gemma2_attention_normalized_softmax_bf16
   termite_embedding_gemma2_matmul_bf16
   termite_embedding_gemma2_gelu_mul_bf16
   termite_embedding_gemma2_gelu_mul_vjp_f32

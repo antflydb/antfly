@@ -32,12 +32,18 @@ pub fn storeIdentity(a: A, store: *const Store) ![32]u8 {
     return digest;
 }
 
+pub const IndexResource = union(enum) { list, get: []const u8 };
+
 pub const Options = struct {
     config: ?*const local.common_config.Config = null,
     secrets: ?*local.common_secrets.FileStore = null,
     deployment: local.common_config.DeploymentMode,
     local_base_dir: ?[]const u8 = null,
     graph_execution_limits: local.graph_work_budget.Limits = .{},
+    embedding_cache: ?@import("internal_query_operations.zig").QueryEmbeddingCache = null,
+    embedding_runtime: ?*@import("antfly_local_sources").inference_managed_embedder.ProviderRuntime = null,
+    inference_api_url: ?[]const u8 = null,
+    inference_api_key: ?[]const u8 = null,
     remote_content: ?*const @import("antfly_scraping").RemoteContentConfig = null,
 };
 
@@ -75,6 +81,10 @@ const Entry = struct {
             .secret_store = options.secrets,
             .graph_execution_limits = options.graph_execution_limits,
             .remote_content = options.remote_content,
+            .embedding_cache = options.embedding_cache,
+            .query_embedding_runtime = options.embedding_runtime,
+            .inference_api_url = options.inference_api_url,
+            .inference_api_key = options.inference_api_key,
         }, io);
         errdefer self.stack.deinit();
         try context.ensureActive();
@@ -137,11 +147,28 @@ pub const Manager = struct {
     }
     /// Caller has resolved and authorized a fresh native catalog binding.
     pub fn handle(self: *Manager, a: A, io: std.Io, table: metadata.TableRecord, options: Options, method: @import("../serverless/api/http_routes.zig").HttpMethod, suffix: []const u8, body: []const u8, context: local.api_operation.RequestContext) !http.HttpResponse {
+        return self.handleRequest(a, io, table, options, method, suffix, body, context, null);
+    }
+
+    pub fn handleIndexResource(self: *Manager, a: A, io: std.Io, table: metadata.TableRecord, options: Options, resource: IndexResource, context: local.api_operation.RequestContext) !http.HttpResponse {
+        return self.handleRequest(a, io, table, options, .get, "indexes", "", context, resource);
+    }
+
+    fn handleRequest(self: *Manager, a: A, io: std.Io, table: metadata.TableRecord, options: Options, method: @import("../serverless/api/http_routes.zig").HttpMethod, suffix: []const u8, body: []const u8, context: local.api_operation.RequestContext, index_resource: ?IndexResource) !http.HttpResponse {
         const guard = http.RequestGuard{ .context = try context.platformDeadline() };
         const cancellation = guard.token();
         try guard.context.ensureActive();
         const entry = try self.acquire(a, io, table, options, guard.context);
         try guard.context.ensureActive();
+        if (index_resource) |resource| {
+            var response = try entry.stack.handler.handleIndexResource("data", switch (resource) {
+                .list => null,
+                .get => |name| name,
+            }, guard.context);
+            errdefer response.deinit(a);
+            try guard.context.ensureActive();
+            return response;
+        }
         if (method == .get and std.mem.eql(u8, suffix, "lookup")) {
             var table_binding = (try entry.stack.catalog.getTableAlloc(a, "data")) orelse return error.TableNotFound;
             defer table_binding.deinit(a);
@@ -177,7 +204,7 @@ pub const Manager = struct {
         var bound_body: ?[]u8 = null;
         defer if (bound_body) |bytes| a.free(bytes);
         if (std.mem.eql(u8, suffix, "query")) bound_body = try stripAliasFences(a, body, entry.indexes);
-        var response = entry.stack.handler.handle(.{ .method = method, .path = path, .body = bound_body orelse body, .cancellation = context.cancellation, .deadline_ns = guard.context.deadline_ns }) catch |err| {
+        var response = entry.stack.handler.handle(.{ .method = method, .path = path, .body = bound_body orelse body, .cancellation = guard.token(), .deadline_ns = guard.context.deadline_ns, .request_id = context.request_id, .query_started_ns = context.query_started_ns, .principal = context.principal }) catch |err| {
             // Transport-only cancellation adapters may report Canceled when
             // the request deadline expired. Preserve the native error kind.
             if (method == .get or std.mem.eql(u8, suffix, "query")) try guard.context.ensureActive();

@@ -53,13 +53,13 @@ pub fn executeWithDelivery(a: A, server: *server_api.ApiHttpServer, table: local
 }
 pub fn executeScopedWithDelivery(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext, delivery: ?local.api_query_response.Delivery, scope: ?*Scope) !?local.api_query.QueryResponse {
     return executePinned(a, server, table, req, request, delivery, false, scope) catch |err| switch (err) {
-        error.IndexRebuilding => rebuilding: {
-            // A failed capture or expired cut needs an independent, keyed
-            // wakeup even when the periodic inventory sweep is busy.
+        error.IndexRebuilding, error.ExternalLakeIndexNotPublished, error.ExternalLakeIndexUnavailable => rebuilding: {
+            // First publication and failed/expired captures need the same
+            // keyed wakeup. Returning a pending response alone leaves a new
+            // table waiting for the periodic inventory sweep.
             server.requestLakePublication(table.name) catch {};
             break :rebuilding error.IndexRebuilding;
         },
-        error.ExternalLakeIndexNotPublished, error.ExternalLakeIndexUnavailable => error.IndexRebuilding,
         error.LakeIndexArtifactUnavailable, error.InvalidLogicalRowIdentity, error.ExternalLakeIndexDefinitionChanged, error.ExternalLakeIndexStoreChanged, error.ExternalLakeIndexCredentialsChanged, error.ExternalLakeIndexSourceChanged, error.ExternalLakeSnapshotMismatch => changed: {
             try server.requestLakePublication(table.name);
             break :changed error.CatalogGenerationChanged;

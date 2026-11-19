@@ -620,8 +620,6 @@ pub const UpdatePasswordRequest = struct {
 
 pub const User = struct {
     username: []const u8,
-    /// Base64 encoded password hash. Exposing this is a security risk.
-    password_hash: []const u8,
     /// Server-side auth metadata available to stored row-filter policies through $auth metadata paths.
     metadata: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
 
@@ -629,8 +627,6 @@ pub const User = struct {
         try jw.beginObject();
         try jw.objectField("username");
         try jw.write(self.username);
-        try jw.objectField("password_hash");
-        try jw.write(self.password_hash);
         switch (self.metadata) {
             .absent => {},
             .null_value => {

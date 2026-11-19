@@ -98,6 +98,16 @@ const CountingOutput = struct {
     }
 };
 
+pub const VerifiedNativeTree = struct {
+    path: []const u8,
+    stat_digest: [Sha256.digest_length]u8,
+};
+
+pub const VerifiedNativeManifest = struct {
+    path: []const u8,
+    sha256: [Sha256.digest_length]u8,
+};
+
 pub const PackOptions = struct {
     header_backup_id: [16]u8 = @as([16]u8, @splat(0)),
     backup_id: []const u8 = "",
@@ -105,6 +115,8 @@ pub const PackOptions = struct {
     created_at_unix_ns: i64 = 0,
     storage_engine: []const u8 = "antfly-native",
     capture: bundle.CaptureMode = .full,
+    verified_trees: []const VerifiedNativeTree = &.{},
+    verified_manifest: ?VerifiedNativeManifest = null,
 };
 
 pub fn readManifestFromFile(
@@ -126,6 +138,81 @@ pub fn readManifestFromFileLimited(alloc: std.mem.Allocator, io: std.Io, source:
     defer alloc.free(manifest_block.payload);
     if (manifest_block.block_type != .bundle_manifest) return error.InvalidBackupManifest;
     return try bundle.parseManifest(alloc, manifest_block.payload);
+}
+
+/// Read and verify one included native object without extracting the archive.
+pub fn readNativeObjectAlloc(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source: std.Io.File,
+    source_size: u64,
+    manifest: bundle.Manifest,
+    path: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    if (manifest.representation != .native or manifest.mode != .full) return error.BackupArtifactFormatMismatch;
+    const object = for (manifest.objects) |object| {
+        if (std.mem.eql(u8, object.logical_path, path)) break object;
+    } else return error.BackupArtifactMissing;
+    if (object.size_bytes > max_bytes) return error.BackupManifestTooLarge;
+    var digest: [Sha256.digest_length]u8 = undefined;
+    _ = std.fmt.hexToBytes(&digest, object.sha256) catch return error.InvalidBackupManifest;
+    const ordinal = for (manifest.blobs, 0..) |blob, ordinal| {
+        if (std.mem.eql(u8, blob.sha256, object.sha256)) break ordinal;
+    } else return error.InvalidBackupManifest;
+    const descriptor = manifest.blobs[ordinal];
+    const index_entry_bytes = Sha256.digest_length + 2 * @sizeOf(u64);
+    const index_count_bytes = @sizeOf(u32);
+    const expected_footer_size = index_count_bytes + manifest.blobs.len * index_entry_bytes;
+    const trailer = try readTrailerFromFile(io, source, source_size);
+    if (trailer.footer_payload_size != expected_footer_size) return error.InvalidBundleFooter;
+    var reader = backup_codec.FileReader.init(io, source, source_size - bundle.trailer_size);
+    reader.pos = trailer.footer_offset;
+    // A full bundle includes every digest-sorted blob in ordinal order.
+    const offset_in_footer = index_count_bytes + ordinal * index_entry_bytes;
+    var count_bytes: [index_count_bytes]u8 = undefined;
+    var entry_bytes: [index_entry_bytes]u8 = undefined;
+    try reader.readPlainBlockRegion(.footer_index, expected_footer_size, &count_bytes, offset_in_footer, &entry_bytes);
+    if (reader.hasRemaining() or std.mem.readInt(u32, &count_bytes, .little) != manifest.blobs.len)
+        return error.InvalidBundleFooter;
+    const entry = bundle.decodeFooterIndexEntry(&entry_bytes);
+    if (!std.mem.eql(u8, &entry.sha256, &digest)) return error.InvalidBundleFooter;
+    if (entry.header_offset >= trailer.footer_offset or entry.stored_size_bytes != object.size_bytes)
+        return error.InvalidBundleFooter;
+
+    reader = backup_codec.FileReader.init(io, source, trailer.footer_offset);
+    reader.pos = entry.header_offset;
+    const header_block = try reader.readPlainBlock(alloc, .blob_header, bundle.max_blob_header_bytes);
+    defer alloc.free(header_block.payload);
+    if (header_block.block_type != .blob_header) return error.InvalidBackupManifest;
+    var header = try bundle.decodeBlobHeader(alloc, header_block.payload);
+    defer header.deinit(alloc);
+    if (!descriptor.included or descriptor.compression != .none or
+        descriptor.logical_size_bytes != object.size_bytes or descriptor.stored_size_bytes != object.size_bytes or
+        header.ordinal != ordinal or header.compression != .none or header.logical_size_bytes != object.size_bytes or
+        header.stored_size_bytes != object.size_bytes or !std.mem.eql(u8, &header.sha256, &digest) or
+        !std.mem.eql(u8, header.role, "native_blob") or
+        !std.mem.startsWith(u8, header.logical_path, "blobs/") or
+        !std.mem.eql(u8, header.logical_path["blobs/".len..], object.sha256))
+        return error.BackupArtifactIntegrityMismatch;
+
+    const body = try alloc.alloc(u8, @intCast(object.size_bytes));
+    errdefer alloc.free(body);
+    var offset: usize = 0;
+    while (offset < body.len) {
+        const block = try reader.readPlainBlock(alloc, .blob_chunk, bundle.blob_chunk_prefix_bytes + @min(bundle.native_chunk_target_bytes, body.len - offset));
+        defer alloc.free(block.payload);
+        if (block.block_type != .blob_chunk) return error.InvalidNativeFileChunk;
+        const chunk = try bundle.decodeBlobChunk(block.payload);
+        if (chunk.ordinal != ordinal or chunk.offset != offset or chunk.bytes.len == 0 or chunk.bytes.len > body.len - offset)
+            return error.InvalidNativeFileChunk;
+        @memcpy(body[offset..][0..chunk.bytes.len], chunk.bytes);
+        offset += chunk.bytes.len;
+    }
+    var actual: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(body, &actual, .{});
+    if (!std.mem.eql(u8, &actual, &digest)) return error.BackupArtifactIntegrityMismatch;
+    return body;
 }
 
 fn readTrailerFromFile(io: std.Io, source: std.Io.File, source_size: u64) !bundle.Trailer {
@@ -189,6 +276,14 @@ pub fn packNativePathsToWriter(
         files.deinit(alloc);
     }
     if (files.items.len == 0) return error.BackupArtifactMissing;
+
+    if (options.verified_manifest) |expected| {
+        const index = sourceFileLowerBound(files.items, expected.path);
+        if (index == files.items.len or !std.mem.eql(u8, files.items[index].logical_path, expected.path) or
+            !std.mem.eql(u8, &files.items[index].sha256, &expected.sha256))
+            return error.BackupArtifactIntegrityMismatch;
+    }
+    for (options.verified_trees) |tree| try verifyNativeTreeGeneration(alloc, files.items, tree);
 
     const objects = try alloc.alloc(bundle.ObjectDescriptor, files.items.len);
     defer alloc.free(objects);
@@ -330,6 +425,34 @@ pub fn packNativePathsToWriter(
         .footer_payload_size = footer.len,
     });
     try sink.writeAll(&trailer);
+}
+
+fn sourceFileLowerBound(files: []const SourceFile, key: []const u8) usize {
+    var lo: usize = 0;
+    var hi = files.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (std.mem.lessThan(u8, files[mid].logical_path, key)) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+fn verifyNativeTreeGeneration(alloc: std.mem.Allocator, files: []const SourceFile, tree: VerifiedNativeTree) !void {
+    const backups = @import("../api/backups.zig");
+    const prefix = try std.fmt.allocPrint(alloc, "{s}/", .{tree.path});
+    defer alloc.free(prefix);
+    const start = sourceFileLowerBound(files, prefix);
+    var end = start;
+    while (end < files.len and std.mem.startsWith(u8, files[end].logical_path, prefix)) : (end += 1) {}
+    var hasher = Sha256.init(.{});
+    backups.hashArtifactU64(&hasher, @intCast(end - start));
+    for (files[start..end]) |file| {
+        backups.hashArtifactBytes(&hasher, file.logical_path[prefix.len..]);
+        backups.hashLocalArtifactStat(&hasher, file.stat);
+    }
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    if (!std.mem.eql(u8, &digest, &tree.stat_digest)) return error.SourceFileChanged;
 }
 
 fn collectSourceFiles(

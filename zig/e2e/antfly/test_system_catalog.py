@@ -16,6 +16,7 @@
 """System catalog identity, placement, and qualified restore regressions."""
 
 import json
+import subprocess
 import tempfile
 import threading
 import uuid
@@ -25,6 +26,7 @@ from urllib.parse import quote
 
 import pytest
 import requests
+from conftest import E2E_BACKUP_CONNECTION
 from helpers import wait_until
 
 
@@ -378,10 +380,12 @@ def test_catalog_cluster_backup_retains_scope_and_literal_names(backup_api):
     api = backup_api
     database = "archive_" + uuid.uuid4().hex[:12]
     api.post(f"/databases/{database}", {})
-    literal = "sales/archive.v1"
+    literal = " sales/archive.v1, west "
+    display_collision = f"{database}.public.{literal}"
     paths = [
         "/tables/" + quote(literal, safe=""),
         f"/databases/{database}/namespaces/public/tables/" + quote(literal, safe=""),
+        "/tables/" + quote(display_collision, safe=""),
     ]
     for index, path in enumerate(paths):
         # Snapshot qualification requires primary ownership, including scoped
@@ -398,19 +402,92 @@ def test_catalog_cluster_backup_retains_scope_and_literal_names(backup_api):
             literal,
             f"{database}.public.{literal}",
         }
+        listed = next(
+            item
+            for item in api.list_backups(location=location)["backups"]
+            if item["backup_id"] == "catalog-cluster"
+        )
+        selectors = listed["table_selectors"]
+        assert [item["name"] for item in selectors] == listed["tables"]
+        collisions = [
+            item["selector"] for item in selectors if item["name"] == display_collision
+        ]
+        assert len(set(collisions)) == 2
+        other_location = (Path(directory) / "other").as_uri()
+        api.cluster_backup(backup_id="catalog-cluster", location=other_location)
+        rejected = api.s.post(
+            f"{api.url}/restore",
+            json={
+                "backup_id": "catalog-cluster",
+                "location": other_location,
+                "connection": E2E_BACKUP_CONNECTION,
+                "restore_mode": "overwrite",
+                "table_names": [collisions[0]],
+            },
+            timeout=30,
+        )
+        assert rejected.status_code == 400, rejected.text
+        assert "backup table selection" in rejected.text
         # The API assertions below exercise the durable manifest after names
         # have disappeared from the live catalog; they cannot pass through a
         # cache of existing bindings.
         for path in paths:
             api.delete(path)
-        restored = api.cluster_restore(
-            backup_id="catalog-cluster",
-            location=location,
-            restore_mode="fail_if_exists",
+        command = subprocess.run(
+            [
+                api._server.binary,
+                "--no-agent",
+                "--output",
+                "json",
+                "restore",
+                "--backup-id",
+                "catalog-cluster",
+                "--connection",
+                E2E_BACKUP_CONNECTION,
+                "--location",
+                location,
+                "--url",
+                api._server.url,
+                "--mode",
+                "fail_if_exists",
+                "--tables",
+                ",".join(item["selector"] for item in selectors),
+                "--wait",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
-        assert restored["committed_table_count"] == 2
+        assert command.returncode == 0, command.stderr + api.debug_logs()
+        assert json.loads(command.stdout)["result"]["committed_table_count"] == 3
         for index, path in enumerate(paths):
             assert api.get(path + "/documents/doc") == {"scope": index}
+        request = {
+            "backup_id": "catalog-cluster",
+            "location": other_location,
+            "connection": E2E_BACKUP_CONNECTION,
+            "restore_mode": "skip_if_exists",
+        }
+        headers = {"Idempotency-Key": f"{database}-archive-replay"}
+        accepted = api.s.post(
+            f"{api.url}/restore", json=request, headers=headers, timeout=30
+        )
+        assert accepted.status_code == 202, accepted.text
+        job_id = accepted.json()["job_id"]
+
+        def terminal():
+            job = api.get(f"/restore/jobs/{job_id}")
+            return job if job["phase"] in {"succeeded", "failed", "cancelled"} else None
+
+        completed = wait_until(terminal, timeout_s=60, interval_s=0.1)
+        assert completed["phase"] == "succeeded", json.dumps(completed)
+        (Path(directory) / "other").rename(Path(directory) / "moved")
+        replay = api.s.post(
+            f"{api.url}/restore", json=request, headers=headers, timeout=30
+        )
+        assert replay.status_code == 202, replay.text
+        assert replay.json()["job_id"] == job_id
+        assert replay.json()["phase"] == "succeeded"
     for path in paths:
         api.delete(path)
     api.delete(f"/databases/{database}")

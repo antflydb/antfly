@@ -3370,9 +3370,13 @@ fn requirePrivacyStoreAdmission(service: anytype, record: metadata_table_manager
 }
 
 fn requireIndexAliasStoreAdmission(service: anytype, record: metadata_table_manager.StoreRecord) !void {
-    if (!record.live or !metadata_table_manager.storeServesTableData(record.role) or metadata_table_manager.indexAliasesProtocolSupported(record.reporter_incarnation, record.artifact_sources_protocol_version)) return;
+    if (!record.live or !metadata_table_manager.storeServesTableData(record.role) or metadata_table_manager.indexAliasLifecycleProtocolSupported(record.reporter_incarnation, record.artifact_sources_protocol_version)) return;
     const store = service.projectedStore() orelse return error.MissingMetadataStore;
-    if (try store.hasIndexAliases(service.metadata_group_id)) return error.IndexAliasProtocolUpgradeRequired;
+    const blocked = if (metadata_table_manager.indexAliasesProtocolSupported(record.reporter_incarnation, record.artifact_sources_protocol_version))
+        try store.hasIndexAliasLifecycleState(service.metadata_group_id)
+    else
+        try store.hasIndexAliases(service.metadata_group_id);
+    if (blocked) return error.IndexAliasProtocolUpgradeRequired;
 }
 
 fn validateDenseNativeStoreAdmission(
@@ -3645,7 +3649,9 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
     var required = (try transitionBaseDecoderVersion(a, command));
     switch (command) {
         .register_store, .upsert_store, .upsert_store_heartbeat => |record| {
-            if (record.artifact_sources_protocol_version >= 3) required = @max(required, metadata_topology_protocol.index_aliases_version);
+            if (record.artifact_sources_protocol_version >= 4) {
+                required = @max(required, metadata_topology_protocol.index_alias_lifecycle_version);
+            } else if (record.artifact_sources_protocol_version >= 3) required = @max(required, 90);
         },
         .upsert_table => |table| required = @max(required, (try tableDecoderVersion(a, table))),
         .compare_and_replace_table => |cas| required = @max(required, @max((try tableDecoderVersion(a, cas.expected)), (try tableDecoderVersion(a, cas.replacement)))),
@@ -3665,7 +3671,7 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
 // higher decoder requirement, including the prior definition in a CAS.
 fn tableDecoderVersion(a: std.mem.Allocator, table: metadata_table_manager.TableRecord) !u16 {
     var required: u16 = 0;
-    if (try metadata_topology_protocol.usesIndexAliases(a, table.indexes_json)) required = @max(required, metadata_topology_protocol.index_aliases_version);
+    required = @max(required, try metadata_topology_protocol.indexAliasDecoderVersion(a, table.indexes_json, false));
     if (table.storage.engine == .object) required = @max(required, metadata_topology_protocol.object_table_engine_version);
     if (table.lake_index_catalog_json.len != 0) required = @max(required, metadata_topology_protocol.lake_index_catalog_version);
     if (metadata_topology_protocol.usesPrivacy(table.indexes_json)) required = @max(required, metadata_topology_protocol.privacy_version);
@@ -3686,6 +3692,8 @@ test "index alias decoder floor composes with table features and preserves CAS h
     try std.testing.expect(!metadata_table_manager.indexAliasesProtocolSupported(0, 3));
     try std.testing.expect(!metadata_table_manager.indexAliasesProtocolSupported(7, 2));
     try std.testing.expect(metadata_table_manager.indexAliasesProtocolSupported(7, 3));
+    try std.testing.expect(!metadata_table_manager.indexAliasLifecycleProtocolSupported(7, 3));
+    try std.testing.expect(metadata_table_manager.indexAliasesProtocolSupported(7, 4));
     try std.testing.expect(!metadata_table_manager.indexAliasesProtocolSupported(7, metadata_table_manager.artifact_sources_protocol_version + 1));
     const Check = struct {
         fn run(allocator: std.mem.Allocator, command: metadata_storage.TransitionCommand, expected: u16) !void {
@@ -3709,7 +3717,10 @@ fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.
         },
         else => "",
     };
-    if ((command == .apply_restore_staging or command == .apply_system_catalog) and namespace_indexes.len != 0 and try @import("antfly_local_sources").api_index_metadata.aliases.usesEnvelope(a, namespace_indexes)) return metadata_topology_protocol.index_aliases_version;
+    if ((command == .apply_restore_staging or command == .apply_system_catalog) and namespace_indexes.len != 0) {
+        const alias_version = try metadata_topology_protocol.indexAliasDecoderVersion(a, namespace_indexes, true);
+        if (alias_version != 0) return alias_version;
+    }
     if (metadata_topology_protocol.usesPrivacy(namespace_indexes)) return metadata_topology_protocol.privacy_version;
     if (metadata_topology_protocol.usesResolverRecords(namespace_indexes)) return metadata_topology_protocol.resolver_records_version;
     if (metadata_topology_protocol.usesResolverNamespaces(namespace_indexes)) return metadata_topology_protocol.resolver_namespaces_version;
@@ -6202,6 +6213,7 @@ pub const MetadataService = struct {
         };
         read_tracker_owned = false;
         errdefer service.deinit();
+        if (service.projectedStore()) |store| try store.ensureDerivedCatalogIndexes(metadata_group_id);
         try foreign_mod.registerDefaultPostgresExecutor(alloc, &service.cdc_backfill_registry);
         return service;
     }
@@ -9031,6 +9043,7 @@ pub const MetadataHttpService = struct {
         owned_backend_runtime = null;
         errdefer service.deinit();
         service.publishTransitionMetricsLocked();
+        if (service.projectedStore()) |store| try store.ensureDerivedCatalogIndexes(metadata_group_id);
         try foreign_mod.registerDefaultPostgresExecutor(alloc, &service.cdc_backfill_registry);
         return service;
     }
@@ -13818,7 +13831,7 @@ test "metadata table topology protocol fences namespace writers and restored dec
     try std.testing.expect(tableTopologyProtocolCompatible(predecessor, 42, 7, incarnation, version));
 }
 
-test "metadata table topology protocol checks the command's required version and exact replica" {
+test "metadata service table topology protocol checks the command's required version and exact replica" {
     const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     var status = MetadataStatus{
         .metadata_group_id = 42,
@@ -13826,6 +13839,13 @@ test "metadata table topology protocol checks the command's required version and
         .metadata_raft_local_node_id = 7,
         .metrics = .{},
     };
+    const pinned_restore_version = metadata_topology_protocol.pinned_restore_job_version;
+    status.table_topology_protocol_version = pinned_restore_version - 1;
+    try std.testing.expect(!tableTopologyProtocolCompatible(status, 42, 7, incarnation, pinned_restore_version));
+    try std.testing.expect(tableTopologyProtocolCompatible(status, 42, 7, incarnation, metadata_topology_protocol.restore_job_admission_version));
+    status.table_topology_protocol_version = pinned_restore_version;
+    try std.testing.expect(tableTopologyProtocolCompatible(status, 42, 7, incarnation, pinned_restore_version));
+    status.table_topology_protocol_version = 0;
     try std.testing.expect(!tableTopologyProtocolCompatible(
         status,
         42,
@@ -18393,6 +18413,7 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
         hasher.update(std.mem.asBytes(&range.restore_native_manifest_size_bytes));
         hashProjectedProvisioningBytes(&hasher, range.restore_native_manifest_sha256);
         hasher.update(&range.completed_restore_fingerprint);
+        hasher.update(&range.restore_admission_fingerprint);
     }
 
     const placements = try service.listProjectedPlacementIntents(alloc);
@@ -23972,7 +23993,13 @@ test "selected owner readiness transition index cancels while observations are l
 test "index alias legacy store admission uses only the durable presence lookup" {
     const Store = struct {
         present: bool = false,
+        lifecycle: bool = false,
         reads: usize = 0,
+        pub fn hasIndexAliasLifecycleState(self: *@This(), group: u64) !bool {
+            try std.testing.expectEqual(@as(u64, 21), group);
+            self.reads += 1;
+            return self.lifecycle;
+        }
         pub fn hasIndexAliases(self: *@This(), group: u64) !bool {
             try std.testing.expectEqual(@as(u64, 21), group);
             self.reads += 1;
@@ -23993,11 +24020,28 @@ test "index alias legacy store admission uses only the durable presence lookup" 
     try std.testing.expectError(error.IndexAliasProtocolUpgradeRequired, requireIndexAliasStoreAdmission(&service, record));
     record.artifact_sources_protocol_version = 3;
     try requireIndexAliasStoreAdmission(&service, record);
+    service.store.lifecycle = true;
+    try std.testing.expectError(error.IndexAliasProtocolUpgradeRequired, requireIndexAliasStoreAdmission(&service, record));
+    record.artifact_sources_protocol_version = 4;
+    try requireIndexAliasStoreAdmission(&service, record);
     record.artifact_sources_protocol_version = 2;
     record.live = false;
     try requireIndexAliasStoreAdmission(&service, record);
     record.live = true;
     record.role = "metadata";
     try requireIndexAliasStoreAdmission(&service, record);
-    try std.testing.expectEqual(@as(usize, 2), service.store.reads);
+    try std.testing.expectEqual(@as(usize, 4), service.store.reads);
+}
+
+test "index alias lifecycle decoder floor distinguishes legacy and restored envelopes" {
+    const a = std.testing.allocator;
+    const before: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs", .indexes_json = "{\"_index_aliases\":{}}" };
+    var after = before;
+    after.indexes_json = "{\"_index_aliases\":{},\"_index_alias_epoch\":\"restore-1\"}";
+    try std.testing.expectEqual(@as(u16, 90), try transitionRequiredCoordinatedDecoderVersion(a, .{ .upsert_table = before }));
+    try std.testing.expectEqual(@as(u16, 91), try transitionRequiredCoordinatedDecoderVersion(a, .{ .upsert_table = after }));
+    try std.testing.expectEqual(@as(u16, 91), try transitionRequiredCoordinatedDecoderVersion(a, .{ .compare_and_replace_table = .{ .expected = after, .replacement = before } }));
+    const envelope = try std.json.Stringify.valueAlloc(a, .{ .table = after }, .{});
+    defer a.free(envelope);
+    try std.testing.expectEqual(@as(u16, 91), try transitionRequiredCoordinatedDecoderVersion(a, .{ .apply_restore_staging = envelope }));
 }

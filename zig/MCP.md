@@ -58,8 +58,9 @@ so an identical retry replays the first receipt. Grants are unchanged.
   - `GET|POST|DELETE /memory/v1/mcp/agent`
 - Trusted-principal auth
   - Antfly can accept `X-Antfly-Trusted-Principal: <token>` from a trusted upstream proxy when
-    `ANTFLY_TRUSTED_PRINCIPAL_SECRET` is configured.
-  - `ANTFLY_TRUSTED_PRINCIPAL_ISSUER` optionally constrains the token issuer. Issuer names are provider-owned; Antfly
+    `ANTFLY_TRUSTED_PRINCIPAL_SECRET` and `ANTFLY_TRUSTED_PRINCIPAL_ISSUER` are both configured.
+  - The secret and issuer are required together; startup fails with one set and not the other. The issuer constrains
+    which tokens are accepted. Issuer names are provider-owned; Antfly
     only verifies the configured trust boundary and maps the token's permissions, row filters, and metadata into the
     normal authenticated identity model.
 - Antfly MCP tools

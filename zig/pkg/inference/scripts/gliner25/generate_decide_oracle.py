@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 REPO = "fastino/GLiNER2.5-Decide"
-REVISION = "7ee5da4c2415e32259bcdc0b1a7367c32ce8d6f6"
+REVISION = "5a7adf72a23b4d311abae6ce050d7f0012bb3416"
 WEIGHT_SHA256 = "40a5a23ff860dc3dff426cecd1048cacdd29c648c96db209dad818e9686dc997"
 WEIGHT_SIZE = 1_945_828_140
 L_TOKEN_ID = 128007

@@ -308,7 +308,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const addPrecomputeAssetProducerBytes = materialization.addPrecomputeAssetProducerBytes;
         pub const appendArtifactRepairSummaryDirtyForStore = materialization.appendArtifactRepairSummaryDirtyForStore;
         pub const appendArtifactRepairSummaryRebuildInvalidationForStore = materialization.appendArtifactRepairSummaryRebuildInvalidationForStore;
-        pub const appendArtifactSourceRevisionWritesFromReplay = materialization.appendArtifactSourceRevisionWritesFromReplay;
+        pub const appendSourceRevisionWritesForEffects = materialization.appendSourceRevisionWritesForEffects;
         pub const appendAssetArtifactSourceIndexDelete = materialization.appendAssetArtifactSourceIndexDelete;
         pub const appendAssetArtifactSourceIndexMutations = materialization.appendAssetArtifactSourceIndexMutations;
         pub const appendAssetArtifactSourceIndexWrite = materialization.appendAssetArtifactSourceIndexWrite;

@@ -129,6 +129,7 @@ test "external lake SQL schema cache discovery" {
 // Filtered roots must reach the mounted transport tests through a named anchor.
 test "api HTTP runtime discovery" {
     _ = httpx_handler;
+    _ = @import("api/backup_cohort_driver.zig");
 }
 
 test "httpx inference gateway source discovery" {

@@ -2140,6 +2140,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     const invalid_query_status = abi.antfly_storage_owner_query_json(
         owner.handle,
         &.{ .control = .{
+            .version = abi.query_request_version,
             .table_name = .fromSlice("docs"),
             .request_json = .fromSlice("{"),
         } },
@@ -4831,6 +4832,7 @@ test "time series owner query preserves invalid histogram class before runtime c
         defer abi.antfly_storage_owner_buffer_destroy(&response.buffer);
         var failure: abi.FailureIdentity = .{};
         const status = abi.antfly_storage_owner_query_json(owner.handle, &.{ .control = .{
+            .version = abi.query_request_version,
             .table_name = .fromSlice("docs"),
             .request_json = .fromSlice(query),
         } }, &response, &failure);

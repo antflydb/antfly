@@ -15,6 +15,7 @@
 
 const hot_standby_write_gate_adapter = @import("../../storage/hot_standby/write_gate.zig");
 const hot_standby_publisher_adapter = @import("../../storage/hot_standby/db_commit.zig");
+const restore_inputs = @import("../../api/restore_job_inputs.zig");
 const std = @import("std");
 const store_report_baseline = @import("../store_report_baseline.zig");
 const secret_store = @import("../secret_store.zig");
@@ -5827,7 +5828,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "14";
+const derived_catalog_index_version = "15";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -6453,6 +6454,43 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
         },
         else => {},
     }
+}
+
+test "metadata raft apply store round trips admission ownership and retains it through completion" {
+    const alloc = std.testing.allocator;
+    const witness: [32]u8 = @splat(0x5a);
+    const encoded = try encodeRangeRecord(alloc, .{
+        .group_id = 901,
+        .table_id = 903,
+        .start_key = "",
+        .restore_backup_id = "daily",
+        .restore_artifact_backup_id = "artifact",
+        .restore_location = "s3://archive/daily",
+        .restore_admission_fingerprint = witness,
+    });
+    defer alloc.free(encoded);
+    var decoded = try decodeRangeRecord(alloc, encoded);
+    defer metadata_table_manager.freeRange(alloc, decoded);
+    try std.testing.expectEqual(witness, decoded.restore_admission_fingerprint);
+    try metadata_table_manager.clearOwnedRangeRestoreIntent(alloc, &decoded);
+    const completed = try encodeRangeRecord(alloc, decoded);
+    defer alloc.free(completed);
+    const reloaded = try decodeRangeRecord(alloc, completed);
+    defer metadata_table_manager.freeRange(alloc, reloaded);
+    try std.testing.expectEqual(witness, reloaded.restore_admission_fingerprint);
+    try std.testing.expect(metadata_table_manager.rangeRestoreCompletionMatches(reloaded, "daily", "artifact", "s3://archive/daily"));
+    const cloned = try metadata_table_manager.cloneRange(alloc, reloaded);
+    defer metadata_table_manager.freeRange(alloc, cloned);
+    try std.testing.expectEqual(witness, cloned.restore_admission_fingerprint);
+    var expected = decoded;
+    expected.restore_backup_id = "daily";
+    expected.restore_artifact_backup_id = "artifact";
+    expected.restore_location = "s3://archive/daily";
+    try std.testing.expect(metadata_table_manager.rangeMatchesRestorePublication(reloaded, expected));
+    expected.restore_admission_fingerprint = @splat(0x5b);
+    try std.testing.expect(!metadata_table_manager.rangeMatchesRestorePublication(reloaded, expected));
+    try std.testing.expectEqual(topology_protocol.pinned_restore_job_version, topology_protocol.restoreAdmissionDecoderVersion(&[_]metadata.RangeRecord{reloaded}, topology_protocol.atomic_table_topology_version));
+    try std.testing.expectEqual(topology_protocol.atomic_table_topology_version, topology_protocol.restoreAdmissionDecoderVersion(&[_]metadata.RangeRecord{.{ .group_id = 1, .table_id = 2, .start_key = "" }}, topology_protocol.atomic_table_topology_version));
 }
 
 test "metadata raft apply store decodes range values before split attempt epochs" {
@@ -7445,7 +7483,11 @@ test "table topology mutation atomically creates and drops catalog ranges" {
             5,
             snapshot,
         ));
-        try restored.ensureDerivedCatalogIndexes(metadata_group_id);
+        const restored_point = try restored.captureCatalogTableProjection(std.testing.allocator, metadata_group_id, table.name, null);
+        defer restored.freeTables(std.testing.allocator, restored_point.tables);
+        defer restored.freeRanges(std.testing.allocator, restored_point.ranges);
+        try std.testing.expectEqual(@as(usize, 1), restored_point.tables.len);
+        try std.testing.expectEqual(table.table_id, restored_point.tables[0].table_id);
         var restored_projection = (try restored.captureTableDropProjection(
             std.testing.allocator,
             metadata_group_id,
@@ -9324,6 +9366,63 @@ test "metadata transition decoders reject unknown enum values" {
     );
 }
 
+test "metadata raft apply store replicates restore job records with immutable inputs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/immutable-restore", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const logical = restore_job_logical_prefix ++ "000000000000002a";
+    const padding = try alloc.alloc(u8, 4 * 1024 * 1024);
+    defer alloc.free(padding);
+    @memset(padding, 'a');
+    const initial = try std.json.Stringify.valueAlloc(alloc, .{
+        .format_version = restore_inputs.version,
+        .job_id = 42,
+        .phase = "queued",
+        .cluster_binding = .{ .child_pins = "immutable-source-witness", .manifest_json = padding },
+    }, .{});
+    defer alloc.free(initial);
+    const proposal = try restore_inputs.packAdmission(alloc, initial);
+    defer alloc.free(proposal);
+    try std.testing.expect(proposal.len < topology_protocol.max_transition_command_bytes);
+    try store.applyStandaloneCommand(group, .{ .create_restore_job = .{ .key = logical, .value = proposal } });
+    const raw = (try store.getRestoreJobRecord(alloc, group, logical)).?;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "immutable-source-witness") == null);
+    const full = (try store.getRestoreJobValue(alloc, group, logical)).?;
+    defer alloc.free(full);
+    try std.testing.expect(std.mem.indexOf(u8, full, "immutable-source-witness") != null);
+    var tree = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer tree.deinit();
+    try tree.value.object.put(tree.arena.allocator(), "phase", .{ .string = "running" });
+    const progress = try std.json.Stringify.valueAlloc(alloc, tree.value, .{});
+    defer alloc.free(progress);
+    try store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical, .value = progress } });
+    const rows = try store.listRestoreJobRows(alloc, group);
+    defer store.freeRestoreJobRows(alloc, rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expect(std.mem.indexOf(u8, rows[0].value, "immutable-source-witness") != null);
+    var key_buf: [256]u8 = undefined;
+    const physical = try restoreJobKeyForGroup(&key_buf, group, logical);
+    const input_key = try std.fmt.allocPrint(alloc, "{s}{s}", .{ physical, restore_inputs.suffix });
+    defer alloc.free(input_key);
+    const saved_inputs = try store.store.get(alloc, input_key);
+    defer alloc.free(saved_inputs);
+    try std.testing.expect(saved_inputs.len > padding.len);
+    const newer = (try store.getRestoreJobRecord(alloc, group, logical)).?;
+    defer alloc.free(newer);
+    const hash = restore_inputs.digest(newer);
+    var raw_hash: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&raw_hash, &hash);
+    try store.applyStandaloneCommand(group, .{ .remove_restore_job_if_matches = .{ .key = logical, .value_hash = &raw_hash } });
+    try std.testing.expectEqual(@as(?[]u8, null), try store.getRestoreJobValue(alloc, group, logical));
+    try std.testing.expectError(error.NotFound, store.store.get(alloc, input_key));
+}
+
 test "metadata raft apply store replicates restore job records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10178,9 +10277,16 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
             }
         };
         var context: u8 = 0;
-        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait }));
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .sync_policy = .{ .mode = .remote_apply, .standby_names = &.{"replica"} }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait }));
         try std.testing.expectError(error.InjectedAfterMetadataHAAppend, source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical_key, .value = importing } }));
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+        // Poll must not invoke the injected wait hook or append the effect twice.
+        try std.testing.expectError(error.HASyncCommitWouldBlock, source.pollHotStandbyOutbox());
+        try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+        source.apply_mutex.lockUncancelable(source.io_impl.io());
+        const busy = source.pollHotStandbyOutbox();
+        source.apply_mutex.unlock(source.io_impl.io());
+        try std.testing.expectError(error.MetadataHAOutboxPending, busy);
         try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHotStandbyCheckpoint(io, checkpoint));
     }
     {
@@ -10695,7 +10801,7 @@ pub const RaftApplyStore = struct {
 
     /// Caller retains the outer mutation lease. apply_mutex serializes the
     /// single durable outbox; transition lock covers only authority + append.
-    fn flushHotStandbyOutboxLocked(self: *RaftApplyStore) !void {
+    fn flushHotStandbyOutboxLocked(self: *RaftApplyStore, wait_for_apply: bool) !void {
         const raw = self.store.get(self.alloc, metadata_hot_standby.outbox_key) catch |err| switch (err) {
             error.NotFound => return,
             else => return err,
@@ -10704,7 +10810,7 @@ pub const RaftApplyStore = struct {
         if (raw.len < 24) return error.InvalidMetadataHAEffect;
         if (self.hot_standby_port) |port| {
             _ = try metadata_hot_standby.Decoder.init(raw[24..]);
-            try port.publishAndLock(raw);
+            try port.publishAndLock(raw, wait_for_apply);
             defer port.unlock();
             var txn = try self.store.beginWriteTxn();
             var committed = false;
@@ -10745,7 +10851,7 @@ pub const RaftApplyStore = struct {
         self.unlockHotStandbyTransition();
         transition_locked = false;
         if (hot_standby_publisher_adapter.options(mirror).sync_policy.mode != .async) {
-            if (hot_standby_publisher_adapter.options(mirror).sync_wait_fn) |wait| try wait(hot_standby_publisher_adapter.options(mirror).sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
+            if (wait_for_apply) if (hot_standby_publisher_adapter.options(mirror).sync_wait_fn) |wait| try wait(hot_standby_publisher_adapter.options(mirror).sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
             const decision = try @import("../../storage/hot_standby/commit_gate.zig").evaluate(try hot_standby_publisher_adapter.runtimePrimary(mirror), lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
             if (!decision.shouldAcknowledge()) return error.HASyncCommitWouldBlock;
         }
@@ -10763,10 +10869,19 @@ pub const RaftApplyStore = struct {
         try self.store.sync(true);
     }
 
+    /// Receipt reconciliation never waits behind another apply or for network
+    /// progress. The durable outbox is the shared publication state; a pending
+    /// observation leaves it intact for replication and later retries.
+    pub fn pollHotStandbyOutbox(self: *RaftApplyStore) !void {
+        if (!self.apply_mutex.tryLock()) return error.MetadataHAOutboxPending;
+        defer self.apply_mutex.unlock(self.io_impl.io());
+        try self.flushHotStandbyOutboxLocked(false);
+    }
+
     pub fn flushHotStandbyOutbox(self: *RaftApplyStore) !void {
         self.apply_mutex.lockUncancelable(self.io_impl.io());
         defer self.apply_mutex.unlock(self.io_impl.io());
-        try self.flushHotStandbyOutboxLocked();
+        try self.flushHotStandbyOutboxLocked(true);
     }
 
     pub fn applyHotStandbyRecord(self: *RaftApplyStore, record: @import("antfly_local_sources").storage_db_replication_record.RecordView) !void {
@@ -11306,12 +11421,20 @@ pub const RaftApplyStore = struct {
         defer if (!committed) txn.abort();
         if (try stagingGet(&txn, marker) != null) return;
         for (rows) |row| {
+            if (std.mem.endsWith(u8, row.key, restore_inputs.suffix)) continue;
+            const input_key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ row.key, restore_inputs.suffix });
+            defer self.alloc.free(input_key);
+            const inputs = for (rows) |candidate| {
+                if (std.mem.eql(u8, candidate.key, input_key)) break candidate.value;
+            } else null;
+            const full = try restore_inputs.hydrate(self.alloc, row.value, inputs);
+            defer self.alloc.free(full);
             const group_id = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
             var key_buf: [256]u8 = undefined;
             const key = try restoreJobKeyForGroup(&key_buf, group_id, row.key);
             if (try stagingGet(&txn, key)) |existing| {
                 if (!std.mem.eql(u8, existing, row.value)) return error.RestoreJobMigrationConflict;
-            } else try self.applyTransitionCommandTxn(&txn, group_id, .{ .create_restore_job = .{ .key = row.key, .value = row.value } });
+            } else try self.applyTransitionCommandTxn(&txn, group_id, .{ .create_restore_job = .{ .key = row.key, .value = full } });
         }
         try txn.put(marker, "1");
         try advanceStandaloneRevision(&txn);
@@ -11433,7 +11556,7 @@ pub const RaftApplyStore = struct {
         std.debug.assert(self.active_relation_publication == null);
         self.active_relation_publication = if (publication) |*value| value else null;
         defer self.active_relation_publication = null;
-        try self.flushHotStandbyOutboxLocked();
+        try self.flushHotStandbyOutboxLocked(true);
         try self.lockHotStandbyTransition();
         var transition_locked = true;
         defer if (transition_locked) self.unlockHotStandbyTransition();
@@ -11460,7 +11583,7 @@ pub const RaftApplyStore = struct {
         try self.commitStandaloneTxn(&txn, &outcome, &committed);
         self.unlockHotStandbyTransition();
         transition_locked = false;
-        try self.flushHotStandbyOutboxLocked();
+        try self.flushHotStandbyOutboxLocked(true);
     }
 
     pub fn replaceStandaloneCatalog(self: *RaftApplyStore, group_id: u64, expected_revision: u64, tables: []const metadata.TableRecord, ranges: []const metadata.RangeRecord, auxiliary_json: []const u8) !void {
@@ -11473,7 +11596,7 @@ pub const RaftApplyStore = struct {
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
-        try self.flushHotStandbyOutboxLocked();
+        try self.flushHotStandbyOutboxLocked(true);
         try self.lockHotStandbyTransition();
         var transition_locked = true;
         defer if (transition_locked) self.unlockHotStandbyTransition();
@@ -11675,7 +11798,7 @@ pub const RaftApplyStore = struct {
         // Local commit and sync succeeded. Failure to publish/acknowledge its
         // outbox must preserve the committed catalog without poisoning local
         // durability or admitting a subsequent mutation past that outbox.
-        self.flushHotStandbyOutboxLocked() catch return error.MetadataReplicationPending;
+        self.flushHotStandbyOutboxLocked(true) catch return error.MetadataReplicationPending;
     }
 
     fn commitStandaloneTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, outcome: *CommittedApplyOutcome, committed: *bool) !void {
@@ -15250,6 +15373,61 @@ pub const RaftApplyStore = struct {
         };
     }
 
+    /// Scope the read to the derived table name and range membership indexes.
+    /// Capture the authority, revision, and physical bounds in one transaction.
+    pub fn captureCatalogTableProjection(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8, deadline_ns: ?u64) !CatalogProjectionSnapshot {
+        try catalogProjectionDeadline(deadline_ns, null);
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        // A route request must never repair a missing durable index or take
+        // the apply mutex. Startup and snapshot install prepare the indexes.
+        try requireDerivedCatalogIndexesTxn(&txn, group_id);
+
+        const cursor = try readCatalogCursorTxn(&txn, group_id);
+        var result: CatalogProjectionSnapshot = .{
+            .metadata_incarnation = cursor.metadata_incarnation,
+            .catalog_revision = cursor.revision,
+            .tables = &.{},
+            .ranges = &.{},
+        };
+        const identity = (try self.getTableByNameResultTxn(system_catalog.ResolvedTable, alloc, &txn, group_id, name)) orelse {
+            try catalogProjectionDeadline(deadline_ns, null);
+            return result;
+        };
+        defer identity.deinit(alloc);
+        const ids = try self.indexedTableRangeIdsTxnUntil(alloc, &txn, group_id, identity.table_id, deadline_ns);
+        defer alloc.free(ids);
+        const ranges = try alloc.alloc(metadata.RangeRecord, ids.len);
+        var filled: usize = 0;
+        errdefer {
+            for (ranges[0..filled]) |range| metadata_table_manager.freeRange(alloc, range);
+            alloc.free(ranges);
+        }
+        var membership: topology_protocol.RangeMembershipAccumulator = .{};
+        for (ids, ranges, 0..) |group, *range, index| {
+            if (index % 64 == 0) try catalogProjectionDeadline(deadline_ns, null);
+            var key_buf: [160]u8 = undefined;
+            const encoded = txn.get(try rangeKeyForGroup(&key_buf, group_id, group)) catch |err| switch (err) {
+                error.NotFound => return error.InvalidDerivedCatalogIndex,
+                else => return err,
+            };
+            var pos: usize = 0;
+            range.* = try readRangeRecordProjected(alloc, encoded, &pos, true);
+            filled += 1;
+            if (range.table_id != identity.table_id or range.group_id != group) return error.InvalidDerivedCatalogIndex;
+            try membership.add(group);
+        }
+        const fence = try self.loadTableTransitionFenceTxn(&txn, group_id, identity.table_id);
+        if (!membership.finish(identity.table_id).eql(fence.membership(identity.table_id))) return error.InvalidDerivedCatalogIndex;
+        try catalogProjectionDeadline(deadline_ns, null);
+        const tables = try alloc.alloc(metadata.TableRecord, 1);
+        errdefer alloc.free(tables);
+        tables[0] = try metadata_table_manager.cloneRoutingTable(alloc, .{ .table_id = identity.table_id, .name = identity.name });
+        result.tables = tables;
+        result.ranges = ranges;
+        return result;
+    }
+
     /// Read the durable authority and applied revision from one storage
     /// transaction. Unlike listener epochs, this cursor survives restarts and
     /// is comparable across replicas of the same metadata group.
@@ -15257,6 +15435,10 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
 
+        return readCatalogCursorTxn(&txn, group_id);
+    }
+
+    fn readCatalogCursorTxn(txn: *docstore.DocStore.Txn, group_id: u64) !CatalogCursor {
         var revision_key_buf: [160]u8 = undefined;
         const revision_key = try catalogRevisionKeyForGroup(&revision_key_buf, group_id);
         const applied = txn.get(revision_key) catch |err| switch (err) {
@@ -16129,9 +16311,8 @@ pub const RaftApplyStore = struct {
     }
 
     /// Builds local, derivable indexes once per metadata projection. These
-    /// rows are intentionally excluded from Raft snapshots: snapshot install
-    /// removes them and the next apply (or indexed read) reconstructs them
-    /// atomically from primary range and extension-member rows.
+    /// rows are intentionally excluded from Raft snapshots. Snapshot install
+    /// reconstructs them atomically from the restored primary rows.
     fn requireDerivedCatalogIndexesTxn(txn: *docstore.DocStore.Txn, group_id: u64) !void {
         var buf: [160]u8 = undefined;
         const marker = txn.get(try derivedCatalogIndexVersionKey(&buf, group_id)) catch |err| switch (err) {
@@ -16197,7 +16378,9 @@ pub const RaftApplyStore = struct {
         defer if (!finished) txn.abort();
         const rebuilt = try self.ensureDerivedCatalogIndexesTxn(&txn, group_id);
         if (rebuilt) {
+            try self.verified_catalog_groups.ensureUnusedCapacity(self.alloc, 1);
             try txn.commit();
+            self.verified_catalog_groups.putAssumeCapacity(group_id, {});
         } else {
             txn.abort();
         }
@@ -16220,8 +16403,10 @@ pub const RaftApplyStore = struct {
         // evaluation, while this mutation is the production repair itself.
         if (!try self.ensureDerivedCatalogIndexesTxn(&txn, group_id))
             return error.InvalidDerivedCatalogIndex;
+        try self.verified_catalog_groups.ensureUnusedCapacity(self.alloc, 1);
         try txn.commit();
         finished = true;
+        self.verified_catalog_groups.putAssumeCapacity(group_id, {});
     }
 
     pub fn captureTableDropProjection(
@@ -17810,6 +17995,7 @@ pub const RaftApplyStore = struct {
         try system_catalog_storage.rebuildNameIndex(self.alloc, txn, group_id);
         var alias_prefix_buf: [160]u8 = undefined;
         try self.deleteDerivedPrefixTxn(txn, try indexAliasTablePrefix(&alias_prefix_buf, group_id));
+        try self.deleteDerivedPrefixTxn(txn, try indexAliasLifecycleTablePrefix(&alias_prefix_buf, group_id));
         var listing_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer listing_arena.deinit();
         const listing_alloc = listing_arena.allocator();
@@ -17911,7 +18097,9 @@ pub const RaftApplyStore = struct {
             const privacy_raw = try txn.get(try tableKeyForGroup(&privacy_table_buf, group_id, table.id));
             const decoded_table = try decodeTableRecord(privacy_alloc, privacy_raw);
             try putPrivacyWork(privacy_alloc, txn, group_id, decoded_table);
-            try synchronizeIndexAliasTableTxn(txn, group_id, table.id, try topology_protocol.usesIndexAliases(self.alloc, decoded_table.indexes_json));
+            const alias_protocol = try @import("antfly_local_sources").api_index_metadata.aliases.requiredStoreProtocol(self.alloc, decoded_table.indexes_json);
+            try synchronizeIndexAliasTableTxn(txn, group_id, table.id, alias_protocol >= 3);
+            try synchronizeIndexAliasLifecycleTableTxn(txn, group_id, table.id, alias_protocol >= 4);
 
             var fence = try self.loadTableTransitionFenceTxn(txn, group_id, table.id);
             fence.range_membership = .{};
@@ -18038,6 +18226,8 @@ pub const RaftApplyStore = struct {
     pub fn listRestoreJobRows(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]RestoreJobRow {
         var prefix_buf: [192]u8 = undefined;
         const prefix = try restoreJobPrefixForGroup(&prefix_buf, group_id);
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
         var rows = std.ArrayListUnmanaged(RestoreJobRow).empty;
         errdefer {
             for (rows.items) |row| {
@@ -18046,18 +18236,24 @@ pub const RaftApplyStore = struct {
             }
             rows.deinit(alloc);
         }
+        const upper = try std.fmt.allocPrint(alloc, "{s}\xff", .{prefix});
+        defer alloc.free(upper);
         var after_key: ?[]u8 = null;
         defer if (after_key) |key| alloc.free(key);
         while (true) {
-            const page = try self.store.scanPrefixPage(alloc, prefix, after_key, 512);
-            defer docstore.DocStore.freeResults(alloc, page);
-            if (page.len == 0) break;
-            for (page) |row| try rows.append(alloc, .{
-                .key = try alloc.dupe(u8, row.key[prefix.len..]),
-                .value = try alloc.dupe(u8, row.value),
-            });
-            if (page.len < 512) break;
-            const next = try alloc.dupe(u8, page[page.len - 1].key);
+            var page = try self.store.scanReadTxnPage(alloc, &txn, after_key orelse prefix, after_key != null, upper, 512, 64 * 1024 * 1024);
+            defer page.deinit(alloc);
+            if (page.items.len == 0) break;
+            for (page.items) |row| {
+                if (std.mem.endsWith(u8, row.key, restore_inputs.suffix)) continue;
+                const value = try self.hydrateRestoreJobTxn(alloc, &txn, row.key, row.value);
+                errdefer alloc.free(value);
+                try rows.append(alloc, .{
+                    .key = try alloc.dupe(u8, row.key[prefix.len..]),
+                    .value = value,
+                });
+            }
+            const next = try alloc.dupe(u8, page.items[page.items.len - 1].key);
             if (after_key) |key| alloc.free(key);
             after_key = next;
         }
@@ -18095,9 +18291,10 @@ pub const RaftApplyStore = struct {
     fn privacyIndexes(txn: *docstore.DocStore.Txn, group: u64, table: u64) ![]const u8 {
         var buffer: [160]u8 = undefined;
         const raw = txn.get(try tableKeyForGroup(&buffer, group, table)) catch |err| if (err == error.NotFound) return "" else return err;
-        const record = try borrowTableProjection(raw, .query);
-        // Borrow the pinned transaction bytes: GC must not duplicate the table
-        // schema and catalog for every checkpoint examined.
+        // Serving projections omit operational scan/census cursors. GC must
+        // examine the complete durable catalog or it could reclaim live blobs.
+        // Borrow it directly: neither schema nor catalog needs a copy.
+        const record = try borrowTableProjection(raw, .admission);
         return record.query_definition.?.indexes_json;
     }
     fn privacyReferenced(txn: *docstore.DocStore.Txn, group: u64, table: u64, ref: privacy_keys.Ref) !bool {
@@ -18299,13 +18496,28 @@ pub const RaftApplyStore = struct {
         return std.json.Stringify.valueAlloc(a, contract.Page{ .rows = rows.items, .next = next }, .{});
     }
 
-    pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
+    pub fn getRestoreJobRecord(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
         var key_buf: [256]u8 = undefined;
-        const key = try restoreJobKeyForGroup(&key_buf, group_id, logical_key);
-        return self.store.get(alloc, key) catch |err| switch (err) {
+        return self.store.get(alloc, try restoreJobKeyForGroup(&key_buf, group_id, logical_key)) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
+    }
+
+    pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [256]u8 = undefined;
+        const key = try restoreJobKeyForGroup(&key_buf, group_id, logical_key);
+        const encoded = (try stagingGet(&txn, key)) orelse return null;
+        return try self.hydrateRestoreJobTxn(alloc, &txn, key, encoded);
+    }
+
+    fn hydrateRestoreJobTxn(self: *RaftApplyStore, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, key: []const u8, encoded: []const u8) ![]u8 {
+        _ = self;
+        const input_key = try std.fmt.allocPrint(alloc, "{s}{s}", .{ key, restore_inputs.suffix });
+        defer alloc.free(input_key);
+        return try restore_inputs.hydrate(alloc, encoded, try stagingGet(txn, input_key));
     }
 
     pub fn getBackupCohort(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, job_id: u64) !?[]u8 {
@@ -18874,6 +19086,7 @@ pub const RaftApplyStore = struct {
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
         try self.checkpoints.ensureUnusedCapacity(self.alloc, 1);
+        try self.verified_catalog_groups.ensureUnusedCapacity(self.alloc, 1);
 
         const existing = blk: {
             var read_txn = try self.store.beginReadTxn();
@@ -18932,17 +19145,27 @@ pub const RaftApplyStore = struct {
         var receipt_key_buf: [128]u8 = undefined;
         const receipt_key = try snapshotInstallKeyForGroup(&receipt_key_buf, group_id);
         const receipt = install_cut.encode();
-        const writes = try alloc.alloc(docstore.KVPair, rows.len + 2);
-        defer alloc.free(writes);
-        for (rows, 0..) |row, i| writes[i] = .{ .key = row.key, .value = row.value };
-        writes[rows.len] = .{ .key = watermark_key, .value = &watermark };
-        writes[rows.len + 1] = .{ .key = receipt_key, .value = &receipt };
-        const deletes = try alloc.alloc([]const u8, existing.len + derived_existing.len);
-        defer alloc.free(deletes);
-        for (existing, 0..) |row, i| deletes[i] = row.key;
-        for (derived_existing, existing.len..) |row, i| deletes[i] = row.key;
-        try self.store.putBatch(writes, deletes);
-        _ = self.verified_catalog_groups.remove(group_id);
+        {
+            // Publish the restored rows, their derived indexes, and the
+            // install receipt together. A failed rebuild leaves the previous
+            // snapshot intact and permits the install to retry.
+            var txn = try self.store.beginWriteTxn();
+            var committed = false;
+            defer if (!committed) txn.abort();
+            for ([_][]const docstore.OwnedKVPair{ existing, derived_existing }) |discarded| {
+                for (discarded) |row| txn.delete(row.key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+            }
+            for (rows) |row| try txn.put(row.key, row.value);
+            try txn.put(watermark_key, &watermark);
+            try txn.put(receipt_key, &receipt);
+            _ = try self.ensureDerivedCatalogIndexesTxn(&txn, group_id);
+            try txn.commit();
+            committed = true;
+        }
+        self.verified_catalog_groups.putAssumeCapacity(group_id, {});
 
         self.checkpoints.putAssumeCapacity(group_id, checkpoint);
         self.invalidateProjectedPlacementGroup(group_id);
@@ -21708,7 +21931,7 @@ pub const RaftApplyStore = struct {
                     };
                     if (existing != null) return;
                 }
-                try txn.put(key, record.value);
+                try self.putRestoreJobTxn(txn, key, record.value);
                 // Only consumers add this work to ordinary restore writes.
                 // The persistence API accepts opaque legacy values; neither
                 // validation nor JSON scanning changes for unreferenced jobs.
@@ -21741,6 +21964,7 @@ pub const RaftApplyStore = struct {
                 var digest: [32]u8 = undefined;
                 std.crypto.hash.sha2.Sha256.hash(existing, &digest, .{});
                 if (!std.mem.eql(u8, &digest, record.value_hash)) return;
+                try self.deleteRestoreInputsTxn(txn, key);
                 try txn.delete(key);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{ .kind = .restore_job, .metadata_group_id = group_id });
@@ -21748,6 +21972,7 @@ pub const RaftApplyStore = struct {
             .remove_restore_job => |record| {
                 var key_buf: [256]u8 = undefined;
                 const key = try restoreJobKeyForGroup(&key_buf, group_id, record.key);
+                try self.deleteRestoreInputsTxn(txn, key);
                 txn.delete(key) catch |err| switch (err) {
                     error.NotFound => {},
                     else => return err,
@@ -21762,6 +21987,7 @@ pub const RaftApplyStore = struct {
                 for (record.keys) |logical_key| {
                     var key_buf: [256]u8 = undefined;
                     const key = try restoreJobKeyForGroup(&key_buf, group_id, logical_key);
+                    try self.deleteRestoreInputsTxn(txn, key);
                     txn.delete(key) catch |err| switch (err) {
                         error.NotFound => {},
                         else => return err,
@@ -21983,6 +22209,7 @@ pub const RaftApplyStore = struct {
             else => return err,
         };
         try synchronizeIndexAliasTableTxn(txn, group_id, table_id, false);
+        try synchronizeIndexAliasLifecycleTableTxn(txn, group_id, table_id, false);
         if (existing_table_name) |name| try self.deleteTableNameIndexTxn(txn, group_id, name);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group_id, .table_name = existing_table_name, .table_id = table_id });
@@ -22045,7 +22272,17 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         table_id: u64,
     ) ![]u64 {
-        _ = self;
+        return self.indexedTableRangeIdsTxnUntil(alloc, txn, group_id, table_id, null);
+    }
+
+    fn indexedTableRangeIdsTxnUntil(
+        _: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+        deadline_ns: ?u64,
+    ) ![]u64 {
         var prefix_buf: [192]u8 = undefined;
         const prefix = try tableRangeIndexPrefixForTable(&prefix_buf, group_id, table_id);
         var ids = std.ArrayListUnmanaged(u64).empty;
@@ -22055,6 +22292,7 @@ pub const RaftApplyStore = struct {
         var entry = try cursor.seekAtOrAfter(prefix);
         while (entry) |row| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, row.key, prefix)) break;
+            if (ids.items.len % 64 == 0) try catalogProjectionDeadline(deadline_ns, null);
             if (row.value.len != @sizeOf(u64)) return error.InvalidDerivedCatalogIndex;
             try ids.append(alloc, std.mem.readInt(u64, row.value[0..@sizeOf(u64)], .little));
         }
@@ -22245,6 +22483,7 @@ pub const RaftApplyStore = struct {
                     // never the ordinary backup_restore bootstrap shortcut.
                     try metadata_table_manager.clearOwnedRangeRestoreIntent(alloc, &owned_range);
                     owned_range.completed_restore_fingerprint = metadata_table_manager.empty_restore_completion_fingerprint;
+                    owned_range.restore_admission_fingerprint = metadata_table_manager.empty_restore_completion_fingerprint;
                     ranges.appendAssumeCapacity(owned_range);
                 }
             }
@@ -22522,6 +22761,27 @@ pub const RaftApplyStore = struct {
         return membership.finish(parent.table.table_id).eql(transition.membership(parent.table.table_id));
     }
 
+    fn putRestoreJobTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, key: []const u8, encoded: []const u8) !void {
+        const parts = try restore_inputs.split(self.alloc, encoded);
+        defer parts.deinit(self.alloc);
+        const input_key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ key, restore_inputs.suffix });
+        defer self.alloc.free(input_key);
+        if (parts.inputs) |bytes| {
+            if (try stagingGet(txn, input_key)) |existing| {
+                if (!std.mem.eql(u8, bytes, existing)) return error.InvalidRestoreJobRecord;
+            } else try txn.put(input_key, bytes);
+        } else {
+            try restore_inputs.validateReference(self.alloc, parts.record, try stagingGet(txn, key));
+        }
+        try txn.put(key, parts.record);
+    }
+
+    fn deleteRestoreInputsTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, key: []const u8) !void {
+        const input_key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ key, restore_inputs.suffix });
+        defer self.alloc.free(input_key);
+        if (try stagingGet(txn, input_key) != null) try txn.delete(input_key);
+    }
+
     fn applyRestoreJobWithStagingTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, record: RestoreJobWithStaging) !void {
         var logical_key_buf: [256]u8 = undefined;
         const logical_key = try restoreJobKeyForGroup(&logical_key_buf, group_id, record.key);
@@ -22564,7 +22824,7 @@ pub const RaftApplyStore = struct {
         // incoming dependency closure and every identity collision first.
         try self.applyRestoreStagingTxn(txn, group_id, bytes);
         if (try stagingGet(txn, plan_key) == null) return;
-        try txn.put(logical_key, record.value);
+        try self.putRestoreJobTxn(txn, logical_key, record.value);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = logical_key });
         self.notifyProjectionListeners(.{ .kind = .restore_job, .metadata_group_id = group_id });
     }
@@ -23326,6 +23586,7 @@ pub const RaftApplyStore = struct {
                 try self.removeSystemCatalogTableTxn(txn, group_id, drop.table_id);
                 try txn.delete(table_key);
                 try synchronizeIndexAliasTableTxn(txn, group_id, drop.table_id, false);
+                try synchronizeIndexAliasLifecycleTableTxn(txn, group_id, drop.table_id, false);
                 try relation_reconciliation.advanceTrackedSource(txn, group_id);
                 var fingerprint_key_buf: [192]u8 = undefined;
                 txn.delete(try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, drop.table_id)) catch |err| switch (err) {
@@ -23953,6 +24214,12 @@ pub const RaftApplyStore = struct {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
         return hasIndexAliasesTxn(&txn, group_id);
+    }
+
+    pub fn hasIndexAliasLifecycleState(self: *RaftApplyStore, group_id: u64) !bool {
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
+        defer txn.abort();
+        return hasIndexAliasLifecycleStateTxn(&txn, group_id);
     }
 
     /// Precondition failures in a committed command are durable rejections,
@@ -26172,7 +26439,9 @@ pub const RaftApplyStore = struct {
         }
         try putPrivacyWork(self.alloc, txn, group_id, record);
         try txn.put(key, value);
-        try synchronizeIndexAliasTableTxn(txn, group_id, record.table_id, try topology_protocol.usesIndexAliases(self.alloc, record.indexes_json));
+        const alias_protocol = try @import("antfly_local_sources").api_index_metadata.aliases.requiredStoreProtocol(self.alloc, record.indexes_json);
+        try synchronizeIndexAliasTableTxn(txn, group_id, record.table_id, alias_protocol >= 3);
+        try synchronizeIndexAliasLifecycleTableTxn(txn, group_id, record.table_id, alias_protocol >= 4);
         const fingerprint = policyTableSchemaRecordDigest(record);
         var fingerprint_key_buf: [192]u8 = undefined;
         try txn.put(try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, record.table_id), &fingerprint);
@@ -28066,8 +28335,31 @@ fn hasIndexAliasesTxn(txn: *docstore.DocStore.Txn, group_id: u64) !bool {
     return std.mem.startsWith(u8, row.key, prefix);
 }
 
+fn indexAliasLifecycleTablePrefix(buf: []u8, group_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:index_alias_lifecycle_table:{d}:", .{group_id});
+}
+fn synchronizeIndexAliasLifecycleTableTxn(txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64, present: bool) !void {
+    var buf: [192]u8 = undefined;
+    const key = try std.fmt.bufPrint(&buf, "\x00\x00__metadata_derived__:index_alias_lifecycle_table:{d}:{x:0>16}", .{ group_id, table_id });
+    if ((try RaftApplyStore.stagingGet(txn, key) != null) == present) return;
+    if (present) return txn.put(key, "");
+    txn.delete(key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+}
+fn hasIndexAliasLifecycleStateTxn(txn: *docstore.DocStore.Txn, group_id: u64) !bool {
+    var buf: [192]u8 = undefined;
+    const prefix = try indexAliasLifecycleTablePrefix(&buf, group_id);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
+    return std.mem.startsWith(u8, row.key, prefix);
+}
+
 fn admitIndexAliasTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table: metadata.TableRecord) !bool {
-    if (!try topology_protocol.usesIndexAliases(self.alloc, table.indexes_json)) return true;
+    const required = try @import("antfly_local_sources").api_index_metadata.aliases.requiredStoreProtocol(self.alloc, table.indexes_json);
+    if (required == 0) return true;
     var buf: [160]u8 = undefined;
     const prefix = try storePrefixForGroup(&buf, group_id);
     var cursor = try txn.openCursor();
@@ -28078,7 +28370,11 @@ fn admitIndexAliasTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, g
         const store = try RaftApplyStore.decodeStoredHeader(self.alloc, kv.value);
         defer metadata_table_manager.freeStore(self.alloc, store);
         if (!store.live or !metadata_table_manager.storeServesTableData(store.role)) continue;
-        if (!metadata_table_manager.indexAliasesProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version)) return false;
+        const supported = if (required >= 4)
+            metadata_table_manager.indexAliasLifecycleProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version)
+        else
+            metadata_table_manager.indexAliasesProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version);
+        if (!supported) return false;
     }
     return true;
 }
@@ -28130,7 +28426,7 @@ test "index alias Raft admission permits rollout and fences returning legacy sto
         try std.testing.expect(!try hasIndexAliasesTxn(&txn, group));
     }
     var modern = legacy;
-    modern.artifact_sources_protocol_version = 3;
+    modern.artifact_sources_protocol_version = 4;
     const new_store = try encodeStoreRecord(a, modern);
     defer a.free(new_store);
     try txn.put(try storeKeyForGroup(&buf, group, modern.store_id), new_store);
@@ -28141,6 +28437,22 @@ test "index alias Raft admission permits rollout and fences returning legacy sto
     try synchronizeIndexAliasTableTxn(&txn, group, table.table_id, true);
     try std.testing.expect(!try admitIndexAliasStoreTxn(&store, &txn, group, legacy));
     try std.testing.expect(try admitIndexAliasStoreTxn(&store, &txn, group, modern));
+    var prior_release = modern;
+    prior_release.artifact_sources_protocol_version = 3;
+    // The v90 representation stays usable during mixed-version rollout.
+    try std.testing.expect(try admitIndexAliasStoreTxn(&store, &txn, group, prior_release));
+    const prior_bytes = try encodeStoreRecord(a, prior_release);
+    defer a.free(prior_bytes);
+    try txn.put(try storeKeyForGroup(&buf, group, modern.store_id), prior_bytes);
+    try std.testing.expect(try admitIndexAliasTableTxn(&store, &txn, group, table));
+    var scoped = table;
+    scoped.indexes_json = "{\"_index_aliases\":{},\"_index_alias_epoch\":\"new-lifecycle\"}";
+    try std.testing.expect(!try admitIndexAliasTableTxn(&store, &txn, group, scoped));
+    try txn.put(try storeKeyForGroup(&buf, group, modern.store_id), new_store);
+    try std.testing.expect(try admitIndexAliasTableTxn(&store, &txn, group, scoped));
+    try synchronizeIndexAliasLifecycleTableTxn(&txn, group, table.table_id, true);
+    try std.testing.expect(!try admitIndexAliasStoreTxn(&store, &txn, group, prior_release));
+    try std.testing.expect(try admitIndexAliasStoreTxn(&store, &txn, group, modern));
     var metadata_only = legacy;
     metadata_only.role = "metadata";
     try std.testing.expect(try admitIndexAliasStoreTxn(&store, &txn, group, metadata_only));
@@ -28150,7 +28462,7 @@ test "index alias Raft admission permits rollout and fences returning legacy sto
 }
 
 fn admitIndexAliasStoreTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, incoming: metadata.StoreRecord) !bool {
-    if (!incoming.live or !metadata_table_manager.storeServesTableData(incoming.role) or metadata_table_manager.indexAliasesProtocolSupported(incoming.reporter_incarnation, incoming.artifact_sources_protocol_version)) return true;
+    if (!incoming.live or !metadata_table_manager.storeServesTableData(incoming.role) or metadata_table_manager.indexAliasLifecycleProtocolSupported(incoming.reporter_incarnation, incoming.artifact_sources_protocol_version)) return true;
     var buf: [160]u8 = undefined;
     const raw = (try RaftApplyStore.stagingGet(txn, try RaftApplyStore.topologyActivationKeyForGroup(&buf, group_id))) orelse return true;
     if (raw.len > 1024) return error.InvalidCatalogRecord;
@@ -28161,6 +28473,8 @@ fn admitIndexAliasStoreTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, g
     // exists. Keep legacy heartbeats working during that rollout. Once alias
     // state commits, reject old registrations in the same transaction; neither
     // a racing proposal nor leader/standby promotion can reopen admission.
+    if (metadata_table_manager.indexAliasesProtocolSupported(incoming.reporter_incarnation, incoming.artifact_sources_protocol_version))
+        return !try hasIndexAliasLifecycleStateTxn(txn, group_id);
     return !try hasIndexAliasesTxn(txn, group_id);
 }
 
@@ -31530,10 +31844,14 @@ fn appendRangeRecord(
     try appendInt(alloc, out, u32, @intCast(record.restore_artifact_backup_id.len));
     try out.appendSlice(alloc, record.restore_artifact_backup_id);
     try out.appendSlice(alloc, &record.completed_restore_fingerprint);
-    if (record.restore_native_manifest_size_bytes != 0 or record.restore_native_manifest_sha256.len != 0) {
+    if (record.restore_native_manifest_size_bytes != 0 or record.restore_native_manifest_sha256.len != 0 or
+        !std.mem.eql(u8, &record.restore_admission_fingerprint, &metadata_table_manager.empty_restore_completion_fingerprint))
+    {
         try appendInt(alloc, out, u64, record.restore_native_manifest_size_bytes);
         try appendInt(alloc, out, u32, @intCast(record.restore_native_manifest_sha256.len));
         try out.appendSlice(alloc, record.restore_native_manifest_sha256);
+        if (!std.mem.eql(u8, &record.restore_admission_fingerprint, &metadata_table_manager.empty_restore_completion_fingerprint))
+            try out.appendSlice(alloc, &record.restore_admission_fingerprint);
     }
 }
 
@@ -31937,9 +32255,13 @@ fn readRequiredString(
     encoded: []const u8,
     pos: *usize,
 ) ![]u8 {
+    return alloc.dupe(u8, try borrowRequiredString(encoded, pos));
+}
+
+fn borrowRequiredString(encoded: []const u8, pos: *usize) ![]const u8 {
     const value_len = try readInt(encoded, pos, u32);
     if (pos.* + value_len > encoded.len) return error.InvalidMetadataTransitionEncoding;
-    const value = try alloc.dupe(u8, encoded[pos.* .. pos.* + value_len]);
+    const value = encoded[pos.* .. pos.* + value_len];
     pos.* += value_len;
     return value;
 }
@@ -32165,6 +32487,15 @@ fn readRangeRecord(
     encoded: []const u8,
     pos: *usize,
 ) !metadata.RangeRecord {
+    return readRangeRecordProjected(alloc, encoded, pos, false);
+}
+
+fn readRangeRestorePrefixString(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize, comptime routing_only: bool) ![]const u8 {
+    const text = if (pos.* < encoded.len) try borrowRequiredString(encoded, pos) else "";
+    return if (routing_only) "" else try alloc.dupe(u8, text);
+}
+
+fn readRangeRecordProjected(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize, comptime routing_only: bool) !metadata.RangeRecord {
     const group_id = try readInt(encoded, pos, u64);
     const table_id = try readInt(encoded, pos, u64);
     const start_len = try readInt(encoded, pos, u32);
@@ -32174,21 +32505,12 @@ fn readRangeRecord(
     pos.* += start_len;
     const end_key = try readOptionalString(alloc, encoded, pos);
     errdefer if (end_key) |value| alloc.free(value);
-    const restore_backup_id = if (pos.* < encoded.len)
-        try readRequiredString(alloc, encoded, pos)
-    else
-        try alloc.dupe(u8, "");
-    errdefer alloc.free(restore_backup_id);
-    const restore_location = if (pos.* < encoded.len)
-        try readRequiredString(alloc, encoded, pos)
-    else
-        try alloc.dupe(u8, "");
-    errdefer alloc.free(restore_location);
-    const restore_snapshot_path = if (pos.* < encoded.len)
-        try readRequiredString(alloc, encoded, pos)
-    else
-        try alloc.dupe(u8, "");
-    errdefer alloc.free(restore_snapshot_path);
+    const restore_backup_id = try readRangeRestorePrefixString(alloc, encoded, pos, routing_only);
+    errdefer if (!routing_only) alloc.free(restore_backup_id);
+    const restore_location = try readRangeRestorePrefixString(alloc, encoded, pos, routing_only);
+    errdefer if (!routing_only) alloc.free(restore_location);
+    const restore_snapshot_path = try readRangeRestorePrefixString(alloc, encoded, pos, routing_only);
+    errdefer if (!routing_only) alloc.free(restore_snapshot_path);
     const range_id = if (pos.* < encoded.len)
         try readInt(encoded, pos, u64)
     else
@@ -32201,6 +32523,15 @@ fn readRangeRecord(
         try readInt(encoded, pos, u64)
     else
         0;
+    if (routing_only) return .{
+        .group_id = group_id,
+        .range_id = if (range_id == 0) group_id else range_id,
+        .table_id = table_id,
+        .start_key = start_key,
+        .end_key = end_key,
+        .doc_identity_shard_id = doc_identity_shard_id,
+        .doc_identity_range_id = doc_identity_range_id,
+    };
     // Range values are independently length-delimited by the metadata store.
     // Older v1 values end after the identity fields, so appended fields must
     // remain optional for rolling upgrades and snapshot/log replay.
@@ -32250,6 +32581,12 @@ fn readRangeRecord(
     else
         try alloc.dupe(u8, "");
     errdefer alloc.free(restore_native_manifest_sha256);
+    var restore_admission_fingerprint = metadata_table_manager.empty_restore_completion_fingerprint;
+    if (pos.* < encoded.len) {
+        if (encoded.len - pos.* != 32) return error.InvalidMetadataTransitionEncoding;
+        @memcpy(&restore_admission_fingerprint, encoded[pos.*..][0..32]);
+        pos.* += 32;
+    }
     return .{
         .group_id = group_id,
         .range_id = if (range_id == 0) group_id else range_id,
@@ -32269,6 +32606,7 @@ fn readRangeRecord(
         .restore_native_manifest_size_bytes = restore_native_manifest_size_bytes,
         .restore_native_manifest_sha256 = restore_native_manifest_sha256,
         .completed_restore_fingerprint = completed_restore_fingerprint,
+        .restore_admission_fingerprint = restore_admission_fingerprint,
     };
 }
 
@@ -34654,6 +34992,32 @@ test "metadata raft apply store catalog projection uses storage snapshot indepen
         try std.testing.expectEqual(snapshot.tables[0].table_id, snapshot.ranges[0].table_id);
         try std.testing.expectEqualStrings("{\"title\":{\"type\":\"text\"}}", snapshot.tables[0].schema_json);
         try std.testing.expectEqualStrings("m", snapshot.ranges[0].start_key);
+        const point = try store.captureCatalogTableProjection(std.testing.allocator, 41, snapshot.tables[0].name, null);
+        defer store.freeTables(std.testing.allocator, point.tables);
+        defer store.freeRanges(std.testing.allocator, point.ranges);
+        try std.testing.expectEqual(snapshot.catalog_revision, point.catalog_revision);
+        try std.testing.expect(point.tables[0].schema_json.len == 0);
+        try std.testing.expectEqual(snapshot.ranges[0].doc_identity_shard_id, point.ranges[0].doc_identity_shard_id);
+        try std.testing.expectEqualStrings("m", point.ranges[0].start_key);
+        const missing = try store.captureCatalogTableProjection(std.testing.allocator, 41, "missing", null);
+        try std.testing.expectEqual(snapshot.catalog_revision, missing.catalog_revision);
+        try std.testing.expectEqual(@as(usize, 0), missing.tables.len);
+        try std.testing.expectEqual(@as(usize, 0), missing.ranges.len);
+
+        // A missing index marker must never wait for the apply mutex.
+        {
+            var write = try store.store.beginWriteTxn();
+            errdefer write.abort();
+            var key_buf: [160]u8 = undefined;
+            try write.delete(try derivedCatalogIndexVersionKey(&key_buf, 41));
+            try write.commit();
+        }
+        try std.testing.expectError(error.InvalidDerivedCatalogIndex, store.captureCatalogTableProjection(
+            std.testing.allocator,
+            41,
+            snapshot.tables[0].name,
+            platform_time.monotonicNs() + std.time.ns_per_s,
+        ));
     }
 }
 
@@ -39790,7 +40154,7 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
 }
 const restore_job_logical_prefix = "\x00\x00__api_restore_jobs__:";
 const max_restore_job_logical_key_bytes: usize = 128;
-const max_restore_job_value_bytes: usize = 64 * 1024;
+const max_restore_job_value_bytes: usize = restore_inputs.max_bytes;
 
 fn applySystemCatalogTestCommand(store: *RaftApplyStore, index: u64, command: SystemCatalogCommand) !void {
     const alloc = std.testing.allocator;
@@ -39993,7 +40357,10 @@ test "system catalog legacy and missing point reads have catalog-independent all
         try txn.put(try tableKeyForGroup(&buf, 21, 7), encoded);
         try txn.commit();
     }
-    try store.ensureQueryCatalogIndexes(21);
+    // Startup repairs a missing marker. The first SQL read must reuse that
+    // rebuild, including when it is an indexed negative lookup.
+    try store.ensureDerivedCatalogIndexes(21);
+    try std.testing.expect(store.verified_catalog_groups.contains(21));
     for ([_]system_catalog.Target{ .{ .table = "legacy" }, .{ .table = "missing" }, .{ .database = "missing", .table = "legacy" } }, 0..) |target, i| {
         var buffer: [4096]u8 = undefined;
         var bounded = std.heap.FixedBufferAllocator.init(&buffer);
@@ -45038,6 +45405,11 @@ test "privacy key attachment and incremental reclamation are atomic and survive 
     }
     try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &initial_hash, .value = ready } });
     try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = table, .replacement = attached } });
+    // The serving projection intentionally omits this live operational token.
+    // Reclamation still has to find it in the complete durable definition.
+    const encoded_attached = try encodeTableRecord(a, attached);
+    const serving = try borrowTableProjection(encoded_attached, .query);
+    try std.testing.expect(std.mem.indexOf(u8, serving.query_definition.?.indexes_json, &ref.token()) == null);
     const attached_header = (try store.getJobState(a, group, manifest)).?;
     var parsed_header = try std.json.parseFromSlice(keys.Header, a, attached_header, .{});
     defer parsed_header.deinit();
@@ -45087,18 +45459,19 @@ test "privacy checkpoint ownership borrows large table records without allocator
     const schema = try a.alloc(u8, 8 * 1024 * 1024);
     defer a.free(schema);
     @memset(schema, ' ');
-    const record = try encodeTableRecord(a, .{ .table_id = 7, .name = "privacy", .schema_json = schema, .indexes_json = "{\"_privacy\":{}}" });
+    const indexes_json = "{\"_privacy\":{\"generation\":1,\"scans\":[{\"from_key\":\"pk1:held\"}]}}";
+    const record = try encodeTableRecord(a, .{ .table_id = 7, .name = "privacy", .schema_json = schema, .indexes_json = indexes_json });
     defer a.free(record);
     // A complete GC page can examine the same large record without creating
     // any schema/catalog copies. The projection retains the pinned row.
     for (0..32) |_| {
-        const view = try borrowTableProjection(record, .query);
+        const view = try borrowTableProjection(record, .admission);
         const indexes = view.query_definition.?.indexes_json;
-        try std.testing.expectEqualStrings("{\"_privacy\":{}}", indexes);
+        try std.testing.expectEqualStrings(indexes_json, indexes);
         try std.testing.expect(@intFromPtr(indexes.ptr) >= @intFromPtr(record.ptr));
         try std.testing.expect(@intFromPtr(indexes.ptr) + indexes.len <= @intFromPtr(record.ptr) + record.len);
     }
-    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, borrowTableProjection(record[0 .. record.len - 1], .query));
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, borrowTableProjection(record[0 .. record.len - 1], .admission));
 }
 
 test "privacy retained capacity denies staging atomically and releases only on final erase" {
@@ -45561,4 +45934,40 @@ test "metadata alias presence lookup is bounded and rebuilds across migration re
     defer txn.abort();
     const legacy: metadata.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .artifact_sources_protocol_version = 2 };
     try std.testing.expect(try admitIndexAliasStoreTxn(&peer, &txn, group, legacy));
+}
+
+test "index alias lifecycle presence rebuilds from v14 and retires transactionally" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/alias-lifecycle-presence", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group: u64 = 21;
+    const table: metadata.TableRecord = .{ .table_id = 42, .name = "docs", .indexes_json = "{\"_index_aliases\":{},\"_index_alias_epoch\":\"one\"}" };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    try std.testing.expect(try store.hasIndexAliasLifecycleState(group));
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        var buf: [160]u8 = undefined;
+        try txn.put(try derivedCatalogIndexVersionKey(&buf, group), "14");
+        try synchronizeIndexAliasLifecycleTableTxn(&txn, group, table.table_id, false);
+        try txn.commit();
+    }
+    try store.ensureDerivedCatalogIndexes(group);
+    try std.testing.expect(try store.hasIndexAliasLifecycleState(group));
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try synchronizeIndexAliasLifecycleTableTxn(&txn, group, table.table_id, false);
+        try std.testing.expect(!try hasIndexAliasLifecycleStateTxn(&txn, group));
+    }
+    try std.testing.expect(try store.hasIndexAliasLifecycleState(group));
+    var legacy = table;
+    legacy.indexes_json = "{\"_index_aliases\":{}}";
+    try store.applyStandaloneCommand(group, .{ .upsert_table = legacy });
+    try std.testing.expect(!try store.hasIndexAliasLifecycleState(group));
+    try std.testing.expect(try store.hasIndexAliases(group));
 }

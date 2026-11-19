@@ -1124,6 +1124,22 @@ const LocalStandaloneMetadata = struct {
         const table = self.manager.tables.get(id) orelse return error.InvalidPrivacyCatalog;
         return .{ .term = if (self.hot_standby_mirror) |mirror| mirror.publisher.identity().epoch else @as(u64, 1), .table = try antfly.metadata.table_manager.cloneTable(a, table) };
     }
+    fn acknowledgeCatalogReplay(ptr: *anyopaque, context: antfly.public_api.operation.RequestContext) !void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        try lockAtomicForRequest(&self.mutex, context);
+        defer self.mutex.unlock();
+        // Visibility is not a durability or RemoteApply receipt. Poll the
+        // original publication, never propose a replacement on replay. Applied
+        // receipts on a promoted standby have no local outbox and remain readable.
+        if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
+        if (self.lifecycle_store) |store|
+            store.pollHotStandbyOutbox() catch return error.MetadataMutationOutcomeUnknown
+        else if (self.hot_standby_catalog_server) |server|
+            server.pollHotStandbyExistingCatalog() catch return error.MetadataMutationOutcomeUnknown;
+        try context.ensureActive();
+    }
+
     fn tableRecord(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) !?antfly.metadata.TableRecord {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
@@ -1146,6 +1162,7 @@ const LocalStandaloneMetadata = struct {
                 .privacy_authority_term = privacyAuthorityTerm,
                 .privacy_work = nextPrivacyWork,
                 .table_record = tableRecord,
+                .acknowledge_catalog_replay = acknowledgeCatalogReplay,
                 .system_catalog = systemCatalog,
                 .tracks_sql_submission = true,
                 .supports_query_definitions = true,
@@ -1479,7 +1496,7 @@ const LocalStandaloneMetadata = struct {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        return (self.lifecycle_store orelse return error.UnsupportedOperation).getRestoreJobValue(alloc, group_ids.main_metadata_group_id, key);
+        return (self.lifecycle_store orelse return error.UnsupportedOperation).getRestoreJobRecord(alloc, group_ids.main_metadata_group_id, key);
     }
     fn applyJobCommandLocked(self: *LocalStandaloneMetadata, command: @import("../metadata/storage/raft_apply_store.zig").TransitionCommand) !void {
         const store = self.lifecycle_store orelse return error.UnsupportedOperation;
@@ -1516,17 +1533,28 @@ const LocalStandaloneMetadata = struct {
         defer locked.deinit();
         try self.requireRestoreJobTermLocked(term);
         try self.applyJobCommandLocked(.{ .upsert_restore_job = .{ .key = key, .value = value } });
-        const actual = (try self.lifecycle_store.?.getRestoreJobValue(self.alloc, group_ids.main_metadata_group_id, key)) orelse return error.RestoreJobCommitNotApplied;
+        const actual = (try self.lifecycle_store.?.getRestoreJobRecord(self.alloc, group_ids.main_metadata_group_id, key)) orelse return error.RestoreJobCommitNotApplied;
         defer self.alloc.free(actual);
         if (!std.mem.eql(u8, actual, value)) return error.RestoreJobCommitNotApplied;
+    }
+    fn requireStandbyRestoreJobFormatLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, value: []const u8) !void {
+        const server = self.hot_standby_catalog_server orelse return;
+        const jobs = antfly.public_api.restore_jobs;
+        if (!try jobs.requiresPinnedRestoreWorker(alloc, value)) return;
+        lockAtomic(&server.hot_standby_state_mutex);
+        defer server.hot_standby_state_mutex.unlock();
+        const primary = server.hot_standby_cfg.internal_primary orelse return error.NotLeader;
+        if (!primary.slots.supportsRestoreJobFormat(primary.identity.timeline_id, jobs.pinned_restore_job_format_version))
+            return error.TableTopologyProtocolUpgradeRequired;
     }
     fn restoreJobsCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, term: u64) ![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         var locked = try self.lockMutation();
         defer locked.deinit();
         try self.requireRestoreJobTermLocked(term);
+        try self.requireStandbyRestoreJobFormatLocked(alloc, value);
         try self.applyJobCommandLocked(.{ .create_restore_job = .{ .key = key, .value = value } });
-        return (try self.lifecycle_store.?.getRestoreJobValue(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
+        return (try self.lifecycle_store.?.getRestoreJobRecord(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
     }
     fn restoreJobsCreateWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan_json: []const u8, term: u64) ![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
@@ -1534,8 +1562,9 @@ const LocalStandaloneMetadata = struct {
         defer locked.deinit();
         if (!self.coordinated_lifecycle_allowed) return error.CoordinatedStandaloneHAMetadataRequired;
         try self.requireRestoreJobTermLocked(term);
+        try self.requireStandbyRestoreJobFormatLocked(alloc, value);
         try self.applyJobCommandLocked(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan_json } });
-        return (try self.lifecycle_store.?.getRestoreJobValue(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
+        return (try self.lifecycle_store.?.getRestoreJobRecord(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
     }
     fn restoreJobsDelete(ptr: *anyopaque, key: []const u8, term: u64) !void {
         return restoreJobsDeleteMany(ptr, &.{key}, term);
@@ -3831,6 +3860,10 @@ const LocalStandaloneMetadata = struct {
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         try mutation.upsertTable(self, updated);
+        // Authored DDL may change privacy's logical catalog. Reconciliation
+        // upserts intentionally cannot change that owned state; commit the
+        // exact definition through the same CAS used by replicated DDL.
+        mutation.compare_and_replace_table = updated.table_id;
         self.epoch +|= 1;
         try mutation.commit(self);
     }
@@ -3849,6 +3882,10 @@ const LocalStandaloneMetadata = struct {
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         try mutation.upsertTable(self, updated);
+        // Authored DDL may change privacy's logical catalog. Reconciliation
+        // upserts intentionally cannot change that owned state; commit the
+        // exact definition through the same CAS used by replicated DDL.
+        mutation.compare_and_replace_table = updated.table_id;
         self.epoch +|= 1;
         try mutation.commit(self);
     }
@@ -6023,6 +6060,21 @@ pub fn runFromIterator(
         )
     else
         null;
+    const repair_job_namespace = "system/api-repair-jobs";
+    var kernel_repair_job_backend: ?antfly.storage_backend_erased.Store = null;
+    defer if (kernel_repair_job_backend) |*store| store.deinit();
+    const lite_repair_job_store = if (lite_path == null) null else if (comptime control_only_storage_sources) blk: {
+        kernel_repair_job_backend = try storage_kernel_context.systemStore(alloc, repair_job_namespace);
+        break :blk &kernel_repair_job_backend.?;
+    } else if (lite_backend) |*backend|
+        try backend.runtimeStoreForNamespace(repair_job_namespace)
+    else
+        null;
+    const repair_job_root = if (lite_path == null)
+        try std.fmt.allocPrint(alloc, "{s}/api-repair-jobs", .{resolved.replica_root_dir})
+    else
+        null;
+    defer if (repair_job_root) |path| alloc.free(path);
     const synced_extension_packages = if (hot_standby_role_requested)
         0
     else
@@ -6222,6 +6274,8 @@ pub fn runFromIterator(
             .session_store = if (lite_session_store) |*store| store else if (native_sessions) |*store| store else null,
             .restore_job_store = if (local_metadata.lifecycle_store == null) restore_job_store else null,
             .research_job_store = if (research_job_store) |*store| store else null,
+            .repair_job_store = lite_repair_job_store,
+            .repair_job_store_path = repair_job_root,
             .incoming_graph_route_store = incoming_graph_route_store,
             .session_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.ttl_seconds * std.time.ns_per_s else standalone_session_ttl_ns,
             .session_cleanup_interval_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_interval_seconds * std.time.ns_per_s else standalone_session_cleanup_interval_ns,
@@ -16902,4 +16956,46 @@ test "index alias standalone graph CAS rejects convergence before durable public
     try std.testing.expectError(error.IndexAliasGraphConflict, LocalStandaloneMetadata.replaceTableDefinition(&metadata, installed, converged));
     try std.testing.expectEqual(revision, metadata.durable_revision);
     try std.testing.expectEqualStrings(installed.indexes_json, metadata.findTableByNameLocked("docs").?.indexes_json);
+}
+
+test "index alias standalone protected migration commits authored DDL through definition CAS" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    var committed: []const u8 = undefined;
+    {
+        var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        try LocalStandaloneMetadata.createTable(&metadata, alloc, "docs", .{});
+        try LocalStandaloneMetadata.createIndex(&metadata, alloc, "docs", "a", "{\"type\":\"full_text\"}");
+        const before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("docs").?.*);
+        var protected = before;
+        protected.indexes_json = try privacy.install(a, before.indexes_json, try privacy.next(a, null, .{ .mode = .redact_for_search_and_ai, .fields = &.{"body"} }, null));
+        try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, protected);
+        try LocalStandaloneMetadata.createIndex(&metadata, alloc, "docs", "b", "{\"type\":\"full_text\"}");
+        const added = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("docs").?.*);
+        const ready = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"complete\":true}", .{});
+        var pinned = added;
+        pinned.indexes_json = try aliases.put(a, added.indexes_json, "live", .{ .index = "b", .idempotency_key = "1" }, ready, 1);
+        try LocalStandaloneMetadata.replaceTableDefinition(&metadata, added, pinned);
+        try LocalStandaloneMetadata.dropIndex(&metadata, alloc, "docs", "a");
+        committed = try a.dupe(u8, metadata.findTableByNameLocked("docs").?.indexes_json);
+        try std.testing.expectError(error.IndexReferencedByAlias, LocalStandaloneMetadata.dropIndex(&metadata, alloc, "docs", "b"));
+    }
+    var reopened = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
+    defer reopened.deinit();
+    const table = reopened.findTableByNameLocked("docs").?.*;
+    try std.testing.expectEqualStrings(committed, table.indexes_json);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, table.indexes_json, .{});
+    try std.testing.expect(!parsed.object.contains("a"));
+    try std.testing.expectEqualStrings("b", try aliases.resolve(parsed, "live"));
 }

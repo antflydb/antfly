@@ -27,6 +27,7 @@ test "privacy compact owner readiness transport discovery" {
 
 test "privacy API and transport contracts" {
     _ = @import("api/privacy.zig");
+    _ = @import("api/indexes.zig");
     _ = @import("api/privacy_mutation_test.zig");
     _ = @import("metadata/catalog_projection_reader.zig");
     _ = @import("api/kernel_bridge.zig");

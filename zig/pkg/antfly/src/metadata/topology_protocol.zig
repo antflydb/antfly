@@ -121,8 +121,28 @@ const std = @import("std");
 /// Version 87 admits bootstrap selectors in reader protocol 100 publications.
 /// Version 88 admits bounded inline map navigation in reader protocol 101.
 /// Version 90 admits table-scoped index aliases and durable retry receipts.
-pub const current_version: u16 = 90;
+/// Version 91 admits lifecycle-scoped alias deletion validators.
+/// Version 92 admits durable restore jobs with backup bindings.
+/// Version 93 separates immutable restore inputs from mutable checkpoints.
+/// Version 94 retains distributed restore admission ownership on ranges.
+pub const pinned_restore_job_version: u16 = 94;
+pub const current_version: u16 = pinned_restore_job_version;
+
+pub fn restoreAdmissionDecoderVersion(ranges: anytype, fallback: u16) u16 {
+    const empty: [32]u8 = @splat(0);
+    for (ranges) |range| {
+        if (!std.mem.eql(u8, &range.restore_admission_fingerprint, &empty)) return pinned_restore_job_version;
+    }
+    return fallback;
+}
+
 pub const index_aliases_version: u16 = 90;
+pub const index_alias_lifecycle_version: u16 = 91;
+pub fn indexAliasDecoderVersion(a: std.mem.Allocator, bytes: []const u8, envelope: bool) std.mem.Allocator.Error!u16 {
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    const required = if (envelope) try aliases.requiredEnvelopeStoreProtocol(a, bytes) else try aliases.requiredStoreProtocol(a, bytes);
+    return if (required >= 4) index_alias_lifecycle_version else if (required >= 3) index_aliases_version else 0;
+}
 pub fn usesIndexAliases(a: std.mem.Allocator, indexes_json: []const u8) !bool {
     return @import("antfly_local_sources").api_index_metadata.aliases.uses(a, indexes_json);
 }
