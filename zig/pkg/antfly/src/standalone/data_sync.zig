@@ -39,10 +39,10 @@ const Definition = struct {
     indexes: Value,
 };
 
-// An empty selection restores every table in the source. A named definition
+// An empty selection synchronizes every table in the source. A named definition
 // map supplies a separate trusted schema/index policy for each table; the
 // original single-table definition is still accepted for one selected table.
-pub fn restoreJsonAlloc(a: Allocator, input: []const u8, output: []const u8, selection: []const u8, definition_json: []const u8, options: Options) ![]u8 {
+pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, selection: []const u8, definition_json: []const u8, options: Options) ![]u8 {
     if (input.len == 0 or output.len == 0 or selection.len > 64 * 1024 or definition_json.len > 1024 * 1024 or options.max_input_bytes == 0 or options.max_expanded_bytes == 0)
         return error.InvalidArguments;
     var definitions = try std.json.parseFromSlice(Value, a, definition_json, .{});
@@ -109,7 +109,7 @@ pub fn restoreJsonAlloc(a: Allocator, input: []const u8, output: []const u8, sel
     if (named == null and names.items.len != 1) return error.InvalidBackupRequest;
     var nonce: [16]u8 = undefined;
     try io.randomSecure(&nonce);
-    const temporary = try std.fmt.allocPrint(a, "{s}.restore-{s}.aflite", .{ output, std.fmt.bytesToHex(nonce, .lower) });
+    const temporary = try std.fmt.allocPrint(a, "{s}.sync-{s}.aflite", .{ output, std.fmt.bytesToHex(nonce, .lower) });
     defer a.free(temporary);
     defer std.Io.Dir.cwd().deleteFile(io, temporary) catch {};
     const lock = try std.fmt.allocPrint(a, "{s}.lock", .{temporary});
@@ -250,7 +250,8 @@ pub fn restoreJsonAlloc(a: Allocator, input: []const u8, output: []const u8, sel
     const result_digest = try fileDigest(io, result, result_stat.size);
     const json = try std.json.Stringify.valueAlloc(a, .{
         .report_version = 1,
-        .operation = "data_restore",
+        .operation = "sync",
+        .mode = "replace",
         .source = .{ .sha256 = &source_digest, .size_bytes = initial.size, .tables = projection.tables.len },
         .output = .{ .sha256 = &result_digest, .size_bytes = result_stat.size, .table = if (names.items.len == 1) names.items[0] else null, .tables = names.items },
         .inventory = .{ .documents = documents, .artifact_records = vectors, .shards = names.items.len },
@@ -555,7 +556,7 @@ fn createTestSource(a: Allocator, path: []const u8, producer: bool) !void {
     try source.backend.markStandaloneArtifact();
 }
 
-test "data restore preserves documents and partial external vectors without source jobs" {
+test "data sync preserves documents and partial external vectors without source jobs" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -570,7 +571,7 @@ test "data restore preserves documents and partial external vectors without sour
     var source = try std.Io.Dir.cwd().openFile(io, input, .{});
     defer source.close(io);
     const before = try fileDigest(io, source, (try source.stat(io)).size);
-    const report = try restoreJsonAlloc(a, input, output, "records", test_definition, .{});
+    const report = try syncJsonAlloc(a, input, output, "records", test_definition, .{});
     defer a.free(report);
     var parsed = try std.json.parseFromSlice(Value, a, report, .{});
     defer parsed.deinit();
@@ -620,7 +621,7 @@ test "data restore preserves documents and partial external vectors without sour
     }
 }
 
-test "data restore rejects hidden producers and never replaces an existing output" {
+test "data sync rejects hidden producers and never replaces an existing output" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -635,14 +636,14 @@ test "data restore rejects hidden producers and never replaces an existing outpu
     var previous = try std.Io.Dir.cwd().createFile(io, output, .{ .read = true, .exclusive = true });
     defer previous.close(io);
     try previous.writePositionalAll(io, "previous generation", 0);
-    try std.testing.expectError(error.InvalidBackupRequest, restoreJsonAlloc(a, input, output, "records", test_definition, .{}));
+    try std.testing.expectError(error.InvalidBackupRequest, syncJsonAlloc(a, input, output, "records", test_definition, .{}));
     var bytes: [19]u8 = undefined;
     try std.testing.expectEqual(@as(usize, bytes.len), try previous.readPositionalAll(io, &bytes, 0));
     try std.testing.expectEqualStrings("previous generation", &bytes);
-    try std.testing.expectError(error.BackupInputLimitExceeded, restoreJsonAlloc(a, input, output, "records", test_definition, .{ .max_input_bytes = 1 }));
+    try std.testing.expectError(error.BackupInputLimitExceeded, syncJsonAlloc(a, input, output, "records", test_definition, .{ .max_input_bytes = 1 }));
 }
 
-test "data restore fails closed on limits corruption and existing outputs" {
+test "data sync fails closed on limits corruption and existing outputs" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -654,15 +655,15 @@ test "data restore fails closed on limits corruption and existing outputs" {
     const output = try std.fs.path.join(a, &.{ root, "result.aflite" });
     defer a.free(output);
     try createTestSource(a, input, false);
-    try std.testing.expectError(error.TableNotFound, restoreJsonAlloc(a, input, output, "absent", test_definition, .{}));
-    try std.testing.expectError(error.BackupExpansionLimitExceeded, restoreJsonAlloc(a, input, output, "records", test_definition, .{ .max_expanded_bytes = 16 }));
-    try std.testing.expectError(error.BackupInputLimitExceeded, restoreJsonAlloc(a, input, output, "records", test_definition, .{ .max_documents = 1 }));
+    try std.testing.expectError(error.TableNotFound, syncJsonAlloc(a, input, output, "absent", test_definition, .{}));
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, syncJsonAlloc(a, input, output, "records", test_definition, .{ .max_expanded_bytes = 16 }));
+    try std.testing.expectError(error.BackupInputLimitExceeded, syncJsonAlloc(a, input, output, "records", test_definition, .{ .max_documents = 1 }));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, output, .{}));
     {
         var previous = try std.Io.Dir.cwd().createFile(io, output, .{ .read = true, .exclusive = true });
         defer previous.close(io);
         try previous.writePositionalAll(io, "previous generation", 0);
-        try std.testing.expectError(error.PathAlreadyExists, restoreJsonAlloc(a, input, output, "records", test_definition, .{}));
+        try std.testing.expectError(error.PathAlreadyExists, syncJsonAlloc(a, input, output, "records", test_definition, .{}));
         var bytes: [19]u8 = undefined;
         try std.testing.expectEqual(@as(usize, bytes.len), try previous.readPositionalAll(io, &bytes, 0));
         try std.testing.expectEqualStrings("previous generation", &bytes);
@@ -673,7 +674,7 @@ test "data restore fails closed on limits corruption and existing outputs" {
         defer source.close(io);
         try source.writePositionalAll(io, "trailing garbage", (try source.stat(io)).size);
     }
-    try std.testing.expectError(error.InvalidBackupRequest, restoreJsonAlloc(a, input, output, "records", test_definition, .{}));
+    try std.testing.expectError(error.InvalidBackupRequest, syncJsonAlloc(a, input, output, "records", test_definition, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, output, .{}));
 }
 
@@ -700,7 +701,7 @@ fn addSecondTestTable(a: Allocator, path: []const u8) !void {
     });
 }
 
-test "data restore stages all or selected tables atomically with aggregate limits" {
+test "data sync stages all or selected tables atomically with aggregate limits" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -715,7 +716,7 @@ test "data restore stages all or selected tables atomically with aggregate limit
     for ([_][]const u8{ "", "records,other", "other" }, 0..) |selection, run| {
         const output = try std.fmt.allocPrint(a, "{s}/result-{d}.aflite", .{ root, run });
         defer a.free(output);
-        const report = try restoreJsonAlloc(a, input, output, selection, definitions, .{});
+        const report = try syncJsonAlloc(a, input, output, selection, definitions, .{});
         defer a.free(report);
         var parsed = try std.json.parseFromSlice(Value, a, report, .{});
         defer parsed.deinit();
@@ -733,11 +734,11 @@ test "data restore stages all or selected tables atomically with aggregate limit
     }
     const output = try std.fs.path.join(a, &.{ root, "rejected.aflite" });
     defer a.free(output);
-    try std.testing.expectError(error.BackupInputLimitExceeded, restoreJsonAlloc(a, input, output, "records,other", definitions, .{ .max_documents = 2 }));
-    try std.testing.expectError(error.InvalidArguments, restoreJsonAlloc(a, input, output, "records,records", definitions, .{}));
-    try std.testing.expectError(error.InvalidArguments, restoreJsonAlloc(a, input, output, "records,", definitions, .{}));
-    try std.testing.expectError(error.InvalidBackupRequest, restoreJsonAlloc(a, input, output, "", test_definition, .{}));
+    try std.testing.expectError(error.BackupInputLimitExceeded, syncJsonAlloc(a, input, output, "records,other", definitions, .{ .max_documents = 2 }));
+    try std.testing.expectError(error.InvalidArguments, syncJsonAlloc(a, input, output, "records,records", definitions, .{}));
+    try std.testing.expectError(error.InvalidArguments, syncJsonAlloc(a, input, output, "records,", definitions, .{}));
+    try std.testing.expectError(error.InvalidBackupRequest, syncJsonAlloc(a, input, output, "", test_definition, .{}));
     const missing = "{\"tables\":{\"records\":" ++ test_definition ++ "}}";
-    try std.testing.expectError(error.InvalidBackupRequest, restoreJsonAlloc(a, input, output, "records,other", missing, .{}));
+    try std.testing.expectError(error.InvalidBackupRequest, syncJsonAlloc(a, input, output, "records,other", missing, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, output, .{}));
 }

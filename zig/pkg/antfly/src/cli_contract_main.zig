@@ -41,6 +41,6 @@ export fn antfly_backup_preflight(_: *const anyopaque) callconv(.c) c_int {
     return 3;
 }
 export fn antfly_backup_preflight_free(_: [*]u8, _: usize) callconv(.c) void {}
-export fn antfly_data_restore(_: *const anyopaque) callconv(.c) c_int {
+export fn antfly_data_sync(_: *const anyopaque) callconv(.c) c_int {
     return 3;
 }

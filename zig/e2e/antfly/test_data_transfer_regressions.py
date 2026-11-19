@@ -33,7 +33,7 @@ from helpers import wait_until
 pytestmark = pytest.mark.e2e_resource("antfly_process")
 
 
-def data_restore_definition():
+def sync_definition():
     return {
         "schema": {
             "version": 0,
@@ -63,10 +63,10 @@ def data_restore_definition():
 
 
 @pytest.mark.parametrize("vector_count", [0, 1, 2])
-def test_data_only_restore_serves_partial_vectors_after_restart(tmp_path, vector_count):
+def test_sync_serves_partial_vectors_after_restart(tmp_path, vector_count):
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     server = StandaloneAntflyServer(binary, "127.0.0.1", 0, storage_engine="lite")
-    definition = data_restore_definition()
+    definition = sync_definition()
     vector = [1.0] + [0.0] * 767
     failed = True
     try:
@@ -104,8 +104,7 @@ def test_data_only_restore_serves_partial_vectors_after_restart(tmp_path, vector
             [
                 binary,
                 "--no-agent",
-                "restore",
-                "--data-only",
+                "sync",
                 "--input",
                 str(source),
                 "--out",
@@ -115,13 +114,23 @@ def test_data_only_restore_serves_partial_vectors_after_restart(tmp_path, vector
                 "--definition",
                 str(trusted),
             ],
-            env={**os.environ, "ANTFLY_URL": "://invalid-server-url"},
+            env={
+                **os.environ,
+                "ANTFLY_URL": "://invalid-server-url",
+                "ANTFLY_TOKEN": "unused-offline-token",
+                "ANTFLY_USERNAME": "unused-offline-user",
+                "ANTFLY_PASSWORD": "unused-offline-password",
+                "ANTFLY_DATABASE": "unused-offline-database",
+                "ANTFLY_NAMESPACE": "unused-offline-namespace",
+            },
             capture_output=True,
             text=True,
             timeout=120,
         )
         assert result.returncode == 0, result.stdout + result.stderr
         report = json.loads(result.stdout)
+        assert report["operation"] == "sync"
+        assert report["mode"] == "replace"
         assert report["inventory"] == {
             "documents": 2,
             "artifact_records": vector_count,
@@ -177,10 +186,10 @@ def test_data_only_restore_serves_partial_vectors_after_restart(tmp_path, vector
 
 
 @pytest.mark.parametrize("selection", [None, "notes", "records,notes"])
-def test_data_only_restore_stages_multiple_tables(tmp_path, selection):
+def test_sync_stages_multiple_tables(tmp_path, selection):
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     server = StandaloneAntflyServer(binary, "127.0.0.1", 0, storage_engine="lite")
-    definition = data_restore_definition()
+    definition = sync_definition()
     vector = [1.0] + [0.0] * 767
     failed = True
     try:
@@ -221,8 +230,7 @@ def test_data_only_restore_stages_multiple_tables(tmp_path, selection):
         args = [
             binary,
             "--no-agent",
-            "restore",
-            "--data-only",
+            "sync",
             "--input",
             str(source),
             "--out",
@@ -235,6 +243,8 @@ def test_data_only_restore_stages_multiple_tables(tmp_path, selection):
         result = subprocess.run(args, capture_output=True, text=True, timeout=120)
         assert result.returncode == 0, result.stdout + result.stderr
         report = json.loads(result.stdout)
+        assert report["operation"] == "sync"
+        assert report["mode"] == "replace"
         selected = set(selection.split(",")) if selection else {"records", "notes"}
         assert set(report["output"]["tables"]) == selected
         assert report["inventory"] == {

@@ -309,70 +309,81 @@ absent. A page can be empty if its window contains only skipped manifests.
 When a backup's table details exceed the page size, its entry sets
 `table_details_omitted`. Use the backup ID to restore the entire backup.
 
-**Restore data under a trusted definition.** To prepare a standalone file from
-selected tables from an uploaded standalone Lite file without running that file, use:
+**Synchronize a complete standalone generation.** `antfly sync` implements
+one-way replacement by preparing a whole new file from a standalone Lite snapshot:
 
 ```bash
-antfly restore --data-only --input uploaded.aflite --out prepared.aflite \
+antfly sync --input uploaded.aflite --out next-generation.aflite \
   --table docs --definition trusted.json
 ```
 
 The caller owns `trusted.json`. For one table it contains `schema` and `indexes`
-objects. To restore several tables, supply a definition for each table:
+objects. To synchronize several tables, supply a definition for each table:
 
 ```json
 {"tables": {"docs": {"schema": {}, "indexes": {}}, "notes": {"schema": {}, "indexes": {}}}}
 ```
 
-The objects above illustrate the structure; each schema and index definition must
-be complete. Use `--tables docs,notes` to select several tables, or omit both
-`--table` and `--tables` to restore every table in the input. Missing definitions,
-duplicate selections, and unsupported source tables fail the entire operation;
-no partially built output is published. An explicit selection omits all other
-tables. Up to 256 tables are supported, with limits shared across the selection.
+The empty objects above show only the structure; each schema and index definition
+must be complete. Use `--tables docs,notes` to select several tables, or omit both
+selectors to include every source table. Missing definitions, duplicate selections,
+and unsupported selected tables fail the entire operation. Up to 256 tables are
+supported, with document and expanded-byte limits shared across the selection.
 
-Selected tables must be in `default.public`, and their authoritative schemas
-and indexes must match the supplied definitions. Other database/namespace scopes
-are currently unsupported.
-This restricted profile supports document records, the default full-text index,
-and external dense embedding indexes with `name`, `type`, `external: true`,
-`dimension`, and `distance_metric`. It rejects replication sources and stored
-enrichment/resolver definitions. It copies existing finite vectors, including
-partial coverage, and rebuilds indexes locally without inference. Other artifact
-kinds and relational rows are unsupported.
+### Replacement and activation contract
 
-The source is opened read-only through native storage readers. Its server is
-never started, and its system catalogs, credentials, jobs, identities, and
-source-owned index configuration are never installed in the output. The new
-file gets the selected table names and the caller's definitions. This is a
-restricted data transfer, not a lossless backup of every database feature.
+`sync` produces the **entire next data generation**, not a delta. The output
+contains exactly the selected source tables and their current documents and
+vectors. When the caller activates this whole file, documents and tables omitted
+from it disappear, and newly computed vectors are included even if document text
+is unchanged. It does not merge with other destination tables. A caller that owns
+only part of a larger instance must not replace that instance with this output.
 
-Success emits a JSON report with source/output SHA-256 hashes, file sizes, and
-document/vector counts and the selected table names. `--out` must be a new path;
-failure before publication leaves an existing file untouched. The caller can validate this prepared file
-and select it using its own generation transaction. This command does not
-contact or overwrite a running server.
+`--out` must be a new path. The input and any existing output are never
+overwritten. All selected tables must succeed before the output is published.
+The source is opened read-only through native storage readers; its server is
+never started. Use a stable `antfly lite snapshot` or an offline source, not a
+concurrent copy of a running file.
 
-A caller can implement manual one-way synchronization by staging a complete
-selection, validating it, and switching the destination to that generation.
-Documents omitted from the next generation disappear; newly computed vectors
-are included even when document text is unchanged. The caller retains its
-managed instance identity and access controls outside the staged data. Failed
-staging leaves the selected generation untouched; the caller owns activation,
-retry, and recovery. This command is the offline staging primitive, not an
-incremental merge or a live-destination synchronization command.
+The destination owner validates the prepared file, then switches its selected
+generation using its existing activation/recovery transaction. It preserves its
+instance identity, members, grants, and managed configuration outside this file.
+Failed staging leaves the active generation untouched. The caller owns activation,
+retry, rollback, and restart, including retaining the previous complete generation
+when an upload or activation fails. `sync` itself does not contact a server or
+replace an open database. This first version transfers and rebuilds a complete
+generation; incremental reconciliation can implement the same contract later.
 
-Restore and restart have different authority: this data-only import excludes
-source jobs and authorization records. Recovery of the same logical instance
-may resume its own accepted work. This restricted profile does not import
-stored enrichment rules; broader restore policies remain separate.
+### Supported data and definitions
 
-Defaults are 512 MiB of input, 1 GiB across the expanded portable streams and
-for the completed output, 250,000 documents total, and 16 MiB per document. Use `--max-input-bytes` and
-`--max-expanded-bytes` to change the byte limits. Allow space beside the output
-for both the portable scratch file and the new database. A process interruption
-can leave temporary siblings with `.restore-` in their names; remove these only
-when no restore is using them.
+Selected tables must be in `default.public`, and their authoritative schemas and
+indexes must match the caller's definitions. This restricted profile supports
+document records, the default full-text index, and external dense embedding
+indexes with `name`, `type`, `external: true`, `dimension`, and `distance_metric`.
+It copies existing finite vectors, including partial coverage, and rebuilds indexes
+without inference. It rejects replication sources and stored enrichment/resolver
+definitions. Other artifact kinds, relational rows, and catalog scopes are
+unsupported.
+
+Source system catalogs, credentials, jobs, identities, and authorization records
+are excluded. The output uses the selected table names and the caller's schema
+and index definitions. This is a restricted synchronization profile. Ordinary
+`restore` remains the backup-recovery operation, including definitions captured
+by the backup; restarting the same logical instance may resume its own accepted
+work. Synchronizing another instance's data does not authorize its pending jobs.
+
+Success emits a JSON report with `report_version: 1`, `operation: "sync"`,
+`mode: "replace"`, source/output SHA-256 hashes and sizes, selected table names,
+and document/vector counts. The report describes a staged generation, not an
+activation receipt. For one selected table, `output.table` is its name;
+`output.tables` always lists the complete selection.
+
+Defaults are 512 MiB of input, 1 GiB across the expanded portable streams and for
+the completed output, 250,000 documents total, and 16 MiB per document. Use
+`--max-input-bytes` and `--max-expanded-bytes` to change the byte limits. Allow
+space beside the output for portable scratch and the new database. A process
+interruption can leave temporary siblings with `.sync-` in their names; remove
+these only when no sync is using them.
 
 For an offline source inventory and compatibility report, use:
 

@@ -184,7 +184,7 @@ pub fn inspectInputJsonAlloc(allocator: std.mem.Allocator, input: []const u8, de
     return allocator.dupe(u8, bytes);
 }
 
-pub const DataRestoreContext = extern struct {
+pub const DataSyncContext = extern struct {
     input_ptr: [*]const u8,
     input_len: usize,
     output_ptr: [*]const u8,
@@ -198,13 +198,13 @@ pub const DataRestoreContext = extern struct {
     result_ptr: *?[*]u8,
     result_len: *usize,
 };
-extern fn antfly_data_restore(context: *const DataRestoreContext) callconv(.c) c_int;
+extern fn antfly_data_sync(context: *const DataSyncContext) callconv(.c) c_int;
 
-pub fn restoreDataJsonAlloc(allocator: std.mem.Allocator, input: []const u8, output: []const u8, table: []const u8, definition: []const u8, max_input_bytes: u64, max_expanded_bytes: u64) ![]u8 {
-    if (comptime use_direct_implementation) return @import("data_restore.zig").restoreJsonAlloc(allocator, input, output, table, definition, .{ .max_input_bytes = max_input_bytes, .max_expanded_bytes = max_expanded_bytes });
+pub fn syncDataJsonAlloc(allocator: std.mem.Allocator, input: []const u8, output: []const u8, table: []const u8, definition: []const u8, max_input_bytes: u64, max_expanded_bytes: u64) ![]u8 {
+    if (comptime use_direct_implementation) return @import("data_sync.zig").syncJsonAlloc(allocator, input, output, table, definition, .{ .max_input_bytes = max_input_bytes, .max_expanded_bytes = max_expanded_bytes });
     var ptr: ?[*]u8 = null;
     var len: usize = 0;
-    const status = antfly_data_restore(&.{
+    const status = antfly_data_sync(&.{
         .input_ptr = input.ptr,
         .input_len = input.len,
         .output_ptr = output.ptr,

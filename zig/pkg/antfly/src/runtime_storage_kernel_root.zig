@@ -75,7 +75,7 @@ comptime {
     exportInternal(&liteEntry, "antfly_runtime_lite");
     exportInternal(&storageEntry, "antfly_runtime_storage");
     exportInternal(&restore_staging_exports.inspect, "antfly_backup_preflight");
-    exportInternal(&restore_staging_exports.restoreData, "antfly_data_restore");
+    exportInternal(&restore_staging_exports.syncData, "antfly_data_sync");
     exportInternal(&restore_staging_exports.freeInspection, "antfly_backup_preflight_free");
     exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
     exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");

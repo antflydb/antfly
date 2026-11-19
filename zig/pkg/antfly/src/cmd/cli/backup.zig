@@ -146,12 +146,6 @@ const RestoreArgs = struct {
     idempotency_key: ?[]const u8 = null,
     wait: bool = false,
     wait_timeout_ms: u64 = default_restore_wait_timeout_ms,
-    data_only: bool = false,
-    limits_explicit: bool = false,
-    output_path: ?[]const u8 = null,
-    definition_path: ?[]const u8 = null,
-    max_input_bytes: u64 = 512 * 1024 * 1024,
-    max_expanded_bytes: u64 = 1024 * 1024 * 1024,
 };
 
 pub const InputRestorePlan = struct {
@@ -457,25 +451,13 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
         printRestoreUsage();
         return;
     }
+    const connection = opts.connection orelse cli.argumentError("--connection is required", .{});
+
     validateRestoreArgs(opts) catch |err| switch (err) {
         error.RestoreLocationRequired => cli.argumentError("--location is required", .{}),
         error.RestoreInputModeUnsupported => cli.argumentError("--input restore targets one table; omit --mode", .{}),
         else => cli.argumentError("invalid restore arguments", .{}),
     };
-
-    if (opts.data_only) {
-        if (client.catalog_scope) |scope| {
-            if (!std.mem.eql(u8, scope.database, "default") or !std.mem.eql(u8, scope.namespace, "public"))
-                cli.argumentError("--data-only currently supports the default database and public namespace", .{});
-        }
-        const definition = try cli.readFileAlloc(io, allocator, opts.definition_path.?, 1024 * 1024);
-        defer allocator.free(definition);
-        const report = try lite_restore_staging.restoreDataJsonAlloc(allocator, opts.input_path.?, opts.output_path.?, opts.table_name orelse opts.tables_str orelse "", definition, opts.max_input_bytes, opts.max_expanded_bytes);
-        defer allocator.free(report);
-        try cli.output.writeJsonArtifact(allocator, io, report);
-        return;
-    }
-    const connection = opts.connection orelse cli.argumentError("--connection is required", .{});
 
     if (opts.url) |value| try client.setBaseUrl(value);
 
@@ -644,20 +626,6 @@ fn parseRestoreArgs(args: *std.process.Args.Iterator) !RestoreArgs {
             out.url = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--idempotency-key")) {
             out.idempotency_key = try nextRequired(args);
-        } else if (std.mem.eql(u8, arg, "--data-only")) {
-            out.data_only = true;
-        } else if (std.mem.eql(u8, arg, "--out")) {
-            if (out.output_path != null) return error.DuplicateArgument;
-            out.output_path = try nextRequired(args);
-        } else if (std.mem.eql(u8, arg, "--definition")) {
-            if (out.definition_path != null) return error.DuplicateArgument;
-            out.definition_path = try nextRequired(args);
-        } else if (std.mem.eql(u8, arg, "--max-input-bytes")) {
-            out.limits_explicit = true;
-            out.max_input_bytes = try std.fmt.parseUnsigned(u64, try nextRequired(args), 10);
-        } else if (std.mem.eql(u8, arg, "--max-expanded-bytes")) {
-            out.limits_explicit = true;
-            out.max_expanded_bytes = try std.fmt.parseUnsigned(u64, try nextRequired(args), 10);
         } else if (std.mem.eql(u8, arg, "--wait")) {
             out.wait = true;
         } else if (std.mem.eql(u8, arg, "--wait-timeout")) {
@@ -704,16 +672,6 @@ fn validateBackupCursor(cursor: []const u8) !void {
 }
 
 fn validateRestoreArgs(opts: RestoreArgs) !void {
-    if (opts.data_only or opts.output_path != null or opts.definition_path != null) {
-        if (!opts.data_only or opts.input_path == null or opts.output_path == null or opts.definition_path == null or
-            (opts.table_name != null and opts.tables_str != null) or opts.backup_id != null or opts.location_explicit or opts.connection != null or opts.url != null or
-            opts.restore_mode != null or opts.idempotency_key != null or opts.wait or opts.max_input_bytes == 0 or opts.max_expanded_bytes == 0)
-            return error.InvalidRestoreInputTarget;
-        if (opts.table_name) |name| if (name.len == 0) return error.InvalidRestoreInputTarget;
-        if (opts.tables_str) |names| if (names.len == 0) return error.InvalidRestoreInputTarget;
-        return;
-    }
-    if (opts.limits_explicit) return error.InvalidRestoreInputTarget;
     if (opts.table_name != null and opts.tables_str != null) return error.ConflictingTableSelection;
     if (opts.input_path) |input| {
         if (opts.tables_str != null or opts.table_name == null) return error.InvalidRestoreInputTarget;
@@ -786,13 +744,6 @@ pub const restore_usage =
     \\  antfly restore --table <name> --backup-id <id> --connection <id> --location <uri> [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
     \\  antfly restore --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--mode <mode>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
     \\  antfly restore --input <db.aflite|backup.afb|backup.afb2> --table <name> --connection <id> --location <shared-uri> [--backup-id <id>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
-    \\
-    \\  Offline data-only restore:
-    \\    antfly restore --data-only --input <db.aflite> --out <new.aflite> [--table <name> | --tables <a,b>] --definition <trusted.json> [--max-input-bytes N] [--max-expanded-bytes N]
-    \\  Creates a new standalone file from documents and external dense vectors.
-    \\  Omit table selection to stage all tables. A multi-table definition uses {"tables":{"name":{"schema":...,"indexes":...}}}.
-    \\  Source jobs and authority are not imported. Existing output is never replaced.
-    \\  Success emits a JSON report with source and output SHA-256 hashes.
     \\
     \\notes:
     \\  `--input` auto-detects AFB1 portable, AFB2 portable, or AFB2 native.
@@ -1090,32 +1041,12 @@ test "backup inspect requires a source and rejects restore options" {
     try std.testing.expectError(error.UnknownArgument, parseRestoreArgs(&old_iter));
 }
 
-test "data restore CLI requires offline output and trusted definition" {
-    var argv = [_][*:0]const u8{ "--data-only", "--input", "source.aflite", "--out", "new.aflite", "--table", "records", "--definition", "trusted.json", "--max-input-bytes", "1024" };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-    const opts = try parseRestoreArgs(&iter);
-    try validateRestoreArgs(opts);
-    try std.testing.expect(opts.data_only);
-    var all = opts;
-    all.table_name = null;
-    try validateRestoreArgs(all);
-    all.tables_str = "records,other";
-    try validateRestoreArgs(all);
-    all.table_name = "records";
-    try std.testing.expectError(error.InvalidRestoreInputTarget, validateRestoreArgs(all));
-    try std.testing.expectEqual(@as(u64, 1024), opts.max_input_bytes);
-    var invalid = opts;
-    invalid.definition_path = null;
-    try std.testing.expectError(error.InvalidRestoreInputTarget, validateRestoreArgs(invalid));
-    invalid = opts;
-    invalid.url = "http://localhost:8080";
-    try std.testing.expectError(error.InvalidRestoreInputTarget, validateRestoreArgs(invalid));
-    invalid = opts;
-    invalid.data_only = false;
-    invalid.output_path = null;
-    invalid.definition_path = null;
-    try std.testing.expectError(error.InvalidRestoreInputTarget, validateRestoreArgs(invalid));
-    invalid = opts;
-    invalid.wait = true;
-    try std.testing.expectError(error.InvalidRestoreInputTarget, validateRestoreArgs(invalid));
+// Snapshot synchronization has its own offline command; backup restore must not
+// silently accept its narrower schema policy or destination-file arguments.
+test "restore rejects offline sync options" {
+    for ([_][*:0]const u8{ "--data-only", "--out", "--definition", "--max-input-bytes", "--max-expanded-bytes" }) |flag| {
+        var argv = [_][*:0]const u8{flag};
+        var args = std.process.Args.Iterator.init(.{ .vector = &argv });
+        try std.testing.expectError(error.UnknownArgument, parseRestoreArgs(&args));
+    }
 }
