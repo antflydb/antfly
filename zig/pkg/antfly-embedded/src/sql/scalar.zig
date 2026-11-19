@@ -281,7 +281,7 @@ pub const EvalLimits = struct {
     regex_checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     regex_context: ?*anyopaque = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, value_identity, is_missing, date_bin };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, value_identity, is_missing, date_bin, @"$array_subscript" };
 
 fn regexFunction(function: Function) ?regex_functions.Function {
     return switch (function) {
@@ -384,6 +384,12 @@ pub fn validateTypedInstructions(instructions: []const Instruction, root: u32, o
                         if (instruction.type.kind != .array) return error.InvalidSqlProgram;
                     },
                     .@"$array", .string_to_array => if (instruction.type.kind != .array) return error.InvalidSqlProgram,
+                    .@"$array_subscript" => {
+                        const array_type = instructions[op.args[0]].type;
+                        const element = array_type.element_type orelse return error.InvalidSqlProgram;
+                        if (array_type.kind != .array or instruction.type.kind != arrayScalarType(element) or instruction.type.element_type != element) return error.InvalidSqlProgram;
+                        for (op.args[1..]) |ordinal| try requireInstructionKind(instructions[ordinal].type, .integer);
+                    },
                     .array_position => if (op.args.len == 3) try requireInstructionKind(instructions[op.args[2]].type, .integer),
                     .is_missing => if (instruction.type.kind != .boolean) return error.InvalidSqlProgram,
                     .value_identity => if (instruction.type.kind != .string) return error.InvalidSqlProgram,
@@ -762,6 +768,7 @@ pub const Program = struct {
                 .array_length,
                 .array_lower,
                 .array_upper,
+                .@"$array_subscript",
                 .@"$array_pattern_quantified",
                 .@"$contains",
                 .@"$overlaps",
@@ -2390,6 +2397,32 @@ test "SQL PostgreSQL array search transforms unwind every allocation failure" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
+test "SQL array subscripts select typed cells using PostgreSQL bounds" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a,
+        \\ ('[0:1]={first,second}'::text[])[0] = 'first'
+        \\ AND ARRAY[[1,2],[3,4]][2][1] = 3
+        \\ AND ARRAY[1][2] IS NULL
+        \\ AND ARRAY[1][NULL] IS NULL
+        \\ AND ARRAY[NULL,1][1] IS NULL
+        \\ AND (NULL::int[])[1] IS NULL
+    , .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const result = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+    try std.testing.expect(!result.sql_null and result.value.bool);
+
+    var typed = try @import("compiler.zig").compileScalar(a, "a[$1]", .{});
+    defer typed.deinit();
+    var typed_program = try bindTyped(a, typed.expression, &.{.{ .name = "a", .type = .array, .element_type = .int16 }}, &.{}, .{});
+    defer typed_program.deinit();
+    try std.testing.expectEqual(arrays.ElementType.int16, typed_program.output_type.element_type.?);
+    try std.testing.expectEqual(arrays.ElementType.int32, typed_program.parameter_descriptors[0].element_type.?);
+}
+
 test "SQL PostgreSQL array search prepared frames keep input widths and bounded hot lookup" {
     const a = std.testing.allocator;
     var compiled = try @import("compiler.zig").compileScalar(a, "array_replace($1,$2,$3)", .{});
@@ -2576,6 +2609,7 @@ pub fn validateFunctionArity(function: Function, count: usize) !void {
         .string_to_array => count == 2 or count == 3,
         .jsonb_set => count == 3 or count == 4,
         .@"$array" => true,
+        .@"$array_subscript" => count >= 2 and count <= arrays.max_rank + 1,
         .@"$array_quantified" => count == 4,
         .cardinality, .array_ndims, .jsonb_array_length, .initcap => count == 1,
         .array_length, .array_lower, .array_upper => count == 2,
@@ -2879,6 +2913,16 @@ const Binder = struct {
                         }
                     }
                     break :blk .{ .kind = .array, .nullable = false, .element_type = kind, .numeric_modifier = try self.commonModifier(call.args, depth) };
+                }
+                if (function == .@"$array_subscript") {
+                    const input = try self.infer(call.args[0], depth + 1);
+                    if (input.kind != .array) return error.SqlTypeMismatch;
+                    const element = input.element_type orelse return error.SqlTypeMismatch;
+                    for (call.args[1..]) |arg| {
+                        const index = try self.infer(arg, depth + 1);
+                        if (index.kind != null and index.kind != .integer) return error.SqlTypeMismatch;
+                    }
+                    break :blk .{ .kind = arrayScalarType(element), .element_type = element, .nullable = true, .numeric_modifier = input.numeric_modifier };
                 }
                 if (function == .@"$array_quantified" or function == .cardinality or function == .array_ndims or function == .array_length or function == .array_lower or function == .array_upper) {
                     const array_index: usize = if (function == .@"$array_quantified") 1 else 0;
@@ -3352,7 +3396,7 @@ const Binder = struct {
                         .array_to_string => if (i == 0) .array else .string,
                         .@"$array" => if (nested_constructor) .array else arrayScalarType(kind.element_type orelse return error.InvalidSqlProgram),
                         .@"$array_quantified" => if (i == 0) (if ((try self.infer(arg, depth + 1)).kind == .number) .number else arrayScalarType((try self.infer(call.args[1], depth + 1)).element_type.?)) else if (i == 1) .array else if (i == 2) .integer else .boolean,
-                        .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) .array else .integer,
+                        .cardinality, .array_ndims, .array_length, .array_lower, .array_upper, .@"$array_subscript" => if (i == 0) .array else .integer,
                         .ai_decide, .ai_choice, .ai_score, .ai_probability => if ((try self.infer(arg, depth + 1)).kind == .json) .json else .string,
                         .@"$single" => if (i == 0) kind.kind else .integer,
                         .@"$pattern_quantified" => if (i == 0) .string else if (i == 1) .json else .boolean,
@@ -3416,7 +3460,7 @@ const Binder = struct {
                         .@"$array_quantified" => if (i == 0 and actual.kind != null) null else if (i < 2) (try self.infer(call.args[1], depth + 1)).element_type else if (i == 2) .int32 else .boolean,
                         .nullif => if (actual.kind != null) null else kind.element_type,
                         .@"$array_pattern_quantified" => if (i < 2) .text else .boolean,
-                        .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .int32,
+                        .cardinality, .array_ndims, .array_length, .array_lower, .array_upper, .@"$array_subscript" => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .int32,
                         else => if (kind.kind == .array or desired == kind.kind) kind.element_type else null,
                     };
                     out.* = try self.compileArrayContext(arg, desired, element_context, depth + 1);
@@ -4153,6 +4197,23 @@ const Evaluator = struct {
                             break :ordinary if (mixed_number) try mixedNumberQuantified(array.*, element, compare_op, every.bool, &work) else try array.quantified(element, compare_op, if (every.bool) .all else .any, &work);
                         };
                         break :blk if (accepted) |value| Datum.json(.{ .bool = value }) else .{};
+                    },
+                    .@"$array_subscript" => {
+                        const input = try self.runDatum(call.args[0], depth + 1);
+                        var indices: [arrays.max_rank]i32 = undefined;
+                        var null_index = false;
+                        for (call.args[1..], indices[0 .. call.args.len - 1]) |argument, *subscript| {
+                            const value = try self.runDatum(argument, depth + 1);
+                            if (value.sql_null) {
+                                null_index = true;
+                            } else {
+                                if (value.value != .integer) return error.SqlTypeMismatch;
+                                subscript.* = std.math.cast(i32, value.value.integer) orelse return error.SqlNumericOutOfRange;
+                            }
+                        }
+                        if (input.sql_null or null_index) break :blk .{};
+                        const array = input.array orelse return error.SqlTypeMismatch;
+                        break :blk array.at(indices[0 .. call.args.len - 1]) orelse .{};
                     },
                     .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => {
                         const input = try self.runDatum(call.args[0], depth + 1);

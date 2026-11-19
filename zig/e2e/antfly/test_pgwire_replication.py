@@ -201,6 +201,8 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                     membership_query,
                     namespace_query,
                     type_query,
+                    "SELECT (ARRAY['pg_catalog', 'public'])[oid - 2198] "
+                    "FROM pg_catalog.pg_namespace WHERE oid = 2200",
                     "SELECT oid,nspname FROM pg_catalog.pg_namespace WHERE nspname = 'public'",
                 )
             ),
@@ -213,6 +215,7 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
             discovery[6],
             "11|pg_catalog|int4",
             *discovery[2:4],
+            "public",
             "2200|public",
         ]
         sql("CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT)")

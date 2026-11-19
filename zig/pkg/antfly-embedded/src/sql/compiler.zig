@@ -734,6 +734,18 @@ const Parser = struct {
                     continue;
                 }
             }
+            if (self.take(.lbracket)) {
+                var args: std.ArrayList(*const ast.Scalar) = .empty;
+                try args.append(self.alloc, left);
+                while (true) {
+                    if (args.items.len > @import("array_value.zig").max_rank) return self.fail(error.SqlLimitExceeded, "array subscript rank exceeds supported limit");
+                    try args.append(self.alloc, try self.scalar(depth + 1, 0));
+                    try self.expect(.rbracket);
+                    if (!self.take(.lbracket)) break;
+                }
+                left = try self.scalarNode(.{ .call = .{ .name = "$array_subscript", .args = try args.toOwnedSlice(self.alloc) } });
+                continue;
+            }
             if (self.peek(.colon_colon)) {
                 if (minimum > 8) break;
                 self.pos += 1;
