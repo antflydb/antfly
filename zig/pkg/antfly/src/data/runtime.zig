@@ -27720,8 +27720,9 @@ const RemoteMetadataSource = struct {
                     }
                 }
                 if (global) |generation| {
-                    if (current.eql(generation.indexed.snapshot.value.change_token))
-                        return generation.indexed.repairRoute(table_name, group_id, budget);
+                    if (current.eql(generation.indexed.snapshot.value.change_token)) {
+                        if (try generation.indexed.repairRoute(table_name, group_id, budget)) |route| return route;
+                    }
                 }
             }
         }
