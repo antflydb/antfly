@@ -16378,7 +16378,9 @@ pub const RaftApplyStore = struct {
         defer if (!finished) txn.abort();
         const rebuilt = try self.ensureDerivedCatalogIndexesTxn(&txn, group_id);
         if (rebuilt) {
+            try self.verified_catalog_groups.ensureUnusedCapacity(self.alloc, 1);
             try txn.commit();
+            self.verified_catalog_groups.putAssumeCapacity(group_id, {});
         } else {
             txn.abort();
         }
@@ -16401,8 +16403,10 @@ pub const RaftApplyStore = struct {
         // evaluation, while this mutation is the production repair itself.
         if (!try self.ensureDerivedCatalogIndexesTxn(&txn, group_id))
             return error.InvalidDerivedCatalogIndex;
+        try self.verified_catalog_groups.ensureUnusedCapacity(self.alloc, 1);
         try txn.commit();
         finished = true;
+        self.verified_catalog_groups.putAssumeCapacity(group_id, {});
     }
 
     pub fn captureTableDropProjection(
@@ -40353,7 +40357,10 @@ test "system catalog legacy and missing point reads have catalog-independent all
         try txn.put(try tableKeyForGroup(&buf, 21, 7), encoded);
         try txn.commit();
     }
-    try store.ensureQueryCatalogIndexes(21);
+    // Startup repairs a missing marker. The first SQL read must reuse that
+    // rebuild, including when it is an indexed negative lookup.
+    try store.ensureDerivedCatalogIndexes(21);
+    try std.testing.expect(store.verified_catalog_groups.contains(21));
     for ([_]system_catalog.Target{ .{ .table = "legacy" }, .{ .table = "missing" }, .{ .database = "missing", .table = "legacy" } }, 0..) |target, i| {
         var buffer: [4096]u8 = undefined;
         var bounded = std.heap.FixedBufferAllocator.init(&buffer);
