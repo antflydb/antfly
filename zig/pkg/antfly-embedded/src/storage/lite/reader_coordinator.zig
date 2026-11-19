@@ -38,6 +38,7 @@
 //! all.
 const std = @import("std");
 const shared_lock_region = @import("shared_lock_region.zig");
+const inode_lock = @import("inode_lock.zig");
 
 pub const Coordinator = struct {
     allocator: std.mem.Allocator,
@@ -348,6 +349,14 @@ pub const Coordinator = struct {
         return frontier;
     }
     pub fn end(self: *Coordinator) void {
+        self.endCeding(null);
+    }
+
+    /// `end` for a window whose writer locked the data file through `entry`.
+    /// A released exclusive grant stays parked on the entry's fd
+    /// (`inode_lock.maybeReleaseAssumeLocked`); restoring a fence on another
+    /// fd of this process would block on it forever, so cede it first.
+    pub fn endCeding(self: *Coordinator, entry: ?*inode_lock.Entry) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         std.debug.assert(self.windows != 0);
@@ -357,6 +366,10 @@ pub const Coordinator = struct {
         // lease is released. Fail closed on an unexpected kernel-lock error.
         const protection = self.io.swapCancelProtection(.blocked);
         defer _ = self.io.swapCancelProtection(protection);
+        if (entry) |held| for (self.readers.items) |fence| if (fence.suspended) {
+            inode_lock.cedeParked(held, self.io);
+            break;
+        };
         for (self.readers.items) |fence| if (fence.suspended) {
             fence.file.lock(self.io, .shared) catch @panic("could not restore Lite reader fence");
             fence.suspended = false;
@@ -475,6 +488,23 @@ test "lite reader registration metadata pin is independent of the data frontier"
     full.close();
     try std.testing.expectEqual(@as(?u64, 20), fixture.region.minimumPinnedSequence());
     try std.testing.expectEqual(@as(?u64, null), fixture.region.minimumMetadataPinnedSequence());
+}
+
+test "lite reader window restores inode-only fences past the writer's parked exclusive lock" {
+    var fixture = try RegistrationFixture.init();
+    defer fixture.deinit();
+    var fallback = try fixture.readerWithoutRegion(20);
+    defer fallback.close();
+    const entry = try inode_lock.open(std.testing.io, fixture.path);
+    defer inode_lock.unref(entry, std.testing.io);
+    _ = fixture.coordinator.beginWithMetadata(fixture.inode, @splat(0), true, null);
+    try std.testing.expect(fallback.fence.?.suspended);
+    // The writer's reuse grant; its release leaves the kernel lock parked.
+    const held = try inode_lock.acquire(entry, std.testing.io, .exclusive, false, false, "test");
+    held.release(std.testing.io);
+    // Restoring the fence's shared lock on its own fd blocked here forever.
+    fixture.coordinator.endCeding(entry);
+    try std.testing.expect(!fallback.fence.?.suspended);
 }
 
 test "lite reader registration falls back to inode-only fencing when no region is available" {
