@@ -672,6 +672,9 @@ def test_busy_index_in_another_process_does_not_starve_maintenance(tmp_path: Pat
     def quiet_segments():
         return next(i["text_active_segments"] for i in db.stats()["indexes"] if i["name"] == "quiet_text")
 
+    def folded_through():
+        return db.status()["storage"]["redo_folded_through"]
+
     path = tmp_path / "busy-peer.aflite"
     stop = tmp_path / "stop"
     progress = tmp_path / "progress"
@@ -699,6 +702,8 @@ def test_busy_index_in_another_process_does_not_starve_maintenance(tmp_path: Pat
             started = time.monotonic() + 60
             while time.monotonic() < started and int((progress.read_text() if progress.exists() else "") or 0) < 20:
                 time.sleep(0.05)
+            # The quiet index's merges start while its backlog builds.
+            folded_before = folded_through()
             for i in range(120):
                 db.batch_json({"inserts": {f"b{i}": {"b": f"quietdoc{i} " + "w " * 200}}, "sync_level": "full_index"})
             writes_before = int(progress.read_text())
@@ -708,8 +713,9 @@ def test_busy_index_in_another_process_does_not_starve_maintenance(tmp_path: Pat
             while time.monotonic() < deadline and segments > 4:
                 time.sleep(0.1)
                 segments = quiet_segments()
-            # Both observations precede the stop request: the peer kept
-            # writing while the merges ran.
+            # Taken when the backlog drained, before the stop request: the
+            # peer folded its redo log while the merges ran.
+            folded_after = folded_through()
             time.sleep(0.5)
             writes_after = int(progress.read_text())
             still_busy = peer.poll() is None
@@ -717,6 +723,9 @@ def test_busy_index_in_another_process_does_not_starve_maintenance(tmp_path: Pat
             stop.touch()
             peer.wait(timeout=60)
     assert peer.returncode == 0
+    # The merges had a backlog to drain, across a physical rebase.
+    assert backlog > 4, backlog
+    assert folded_after > folded_before, (folded_before, folded_after)
     assert still_busy and writes_after > writes_before >= 20, (writes_before, writes_after)
     assert segments <= 4, (backlog, segments)
 
