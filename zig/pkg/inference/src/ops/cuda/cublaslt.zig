@@ -149,17 +149,24 @@ const TensorCorePlan = struct {
     selection: MatmulSelection,
 };
 
+const CachedTensorCorePlan = struct {
+    plan: TensorCorePlan,
+    borrowers: usize = 0,
+    last_used: u64 = 0,
+    // Captured graphs may outlive a host invocation. Only an explicit
+    // exclusive refresh after graph retirement may discard these entries.
+    capture_pinned: bool = false,
+};
+
 const TensorCorePlanLease = struct {
     plan: TensorCorePlan,
     owns_descriptors: bool,
     pending_key: ?TensorCorePlanKey = null,
+    cached_key: ?TensorCorePlanKey = null,
     owns_tuning_mutex: bool = false,
 
-    /// Publish only after cublasLt has accepted one real invocation with this
-    /// plan. A failed first submission therefore cannot poison the
-    /// process-lifetime cache. Concurrent ordinary misses may race here; the
-    /// first canonical entry wins and every other lease destroys its own
-    /// descriptors after the already-submitted call completes.
+    /// Publish only after a real submission succeeds. Replace the least recent
+    /// idle, uncaptured plan; outstanding host leases keep their descriptors.
     fn publish(self: *TensorCorePlanLease, cublas: *CublasLt) bool {
         const key = self.pending_key orelse return true;
         const allocator = cublas.allocator orelse return false;
@@ -169,22 +176,45 @@ const TensorCorePlanLease = struct {
             self.pending_key = null;
             return true;
         }
-        if (cublas.tensor_core_plans.count() >= cublas.plan_cache_capacity) {
-            cublas.uncached_plans += 1;
-            cublas.tensor_core_plans_mutex.unlock();
-            return false;
-        }
-        cublas.tensor_core_plans.put(allocator, key, self.plan) catch {
+        cublas.tensor_core_plans.ensureUnusedCapacity(allocator, 1) catch {
             cublas.tensor_core_plans_mutex.unlock();
             return false;
         };
-        cublas.tensor_core_plans_mutex.unlock();
+        var retired: ?TensorCorePlan = null;
+        if (cublas.tensor_core_plans.count() >= cublas.plan_cache_capacity) {
+            const victim = cublas.tensorCoreEvictionCandidate() orelse {
+                cublas.uncached_plans += 1;
+                cublas.tensor_core_plans_mutex.unlock();
+                return false;
+            };
+            retired = cublas.tensor_core_plans.fetchRemove(victim).?.value.plan;
+            cublas.plan_cache_evictions += 1;
+        }
+        cublas.plan_cache_clock +%= 1;
+        cublas.tensor_core_plans.putAssumeCapacityNoClobber(key, .{
+            .plan = self.plan,
+            .borrowers = 1,
+            .last_used = cublas.plan_cache_clock,
+        });
         self.pending_key = null;
+        self.cached_key = key;
         self.owns_descriptors = false;
+        cublas.tensor_core_plans_mutex.unlock();
+        // cuBLASLt consumes host descriptors during submission, as for an
+        // uncached lease. No GPU fence is needed once all host borrowers left.
+        // NVIDIA's LtSgemm sample likewise destroys descriptors after enqueue.
+        if (retired) |plan| cublas.destroyTensorCorePlan(plan);
         return true;
     }
 
     pub fn deinit(self: *TensorCorePlanLease, cublas: *CublasLt) void {
+        if (self.cached_key) |key| {
+            spinLock(&cublas.tensor_core_plans_mutex);
+            const entry = cublas.tensor_core_plans.getPtr(key).?;
+            std.debug.assert(entry.borrowers > 0);
+            entry.borrowers -= 1;
+            cublas.tensor_core_plans_mutex.unlock();
+        }
         if (self.owns_descriptors) cublas.destroyTensorCorePlan(self.plan);
         if (self.owns_tuning_mutex) cublas.tensor_core_tuning_mutex.unlock();
         self.* = undefined;
@@ -273,13 +303,15 @@ pub const CublasLt = struct {
     owner_context: driver_mod.CUcontext,
     owner_device: driver_mod.CUdevice,
     fns: Table,
-    tensor_core_plans: std.AutoHashMapUnmanaged(TensorCorePlanKey, TensorCorePlan) = .empty,
+    tensor_core_plans: std.AutoHashMapUnmanaged(TensorCorePlanKey, CachedTensorCorePlan) = .empty,
     tensor_core_plans_mutex: std.atomic.Mutex = .unlocked,
     plan_cache_capacity: usize = default_tensor_core_plans,
     plan_cache_hits: usize = 0,
     plan_cache_misses: usize = 0,
     uncached_plans: usize = 0,
     plan_cache_refreshes: usize = 0,
+    plan_cache_evictions: usize = 0,
+    plan_cache_clock: u64 = 0,
     /// GPU-timed algorithm searches, including searches that fail.
     matmul_tuning_searches: usize = 0,
     // Bias pointers are invocation data in a cached descriptor. Serialize
@@ -294,7 +326,7 @@ pub const CublasLt = struct {
 
     /// A fixed OCR profile has up to 64 decode row counts plus a small set
     /// of admitted prefill/vision shapes. Keep other providers at 256 entries;
-    /// no eviction can invalidate descriptors borrowed by concurrent callers.
+    /// replacement skips active host leases and graph-pinned descriptors.
     pub fn setPlanCacheCapacity(self: *CublasLt, capacity: usize) Error!void {
         if (capacity == 0 or capacity > maximum_tensor_core_plans) return error.CublasLtUnsupported;
         spinLock(&self.tensor_core_plans_mutex);
@@ -317,8 +349,13 @@ pub const CublasLt = struct {
         ctx.synchronize() catch return error.CublasLtError;
         spinLock(&self.tensor_core_plans_mutex);
         defer self.tensor_core_plans_mutex.unlock();
+        var borrowed = self.tensor_core_plans.valueIterator();
+        while (borrowed.next()) |entry| if (entry.borrowers != 0) return error.CublasLtUnsupported;
         var plans = self.tensor_core_plans.valueIterator();
-        while (plans.next()) |plan| self.destroyTensorCorePlan(plan.*);
+        while (plans.next()) |entry| {
+            std.debug.assert(entry.borrowers == 0);
+            self.destroyTensorCorePlan(entry.plan);
+        }
         self.tensor_core_plans.clearRetainingCapacity();
         self.plan_cache_refreshes += 1;
         return true;
@@ -423,7 +460,10 @@ pub const CublasLt = struct {
         // execution has quiesced; concurrent deinit and matmul is unsupported.
         if (self.allocator) |allocator| {
             var plans = self.tensor_core_plans.valueIterator();
-            while (plans.next()) |plan| self.destroyTensorCorePlan(plan.*);
+            while (plans.next()) |entry| {
+                std.debug.assert(entry.borrowers == 0);
+                self.destroyTensorCorePlan(entry.plan);
+            }
             self.tensor_core_plans.deinit(allocator);
         }
         if (self.handle != null) {
@@ -714,6 +754,30 @@ pub const CublasLt = struct {
             (kind == .dense or kind == .dense_bias) and batch_count == 1 and rows >= 1 and rows <= 64 and !tuning.enabled) 32 else 0;
     }
 
+    fn tensorCoreEvictionCandidate(self: *CublasLt) ?TensorCorePlanKey {
+        var oldest: u64 = std.math.maxInt(u64);
+        var victim: ?TensorCorePlanKey = null;
+        var entries = self.tensor_core_plans.iterator();
+        while (entries.next()) |entry| {
+            const value = entry.value_ptr;
+            if (value.borrowers != 0 or value.capture_pinned) continue;
+            if (victim == null or value.last_used < oldest) {
+                oldest = value.last_used;
+                victim = entry.key_ptr.*;
+            }
+        }
+        return victim;
+    }
+
+    fn borrowTensorCorePlan(self: *CublasLt, key: TensorCorePlanKey, capturing: bool) ?TensorCorePlanLease {
+        const entry = self.tensor_core_plans.getPtr(key) orelse return null;
+        self.plan_cache_clock +%= 1;
+        entry.last_used = self.plan_cache_clock;
+        entry.borrowers += 1;
+        entry.capture_pinned = entry.capture_pinned or capturing;
+        return .{ .plan = entry.plan, .owns_descriptors = false, .cached_key = key };
+    }
+
     fn tensorCorePlanFor(
         self: *CublasLt,
         kind: TensorCorePlanKind,
@@ -757,22 +821,17 @@ pub const CublasLt = struct {
             } else self.canonical_f16_calls += 1;
         }
 
-        // Keep the steady-state path to one short plan-map lookup. The much
-        // longer tuning mutex is taken only after a cache miss, then the map
-        // is checked again so a concurrent first user can publish the plan.
+        // Authoritative capture state also protects cached hits: a graph may
+        // retain this plan long after its host lease has been released.
+        const capturing = ctx.streamCaptureActive() catch return error.CublasLtUnsupported;
         spinLock(&self.tensor_core_plans_mutex);
-        const cached_plan = self.tensor_core_plans.get(key);
+        const cached_plan = self.borrowTensorCorePlan(key, capturing);
         if (cached_plan != null) self.plan_cache_hits += 1 else self.plan_cache_misses += 1;
         self.tensor_core_plans_mutex.unlock();
-        if (cached_plan) |plan| return .{ .plan = plan, .owns_descriptors = false };
+        if (cached_plan) |lease| return lease;
 
-        // Descriptor creation, heuristic discovery, algo checks, and event
-        // timing are all first-use host work. A cached plan is graph-safe, but
-        // every cache miss must fail closed while the actual stream is being
-        // captured, including ordinary (non-tuned) misses.
-        if (ctx.streamCaptureActive() catch return error.CublasLtUnsupported) {
-            return error.CublasLtUnsupported;
-        }
+        // Discovery and descriptor creation remain forbidden during capture.
+        if (capturing) return error.CublasLtUnsupported;
 
         // An enabled tuning request is useful only when its result can be
         // cached. Otherwise every invocation would repeat synchronous timing.
@@ -785,12 +844,12 @@ pub const CublasLt = struct {
         errdefer if (owns_tuning_mutex) self.tensor_core_tuning_mutex.unlock();
 
         spinLock(&self.tensor_core_plans_mutex);
-        const cached_after_tuning_wait = self.tensor_core_plans.get(key);
-        const cache_has_capacity = self.tensor_core_plans.count() < self.plan_cache_capacity;
+        const cached_after_tuning_wait = self.borrowTensorCorePlan(key, false);
+        const cache_has_capacity = self.tensor_core_plans.count() < self.plan_cache_capacity or self.tensorCoreEvictionCandidate() != null;
         self.tensor_core_plans_mutex.unlock();
-        if (cached_after_tuning_wait) |plan| {
+        if (cached_after_tuning_wait) |lease| {
             if (owns_tuning_mutex) self.tensor_core_tuning_mutex.unlock();
-            return .{ .plan = plan, .owns_descriptors = false };
+            return lease;
         }
         if (effective_tuning.enabled and !cache_has_capacity) return error.CublasLtUnsupported;
 
@@ -1976,4 +2035,94 @@ test "LightOnOCR3 CUDA projection descriptor policy keeps actual rows and conser
     try std.testing.expectEqual(@as(u32, 0), blas.canonicalDecodeRows(.dense, CUDA_R_16BF, CUDA_R_32F, 1, 85, 2560, 4096, .{ .enabled = true }));
     blas.lighton_projection_profile = .off;
     try std.testing.expectEqual(@as(u32, 0), blas.canonicalDecodeRows(.dense, CUDA_R_16BF, CUDA_R_32F, 1, 85, 2560, 4096, .{}));
+}
+
+test "GLiNER BF16 projections bounded plan replacement preserves borrowers and captured replay" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = context_mod.CudaContext.initDefault() catch |err| {
+        if (@import("antfly_platform").env.getenvBool("TERMITE_REQUIRE_CUDA_TESTS")) return err;
+        return error.SkipZigTest;
+    };
+    defer ctx.deinit();
+    var blas = try CublasLt.openWithAllocator(std.testing.allocator, &ctx);
+    defer blas.deinit();
+    try blas.setPlanCacheCapacity(2);
+    const width = 64;
+    var input = try buffer_mod.DeviceBuffer.alloc(&ctx, 8 * width * 2);
+    defer input.free(&ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(&ctx, width * width * 2);
+    defer weight.free(&ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(&ctx, 8 * width * 4);
+    defer output.free(&ctx);
+    const values: [8 * width]u16 = @splat(0x3f80);
+    var weights: [width * width]u16 = @splat(0);
+    for (0..width) |i| weights[i * width + i] = 0x3f80;
+    try input.copyFromHost(&ctx, std.mem.sliceAsBytes(&values));
+    try weight.copyFromHost(&ctx, std.mem.sliceAsBytes(&weights));
+    for (1..3) |rows| try blas.matmulBf16WeightF32Out(&ctx, output, input, weight, .{}, rows, width, width);
+    const invocation = TensorCoreInvocation{ .dst = output, .input = input, .weight = weight, .workspace = .{} };
+    // Hold one host borrower while a different shape fills/replaces the other
+    // slot. An implementation that evicts a borrowed descriptor fails here.
+    var held = try blas.tensorCorePlanFor(.dense, CUDA_R_16BF, CUDA_R_32F, 1, 1, width, width, 0, .{}, &ctx, invocation);
+    var held_active = true;
+    defer if (held_active) held.deinit(&blas);
+    const held_key = held.cached_key.?;
+    try blas.matmulBf16WeightF32Out(&ctx, output, input, weight, .{}, 3, width, width);
+    try std.testing.expect(blas.tensor_core_plans.contains(held_key));
+    const misses = blas.plan_cache_misses;
+    const hits = blas.plan_cache_hits;
+    try blas.matmulBf16WeightF32Out(&ctx, output, input, weight, .{}, 3, width, width);
+    try std.testing.expectEqual(misses, blas.plan_cache_misses);
+    try std.testing.expectEqual(hits + 1, blas.plan_cache_hits);
+    try std.testing.expectEqual(@as(usize, 1), blas.plan_cache_evictions);
+    var other = try blas.tensorCorePlanFor(.dense, CUDA_R_16BF, CUDA_R_32F, 1, 3, width, width, 0, .{}, &ctx, invocation);
+    var other_active = true;
+    defer if (other_active) other.deinit(&blas);
+    // With every slot borrowed, a miss may run uncached but cannot invalidate
+    // either outstanding lease. Once released, that shape can be admitted.
+    const uncached = blas.uncached_plans;
+    try blas.matmulBf16WeightF32Out(&ctx, output, input, weight, .{}, 4, width, width);
+    try std.testing.expectEqual(uncached + 1, blas.uncached_plans);
+    other.deinit(&blas);
+    other_active = false;
+    held.deinit(&blas);
+    held_active = false;
+    try blas.matmulBf16WeightF32Out(&ctx, output, input, weight, .{}, 4, width, width);
+    const admitted_misses = blas.plan_cache_misses;
+    try blas.matmulBf16WeightF32Out(&ctx, output, input, weight, .{}, 4, width, width);
+    try std.testing.expectEqual(admitted_misses, blas.plan_cache_misses);
+
+    // Also exercise capture begun through the driver rather than the local
+    // debug flag. A captured hit pins its descriptor through later churn.
+    try ctx.makeCurrent();
+    try ctx.driver.check(ctx.driver.fns.cuStreamBeginCapture(ctx.stream, driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED));
+    var capturing = true;
+    errdefer if (capturing) {
+        const abandoned = ctx.endStreamCapture() catch null;
+        ctx.destroyGraph(abandoned);
+    };
+    try std.testing.expect(!ctx.debug_graph_capture_active);
+    try blas.matmulBf16WeightF32Out(&ctx, output, input, weight, .{}, 4, width, width);
+    const graph = try ctx.endStreamCapture();
+    capturing = false;
+    defer ctx.destroyGraph(graph);
+    const exec = try ctx.instantiateGraph(graph);
+    defer ctx.destroyGraphExec(exec);
+    for (5..9) |rows| try blas.matmulBf16WeightF32Out(&ctx, output, input, weight, .{}, rows, width, width);
+    var entries = blas.tensor_core_plans.iterator();
+    var pinned = false;
+    while (entries.next()) |entry| {
+        if (entry.key_ptr.rows == 4) pinned = entry.value_ptr.capture_pinned;
+        try std.testing.expectEqual(@as(usize, 0), entry.value_ptr.borrowers);
+    }
+    try std.testing.expect(pinned);
+    try std.testing.expectEqual(@as(usize, 2), blas.tensor_core_plans.count());
+    const fresh: [8 * width]u16 = @splat(0x4000);
+    try input.copyFromHost(&ctx, std.mem.sliceAsBytes(&fresh));
+    try ctx.launchGraph(exec);
+    var actual: [4 * width]f32 = undefined;
+    try output.copyToHost(&ctx, std.mem.sliceAsBytes(&actual));
+    try ctx.synchronize();
+    for (actual) |value| try std.testing.expectEqual(@as(f32, 2), value);
+    try std.testing.expectEqual(@as(usize, 0), blas.matmul_tuning_searches);
 }

@@ -40,6 +40,9 @@ pub const Cache = struct {
         return if (self.entries.get(key)) |entry| entry.buffers else null;
     }
     pub fn publish(self: *Cache, allocator: std.mem.Allocator, ctx: *Context, key: Key, sources: [2]Buffer) !bool {
+        return self.publishUsingCopy(allocator, ctx, key, sources, Buffer.copyFromDevice);
+    }
+    fn publishUsingCopy(self: *Cache, allocator: std.mem.Allocator, ctx: *Context, key: Key, sources: [2]Buffer, comptime copy: anytype) !bool {
         if (self.entries.contains(key)) return true;
         if (key.rows == 0 or key.hidden == 0) return error.InvalidShape;
         if (key.rows > 512 or key.hidden > 1024) return false;
@@ -53,14 +56,21 @@ pub const Cache = struct {
         var committed = false;
         defer if (!committed) if (lease) |*active| active.release();
         var buffers: [2]Buffer = @splat(.{});
+        var submitted = false;
         defer if (!committed) {
-            ctx.synchronize() catch {};
+            if (submitted) ctx.synchronize() catch {};
             for (&buffers) |*buffer| buffer.free(ctx);
         };
         for (&buffers) |*buffer| buffer.* = Buffer.alloc(ctx, single) catch return false;
-        for (buffers, sources) |buffer, source| try buffer.copyFromDevice(ctx, source, single);
-        // Publish only complete snapshots. No request allocation is retained.
-        try ctx.synchronize();
+        for (buffers, sources) |buffer, source| {
+            // A failed later submission must retire any earlier queued copy
+            // before releasing these private buffers and their admission.
+            submitted = true;
+            try copy(buffer, ctx, source, single);
+        }
+        // Copies and all consumers use ctx.stream. Publish queued snapshots;
+        // source recycling on that stream remains ordered after these reads.
+        // Teardown drains before freeing the retained snapshot buffers.
         self.entries.putAssumeCapacityNoClobber(key, .{ .buffers = buffers, .lease = lease });
         self.bytes += bytes;
         committed = true;
@@ -83,11 +93,13 @@ pub const Cache = struct {
         defer if (!committed) if (lease) |*active| active.release();
         var converted = Buffer.alloc(ctx, bytes) catch return null;
         defer if (!committed) {
+            // Preserve the original launch error while retiring partial work.
             ctx.synchronize() catch {};
             converted.free(ctx);
         };
+        // The immutable weight source outlives the conversion, and same-stream
+        // GEMMs consume it only after this launch. No host drain is needed.
         try kernels.launchF32ToBf16(ctx, converted, source, key.count);
-        try ctx.synchronize();
         self.biases.putAssumeCapacityNoClobber(key, .{ .buffer = converted, .lease = lease });
         self.bytes += bytes;
         self.bias_bytes += bytes;
@@ -112,7 +124,7 @@ pub const Cache = struct {
         var next = Buffer.alloc(ctx, bytes) catch return null;
         defer if (!committed) next.free(ctx);
         // Retiring the old slot must drain earlier GEMMs that borrowed it.
-        try ctx.synchronize();
+        if (self.norm.ptr != 0) try ctx.synchronize();
         self.bytes -= self.norm.len;
         self.norm.free(ctx);
         if (self.norm_lease) |*active| active.release();
@@ -203,7 +215,9 @@ test "GLiNER BF16 relative cache snapshots are independent bounded and released"
     try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
     try std.testing.expectEqual(@as(u64, 0), controller.snapshot().backend_weight_bytes);
     ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = max_bytes;
+    const syncs_before_publish = ctx.stats.stream_syncs;
     try std.testing.expect(try cache.publish(a, &ctx, key, .{ input, input }));
+    try std.testing.expectEqual(syncs_before_publish, ctx.stats.stream_syncs);
     try std.testing.expectEqual(@as(u64, key.rows * key.hidden * 4), controller.snapshot().backend_weight_bytes);
     var next = key;
     next.generation += 1;
@@ -250,7 +264,9 @@ test "GLiNER BF16 bias snapshots retain rounding identity and admission" {
     ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 1 }, .check_live_memory = false };
     try std.testing.expect((try cache.publishBias(std.testing.allocator, &ctx, &kernels, key, source)) == null);
     ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = 8;
+    const syncs_before_publish = ctx.stats.stream_syncs;
     const snapshot = (try cache.publishBias(std.testing.allocator, &ctx, &kernels, key, source)).?;
+    try std.testing.expectEqual(syncs_before_publish, ctx.stats.stream_syncs);
     var changed = key;
     changed.generation += 1;
     try std.testing.expect(cache.getBias(changed) == null);
@@ -322,4 +338,38 @@ test "GLiNER BF16 norm writes invalidate partial overlaps without touching adjac
         cache.invalidateNormForWrite(write.pointer, write.bytes);
         try std.testing.expectEqual(!write.overlaps, cache.normInput(1000, 8, generation) != null);
     }
+}
+
+test "GLiNER BF16 relative cache failed second copy drains and releases unpublished snapshots" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const Fault = struct {
+        var calls: usize = 0;
+        fn copy(dst: Buffer, ctx: *Context, source: Buffer, bytes: usize) !void {
+            calls += 1;
+            if (calls == 2) return error.InjectedSnapshotCopyFailure;
+            try dst.copyFromDevice(ctx, source, bytes);
+        }
+    };
+    var ctx = Context.initDefault() catch |err| {
+        if (@import("antfly_platform").env.getenvBool("TERMITE_REQUIRE_CUDA_TESTS")) return err;
+        return error.SkipZigTest;
+    };
+    defer ctx.deinit();
+    var controller = Memory.AdmissionController{};
+    ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = max_bytes }, .check_live_memory = false };
+    var cache = Cache{};
+    defer cache.deinit(std.testing.allocator, &ctx);
+    const key = Key{ .sources = .{ 1, 2, 3, 4, 5, 6, 7 }, .generation = 1, .sequence = 128, .rows = 256, .hidden = 768, .layout = 0, .eps_bits = 0, .buckets = 256, .positions = 512 };
+    var source = try Buffer.alloc(&ctx, key.rows * key.hidden * 2);
+    defer source.free(&ctx);
+    const live = ctx.device_allocations.snapshot().live;
+    const syncs = ctx.stats.stream_syncs;
+    Fault.calls = 0;
+    try std.testing.expectError(error.InjectedSnapshotCopyFailure, cache.publishUsingCopy(std.testing.allocator, &ctx, key, .{ source, source }, Fault.copy));
+    try std.testing.expectEqual(@as(usize, 2), Fault.calls);
+    try std.testing.expectEqual(syncs + 1, ctx.stats.stream_syncs);
+    try std.testing.expectEqual(live, ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
+    try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+    try std.testing.expectEqual(@as(u64, 0), controller.snapshot().backend_weight_bytes);
 }

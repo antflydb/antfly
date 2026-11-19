@@ -1534,6 +1534,9 @@ pub const RuntimeStats = struct {
     bf16_cublaslt_activation_mirror_hits: usize = 0,
     bf16_cublaslt_fallbacks: usize = 0,
     cublaslt_plan_cache_misses: usize = 0,
+    cublaslt_plan_cache_hits: usize = 0,
+    cublaslt_plan_cache_evictions: usize = 0,
+    cublaslt_uncached_plans: usize = 0,
     cublaslt_matmul_tuning_searches: usize = 0,
     bf16_cublaslt_tuning_tuned_calls: usize = 0,
     bf16_cublaslt_tuning_heuristic_calls: usize = 0,
@@ -6201,6 +6204,9 @@ pub const CudaCompute = struct {
         var stats = self.stats;
         if (self.cublaslt) |blas| {
             stats.cublaslt_plan_cache_misses = blas.plan_cache_misses;
+            stats.cublaslt_plan_cache_hits = blas.plan_cache_hits;
+            stats.cublaslt_plan_cache_evictions = blas.plan_cache_evictions;
+            stats.cublaslt_uncached_plans = blas.uncached_plans;
             stats.cublaslt_matmul_tuning_searches = blas.matmul_tuning_searches;
         }
         stats.kernel_launches = self.ctx.stats.kernel_launches;
@@ -34943,7 +34949,7 @@ test "LightOnOCR3 CUDA GB10 GEMM tuning includes singleton decode and stays opt 
     }
 }
 
-test "LightOnOCR3 CUDA bounded GEMM plan cache retains cuBLAS when tuning saturates" {
+test "LightOnOCR3 CUDA bounded GEMM plan cache replaces saturated plans without scalar fallback" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
     var compute = try CudaCompute.init(a);
@@ -34975,8 +34981,13 @@ test "LightOnOCR3 CUDA bounded GEMM plan cache retains cuBLAS when tuning satura
         try compute.ctx.synchronize();
         for (actual[0 .. rows * width]) |value| try std.testing.expectEqual(@as(f32, 1), value);
     }
-    try std.testing.expect(compute.stats.bf16_cublaslt_tuning_api_fallbacks > 0);
-    try std.testing.expect(blas.uncached_plans > 0);
+    try std.testing.expect(blas.plan_cache_evictions > 0);
+    try std.testing.expectEqual(@as(usize, 0), blas.uncached_plans);
+    const misses = blas.plan_cache_misses;
+    const searches = blas.matmul_tuning_searches;
+    try std.testing.expect(runCublasLtBf16Matmul(&compute, output, input, weight, .{}, 9, width, width));
+    try std.testing.expectEqual(misses, blas.plan_cache_misses);
+    try std.testing.expectEqual(searches, blas.matmul_tuning_searches);
     try std.testing.expectEqual(@as(usize, 4), blas.tensor_core_plans.count());
     try std.testing.expectError(error.CublasLtUnsupported, blas.setPlanCacheCapacity(3));
     try std.testing.expectEqual(scalar_calls, compute.stats.bf16_scalar_linear_calls);

@@ -5,6 +5,74 @@ Python CUDA BF16 with the user-approved bounded-difference policy. It is selecte
 automatically on NVIDIA L4 SM89, driver API >=13000 and cuBLAS 130400 or 130401.
 Base BF16 remains unqualified; Base keeps its accurate FP32 default.
 
+## PR #1746 review fixes: current default
+
+The current default records resident-name ownership before optional BF16
+rounding, so that a post-insertion rounding error leaves exactly one owner for
+teardown. A fault-injection regression checks the original error and one release.
+Relative-projection snapshots and bias conversions now use stream ordering on
+success; partial-submission cleanup and teardown retain their lifetime fences.
+The GEMM cache replaces idle entries with bounded LRU, protecting active host
+leases and plans used by captured graphs. Its existing capacity stays 256.
+
+**47 focused CUDA tests, 29 Python tests and CUDA type checking pass.** Shared
+cuBLASLt tests cover tuning, captured replay, exclusive refresh, active borrowers
+and replacement. All 89 varied Decide cases pass in three fresh ReleaseFast
+processes on each supported cuBLAS version, two outputs per case. Maximum
+confidence drift is **0.015933**, below the unchanged 0.02 gate; decisions outside
+the approved threshold/tie band match. Both loaded pipelines pass all 89 cases
+with exact token IDs and batch-32/four-forward execution. Base's 42 CPU FP32
+regression cases pass with exact decisions and maximum raw error 0.00011492.
+
+### Loaded-pipeline cache stress
+
+One fresh controlled **Debug** process per arm, 19 variable length/schema shapes,
+86 additional lengths to fill the real cache, and 16 returning requests. Includes
+rendering, tokenization, decoding and synchronized readback; excludes HTTP/load.
+These are exploratory one-process timings, separate from the release campaign.
+
+| Metric | Reviewed build | Fixed build |
+|---|---:|---:|
+| Median first forward | 15.14 ms | 13.62 ms |
+| Maximum first forward | 309.20 ms | 223.53 ms |
+| Plan misses across 16 returning requests | 2,400 | 0 |
+| Returning-request median | 22.03 ms | 21.88 ms |
+
+The fixed process records 265 bounded evictions, zero uncached plans and zero
+timed tuning searches. Its 19 first calls record 1–8 stream synchronizations,
+including readback and norm-slot retirement; successful relative/bias cache
+publication records none. Returning-request wall time is effectively unchanged
+in this run despite eliminating the recurring setup work.
+
+### Fresh release comparison
+
+Same prepared input tensors and BF16 checkpoint, three rotated fresh-process
+rounds and eight warm measured forwards per shape/arm. Native retains the first
+forward separately, followed by three excluded warmups. PJRT uses its usual
+three warmups and cached executables. The control is the reviewed **heuristic**
+profile, not the older tuned profile below. Both native arms include uploads,
+encoder/head execution and synchronized readback; exclude HTTP and tokenization.
+All accepted campaigns held the GPU lock and recorded no foreign GPU processes.
+The PJRT CUDA 12.8 runtime was reused at its new local path after cleanup; the
+initial failed startup produced no PJRT measurements.
+
+| Tokens | Batch | Reviewed heuristic CUDA | Fixed CUDA | PJRT BF16 | PJRT / fixed |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 1 | 4.83 | 4.77 | 7.89 | 1.653× |
+| 128 | 8 | 24.05 | 23.99 | 25.57 | 1.066× |
+| 512 | 1 | 17.20 | 17.21 | 16.43 | 0.955× |
+| 512 | 8 | 122.78 | 122.63 | 129.67 | 1.057× |
+
+Warm native performance is effectively unchanged. Native wins three geometries;
+the 512-token singleton is about 4.7% slower than PJRT. This replaces the earlier
+incomplete warm remeasurement, without treating the older tuned results as the
+current default's performance.
+
+GPU process peaks are **1,866 MiB** for both native arms versus **2,362 MiB** for
+PJRT. Median startup+inference PSS+GPU peaks are 3,271 MiB reviewed, 3,086 MiB fixed
+and 3,456 MiB PJRT. Combined peaks depend on startup and 0.2 s sampling; they do
+not isolate a memory-efficiency improvement caused by these cache fixes.
+
 ## Base: accurate FP32 default
 
 Base retains FP32 weights and state with compensated BF16x3/TF32x3 projections.
@@ -32,7 +100,7 @@ band and changes some entity selections; it remains gated.
 ## Historical tuned Decide BF16 qualification
 
 This initial campaign predates heuristic selection; current revalidation is
-reported under [heuristic serving](#heuristic-serving-and-first-seen-shapes).
+reported under [current default](#pr-1746-review-fixes-current-default).
 
 - 89 deterministic classification cases pass in three fresh processes on each
   of cuBLAS 13.4.0 and 13.4.1, with two native and two Python samples per case.
@@ -56,7 +124,7 @@ band is 0.02; an argmax change permits a reference gap <= 0.04 because each labe
 may move by 0.02. See [GLINER25.md](GLINER25.md#automatic-decide-bf16-qualification)
 for reproducible fixture preparation and qualification commands.
 
-## Heuristic serving and first-seen shapes
+## Earlier heuristic serving and first-seen shapes
 
 BF16 load-time preparation and projection/attention dispatch now use the same
 complete capability check. Missing the optional FP32 softmax symbol keeps
@@ -93,10 +161,10 @@ work was rejected and replaced. All accepted runs record zero timed searches.
 All 41 focused GPU tests, 29 Python tests, CUDA type checking, source-policy and
 format/whitespace checks pass.
 
-The fresh paired ReleaseFast warm/PJRT campaign is not yet qualified: independent
-Gemma jobs repeatedly overlapped GPU execution without taking the shared lock.
-Affected attempts were rejected and are excluded. The historical warm tables
-below must not be treated as measurements of the new heuristic default.
+At that earlier stage, overlapping Gemma work blocked the paired warm/PJRT
+campaign. Those attempts remain excluded; the completed current-default
+comparison above supersedes that limitation. The historical tuned tables below
+remain separate from current heuristic measurements.
 
 ## Historical tuned Decide BF16 latency
 

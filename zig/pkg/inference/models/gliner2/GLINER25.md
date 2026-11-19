@@ -829,6 +829,18 @@ GLiNER's BF16 GEMM cache misses use cuBLASLt heuristics, without synchronous
 candidate timing. New padded sequence lengths and microbatch sizes therefore
 do not launch autotuning trials while holding the model execution lane.
 
+Relative-projection snapshots and cached bias conversions are published in stream
+order. Their same-stream consumers do not need a host synchronization. Cleanup
+still drains partial submissions on failure and waits before freeing retained
+buffers. Growing an existing norm slot also waits for its earlier readers.
+Resident-name ownership is recorded before post-upload rounding so a rounding
+failure leaves the committed name for session teardown to release once.
+
+The 256-entry GEMM plan cache uses bounded LRU replacement. Active host leases
+and plans used during graph capture remain protected; graph-pinned plans are
+released only at an explicit exclusive refresh after graph retirement, or model
+teardown. If every entry is protected, an ordinary request can run uncached.
+
 Projection weights use BF16 storage. Rounded linear, residual, attention and
 GELU boundaries follow the qualified profile, with FP32 reductions and output
 buffers. Physical forwards remain limited to eight rows and 512 tokens;

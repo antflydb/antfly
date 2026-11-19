@@ -129,6 +129,14 @@ GLiNER serving uses heuristic plans: new shapes can miss the cache, but must
 record zero timed tuning searches. Retain cold latency separately from warm
 medians; model loading and HTTP remain outside this benchmark.
 
+The same evidence includes `stream_syncs`, `plan_cache_hits`,
+`plan_cache_evictions` and `uncached_plans`. Synchronization counts include
+required result readback and norm-slot retirement; successful relative/bias
+snapshot publication does not drain the stream. Saturate the cache with varied
+lengths, then repeat recently introduced shapes: misses should stop after
+admission, while the bounded cache records replacements. Protected graph plans
+and outstanding host leases are never evicted.
+
 ```sh
 python -m unittest discover -s zig/lib/pjrt/tools -p 'test_*.py'
 ```

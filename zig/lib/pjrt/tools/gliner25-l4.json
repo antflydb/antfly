@@ -923,7 +923,208 @@
     "warm_remeasurement": {
       "status": "incomplete: no uncontaminated paired warm campaign after heuristic selection",
       "reason": "Independent Gemma GPU jobs did not acquire the shared lock and repeatedly overlapped attempted timings. Rejected runs are excluded.",
-      "historical_tables": "decide_bf16 latency and memory describe the earlier tuned profile, not the current heuristic default."
+      "historical_tables": "decide_bf16 latency and memory describe the earlier tuned profile, not the current heuristic default.",
+      "superseded_by": "review_1746_fixes.release_performance"
+    }
+  },
+  "review_1746_fixes": {
+    "time_utc": "2026-11-19T19:22:51.884928+00:00",
+    "reviewed_commit": "265e561bb7b94727f0aa1d469acd35bb20e8bd83",
+    "review_url": "https://github.com/antflydb/antfly/pull/1746#pullrequestreview-5979904796",
+    "findings": [
+      {
+        "priority": "P1",
+        "comment": 4632434674,
+        "fix": "Record resident-name ownership before post-insertion BF16 rounding; injected original-error propagation and single-release regression."
+      },
+      {
+        "priority": "P2",
+        "comment": 4632434689,
+        "fix": "Queue relative snapshots and bias conversion on the owner stream, without success-path drains; partial-copy failure and teardown retain lifetime fences; expose stream-sync counters."
+      },
+      {
+        "priority": "P2",
+        "comment": 4632434699,
+        "fix": "Bounded LRU GEMM plans; active host leases and captured plans cannot be replaced; repeated saturated-cache shapes reuse their plans."
+      }
+    ],
+    "focused_cuda_tests": 47,
+    "python_tests": 29,
+    "cuda_type_check": "pass",
+    "qualified_bf16_flags": 11698200,
+    "confidence_limit": 0.02,
+    "max_confidence_delta": 0.015933293337995202,
+    "release_qualification": [
+      {
+        "runtime": 130400,
+        "round": 0,
+        "passed": true,
+        "max_confidence_delta": 0.009570133540495629
+      },
+      {
+        "runtime": 130400,
+        "round": 1,
+        "passed": true,
+        "max_confidence_delta": 0.015933293337995202
+      },
+      {
+        "runtime": 130400,
+        "round": 2,
+        "passed": true,
+        "max_confidence_delta": 0.009570133540495629
+      },
+      {
+        "runtime": 130401,
+        "round": 0,
+        "passed": true,
+        "max_confidence_delta": 0.009570133540495629
+      },
+      {
+        "runtime": 130401,
+        "round": 1,
+        "passed": true,
+        "max_confidence_delta": 0.009570133540495629
+      },
+      {
+        "runtime": 130401,
+        "round": 2,
+        "passed": true,
+        "max_confidence_delta": 0.010363273249720473
+      }
+    ],
+    "public_pipeline": {
+      "scope": "One fresh controlled Debug public-pipeline worker per arm; variable-length requests, 86 additional lengths to saturate the 256-entry plan cache, 16 returning requests, and 89 qualification cases with two outputs per case. Excludes HTTP/model loading.",
+      "before": {
+        "qualified_cases": 89,
+        "max_confidence_delta": 0.009570133540495629,
+        "first_median_ms": 15.143669,
+        "first_max_ms": 309.197801,
+        "warm_median_ms": 8.939983,
+        "post_saturation_median_ms": 22.031222,
+        "post_saturation_misses": 2400,
+        "timed_tuning_searches": 0
+      },
+      "after": {
+        "qualified_cases": 89,
+        "max_confidence_delta": 0.009570133540495629,
+        "first_median_ms": 13.621604,
+        "first_max_ms": 223.528978,
+        "warm_median_ms": 8.9229815,
+        "post_saturation_median_ms": 21.8814165,
+        "post_saturation_misses": 0,
+        "timed_tuning_searches": 0,
+        "first_stream_syncs": [
+          3,
+          4,
+          1,
+          3,
+          3,
+          6,
+          6,
+          2,
+          8,
+          1,
+          1,
+          1,
+          1,
+          1,
+          5,
+          1,
+          1,
+          1,
+          5
+        ],
+        "plan_evictions": 265,
+        "uncached_plans": 0
+      },
+      "foreign_gpu_processes": {}
+    },
+    "base_fp32_regression": {
+      "passed": true,
+      "cases": 42,
+      "max_abs_output_error": 0.00011491775512695312,
+      "exact_decisions": true
+    },
+    "release_performance": {
+      "scope": "ReleaseFast prepared tensors through synchronized readback, first shape forward retained, three following warmups, eight measured warm forwards, three rotated fresh-process rounds; PJRT three warmups/eight forwards; shared GPU lock",
+      "performance": [
+        {
+          "id": "classification_s128_b1",
+          "warm_ms": {
+            "before": 4.834814,
+            "after": 4.772905499999999,
+            "pjrt": 7.8906485
+          },
+          "first_ms": {
+            "before": 128.077763,
+            "after": 126.95764700000001
+          }
+        },
+        {
+          "id": "classification_s128_b8",
+          "warm_ms": {
+            "before": 24.050496,
+            "after": 23.985069499999998,
+            "pjrt": 25.565641499999998
+          },
+          "first_ms": {
+            "before": 20.735774,
+            "after": 20.777866999999997
+          }
+        },
+        {
+          "id": "classification_s512_b1",
+          "warm_ms": {
+            "before": 17.197038999999997,
+            "after": 17.2076315,
+            "pjrt": 16.433087
+          },
+          "first_ms": {
+            "before": 21.85089,
+            "after": 21.489413
+          }
+        },
+        {
+          "id": "classification_s512_b8",
+          "warm_ms": {
+            "before": 122.7815075,
+            "after": 122.634738,
+            "pjrt": 129.67063299999998
+          },
+          "first_ms": {
+            "before": 119.32176799999999,
+            "after": 119.844484
+          }
+        }
+      ],
+      "foreign_gpu_processes": []
+    },
+    "descriptor_lifetime_reference": "https://github.com/NVIDIA/CUDALibrarySamples/blob/master/cuBLASLt/LtSgemm/sample_cublasLt_LtSgemm.cu#L94",
+    "pjrt_runtime_note": "CUDA 12.8 runtime at perf-gemma4-pjrt-cuda/.tools/llama-runtime/cuda12; same pre-existing llama-b11669 runtime, relocated since earlier campaigns. First attempt failed before PJRT device startup; completed native observations reused, then all three PJRT rounds completed.",
+    "production_note": "Additional existing shared-cache tests were enabled and updated after the production-equivalent ReleaseFast binary was built; production code was unchanged.",
+    "memory_median_process_peaks": {
+      "values": {
+        "before": {
+          "peak_gpu_bytes": 1956642816,
+          "peak_footprint_bytes": 3429565440
+        },
+        "after": {
+          "peak_gpu_bytes": 1956642816,
+          "peak_footprint_bytes": 3235418112
+        },
+        "pjrt": {
+          "peak_gpu_bytes": 2476736512,
+          "peak_footprint_bytes": 3623611392
+        }
+      },
+      "scope": "Startup and inference, process-tree PSS plus NVML every 0.2 s; coordinator/parameter feeder included. Combined peaks are sampling/startup-sensitive; differences are not isolated effects of the cache changes."
+    },
+    "binaries": {
+      ".tools/gliner25-p2-pipeline-debug": "be4361cd55d611d29ae81c190bd5d88a2fead6262bd89f838b93f458fea60a7b",
+      ".tools/gliner25-pr1746-pipeline-debug": "de4cead5aee68450dfb114b8023f7d50e7e19e740246cc9c22978af3ce01f606",
+      ".tools/gliner25-pr1746-core-release": "266f07e4b96d9ffc3a2a01032365ffde948f15dd5cd4c0d7e3684e9ed066f903",
+      ".tools/gliner25-p2-core-release": "85466b7149a8bfdae8a28a061204ef6e3d9e99a5e35b1c49d9677998c31f349f",
+      ".tools/antfly-pjrt-gliner25-qualified": "1b940e3050f1e3281a3c1539c0bca38a9a0a965bd6aaf4895e8832ddc2b66042"
     }
   }
 }

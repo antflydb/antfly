@@ -179,7 +179,7 @@ fn runCase(io: std.Io, pipeline: *gliner.GlinerPipeline, selected: []const u8, p
         }
         if (i >= warmup) samples[i - warmup] = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     }
-    const CudaEvidence = struct { plan_cache_misses: usize, matmul_tuning_searches: usize, kernel_launches: usize, h2d_bytes: usize, d2h_bytes: usize, downloads: usize, stream_f32_attention_calls: usize, materialized_f16_attention_calls: usize, f16_cublaslt_linear_calls: usize, bf16_attention_calls: usize, bf16_ffn_calls: usize };
+    const CudaEvidence = struct { stream_syncs: usize, plan_cache_hits: usize, plan_cache_evictions: usize, uncached_plans: usize, plan_cache_misses: usize, matmul_tuning_searches: usize, kernel_launches: usize, h2d_bytes: usize, d2h_bytes: usize, downloads: usize, stream_f32_attention_calls: usize, materialized_f16_attention_calls: usize, f16_cublaslt_linear_calls: usize, bf16_attention_calls: usize, bf16_ffn_calls: usize };
     const cuda_transfers: ?CudaEvidence = if (comptime factory.CudaRuntimeStats != void) blk: {
         const before = stats_before orelse break :blk null;
         factory.drainCudaProfile(pipeline.session);
@@ -188,7 +188,7 @@ fn runCase(io: std.Io, pipeline: *gliner.GlinerPipeline, selected: []const u8, p
             var buffer: [768]u8 = undefined;
             std.debug.print("{s}\n", .{factory.formatCudaPrefillProfileLine(&buffer, delta)});
         }
-        break :blk .{ .plan_cache_misses = delta.cublaslt_plan_cache_misses, .matmul_tuning_searches = delta.cublaslt_matmul_tuning_searches, .kernel_launches = delta.kernel_launches, .h2d_bytes = delta.h2d_bytes, .d2h_bytes = delta.d2h_bytes, .downloads = delta.to_float32_calls, .stream_f32_attention_calls = delta.deberta_stream_f32_attention_calls, .materialized_f16_attention_calls = delta.deberta_materialized_f16_attention_calls, .f16_cublaslt_linear_calls = delta.f16_cublaslt_linear_calls, .bf16_attention_calls = delta.gliner25_bf16_attention_calls, .bf16_ffn_calls = delta.gliner25_bf16_ffn_calls };
+        break :blk .{ .stream_syncs = delta.stream_syncs, .plan_cache_hits = delta.cublaslt_plan_cache_hits, .plan_cache_evictions = delta.cublaslt_plan_cache_evictions, .uncached_plans = delta.cublaslt_uncached_plans, .plan_cache_misses = delta.cublaslt_plan_cache_misses, .matmul_tuning_searches = delta.cublaslt_matmul_tuning_searches, .kernel_launches = delta.kernel_launches, .h2d_bytes = delta.h2d_bytes, .d2h_bytes = delta.d2h_bytes, .downloads = delta.to_float32_calls, .stream_f32_attention_calls = delta.deberta_stream_f32_attention_calls, .materialized_f16_attention_calls = delta.deberta_materialized_f16_attention_calls, .f16_cublaslt_linear_calls = delta.f16_cublaslt_linear_calls, .bf16_attention_calls = delta.gliner25_bf16_attention_calls, .bf16_ffn_calls = delta.gliner25_bf16_ffn_calls };
     } else null;
     std.mem.sort(f64, samples, {}, struct {
         fn less(_: void, left: f64, right: f64) bool {

@@ -134,6 +134,8 @@ test "GLiNER BF16 projections share input and match rounded CPU oracle" {
     try std.testing.expect(plan(4097, hidden, 3) == null);
     try std.testing.expect(plan(rows, hidden, 1) == null);
     try std.testing.expect(lt.plan_cache_misses > 2);
-    try std.testing.expect(lt.uncached_plans > 0);
+    try std.testing.expect(lt.plan_cache_evictions > 0);
+    try std.testing.expectEqual(@as(usize, 0), lt.uncached_plans);
+    try std.testing.expectEqual(@as(usize, 2), lt.tensor_core_plans.count());
     try std.testing.expectEqual(@as(usize, 0), lt.matmul_tuning_searches);
 }

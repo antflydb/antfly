@@ -2335,12 +2335,13 @@ fn createCudaSessionWithRequiredProfileAndHostLease(
     for (resident_uploads.items) |upload| {
         if (upload.mmap_bytes) |bytes| c_file.MmapRegion.adviseBytesSequential(bytes);
         const owned_key = try allocator.dupe(u8, upload.key);
+        var key_transferred = false;
         const uploaded = if (model_manifest.glide_declared)
             uploadGlideCudaWeight(&cuda_compute, owned_key, upload.loaded, !glide_fp32)
         else
-            uploadGlinerCudaWeight(&cuda_compute, owned_key, upload.loaded, gliner_precision);
+            uploadGlinerCudaWeight(&cuda_compute, owned_key, upload.loaded, gliner_precision, &key_transferred);
         uploaded catch |err| {
-            if (!model_manifest.glide_declared) allocator.free(owned_key);
+            if (!model_manifest.glide_declared and !key_transferred) allocator.free(owned_key);
             return err;
         };
         // Every resident upload waits for its host readers before returning.
@@ -2495,7 +2496,8 @@ test "GLiDE CUDA compact projections recognize encoder and wrapped decoder names
     try std.testing.expect(!isGlideProjectionWeight("glide_readout.weight", 2));
 }
 
-fn uploadGlinerCudaWeight(compute: anytype, name: []const u8, loaded: *const LoadedWeight, precision: GlinerCudaPrecision) !void {
+fn uploadGlinerCudaWeight(compute: anytype, name: []const u8, loaded: *const LoadedWeight, precision: GlinerCudaPrecision, key_transferred: *bool) !void {
+    key_transferred.* = false;
     // Only the explicit DeBERTa experiment also converts classifier/boundary
     // linear weights. Embedding and normalization storage stays FP32.
     // Packed-only weights have no dense tensor shape. Check the requested
@@ -2514,6 +2516,9 @@ fn uploadGlinerCudaWeight(compute: anytype, name: []const u8, loaded: *const Loa
         (!experimental_head and !std.mem.startsWith(u8, name, "model.layers.") and !std.mem.startsWith(u8, name, "encoder.layer.")) or !std.mem.endsWith(u8, name, ".weight"))
     {
         try compute.insertWeightFromLoaded(name, loaded);
+        // Insertion has committed the owned name to the resident map. Any
+        // later rounding error must leave its cleanup to session teardown.
+        key_transferred.* = true;
         if (precision == .bf16_full) {
             if (comptime @hasDecl(@TypeOf(compute.*), "roundGlinerBf16Weight")) try compute.roundGlinerBf16Weight(name) else return error.UnsupportedGlinerCudaPrecision;
         }
@@ -2521,7 +2526,11 @@ fn uploadGlinerCudaWeight(compute: anytype, name: []const u8, loaded: *const Loa
     }
     if (loaded.quantized or loaded.quantized_storage != null or loaded.tensor.dtype != .f32)
         return error.UnsupportedGlinerCudaPrecision;
-    if (precision == .bf16 or precision == .bf16_full) return compute.insertBf16WeightFromF32Tensor(name, &loaded.tensor);
+    if (precision == .bf16 or precision == .bf16_full) {
+        try compute.insertBf16WeightFromF32Tensor(name, &loaded.tensor);
+        key_transferred.* = true;
+        return;
+    }
     const values = loaded.tensor.asFloat32();
     const half = try compute.allocator.alloc(f16, values.len);
     defer compute.allocator.free(half);
@@ -2532,6 +2541,8 @@ fn uploadGlinerCudaWeight(compute: anytype, name: []const u8, loaded: *const Loa
     var tensor = loaded.tensor;
     tensor.dtype = .f16;
     tensor.data = std.mem.sliceAsBytes(half);
+    // This insertion API consumes the name on failure as well as success.
+    key_transferred.* = true;
     return compute.insertF16WeightFromTensor(name, &tensor);
 }
 
@@ -2552,25 +2563,69 @@ test "GLiNER BF16 encoder upload protects embeddings and gates head experiment" 
             return error.UnexpectedPrecision;
         }
     };
+    var key_transferred = false;
     var compute = Fake{ .allocator = std.testing.allocator };
     var values = [_]f32{ 1, 2, 3, 4 };
     var loaded = LoadedWeight{ .tensor = .{ .data = std.mem.sliceAsBytes(&values), .dtype = .f32, .shape = &.{ 2, 2 }, .name = "", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false } };
-    try uploadGlinerCudaWeight(&compute, "encoder.layer.0.attention.self.query_proj.weight", &loaded, .bf16);
-    try uploadGlinerCudaWeight(&compute, "model.layers.0.attn.Wqkv.weight", &loaded, .bf16);
-    try uploadGlinerCudaWeight(&compute, "embeddings.word_embeddings.weight", &loaded, .bf16);
-    try uploadGlinerCudaWeight(&compute, "encoder.LayerNorm.weight", &loaded, .bf16);
-    try uploadGlinerCudaWeight(&compute, "label_classifier.0.weight", &loaded, .bf16);
-    try uploadGlinerCudaWeight(&compute, "encoder.layer.0.attention.self.query_proj.weight", &loaded, .fp32);
+    try uploadGlinerCudaWeight(&compute, "encoder.layer.0.attention.self.query_proj.weight", &loaded, .bf16, &key_transferred);
+    try uploadGlinerCudaWeight(&compute, "model.layers.0.attn.Wqkv.weight", &loaded, .bf16, &key_transferred);
+    try uploadGlinerCudaWeight(&compute, "embeddings.word_embeddings.weight", &loaded, .bf16, &key_transferred);
+    try uploadGlinerCudaWeight(&compute, "encoder.LayerNorm.weight", &loaded, .bf16, &key_transferred);
+    try uploadGlinerCudaWeight(&compute, "label_classifier.0.weight", &loaded, .bf16, &key_transferred);
+    try uploadGlinerCudaWeight(&compute, "encoder.layer.0.attention.self.query_proj.weight", &loaded, .fp32, &key_transferred);
     try std.testing.expectEqual(@as(usize, 2), compute.reduced);
     try std.testing.expectEqual(@as(usize, 4), compute.protected);
-    try uploadGlinerCudaWeight(&compute, "classifier.0.weight", &loaded, .bf16);
+    try uploadGlinerCudaWeight(&compute, "classifier.0.weight", &loaded, .bf16, &key_transferred);
     try std.testing.expectEqual(@as(usize, 5), compute.protected);
     compute.gliner_deberta_bf16 = true;
-    try uploadGlinerCudaWeight(&compute, "classifier.0.weight", &loaded, .bf16);
-    try uploadGlinerCudaWeight(&compute, "boundary_head.boundary_encoder.left_projection.weight", &loaded, .bf16);
-    try uploadGlinerCudaWeight(&compute, "encoder.rel_embeddings.weight", &loaded, .bf16);
+    try uploadGlinerCudaWeight(&compute, "classifier.0.weight", &loaded, .bf16, &key_transferred);
+    try uploadGlinerCudaWeight(&compute, "boundary_head.boundary_encoder.left_projection.weight", &loaded, .bf16, &key_transferred);
+    try uploadGlinerCudaWeight(&compute, "encoder.rel_embeddings.weight", &loaded, .bf16, &key_transferred);
     try std.testing.expectEqual(@as(usize, 4), compute.reduced);
     try std.testing.expectEqual(@as(usize, 6), compute.protected);
+}
+
+test "GLiNER BF16 encoder upload rounding failure preserves committed key ownership" {
+    const Fake = struct {
+        allocator: std.mem.Allocator,
+        resident_key: ?[]const u8 = null,
+        releases: usize = 0,
+        fn insertWeightFromLoaded(self: *@This(), name: []const u8, _: *const LoadedWeight) !void {
+            self.resident_key = name;
+        }
+        pub fn roundGlinerBf16Weight(_: *@This(), _: []const u8) !void {
+            return error.InjectedBf16RoundingFailure;
+        }
+        fn insertBf16WeightFromF32Tensor(_: *@This(), _: []const u8, _: *const Tensor) !void {
+            return error.UnexpectedUpload;
+        }
+        fn insertF16WeightFromTensor(_: *@This(), _: []const u8, _: *const Tensor) !void {
+            return error.UnexpectedUpload;
+        }
+        fn deinit(self: *@This()) void {
+            if (self.resident_key) |key| {
+                self.allocator.free(key);
+                self.resident_key = null;
+                self.releases += 1;
+            }
+        }
+    };
+    var compute = Fake{ .allocator = std.testing.allocator };
+    defer compute.deinit();
+    var values = [_]f32{ 1, 2, 3, 4 };
+    const loaded = LoadedWeight{ .tensor = .{ .data = std.mem.sliceAsBytes(&values), .dtype = .f32, .shape = &.{4}, .name = "", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false } };
+    const name = try std.testing.allocator.dupe(u8, "encoder.LayerNorm.weight");
+    var key_transferred = false;
+    const result = uploadGlinerCudaWeight(&compute, name, &loaded, .bf16_full, &key_transferred);
+    // Mirror the real loader's error cleanup, before session teardown.
+    result catch {
+        if (!key_transferred) std.testing.allocator.free(name);
+    };
+    try std.testing.expectError(error.InjectedBf16RoundingFailure, result);
+    try std.testing.expect(key_transferred);
+    try std.testing.expectEqual(name.ptr, compute.resident_key.?.ptr);
+    compute.deinit();
+    try std.testing.expectEqual(@as(usize, 1), compute.releases);
 }
 
 test "GLiNER Decide CUDA mixed precision rejects packed-only weights before upload" {
@@ -2586,13 +2641,14 @@ test "GLiNER Decide CUDA mixed precision rejects packed-only weights before uplo
             return error.UnexpectedUpload;
         }
     };
+    var key_transferred = false;
     var compute = Compute{ .allocator = std.testing.allocator };
     var loaded = LoadedWeight{
         .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &.{}, .name = "", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false },
         .quantized = true,
     };
     for ([_]GlinerCudaPrecision{ .fp16, .bf16 }) |precision|
-        try std.testing.expectError(error.UnsupportedGlinerCudaPrecision, uploadGlinerCudaWeight(&compute, "model.layers.0.attn.Wqkv.weight", &loaded, precision));
+        try std.testing.expectError(error.UnsupportedGlinerCudaPrecision, uploadGlinerCudaWeight(&compute, "model.layers.0.attn.Wqkv.weight", &loaded, precision, &key_transferred));
 }
 
 /// Materialize the immutable, pre-sharded expert payload consumed by the A4B
