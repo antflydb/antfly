@@ -1033,7 +1033,7 @@ pub const SnapshotBackfillRunner = struct {
             }
 
             if (lake_owner != null) {
-                if (result.rows.len > lake_catalog.parquet_writer.max_rows - lake_rows.items.len) return error.LakeWriteTooLarge;
+                if (result.rows.len > lake_catalog.row_commit.max_bootstrap_rows - lake_rows.items.len) return error.LakeWriteTooLarge;
                 for (result.rows) |row| {
                     const encoded = try std.json.Stringify.valueAlloc(self.alloc, row, .{});
                     defer self.alloc.free(encoded);

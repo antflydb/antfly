@@ -237,12 +237,12 @@ pub const StreamOwner = struct {
         const batch = if (request.snapshot_rows) |rows| blk: {
             if (request.previous_checkpoint != null or request.changes.len != 0 or
                 !std.mem.eql(u8, request.checkpoint, request.cutover.prepared_checkpoint)) return error.InvalidReplicationCheckpoint;
-            if (rows.len > max_group_changes) return error.LakeWriteTooLarge;
+            if (rows.len > catalog.row_commit.max_bootstrap_rows) return error.LakeWriteTooLarge;
             const changes = try a.alloc(Batch.Change, rows.len);
             for (rows, changes) |row, *change| change.* = .{ .op = .upsert, .row = row };
             var snapshot = try bootstrapIdentity(a, source, epoch, request.checkpoint, identity.key_columns);
             snapshot.changes = changes;
-            try snapshot.validate(max_group_changes);
+            try snapshot.validate(catalog.row_commit.max_bootstrap_rows);
             break :blk snapshot;
         } else blk: {
             const previous = request.previous_checkpoint orelse return error.InvalidReplicationCheckpoint;
