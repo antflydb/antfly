@@ -1299,6 +1299,9 @@ pub const IndexSnapshot = struct {
     ref_count: u32,
     epoch: u64,
     graph_predicates: GraphPredicateCache = .{},
+    graph_ordinal_mutex: std.atomic.Mutex = .unlocked,
+    graph_ordinal_navigation: ?GraphOrdinalNavigation = null,
+    graph_ordinal_incomplete: bool = false,
     segments: []SegmentEntry,
     global_total_field_len: std.StringHashMapUnmanaged(u64),
     collection_doc_count: ?u32 = null,
@@ -1690,6 +1693,10 @@ pub const IndexSnapshot = struct {
     fn freeFinal(self: *IndexSnapshot) void {
         self.quiesceOwnedSources();
         const alloc = self.alloc;
+        if (self.graph_ordinal_navigation) |*navigation| {
+            alloc.free(navigation.entries);
+            navigation.reservation.release();
+        }
         self.graph_predicates.deinit(alloc);
         self.binding_flights.deinit(alloc);
         var entries = self.bound_segments.valueIterator();
@@ -2120,6 +2127,86 @@ pub const IndexSnapshot = struct {
 
     /// Stream directly into compact membership without a corpus-sized u32
     /// result array. Check request control even across deleted/sparse rows.
+    const GraphOrdinalNavigation = struct {
+        const Entry = struct {
+            ordinal: u32,
+            doc: u32,
+        };
+        entries: []Entry,
+        reservation: resource_manager_mod.Reservation,
+    };
+
+    fn graphOrdinalNavigation(self: *IndexSnapshot, control: query_mod.ExecutionControl) !?[]const GraphOrdinalNavigation.Entry {
+        while (!self.graph_ordinal_mutex.tryLock()) {
+            try control.check();
+            spinOrYield();
+        }
+        defer self.graph_ordinal_mutex.unlock();
+        if (self.graph_ordinal_navigation) |navigation| return navigation.entries;
+        if (self.graph_ordinal_incomplete) return null;
+        const manager = self.graph_predicates.manager.load(.acquire) orelse return null;
+        if (!try self.hasDocOrdinalCoverage()) {
+            self.graph_ordinal_incomplete = true;
+            return null;
+        }
+        var total: u32 = 0;
+        for (self.segments) |segment| total = try std.math.add(u32, total, segment.reader.doc_count);
+        const bytes = @as(usize, total) * @sizeOf(GraphOrdinalNavigation.Entry);
+        if (bytes > 32 * 1024 * 1024) return null;
+        var reservation = manager.reserveWithoutReclaim(.graph_predicate_cache, bytes) catch return null;
+        var owned = true;
+        defer if (owned) reservation.release();
+        const entries = try self.alloc.alloc(GraphOrdinalNavigation.Entry, total);
+        defer if (owned) self.alloc.free(entries);
+        var offset: u32 = 0;
+        for (self.segments, 0..) |segment, segment_index| {
+            try control.check();
+            var lease = try self.leaseSegment(segment_index);
+            defer lease.deinit();
+            var cursor = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
+            for (0..segment.reader.doc_count) |local| {
+                if (local % 256 == 0) try control.check();
+                const ordinal = (try cursor.get(@intCast(local))) orelse {
+                    self.graph_ordinal_incomplete = true;
+                    return null;
+                };
+                const doc = offset + @as(u32, @intCast(local));
+                entries[doc] = .{ .ordinal = ordinal, .doc = doc };
+            }
+            offset += segment.reader.doc_count;
+        }
+        const Order = struct {
+            fn less(_: void, a: GraphOrdinalNavigation.Entry, b: GraphOrdinalNavigation.Entry) bool {
+                return if (a.ordinal == b.ordinal) a.doc < b.doc else a.ordinal < b.ordinal;
+            }
+        };
+        std.mem.sort(GraphOrdinalNavigation.Entry, entries, {}, Order.less);
+        try control.check();
+        self.graph_ordinal_navigation = .{ .entries = entries, .reservation = reservation };
+        owned = false;
+        return entries;
+    }
+
+    /// The directory maps physical documents, including deleted copies.
+    /// Callers still apply the active segment deletion mask when probing.
+    pub fn graphFrontierDocNumsAlloc(self: *IndexSnapshot, alloc: Allocator, frontier: anytype, control: query_mod.ExecutionControl) !?roaring.RoaringBitmap {
+        const entries = (try self.graphOrdinalNavigation(control)) orelse return null;
+        var docs = roaring.RoaringBitmap.init(alloc);
+        errdefer docs.deinit();
+        var keys = frontier.keyIterator();
+        while (keys.next()) |key| {
+            try control.check();
+            var low: usize = 0;
+            var high = entries.len;
+            while (low < high) {
+                const middle = low + (high - low) / 2;
+                if (entries[middle].ordinal < key.*) low = middle + 1 else high = middle;
+            }
+            while (low < entries.len and entries[low].ordinal == key.*) : (low += 1) try docs.add(entries[low].doc);
+        }
+        return docs;
+    }
+
     pub fn tryDocNumBitmapForOrdinalMembershipAlloc(self: *const IndexSnapshot, alloc: Allocator, membership: anytype, control: query_mod.ExecutionControl) !?roaring.RoaringBitmap {
         return self.tryDocNumBitmapForOrdinalMembershipWithCoverageAlloc(alloc, membership, control, false);
     }

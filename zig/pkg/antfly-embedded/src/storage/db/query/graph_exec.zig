@@ -4763,6 +4763,23 @@ fn jsonValueMatchesStandardRange(value: std.json.Value, lower: ?PatternJsonRange
         }
         return false;
     }
+    const numeric = @import("../../../section/typed_doc_values.zig");
+    if (numeric.exactNumericValueFromJson(value)) |candidate| {
+        const min = if (lower) |bound| numeric.exactNumericValueFromJson(bound.value) else null;
+        const max = if (upper) |bound| numeric.exactNumericValueFromJson(bound.value) else null;
+        if ((lower == null or min != null) and (upper == null or max != null)) {
+            if (min) |bound| {
+                const order = numeric.compareNumericValues(candidate, bound);
+                if (order == .lt or (order == .eq and !lower.?.inclusive)) return false;
+            }
+            if (max) |bound| {
+                const order = numeric.compareNumericValues(candidate, bound);
+                if (order == .gt or (order == .eq and !upper.?.inclusive)) return false;
+            }
+            return true;
+        }
+    }
+
     // Temporal strings and typed nanosecond columns share one signed order.
     // Ordinary numeric predicates retain scalar comparison; wide integer
     // timestamp representations use the same signed order as temporal strings.

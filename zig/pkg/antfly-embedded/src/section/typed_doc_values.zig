@@ -116,6 +116,21 @@ pub fn compareNumericValues(a: NumericValue, b: NumericValue) std.math.Order {
     };
 }
 
+/// Integer spellings outside the typed domains remain available to legacy
+/// temporal comparisons. Never round them into a native exact range bound.
+pub fn exactNumericValueFromJson(value: std.json.Value) ?NumericValue {
+    return switch (value) {
+        .integer => |number| .{ .i64_val = number },
+        .float => |number| if (std.math.isFinite(number)) .{ .f64_val = number } else null,
+        .number_string => |text| blk: {
+            if (std.fmt.parseInt(i64, text, 10)) |number| break :blk .{ .i64_val = number } else |_| {}
+            if (std.fmt.parseUnsigned(u64, text, 10)) |number| break :blk .{ .u64_val = number } else |_| {}
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
 /// Decode the finite numeric kinds accepted by typed numeric projections.
 pub fn numericValueFromJson(value: std.json.Value) ?NumericValue {
     return switch (value) {

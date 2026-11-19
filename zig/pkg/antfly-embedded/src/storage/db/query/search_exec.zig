@@ -9549,15 +9549,26 @@ const IndexedPredicateEvaluator = struct {
         }
         const cache = &self.snapshot.graph_predicates;
         if (try cache.getScoped(self.alloc, key, self.control, scope)) |rows| return rows;
-        if (scope) |domain| if (self.local_cache) |local| {
-            if (local.memory.shouldProbe(key)) {
+        if (scope) |domain| if (self.probe_input != null) {
+            const live_count = self.snapshot.liveDocCount();
+            const small_frontier = live_count >= 65_536 and domain.cardinality() <= 128;
+            const low_headroom = if (self.budget) |budget|
+                @as(u64, live_count) * 8 > budget.max_retained_state_bytes -| budget.retained_state_bytes
+            else
+                false;
+            if (small_frontier or low_headroom or (self.local_cache != null and self.local_cache.?.memory.shouldProbe(key))) {
                 if (try self.probeFrontier(query, domain)) |rows| return rows;
             }
         };
         const flight = try cache.lockFlight(key, self.control);
         defer flight.unlock();
         if (try cache.getScoped(self.alloc, key, self.control, scope)) |rows| return rows;
-        var all = try self.executeIndexed(query);
+        var all = self.executeIndexed(query) catch |err| {
+            if (err == error.OutOfMemory) if (scope) |domain| {
+                if (try self.probeFrontier(query, domain)) |rows| return rows;
+            };
+            return err;
+        };
         cache.put(self.snapshot.alloc, key, &all);
         if (self.local_cache) |local| local.memory.put(local.alloc, local.budget, key, &all);
         if (scope == null) return all;
@@ -9571,7 +9582,8 @@ const IndexedPredicateEvaluator = struct {
             memo.attempted = true;
             if (!try self.snapshot.hasDocOrdinalCoverage()) return null;
             const frontier = self.frontier orelse return null;
-            memo.docs = try self.snapshot.tryDocNumBitmapForOrdinalMembershipWithCoverageAlloc(self.alloc, frontier, self.control, true);
+            memo.docs = (try self.snapshot.graphFrontierDocNumsAlloc(self.alloc, frontier, self.control)) orelse
+                try self.snapshot.tryDocNumBitmapForOrdinalMembershipWithCoverageAlloc(self.alloc, frontier, self.control, true);
         }
         const candidates_bitmap = if (memo.docs) |*docs| docs else return null;
         const filter = (try search_mod.searchQueryToFilterArena(self.scratch, query)).withControl(self.control);
@@ -9629,13 +9641,6 @@ const IndexedPredicateEvaluator = struct {
 
     fn initialScope(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery) !roaring.RoaringBitmap {
         var necessary: std.ArrayListUnmanaged(search_mod.SearchQuery) = .empty;
-        if (query == .bool_query) {
-            var direct: std.ArrayListUnmanaged(search_mod.SearchQuery) = .empty;
-            for (query.bool_query.must) |child| if (try self.indexed(child)) try direct.append(self.scratch, child);
-            if (direct.items.len != 0) return self.executeIndexedClause(.{ .bool_query = .{ .must = direct.items } }, null, "/g0");
-            if (try self.indexedShouldGate(query.bool_query.should, requiredShould(query.bool_query))) |gate|
-                return self.executeIndexedClause(gate, null, "/t0");
-        }
         try self.collectNecessaryIndexed(query, &necessary);
         if (necessary.items.len != 0) {
             return self.executeIndexedClause(.{ .bool_query = .{ .must = necessary.items } }, null, "/initial");
@@ -10499,7 +10504,10 @@ fn searchQueryCanUseSnapshotWithControl(
             try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
             (snapshot.liveDocCount() == 0 or try snapshot.hasInvertedField(item.field)),
         .fuzzy => |item| try snapshot.hasInvertedField(item.field),
-        .numeric_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .numeric, if (item.exact_bounds == null) .numeric_range else .standard_numeric_range, control),
+        .numeric_range => |item| if (item.stored_standard_range != null and item.exact_bounds == null)
+            false
+        else
+            try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .numeric, if (item.exact_bounds == null) .numeric_range else .standard_numeric_range, control),
         .date_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .datetime, .sort_or_legacy_filter, control),
         .bool_field => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .boolean, .sort_or_legacy_filter, control),
         .geo_distance => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
@@ -12079,17 +12087,18 @@ fn parseStandardRangeObject(
     if (lower == null and upper == null) return error.InvalidArgument;
 
     return switch (mapping.field_type) {
-        .numeric => .{ .numeric_range = .{
-            .field = field,
-            .exact_bounds = .{
-                .min = if (lower) |bound| try exactNumericRangeBound(bound.value) else null,
-                .max = if (upper) |bound| try exactNumericRangeBound(bound.value) else null,
-            },
-            .min = if (lower) |bound| try jsonOptionalF64Strict(bound.value) else null,
-            .max = if (upper) |bound| try jsonOptionalF64Strict(bound.value) else null,
-            .inclusive_min = if (lower) |bound| bound.inclusive else true,
-            .inclusive_max = if (upper) |bound| bound.inclusive else false,
-        } },
+        .numeric => numeric: {
+            const min = if (lower) |bound| typed_dv.exactNumericValueFromJson(bound.value) else null;
+            const max = if (upper) |bound| typed_dv.exactNumericValueFromJson(bound.value) else null;
+            break :numeric .{ .numeric_range = .{
+                .field = field,
+                .exact_bounds = if ((lower == null or min != null) and (upper == null or max != null)) .{ .min = min, .max = max } else null,
+                .min = if (lower) |bound| try jsonOptionalF64Strict(bound.value) else null,
+                .max = if (upper) |bound| try jsonOptionalF64Strict(bound.value) else null,
+                .inclusive_min = if (lower) |bound| bound.inclusive else true,
+                .inclusive_max = if (upper) |bound| bound.inclusive else false,
+            } };
+        },
         .datetime => .{ .date_range = .{
             .field = field,
             .start_ns = if (lower) |bound| try jsonOptionalDateOrNs(bound.value) else null,
@@ -12104,16 +12113,6 @@ fn parseStandardRangeObject(
             .inclusive_min = if (lower) |bound| bound.inclusive else true,
             .inclusive_max = if (upper) |bound| bound.inclusive else false,
         } },
-        else => error.InvalidArgument,
-    };
-}
-
-fn exactNumericRangeBound(value: std.json.Value) !typed_dv.NumericValue {
-    return switch (value) {
-        .integer => |number| .{ .i64_val = number },
-        .float => |number| if (std.math.isFinite(number)) .{ .f64_val = number } else error.InvalidArgument,
-        // The residual predicate also handles wide integer bounds as temporal
-        // values. Keep those on the residual path.
         else => error.InvalidArgument,
     };
 }
@@ -39465,12 +39464,15 @@ test "optional numeric range covers unsigned values and uses identical stored se
         .default_type = "doc",
     };
     const bytes = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{
-        .{ .key = "wide", .doc_ordinal = 1, .value = "{\"body\":\"beacon\",\"rank\":9223372036854775808}" },
+        .{ .key = "wide", .doc_ordinal = 1, .value = "{\"body\":\"beacon rare\",\"rank\":9223372036854775808}" },
         .{ .key = "absent", .doc_ordinal = 2, .value = "{\"body\":\"beacon\"}" },
     }, .{}, schema)).?;
     defer a.free(bytes);
+    var manager = @import("../../resource_manager.zig").ResourceManager.init(.{});
+    defer manager.deinit(a);
     var writer = try index_mod.IndexWriter.init(a);
     defer writer.deinit();
+    writer.attachResourceManager(&manager);
     try writer.addSegment(bytes);
     const snapshot = writer.snapshot();
     const query: search_mod.SearchQuery = .{ .numeric_range = .{ .field = "rank", .min = 9e18 } };
@@ -39483,6 +39485,21 @@ test "optional numeric range covers unsigned values and uses identical stored se
     var predicate = try graph_exec.PreparedPatternFilter.initValue(a, source.value);
     defer predicate.deinit();
     try std.testing.expect(try predicate.matchesStored(a, "wide", "{\"rank\":9223372036854775808}"));
+    var standard = try std.json.parseFromSlice(std.json.Value, a, "{\"range\":{\"rank\":{\"gte\":9223372036854775808}}}", .{});
+    defer standard.deinit();
+    var compile_arena = std.heap.ArenaAllocator.init(a);
+    defer compile_arena.deinit();
+    const lowered = try patternFilterValueToSearchQuery(compile_arena.allocator(), standard.value, .{}, schema);
+    try std.testing.expectEqual(@as(u64, 9223372036854775808), lowered.numeric_range.exact_bounds.?.min.?.u64_val);
+    var precise = try graph_exec.PreparedPatternFilter.initValue(a, standard.value);
+    defer precise.deinit();
+    try std.testing.expect(try precise.matchesStored(a, "wide", "{\"rank\":9223372036854775808}"));
+    try std.testing.expect(!try precise.matchesStored(a, "lower", "{\"rank\":9223372036854775807}"));
+    var fractional_json = try std.json.parseFromSlice(std.json.Value, a, "{\"range\":{\"rank\":{\"gt\":9.5}}}", .{});
+    defer fractional_json.deinit();
+    var fractional = try graph_exec.PreparedPatternFilter.initValue(a, fractional_json.value);
+    defer fractional.deinit();
+    try std.testing.expect(try fractional.matchesStored(a, "wide", "{\"rank\":9223372036854775808}"));
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     var frontier: std.AutoHashMapUnmanaged(doc_set.DocOrdinal, []const u8) = .empty;
@@ -39512,10 +39529,26 @@ test "optional numeric range covers unsigned values and uses identical stored se
         .frontier = frontier,
         .probe_input = &input,
     };
-    var scoped = (try evaluator.probeFrontier(.{ .term = .{ .field = "body", .term = "beacon" } }, &domain)).?;
+    var low_budget = WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 1 });
+    var bounded = evaluator;
+    bounded.budget = &low_budget;
+    var scoped = try bounded.executeIndexedClause(.{ .term = .{ .field = "body", .term = "beacon" } }, &domain, "/first-miss");
     defer scoped.deinit();
+    try std.testing.expect(input.attempted);
     try std.testing.expectEqual(@as(usize, 1), scoped.cardinality());
     try std.testing.expect(scoped.contains(1));
+
+    const nested: search_mod.SearchQuery = .{ .bool_query = .{ .must = &.{
+        .{ .match_all = {} },
+        .{ .bool_query = .{ .must = &.{
+            .{ .match = .{ .field = "body", .text = "rare", .analyzer = &analysis_mod.default_analyzer } },
+            .{ .numeric_range = .{ .field = "unmapped", .min = 0 } },
+        } } },
+    } } };
+    var gated = try evaluator.initialScope(nested);
+    defer gated.deinit();
+    try std.testing.expectEqual(@as(usize, 1), gated.cardinality());
+    try std.testing.expect(gated.contains(1));
 }
 
 test "optional numeric range cold and warm measurement" {
