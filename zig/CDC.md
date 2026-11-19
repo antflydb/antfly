@@ -36,10 +36,11 @@ both cases from the `zig` directory.
 ANTFLY_BIN="$PWD/zig-out/bin/antfly" uv run --project e2e/antfly pytest e2e/antfly/test_pgwire_replication.py
 ```
 
-The [Debezium qualification driver](e2e/antfly/clients/debezium/README.md) passes
-its PostgreSQL 17.6 control with the stock 3.3.0.Final connector. The Antfly run
-reaches connector catalog discovery after login and fails during startup.
-Debezium snapshot and streaming qualification remains open.
+The stock Debezium 3.3.0.Final connector with pgjdbc 42.7.7 passed initial
+snapshot, streaming, graceful reconnect, and crash recovery on a native Antfly
+table. The qualified deployment used one metadata node, one data node, and
+a dedicated local spool. The qualification driver and exact deployment details
+are recorded in the [Debezium README](e2e/antfly/clients/debezium/README.md).
 
 Provision a dedicated mounted directory for the slot spool. Every data node
 serving the publication or reclaiming its spool must see the same files and
@@ -234,20 +235,21 @@ Iceberg. The Iceberg row writer aliases that type and continues to own typed
 schema validation. Its retry identity retains the existing source/epoch/batch
 hash, so extracting the contract does not change durable queue identities.
 
-PostgreSQL poll results expose only complete committed transactions. All rows
-in one transaction have the same opaque commit checkpoint and occur
-contiguously. The streaming coordinator advances durable source progress only
-after every member has applied. A failure midway leaves the prior transaction's
-checkpoint and replays the incomplete transaction on resume. This protects the
-resume frontier; the existing per-row destination apply still does not provide
-atomic visibility of the entire source transaction. Unknown mutation messages
-and unsupported TRUNCATE fail instead of silently advancing past their effects.
+PostgreSQL poll results expose complete committed transactions. All rows in
+one transaction share an opaque source checkpoint. Native destinations admit
+the transaction through their canonical write path. Standalone writable
+Iceberg destinations admit it through the lake ingress and resolve the
+catalog commit before advancing the durable source checkpoint. A retry uses the
+same source epoch, transaction identity, and checkpoint. Unsupported mutation
+messages, including inbound TRUNCATE, stop progress before the checkpoint.
 
-This shared envelope and checkpoint boundary do not yet connect managed
-PostgreSQL orchestration to writable Iceberg, retain outbound before-images, or
-implement public changefeeds/pgoutput. Those remain tracked by
-[#1698](https://github.com/antflydb/antfly/issues/1698) and
-[#1639](https://github.com/antflydb/antfly/issues/1639).
+A native destination can separately expose retained committed history through
+the public changefeed API and eligible relational tables through pgoutput.
+Writable Iceberg reports its ingress and catalog commit capability. External
+read-only Iceberg attachments report committed snapshots as their change
+authority. Index publication is a separate milestone across these contracts.
+See [destination integration](https://github.com/antflydb/antfly/issues/1698)
+and [committed history and changefeeds](https://github.com/antflydb/antfly/issues/1639).
 
 Writable native Iceberg tables also accept complete provider-neutral CDC
 transactions at `POST /db/v1/tables/{tableName}/lake/changes`. This push boundary
