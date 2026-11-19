@@ -68,10 +68,12 @@ pub fn decodeBatchRequest(alloc: std.mem.Allocator, buf: []const u8) !DecodedBat
     _ = try reader.readInt(u8); // reserved
     const write_count = try reader.readInt(u32);
     const delete_count = try reader.readInt(u32);
-    // Every entry needs at least one length-prefix u32, so a count exceeding
-    // the remaining buffer can never be satisfied; reject before allocating
-    // the index arrays instead of trusting an attacker/caller-controlled count.
-    if (write_count > buf.len or delete_count > buf.len) return error.InvalidArgument;
+    // A write needs at least its two length prefixes and a delete its one,
+    // so counts whose combined minimum encoding exceeds the bytes left can
+    // never be satisfied; reject before allocating the index arrays instead
+    // of trusting a caller-controlled count.
+    const minimum_bytes = @as(u64, write_count) * 8 + @as(u64, delete_count) * 4;
+    if (minimum_bytes > buf.len - reader.pos) return error.InvalidArgument;
 
     const writes = try alloc.alloc(mutation.BatchWrite, write_count);
     errdefer alloc.free(writes);
@@ -209,6 +211,22 @@ test "batch wire round-trips writes, deletes and sync level" {
     try std.testing.expectEqual(buf[16 + 4 ..].ptr, probe.writes[0].key.ptr);
     alloc.free(probe.writes);
     alloc.free(probe.deletes);
+}
+
+test "batch wire rejects counts larger than the body could encode before allocating" {
+    // Header plus one write's worth of bytes, claiming a million writes.
+    // magic u32, version u16, sync u8, reserved u8, write and delete counts.
+    var buf: [16 + 8]u8 = @splat(0);
+    std.mem.writeInt(u32, buf[0..4], magic, .little);
+    std.mem.writeInt(u16, buf[4..6], version, .little);
+    buf[6] = syncLevelTag(.write);
+    std.mem.writeInt(u32, buf[8..12], 1_000_000, .little);
+    // A failing allocator: any index-array allocation fails the test.
+    try std.testing.expectError(error.InvalidArgument, decodeBatchRequest(std.testing.failing_allocator, &buf));
+    // Both counts count: 1 write (8 bytes) plus 1 delete (4 bytes) > 8.
+    std.mem.writeInt(u32, buf[8..12], 1, .little);
+    std.mem.writeInt(u32, buf[12..16], 1, .little);
+    try std.testing.expectError(error.InvalidArgument, decodeBatchRequest(std.testing.failing_allocator, &buf));
 }
 
 test "batch wire rejects a bad magic, version, truncated body and reserved keys" {

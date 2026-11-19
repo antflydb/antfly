@@ -2247,6 +2247,12 @@ pub const Owner = struct {
     // allowed to finish when shutdown cancels the remaining maintenance.
     allocator_verification_started: bool = false,
     allocator_verification_active: bool = false,
+    /// When this owner's last reuse proof walk ended. Until
+    /// `reuse_proof_backoff_ns` passes, an unverified pool allocates
+    /// append-only instead of walking the file again: a peer committing
+    /// continuously invalidates each proof, and walking on every write
+    /// starves this owner. Guarded by the gate.
+    last_reuse_proof_ns: i96 = 0,
     // Directory progress belongs to the path owner, not a serving generation.
     artifact_marker_sweep: @FieldType(NativeStore, "artifact_marker_sweep") = .{},
     reader_coordinator: *native.ReaderCoordinator = undefined,
@@ -4485,6 +4491,7 @@ pub const Owner = struct {
         const verified = reader.completeAllocatorVerification();
         const proof_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - proof_started));
         self.gate.mutex.lockUncancelable(io);
+        self.last_reuse_proof_ns = std.Io.Clock.awake.now(io).nanoseconds;
         self.publication_stats.allocator_proof_walks +|= 1;
         self.publication_stats.allocator_proof_ns +|= proof_ns;
         self.publication_stats.allocator_proof_max_ns = @max(self.publication_stats.allocator_proof_max_ns, proof_ns);
@@ -4526,6 +4533,14 @@ pub const Owner = struct {
                 try live.inheritAllocatorVerification(reader);
         }
         self.allocator_proof_receipt = null;
+    }
+
+    /// A reuse proof walk ended recently (`last_reuse_proof_ns`): allocate
+    /// append-only for now instead of proving again. Capacity-limited
+    /// stores still need their proof.
+    fn reuseProofBackoffActive(self: *Owner, root: *h.Handle) bool {
+        if (self.last_reuse_proof_ns == 0 or Connection.usesCapacityAdmission(root)) return false;
+        return std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds - self.last_reuse_proof_ns < Connection.reuse_proof_backoff_ns;
     }
 
     fn deinitMaintenanceSchedules(self: *Owner) void {
@@ -5070,8 +5085,11 @@ pub const Connection = struct {
                 // Another process may move the tip during the detached walk.
                 // Do not repeat whole-file proofs while holding this
                 // connection's admission queue. No transaction has started:
-                // refuse safely and let a later request prove the new tip.
-                if (try needsCapacityProof(root) or (intent == .mutation and try self.needsReuseAdmission(root))) return error.FileBusy;
+                // a capacity limit refuses safely and lets a later request
+                // prove the new tip. Page reuse is only an optimization:
+                // allocate append-only, and skip proofs for a while, rather
+                // than starve while a peer keeps writing.
+                if (try needsCapacityProof(root)) return error.FileBusy;
             }
         }
         self.current = root;
@@ -5125,9 +5143,13 @@ pub const Connection = struct {
         }
     }
 
+    const reuse_proof_backoff_ns: i96 = std.time.ns_per_s;
+
     fn needsReuseAdmission(self: *Connection, root: *h.Handle) !bool {
         const store = root.owned_lite_backend.?.native_docstore.?;
         if (store.file.free_pages_verified) return self.owner.allocator_verification_active;
+        // A recent proof was lost to a foreign commit: stay append-only.
+        if (self.owner.reuseProofBackoffActive(root)) return false;
         // This reads allocator metadata, not the live graph. Do not trust the
         // advertised pages for allocation until the detached proof checks them.
         // Waiting only for a nonempty pool avoids a graph scan on empty imports.

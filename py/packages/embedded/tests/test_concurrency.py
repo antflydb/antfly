@@ -741,6 +741,48 @@ def test_busy_index_in_another_process_does_not_starve_maintenance(tmp_path: Pat
     assert segments <= 4, (backlog, segments)
 
 
+def test_writes_proceed_while_a_peer_keeps_invalidating_allocator_proofs(tmp_path: Path) -> None:
+    # Each peer commit invalidates this process's page-reuse proof. Proving
+    # again before every write lost each proof to the next peer commit and
+    # ran out the busy timeout; writes now fall back to append-only.
+    path = tmp_path / "proof-churn.aflite"
+    stop = tmp_path / "stop"
+    progress = tmp_path / "progress"
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=30.0) as db:
+        db.create_table("busy", {})
+        db.open_table("busy").add_index({"name": "busy_text", "type": "full_text", "config_json": {"field": "a"}})
+        # The peer runs no background maintenance, so this process's
+        # reclamation keeps a reusable pool for its proofs to cover.
+        script = (
+            "import antfly_embedded as af, os, sys\n"
+            "db = af.open_with_options(sys.argv[1], af.OpenOptions(profile=af.Profile.HOSTED, no_sync=True, busy_timeout=30.0))\n"
+            "busy = db.open_table('busy'); n = 0\n"
+            "while not os.path.exists(sys.argv[2]):\n"
+            "    busy.batch_json({'inserts': {f'a{n % 4}': {'a': f'busydoc{n} ' + 'filler ' * 1000}}, 'sync_level': 'full_index'}); n += 1\n"
+            "    open(sys.argv[3] + '.tmp', 'w').write(str(n)); os.replace(sys.argv[3] + '.tmp', sys.argv[3])\n"
+            "db.close()"
+        )
+        peer = subprocess.Popen(
+            [sys.executable, "-c", script, str(path), str(stop), str(progress)], env=_child_environment()
+        )
+        try:
+            started = time.monotonic() + 60
+            while time.monotonic() < started and int((progress.read_text() if progress.exists() else "") or 0) < 20:
+                time.sleep(0.05)
+            slowest = 0.0
+            for i in range(120):
+                began = time.monotonic()
+                db.batch_json({"inserts": {f"b{i}": {"b": f"doc{i} " + "w " * 200}}, "sync_level": "full_index"})
+                slowest = max(slowest, time.monotonic() - began)
+            still_busy = peer.poll() is None
+        finally:
+            stop.touch()
+            peer.wait(timeout=60)
+    assert peer.returncode == 0
+    assert still_busy
+    assert slowest < 10, slowest
+
+
 def test_cross_process_overwrites_keep_full_text_deletes(tmp_path: Path) -> None:
     # Regression: overwrites from several processes, each waiting for
     # full-text visibility, lost earlier deletes. A writer rewrote a
