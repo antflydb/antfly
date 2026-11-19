@@ -21986,6 +21986,9 @@ pub fn fairWriterLockWithIo(allocator: Allocator, io: std.Io, wait_io: std.Io, p
 /// that call already jumps straight to a bare nonblocking kernel attempt
 /// when it finds the region unusable too, so there is nothing further
 /// for this function's own fallback to add.
+/// How long a try-only acquisition may spend repairing a dead writer.
+const stale_writer_recovery_budget_ns: i96 = 250 * std.time.ns_per_ms;
+
 pub fn tryFairWriterLockWithIo(allocator: Allocator, io: std.Io, path: []const u8) !PathWriterLock {
     const pid = antfly_platform.process.currentId() orelse 0;
     var region = shared_lock_region.Region.open(std.heap.page_allocator, io, path) catch |err| {
@@ -21993,8 +21996,17 @@ pub fn tryFairWriterLockWithIo(allocator: Allocator, io: std.Io, path: []const u
         return err;
     };
     if (!region.tryAcquireWriterFair(pid)) {
+        // A dead holder or a resolved head ticket never clears by itself,
+        // and a try-only caller (background maintenance) would otherwise
+        // keep deferring on an idle database. Escalate to a short bounded
+        // acquisition, which runs the recovery.
+        const stale = region.staleWriterState();
         region.close();
-        return error.WouldBlock;
+        if (!stale) return error.WouldBlock;
+        return fairWriterLockWithIo(allocator, io, io, path, std.Io.Clock.awake.now(io).nanoseconds + stale_writer_recovery_budget_ns) catch |err| switch (err) {
+            error.FileBusy => error.WouldBlock,
+            else => err,
+        };
     }
     errdefer region.close();
     errdefer region.releaseWriter();
@@ -22086,16 +22098,18 @@ fn sidecarWriterLockUntil(allocator: Allocator, io: std.Io, wait_io: std.Io, pat
                 };
             };
         }
-        if (cached) |c| {
-            // A real wake signal (or a short internal re-check step, not
-            // a dumb poll) on the region's own futex -- loop straight
-            // back to retry the real flock, no extra backoff on top of
-            // it.
+        // A real wake signal (or a short internal re-check step, not a
+        // dumb poll) on the region's own futex -- loop straight back to
+        // retry the real flock, no extra backoff on top of it. Only while
+        // the region names a writer: a flock-only writer or a sidecar
+        // reader leaves the word clear, so the wait would return at once
+        // and spin; that case joins the kernel's own wait queue below.
+        if (cached) |c| if (c.region.writerWordHeld()) {
             c.region.waitWriterFreeBounded(wait_io, .{ .nanoseconds = deadline_ns }) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
             };
             continue;
-        }
+        };
         if (waitPathLockWithIo(allocator, wait_io, path, true, deadline_ns)) |held| {
             var lease = held;
             lease.borrowed_io = io;
@@ -24886,6 +24900,65 @@ test "lite fair writer lock waits on the flock, not its own region word, after w
     var lease = try fairWriterLockWithIo(a, io, io, path, started + 5 * std.time.ns_per_s);
     lease.close();
     try std.testing.expect(std.Io.Clock.awake.now(io).nanoseconds - started < 2 * std.time.ns_per_s);
+}
+
+test "lite try-only fair writer lock recovers a dead holder instead of deferring" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "try-fair-dead-holder.aflite");
+    defer a.free(path);
+    var pool = std.Io.Threaded.init(a, .{ .concurrent_limit = .limited(4) });
+    defer pool.deinit();
+    const io = pool.io();
+    {
+        var file = try NativeFile.createWithIo(a, io, path, .{ .no_sync = true });
+        defer file.close();
+    }
+    var region = try shared_lock_region.Region.open(std.heap.page_allocator, io, path);
+    defer region.close();
+    region.markDeadWriterForTest(@as(u32, @bitCast(std.c.getpid())) +% 1);
+    try std.testing.expect(region.staleWriterState());
+    var lease = try tryFairWriterLockWithIo(a, io, path);
+    lease.close();
+    try std.testing.expect(!region.writerHolderDead());
+}
+
+test "lite sidecar wait joins the kernel queue when the region names no writer" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "sidecar-wait-no-holder.aflite");
+    defer a.free(path);
+    var pool = std.Io.Threaded.init(a, .{ .concurrent_limit = .limited(4) });
+    defer pool.deinit();
+    const io = pool.io();
+    {
+        var file = try NativeFile.createWithIo(a, io, path, .{ .no_sync = true });
+        defer file.close();
+    }
+    var region = try shared_lock_region.Region.open(std.heap.page_allocator, io, path);
+    defer region.close();
+    // A flock-only writer: the sidecar is held, the region word is clear.
+    var flock_only = try plainWriterLockUntil(a, io, io, path, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
+    defer flock_only.close();
+    try std.testing.expect(!region.writerWordHeld());
+    var before: std.c.rusage = undefined;
+    _ = std.c.getrusage(std.c.rusage.SELF, &before);
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    try std.testing.expectError(error.FileBusy, plainWriterLockUntil(a, io, io, path, started + 400 * std.time.ns_per_ms));
+    const wall_us = @divTrunc(std.Io.Clock.awake.now(io).nanoseconds - started, std.time.ns_per_us);
+    var after: std.c.rusage = undefined;
+    _ = std.c.getrusage(std.c.rusage.SELF, &after);
+    const Usage = struct {
+        fn micros(u: std.c.rusage) i64 {
+            return (@as(i64, @intCast(u.utime.sec)) + @as(i64, @intCast(u.stime.sec))) * std.time.us_per_s +
+                @as(i64, @intCast(u.utime.usec)) + @as(i64, @intCast(u.stime.usec));
+        }
+    };
+    const cpu_us = Usage.micros(after) - Usage.micros(before);
+    // Spinning on the region word burned the whole wait on CPU.
+    try std.testing.expect(cpu_us * 2 < @as(i64, @intCast(wall_us)));
 }
 
 test "lite fair writer lock grants contended writers in arrival order" {

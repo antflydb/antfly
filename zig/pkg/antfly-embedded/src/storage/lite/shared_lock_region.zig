@@ -783,6 +783,8 @@ pub const Region = struct {
     /// Test support: runs in `tryClaimTicket` between a competing claim's
     /// death probe and its published check.
     test_after_claim_death_probe: ?*const fn (*Region) void = null,
+    /// Test support: runs between a ticketless claim and its queue recheck.
+    test_after_ticketless_claim: ?*const fn (*Region) void = null,
     /// This handle's own reference into `fd_registry` -- this process's
     /// *shared* `FdEntry` for the region's inode (see
     /// `acquireProcessFd`'s own doc comment). Its `fd` is reused for
@@ -1433,7 +1435,7 @@ pub const Region = struct {
         // FIFO: only take the fast, ticketless path with nobody already
         // queued -- otherwise a new arrival could win the CAS ahead of an
         // earlier ticket already parked and waiting its turn.
-        if (hdr.writer_ticket_head.load(.monotonic) == @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))) and self.tryAcquireWriter(pid)) return;
+        if (self.tryAcquireWriterTicketless(pid)) return;
         // `rawFutexWaitShared`, not an uncancelable wait with no Io: see
         // this function's own module-level peers for why it takes none,
         // and `tryHelpDeadTicketAt`'s own doc comment for why phase 1
@@ -1484,9 +1486,37 @@ pub const Region = struct {
     /// ticket on failure, so there is nothing to abandon; a failed call
     /// leaves no trace.
     pub fn tryAcquireWriterFair(self: *Region, pid: u32) bool {
+        return self.tryAcquireWriterTicketless(pid);
+    }
+
+    /// Takes the writer word without a ticket, only while nobody is queued.
+    /// The queue is checked again after the claim: a ticket published
+    /// between the first check and the claim came first, so the word is
+    /// handed back to it rather than overtaking it.
+    fn tryAcquireWriterTicketless(self: *Region, pid: u32) bool {
         const hdr = self.header();
-        if (hdr.writer_ticket_head.load(.monotonic) != @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic)))) return false;
-        return self.tryAcquireWriter(pid);
+        if (hdr.writer_ticket_head.load(.acquire) != @as(u32, @truncate(hdr.writer_ticket_tail.load(.acquire)))) return false;
+        if (!self.tryAcquireWriter(pid)) return false;
+        if (comptime builtin.is_test) if (self.test_after_ticketless_claim) |hook| hook(self);
+        if (hdr.writer_ticket_head.load(.acquire) == @as(u32, @truncate(hdr.writer_ticket_tail.load(.acquire)))) return true;
+        self.releaseWriter();
+        return false;
+    }
+
+    /// Whether a writer that has died still holds the writer word, or a
+    /// resolved ticket sits at the head of the queue: state only a bounded
+    /// acquisition (`acquireWriterFairBounded`) repairs.
+    pub fn staleWriterState(self: *const Region) bool {
+        if (self.writerHolderDead()) return true;
+        const hdr = self.header();
+        const head = hdr.writer_ticket_head.load(.acquire);
+        if (head == @as(u32, @truncate(hdr.writer_ticket_tail.load(.acquire)))) return false;
+        return self.ticketResolvable(self.ticketSlots()[head % hdr.max_readers].load(.acquire), head);
+    }
+
+    /// Whether any writer holds the word, live or dead.
+    pub fn writerWordHeld(self: *const Region) bool {
+        return self.header().writer_holder.load(.acquire) != 0;
     }
 
     /// `true` when there is a ticket queued (regardless of whether it
@@ -1622,7 +1652,7 @@ pub const Region = struct {
     /// before running `recovery`.
     pub fn acquireWriterFairBounded(self: *Region, io: Io, pid: u32, deadline: Io.Timestamp, recovery: ?DeadWriterRecovery) !bool {
         const hdr = self.header();
-        if (hdr.writer_ticket_head.load(.monotonic) == @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))) and self.tryAcquireWriter(pid)) return false;
+        if (self.tryAcquireWriterTicketless(pid)) return false;
         const my_ticket: u32 = while (true) {
             const ring_head = hdr.writer_ticket_head.load(.acquire);
             if (!self.ringHasRoomAt(ring_head)) {
@@ -4151,6 +4181,31 @@ test "shared lock region: a stale claimant frees a dead claim that was never pub
     try std.testing.expectEqual(@as(?u32, null), region.tryClaimTicket(t, pid));
     try std.testing.expectEqual(@as(u128, 0), region.ticketSlots()[ticket % hdr.max_readers].load(.acquire));
     try std.testing.expectEqual(ticket, region.tryClaimTicket(t, pid).?);
+}
+
+test "shared lock region: a ticketless claim yields to a ticket published before it" {
+    var fixture = try TicketFixture.init("region-ticketless-yield.aflite");
+    defer fixture.deinit();
+    const region = &fixture.region;
+    const hdr = region.header();
+    const pid: u32 = @bitCast(std.c.getpid());
+    // The queue looked empty, then a waiter published its ticket before
+    // this caller's claim landed.
+    const Publish = struct {
+        var ticket: ?u32 = null;
+        fn run(r: *Region) void {
+            ticket = r.tryClaimTicket(r.header().writer_ticket_tail.load(.monotonic), @bitCast(std.c.getpid()));
+        }
+    };
+    region.test_after_ticketless_claim = Publish.run;
+    try std.testing.expect(!region.tryAcquireWriterFair(pid));
+    region.test_after_ticketless_claim = null;
+    try std.testing.expect(!region.writerWordHeld());
+    // The waiter, not the overtaker, takes the turn.
+    try std.testing.expect(region.tryAcquireWriter(pid));
+    region.finishTurn(Publish.ticket.?);
+    region.releaseWriter();
+    try std.testing.expectEqual(@as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))), hdr.writer_ticket_head.load(.monotonic));
 }
 
 test "shared lock region: the queue keeps admitting contended writers across the 32-bit head wrap" {
