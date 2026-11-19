@@ -2944,6 +2944,7 @@ const GuardedCatalog = struct {
     fn scan(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try self.checkTableRead(table);
+        if (system.isRoles(table)) return system.scanRole(alloc, request, try self.catalogRole());
         if (system.owns(table)) return system.scan(alloc, request);
         if (self.authority.importedSnapshot()) |snapshot| return self.scanPinned(alloc, snapshot, table, request);
         return self.native.vtable.scan(self.native.ptr, alloc, table, request);
@@ -3078,10 +3079,23 @@ const GuardedCatalog = struct {
             self.alloc.destroy(self);
         }
     };
+    fn catalogRole(self: *GuardedCatalog) !system.Role {
+        const identity = self.authority.identity.* orelse return error.Forbidden;
+        const can_replicate = for (identity.permissions) |permission| {
+            if (permission.resource_type != .table and permission.resource_type != .@"*") continue;
+            if (permission.deny_mutation or !permission.type.allows(.replicate)) continue;
+            if (try http.tablePermissionCurrentlyAllowed(identity, permission.resource, .replicate)) break true;
+        } else false;
+        return .{ .name = self.authority.credential.sessionPrincipal(), .replicate = can_replicate };
+    }
+    fn openSystemScan(self: *GuardedCatalog, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {
+        if (system.isRoles(table)) return system.openRole(alloc, request, try self.catalogRole());
+        return system.open(alloc, request);
+    }
     fn openScan(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try self.checkTableRead(table);
-        if (system.owns(table)) return try system.open(alloc, request);
+        if (system.owns(table)) return try self.openSystemScan(alloc, table, request);
         if (self.authority.importedSnapshot()) |snapshot| return try self.openPinned(alloc, snapshot, table, request);
         const open = self.native.vtable.open_scan orelse return null;
         const inner = (try open(self.native.ptr, alloc, table, request)) orelse return null;
@@ -3151,7 +3165,7 @@ const GuardedCatalog = struct {
             var opened: usize = 0;
             errdefer for (cursors[0..opened]) |cursor| cursor.close(cursor.ptr);
             for (scans, cursors) |selection, *cursor| {
-                cursor.* = try system.open(alloc, selection.request);
+                cursor.* = try self.openSystemScan(alloc, selection.table, selection.request);
                 opened += 1;
             }
             owner.* = .{ .alloc = alloc, .cursors = cursors };

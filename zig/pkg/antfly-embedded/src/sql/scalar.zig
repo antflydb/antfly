@@ -32,6 +32,24 @@ fn scopeField(name: []const u8) ?enum { database, principal } {
     return null;
 }
 
+/// Stable OID for the session's projected PostgreSQL role.
+pub fn postgresRoleOid(principal: []const u8) u32 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(principal, &digest, .{});
+    return 16384 + std.mem.readInt(u32, digest[0..4], .little) % (std.math.maxInt(u32) - 16384);
+}
+
+fn pgHasRole(name: []const u8) bool {
+    return std.mem.eql(u8, name, "pg_has_role");
+}
+
+fn validatePgHasRole(args: []const *const ast.Scalar) !void {
+    if (args.len != 3 or args[2].* != .literal or args[2].literal != .string) return error.SqlUndefinedFunction;
+    const mode = args[2].literal.string;
+    if (!std.ascii.eqlIgnoreCase(mode, "MEMBER") and !std.ascii.eqlIgnoreCase(mode, "USAGE") and !std.ascii.eqlIgnoreCase(mode, "SET"))
+        return error.SqlUndefinedFunction;
+}
+
 pub const PatternSet = struct {
     ptr: *anyopaque,
     count: usize,
@@ -2762,6 +2780,14 @@ const Binder = struct {
                     if (call.args.len != 0) return error.SqlUndefinedFunction;
                     break :blk .{ .kind = .string, .element_type = .text, .nullable = false };
                 }
+                if (pgHasRole(call.name)) {
+                    try validatePgHasRole(call.args);
+                    const user = try self.infer(call.args[0], depth + 1);
+                    const role = try self.infer(call.args[1], depth + 1);
+                    if ((user.kind != null and user.kind != .string) or (role.kind != null and role.kind != .string and role.kind != .integer))
+                        return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = .boolean, .element_type = .boolean, .nullable = user.nullable or role.nullable };
+                }
                 const function = try functionId(call.name);
                 try validateFunctionArity(function, call.args.len);
                 if (function == .value_identity or function == .is_missing) {
@@ -3232,6 +3258,21 @@ const Binder = struct {
                         .principal => view.scope.principal,
                     };
                     break :blk .{ .literal = .{ .string = try self.alloc.dupe(u8, value) } };
+                }
+                if (pgHasRole(call.name)) {
+                    const principal = if (self.allow_unresolved) "" else (self.settings orelse return error.SettingCatalogUnavailable).scope.principal;
+                    const role = try self.infer(call.args[1], depth + 1);
+                    const name_literal = try self.alloc.create(ast.Scalar);
+                    name_literal.* = .{ .literal = .{ .string = try self.alloc.dupe(u8, principal) } };
+                    const role_literal = try self.alloc.create(ast.Scalar);
+                    role_literal.* = if (role.kind == .integer) .{ .literal = .{ .integer = postgresRoleOid(principal) } } else name_literal.*;
+                    const is_user = try self.alloc.create(ast.Scalar);
+                    is_user.* = .{ .binary = .{ .op = .eq, .left = call.args[0], .right = name_literal } };
+                    const is_role = try self.alloc.create(ast.Scalar);
+                    is_role.* = .{ .binary = .{ .op = .eq, .left = call.args[1], .right = role_literal } };
+                    const membership = try self.alloc.create(ast.Scalar);
+                    membership.* = .{ .binary = .{ .op = .@"and", .left = is_user, .right = is_role } };
+                    return self.compile(membership, expected, depth + 1);
                 }
                 const function = try functionId(call.name);
                 if (function == .current_setting) {

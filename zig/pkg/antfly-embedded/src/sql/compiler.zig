@@ -540,7 +540,7 @@ const Parser = struct {
             const name_value = try self.alloc.dupe(u8, function.text);
             if (!function.owned) _ = std.ascii.lowerString(name_value, name_value);
             if (std.mem.startsWith(u8, name_value, "$")) return self.fail(error.UnsupportedSqlShape, "compiler-owned helper functions cannot be called from SQL");
-            if (std.mem.eql(u8, name_value, "current_setting") or std.mem.eql(u8, name_value, "current_database")) self.uses_current_setting = true;
+            if (std.mem.eql(u8, name_value, "current_setting") or std.mem.eql(u8, name_value, "current_database") or std.mem.eql(u8, name_value, "pg_has_role")) self.uses_current_setting = true;
             var args: std.ArrayList(*const ast.Scalar) = .empty;
             const distinct = self.keyword(.distinct);
             const star = self.take(.star);

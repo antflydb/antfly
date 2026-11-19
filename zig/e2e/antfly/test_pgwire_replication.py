@@ -141,17 +141,25 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                 "SELECT version(), current_user, current_database(), current_catalog",
                 "-c",
                 "SELECT oid, typname, typelem, typarray FROM pg_catalog.pg_type WHERE oid IN (23, 1007) ORDER BY oid",
+                "-c",
+                "SELECT oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolreplication FROM pg_roles WHERE pg_has_role('admin', oid, 'member')",
+                "-c",
+                "SELECT pg_has_role('other', oid, 'member') FROM pg_catalog.pg_roles",
             ],
             env=env,
             text=True,
             timeout=40,
         ).splitlines()
-        assert discovery == [
+        assert discovery[:4] == [
             "logical",
             "PostgreSQL 16.0 compatibility (Antfly)|admin|default|default",
             "23|int4|0|1007",
             "1007|_int4|23|0",
         ]
+        oid, *role = discovery[4].split("|")
+        assert int(oid) >= 16_384
+        assert role == ["admin", "f", "f", "f", "f", "t", "t"]
+        assert discovery[5:] == ["f"]
         sql("CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT)")
         if export_snapshot:
             sql("ALTER TABLE smoke REPLICA IDENTITY FULL")

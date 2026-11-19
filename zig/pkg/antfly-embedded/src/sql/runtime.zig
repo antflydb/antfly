@@ -2162,6 +2162,15 @@ test "SQL catalog identity uses the authorized statement scope" {
     try std.testing.expectEqualStrings("replicator", cells[0].string);
     try std.testing.expectEqualStrings("analytics", cells[1].string);
     try std.testing.expectEqualStrings("analytics", cells[2].string);
+
+    const membership_query = try std.fmt.allocPrint(alloc, "SELECT pg_has_role(current_user, {d}, 'MEMBER'), pg_has_role('other', 'replicator', 'USAGE'), pg_has_role(current_user, NULL, 'MEMBER')", .{@import("scalar.zig").postgresRoleOid("replicator")});
+    defer alloc.free(membership_query);
+    var membership = try compiler.compile(alloc, membership_query, .{});
+    defer membership.deinit();
+    try std.testing.expect(membership.uses_current_setting);
+    var memberships = try execute(alloc, backend, &membership, &.{}, .{});
+    defer memberships.deinit();
+    try std.testing.expectEqualDeep(@as([]const std.json.Value, &.{ .{ .bool = true }, .{ .bool = false }, .null }), memberships.output.rows[0]);
 }
 
 test "SQL NUMERIC insert literals preserve decimals at the mutation boundary" {

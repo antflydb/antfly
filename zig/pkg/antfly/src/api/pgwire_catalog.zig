@@ -23,12 +23,34 @@ const Element = local.sql_array_value.ElementType;
 const pg_type_name = "pg_type";
 const pg_type_storage = "\x00pg_catalog.pg_type";
 const pg_catalog_oid = 11;
+const pg_roles_storage = "\x00pg_catalog.pg_roles";
+pub const Role = struct {
+    name: []const u8,
+    replicate: bool,
+};
 
 pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?catalog.Table {
-    if (!std.mem.eql(u8, name.table, pg_type_name)) return null;
+    const roles = std.mem.eql(u8, name.table, "pg_roles");
+    if (!roles and !std.mem.eql(u8, name.table, pg_type_name)) return null;
     if (name.namespace) |namespace| if (!std.mem.eql(u8, namespace, "pg_catalog")) return null;
     if (name.database) |qualified| if (!std.mem.eql(u8, qualified, database)) return error.Forbidden;
     if (action != .read) return error.SqlReadOnlyTransaction;
+    if (roles) return .{
+        .id = 12000,
+        .physical_name = pg_roles_storage,
+        .schema_version = 1,
+        .scope = .{ .database = database, .namespace = "pg_catalog", .name = "pg_roles", .revision = 1 },
+        .columns = &.{
+            .{ .name = "oid", .path = "oid", .type = .integer, .nullable = false },
+            .{ .name = "rolname", .path = "rolname", .type = .string, .nullable = false },
+            .{ .name = "rolsuper", .path = "rolsuper", .type = .boolean, .nullable = false },
+            .{ .name = "rolinherit", .path = "rolinherit", .type = .boolean, .nullable = false },
+            .{ .name = "rolcreaterole", .path = "rolcreaterole", .type = .boolean, .nullable = false },
+            .{ .name = "rolcreatedb", .path = "rolcreatedb", .type = .boolean, .nullable = false },
+            .{ .name = "rolcanlogin", .path = "rolcanlogin", .type = .boolean, .nullable = false },
+            .{ .name = "rolreplication", .path = "rolreplication", .type = .boolean, .nullable = false },
+        },
+    };
     return .{
         .id = 1247, // PostgreSQL's pg_type relation OID.
         .physical_name = pg_type_storage,
@@ -52,7 +74,58 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
 }
 
 pub fn owns(table: catalog.Table) bool {
-    return std.mem.eql(u8, table.physical_name, pg_type_storage);
+    return std.mem.eql(u8, table.physical_name, pg_type_storage) or isRoles(table);
+}
+
+pub fn isRoles(table: catalog.Table) bool {
+    return std.mem.eql(u8, table.physical_name, pg_roles_storage);
+}
+
+const roleOid = local.sql_scalar.postgresRoleOid;
+
+fn rolePage(a: std.mem.Allocator, role: Role, done: bool) !catalog.Page {
+    if (done) return .{ .rows = &.{} };
+    var arena = std.heap.ArenaAllocator.init(a);
+    errdefer arena.deinit();
+    const owned = arena.allocator();
+    var value: std.json.ObjectMap = .empty;
+    try value.put(owned, "oid", .{ .integer = roleOid(role.name) });
+    try value.put(owned, "rolname", .{ .string = try owned.dupe(u8, role.name) });
+    inline for (.{ "rolsuper", "rolinherit", "rolcreaterole", "rolcreatedb", "rolcanlogin" }) |flag| {
+        try value.put(owned, flag, .{ .bool = std.mem.eql(u8, flag, "rolcanlogin") });
+    }
+    try value.put(owned, "rolreplication", .{ .bool = role.replicate });
+    const rows = try owned.dupe(catalog.Row, &.{.{ .id = try std.fmt.allocPrint(owned, "{d}", .{roleOid(role.name)}), .version = 1, .value = .{ .object = value } }});
+    return .{ .rows = rows, .owned_arena = arena };
+}
+
+pub fn scanRole(a: std.mem.Allocator, request: catalog.Scan, role: Role) !catalog.Page {
+    if (request.search != null or request.after != null) return error.UnsupportedSqlShape;
+    return rolePage(a, role, false);
+}
+
+pub fn openRole(a: std.mem.Allocator, request: catalog.Scan, role: Role) !catalog.Cursor {
+    if (request.search != null or request.after != null) return error.UnsupportedSqlShape;
+    const RoleCursor = struct {
+        allocator: std.mem.Allocator,
+        role: Role,
+        done: bool = false,
+        fn next(raw: *anyopaque, alloc: std.mem.Allocator, _: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const result = try rolePage(alloc, self.role, self.done);
+            self.done = true;
+            return result;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.allocator.free(self.role.name);
+            self.allocator.destroy(self);
+        }
+    };
+    const cursor = try a.create(RoleCursor);
+    errdefer a.destroy(cursor);
+    cursor.* = .{ .allocator = a, .role = .{ .name = try a.dupe(u8, role.name), .replicate = role.replicate } };
+    return .{ .ptr = cursor, .next = RoleCursor.next, .close = RoleCursor.close, .estimated_rows = 1 };
 }
 
 const Type = struct {
@@ -192,4 +265,24 @@ test "pgwire pg_type reflects the scalar and array wire OIDs" {
         }
     }
     return error.TestExpectedArrayType;
+}
+
+test "pgwire pg_roles describes only the supplied authenticated role" {
+    const a = std.testing.allocator;
+    const projected = (try resolve(.{ .namespace = "pg_catalog", .table = "pg_roles" }, .read, "default")).?;
+    try std.testing.expect(isRoles(projected));
+    try std.testing.expectError(error.SqlReadOnlyTransaction, resolve(.{ .table = "pg_roles" }, .write, "default"));
+    const request: catalog.Scan = .{ .fields = &.{}, .limit = 1 };
+    var cursor = try openRole(a, request, .{ .name = "reader", .replicate = false });
+    defer cursor.close(cursor.ptr);
+    var first = try cursor.next(cursor.ptr, a, 1);
+    defer first.deinit();
+    const fields = first.rows[0].value.object;
+    try std.testing.expectEqualStrings("reader", fields.get("rolname").?.string);
+    try std.testing.expectEqual(@as(i64, roleOid("reader")), fields.get("oid").?.integer);
+    try std.testing.expect(!fields.get("rolreplication").?.bool);
+    try std.testing.expect(!fields.get("rolsuper").?.bool);
+    var exhausted = try cursor.next(cursor.ptr, a, 1);
+    defer exhausted.deinit();
+    try std.testing.expectEqual(@as(usize, 0), exhausted.rows.len);
 }
