@@ -65,8 +65,10 @@ The private ordered source-fence command commits acquisition, release, scan
 initialization, takeover, or a bounded scan page with its apply receipt. It
 rejects delayed acquisitions for released attempts and checks the full fence
 identity before staging scan work. An owner takeover preserves the pinned scan
-cursor and fences subsequent proposals from the old owner. A private native
-lookup returns the current owner epoch and cursor from one storage snapshot.
+cursor and fences subsequent proposals from the old owner. Pages advance in
+physical source order, can contain no relationships, and cannot replace a
+contribution imported by an earlier page. A private native lookup returns the
+current owner epoch and cursor from one storage snapshot.
 The hosted caller must establish the owner read barrier before the lookup.
 An active source fence allows an ordered catalog change only when activation
 proofs match its pinned snapshot. Raft protocol version 31 gates these commands,

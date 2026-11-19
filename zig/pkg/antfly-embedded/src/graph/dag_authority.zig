@@ -89,6 +89,7 @@ pub const SourceFenceCommand = struct {
 
     pub const Page = struct {
         after: ?[]const u8 = null,
+        next: []const u8,
         replacements: []const Contributions.Replacement,
     };
 
@@ -120,7 +121,7 @@ pub const SourceFenceCommand = struct {
             };
             var budget: @import("dag_validation.zig").Budget = .{ .clock = .{ .context = txn, .now = ScanClock.now } };
             var witness: @import("dag_validation.zig").Witness = .{};
-            try Contributions.seedActivationPage(alloc, txn, scan.domain, scan.owner_epoch, self.fence.snapshot, page.after, page.replacements, &budget, &witness);
+            try Contributions.seedActivationPage(alloc, txn, scan.domain, scan.owner_epoch, self.fence.snapshot, page.after, page.next, page.replacements, &budget, &witness);
             return;
         }
         Storage.create(txn, scan.domain, scan.owner_epoch) catch |err| {
@@ -158,7 +159,7 @@ pub const SourceFenceCommand = struct {
                     return error.InvalidBatchRequest;
             }
             if (scan.page) |page| {
-                if (page.replacements.len == 0) return error.InvalidBatchRequest;
+                if (page.next.len == 0) return error.InvalidBatchRequest;
             }
         }
         const empty: @TypeOf(req) = .{};
@@ -1020,7 +1021,7 @@ pub const Contributions = struct {
         membership: []const Membership.Update,
     };
 
-    fn plan(alloc: A, txn: anytype, id: Digest, replacements: []const Replacement, budget: *validation.Budget) !Plan {
+    fn plan(alloc: A, txn: anytype, id: Digest, replacements: []const Replacement, mode: enum { activation, mutation }, budget: *validation.Budget) !Plan {
         var changes: std.ArrayList(validation.Change) = .empty;
         var previous: ?Replacement = null;
         for (replacements) |replacement| {
@@ -1041,10 +1042,13 @@ pub const Contributions = struct {
             }
             const storage_key = try key(alloc, id, replacement);
             defer alloc.free(storage_key);
-            const stored = txn.get(storage_key) catch |err| blk: {
+            if (mode == .activation and replacement.targets.len == 0) return error.InvalidDagMutation;
+            const existing: ?[]const u8 = txn.get(storage_key) catch |err| blk: {
                 if (err != error.NotFound) return err;
-                break :blk "";
+                break :blk null;
             };
+            if (mode == .activation and existing != null) return error.InvalidDagMutation;
+            const stored = existing orelse "";
             try budget.consume(.bytes, stored.len);
             // Storage values may be invalidated by subsequent reads.
             var remaining: []const u8 = try alloc.dupe(u8, stored);
@@ -1126,9 +1130,9 @@ pub const Contributions = struct {
     }
 
     /// The catalog must fence writes and pin the authoritative contribution
-    /// snapshot before invoking this function. The cursor is the concatenation
-    /// of the last owner digest and source. Each page commits atomically with
-    /// its new cursor and is checked against every previous accepted page.
+    /// snapshot before invoking this function. The scanner supplies a strictly
+    /// increasing cursor in source order, including the root order for multi-root
+    /// scans. Contribution identities need only be sorted within the page.
     pub fn seedActivationPage(
         alloc: A,
         txn: anytype,
@@ -1136,6 +1140,7 @@ pub const Contributions = struct {
         epoch: u64,
         snapshot: Digest,
         expected_after: ?[]const u8,
+        next: []const u8,
         replacements: []const Replacement,
         budget: *validation.Budget,
         witness: *validation.Witness,
@@ -1143,15 +1148,14 @@ pub const Contributions = struct {
         _ = try activationState(txn, id, epoch);
         try SourceFence.requireSnapshot(txn, snapshot);
         try requireActivationCursor(txn, id, snapshot, expected_after);
-        if (replacements.len == 0) return error.InvalidDagMutation;
-        const first = replacements[0];
+        if (next.len == 0) return error.InvalidDagMutation;
         if (expected_after) |after| {
-            const owner_order = std.mem.order(u8, after[0..@sizeOf(Digest)], &first.owner);
-            if (owner_order == .gt or (owner_order == .eq and
-                std.mem.order(u8, after[@sizeOf(Digest)..], first.source) != .lt)) return error.InvalidDagMutation;
+            if (std.mem.order(u8, after, next) != .lt) return error.InvalidDagMutation;
+            try budget.consume(.bytes, after.len);
         }
+        try budget.consume(.bytes, next.len);
         var memory: validation.Memory = .{ .parent = alloc, .budget = budget };
-        seedPage(memory.allocator(), txn, id, snapshot, replacements, budget, witness) catch |err| {
+        seedPage(memory.allocator(), txn, id, snapshot, next, replacements, budget, witness) catch |err| {
             if (err == error.OutOfMemory and memory.denied) {
                 budget.exhausted = .memory;
                 return error.GraphConstraintCapacity;
@@ -1160,17 +1164,16 @@ pub const Contributions = struct {
         };
     }
 
-    fn seedPage(alloc: A, txn: anytype, id: Digest, snapshot: Digest, replacements: []const Replacement, budget: *validation.Budget, witness: *validation.Witness) !void {
+    fn seedPage(alloc: A, txn: anytype, id: Digest, snapshot: Digest, next: []const u8, replacements: []const Replacement, budget: *validation.Budget, witness: *validation.Witness) !void {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
-        const delta = try plan(arena.allocator(), txn, id, replacements, budget);
+        const delta = try plan(arena.allocator(), txn, id, replacements, .activation, budget);
         const reader: Adjacency.Reader(@TypeOf(txn)) = .{ .txn = txn, .domain_id = id };
         try validation.validate(alloc, reader, delta.adjacency, budget, witness);
         try Adjacency.stage(alloc, txn, id, delta.adjacency);
         try Membership.stage(alloc, txn, id, delta.membership);
         try stageManifests(alloc, txn, id, replacements);
-        const last = replacements[replacements.len - 1];
-        const progress = try std.mem.concat(alloc, u8, &.{ &snapshot, &last.owner, last.source });
+        const progress = try std.mem.concat(alloc, u8, &.{ &snapshot, next });
         defer alloc.free(progress);
         try txn.put(&activationKey(id), progress);
     }
@@ -1220,7 +1223,7 @@ pub const Contributions = struct {
             return err;
         };
         const width = @sizeOf(Digest);
-        if (raw.len != width and raw.len < 2 * width) return error.InvalidDagAuthority;
+        if (raw.len < width) return error.InvalidDagAuthority;
         return .{ .snapshot = raw[0..width].*, .after = if (raw.len == width) null else raw[width..] };
     }
 
@@ -1295,7 +1298,7 @@ pub const Contributions = struct {
         const bounded = memory.allocator();
         var arena = std.heap.ArenaAllocator.init(bounded);
         defer arena.deinit();
-        const delta = plan(arena.allocator(), txn, token.domain, replacements, budget) catch |err| {
+        const delta = plan(arena.allocator(), txn, token.domain, replacements, .mutation, budget) catch |err| {
             if (err == error.OutOfMemory and memory.denied) {
                 budget.exhausted = .memory;
                 return error.GraphConstraintCapacity;
@@ -1330,7 +1333,7 @@ pub const Contributions = struct {
             .limits = .{ .edges = std.math.maxInt(usize), .bytes = std.math.maxInt(usize), .requests = std.math.maxInt(usize) },
             .clock = .{ .context = &arena, .now = replayTime },
         };
-        const delta = try plan(arena.allocator(), txn, token.domain, replacements, &replay_budget);
+        const delta = try plan(arena.allocator(), txn, token.domain, replacements, .mutation, &replay_budget);
         const receipt = try Storage.accept(alloc, txn, token, delta.adjacency, delta.membership);
         try stageManifests(alloc, txn, token.domain, replacements);
         return receipt;
@@ -1752,7 +1755,7 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     try fence.acquire(&txn);
     var budget: Contributions.validation.Budget = .{ .clock = .{ .now = Txn.now, .context = &txn } };
     var witness: Contributions.validation.Witness = .{};
-    try std.testing.expectError(error.GraphConstraintNotReady, Contributions.seedActivationPage(alloc, &txn, existing_id, 1, versions, null, &initial, &budget, &witness));
+    try std.testing.expectError(error.GraphConstraintNotReady, Contributions.seedActivationPage(alloc, &txn, existing_id, 1, versions, null, "source:3", &initial, &budget, &witness));
     try std.testing.expect((try Contributions.scanCheckpoint(alloc, &txn, existing_id, fence)) == null);
     try Contributions.beginActivation(&txn, existing_id, 1, versions);
     try Contributions.beginActivation(&txn, existing_id, 1, versions);
@@ -1763,7 +1766,7 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     defer before_first_page.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), before_first_page.owner_epoch);
     try std.testing.expect(before_first_page.after == null);
-    try Contributions.seedActivationPage(alloc, &txn, existing_id, 1, versions, null, &initial, &budget, &witness);
+    try Contributions.seedActivationPage(alloc, &txn, existing_id, 1, versions, null, "source:3", &initial, &budget, &witness);
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, existing_id, 1));
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.begin(&txn, existing_id, 1, 0, testAttempt(7)));
     const takeover: SourceFenceCommand = .{
@@ -1787,12 +1790,15 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     const cycle: []const Contributions.Replacement = &.{
         .{ .owner = @splat(1), .source = "b", .targets = &.{"a"} },
     };
-    try std.testing.expectError(error.GraphConstraintOwnerChanged, Contributions.seedActivationPage(alloc, &txn, existing_id, 1, versions, first_cursor, cycle, &budget, &witness));
-    try std.testing.expectError(error.GraphCycle, Contributions.seedActivationPage(alloc, &txn, existing_id, 2, versions, first_cursor, cycle, &budget, &witness));
+    try std.testing.expectError(error.GraphConstraintOwnerChanged, Contributions.seedActivationPage(alloc, &txn, existing_id, 1, versions, first_cursor, "source:4", cycle, &budget, &witness));
+    try std.testing.expectError(error.GraphCycle, Contributions.seedActivationPage(alloc, &txn, existing_id, 2, versions, first_cursor, "source:4", cycle, &budget, &witness));
     const valid_page: []const Contributions.Replacement = &.{
-        .{ .owner = @splat(1), .source = "b", .targets = &.{"c"} },
+        .{ .owner = @splat(0), .source = "b", .targets = &.{"c"} },
     };
-    try Contributions.seedActivationPage(alloc, &txn, existing_id, 2, versions, first_cursor, valid_page, &budget, &witness);
+    try std.testing.expectError(error.InvalidDagMutation, Contributions.seedActivationPage(alloc, &txn, existing_id, 2, versions, first_cursor, first_cursor, &.{}, &budget, &witness));
+    try std.testing.expectError(error.InvalidDagMutation, Contributions.seedActivationPage(alloc, &txn, existing_id, 2, versions, first_cursor, "source:4", &initial, &budget, &witness));
+    try Contributions.seedActivationPage(alloc, &txn, existing_id, 2, versions, first_cursor, "source:4", valid_page, &budget, &witness);
+    try Contributions.seedActivationPage(alloc, &txn, existing_id, 2, versions, "source:4", "source:5", &.{}, &budget, &witness);
     try std.testing.expectError(error.GraphConstraintRevisionChanged, Contributions.finishActivation(&txn, existing_id, 2, versions, first_cursor));
     const last_cursor = (try Contributions.activationCursor(alloc, &txn, existing_id, 2, versions)).?;
     defer alloc.free(last_cursor);

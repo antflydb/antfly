@@ -156045,19 +156045,20 @@ test "db ordered DAG source fence persists with the apply receipt" {
     request.dag_source_fence.?.scan = .{ .domain = domain, .owner_epoch = 1 };
     try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 2 }, true);
     const owner: dag.Digest = @splat(6);
-    request.dag_source_fence.?.scan.?.page = .{ .replacements = &.{.{ .owner = owner, .source = "a", .targets = &.{"b"} }} };
+    request.dag_source_fence.?.scan.?.page = .{ .next = "source:a", .replacements = &.{.{ .owner = owner, .source = "a", .targets = &.{"b"} }} };
     try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 3 }, true);
     try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 3 }, true);
-    const cursor = owner ++ "a".*;
+    const cursor = "source:a";
     request.dag_source_fence.?.scan.?.page = .{
-        .after = &cursor,
+        .after = cursor,
+        .next = "source:b",
         .replacements = &.{.{ .owner = owner, .source = "b", .targets = &.{"a"} }},
     };
     try std.testing.expectError(error.GraphCycle, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 4 }, true));
     const checkpoint = (try db.dagActivationCheckpoint(a, request.dag_source_fence.?.namespace, domain, fence)).?;
     defer checkpoint.deinit(a);
     try std.testing.expectEqual(@as(u64, 1), checkpoint.owner_epoch);
-    try std.testing.expectEqualSlices(u8, &cursor, checkpoint.after.?);
+    try std.testing.expectEqualSlices(u8, cursor, checkpoint.after.?);
     const lookup_control = try std.json.Stringify.valueAlloc(a, .{
         .mode = @as(enum { dag_activation_checkpoint }, .dag_activation_checkpoint),
         .dag_scan = .{ .namespace = request.dag_source_fence.?.namespace, .domain = domain, .fence = fence },
