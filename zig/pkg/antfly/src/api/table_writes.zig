@@ -117,20 +117,20 @@ fn resolveCatalogGroupsEventually(
     timeout_ns: u64,
     poll_interval_ms: u64,
 ) ![]u64 {
-    return try resolveCatalogGroupsFencedEventually(alloc, catalog, table_name, from_key, to_key, timeout_ns, poll_interval_ms, null);
+    const deadline_ns = catalog.budget(null).nowNs() +| timeout_ns;
+    return try resolveCatalogGroupsFencedUntil(alloc, catalog, table_name, from_key, to_key, deadline_ns, poll_interval_ms, null);
 }
 
-fn resolveCatalogGroupsFencedEventually(
+fn resolveCatalogGroupsFencedUntil(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
     table_name: []const u8,
     from_key: []const u8,
     to_key: []const u8,
-    timeout_ns: u64,
+    deadline_ns: u64,
     poll_interval_ms: u64,
     routing_fence: ?*u64,
 ) ![]u64 {
-    const deadline_ns = catalog.budget(null).nowNs() +| timeout_ns;
     const budget = catalog.budget(deadline_ns);
     return switch (try table_catalog.resolveGroupsForSpanEventuallyUntil(
         alloc,
@@ -1045,16 +1045,18 @@ fn resolveArtifactRepairRouting(
     table_name: []const u8,
     selection: ArtifactRepairRouteSelection,
 ) !ArtifactRepairRouting {
-    const timeout_ns = 5 * std.time.ns_per_s;
+    const deadline_ns = catalog.budget(null).nowNs() +| 5 * std.time.ns_per_s;
+    const budget = catalog.budget(deadline_ns);
     if (selection != .all) {
-        if (catalog.vtable.acquire_routing_generation) |acquire| {
-            const budget = catalog.budget(catalog.budget(null).nowNs() +| timeout_ns);
-            // The remote route authority normally supplies the full span.
-            // Preserve its read barrier while reusing the retained indexes.
-            const authoritative = catalog.vtable.await_route != null;
-            const generation = try acquire(catalog.ptr, budget, authoritative);
-            var session = generation.session(alloc, catalog, authoritative);
-            defer session.deinit();
+        const generation: ?*table_catalog.RoutingGeneration = if (catalog.vtable.acquire_table_routing_generation) |acquire|
+            try acquire(catalog.ptr, table_name, budget)
+        else if (catalog.vtable.await_route == null and catalog.vtable.acquire_routing_generation != null)
+            try catalog.vtable.acquire_routing_generation.?(catalog.ptr, budget, false)
+        else
+            null;
+        if (generation) |retained| {
+            defer retained.release();
+            const session = &retained.indexed;
             if (try session.repairRoutingView(table_name, budget)) |view| {
                 const group_ids: []u64 = switch (selection) {
                     .group => |group_id| blk: {
@@ -1074,7 +1076,7 @@ fn resolveArtifactRepairRouting(
     // Keep the standard publication wait for a missing table and for
     // catalog sources without a retained routing generation.
     var fence: u64 = 0;
-    const ids = try resolveCatalogGroupsFencedEventually(alloc, catalog, table_name, "", "", timeout_ns, 10, &fence);
+    const ids = try resolveCatalogGroupsFencedUntil(alloc, catalog, table_name, "", "", deadline_ns, 10, &fence);
     if (selection == .all) return .{ .group_ids = ids, .fence = if (ids.len != 0) fence else null };
     defer alloc.free(ids);
     return .{
@@ -61241,7 +61243,7 @@ fn implementationTests() type {
                     return .{
                         .ptr = routing,
                         .vtable = &.{
-                            .acquire_routing_generation = if (scenario == .parked_documents) acquireGeneration else null,
+                            .acquire_table_routing_generation = if (scenario == .parked_documents) acquireGeneration else null,
                             .admin_snapshot = adminSnapshot,
                             .free_admin_snapshot = freeAdminSnapshot,
                             .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
@@ -61251,7 +61253,8 @@ fn implementationTests() type {
                     };
                 }
 
-                fn acquireGeneration(ptr: *anyopaque, _: table_catalog.RoutingBudget, _: bool) !*table_catalog.RoutingGeneration {
+                fn acquireGeneration(ptr: *anyopaque, table_name: []const u8, _: table_catalog.RoutingBudget) !*table_catalog.RoutingGeneration {
+                    try std.testing.expectEqualStrings("docs", table_name);
                     const routing: *table_catalog.RoutingGeneration = @ptrCast(@alignCast(ptr));
                     routing.retain();
                     return routing;

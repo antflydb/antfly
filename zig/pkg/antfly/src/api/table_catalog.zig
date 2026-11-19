@@ -105,6 +105,9 @@ pub const CatalogSource = struct {
         /// owned by the caller. Authoritative captures must still cross the
         /// source's read barrier; an eventual cache hit never proves absence.
         acquire_routing_generation: ?*const fn (ptr: *anyopaque, budget: RoutingBudget, authoritative: bool) anyerror!*RoutingGeneration = null,
+        /// An authoritative retained generation for one table. Remote sources
+        /// refresh through table-scoped metadata reads on a cache miss.
+        acquire_table_routing_generation: ?*const fn (ptr: *anyopaque, table_name: []const u8, budget: RoutingBudget) anyerror!*RoutingGeneration = null,
         /// Allocation-efficient point projection used by mutation routing.
         /// It returns the same owned wire type with zero or one table.
         table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
