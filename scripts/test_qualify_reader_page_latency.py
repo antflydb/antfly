@@ -16,10 +16,15 @@
 """Fail-closed reference contracts for private OCR performance qualification."""
 
 import hashlib
+import contextlib
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
+
+import qualify_reader_page_latency as qualifier
 
 from qualify_reader_page_latency import (
     image_request_payload,
@@ -28,6 +33,86 @@ from qualify_reader_page_latency import (
     reference_expectations,
     response_texts_and_statuses,
 )
+
+
+class WarmupCaptureTests(unittest.TestCase):
+    def capture(self, warmup_status):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = b"hash-verified test fixture"
+            (root / "page.png").write_bytes(image)
+            (root / "manifest.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "test-page",
+                            "image": "page.png",
+                            "image_sha256": hashlib.sha256(image).hexdigest(),
+                        }
+                    ]
+                )
+            )
+            (root / "expectations.json").write_text(
+                json.dumps({"cases": {"test-page": ["tail"]}})
+            )
+            calls = []
+
+            def response(*args, **kwargs):
+                status = warmup_status if not calls else "completed"
+                calls.append(status)
+                result = mock.MagicMock()
+                result.status = 200
+                result.read.return_value = json.dumps(
+                    {"data": [{"text": "complete tail", "status": status}]}
+                ).encode()
+                result.__enter__.return_value = result
+                return result
+
+            argv = [
+                "qualifier",
+                "--url",
+                "http://unused.test/ai/v1/read",
+                "--model",
+                "test",
+                "--fixtures",
+                directory,
+                "--pages",
+                "test-page",
+                "--warmup-rounds",
+                "1",
+                "--rounds",
+                "2",
+                "--output",
+                str(root / "receipt.json"),
+            ]
+            with (
+                mock.patch("sys.argv", argv),
+                mock.patch.object(
+                    qualifier.urllib.request, "urlopen", side_effect=response
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaises(SystemExit) as exit:
+                    qualifier.main()
+            return (
+                exit.exception.code,
+                json.loads((root / "receipt.json").read_text()),
+                calls,
+            )
+
+    def test_warmup_is_excluded_from_measured_cohorts(self):
+        code, receipt, calls = self.capture("completed")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(receipt["warmup_observations"]), 1)
+        self.assertEqual(len(receipt["observations"]), 2)
+        self.assertTrue(receipt["passed"])
+
+    def test_incomplete_warmup_still_fails_correctness(self):
+        code, receipt, calls = self.capture("truncated")
+        self.assertEqual(code, 1)
+        self.assertEqual(calls, ["truncated", "completed", "completed"])
+        self.assertFalse(receipt["passed"])
 
 
 class ReaderWireTests(unittest.TestCase):

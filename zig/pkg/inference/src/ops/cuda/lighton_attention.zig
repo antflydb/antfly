@@ -95,6 +95,56 @@ comptime {
         @compileError("LightOn CUDA attention packet ABI changed");
 }
 
+/// Group four query heads only when the active KV chunks can populate at
+/// least four waves of the device's SMs. Row count alone misses long small
+/// cohorts and over-groups short wider cohorts. Reserved future chunks are
+/// excluded: their empty launches cannot hide the grouped kernel's latency.
+/// Unknown device capacity retains the ordinary split-attention kernel.
+pub fn useGrouped(params: *const Params, chunk128: bool, multiprocessors: usize) bool {
+    if (multiprocessors == 0 or multiprocessors > 1024 or params.items == 0 or params.items > params.pages.len or params.chunks == 0) return false;
+    if (!((params.heads == 8 and params.kv_heads == 2 and !chunk128) or
+        (params.heads == 16 and params.kv_heads == 4 and chunk128))) return false;
+    const chunk: u32 = if (chunk128) 128 else 32;
+    var active_blocks: u64 = 0;
+    for (params.pages[0..params.items]) |page| {
+        if (page.tokens == 0) return false;
+        active_blocks += @as(u64, params.kv_heads) * @min(params.chunks, 1 + (page.tokens - 1) / chunk);
+    }
+    return active_blocks >= 4 * @as(u64, @intCast(multiprocessors));
+}
+
+test "LightOnOCR3 grouped attention follows active chunks and device capacity" {
+    var params = Params{ .heads = 16, .kv_heads = 4, .items = 4, .chunks = 31 };
+    for (&params.pages) |*page| page.tokens = 1914;
+    try std.testing.expect(useGrouped(&params, true, 48));
+    try std.testing.expect(!useGrouped(&params, true, 108));
+    try std.testing.expect(!useGrouped(&params, true, 0));
+    params.items = 2;
+    try std.testing.expect(!useGrouped(&params, true, 48));
+    params.items = 16;
+    for (&params.pages) |*page| page.tokens = 256;
+    // Future reservations do not turn empty work into useful occupancy.
+    try std.testing.expect(!useGrouped(&params, true, 48));
+    params.items = 32;
+    try std.testing.expect(useGrouped(&params, true, 48));
+    params.heads = 8;
+    params.kv_heads = 2;
+    params.items = 8;
+    params.chunks = 124;
+    try std.testing.expect(!useGrouped(&params, false, 48));
+    params.items = 16;
+    try std.testing.expect(useGrouped(&params, false, 48));
+    params.items = 2;
+    for (&params.pages) |*page| page.tokens = 1914;
+    try std.testing.expect(useGrouped(&params, false, 48));
+    try std.testing.expect(!useGrouped(&params, true, 48));
+    params.kv_heads = 1;
+    try std.testing.expect(!useGrouped(&params, false, 48));
+    params.kv_heads = 2;
+    params.pages[1].tokens = 0;
+    try std.testing.expect(!useGrouped(&params, false, 48));
+}
+
 pub const Module = struct {
     module: driver.CUmodule = null,
     functions: [7]driver.CUfunction = @splat(null),
@@ -102,6 +152,8 @@ pub const Module = struct {
     suffix_write_calls: usize = 0,
     chunk128_calls: usize = 0,
     items: usize = 0,
+    grouped_calls: usize = 0,
+    multiprocessors: usize = 0,
 
     pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
         if (self.module != null) {
@@ -120,6 +172,11 @@ pub const Module = struct {
         var functions: [7]driver.CUfunction = @splat(null);
         inline for (.{ "lighton_attention_chunks", "lighton_attention_combine", "lighton_attention_write_suffix", "lighton_attention_chunks128", "lighton_graph_advance", "lighton_attention_grouped_chunks32", "lighton_attention_grouped_chunks128" }, 0..) |name, i|
             try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&functions[i], module, name));
+        var multiprocessors: c_int = 0;
+        if (ctx.driver.fns.cuDeviceGetAttribute) |attribute| {
+            if (attribute(&multiprocessors, 16, ctx.device) != driver.CUDA_SUCCESS) multiprocessors = 0;
+        }
+        self.multiprocessors = if (multiprocessors > 0) @intCast(multiprocessors) else 0;
         self.module = module;
         self.functions = functions;
     }
@@ -140,17 +197,14 @@ pub const Module = struct {
     }
     pub fn run(self: *Module, ctx: *context.CudaContext, params: *Params, chunk128: bool) !void {
         var args = [_]?*anyopaque{@ptrCast(params)};
-        // Small cohorts need more independent CTAs for occupancy. These
-        // two grouped ranges are selected from complete-operation timings;
-        // operator overrides retain the original F32 kernel elsewhere.
-        const grouped = (params.heads == 8 and !chunk128 and params.items >= 8) or
-            (params.heads == 16 and chunk128 and params.items >= 16);
+        const grouped = useGrouped(params, chunk128, self.multiprocessors);
         const function = self.functions[if (grouped) (if (chunk128) @as(usize, 6) else 5) else if (chunk128) 3 else 0];
         try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(function, if (grouped) params.kv_heads else params.heads, params.items * params.chunks, 1, 128, 1, 1, 0, ctx.stream, &args, null));
         ctx.noteKernelLaunch();
         try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.functions[1], params.items * params.heads, 1, 1, 128, 1, 1, 0, ctx.stream, &args, null));
         ctx.noteKernelLaunch();
         self.calls += 1;
+        self.grouped_calls += @intFromBool(grouped);
         self.chunk128_calls += @intFromBool(chunk128);
         self.items += params.items;
     }

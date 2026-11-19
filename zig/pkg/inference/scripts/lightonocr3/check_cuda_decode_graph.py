@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qualify two-token decoder-graph attention against an independent CPU oracle.
+"""Qualify bounded multi-token decoder-graph attention against an independent CPU oracle.
 
 Checks repeated replay and reset across page boundaries, complete KV contents,
 unused slots, exact GPU positions/progress, read-only inputs and output canaries.
@@ -33,6 +33,7 @@ from check_cuda_recurrent import Driver
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--artifact", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
+parser.add_argument("--steps", type=int, choices=range(2, 9), default=2)
 cli = parser.parse_args()
 Params = oracle.Params
 assert c.sizeof(Params) == 17520
@@ -82,7 +83,9 @@ try:
                 if batch in (2, 4):
                     lengths = [1914, 2697, 4096, 8192][:batch]
                 replays = 5
-                counts = [math.ceil((n + replays * 2) / page_size) for n in lengths]
+                counts = [
+                    math.ceil((n + replays * cli.steps) / page_size) for n in lengths
+                ]
                 blocks = sum(counts)
                 capacity = (2 * blocks + 2) * page_size
                 q = torch.randn(batch, heads, 256)
@@ -97,7 +100,9 @@ try:
                 progress = torch.zeros(1, dtype=torch.int32, device="cuda")
                 base_positions = torch.arange(3 * batch, dtype=torch.int32) + 400
                 positions = base_positions.cuda()
-                chunks = math.ceil(max(n + replays * 2 for n in lengths) / chunk)
+                chunks = math.ceil(
+                    max(n + replays * cli.steps for n in lengths) / chunk
+                )
                 grouped = (heads == 8 and chunk == 32 and batch >= 8) or (
                     heads == 16 and chunk == 128 and batch >= 16
                 )
@@ -108,7 +113,7 @@ try:
                 for count in counts:
                     tables.append([2 * x + 1 for x in order[cursor : cursor + count]])
                     cursor += count
-                for step in range(2):
+                for step in range(cli.steps):
                     output = torch.full(
                         (batch * heads * 256 + 16,), 123456.0, device="cuda"
                     )
@@ -225,10 +230,10 @@ try:
                         replay = 0
                     graph.replay()
                     torch.cuda.synchronize()
-                    for step in range(2):
+                    for step in range(cli.steps):
                         expected = []
                         for i, n in enumerate(lengths):
-                            tokens = n + replay * 2 + step
+                            tokens = n + replay * cli.steps + step
                             physical = (
                                 tables[i][(tokens - 1) // page_size] * page_size
                                 + (tokens - 1) % page_size
@@ -257,10 +262,10 @@ try:
                             error,
                         )
                         max_error = max(max_error, error)
-                    assert progress.item() == (replay + 1) * 2
+                    assert progress.item() == (replay + 1) * cli.steps
                     torch.testing.assert_close(
                         positions.cpu(),
-                        base_positions + (replay + 1) * 2,
+                        base_positions + (replay + 1) * cli.steps,
                         rtol=0,
                         atol=0,
                     )
@@ -279,11 +284,12 @@ try:
                 graph = None
                 result = dict(
                     heads=heads,
+                    steps=cli.steps,
                     items=batch,
                     packets_per_step=math.ceil(batch / 64),
                     grouped=grouped,
                     chunk=chunk,
-                    replayed_steps=(replays + 1) * 2,
+                    replayed_steps=(replays + 1) * cli.steps,
                     resets=1,
                     max_abs=max_error,
                     full_kv_and_holes=True,
