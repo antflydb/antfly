@@ -281,7 +281,7 @@ pub const EvalLimits = struct {
     regex_checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     regex_context: ?*anyopaque = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, value_identity, is_missing, date_bin, @"$array_subscript", @"$series_step", current_schemas };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, value_identity, is_missing, date_bin, @"$array_subscript", @"$series_step", current_schemas, pg_current_wal_lsn };
 
 fn regexFunction(function: Function) ?regex_functions.Function {
     return switch (function) {
@@ -745,6 +745,7 @@ pub const Program = struct {
                 .to_timestamp,
                 .current_setting,
                 .current_schemas,
+                .pg_current_wal_lsn,
                 .@"$single",
                 .trunc,
                 .sign,
@@ -2141,6 +2142,16 @@ fn mixedNumberQuantified(value: arrays.Value, probe: arrays.Element, op: arrays.
 fn uuidTextOperand(expression: *const ast.Scalar) bool {
     return expression.* == .literal and expression.literal == .string;
 }
+fn booleanLiteralSide(op: ast.Scalar.Binary, left: *const ast.Scalar, right: *const ast.Scalar, left_type: Type, right_type: Type) ?enum { left, right } {
+    switch (op) {
+        .eq, .neq, .lt, .lte, .gt, .gte, .is_distinct, .is_not_distinct => {},
+        else => return null,
+    }
+    if (left_type.kind == .boolean and right.* == .literal and right.literal == .string) return .right;
+    if (right_type.kind == .boolean and left.* == .literal and left.literal == .string) return .left;
+    return null;
+}
+
 fn common(left: Type, right: Type) !Type {
     if (left.kind == .array or right.kind == .array) {
         const chosen = if (left.kind == .array) left else right;
@@ -2619,6 +2630,7 @@ pub fn validateFunctionArity(function: Function, count: usize) !void {
     }
     const valid = switch (function) {
         .value_identity, .is_missing, .current_schemas => count == 1,
+        .pg_current_wal_lsn => count == 0,
         .regexp_like, .regexp_count, .regexp_instr, .regexp_substr, .regexp_replace => unreachable,
         .array_position => count == 2 or count == 3,
         .array_positions, .array_remove, .array_append, .array_prepend, .array_cat => count == 2,
@@ -2805,6 +2817,9 @@ const Binder = struct {
                     if (right.kind != null and right.kind != .string and right.kind != .integer) return error.SqlTypeMismatch;
                     break :blk .{ .kind = if (binary.op == .json_get) .json else .string };
                 }
+                const distinct = binary.op == .is_distinct or binary.op == .is_not_distinct;
+                if (booleanLiteralSide(binary.op, binary.left, binary.right, left, right) != null)
+                    break :blk .{ .kind = .boolean, .element_type = .boolean, .nullable = !distinct and (left.nullable or right.nullable) };
                 const merged = try common(left, right);
                 switch (binary.op) {
                     .add, .subtract, .multiply, .divide, .modulo => {
@@ -2829,6 +2844,10 @@ const Binder = struct {
                     if (call.args.len == 0) return error.InvalidSqlParameters;
                     for (call.args) |arg| _ = try self.infer(arg, depth + 1);
                     break :blk .{ .kind = .integer, .nullable = false };
+                }
+                if (std.mem.eql(u8, call.name, "pg_current_wal_lsn") or std.mem.eql(u8, call.name, "pg_last_wal_receive_lsn")) {
+                    if (call.args.len != 0) return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = .string, .element_type = .text, .nullable = std.mem.eql(u8, call.name, "pg_last_wal_receive_lsn") };
                 }
                 if (std.mem.eql(u8, call.name, "pg_is_in_recovery")) {
                     if (call.args.len != 0) return error.SqlUndefinedFunction;
@@ -3292,6 +3311,16 @@ const Binder = struct {
                 if (binary.op == .json_get or binary.op == .json_text) break :blk .{ .binary = .{ .op = binary.op, .left = try self.compile(binary.left, .json, depth + 1), .right = try self.compile(binary.right, .string, depth + 1) } };
                 const left_type = try self.infer(binary.left, depth + 1);
                 const right_type = try self.infer(binary.right, depth + 1);
+                if (booleanLiteralSide(binary.op, binary.left, binary.right, left_type, right_type)) |which| {
+                    const literal = if (which == .left) binary.left else binary.right;
+                    const cast = try self.alloc.create(ast.Scalar);
+                    cast.* = .{ .cast = .{ .operand = literal, .type = .boolean, .element_type = .boolean } };
+                    break :blk .{ .binary = .{
+                        .op = binary.op,
+                        .left = try self.compile(if (which == .left) cast else binary.left, .boolean, depth + 1),
+                        .right = try self.compile(if (which == .right) cast else binary.right, .boolean, depth + 1),
+                    } };
+                }
                 var merged = try common(left_type, right_type);
                 // PostgreSQL's mixed NUMERIC/real operators use float8;
                 // CASE/COALESCE and array common types still select real.
@@ -3334,6 +3363,8 @@ const Binder = struct {
                 // PostgreSQL physical standby mode, which pgwire never enters.
                 if (std.mem.eql(u8, call.name, "pg_is_in_recovery"))
                     break :blk .{ .literal = .{ .bool = false } };
+                if (std.mem.eql(u8, call.name, "pg_last_wal_receive_lsn"))
+                    break :blk .{ .literal = .null };
                 if (scopeField(call.name)) |field| {
                     if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };
                     const view = self.settings orelse return error.SettingCatalogUnavailable;
@@ -4239,6 +4270,11 @@ const Evaluator = struct {
                             break :ordinary if (mixed_number) try mixedNumberQuantified(array.*, element, compare_op, every.bool, &work) else try array.quantified(element, compare_op, if (every.bool) .all else .any, &work);
                         };
                         break :blk if (accepted) |value| Datum.json(.{ .bool = value }) else .{};
+                    },
+                    .pg_current_wal_lsn => {
+                        const view = self.program.settings orelse return error.SqlSnapshotLsnUnavailable;
+                        const lsn = view.snapshot_lsn orelse return error.SqlSnapshotLsnUnavailable;
+                        break :blk Datum.json(.{ .string = try std.fmt.allocPrint(self.alloc, "{X}/{X}", .{ lsn >> 32, lsn & 0xffffffff }) });
                     },
                     .current_schemas => {
                         const implicit = try self.runDatum(call.args[0], depth + 1);

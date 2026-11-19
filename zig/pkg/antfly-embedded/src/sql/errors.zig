@@ -167,6 +167,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.CatalogPublicationProofPending => .{ .code = "53300", .message = "The relation catalog publication is not ready to authorize this DDL.", .hint = "No schema change was admitted. Wait for catalog publication, then retry the complete DDL.", .retryable = true },
         error.SettingAuthorityUnavailable => .{ .code = "53300", .message = "The metadata setting authority is not configured for this SQL operation.", .hint = "Ask an operator to configure trusted setting authority, then inspect schema state before resubmitting DDL. Do not automatically replay a mutation.", .retryable = false },
         error.SqlNumericOutOfRange => .{ .code = "22003", .message = "A numeric expression exceeds its supported range.", .retryable = false },
+        error.SqlSnapshotLsnUnavailable => .{ .code = "0A000", .message = "A WAL position is available only in a transaction with an imported replication snapshot.", .retryable = false },
         error.SqlZeroSeriesStep => .{ .code = "22023", .message = "Step size cannot equal zero.", .retryable = false },
         error.SqlInvalidParameterValue => .{ .code = "22023", .message = "The SQL type modifier is outside its supported range.", .hint = "NUMERIC precision must be 1..1000 and scale -1000..1000.", .retryable = false },
         error.SqlSubstringError => .{ .code = "22011", .message = "The substring start or length is invalid.", .retryable = false },

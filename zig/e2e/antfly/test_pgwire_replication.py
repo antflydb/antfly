@@ -348,6 +348,9 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                     "-c",
                     f"SET TRANSACTION SNAPSHOT '{snapshot}'",
                     "-c",
+                    "SELECT CASE pg_is_in_recovery() WHEN 't' THEN pg_last_wal_receive_lsn() "
+                    "ELSE pg_current_wal_lsn() END",
+                    "-c",
                     "SELECT content FROM smoke",
                     "-c",
                     "COMMIT",
@@ -362,6 +365,7 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
                 "BEGIN",
                 "SET",
                 "SET",
+                point,
                 "snapshot-before-cut",
                 "COMMIT",
             ]

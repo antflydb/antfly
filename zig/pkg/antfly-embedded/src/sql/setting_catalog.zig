@@ -242,6 +242,7 @@ pub const View = struct {
     by_id: std.AutoHashMapUnmanaged(u64, usize),
     by_name: std.StringHashMapUnmanaged(usize),
     schema_search_path: ?[]const []const u8 = null,
+    snapshot_lsn: ?u64 = null,
 
     pub fn capture(backing: std.mem.Allocator, owner: Owner, scope: Scope, overlay: []const OverlayEntry) !View {
         var arena = std.heap.ArenaAllocator.init(backing);
@@ -579,6 +580,17 @@ test "SQL current_setting evaluates from one authorized pinned view" {
     var result = try runtime.execute(std.testing.allocator, with_capture, &compiled, &.{}, .{});
     defer result.deinit();
     try std.testing.expectEqualStrings("alice-tenant", result.output.rows[0][0].string);
+    var wal = try compiler.compile(std.testing.allocator, "SELECT CASE pg_is_in_recovery() WHEN 't' THEN pg_last_wal_receive_lsn() ELSE pg_catalog.pg_current_wal_lsn() END, pg_last_wal_receive_lsn() IS NULL", .{});
+    defer wal.deinit();
+    try std.testing.expect(wal.uses_snapshot_lsn);
+    try std.testing.expectError(error.SqlSnapshotLsnUnavailable, runtime.execute(std.testing.allocator, with_capture, &wal, &.{}, .{}));
+    with_capture.setting_capture.?.snapshot_lsn = 0x1_00000002;
+    var wal_result = try runtime.execute(std.testing.allocator, with_capture, &wal, &.{}, .{});
+    defer wal_result.deinit();
+    try std.testing.expectEqualStrings("1/2", wal_result.output.rows[0][0].string);
+    try std.testing.expect(wal_result.output.rows[0][1].bool);
+    with_capture.setting_capture.?.snapshot_lsn = null;
+
     var schemas = try compiler.compile(std.testing.allocator, "SELECT current_schemas(false)[1], pg_catalog.current_schemas(true)[1], current_schemas(true)[3], current_schemas(NULL) IS NULL", .{});
     defer schemas.deinit();
     try std.testing.expect(schemas.uses_current_schemas and schemas.uses_current_setting);

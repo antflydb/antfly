@@ -82,6 +82,7 @@ pub const Compiled = struct {
     /// The statement binds settings or identity from the authorized SQL scope.
     uses_current_setting: bool = false,
     uses_current_schemas: bool = false,
+    uses_snapshot_lsn: bool = false,
 
     pub fn deinit(self: *Compiled) void {
         self.arena.deinit();
@@ -161,7 +162,7 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
     const statement = try parser.statement();
     _ = parser.take(.semicolon);
     if (parser.pos != tokens.items.len) return parser.fail(error.UnsupportedSqlShape, "unexpected trailing SQL; only one supported statement is allowed");
-    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting, .uses_current_schemas = parser.uses_current_schemas };
+    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting, .uses_current_schemas = parser.uses_current_schemas, .uses_snapshot_lsn = parser.uses_snapshot_lsn };
 }
 
 fn lexicalError(kind: lexer.LexErrorKind) Error {
@@ -329,6 +330,7 @@ const Parser = struct {
     parameter_count: u32 = 0,
     uses_current_setting: bool = false,
     uses_current_schemas: bool = false,
+    uses_snapshot_lsn: bool = false,
     relation_depth: usize = 0,
 
     fn fail(self: *Parser, err: Error, message: []const u8) Error {
@@ -522,7 +524,7 @@ const Parser = struct {
                 return if (t.owned) std.mem.eql(u8, t.text, expected) else std.ascii.eqlIgnoreCase(t.text, expected);
             }
         }.name;
-        return matches(schema, "pg_catalog") and (matches(function, "current_schemas") or matches(function, "pg_is_in_recovery"));
+        return matches(schema, "pg_catalog") and (matches(function, "current_schemas") or matches(function, "pg_is_in_recovery") or matches(function, "pg_current_wal_lsn") or matches(function, "pg_last_wal_receive_lsn"));
     }
 
     fn scalar(self: *Parser, depth: usize, minimum: u8) Error!*const ast.Scalar {
@@ -623,6 +625,10 @@ const Parser = struct {
             if (std.mem.eql(u8, name_value, "current_schemas")) {
                 self.uses_current_setting = true;
                 self.uses_current_schemas = true;
+            }
+            if (std.mem.eql(u8, name_value, "pg_current_wal_lsn")) {
+                self.uses_current_setting = true;
+                self.uses_snapshot_lsn = true;
             }
             var args: std.ArrayList(*const ast.Scalar) = .empty;
             const distinct = self.keyword(.distinct);
@@ -2545,7 +2551,7 @@ const Parser = struct {
             },
             .cast => |part| try self.persistentExpression(part.operand, generated),
             .call => |part| {
-                if (std.mem.eql(u8, part.name, "current_schemas")) return self.fail(error.UnsupportedSqlShape, "schema expressions cannot capture the session search path");
+                if (std.mem.eql(u8, part.name, "current_schemas") or std.mem.eql(u8, part.name, "pg_current_wal_lsn")) return self.fail(error.UnsupportedSqlShape, "schema expressions cannot capture session state");
                 if (part.subquery != null or part.star or part.distinct or part.filter != null or part.window != null or part.within_group != null)
                     return self.fail(error.UnsupportedSqlShape, "subqueries, aggregates and windows are not allowed in schema expressions");
                 for (part.args) |arg| try self.persistentExpression(arg, generated);

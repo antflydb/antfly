@@ -3190,6 +3190,14 @@ const GuardedCatalog = struct {
     fn settingCapture(self: *GuardedCatalog, alloc: std.mem.Allocator, adapter: *execution.Adapter, compiled: *const compiler.Compiled) !@FieldType(catalog.Backend, "setting_capture") {
         if (!compiled.uses_current_setting) return null;
         var capture = adapter.settingCapture().?;
+        if (compiled.uses_snapshot_lsn) if (self.authority.importedSnapshot()) |snapshot| {
+            const identity: ReplicationIdentity = .{ .context = self.authority.credential, .read = Adapter.replicationIdentity };
+            const context = try self.authority.context();
+            const slots = try CatalogReplicationSlots.open(self.authority.server orelse return error.UnsupportedReplicationMode, identity, alloc, self.authority.request.database orelse "default", context);
+            var state = try slots.qualifySnapshot(alloc, snapshot.token, context);
+            defer state.deinit();
+            capture.snapshot_lsn = state.value.slot.?.consistent_lsn;
+        };
         if (!compiled.uses_current_schemas) return capture;
         const namespaces = try self.catalogNamespaces(alloc, &.{});
         const path = if (self.authority.request.search_path) |*configured| configured.entries[0..configured.len] else null;
