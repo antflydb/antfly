@@ -262,11 +262,11 @@ pub const Prepared = struct {
     /// Trusted local producer: prepare/scan once, rather than serialize a
     /// locally computed page only to execute it again on the same owner.
     /// Standby/transport callers still use init's independent replay path.
-    pub fn preparePage(a: A, core: *core_mod.DBCore, binding: job.Binding, budget: @import("relational_rows.zig").Budget, context: operation.RequestContext) !@This() {
+    pub fn preparePage(a: A, core: *core_mod.DBCore, binding: job.Binding, budget: @import("read_session_types").types.values.Budget, context: operation.RequestContext) !@This() {
         if (binding.authority != .native) return error.InvalidControlReceiptPosition;
         return preparePageFor(a, core, binding, budget, context);
     }
-    pub fn prepareRaftPage(a: A, core: *core_mod.DBCore, binding: job.Binding, budget: @import("relational_rows.zig").Budget, context: operation.RequestContext) !@This() {
+    pub fn prepareRaftPage(a: A, core: *core_mod.DBCore, binding: job.Binding, budget: @import("read_session_types").types.values.Budget, context: operation.RequestContext) !@This() {
         if (binding.authority != .raft) return error.InvalidControlReceiptPosition;
         return preparePageFor(a, core, binding, budget, context);
     }
@@ -290,7 +290,7 @@ pub const Prepared = struct {
         const command: Command = .{ .binding = binding, .action = .reconcile_transactions, .payload = payload };
         return .{ .alloc = a, .command = command, .context = context, .owned = payload, .debt_page = page, .command_identity = if (binding.authority == .raft) try command.raftIdentity() else @splat(0) };
     }
-    fn preparePageFor(a: A, core: *core_mod.DBCore, binding: job.Binding, budget: @import("relational_rows.zig").Budget, context: operation.RequestContext) !@This() {
+    fn preparePageFor(a: A, core: *core_mod.DBCore, binding: job.Binding, budget: @import("read_session_types").types.values.Budget, context: operation.RequestContext) !@This() {
         var page = try job.PreparedPage.prepare(a, core, binding, budget, control(&context));
         errdefer page.deinit();
         const encoded = try (try page.command()).encode(a);

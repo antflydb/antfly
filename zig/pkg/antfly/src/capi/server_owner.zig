@@ -5701,9 +5701,7 @@ const RaftSchemaPreparation = struct {
     root_generation: u64,
     term: u64,
     index: u64,
-    binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding,
-    command_identity: [32]u8,
-    prepared: ?db_mod.DB.SchemaOwnerControl.Prepared,
+    prepared: @import("antfly_local_sources").storage_read_session_types.contract.Handle,
     applying: std.atomic.Mutex = .unlocked,
 };
 const RaftSchemaPreparationRegistry = HandleRegistryOf(RaftSchemaPreparation);
@@ -5738,15 +5736,13 @@ fn prepareRaftSchemaControl(owner: ?*anyopaque, request: *const kernel_owner_abi
     if (handle.storage_owner_schema_preparing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.StorageBusy;
     errdefer handle.storage_owner_schema_preparing.store(false, .release);
     const command = try @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Command.decodeRaft(request.command.slice());
-    var prepared = try handle.db.prepareCommittedRaftSchemaOwnerCommand(command, handle.storage_owner_group_id, .{ .term = request.term, .index = request.index }, context);
-    errdefer if (prepared) |*value| value.deinit();
+    const schema_protocol = @import("antfly_local_sources").storage_read_session_types.contract;
+    const prepared = try handle.db.retainRaftSchemaOwnerPreparation(command, handle.storage_owner_group_id, .{ .term = request.term, .index = request.index }, context);
+    errdefer schema_protocol.call("close", .schema_preparation, prepared, .{prepared}) catch @panic("incompatible schema preparation owner");
     try context.ensureActive();
-    // These callbacks borrow the prepare call's stack. Commit gets its own
-    // invocation context; neither a worker nor a cached ticket retains them.
-    if (prepared) |*value| value.context = .{};
     const ticket = try handle.alloc.create(RaftSchemaPreparation);
     errdefer handle.alloc.destroy(ticket);
-    ticket.* = .{ .owner_id = owner.?, .owner = handle, .owner_slot = entered[1], .root_generation = handle.storage_owner_root_generation, .term = request.term, .index = request.index, .binding = command.binding, .command_identity = request.command.slice()[request.command.len - 32 ..][0..32].*, .prepared = prepared };
+    ticket.* = .{ .owner_id = owner.?, .owner = handle, .owner_slot = entered[1], .root_generation = handle.storage_owner_root_generation, .term = request.term, .index = request.index, .prepared = prepared };
     var result: kernel_owner_abi.RaftSchemaOwnerPreparationResult = .{ .prepared = try raft_schema_preparations.register(ticket), .root_generation = handle.storage_owner_root_generation };
     std.mem.writeInt(u128, &result.physical_root_incarnation_le, physical_root, .little);
     return result;
@@ -5784,7 +5780,8 @@ fn applyPreparedRaftSchemaControl(owner: ?*anyopaque, request: *const kernel_own
     // Concurrent misuse never blocks progress behind another apply invocation.
     if (!ticket.applying.tryLock()) return error.StorageBusy;
     defer ticket.applying.unlock();
-    try ticket.owner.db.applyPreparedRaftSchemaOwnerCommand(if (ticket.prepared) |*value| value else null, ticket.binding, ticket.command_identity, ticket.owner.storage_owner_group_id, .{ .term = request.term, .index = request.index }, context);
+    const protocol = @import("antfly_local_sources").storage_read_session_types.contract;
+    try protocol.call("apply_schema", .schema_preparation, ticket.prepared, .{ ticket.prepared, request.term, request.index, context });
     // Leave retained buffers to the control worker. No fallible post-commit
     // acknowledgement or caller callback can turn this commit into an error.
 }
@@ -5802,7 +5799,8 @@ pub fn storageOwnerDestroyRaftSchemaPreparation(prepared: ?*anyopaque) callconv(
     const closed = raft_schema_preparations.beginClose(prepared) orelse return;
     const ticket = closed[0];
     const slot = ticket.owner_slot;
-    if (ticket.prepared) |*value| value.deinit();
+    const protocol = @import("antfly_local_sources").storage_read_session_types.contract;
+    protocol.call("close", .schema_preparation, ticket.prepared, .{ticket.prepared}) catch @panic("incompatible schema preparation owner");
     ticket.owner.storage_owner_schema_preparing.store(false, .release);
     ticket.owner.alloc.destroy(ticket);
     HandleRegistry.leave(slot);
@@ -6042,26 +6040,11 @@ fn prepareSchemaProposal(owner: ?*anyopaque, request: *const kernel_owner_abi.Sc
     if (descriptor.action != .page and descriptor.action != .reconcile_transactions) return error.InvalidArgument;
     if (handle.storage_owner_schema_preparing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.StorageBusy;
     defer handle.storage_owner_schema_preparing.store(false, .release);
-    const resources = local.storage_resource_manager;
-    var budget = if (handle.db.core.index_manager.resource_manager) |manager| resources.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, handle.alloc, 1) else null;
-    defer if (budget) |*value| value.deinit();
-    const a = if (budget) |*value| value.allocator() else handle.alloc;
-    var prepared: ?db_mod.DB.NativeSchemaOwnerControl.Prepared = if (descriptor.action == .page)
-        db_mod.DB.NativeSchemaOwnerControl.Prepared.prepareRaftPage(a, handle.db.core, descriptor.binding, .{ .records = request.records, .time_ns = request.time_ns }, context) catch |err| {
-            if (budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
-            return err;
-        }
-    else
-        db_mod.DB.NativeSchemaOwnerControl.Prepared.prepareTransactionDebtPage(a, handle.db.core, descriptor.binding, context) catch |err| {
-            if (budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
-            return err;
-        };
-    defer if (prepared) |*value| value.deinit();
+    const prepared = try handle.db.prepareSchemaOwnerProposalBytes(handle.alloc, descriptor, .{ .records = request.records, .time_ns = request.time_ns }, context);
+    defer if (prepared) |bytes| handle.alloc.free(bytes);
     var result: kernel_owner_abi.SchemaOwnerProposalResult = .{ .root_generation = handle.storage_owner_root_generation };
     std.mem.writeInt(u128, &result.physical_root_incarnation_le, try handle.db.durableRootIncarnation(), .little);
-    if (prepared) |*value| {
-        const bytes = try value.command.encodeRaft(a);
-        defer a.free(bytes);
+    if (prepared) |bytes| {
         const copied = try dupBytes(bytes);
         result.command = .{ .ptr = copied.ptr, .len = @intCast(copied.len) };
     }
@@ -6116,23 +6099,11 @@ pub fn storageOwnerNativeSchemaControlJson(owner: ?*anyopaque, request: *const k
     if (descriptor.binding.authority != .native) return Failure.result(error.InvalidControlReceiptPosition, out_failure);
     if (handle.storage_owner_schema_preparing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return Failure.result(error.StorageBusy, out_failure);
     defer handle.storage_owner_schema_preparing.store(false, .release);
-    const resources = local.storage_resource_manager;
-    var budget = if (handle.db.core.index_manager.resource_manager) |manager| resources.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, handle.alloc, 1) else null;
-    defer if (budget) |*value| value.deinit();
-    const task_alloc = if (budget) |*value| value.allocator() else handle.alloc;
-    var prepared = (if (descriptor.action == .page and request.payload.len == 0)
-        db_mod.DB.NativeSchemaOwnerControl.Prepared.preparePage(task_alloc, handle.db.core, descriptor.binding, .{ .records = request.records, .time_ns = request.time_ns }, context)
-    else
-        db_mod.DB.NativeSchemaOwnerControl.Prepared.init(task_alloc, handle.db.core, .{ .binding = descriptor.binding, .action = descriptor.action, .payload = request.payload.slice() }, context)) catch |err| {
-        if (budget) |value| if (value.denied()) return Failure.result(error.ResourceBudgetExceeded, out_failure);
-        return Failure.result(err, out_failure);
-    };
-    defer prepared.deinit();
     // Own response memory BEFORE admission. Cancellation/allocation failure
     // after commit must never masquerade as a rolled-back native mutation.
     var response = BoundedOwnerJsonResponse(contract.NativeObservation.max_wire_bytes).init() catch |err| return Failure.result(err, out_failure);
     defer response.deinit();
-    const outcome = handle.db.applyPreparedNativeSchemaOwnerControl(&prepared, null) catch |err| return Failure.result(err, out_failure);
+    const outcome = handle.db.executeNativeSchemaOwnerControl(.{ .binding = descriptor.binding, .action = descriptor.action, .payload = request.payload.slice() }, .{ .records = request.records, .time_ns = request.time_ns }, context) catch |err| return Failure.result(err, out_failure);
     const used = response.encode(outcome) catch |err| return Failure.result(err, out_failure);
     out_response.* = response.detach(used);
     return .ok;
@@ -7733,7 +7704,7 @@ pub const StorageRelationalRead = struct {
             return .{ .ptr = session, .vtable = &.{ .next = StorageRelationalRead.next, .close = StorageRelationalRead.close, .normalize = StorageRelationalRead.normalize, .range_proofs = StorageRelationalRead.rangeProofs } };
         }
 
-        pub fn graphPage(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("antfly_local_sources").storage_statement_read_fence.GraphRead.Request) !@import("antfly_local_sources").storage_statement_read_fence.GraphRead.Page {
+        pub fn graphPage(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("antfly_local_sources").storage_statement_read_fence.RetainedGraphRead.Request) !@import("antfly_local_sources").storage_statement_read_fence.RetainedGraphRead.Page {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.db.relationalGraphSnapshotPage(&self.read, alloc, request);
         }
@@ -7825,7 +7796,7 @@ pub const StorageRelationalRead = struct {
         defer if (schema) |*epoch| epoch.release();
         if (schema == null or schema.?.storageMode() == .document) {
             const session = try db.openDocumentReadSession(alloc, from, to, opts);
-            return .{ .text_filter_digest = if (session.text) |text| text.query_digest else null, .ptr = session, .vtable = &.{ .next = nextDocument, .close = closeDocument, .normalize = normalizeDocument, .range_proofs = documentRangeProofs } };
+            return .{ .text_filter_digest = session.textFilterDigest(), .ptr = session, .vtable = &.{ .next = nextDocument, .close = closeDocument, .normalize = normalizeDocument, .range_proofs = documentRangeProofs } };
         }
         const session = try db.openRelationalReadSession(alloc, from, to, opts);
         return .{ .ptr = session, .vtable = &.{ .next = next, .close = close, .normalize = normalize, .range_proofs = rangeProofs } };

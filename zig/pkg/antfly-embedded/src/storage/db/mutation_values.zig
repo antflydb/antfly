@@ -17,12 +17,32 @@
 //! No database, storage backend, scheduler, schema or inference dependencies.
 const std = @import("std");
 pub const BatchWrite = struct {
+    /// Borrowed from an authenticated internal batch or owned SQL session.
+    /// Public JSON never creates this canonical-domain preparation marker.
     prepared_domain: ?*const @import("../../schema/prepared_row_contract.zig").PreparedContract = null,
     key: []const u8,
     value: []const u8,
     /// Top-level JSON-typed fields whose null datum is JSON null, not SQL NULL.
     /// Validated against the pinned relational schema before preparation.
     json_null_fields: []const []const u8 = &.{},
+
+    pub fn json_skip_field(self: @This(), field: []const u8) bool {
+        return std.mem.eql(u8, field, "prepared_domain") and self.prepared_domain == null;
+    }
+
+    /// Integrity encoders serialize the contract data, never its borrowed
+    /// process address. Unprepared writes keep their historical projection.
+    pub fn nativeJsonProjection(self: @This()) struct {
+        key: []const u8,
+        value: []const u8,
+        json_null_fields: []const []const u8,
+        prepared_domain: ?@import("../../schema/prepared_row_contract.zig").PreparedContract,
+        pub fn nativeJsonSkipField(value: @This(), field: []const u8) bool {
+            return std.mem.eql(u8, field, "prepared_domain") and value.prepared_domain == null;
+        }
+    } {
+        return .{ .key = self.key, .value = self.value, .json_null_fields = self.json_null_fields, .prepared_domain = if (self.prepared_domain) |contract| contract.* else null };
+    }
 };
 
 pub fn cloneJsonNullFields(alloc: std.mem.Allocator, fields: []const []const u8) ![]const []const u8 {

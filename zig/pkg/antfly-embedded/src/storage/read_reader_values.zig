@@ -19,6 +19,8 @@ const Allocator = std.mem.Allocator;
 const tuples = @import("db/relational_index_keys.zig");
 const predicates = @import("db/relational_predicate.zig");
 const codec = @import("db/algebraic/relational_row_codec.zig");
+pub const ExpressionKeyIdentity = @import("relational_index.zig").ExpressionKeyIdentity;
+
 pub const TypedLayout = @import("../sql/catalog.zig").Row.TypedLayout;
 pub const OrdinalRowView = codec.OrdinalRowView;
 pub const Hydrated = struct { rows: []const ?@import("read_session_values.zig").Row, consumed: usize, output_bytes: usize };
@@ -42,7 +44,7 @@ pub const RowFilter = struct {
     }
 };
 pub const ExpressionEquality = struct {
-    identity: @import("relational_index.zig").ExpressionKeyIdentity,
+    identity: ExpressionKeyIdentity,
     fold_ascii: bool = false,
     value: Value,
 };

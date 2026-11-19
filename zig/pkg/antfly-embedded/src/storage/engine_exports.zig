@@ -983,7 +983,31 @@ fn verifyTransferablePrimarySnapshotWithOrigin(self: *DB, namespace: [24]u8, rec
     return .{ .value = self.verifyTransferablePrimarySnapshotWithOrigin(namespace, receipt, origin) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn stepSchemaOwnerRowAudit(self: *DB, owner_group: u64, binding: @import("db/relational_schema_owner_contract.zig").Binding, inputs: []const u8, budget: @import("db/relational_rows.zig").Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../api/operation.zig").RequestContext) engine.Outcome(@import("db/relational_schema_audit_checkpoint.zig").Result) {
+fn prepareSchemaOwnerProposalBytes(self: *DB, output: Allocator, command_descriptor: @import("db/relational_schema_owner_contract.zig").CommandDescriptor, budget: @import("read_session_types").types.values.Budget, context: @import("../api/operation.zig").RequestContext) engine.Outcome(?[]u8) {
+    return .{ .value = self.prepareSchemaOwnerProposalBytes(output, command_descriptor, budget, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn executeNativeSchemaOwnerControl(self: *DB, command: @import("db/relational_schema_owner_contract.zig").Command, budget: @import("read_session_types").types.values.Budget, context: @import("../api/operation.zig").RequestContext) engine.Outcome(@import("db/relational_schema_owner_contract.zig").NativeOutcome) {
+    return .{ .value = self.executeNativeSchemaOwnerControl(command, budget, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn retainRaftSchemaOwnerPreparation(self: *DB, command: @import("db/relational_schema_owner_contract.zig").Command, owner_group: u64, entry: db.OrderedApplyReceipt, context: @import("../api/operation.zig").RequestContext) engine.Outcome(session_contract.Handle) {
+    return .{ .value = self.retainRaftSchemaOwnerPreparation(command, owner_group, entry, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn sqlMaintenanceJson(self: *DB, alloc: Allocator, bytes: []const u8) engine.Outcome([]u8) {
+    return .{ .value = self.sqlMaintenanceJson(alloc, bytes) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn applyReplicatedSchemaOwnerControl(self: *DB, record: @import("db/replication_record.zig").RecordView) engine.Outcome(void) {
+    return .{ .value = self.applyReplicatedSchemaOwnerControl(record) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn applyRaftSchemaOwnerCommand(self: *DB, command: @import("db/relational_schema_owner_contract.zig").Command, owner_group: u64, entry: db.OrderedApplyReceipt, context: @import("../api/operation.zig").RequestContext) engine.Outcome(void) {
+    return .{ .value = self.applyRaftSchemaOwnerCommand(command, owner_group, entry, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn stepSchemaOwnerRowAudit(self: *DB, owner_group: u64, binding: @import("db/relational_schema_owner_contract.zig").Binding, inputs: []const u8, budget: @import("read_session_types").types.values.Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../api/operation.zig").RequestContext) engine.Outcome(@import("db/relational_schema_audit_checkpoint.zig").Result) {
     return .{ .value = self.stepSchemaOwnerRowAudit(owner_group, binding, inputs, budget, signing_root_dir, signing_root_incarnation, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 

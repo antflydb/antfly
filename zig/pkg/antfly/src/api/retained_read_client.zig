@@ -25,10 +25,10 @@ const time = @import("antfly_platform").time;
 fn unpublishedAdmissionBusy(operation: @FieldType(rpc.Request, "operation"), status: u16, acknowledged: bool, body: []const u8) bool {
     if (status != 503 or !acknowledged or !std.mem.eql(u8, body, "ReadUnavailable")) return false;
     return switch (operation) {
-        .admit, .capture, .validate, .snapshot, .open => true,
+        .admit, .admit_graph, .capture, .validate, .snapshot, .open => true,
         // These operations can run after query evaluation/row delivery. A
         // negative reply never authorizes replay of an advanced cursor.
-        .open_snapshot, .next, .normalize, .range_proofs, .close, .cancel, .renew_snapshot, .graph_page => false,
+        .open_snapshot, .next, .normalize, .range_proofs, .close, .cancel, .renew_snapshot, .graph_page, .graph_snapshot, .graph_invoke, .graph_open => false,
     };
 }
 

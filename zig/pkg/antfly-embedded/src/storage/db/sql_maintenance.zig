@@ -236,7 +236,7 @@ fn analyze(db: anytype, a: A, scratch_backing: A, state: *contract.Progress, sel
     var pages: usize = 0;
     var rows: usize = 0;
     if (schema != null and schema.?.storageMode() == .relational) {
-        var reader = try @import("relational_rows.zig").Reader.open(a, db.core.store, schema.?, null, .{ .fields = names, .expected_schema_version = state.request.schema_version, .primary_lower = if (state.after) |after| .{ .key = after, .inclusive = false } else null }, @intCast(platform.time.realtimeNs()));
+        var reader = try @import("read_session_backend").RelationalRows.Reader.open(a, db.core.store, schema.?, null, .{ .fields = names, .expected_schema_version = state.request.schema_version, .primary_lower = if (state.after) |after| .{ .key = after, .inclusive = false } else null }, @intCast(platform.time.realtimeNs()));
         defer reader.deinit();
         db.core.unlockApplyShared();
         locked = false;
@@ -268,7 +268,7 @@ fn analyze(db: anytype, a: A, scratch_backing: A, state: *contract.Progress, sel
         };
         const owned_range = try ranges.decodeRangeAlloc(a, raw_range);
         owns_read = false; // Session consumes the snapshot on every outcome.
-        const session = try @import("document_rows.zig").Session.openSnapshot(a, db.core.store, read, schema, .{ .start = owned_range.start, .end = owned_range.end }, state.after orelse owned_range.start, owned_range.end, .{ .inclusive_from = state.after == null, .relational_query = .{ .fields = names, .schema_version = state.request.schema_version } }, @intCast(platform.time.realtimeNs()));
+        const session = try @import("read_session_backend").Document.openSnapshot(a, db.core.store, read, schema, .{ .start = owned_range.start, .end = owned_range.end }, state.after orelse owned_range.start, owned_range.end, .{ .inclusive_from = state.after == null, .relational_query = .{ .fields = names, .schema_version = state.request.schema_version } }, @intCast(platform.time.realtimeNs()));
         defer session.deinit();
         db.core.unlockApplyShared();
         locked = false;

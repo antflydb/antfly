@@ -21,7 +21,7 @@ const contract = @import("relational_integrity_activation_contract.zig");
 const activation = @import("relational_integrity_activation.zig");
 const validation = @import("foreign_key_validation.zig");
 const input_contract = @import("relational_schema_owner_contract.zig");
-const rows = @import("relational_rows.zig");
+const rows = @import("read_session_backend").RelationalRows;
 const A = std.mem.Allocator;
 
 pub const Page = struct {

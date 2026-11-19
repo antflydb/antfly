@@ -156,6 +156,10 @@ pub const Implementation = struct {
         return session;
     }
 
+    pub fn textFilterDigest(self: *const Implementation) ?[32]u8 {
+        return if (self.text) |text| text.query_digest else null;
+    }
+
     pub fn deinit(self: *Implementation) void {
         if (self.text) |text| text.deinit();
         if (self.row_policy_lease) |*lease| lease.release();

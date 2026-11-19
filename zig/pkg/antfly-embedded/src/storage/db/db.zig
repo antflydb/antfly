@@ -3430,6 +3430,7 @@ pub const DB = struct {
     /// and the exact range cohort are enforced by the control-plane producer;
     /// native runtime admission also applies to internal transport callers.
     pub fn sqlMaintenanceJson(self: *DB, alloc: Allocator, bytes: []const u8) ![]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("sqlMaintenanceJson", .{ self, alloc, bytes });
         if (!self.core.sql_maintenance_mutex.tryLock()) return error.MaintenanceBusy;
         defer self.core.sql_maintenance_mutex.unlock(self.core.index_manager.checkpointIo());
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
@@ -10653,6 +10654,85 @@ pub const DB = struct {
         return self.applyPreparedNativeOwnerEffect(prepared, replay);
     }
 
+    pub fn prepareSchemaOwnerProposalBytes(self: *DB, output: Allocator, descriptor: @import("relational_schema_owner_contract.zig").CommandDescriptor, budget: @import("read_session_types").types.values.Budget, context: @import("../../api/operation.zig").RequestContext) !?[]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("prepareSchemaOwnerProposalBytes", .{ self, output, descriptor, budget, context });
+        try context.ensureActive();
+        try descriptor.binding.validate();
+        if (descriptor.binding.authority != .raft) return error.InvalidControlReceiptPosition;
+        if (!descriptor.binding.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        if (descriptor.action != .page and descriptor.action != .reconcile_transactions) return error.InvalidArgument;
+        var memory = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, self.alloc, 1) else null;
+        defer if (memory) |*value| value.deinit();
+        const a = if (memory) |*value| value.allocator() else self.alloc;
+        var prepared: ?NativeSchemaOwnerControl.Prepared = if (descriptor.action == .page)
+            @as(?NativeSchemaOwnerControl.Prepared, NativeSchemaOwnerControl.Prepared.prepareRaftPage(a, self.core, descriptor.binding, budget, context) catch |err| {
+                if (memory) |value| if (value.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            })
+        else
+            NativeSchemaOwnerControl.Prepared.prepareTransactionDebtPage(a, self.core, descriptor.binding, context) catch |err| {
+                if (memory) |value| if (value.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            };
+        defer if (prepared) |*value| value.deinit();
+        if (prepared) |*value| return try value.command.encodeRaft(output);
+        return null;
+    }
+
+    pub fn executeNativeSchemaOwnerControl(self: *DB, command: @import("relational_schema_owner_contract.zig").Command, budget: @import("read_session_types").types.values.Budget, context: @import("../../api/operation.zig").RequestContext) !@import("relational_schema_owner_contract.zig").NativeOutcome {
+        if (comptime storage_engine.enabled) return storage_engine.call("executeNativeSchemaOwnerControl", .{ self, command, budget, context });
+        try context.ensureActive();
+        if (command.binding.authority != .native) return error.InvalidControlReceiptPosition;
+        var memory = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, self.alloc, 1) else null;
+        defer if (memory) |*value| value.deinit();
+        const a = if (memory) |*value| value.allocator() else self.alloc;
+        var prepared = (if (command.action == .page and command.payload.len == 0)
+            NativeSchemaOwnerControl.Prepared.preparePage(a, self.core, command.binding, budget, context)
+        else
+            NativeSchemaOwnerControl.Prepared.init(a, self.core, command, context)) catch |err| {
+            if (memory) |value| if (value.denied()) return error.ResourceBudgetExceeded;
+            return err;
+        };
+        defer prepared.deinit();
+        return self.applyPreparedNativeSchemaOwnerControl(&prepared, null);
+    }
+
+    pub fn retainRaftSchemaOwnerPreparation(self: *DB, command: @import("relational_schema_owner_contract.zig").Command, owner_group: u64, entry: OrderedApplyReceipt, context: @import("../../api/operation.zig").RequestContext) !@import("read_session_types").types.contract.Handle {
+        if (comptime storage_engine.enabled) return storage_engine.call("retainRaftSchemaOwnerPreparation", .{ self, command, owner_group, entry, context });
+        const protocol = @import("read_session_types").types.contract;
+        const Purpose = struct {
+            db: *DB,
+            prepared: ?SchemaOwnerControl.Prepared,
+            binding: @import("relational_schema_owner_contract.zig").Binding,
+            command_identity: [32]u8,
+            owner_group: u64,
+            entry: OrderedApplyReceipt,
+            const operations: protocol.Operations = .{ .close = @This().close, .apply_schema = @This().apply };
+            fn close(handle: protocol.Handle) protocol.NativeOutcome(void) {
+                const held = handle.resolve(.schema_preparation, @This()) catch |err| return .{ .failure = .init(@errorName(err)) };
+                if (held.prepared) |*value| value.deinit();
+                held.db.alloc.destroy(held);
+                return .{ .value = {} };
+            }
+            fn apply(handle: protocol.Handle, term: u64, index: u64, operation: @import("../../api/operation.zig").RequestContext) protocol.NativeOutcome(void) {
+                const held = handle.resolve(.schema_preparation, @This()) catch |err| return .{ .failure = .init(@errorName(err)) };
+                if (term != held.entry.term or index != held.entry.index) return .{ .failure = .init("InvalidOrderedApplyReceipt") };
+                defer if (held.prepared) |*value| {
+                    value.context = .{};
+                };
+                held.db.applyPreparedRaftSchemaOwnerCommand(if (held.prepared) |*value| value else null, held.binding, held.command_identity, held.owner_group, held.entry, operation) catch |err| return .{ .failure = .init(@errorName(err)) };
+                return .{ .value = {} };
+            }
+        };
+        var prepared = try self.prepareCommittedRaftSchemaOwnerCommand(command, owner_group, entry, context);
+        errdefer if (prepared) |*value| value.deinit();
+        if (prepared) |*value| value.context = .{};
+        const command_identity = try command.raftIdentity();
+        const held = try self.alloc.create(Purpose);
+        held.* = .{ .db = self, .prepared = prepared, .binding = command.binding, .command_identity = command_identity, .owner_group = owner_group, .entry = entry };
+        return protocol.Handle.issue(.schema_preparation, held, &Purpose.operations, protocol.Boundary.local_dispatch, &self.alloc);
+    }
+
     pub fn prepareNativeSchemaOwnerPage(self: *DB, binding: @import("relational_nullability_job.zig").Binding, budget: RelationalRows.Budget, context: @import("../../api/operation.zig").RequestContext) !NativeSchemaOwnerControl.Prepared {
         return NativeSchemaOwnerControl.Prepared.preparePage(self.alloc, self.core, binding, budget, context);
     }
@@ -10673,7 +10753,7 @@ pub const DB = struct {
     /// A stable DB-owned snapshot survives bounded turns, including ordinary
     /// writes on released tables. Full transaction/provenance qualification
     /// remains the receiving recovery protocol's additional obligation.
-    pub fn stepSchemaOwnerRowAudit(self: *DB, owner_group: u64, binding: @import("relational_schema_owner_contract.zig").Binding, inputs: []const u8, budget: @import("relational_rows.zig").Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_schema_audit_checkpoint.zig").Result {
+    pub fn stepSchemaOwnerRowAudit(self: *DB, owner_group: u64, binding: @import("relational_schema_owner_contract.zig").Binding, inputs: []const u8, budget: @import("read_session_types").types.values.Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_schema_audit_checkpoint.zig").Result {
         if (comptime storage_engine.enabled) return storage_engine.call("stepSchemaOwnerRowAudit", .{ self, owner_group, binding, inputs, budget, signing_root_dir, signing_root_incarnation, context });
         try context.ensureActive();
         try budget.validate();
@@ -10703,7 +10783,7 @@ pub const DB = struct {
         };
     }
 
-    fn stepSchemaOwnerRowAuditLease(self: *DB, a: Allocator, io: std.Io, lease: *@import("relational_schema_audit_cache.zig").Cache.Lease, budget: @import("relational_rows.zig").Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_schema_audit_checkpoint.zig").Result {
+    fn stepSchemaOwnerRowAuditLease(self: *DB, a: Allocator, io: std.Io, lease: *@import("relational_schema_audit_cache.zig").Cache.Lease, budget: @import("read_session_types").types.values.Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_schema_audit_checkpoint.zig").Result {
         try lease.requireCurrent();
         const audit = lease.audit();
         var guard = try @import("relational_schema_audit_checkpoint.zig").open(a, io, signing_root_dir, signing_root_incarnation, self.root_incarnation, audit, context);
@@ -10810,6 +10890,7 @@ pub const DB = struct {
     /// preparable forever: a durable applied watermark skips their replay only
     /// after checking the actual namespace, owner group and authority domain.
     pub fn applyRaftSchemaOwnerCommand(self: *DB, command: SchemaOwnerControl.Command, owner_group: u64, entry: OrderedApplyReceipt, context: @import("../../api/operation.zig").RequestContext) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyRaftSchemaOwnerCommand", .{ self, command, owner_group, entry, context });
         var prepared = try self.prepareCommittedRaftSchemaOwnerCommand(command, owner_group, entry, context);
         defer if (prepared) |*value| value.deinit();
         try self.applyPreparedRaftSchemaOwnerCommand(if (prepared) |*value| value else null, command.binding, try command.raftIdentity(), owner_group, entry, context);
@@ -10951,6 +11032,7 @@ pub const DB = struct {
     /// Called only by committed standby ingress, preserving the native owner
     /// clock separately from the journal's LSN. Never accepted as a row batch.
     pub fn applyReplicatedSchemaOwnerControl(self: *DB, record: @import("replication_record.zig").RecordView) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyReplicatedSchemaOwnerControl", .{ self, record });
         if (record.kind != .metadata_mutation or record.payload_codec != .binary or record.lsn == 0) return error.InvalidSchemaOwnerControl;
         const frame = try NativeSchemaOwnerControl.Frame.decode(record.payload);
         if (record.table_id != frame.position.namespace.table_id or record.shard_id != frame.position.namespace.shard_id or

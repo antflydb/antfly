@@ -42,7 +42,7 @@ pub fn tryFence(db: anytype, allow_unresolved: bool) !?contract.Handle {
             const retained = try database.alloc.create(StatementOwner);
             errdefer database.alloc.destroy(retained);
             retained.* = .{ .alloc = database.alloc, .db = database, .value = try database.captureRelationalStatementSnapshotAtFence(&held.value) };
-            return .{ .handle = issue(.statement, retained), .schema_version = retained.value.schema_version };
+            return .{ .handle = issue(.statement, retained), .schema_version = retained.value.schema_version, .document = retained.value.document };
         }
     };
     owner.* = .{ .alloc = db.alloc, .value = value, .db = db, .capture = Capture.run };
@@ -64,13 +64,13 @@ pub fn capture(db: anytype) !contract.Statement {
     const retained = try db.alloc.create(StatementOwner);
     errdefer db.alloc.destroy(retained);
     retained.* = .{ .alloc = db.alloc, .db = db, .value = try db.captureRelationalStatementSnapshot() };
-    return .{ .handle = issue(.statement, retained), .schema_version = retained.value.schema_version };
+    return .{ .handle = issue(.statement, retained), .schema_version = retained.value.schema_version, .document = retained.value.document };
 }
 pub fn captureWithGraphs(db: anytype, names: []const []const u8) !contract.Statement {
     const retained = try db.alloc.create(StatementOwner);
     errdefer db.alloc.destroy(retained);
     retained.* = .{ .alloc = db.alloc, .db = db, .value = try db.captureRelationalStatementSnapshotWithGraphs(names) };
-    return .{ .handle = issue(.statement, retained), .schema_version = retained.value.schema_version };
+    return .{ .handle = issue(.statement, retained), .schema_version = retained.value.schema_version, .document = retained.value.document };
 }
 pub fn graphSnapshotPage(db: anytype, handle: contract.Handle, a: A, request: @import("graph_read_snapshot.zig").Request) !@import("graph_read_snapshot.zig").Page {
     const owner = try handle.resolve(.statement, StatementOwner);
@@ -249,9 +249,14 @@ const Outcome = @import("read_session_types").types.contract.NativeOutcome;
 const statement_ops: contract.Operations = .{ .close = Adapters.closeStatement };
 const relational_ops: contract.Operations = .{ .normalize_domains = Adapters.normalizeDomains, .metadata = Adapters.metadata, .set_read_time = Adapters.setReadTime, .next_page = Adapters.relationalNextPage, .seek_prefix = Adapters.seekPrefix, .visit_cypher = Adapters.visitCypher, .close = Adapters.closeRelational, .checkpoint = Adapters.checkpoint, .range_proofs = Adapters.relationalProofs, .normalize = Adapters.normalizeRelational, .next_typed = Adapters.nextTyped, .next_view = Adapters.nextView };
 const reader_ops: contract.Operations = .{ .nullability_page = Adapters.nullability_page, .nullability_replay = Adapters.nullability_replay, .foreign_validation_page = Adapters.foreign_validation_page, .foreign_validation_replay = Adapters.foreign_validation_replay, .resume_nullability = Adapters.resume_nullability, .resume_foreign_validation = Adapters.resume_foreign_validation, .reader_seek_prefix = Adapters.readerSeekPrefix, .close = Adapters.closeReader, .next_page = Adapters.readerNextPage, .next_typed = Adapters.readerNextTyped, .lookup_batch = Adapters.readerLookupBatch, .lookup_one = Adapters.readerLookupOne };
-const document_ops: contract.Operations = .{ .close = Adapters.closeDocument, .range_proofs = Adapters.documentProofs, .normalize = Adapters.normalizeDocument, .next_view = Adapters.nextDocument };
+const document_ops: contract.Operations = .{ .document_metadata = Adapters.documentMetadata, .close = Adapters.closeDocument, .range_proofs = Adapters.documentProofs, .normalize = Adapters.normalizeDocument, .next_view = Adapters.nextDocument };
 const provider = @This();
 const Adapters = struct {
+    fn documentMetadata(h: contract.Handle) Outcome(contract.DocumentMetadata) {
+        const owner = h.resolve(.document, Document) catch |err| return failure(contract.DocumentMetadata, err);
+        return .{ .value = .{ .text_filter_digest = if (owner.text) |text| text.query_digest else null } };
+    }
+
     fn nullability_page(h: contract.Handle, a: std.mem.Allocator, io: ?contract.IoBorrow, budget: Rows.Budget, plan: *const ReaderValues.nullability.Plan, control: ReaderValues.nullability.Control) Outcome(ReaderValues.NullabilityPage) {
         var receiver: ?contract.IoReceiver = if (io) |borrow| borrow.receive() catch |err| return failure(ReaderValues.NullabilityPage, err) else null;
         const reader = h.resolve(.reader, ReaderOwner) catch |err| return failure(ReaderValues.NullabilityPage, err);

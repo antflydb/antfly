@@ -41980,7 +41980,7 @@ pub const RaftApplyStore = struct {
         }
         if (!try admitIndexAliasTableTxn(self, txn, group_id, replacement)) {
             try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
-            return;
+            return false;
         }
         if (!try privacyKeysReady(self.alloc, txn, group_id, replacement)) {
             if (!try metadata_table_manager.privacyProgressOnly(self.alloc, current, replacement))

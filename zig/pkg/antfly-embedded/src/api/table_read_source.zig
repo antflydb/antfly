@@ -168,7 +168,7 @@ pub const RelationalStatementSnapshot = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: Abi.Dispatch = Abi.local_dispatch,
-    pub const GraphRead = @import("../storage/statement_read_fence.zig").GraphRead;
+    pub const GraphRead = @import("../storage/statement_read_fence.zig").RetainedGraphRead;
     pub const GuardedRead = struct {
         view: RelationalReadView,
         /// Issued by the authenticated routed owner for this exact delayed

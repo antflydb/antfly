@@ -17,7 +17,7 @@
 const Source = @import("read_session_source_types").types;
 pub const Graph = struct {
     read: Source.graph_types.GraphIndex.RetainedEdgeRead,
-    proof: @import("../graph_read_snapshot.zig").Proof,
+    proof: @import("read_session_types").types.graph_snapshot.Proof,
 };
 pub const Implementation = struct {
     read_at_ns: u64 = 0,

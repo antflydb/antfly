@@ -27,9 +27,12 @@ const ReaderValues = @import("read_reader_values.zig");
 const View = @import("relational_read_view.zig").View;
 const Types = @import("db/types.zig");
 const Proof = @import("range_protection.zig").Proof;
-pub const abi_version: u32 = 5;
-pub const Kind = enum(u32) { statement = 1, relational = 2, document = 3, reader = 4, document_reader = 5, statement_fence = 6, _ };
+pub const abi_version: u32 = 6;
+pub const Kind = enum(u32) { statement = 1, relational = 2, document = 3, reader = 4, document_reader = 5, statement_fence = 6, schema_preparation = 7, _ };
+pub const DocumentMetadata = struct { text_filter_digest: ?[32]u8 };
 pub const Operations = struct {
+    apply_schema: ?*const fn (Handle, u64, u64, @import("../api/operation.zig").RequestContext) Outcome(void) = null,
+    document_metadata: ?*const fn (Handle) Outcome(DocumentMetadata) = null,
     metadata: ?*const fn (Handle) Outcome(Values.RelationalMetadata) = null,
     set_read_time: ?*const fn (Handle, u64) Outcome(void) = null,
     seek_prefix: ?*const fn (Handle, []const std.json.Value, ?[]const u8) Outcome(void) = null,
@@ -79,7 +82,7 @@ pub const Handle = extern struct {
         return @ptrCast(@alignCast(pointer));
     }
 };
-pub const Statement = struct { handle: Handle, schema_version: u32 };
+pub const Statement = struct { handle: Handle, schema_version: u32, document: bool = false };
 /// Explicit provider release for a complete immutable page. Payloads may
 /// outlive the session; no session or temporary IO adapter is retained.
 pub const Release = struct {

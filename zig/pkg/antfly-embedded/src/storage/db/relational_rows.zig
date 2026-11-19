@@ -267,7 +267,7 @@ pub const Reader = struct {
                 const implication = try owned.alloc(bool, conditions.len);
                 const KeyConditions = struct { equality: ?Value = null, has_range: bool = false };
                 var keyed: std.AutoHashMapUnmanaged(u64, KeyConditions) = .empty;
-                const ExpressionKey = struct { identity: @import("../relational_index.zig").ExpressionKeyIdentity, fold_ascii: bool };
+                const ExpressionKey = struct { identity: request_values.ExpressionKeyIdentity, fold_ascii: bool };
                 var expression_keyed: std.AutoHashMapUnmanaged(ExpressionKey, Value) = .empty;
                 try expression_keyed.ensureTotalCapacity(owned, @intCast(request.expression_equalities.len));
                 for (request.expression_equalities) |hint| {
@@ -1037,7 +1037,7 @@ pub const Reader = struct {
         self.nullability_projection = identity;
     }
 
-    fn nextPageFormat(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, typed_output: bool, validation: ?*ValidationVisit, visitor: ?@import("types.zig").ScanVisitor) !Page {
+    fn nextPageFormat(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, typed_output: bool, validation: ?*ValidationVisit, visitor: ?Types.types.ScanVisitor) !Page {
         try budget.validate();
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
@@ -1183,7 +1183,7 @@ pub const Reader = struct {
                             // must outlive the reader and source-binding cache.
                             const names = try page.alloc([]const u8, self.fields.len);
                             for (self.fields, names) |name, *out| out.* = try page.dupe(u8, name);
-                            native_layout = try @import("../../sql/catalog.zig").Row.TypedLayout.init(page, names);
+                            native_layout = try request_values.TypedLayout.init(page, names);
                         }
                         // Complete projections already follow requested-field
                         // order. Preserve their direct ordinal fast path; only

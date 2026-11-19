@@ -20,9 +20,9 @@
 const std = @import("std");
 const job = @import("relational_nullability_job.zig");
 const debt = @import("../transaction_debt.zig");
-const DirectoryAudit = debt.SnapshotAudit(*@FieldType(@import("relational_rows.zig").Reader, "read"));
-const TransactionAudit = @import("../transactions.zig").TxnManager.TopologySnapshotAudit(*@FieldType(@import("relational_rows.zig").Reader, "read"));
-const HistoryAudit = @import("relational_schema_apply_outcome.zig").SnapshotAudit(*@FieldType(@import("relational_rows.zig").Reader, "read"));
+const DirectoryAudit = debt.SnapshotAudit(*@FieldType(@import("read_session_backend").RelationalRows.Reader, "read"));
+const TransactionAudit = @import("../transactions.zig").TxnManager.TopologySnapshotAudit(*@FieldType(@import("read_session_backend").RelationalRows.Reader, "read"));
+const HistoryAudit = @import("relational_schema_apply_outcome.zig").SnapshotAudit(*@FieldType(@import("read_session_backend").RelationalRows.Reader, "read"));
 const resources = @import("../resource_manager.zig");
 const Runtime = @import("../background_runtime.zig").BackendRuntime;
 const Scheduler = @import("../../common/maintenance_scheduler.zig").Scheduler;
@@ -141,7 +141,7 @@ pub const Cache = struct {
         }
         /// Structural directory coverage shares the row scanner's immutable
         /// image. This does not establish coordinator decisions or cohort ACKs.
-        pub fn qualifyDirectory(self: *const @This(), a: A, budget: @import("relational_rows.zig").Budget, context: Context) !?debt.SnapshotStats {
+        pub fn qualifyDirectory(self: *const @This(), a: A, budget: @import("read_session_types").types.values.Budget, context: Context) !?debt.SnapshotStats {
             try self.requireCurrent();
             var points = try self.audit().reader.read.openReadScope(a);
             defer points.close();
@@ -155,7 +155,7 @@ pub const Cache = struct {
             if (!try directory.step(&points, .{ .records = @min(budget.records, debt.max_page_units), .time_ns = budget.time_ns, .io = self.io }, &control)) return null;
             return try directory.result();
         }
-        pub fn qualifyTransactions(self: *const @This(), budget: @import("relational_rows.zig").Budget, scratch_dir: []const u8, context: Context) !?@import("../transaction_snapshot.zig").Stats {
+        pub fn qualifyTransactions(self: *const @This(), budget: @import("read_session_types").types.values.Budget, scratch_dir: []const u8, context: Context) !?@import("../transaction_snapshot.zig").Stats {
             try self.requireCurrent();
             const control: Control = .{ .request = context };
             if (self.entry.transactions == null) {
@@ -168,7 +168,7 @@ pub const Cache = struct {
         }
         /// Exact schema-command history is qualified on the same retained
         /// image as rows and cohorts, independently of the row checkpoint.
-        pub fn qualifyHistory(self: *const @This(), a: A, physical_root_dir: []const u8, budget: @import("relational_rows.zig").Budget, context: Context) !?@import("relational_schema_apply_outcome.zig").SnapshotStats {
+        pub fn qualifyHistory(self: *const @This(), a: A, physical_root_dir: []const u8, budget: @import("read_session_types").types.values.Budget, context: Context) !?@import("relational_schema_apply_outcome.zig").SnapshotStats {
             try self.requireCurrent();
             const control: Control = .{ .request = context };
             if (self.entry.history == null) {

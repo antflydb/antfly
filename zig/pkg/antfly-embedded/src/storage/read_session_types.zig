@@ -25,3 +25,4 @@ pub const reader_values = @import("read_reader_values.zig");
 pub const query_lease = @import("query_read_lease_contract.zig");
 
 pub const document_values = @import("read_document_values.zig");
+pub const graph_snapshot = @import("graph_read_snapshot.zig");

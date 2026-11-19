@@ -42,11 +42,12 @@ pub const StatementReadFence = struct {
 };
 pub const GraphStatementSnapshot = opaque {};
 pub const Statement = struct {
+    document: bool,
     handle: contract.Handle,
     schema_version: u32,
     pub fn fromIssued(value: contract.Statement) !Statement {
         try value.handle.validate(.statement);
-        return .{ .handle = value.handle, .schema_version = value.schema_version };
+        return .{ .handle = value.handle, .schema_version = value.schema_version, .document = value.document };
     }
     pub fn deinit(self: *Statement) void {
         contract.call("close", .statement, self.handle, .{self.handle}) catch @panic("incompatible read session owner");
@@ -112,14 +113,20 @@ pub const Relational = struct {
     }
 };
 pub const Document = struct {
+    text_filter_digest: ?[32]u8,
     handle: contract.Handle,
     alloc: A,
     pub fn fromHandle(alloc: A, handle: contract.Handle) !*Document {
         try handle.validate(.document);
         errdefer contract.call("close", .document, handle, .{handle}) catch @panic("incompatible read session owner");
         const self = try alloc.create(Document);
-        self.* = .{ .alloc = alloc, .handle = handle };
+        errdefer alloc.destroy(self);
+        const metadata = try contract.call("document_metadata", .document, handle, .{handle});
+        self.* = .{ .alloc = alloc, .handle = handle, .text_filter_digest = metadata.text_filter_digest };
         return self;
+    }
+    pub fn textFilterDigest(self: *const Document) ?[32]u8 {
+        return self.text_filter_digest;
     }
     pub fn deinit(self: *Document) void {
         contract.call("close", .document, self.handle, .{self.handle}) catch @panic("incompatible read session owner");
