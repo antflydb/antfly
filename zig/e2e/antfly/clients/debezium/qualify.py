@@ -168,7 +168,7 @@ def run(options, directory):
     password = os.environ.get("QUALIFICATION_DATABASE_PASSWORD", "local-test-only")
     env = dict(os.environ, PGPASSWORD=password)
 
-    def sql(text):
+    def sql(*statements):
         return command(
             "docker",
             "run",
@@ -192,8 +192,7 @@ def run(options, directory):
             "-v",
             "ON_ERROR_STOP=1",
             "-At",
-            "-c",
-            text,
+            *(arg for text in statements for arg in ("-c", text)),
             env=env,
         )
 
@@ -242,12 +241,15 @@ def run(options, directory):
                     if time.monotonic() >= deadline:
                         raise
                     time.sleep(0.25)
+        columns = "(id, label, amount, flag)"
         sql(
-            f"CREATE TABLE public.{table} (id integer PRIMARY KEY, label text NOT NULL, amount numeric(38,8) NOT NULL, flag boolean NOT NULL); "
-            f"ALTER TABLE public.{table} REPLICA IDENTITY FULL; "
-            f"INSERT INTO public.{table} VALUES (1, 'snapshot', 12345678901234567890.12345678, true); "
-            f"CREATE PUBLICATION {publication} FOR TABLE public.{table}"
+            f"CREATE TABLE public.{table} (id integer PRIMARY KEY, label text NOT NULL, amount numeric(38,8) NOT NULL, flag boolean NOT NULL)"
         )
+        sql(f"ALTER TABLE public.{table} REPLICA IDENTITY FULL")
+        sql(
+            f"INSERT INTO public.{table} {columns} VALUES (1, 'snapshot', 12345678901234567890.12345678, true)"
+        )
+        sql(f"CREATE PUBLICATION {publication} FOR TABLE public.{table}")
         config = {
             "name": "antfly-qualification",
             "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
@@ -294,8 +296,10 @@ def run(options, directory):
         ).decode()
         assert after["amount"] == expected_decimal, snapshot
         sql(
-            f"BEGIN; INSERT INTO public.{table} VALUES (2, 'stream', 2.5, false); "
-            f"UPDATE public.{table} SET label='updated' WHERE id=1; COMMIT"
+            "BEGIN",
+            f"INSERT INTO public.{table} {columns} VALUES (2, 'stream', 2.5, false)",
+            f"UPDATE public.{table} SET label='updated' WHERE id=1",
+            "COMMIT",
         )
         inserted = client.wait(lambda event: row(event, "c", 2))
         updated = client.wait(lambda event: row(event, "u", 1))
@@ -315,7 +319,7 @@ def run(options, directory):
         client.stop()
         assert (directory / "state/offsets.dat").stat().st_size > 0
         resume = len(client.events)
-        sql(f"INSERT INTO public.{table} VALUES (3, 'offline', 3, true)")
+        sql(f"INSERT INTO public.{table} {columns} VALUES (3, 'offline', 3, true)")
         client.start()
         client.wait(lambda event: row(event, "c", 3), start=resume)
         sql(f"UPDATE public.{table} SET id=10 WHERE id=1")
@@ -331,11 +335,11 @@ def run(options, directory):
             (event.get("value") or {}).get("op") == "r"
             for event in client.events[resume:]
         )
-        sql(f"INSERT INTO public.{table} VALUES (4, 'crash', 4, false)")
+        sql(f"INSERT INTO public.{table} {columns} VALUES (4, 'crash', 4, false)")
         client.wait(lambda event: row(event, "c", 4), start=resume)
         client.stop(abrupt=True)
         crash_resume = len(client.events)
-        sql(f"INSERT INTO public.{table} VALUES (5, 'crash-resume', 5, true)")
+        sql(f"INSERT INTO public.{table} {columns} VALUES (5, 'crash-resume', 5, true)")
         client.start()
         client.wait(lambda event: row(event, "c", 5), start=crash_resume)
         assert not any(
