@@ -276,10 +276,11 @@ END;
             db.run_until_idle()
 
 
-# Every Nth acknowledged full-text write is searched on the writer's own
-# handle right away, outside the timed call: full_index must already make it
-# visible, before any later write, drain or close could.
-VISIBILITY_SAMPLE_INTERVAL = 64
+# After its timed window, each full-text worker makes this many more writes
+# and searches each on its own handle as soon as it is acknowledged:
+# full_index must already make it visible, before any later write, drain or
+# close could. Untimed, so the throughput comparison is not perturbed.
+VISIBILITY_PROBES = 8
 
 
 def worker_main(config, worker, ready, start, begin, stop, results, release, closes):
@@ -353,12 +354,11 @@ def worker_main(config, worker, ready, start, begin, stop, results, release, clo
         if syncs:
             result["syncs_started"] = syncs()
         deadline = begin.value + config["seconds"]
-        sequence = 0
-        while not stop.is_set() and time.monotonic() < deadline:
+        sync_level = "full_index" if config["indexed"] else "write"
+
+        def build(sequence):
             document_key = key(worker, sequence)
-            value = payload(worker, sequence)
-            document = encoded(value)
-            sync_level = "full_index" if config["indexed"] else "write"
+            document = encoded(payload(worker, sequence))
             if config["engine"] != "sqlite" and config["batch_path"] == "wire":
                 # Built outside the timed section, matching the JSON request
                 # string below: only the engine's batch-apply cost is timed,
@@ -376,6 +376,11 @@ def worker_main(config, worker, ready, start, begin, stop, results, release, clo
                     + encoded(sync_level)
                     + "}"
                 )
+            return document_key, document, request
+
+        sequence = 0
+        while not stop.is_set() and time.monotonic() < deadline:
+            document_key, document, request = build(sequence)
             began = time.perf_counter_ns()
             try:
                 write(document_key, document, request)
@@ -389,23 +394,30 @@ def worker_main(config, worker, ready, start, begin, stop, results, release, clo
                 # zero-Busy gate, including any post-commit visibility refusal.
                 continue
             result["latencies_ns"].append(time.perf_counter_ns() - began)
-            if (
-                config["indexed"]
-                and sequence % VISIBILITY_SAMPLE_INTERVAL
-                == VISIBILITY_SAMPLE_INTERVAL - 1
-            ):
-                token = f"matchedworker{worker}sequence{sequence}"
-                found = search_keys(token)
-                result["visibility_samples"] += 1
-                if found != [document_key]:
-                    result["visibility_failures"].append(
-                        {"token": token, "found": found}
-                    )
             sequence += 1
-        result["successful_calls"] = sequence
+        result["timed_calls"] = sequence
         result["ended"] = time.monotonic()
         if syncs:
             result["syncs_ended"] = syncs()
+        probes = 0
+        while config["indexed"] and not stop.is_set() and probes < VISIBILITY_PROBES:
+            document_key, document, request = build(sequence)
+            try:
+                write(document_key, document, request)
+            except busy as error:
+                if config["engine"] == "sqlite" and getattr(
+                    error, "sqlite_errorcode", None
+                ) not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    raise
+                continue  # Other workers may still be finishing their window.
+            token = f"matchedworker{worker}sequence{sequence}"
+            found = search_keys(token)
+            result["visibility_samples"] += 1
+            if found != [document_key]:
+                result["visibility_failures"].append({"token": token, "found": found})
+            probes += 1
+            sequence += 1
+        result["successful_calls"] = sequence
     except BaseException:
         result["error"] = traceback.format_exc()
         stop.set()
@@ -801,15 +813,19 @@ def run_case(config):
         "smoke_only": config["smoke"],
         "compiler_contamination_samples": compiler_contamination_samples,
     }
-    result["all_workers_progressed"] = all(row["successful_calls"] > 0 for row in rows)
+    result["all_workers_progressed"] = all(row["timed_calls"] > 0 for row in rows)
     result["zero_busy"] = result["busy_calls"] == 0
     result["visibility_samples"] = sum(row["visibility_samples"] for row in rows)
     result["visibility_failures"] = [
         f for row in rows for f in row["visibility_failures"]
     ]
+    result["visibility_probed_every_worker"] = not config["indexed"] or all(
+        row["visibility_samples"] >= VISIBILITY_PROBES for row in rows
+    )
     result["qualification_passed"] = (
         result["all_workers_progressed"]
         and result["zero_busy"]
+        and result["visibility_probed_every_worker"]
         and not result["visibility_failures"]
     )
     result["cleanup"] = cleanup(config["path"])
