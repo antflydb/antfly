@@ -28,6 +28,7 @@ const pg_namespace_storage = "\x00pg_catalog.pg_namespace";
 const pg_auth_members_storage = "\x00pg_catalog.pg_auth_members";
 const pg_publication_storage = "\x00pg_catalog.pg_publication";
 const pg_replication_slots_storage = "\x00pg_catalog.pg_replication_slots";
+const pg_index_storage = "\x00pg_catalog.pg_index";
 const pg_attribute_storage = "\x00pg_catalog.pg_attribute";
 const pg_attrdef_storage = "\x00pg_catalog.pg_attrdef";
 const pg_class_storage = "\x00pg_catalog.pg_class";
@@ -50,7 +51,8 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
     const classes = std.mem.eql(u8, name.table, "pg_class");
     const attributes = std.mem.eql(u8, name.table, "pg_attribute");
     const defaults = std.mem.eql(u8, name.table, "pg_attrdef");
-    if (!attributes and !defaults and !classes and !descriptions and !roles and !members and !namespaces and !enums and !slots and !publications and !std.mem.eql(u8, name.table, pg_type_name)) return null;
+    const indexes = std.mem.eql(u8, name.table, "pg_index");
+    if (!indexes and !attributes and !defaults and !classes and !descriptions and !roles and !members and !namespaces and !enums and !slots and !publications and !std.mem.eql(u8, name.table, pg_type_name)) return null;
     if (name.namespace) |namespace| if (!std.mem.eql(u8, namespace, "pg_catalog")) return null;
     if (name.database) |qualified| if (!std.mem.eql(u8, qualified, database)) return error.Forbidden;
     if (action != .read) return error.SqlReadOnlyTransaction;
@@ -115,6 +117,22 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
             .{ .name = "adrelid", .path = "adrelid", .type = .integer, .nullable = false },
             .{ .name = "adnum", .path = "adnum", .type = .integer, .element_type = .int16, .nullable = false },
             .{ .name = "adbin", .path = "adbin", .type = .string, .nullable = false },
+        },
+    };
+    if (indexes) return .{
+        .id = @backingInt(RelationOid.pg_index),
+        .physical_name = pg_index_storage,
+        .schema_version = 1,
+        .scope = .{ .database = database, .namespace = "pg_catalog", .name = "pg_index", .revision = 1 },
+        .columns = &.{
+            .{ .name = "indexrelid", .path = "indexrelid", .type = .integer, .nullable = false },
+            .{ .name = "indrelid", .path = "indrelid", .type = .integer, .nullable = false },
+            .{ .name = "indnatts", .path = "indnatts", .type = .integer, .element_type = .int16, .nullable = false },
+            .{ .name = "indnkeyatts", .path = "indnkeyatts", .type = .integer, .element_type = .int16, .nullable = false },
+            .{ .name = "indisunique", .path = "indisunique", .type = .boolean, .nullable = false },
+            .{ .name = "indisprimary", .path = "indisprimary", .type = .boolean, .nullable = false },
+            .{ .name = "indisvalid", .path = "indisvalid", .type = .boolean, .nullable = false },
+            .{ .name = "indkey", .path = "indkey", .type = .array, .element_type = .int16, .nullable = false },
         },
     };
     if (attributes) return .{
@@ -225,7 +243,7 @@ pub fn resolve(name: ast.Name, action: catalog.Action, database: []const u8) !?c
 }
 
 pub fn owns(table: catalog.Table) bool {
-    return std.mem.eql(u8, table.physical_name, pg_type_storage) or isRoles(table) or isEmpty(table) or isNamespaces(table) or isReplicationSlots(table) or isPublications(table) or isClasses(table) or isAttributes(table);
+    return std.mem.eql(u8, table.physical_name, pg_type_storage) or isRoles(table) or isEmpty(table) or isNamespaces(table) or isReplicationSlots(table) or isPublications(table) or isClasses(table) or isAttributes(table) or isIndexes(table);
 }
 
 pub fn isClasses(table: catalog.Table) bool {
@@ -300,6 +318,66 @@ pub fn openRows(comptime RowType: type, request: catalog.Scan, arena: std.heap.A
     const state = try owned.allocator().create(Classes);
     state.* = .{ .arena = owned, .items = items, .index = start };
     return .{ .ptr = state, .next = Classes.next, .close = Classes.close, .estimated_rows = items.len - start };
+}
+
+pub fn isIndexes(table: catalog.Table) bool {
+    return std.mem.eql(u8, table.physical_name, pg_index_storage);
+}
+
+pub const PrimaryIndex = struct {
+    relation: u32,
+    index: u32,
+    namespace: u32,
+    name: []const u8,
+    keys: []const i16,
+
+    pub fn matches(self: PrimaryIndex, conditions: []const catalog.Condition) !bool {
+        for (conditions) |condition| {
+            const field = std.meta.stringToEnum(enum { indexrelid, indrelid, indnatts, indnkeyatts, indisunique, indisprimary, indisvalid }, condition.column) orelse return error.InvalidSqlBackendResponse;
+            const value: std.json.Value = switch (field) {
+                .indexrelid => .{ .integer = self.index },
+                .indrelid => .{ .integer = self.relation },
+                .indnatts, .indnkeyatts => .{ .integer = @intCast(self.keys.len) },
+                .indisunique, .indisprimary, .indisvalid => .{ .bool = true },
+            };
+            if (!try conditionMatches(value, condition)) return false;
+        }
+        return true;
+    }
+
+    fn page(a: std.mem.Allocator, items: []const PrimaryIndex, start: usize, limit: u32) !catalog.Page {
+        const arrays = local.sql_array_value;
+        const Datum = local.sql_scalar.Datum;
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+        const end = @min(items.len, start +| limit);
+        const rows = try alloc.alloc(catalog.Row, end - start);
+        const layout = try catalog.Row.TypedLayout.init(alloc, &.{ "indexrelid", "indrelid", "indnatts", "indnkeyatts", "indisunique", "indisprimary", "indisvalid", "indkey" });
+        for (items[start..end], rows) |item, *output| {
+            var scratch_arena = std.heap.ArenaAllocator.init(a);
+            defer scratch_arena.deinit();
+            const scratch = scratch_arena.allocator();
+            const cells = try scratch.alloc(Datum, item.keys.len);
+            for (item.keys, cells) |key, *cell| cell.* = Datum.json(.{ .integer = key });
+            const shape = [_]arrays.Dimension{.{ .length = @intCast(cells.len), .lower = 0 }};
+            const key_array = try arrays.Value.init(.int16, &shape, cells, .{});
+            const count = Datum.json(.{ .integer = @intCast(cells.len) });
+            const truth = Datum.json(.{ .bool = true });
+            output.* = try catalog.Row.fromDatums(alloc, try std.fmt.allocPrint(scratch, "{d:0>10}", .{item.index}), layout, &.{
+                Datum.json(.{ .integer = item.index }), Datum.json(.{ .integer = item.relation }),
+                count,                                  count,
+                truth,                                  truth,
+                truth,                                  Datum.typedArray(&key_array),
+            });
+        }
+        return .{ .rows = rows, .owned_arena = arena, .after = if (end < items.len) try std.fmt.allocPrint(alloc, "{d}", .{end}) else null };
+    }
+};
+
+pub fn scanIndexes(a: std.mem.Allocator, request: catalog.Scan, items: []const PrimaryIndex) !catalog.Page {
+    if (request.search != null) return error.UnsupportedSqlShape;
+    return PrimaryIndex.page(a, items, try startOf(request.after, items.len), request.limit);
 }
 
 pub fn isAttributes(table: catalog.Table) bool {
@@ -801,6 +879,21 @@ test "pgwire pg_roles describes only the supplied authenticated role" {
     var exhausted = try cursor.next(cursor.ptr, a, 1);
     defer exhausted.deinit();
     try std.testing.expectEqual(@as(usize, 0), exhausted.rows.len);
+}
+
+test "pgwire pg_index preserves primary key order and int2vector subscripts" {
+    const a = std.testing.allocator;
+    const relation = (try resolve(.{ .table = "pg_index" }, .read, "default")).?;
+    try std.testing.expect(owns(relation));
+    const index: PrimaryIndex = .{ .relation = 17000, .index = 17001, .namespace = 2200, .name = "compound_pk", .keys = &.{ 2, 1 } };
+    const page_ = try scanIndexes(a, .{ .fields = &.{}, .limit = 10 }, &.{index});
+    defer page_.deinit();
+    const typed = page_.rows[0].typed_cells.?;
+    const keys = typed.values[typed.layout.ordinals.get("indkey").?].array.?;
+    try std.testing.expectEqual(Element.int16, keys.element_type);
+    try std.testing.expectEqual(@as(i64, 2), keys.at(&.{0}).?.value.integer);
+    try std.testing.expectEqual(@as(i64, 1), keys.at(&.{1}).?.value.integer);
+    try std.testing.expect(keys.at(&.{2}) == null);
 }
 
 test "pgwire pg_attribute preserves array OIDs and numeric modifiers" {

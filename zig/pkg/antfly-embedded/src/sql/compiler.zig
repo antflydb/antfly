@@ -50,6 +50,7 @@ pub const PostgresCatalogRelation = enum(u32) {
     pg_class = 1259,
     pg_description = 2609,
     pg_attribute = 1249,
+    pg_index = 2610,
     pg_attrdef = 2604,
     pg_type = 1247,
     pg_namespace = 2615,

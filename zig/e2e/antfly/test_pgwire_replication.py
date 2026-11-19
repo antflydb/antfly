@@ -321,6 +321,28 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
         ).splitlines()
         assert columns == ["id|int8|1|t|", "content|text|2|f|"]
         assert names == ["public|smoke|r|"]
+        sql(
+            "CREATE TABLE catalog_key_order (first_key BIGINT, second_key TEXT, "
+            "CONSTRAINT ordered_primary PRIMARY KEY (second_key, first_key))"
+        )
+        primary_key = subprocess.check_output(
+            [
+                psql,
+                *connection,
+                "-XAt",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                "SELECT ci.relname, ci.relkind, i.indnkeyatts, i.indkey[0], i.indkey[1] "
+                "FROM pg_catalog.pg_class ct JOIN pg_catalog.pg_index i ON ct.oid = i.indrelid "
+                "JOIN pg_catalog.pg_class ci ON ci.oid = i.indexrelid "
+                "WHERE ct.relname = 'catalog_key_order' AND i.indisprimary",
+            ],
+            text=True,
+            env=env,
+            timeout=40,
+        ).splitlines()
+        assert primary_key == ["ordered_primary|i|2|2|1"]
         assert catalog_publication() == []
         sql("CREATE PUBLICATION changes FOR TABLE smoke")
         assert catalog_publication() == ["f|t|t|t|f"]

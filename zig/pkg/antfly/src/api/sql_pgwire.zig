@@ -2961,7 +2961,7 @@ const GuardedCatalog = struct {
         if (system.isClasses(table)) {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
-            return system.scanClasses(alloc, request, try self.catalogClasses(arena.allocator(), request.conditions));
+            return system.scanClasses(alloc, request, try self.catalogClasses(arena.allocator(), request.conditions, true));
         }
         if (system.isNamespaces(table)) {
             var arena = std.heap.ArenaAllocator.init(alloc);
@@ -2972,6 +2972,12 @@ const GuardedCatalog = struct {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             return system.scanAttributes(alloc, request, try self.catalogAttributes(arena.allocator(), request.conditions));
+        }
+        if (system.isIndexes(table)) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            return system.scanIndexes(alloc, request, try self.catalogIndexes(a, try self.catalogClasses(a, &.{}, false), request.conditions));
         }
         if (system.owns(table)) return system.scan(alloc, request);
         if (self.authority.importedSnapshot()) |snapshot| return self.scanPinned(alloc, snapshot, table, request);
@@ -3123,7 +3129,7 @@ const GuardedCatalog = struct {
         if (system.isPublications(table)) return system.openSingleRow(alloc, try self.publicationPage(alloc, request));
         if (system.isClasses(table)) {
             var arena = std.heap.ArenaAllocator.init(alloc);
-            const items = self.catalogClasses(arena.allocator(), request.conditions) catch |err| {
+            const items = self.catalogClasses(arena.allocator(), request.conditions, true) catch |err| {
                 arena.deinit();
                 return err;
             };
@@ -3141,6 +3147,14 @@ const GuardedCatalog = struct {
                 return err;
             };
             return system.openRows(system.Attribute, request, arena, items);
+        }
+        if (system.isIndexes(table)) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            const items = self.openIndexRows(arena.allocator(), request.conditions) catch |err| {
+                arena.deinit();
+                return err;
+            };
+            return system.openRows(system.PrimaryIndex, request, arena, items);
         }
         return system.open(alloc, request);
     }
@@ -3233,7 +3247,7 @@ const GuardedCatalog = struct {
         return capture;
     }
 
-    fn catalogClasses(self: *GuardedCatalog, a: std.mem.Allocator, conditions: []const catalog.Condition) ![]const system.Class {
+    fn catalogClasses(self: *GuardedCatalog, a: std.mem.Allocator, conditions: []const catalog.Condition, include_indexes: bool) ![]const system.Class {
         const domain = @import("antfly_local_sources").system_catalog_domain;
         const Relation = compiler.PostgresCatalogRelation;
         var result: std.ArrayList(system.Class) = .empty;
@@ -3277,7 +3291,7 @@ const GuardedCatalog = struct {
                     if (!try http.tablePermissionCurrentlyAllowed(identity, key, .read)) continue;
                     const digest = publication_control.hash(.{ .domain = "antfly:pg-class-oid:v1", .table = entry.table.table_id });
                     const item: system.Class = .{ .oid = 16384 + std.mem.readInt(u32, digest[0..4], .big) % (std.math.maxInt(u32) - 16384), .name = entry.name, .namespace = namespace.oid };
-                    if (try item.matches(conditions)) {
+                    if (include_indexes or try item.matches(conditions)) {
                         var retained = item;
                         retained.name = try a.dupe(u8, item.name);
                         retained.logical = .{ .namespace = namespace.name, .id = entry.table.table_id, .revision = page.revision };
@@ -3290,6 +3304,17 @@ const GuardedCatalog = struct {
                 list.after_table_id = page.next_table_id;
             }
         }
+        if (include_indexes) {
+            const indexes = try self.catalogIndexes(a, result.items, &.{});
+            for (indexes) |index| try result.append(a, .{ .oid = index.index, .name = index.name, .namespace = index.namespace, .kind = "i" });
+            var kept: usize = 0;
+            for (result.items) |item| {
+                if (!try item.matches(conditions)) continue;
+                result.items[kept] = item;
+                kept += 1;
+            }
+            result.shrinkRetainingCapacity(kept);
+        }
         std.mem.sort(system.Class, result.items, {}, struct {
             fn less(_: void, lhs: system.Class, rhs: system.Class) bool {
                 return lhs.oid < rhs.oid;
@@ -3301,9 +3326,80 @@ const GuardedCatalog = struct {
         return result.items;
     }
 
+    const CatalogDefinition = struct { name: []const u8, schema: @import("antfly_local_sources").system_catalog_domain.QueryDefinition };
+
+    fn catalogDefinition(self: *GuardedCatalog, a: std.mem.Allocator, class: system.Class) !?CatalogDefinition {
+        const logical = class.logical orelse return null;
+        const server = self.authority.server orelse return error.InvalidSqlBackendResponse;
+        const context = try self.authority.context();
+        const domain = @import("antfly_local_sources").system_catalog_domain;
+        const target: domain.Target = .{ .database = self.authority.request.database orelse "default", .namespace = logical.namespace, .table = class.name };
+        const bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = .{
+            .targets = &.{target},
+            .include_query_definitions = true,
+            .expected_revision = logical.revision,
+        } });
+        const snapshot = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, bytes, .{});
+        if (snapshot.tables.len != 1 or snapshot.revision != logical.revision) return error.CatalogGenerationChanged;
+        const current = snapshot.tables[0] orelse return error.CatalogGenerationChanged;
+        if (current.table_id != logical.id) return error.CatalogGenerationChanged;
+        try current.requireAccess(context.native_service);
+        const schema = current.query_definition orelse return error.InvalidSqlBackendResponse;
+        if (schema.table_id != logical.id) return error.CatalogGenerationChanged;
+        return .{ .name = current.name, .schema = schema };
+    }
+
+    fn catalogSchema(self: *GuardedCatalog, a: std.mem.Allocator, definition: CatalogDefinition) !catalog.Table {
+        const server = self.authority.server orelse return error.InvalidSqlBackendResponse;
+        return server.sql_schema_cache.resolve(server.sqlPlanCacheIo(), a, definition.schema.schema_json, definition.schema.table_id, definition.name);
+    }
+
+    fn openIndexRows(self: *GuardedCatalog, alloc: std.mem.Allocator, conditions: []const catalog.Condition) ![]const system.PrimaryIndex {
+        return self.catalogIndexes(alloc, try self.catalogClasses(alloc, &.{}, false), conditions);
+    }
+
+    fn catalogIndexes(self: *GuardedCatalog, alloc: std.mem.Allocator, classes: []const system.Class, conditions: []const catalog.Condition) ![]const system.PrimaryIndex {
+        var indexes: std.ArrayList(system.PrimaryIndex) = .empty;
+        for (classes) |class| {
+            if (class.logical == null) continue;
+            try checkpoint(self);
+            var arena = std.heap.ArenaAllocator.init(if (self.authority.server) |server| server.alloc else alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const definition = (try self.catalogDefinition(a, class)) orelse continue;
+            var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, definition.schema.schema_json);
+            defer schema.deinit(a);
+            const constraints = schema.unique_constraints orelse continue;
+            for (constraints.value) |constraint| {
+                if (!(constraint.primary orelse false)) continue;
+                const names = constraint.columns orelse return error.InvalidSqlBackendResponse;
+                const table = try self.catalogSchema(a, definition);
+                const keys = try a.alloc(i16, names.len);
+                for (names, keys) |name, *key| {
+                    key.* = for (table.columns, 1..) |column, ordinal| {
+                        if (std.mem.eql(u8, column.name, name)) break std.math.cast(i16, ordinal) orelse return error.SqlProgramLimitExceeded;
+                    } else return error.InvalidSqlBackendResponse;
+                }
+                const digest = publication_control.hash(.{ .domain = "antfly:pg-primary-index-oid:v1", .table = definition.schema.table_id, .name = constraint.name });
+                var item: system.PrimaryIndex = .{
+                    .relation = class.oid,
+                    .index = 16384 + std.mem.readInt(u32, digest[0..4], .big) % (std.math.maxInt(u32) - 16384),
+                    .namespace = class.namespace,
+                    .name = constraint.name,
+                    .keys = keys,
+                };
+                if (!try item.matches(conditions)) continue;
+                item.name = try alloc.dupe(u8, item.name);
+                item.keys = try alloc.dupe(i16, item.keys);
+                try indexes.append(alloc, item);
+            }
+        }
+        return indexes.items;
+    }
+
     fn catalogAttributes(self: *GuardedCatalog, alloc: std.mem.Allocator, conditions: []const catalog.Condition) ![]const system.Attribute {
         const database = self.authority.request.database orelse "default";
-        const classes = try self.catalogClasses(alloc, &.{});
+        const classes = try self.catalogClasses(alloc, &.{}, false);
         var attributes: std.ArrayList(system.Attribute) = .empty;
         var visited: usize = 0;
         for (classes) |class| {
@@ -3317,28 +3413,10 @@ const GuardedCatalog = struct {
             var arena = std.heap.ArenaAllocator.init(if (self.authority.server) |server| server.alloc else alloc);
             defer arena.deinit();
             const a = arena.allocator();
-            const table = if (class.logical) |logical| table: {
-                const server = self.authority.server orelse return error.InvalidSqlBackendResponse;
-                const context = try self.authority.context();
-                const target = @import("antfly_local_sources").system_catalog_domain.Target{
-                    .database = database,
-                    .namespace = logical.namespace,
-                    .table = class.name,
-                };
-                const bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = .{
-                    .targets = &.{target},
-                    .include_query_definitions = true,
-                    .expected_revision = logical.revision,
-                } });
-                const snapshot = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").system_catalog_domain.ResolvedMany, a, bytes, .{});
-                if (snapshot.tables.len != 1 or snapshot.revision != logical.revision) return error.CatalogGenerationChanged;
-                const current = snapshot.tables[0] orelse return error.CatalogGenerationChanged;
-                if (current.table_id != logical.id) return error.CatalogGenerationChanged;
-                try current.requireAccess(context.native_service);
-                const definition = current.query_definition orelse return error.InvalidSqlBackendResponse;
-                if (definition.table_id != logical.id) return error.CatalogGenerationChanged;
-                break :table try server.sql_schema_cache.resolve(server.sqlPlanCacheIo(), a, definition.schema_json, current.table_id, current.name);
-            } else (try system.resolve(.{ .namespace = "pg_catalog", .table = class.name }, .read, database)) orelse return error.InvalidSqlBackendResponse;
+            const table = if (try self.catalogDefinition(a, class)) |definition|
+                try self.catalogSchema(a, definition)
+            else
+                (try system.resolve(.{ .namespace = "pg_catalog", .table = class.name }, .read, database)) orelse return error.InvalidSqlBackendResponse;
             for (table.columns, 1..) |column, ordinal| {
                 visited += 1;
                 if (visited > 32768) return error.SqlProgramLimitExceeded;
