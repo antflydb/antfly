@@ -121,6 +121,7 @@ pub const JobState = struct {
     /// Aligned with pending_document_pages. Legacy cursors are ready now.
     document_page_retry_at_millis: ?[]const u64 = null,
     resume_document_page: bool = false,
+    document_page_epoch: u64 = 0,
     repair_groups: ?u64 = null,
     result: db_mod.types.ArtifactRepairResult = .{},
     last_error: ?[]const u8 = null,
@@ -176,6 +177,55 @@ pub const BeginAdvanceResult = struct {
     started: bool,
 };
 
+const mem_backend = @import("antfly_local_sources").storage_mem_backend;
+
+const ParkedPageKey = struct {
+    const prefix = "__api_table_repair_pages__:";
+    const JobEpoch = [prefix.len + 16]u8;
+    const Key = [prefix.len + 40]u8;
+
+    fn jobEpoch(job_id: u64, epoch: u64) JobEpoch {
+        var out: JobEpoch = undefined;
+        @memcpy(out[0..prefix.len], prefix);
+        std.mem.writeInt(u64, out[prefix.len..][0..8], job_id, .big);
+        std.mem.writeInt(u64, out[prefix.len + 8 ..][0..8], epoch, .big);
+        return out;
+    }
+
+    fn encode(job_epoch: JobEpoch, retry_at: u64, attempt_id: u64, position: usize) Key {
+        var out: Key = undefined;
+        @memcpy(out[0..job_epoch.len], &job_epoch);
+        std.mem.writeInt(u64, out[job_epoch.len..][0..8], retry_at, .big);
+        std.mem.writeInt(u64, out[job_epoch.len + 8 ..][0..8], attempt_id, .big);
+        std.mem.writeInt(u64, out[job_epoch.len + 16 ..][0..8], @intCast(position), .big);
+        return out;
+    }
+
+    fn retryAt(key: []const u8) u64 {
+        return std.mem.readInt(u64, key[prefix.len + 16 ..][0..8], .big);
+    }
+};
+
+const MemoryParkedPages = struct {
+    backend: mem_backend.Backend,
+    store: docstore_mod.DocStore,
+};
+
+const ParkedPagesUpdate = struct {
+    writes: std.ArrayList(docstore_mod.KVPair) = .empty,
+    selected: ?docstore_mod.OwnedKVPair = null,
+    pop_existing: bool = false,
+
+    fn deinit(self: *ParkedPagesUpdate, alloc: std.mem.Allocator) void {
+        for (self.writes.items) |entry| alloc.free(entry.key);
+        self.writes.deinit(alloc);
+        if (self.selected) |head| {
+            alloc.free(head.key);
+            alloc.free(head.value);
+        }
+    }
+};
+
 pub const Store = struct {
     const PendingMaintenanceEntry = struct {
         previous_job_id: ?u64 = null,
@@ -185,6 +235,9 @@ pub const Store = struct {
     alloc: std.mem.Allocator,
     cfg: StoreConfig,
     opened_store: ?*OpenedStore = null,
+    memory_parked_pages: ?*MemoryParkedPages = null,
+    parked_page_cleanup_cursor: ?ParkedPageKey.Key = null,
+    last_parked_page_cleanup_ms: u64 = 0,
     mutex: std.atomic.Mutex = .unlocked,
     jobs: std.AutoHashMapUnmanaged(u64, []u8) = .{},
     next_job_id: u64 = 1,
@@ -216,6 +269,11 @@ pub const Store = struct {
         while (it.next()) |entry| self.alloc.free(entry.value_ptr.*);
         self.jobs.deinit(self.alloc);
         self.pending_maintenance_jobs.deinit(self.alloc);
+        if (self.memory_parked_pages) |memory| {
+            memory.store.close();
+            memory.backend.close();
+            self.alloc.destroy(memory);
+        }
         if (self.durable_cleanup_cursor) |cursor| self.alloc.free(cursor);
         if (self.opened_store) |store| {
             store.deinit();
@@ -431,6 +489,7 @@ pub const Store = struct {
                 .pending_document_pages = null,
                 .document_page_retry_at_millis = null,
                 .resume_document_page = false,
+                .document_page_epoch = current.document_page_epoch,
                 .repair_groups = current.repair_groups,
                 .control = current.control,
                 .repair_id = current.repair_id,
@@ -466,6 +525,7 @@ pub const Store = struct {
             .pending_document_pages = previous.pending_document_pages,
             .document_page_retry_at_millis = previous.document_page_retry_at_millis,
             .resume_document_page = previous.resume_document_page,
+            .document_page_epoch = previous.document_page_epoch,
             .repair_groups = previous.repair_groups,
             .control = previous.control,
             .repair_id = previous.repair_id,
@@ -522,6 +582,7 @@ pub const Store = struct {
             .pending_document_pages = current.pending_document_pages,
             .document_page_retry_at_millis = current.document_page_retry_at_millis,
             .resume_document_page = current.resume_document_page,
+            .document_page_epoch = current.document_page_epoch,
             .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
@@ -560,6 +621,7 @@ pub const Store = struct {
             previous.pending_document_pages = null;
             previous.document_page_retry_at_millis = null;
             previous.resume_document_page = false;
+            previous.document_page_epoch = std.math.add(u64, previous.document_page_epoch, 1) catch return error.InvalidRepairJobState;
             previous.cursor = null;
             // Failures from the retired topology cannot describe the current
             // traversal. Recount debt from the groups the restarted job sees.
@@ -587,30 +649,6 @@ pub const Store = struct {
             }
         }
         const now_ms = nowMillis();
-        var document_pages: std.ArrayList([]const u8) = .empty;
-        defer document_pages.deinit(alloc);
-        var page_retry_times: std.ArrayList(u64) = .empty;
-        defer page_retry_times.deinit(alloc);
-        if (previous.pending_document_pages) |pages| {
-            try document_pages.appendSlice(alloc, pages);
-            if (previous.document_page_retry_at_millis) |times| {
-                try page_retry_times.appendSlice(alloc, times);
-            } else {
-                try page_retry_times.appendNTimes(alloc, 0, pages.len);
-            }
-        }
-        if (pass.pending_document_pages) |pages| {
-            for (pages) |page| {
-                const still_pending = previous.resume_document_page and pass.in_progress != 0 and
-                    std.mem.eql(u8, previous.cursor orelse "", page);
-                const retry_at = if (previous.auto_advance == true and still_pending)
-                    now_ms +| repairObservationDelayMs(previous.job_id)
-                else
-                    0;
-                try document_pages.append(alloc, page);
-                try page_retry_times.append(alloc, retry_at);
-            }
-        }
         const tracks_groups = pass.pending_index_groups != null or previous.observe_index_groups != null or previous.pending_index_groups != null;
         var pending_observation = previous.pending_observation;
         const stationary_page = pass.has_more and std.mem.eql(u8, previous.cursor orelse "", pass.next_cursor orelse "");
@@ -618,16 +656,22 @@ pub const Store = struct {
             pending_observation = .{ .cursor = previous.cursor };
         }
         const revisit = !pass.has_more and pending_observation != null;
-        const resume_document_page = !pass.has_more and !revisit and document_pages.items.len != 0;
-        var document_retry_at: u64 = 0;
-        const document_cursor: ?[]const u8 = if (resume_document_page) blk: {
-            var earliest: usize = 0;
-            for (page_retry_times.items, 0..) |retry_at, index| {
-                if (retry_at < page_retry_times.items[earliest]) earliest = index;
-            }
-            document_retry_at = page_retry_times.orderedRemove(earliest);
-            break :blk document_pages.orderedRemove(earliest);
-        } else null;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const current_encoded = (try self.loadJobLocked(previous.job_id)) orelse return error.NotFound;
+        var parsed_current = try std.json.parseFromSlice(JobState, self.alloc, current_encoded, .{ .ignore_unknown_fields = true });
+        defer parsed_current.deinit();
+        const current = parsed_current.value;
+        if (!jobStateTransitionTokenMatches(current, previous_state)) return try alloc.dupe(u8, current_encoded);
+
+        var parked: ParkedPagesUpdate = .{};
+        defer parked.deinit(alloc);
+        if (!current.cancel_requested and !pass.observation_changed) {
+            try self.prepareParkedPagesLocked(alloc, previous, pass, now_ms, !pass.has_more and !revisit, &parked);
+        }
+        const resume_document_page = parked.selected != null;
+        const document_retry_at = if (parked.selected) |head| ParkedPageKey.retryAt(head.key) else 0;
+        const document_cursor: ?[]const u8 = if (parked.selected) |head| head.value else null;
         const observe_groups = !pass.has_more and !revisit and !resume_document_page and pending_groups.items.len != 0;
         const rewind_cursor = if (revisit) blk: {
             const cursor = pending_observation.?.cursor orelse break :blk null;
@@ -671,7 +715,7 @@ pub const Store = struct {
         total.has_more = pass.has_more or revisit or observe_groups or resume_document_page;
         // A later page may succeed while documents on an earlier page still
         // failed. Keep that outcome when the traversal reaches its last page.
-        total.debt_remaining = pass.debt_remaining or pending_observation != null or pending_groups.items.len != 0 or resume_document_page or document_pages.items.len != 0 or (previous.control == null and
+        total.debt_remaining = pass.debt_remaining or pending_observation != null or pending_groups.items.len != 0 or resume_document_page or parked.writes.items.len != 0 or (previous.control == null and
             (total.failed != 0 or total.unsupported != 0 or total.missing_source_docs != 0));
         total.next_cursor = if (next_cursor) |value| @constCast(value) else null;
         total.pending_index_groups = null;
@@ -708,15 +752,6 @@ pub const Store = struct {
         else
             null;
 
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        const current_encoded = (try self.loadJobLocked(previous.job_id)) orelse return error.NotFound;
-        var parsed_current = try std.json.parseFromSlice(JobState, self.alloc, current_encoded, .{ .ignore_unknown_fields = true });
-        defer parsed_current.deinit();
-        const current = parsed_current.value;
-        if (!jobStateTransitionTokenMatches(parsed_current.value, previous)) {
-            return try alloc.dupe(u8, current_encoded);
-        }
         if (requiresDurableCancel(current)) {
             const encoded = try encodeState(alloc, .{
                 .job_id = current.job_id,
@@ -732,6 +767,7 @@ pub const Store = struct {
                 .pending_document_pages = null,
                 .document_page_retry_at_millis = null,
                 .resume_document_page = false,
+                .document_page_epoch = current.document_page_epoch,
                 .repair_groups = current.repair_groups,
                 .control = current.control,
                 .repair_id = current.repair_id,
@@ -766,9 +802,8 @@ pub const Store = struct {
             .pending_observation = if (final_phase == .queued and !revisit) pending_observation else null,
             .pending_index_groups = if (final_phase == .queued and !observe_groups and pending_groups.items.len != 0) pending_groups.items else null,
             .observe_index_groups = if (final_phase != .queued) null else if (observe_groups) pending_groups.items else previous.observe_index_groups,
-            .pending_document_pages = if (final_phase == .queued and document_pages.items.len != 0) document_pages.items else null,
-            .document_page_retry_at_millis = if (final_phase == .queued and page_retry_times.items.len != 0) page_retry_times.items else null,
             .resume_document_page = final_phase == .queued and resume_document_page,
+            .document_page_epoch = previous.document_page_epoch,
             .repair_groups = pass.repair_groups orelse previous.repair_groups,
             .control = previous.control,
             .repair_id = previous.repair_id,
@@ -797,7 +832,7 @@ pub const Store = struct {
             .expires_at_millis = now_ms + self.retentionMillis(),
         });
         errdefer alloc.free(encoded);
-        try self.storeEncodedLocked(previous.job_id, encoded, null);
+        try self.storeEncodedWithParkedPagesLocked(previous.job_id, encoded, null, &parked);
         return encoded;
     }
 
@@ -842,6 +877,7 @@ pub const Store = struct {
             .pending_document_pages = current.pending_document_pages,
             .document_page_retry_at_millis = current.document_page_retry_at_millis,
             .resume_document_page = current.resume_document_page,
+            .document_page_epoch = current.document_page_epoch,
             .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
@@ -894,6 +930,7 @@ pub const Store = struct {
             .pending_document_pages = current.pending_document_pages,
             .document_page_retry_at_millis = current.document_page_retry_at_millis,
             .resume_document_page = current.resume_document_page,
+            .document_page_epoch = current.document_page_epoch,
             .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
@@ -947,6 +984,7 @@ pub const Store = struct {
             .pending_document_pages = if (durable_cancel) null else current.pending_document_pages,
             .document_page_retry_at_millis = if (durable_cancel) null else current.document_page_retry_at_millis,
             .resume_document_page = !durable_cancel and current.resume_document_page,
+            .document_page_epoch = current.document_page_epoch,
             .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
@@ -1012,6 +1050,7 @@ pub const Store = struct {
             .pending_document_pages = current.pending_document_pages,
             .document_page_retry_at_millis = current.document_page_retry_at_millis,
             .resume_document_page = current.resume_document_page,
+            .document_page_epoch = current.document_page_epoch,
             .repair_groups = pass.repair_groups orelse current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
@@ -1089,6 +1128,45 @@ pub const Store = struct {
             self.removePendingMaintenanceLocked(job_id);
             if (self.jobs.fetchRemove(job_id)) |removed| self.alloc.free(removed.value);
         }
+        if (self.last_parked_page_cleanup_ms == 0 or now_ms >= self.last_parked_page_cleanup_ms +| durable_cleanup_interval_ms) {
+            self.cleanupParkedPagesLocked() catch |err| {
+                std.log.warn("repair parked page cleanup deferred: {s}", .{@errorName(err)});
+                return;
+            };
+            self.last_parked_page_cleanup_ms = now_ms;
+        }
+    }
+
+    // A topology reset changes the epoch in the same commit as the job
+    // cursor. Retired epochs and cancelled jobs are reclaimed incrementally.
+    fn cleanupParkedPagesLocked(self: *Store) !void {
+        const queue = self.parkedStoreLocked() orelse return;
+        const results = try queue.scanPrefixPage(self.alloc, ParkedPageKey.prefix, if (self.parked_page_cleanup_cursor) |*key| key else null, durable_cleanup_scan_limit);
+        defer docstore_mod.DocStore.freeResults(self.alloc, results);
+        var deletes: [durable_cleanup_scan_limit][]const u8 = undefined;
+        var count: usize = 0;
+        for (results) |entry| {
+            const prefix_len = ParkedPageKey.prefix.len;
+            const stale = blk: {
+                if (entry.key.len != @sizeOf(ParkedPageKey.Key)) break :blk true;
+                const job_id = std.mem.readInt(u64, entry.key[prefix_len..][0..8], .big);
+                const epoch = std.mem.readInt(u64, entry.key[prefix_len + 8 ..][0..8], .big);
+                const encoded = (try self.loadJobLocked(job_id)) orelse break :blk true;
+                var parsed = try std.json.parseFromSlice(JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                break :blk parsed.value.document_page_epoch != epoch or parsed.value.cancel_requested or isTerminalPhase(parsed.value.phase);
+            };
+            if (stale) {
+                deletes[count] = entry.key;
+                count += 1;
+            }
+        }
+        if (count != 0) try queue.putBatch(&.{}, deletes[0..count]);
+        self.parked_page_cleanup_cursor = null;
+        if (results.len == durable_cleanup_scan_limit) {
+            const last = results[results.len - 1].key;
+            if (last.len == @sizeOf(ParkedPageKey.Key)) self.parked_page_cleanup_cursor = last[0..@sizeOf(ParkedPageKey.Key)].*;
+        }
     }
 
     fn shouldRunDurableCleanupLocked(self: *Store, now_ms: u64) bool {
@@ -1136,7 +1214,87 @@ pub const Store = struct {
         try self.storeEncodedLocked(job_id, encoded, next_job_id);
     }
 
+    fn parkedStoreLocked(self: *Store) ?*docstore_mod.DocStore {
+        if (self.opened_store) |opened| return opened.docstore;
+        return if (self.memory_parked_pages) |memory| &memory.store else null;
+    }
+
+    fn ensureParkedStoreLocked(self: *Store) !*docstore_mod.DocStore {
+        if (self.parkedStoreLocked()) |store| return store;
+        const memory = try self.alloc.create(MemoryParkedPages);
+        errdefer self.alloc.destroy(memory);
+        memory.backend = mem_backend.Backend.init(self.alloc, .{});
+        errdefer memory.backend.close();
+        memory.store = try docstore_mod.DocStore.openRuntime(self.alloc, try memory.backend.runtimeStore(self.alloc, .{}));
+        self.memory_parked_pages = memory;
+        return &memory.store;
+    }
+
+    fn prepareParkedPagesLocked(self: *Store, alloc: std.mem.Allocator, previous: JobState, pass: db_mod.types.ArtifactRepairResult, now_ms: u64, select_next: bool, update: *ParkedPagesUpdate) !void {
+        if (previous.control != null or !std.mem.eql(u8, previous.target, "index")) return;
+        const prefix = ParkedPageKey.jobEpoch(previous.job_id, previous.document_page_epoch);
+        // The old inline representation is imported once with the next pass.
+        const legacy = previous.pending_document_pages orelse @as([]const []const u8, &.{});
+        for (legacy, 0..) |cursor, pos| {
+            const retry_at = if (previous.document_page_retry_at_millis) |times| times[pos] else 0;
+            try appendParkedPage(alloc, update, ParkedPageKey.encode(prefix, retry_at, previous.attempt_id, pos), cursor);
+        }
+        if (pass.pending_document_pages) |pages| {
+            for (pages, 0..) |cursor, pos| {
+                const still_pending = previous.resume_document_page and pass.in_progress != 0 and
+                    std.mem.eql(u8, previous.cursor orelse "", cursor);
+                const retry_at = if (previous.auto_advance == true and still_pending)
+                    now_ms +| repairObservationDelayMs(previous.job_id)
+                else
+                    0;
+                try appendParkedPage(alloc, update, ParkedPageKey.encode(prefix, retry_at, previous.attempt_id, legacy.len + pos), cursor);
+            }
+        }
+        if (!select_next) return;
+
+        var earliest: ?usize = null;
+        for (update.writes.items, 0..) |entry, index| {
+            if (earliest == null or std.mem.order(u8, entry.key, update.writes.items[earliest.?].key) == .lt) earliest = index;
+        }
+        if (self.parkedStoreLocked()) |store| {
+            const head = try store.scanPrefixPage(alloc, &prefix, null, 1);
+            defer docstore_mod.DocStore.freeResults(alloc, head);
+            if (head.len != 0) {
+                if (head[0].key.len != @sizeOf(ParkedPageKey.Key) or head[0].value.len == 0 or head[0].value.len > max_job_string_bytes)
+                    return error.InvalidRepairJobState;
+                if (earliest == null or std.mem.order(u8, head[0].key, update.writes.items[earliest.?].key) != .gt) {
+                    try selectParkedPage(alloc, update, head[0].key, head[0].value);
+                    update.pop_existing = true;
+                    return;
+                }
+            }
+        }
+        if (earliest) |index| {
+            const entry = update.writes.swapRemove(index);
+            defer alloc.free(entry.key);
+            try selectParkedPage(alloc, update, entry.key, entry.value);
+        }
+    }
+
+    fn appendParkedPage(alloc: std.mem.Allocator, update: *ParkedPagesUpdate, key: ParkedPageKey.Key, cursor: []const u8) !void {
+        if (cursor.len == 0 or cursor.len > max_job_string_bytes) return error.InvalidRepairJobState;
+        const owned_key = try alloc.dupe(u8, &key);
+        errdefer alloc.free(owned_key);
+        try update.writes.append(alloc, .{ .key = owned_key, .value = cursor });
+    }
+
+    fn selectParkedPage(alloc: std.mem.Allocator, update: *ParkedPagesUpdate, key: []const u8, cursor: []const u8) !void {
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        update.selected = .{ .key = owned_key, .value = try alloc.dupe(u8, cursor) };
+    }
+
     fn storeEncodedLocked(self: *Store, job_id: u64, encoded: []const u8, next_job_id: ?u64) !void {
+        const empty: ParkedPagesUpdate = .{};
+        return self.storeEncodedWithParkedPagesLocked(job_id, encoded, next_job_id, &empty);
+    }
+
+    fn storeEncodedWithParkedPagesLocked(self: *Store, job_id: u64, encoded: []const u8, next_job_id: ?u64, pages: *const ParkedPagesUpdate) !void {
         if (encoded.len > max_job_record_bytes) return error.InvalidRepairJobState;
         const owned = try self.alloc.dupe(u8, encoded);
         errdefer self.alloc.free(owned);
@@ -1156,7 +1314,9 @@ pub const Store = struct {
             defer self.alloc.free(key);
             const active_key = try activeJobKey(self.alloc, job_id);
             defer self.alloc.free(active_key);
-            var writes: [3]docstore_mod.KVPair = undefined;
+            var inline_writes: [3]docstore_mod.KVPair = undefined;
+            const writes: []docstore_mod.KVPair = if (pages.writes.items.len == 0) &inline_writes else try self.alloc.alloc(docstore_mod.KVPair, inline_writes.len + pages.writes.items.len);
+            defer if (pages.writes.items.len != 0) self.alloc.free(writes);
             var write_count: usize = 0;
             var next_raw: [@sizeOf(u64)]u8 = undefined;
             writes[write_count] = .{ .key = key, .value = encoded };
@@ -1173,10 +1333,24 @@ pub const Store = struct {
                 // the same DocStore batch.
                 writes[write_count] = .{ .key = active_key, .value = active_job_marker_value };
                 write_count += 1;
-                try opened.docstore.putBatch(writes[0..write_count], &.{});
-            } else {
-                try opened.docstore.putBatch(writes[0..write_count], &.{active_key});
             }
+            @memcpy(writes[write_count..][0..pages.writes.items.len], pages.writes.items);
+            write_count += pages.writes.items.len;
+            var deletes: [2][]const u8 = undefined;
+            var delete_count: usize = 0;
+            if (isTerminalPhase(parsed.value.phase)) {
+                deletes[delete_count] = active_key;
+                delete_count += 1;
+            }
+            if (pages.pop_existing) {
+                deletes[delete_count] = pages.selected.?.key;
+                delete_count += 1;
+            }
+            try opened.docstore.putBatch(writes[0..write_count], deletes[0..delete_count]);
+        } else if (pages.writes.items.len != 0 or pages.pop_existing) {
+            const queue = try self.ensureParkedStoreLocked();
+            const deletes: []const []const u8 = if (pages.pop_existing) &.{pages.selected.?.key} else &.{};
+            try queue.putBatch(pages.writes.items, deletes);
         }
         if (!queue_job) self.removePendingMaintenanceLocked(job_id);
         if (self.jobs.fetchPutAssumeCapacity(job_id, owned)) |old| self.alloc.free(old.value);
@@ -1271,6 +1445,7 @@ pub const Store = struct {
                     .pending_document_pages = if (durable_cancel) null else parsed.value.pending_document_pages,
                     .document_page_retry_at_millis = if (durable_cancel) null else parsed.value.document_page_retry_at_millis,
                     .resume_document_page = !durable_cancel and parsed.value.resume_document_page,
+                    .document_page_epoch = parsed.value.document_page_epoch,
                     .repair_groups = parsed.value.repair_groups,
                     .control = parsed.value.control,
                     .repair_id = parsed.value.repair_id,
@@ -1371,6 +1546,7 @@ pub const Store = struct {
             .pending_document_pages = current.pending_document_pages,
             .document_page_retry_at_millis = current.document_page_retry_at_millis,
             .resume_document_page = current.resume_document_page,
+            .document_page_epoch = current.document_page_epoch,
             .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
@@ -1963,6 +2139,7 @@ test "durable cancellation scan rotates past a backed off head window" {
             .pending_document_pages = current.pending_document_pages,
             .document_page_retry_at_millis = current.document_page_retry_at_millis,
             .resume_document_page = current.resume_document_page,
+            .document_page_epoch = current.document_page_epoch,
             .repair_groups = current.repair_groups,
             .control = current.control,
             .repair_id = current.repair_id,
@@ -2818,4 +2995,83 @@ test "table repair job commits stationary page failures only when the page settl
     defer completed.deinit();
     try std.testing.expectEqualStrings("succeeded", completed.value.phase);
     try std.testing.expect(!completed.value.result.debt_remaining);
+}
+
+test "table repair job persists a large parked backlog separately across restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/independent-repair-pages", .{tmp.sub_path});
+    defer alloc.free(path);
+    const long_cursor = try alloc.alloc(u8, 48 * 1024);
+    defer alloc.free(long_cursor);
+    @memset(long_cursor, 'b');
+    var parked: [24][]u8 = undefined;
+    @memset(&parked, long_cursor);
+    try std.testing.expect(parked.len * long_cursor.len > max_job_record_bytes);
+
+    var job_id: u64 = undefined;
+    {
+        var store = Store.init(alloc, .{});
+        defer store.deinit();
+        try attachOpenedTestStore(&store, alloc, path);
+        const started = try store.startJob(alloc, "docs", .{ .target = "index", .index = "semantic", .limit = 1, .advance = false });
+        defer alloc.free(started);
+        const queued = try std.json.parseFromSlice(JobState, alloc, started, .{});
+        defer queued.deinit();
+        job_id = queued.value.job_id;
+        const claim = try store.beginAdvance(alloc, queued.value);
+        defer alloc.free(claim.encoded);
+        const running = try std.json.parseFromSlice(JobState, alloc, claim.encoded, .{});
+        defer running.deinit();
+
+        var next_shard = "100:".*;
+        const dispatch = try store.recordPass(alloc, running.value, .{
+            .has_more = true,
+            .debt_remaining = true,
+            .next_cursor = &next_shard,
+            .pending_document_pages = &parked,
+        });
+        defer alloc.free(dispatch);
+        try std.testing.expect(dispatch.len < 4096);
+    }
+
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+    try attachOpenedTestStore(&store, alloc, path);
+    const loaded = (try store.loadJobAlloc(alloc, job_id)).?;
+    defer alloc.free(loaded);
+    const queued = try std.json.parseFromSlice(JobState, alloc, loaded, .{});
+    defer queued.deinit();
+    const claim = try store.beginAdvance(alloc, queued.value);
+    defer alloc.free(claim.encoded);
+    const running = try std.json.parseFromSlice(JobState, alloc, claim.encoded, .{});
+    defer running.deinit();
+    const resumed = try store.recordPass(alloc, running.value, .{});
+    defer alloc.free(resumed);
+    const selected = try std.json.parseFromSlice(JobState, alloc, resumed, .{});
+    defer selected.deinit();
+    try std.testing.expect(selected.value.resume_document_page);
+    try std.testing.expect(selected.value.pending_document_pages == null);
+    try std.testing.expectEqualStrings(long_cursor, selected.value.cursor.?);
+    try std.testing.expect(resumed.len < max_job_record_bytes);
+    const prefix = ParkedPageKey.jobEpoch(job_id, selected.value.document_page_epoch);
+    const remaining = try store.opened_store.?.docstore.scanPrefixPage(alloc, &prefix, null, parked.len);
+    defer docstore_mod.DocStore.freeResults(alloc, remaining);
+    try std.testing.expectEqual(parked.len - 1, remaining.len);
+
+    const resumed_claim = try store.beginAdvance(alloc, selected.value);
+    defer alloc.free(resumed_claim.encoded);
+    const resumed_running = try std.json.parseFromSlice(JobState, alloc, resumed_claim.encoded, .{});
+    defer resumed_running.deinit();
+    const reset = try store.recordPass(alloc, resumed_running.value, .{ .observation_changed = true });
+    defer alloc.free(reset);
+    const reset_state = try std.json.parseFromSlice(JobState, alloc, reset, .{});
+    defer reset_state.deinit();
+    try std.testing.expectEqual(selected.value.document_page_epoch + 1, reset_state.value.document_page_epoch);
+    try std.testing.expect(!reset_state.value.resume_document_page and reset_state.value.cursor == null);
+    store.cleanupExpiredJobs();
+    const retired = try store.opened_store.?.docstore.scanPrefixPage(alloc, &prefix, null, 1);
+    defer docstore_mod.DocStore.freeResults(alloc, retired);
+    try std.testing.expectEqual(@as(usize, 0), retired.len);
 }

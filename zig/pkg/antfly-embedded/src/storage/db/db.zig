@@ -17370,21 +17370,17 @@ pub const DB = struct {
                 // durable replay; a fresh job can explicitly retry its outcome.
                 const same_job = req.repair_job_id != null and completion_snapshot.queued_job_id == req.repair_job_id.?;
                 if (queued != 0 and
-                    ((queued >= issue.sequence and (applied < queued or same_job)) or
-                        (same_job and completion_snapshot.failed_sequence >= queued)))
+                    ((queued >= issue.sequence and applied < queued) or
+                        (same_job and (queued >= issue.sequence or artifactRepairPublicationSettled(completion_snapshot)))))
                 {
-                    if (applied < queued) {
+                    if (applied < queued and !artifactRepairPublicationSettled(completion_snapshot)) {
                         result.in_progress += 1;
                     } else {
                         const readable = issue.artifact_kind == .chunk or try self.artifactNowReadable(alloc, issue.*);
                         // A readable asset may be an old payload or a manifest
                         // recording terminal OCR failures. Only a successful
                         // publication's completion fence proves this repair.
-                        const completed = if (!readable)
-                            false
-                        else if (issue.reason == .enrichment_failed)
-                            (try self.completeArtifactRepairIssueIfCurrent(alloc, issue.*, issue_revision, completion_key, completion_snapshot.epoch, true)) == .completed
-                        else
+                        const completed = issue.reason != .enrichment_failed and readable and
                             try self.clearArtifactRepairIssueIfCurrent(alloc, issue.*, issue_revision);
                         if (completed) {
                             result.repaired += 1;
@@ -17392,9 +17388,9 @@ pub const DB = struct {
                         }
                         // Successful providers may have published a later
                         // derived batch that the index has not applied yet.
-                        // An unchanged, older diagnosis is not a failure of
-                        // this queued attempt; wait for its publication fence.
-                        if (issue.sequence < queued and completion_snapshot.failed_sequence < queued)
+                        // Once publication settles, a consumer that still
+                        // lacks coverage is remaining debt for this attempt.
+                        if (issue.sequence < queued and !artifactRepairPublicationSettled(completion_snapshot))
                             result.in_progress += 1
                         else
                             result.failed += 1;
@@ -17566,6 +17562,11 @@ pub const DB = struct {
         return result;
     }
 
+    fn artifactRepairPublicationSettled(completion: ArtifactRepairCompletionState) bool {
+        return completion.completed_sequence >= completion.queued_sequence or
+            completion.failed_sequence >= completion.queued_sequence;
+    }
+
     fn observeIndexDocumentRepairs(self: *DB, alloc: Allocator, req: types.ArtifactRepairRunRequest, options: types.ArtifactRepairRunOptions, result: *types.ArtifactRepairResult) !void {
         var page = try self.listArtifactRepairIssuesPage(alloc, .{
             .index_name = req.index_name,
@@ -17582,16 +17583,14 @@ pub const DB = struct {
                 defer alloc.free(key);
                 const completion = try self.artifactRepairCompletionSnapshot(alloc, key);
                 const queued = completion.queued_sequence;
-                if (queued != 0 and applied < queued) {
+                if (queued != 0 and applied < queued and !artifactRepairPublicationSettled(completion)) {
                     result.document_replay_in_progress += 1;
                     continue;
                 }
                 if (issue.reason == .enrichment_failed and completion.completed_sequence >= issue.sequence and
                     (issue.artifact_kind == .chunk or try self.artifactNowReadable(alloc, issue)) and
                     try self.observedArtifactRepairConsumerCoverageComplete(alloc, issue)) continue;
-                if (queued != 0 and issue.sequence < queued and completion.failed_sequence < queued and
-                    completion.completed_sequence < queued)
-                {
+                if (queued != 0 and issue.sequence < queued and !artifactRepairPublicationSettled(completion)) {
                     // The source replay applied, but its derived output or
                     // terminal failure is not visible in the ledger yet.
                     result.document_replay_in_progress += 1;
@@ -90284,12 +90283,37 @@ test "db shared repair completion reprocesses consumer with terminal coverage" {
     }});
 
     try std.testing.expect(try db.artifactNowReadable(alloc, pending[0]));
+    // A successful replay shared with a sibling is no longer pending
+    // even though this consumer still has terminal coverage.
+    const applied_before = try enrichment_state.loadAppliedSequence(alloc, db.core.store, enrichment_runtime_mod.scope_name);
+    const settled_sequence = completion.completed_sequence + 1;
+    var shared_publication = completion;
+    shared_publication.queued_sequence = settled_sequence;
+    shared_publication.queued_job_id = 42;
+    shared_publication.completed_sequence = settled_sequence;
+    encodeArtifactRepairCompletionState(&encoded_completion, shared_publication);
+    try db.core.store.put(completion_key, &encoded_completion);
+    try enrichment_state.saveAppliedSequence(db.core.store, enrichment_runtime_mod.scope_name, settled_sequence);
     var observed: types.ArtifactRepairResult = .{ .limit = 1, .observed_only = true };
     defer observed.deinit(alloc);
     try db.observeIndexDocumentRepairs(alloc, .{ .index_name = "semantic" }, .{}, &observed);
     try std.testing.expectEqual(@as(u64, 1), observed.failed);
     try std.testing.expect(observed.debt_remaining);
     try std.testing.expectEqual(@as(u64, 0), observed.in_progress);
+
+    var settled = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
+        .target = .artifact,
+        .index_name = "semantic",
+        .repair_job_id = 42,
+        .operator_initiated = true,
+    }, .{ .defer_durable_index_repair_execution = true });
+    defer settled.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), settled.failed);
+    try std.testing.expectEqual(@as(u64, 0), settled.in_progress);
+    try std.testing.expect(!settled.has_more and settled.debt_remaining);
+    encodeArtifactRepairCompletionState(&encoded_completion, completion);
+    try db.core.store.put(completion_key, &encoded_completion);
+    try enrichment_state.saveAppliedSequence(db.core.store, enrichment_runtime_mod.scope_name, applied_before);
 
     var repair = try db.repairArtifactIssues(alloc, .embedding, 1);
     defer repair.deinit(alloc);
