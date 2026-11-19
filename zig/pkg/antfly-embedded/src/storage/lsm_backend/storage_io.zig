@@ -581,6 +581,8 @@ pub const Storage = struct {
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
+    pub const FreshMappingCachePolicy = enum { preserve_cached, evict_cached };
+
     pub const VTable = struct {
         /// Physical directory for private build files; null disables filesystem staging.
         private_scratch_directory: ?*const fn (*anyopaque) ?[]const u8 = null,
@@ -594,7 +596,7 @@ pub const Storage = struct {
         /// Mapping pins the existing backing file without copying it to scratch.
         direct_immutable_mapping: bool = false,
         /// Bypasses cached descriptors and resolves the current pathname.
-        map_fresh_immutable_artifact: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").MappedArtifact = null,
+        map_fresh_immutable_artifact: ?*const fn (*anyopaque, Allocator, []const u8, FreshMappingCachePolicy) anyerror!@import("../../segment_source.zig").MappedArtifact = null,
         open_immutable_source: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").Source = null,
         /// Artifact-specific reclamation lease with provider-independent
         /// descriptor/runtime ownership. Persistent readers use this capability.
@@ -737,9 +739,9 @@ pub const Storage = struct {
         return self.mapImmutableArtifact(allocator, path);
     }
 
-    pub fn mapFreshImmutableArtifact(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").MappedArtifact {
+    pub fn mapFreshImmutableArtifact(self: Storage, allocator: Allocator, path: []const u8, cache_policy: FreshMappingCachePolicy) !@import("../../segment_source.zig").MappedArtifact {
         const map = self.vtable.map_fresh_immutable_artifact orelse return error.MappedArtifactUnsupported;
-        return BoundaryAbi.call("map_fresh_immutable_artifact", self.boundary_dispatch, map, .{ self.ptr, allocator, path });
+        return BoundaryAbi.call("map_fresh_immutable_artifact", self.boundary_dispatch, map, .{ self.ptr, allocator, path, cache_policy });
     }
 
     /// Validate the immutable artifact against its publication descriptor.
@@ -759,7 +761,7 @@ pub const Storage = struct {
         var fresh = false;
         while (true) : (fresh = true) {
             var artifact = (if (fresh)
-                self.mapFreshImmutableArtifact(allocator, path)
+                self.mapFreshImmutableArtifact(allocator, path, .evict_cached)
             else if (direct_only)
                 self.mapDirectImmutableArtifact(allocator, path)
             else
@@ -3580,19 +3582,19 @@ const NativeMappedArtifact = struct {
     identity: NativeFileIdentity,
 
     fn create(raw: *anyopaque, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").MappedArtifact {
-        return createWithCache(raw, allocator, path, true);
+        return createWithCache(raw, allocator, path, null);
     }
 
-    fn createFresh(raw: *anyopaque, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").MappedArtifact {
-        return createWithCache(raw, allocator, path, false);
+    fn createFresh(raw: *anyopaque, allocator: Allocator, path: []const u8, cache_policy: Storage.FreshMappingCachePolicy) !@import("../../segment_source.zig").MappedArtifact {
+        return createWithCache(raw, allocator, path, cache_policy);
     }
 
-    fn createWithCache(raw: *anyopaque, allocator: Allocator, path: []const u8, comptime use_cache: bool) !@import("../../segment_source.zig").MappedArtifact {
+    fn createWithCache(raw: *anyopaque, allocator: Allocator, path: []const u8, cache_policy: ?Storage.FreshMappingCachePolicy) !@import("../../segment_source.zig").MappedArtifact {
         if (comptime !supports_posix_fd_cache) return error.MappedArtifactUnsupported;
         const state: *NativeStorageState = @ptrCast(@alignCast(raw));
         const retained = try state.acquireLease();
         errdefer retained.release();
-        if (!use_cache) state.invalidatePath(path);
+        if (cache_policy == .evict_cached) state.invalidatePath(path);
         const io = state.threaded.io();
         const cache = state.fdCache();
         const namespace = state.cache_namespace;
@@ -3600,7 +3602,7 @@ const NativeMappedArtifact = struct {
         const shard = cache.shardForHash(path_hash);
         while (true) {
             var epoch: u64 = undefined;
-            if (use_cache) {
+            if (cache_policy == null) {
                 if (cache.retainCached(shard, namespace, path_hash, path, &epoch)) |entry| {
                     defer cache.release(io, entry);
                     return mapFd(retained, allocator, path, entry.fd, entry.identity);
@@ -5616,6 +5618,16 @@ test "native fd cache keeps cold mappings out of the read working set" {
     defer hot_map.deinit();
     try std.testing.expectEqualStrings("hot", hot_map.bytes);
     try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_cache_entries);
+
+    const cache = native.state.fdCache();
+    for ([_][]const u8{ cold, hot }) |path| {
+        const shard = cache.shardForHash(namespacedPathHash(native.state.cache_namespace, path));
+        const epoch = FdCache.mappingEpoch(shard);
+        var fresh = try storage.mapFreshImmutableArtifact(alloc, path, .preserve_cached);
+        defer fresh.deinit();
+        try std.testing.expectEqual(epoch, FdCache.mappingEpoch(shard));
+        try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_cache_entries);
+    }
 
     var positional: [4]u8 = undefined;
     try std.testing.expect(try cold_map.try_read_into.?(cold_map.context.?, 0, &positional));

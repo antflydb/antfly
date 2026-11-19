@@ -1550,7 +1550,7 @@ pub const PersistentIndex = struct {
                     if (comptime builtin.os.tag != .freestanding) {
                         if (store.storage_owner != null) {
                             break :blk index_mod.SegmentData.fromMapped(store.mapFile(segment_path) catch |err| switch (err) {
-                                error.FileNotFound => {
+                                error.FileNotFound, error.EmptySegment => {
                                     try stale_active_ids.append(alloc, seg_id);
                                     continue;
                                 },
@@ -1560,7 +1560,7 @@ pub const PersistentIndex = struct {
                     }
                     if (store.storage.vtable.open_leased_immutable_source != null) {
                         const source = store.storage.openLeasedImmutableSource(alloc, segment_path) catch |err| switch (err) {
-                            error.FileNotFound => {
+                            error.FileNotFound, error.EmptySegment => {
                                 try stale_active_ids.append(alloc, seg_id);
                                 continue;
                             },
@@ -1572,10 +1572,10 @@ pub const PersistentIndex = struct {
                         // The active ID has no content fingerprint to
                         // distinguish an old, valid inode from its replacement.
                         const artifact = (if (store.storage.vtable.map_fresh_immutable_artifact != null)
-                            store.storage.mapFreshImmutableArtifact(alloc, segment_path)
+                            store.storage.mapFreshImmutableArtifact(alloc, segment_path, .preserve_cached)
                         else
                             store.storage.mapImmutableArtifact(alloc, segment_path)) catch |err| switch (err) {
-                            error.FileNotFound => {
+                            error.FileNotFound, error.EmptySegment => {
                                 try stale_active_ids.append(alloc, seg_id);
                                 continue;
                             },
@@ -4764,47 +4764,62 @@ test "persistent merge replacement carries deletion bitmap across reopen" {
 
 test "persistent index open prunes stale active segment references" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = persistTmpPath(&path_buf);
-    defer cleanupPersistDir(path);
+    for ([_]enum { missing, empty_owned, empty_supplied }{ .missing, .empty_owned, .empty_supplied }) |fixture| {
+        var path_buf: [256]u8 = undefined;
+        const path = persistTmpPath(&path_buf);
+        defer cleanupPersistDir(path);
 
-    {
-        var pi = try PersistentIndex.open(alloc, .{ .path = path });
-        defer pi.close();
+        {
+            var pi = try PersistentIndex.open(alloc, .{ .path = path });
+            defer pi.close();
 
-        const seg = try buildSimpleSegment(alloc, "doc:a", "alpha");
-        defer alloc.free(seg);
-        try pi.indexSegment(seg);
+            const seg = try buildSimpleSegment(alloc, "doc:a", "alpha");
+            defer alloc.free(seg);
+            try pi.indexSegment(seg);
 
-        var txn = try pi.beginWriteMainTxn();
-        errdefer txn.abort();
+            var txn = try pi.beginWriteMainTxn();
+            errdefer txn.abort();
 
-        const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1)));
-        txn.delete(.segments, &seg_key) catch |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        };
-        try pi.deleteSegmentRange(&txn, 1);
-        try txn.commit();
-        pi.deleteSegmentFile(1);
-    }
-
-    {
-        var pi = try PersistentIndex.open(alloc, .{ .path = path });
-        defer pi.close();
-
-        const ranges = try pi.activeSegmentRanges(alloc);
-        defer {
-            for (ranges) |*range| range.deinit(alloc);
-            alloc.free(ranges);
+            const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1)));
+            txn.delete(.segments, &seg_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            try pi.deleteSegmentRange(&txn, 1);
+            try txn.commit();
+            if (fixture == .missing) {
+                pi.deleteSegmentFile(1);
+            } else {
+                const files = &pi.segment_files.?;
+                const segment_path = try files.pathAlloc(1);
+                defer alloc.free(segment_path);
+                try files.storage.writeFileAbsolute(segment_path, "");
+            }
         }
-        try std.testing.expectEqual(@as(usize, 0), ranges.len);
 
-        var txn = try pi.beginReadMainTxn();
-        defer txn.abort();
-        const active_ids = try pi.loadActiveSegmentIds(&txn, alloc);
-        defer alloc.free(active_ids);
-        try std.testing.expectEqual(@as(usize, 0), active_ids.len);
+        {
+            var native = if (fixture == .empty_supplied) try storage_io.NativeStorage.init(alloc, .threaded) else null;
+            defer if (native) |*storage| storage.deinit();
+            var pi = try PersistentIndex.open(alloc, .{
+                .path = path,
+                .main_lsm_storage = if (native) |*storage| storage.storage() else null,
+            });
+            defer pi.close();
+            try std.testing.expectEqual(@as(usize, 0), pi.snapshot().segments.len);
+
+            const ranges = try pi.activeSegmentRanges(alloc);
+            defer {
+                for (ranges) |*range| range.deinit(alloc);
+                alloc.free(ranges);
+            }
+            try std.testing.expectEqual(@as(usize, 0), ranges.len);
+
+            var txn = try pi.beginReadMainTxn();
+            defer txn.abort();
+            const active_ids = try pi.loadActiveSegmentIds(&txn, alloc);
+            defer alloc.free(active_ids);
+            try std.testing.expectEqual(@as(usize, 0), active_ids.len);
+        }
     }
 }
 
@@ -4861,7 +4876,7 @@ test "persistent index open releases a rejected segment mapping exactly once" {
     const Fault = struct {
         var closes: usize = 0;
 
-        fn map(_: *anyopaque, _: Allocator, path: []const u8) !@import("../segment_source.zig").MappedArtifact {
+        fn map(_: *anyopaque, _: Allocator, path: []const u8, _: storage_io.Storage.FreshMappingCachePolicy) !@import("../segment_source.zig").MappedArtifact {
             return .{ .bytes = try mapSegmentFile(path), .context = &closes, .release = close };
         }
 
