@@ -156241,3 +156241,119 @@ test "privacy scoped readiness status isolates shared catch-up telemetry" {
     try std.testing.expect(DB.denseCatchUpAffectsIndex(pending, progress));
     try std.testing.expect(!DB.denseCatchUpAffectsIndex(pending, .{}));
 }
+
+test "db optional numeric range filters lexical and dense candidates on fresh and evolved schemas" {
+    const a = std.testing.allocator;
+    const schema =
+        \\{"version":2,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"tenant":{"type":"string","x-antfly-field":{"type":"keyword"}},"retention_years":{"type":"integer","x-antfly-field":{"type":"number","sortable":true}},"size":{"type":"integer","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    const original_schema =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"tenant":{"type":"string","x-antfly-field":{"type":"keyword"}}}}}}}
+    ;
+    const PendingDenseMigration = struct {
+        fn authorityPermitted(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    for ([_]bool{ false, true }) |evolved| {
+        var directory = try TestDirectory.init("db");
+        defer directory.cleanup();
+        // Exercise the same filter planning with a dense index whose storage
+        // generation is held at the mixed-version compatibility floor.
+        var db = try DB.open(a, directory.path(), .{
+            .index_backends = .{ .dense_native_migration_policy_source = .{
+                .ptr = &directory,
+                .authority_permitted = PendingDenseMigration.authorityPermitted,
+            } },
+        });
+        defer db.close();
+        try db.setSchemaJson(a, if (evolved) original_schema else schema);
+        try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+        try db.addIndex(.{ .name = "dv", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"external\":true}" });
+
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var writes: [640]types.BatchWrite = undefined;
+        for (&writes, 0..) |*write, i| {
+            write.* = .{
+                .key = try std.fmt.allocPrint(scratch, "doc:{d:0>3}", .{i}),
+                .value = try std.json.Stringify.valueAlloc(scratch, .{
+                    .body = "harbor beacon",
+                    .tenant = if (i % 4 == 0) "archive" else "audit",
+                    ._embeddings = .{ .dv = [_]f64{ 1, @as(f64, @floatFromInt(i + 1)) / 640 } },
+                }, .{}),
+            };
+        }
+        const text_index = if (evolved) blk: {
+            try db.batch(.{ .writes = &writes, .sync_level = .full_index });
+            try db.setSchemaJson(a, schema);
+            // Public schema evolution publishes a replacement text generation.
+            try db.addIndex(.{ .name = "ft_v2", .kind = .full_text, .config_json = "{}" });
+            break :blk "ft_v2";
+        } else "ft";
+        for (&writes, 0..) |*write, i| {
+            const bucket = (i / 4) % 10;
+            const fields = if (bucket == 9)
+                ",\"size\":99"
+            else
+                try std.fmt.allocPrint(scratch, ",\"retention_years\":{d}", .{5 + bucket});
+            write.value = try std.fmt.allocPrint(scratch, "{s}{s}}}", .{ write.value[0 .. write.value.len - 1], fields });
+        }
+        var offset: usize = 0;
+        while (offset < writes.len) : (offset += 128) {
+            try db.batch(.{ .writes = writes[offset..][0..128], .sync_level = .full_index });
+        }
+
+        for ([_]struct { field: []const u8, value: u32, bucket: ?usize }{
+            .{ .field = "retention_years", .value = 6, .bucket = 1 },
+            .{ .field = "size", .value = 99, .bucket = 9 },
+            .{ .field = "retention_years", .value = 99, .bucket = null },
+        }) |case| {
+            const filter = try std.fmt.allocPrint(scratch,
+                \\{{"bool":{{"must":[{{"term":{{"tenant":"archive"}}}},{{"numeric_range":{{"field":"{s}","min":{d},"max":{d},"inclusive_max":true}}}}]}}}}
+            , .{ case.field, case.value, case.value });
+            const expected: u64 = if (case.bucket != null) 16 else 0;
+            var lexical = try db.search(a, .{
+                .index_name = text_index,
+                .limit = 16,
+                .include_stored = false,
+                .profile = true,
+                .full_text = .{ .match = .{ .field = "body", .text = "harbor beacon" } },
+                .filter_query_json = filter,
+            });
+            defer lexical.deinit();
+            var dense = try db.searchDenseProfiled(a, .{
+                .index_name = "dv",
+                .primary_text_index_name = text_index,
+                .limit = 16,
+                .include_stored = false,
+                .filter_query_json = filter,
+            }, .{ .vector = &.{ 1, 0 }, .k = 16 });
+            defer dense.result.deinit();
+            errdefer std.debug.print(
+                "evolved={} field={s} value={d} lexical={d} dense={d} dense_route={s} reason={s}\n",
+                .{ evolved, case.field, case.value, lexical.hits.len, dense.result.hits.len, dense.profile.search_route, dense.profile.route_reason },
+            );
+            try std.testing.expectEqual(expected, dense.profile.native_filter_candidate_count);
+            if (expected != 0) {
+                try std.testing.expectEqual(expected, lexical.sort_profile.?.candidate_count);
+                try std.testing.expectEqualStrings("exact_native_filter", dense.profile.search_route);
+            } else {
+                try std.testing.expectEqualStrings("native_filter", lexical.sort_profile.?.candidate_source);
+                try std.testing.expectEqualStrings("empty_native_filter", dense.profile.route_reason);
+            }
+            for ([_][]const types.SearchHit{ lexical.hits, dense.result.hits }) |hits| {
+                try std.testing.expectEqual(expected, hits.len);
+                if (case.bucket) |bucket| {
+                    for (0..16) |group| {
+                        const key = writes[group * 40 + bucket * 4].key;
+                        try std.testing.expect(for (hits) |hit| {
+                            if (std.mem.eql(u8, hit.id, key)) break true;
+                        } else false);
+                    }
+                }
+            }
+        }
+    }
+}

@@ -9881,7 +9881,16 @@ fn searchQueryCanUseMappedDocValues(
     };
     if (mapping.field_type != expected_type) return false;
     if (!runtime_schema_mod.mappingHasNativeDocValues(mapping)) return false;
-    return try snapshotTypedDocValuesCoverageForMapping(snapshot, field, mapping) == .covered;
+    const allow_sparse_numeric = expected_type == .numeric and
+        runtime_schema_mod.hasNumericRangeCoverageMapping(schema, field);
+    const coverage = try snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
+        snapshot,
+        field,
+        mapping,
+        null,
+        allow_sparse_numeric,
+    );
+    return coverage.status == .covered;
 }
 
 fn schemaInfersDynamicFieldType(schema: runtime_schema_mod.TableSchema, field: []const u8) bool {
@@ -18311,7 +18320,7 @@ fn snapshotTypedDocValuesCoverageDetailsForMapping(
     field: []const u8,
     mapping: runtime_schema_mod.FieldMapping,
 ) !TypedDocValuesCoverage {
-    return snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(snapshot, field, mapping, null);
+    return snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(snapshot, field, mapping, null, false);
 }
 
 fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
@@ -18319,6 +18328,7 @@ fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
     field: []const u8,
     mapping: runtime_schema_mod.FieldMapping,
     validation: ?index_mod.CoverageValidation,
+    allow_sparse_numeric: bool,
 ) !TypedDocValuesCoverage {
     var expected_value_type: ?typed_dv.ValueType = null;
     for (snapshot.segments, 0..) |*physical, segment_index| {
@@ -18329,6 +18339,14 @@ fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
         };
         defer segment_lease.deinit();
         const segment = segment_lease.entry;
+        const numeric_coverage = if (allow_sparse_numeric)
+            segment.reader.numericRangeCoverage(field) catch |err| switch (err) {
+                error.InvalidSegment, error.CrcMismatch => return .{ .status = .malformed_doc_values_section },
+                else => return err,
+            }
+        else
+            null;
+        if (numeric_coverage == .empty) continue;
         const nulls_complete = try segment.reader.provesNullIndexSortField(field);
         // Sort-only completeness is a producer witness, not general dense
         // column coverage. Validate the header/domain here and each selected
@@ -18370,7 +18388,9 @@ fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
         } else {
             expected_value_type = value_type;
         }
-        if (cached.status != .covered and !(cached.status == .sparse_live_doc_values and mapping.missing_null_policy == .nulls_ordered and nulls_complete)) return .{ .status = cached.status, .value_type = expected_value_type };
+        const sparse_complete = cached.status == .sparse_live_doc_values and
+            (numeric_coverage == .populated or (nulls_complete and mapping.missing_null_policy == .nulls_ordered));
+        if (cached.status != .covered and !sparse_complete) return .{ .status = cached.status, .value_type = expected_value_type };
     }
     return .{ .status = .covered, .value_type = expected_value_type };
 }
@@ -18872,7 +18892,7 @@ fn planTextNativeSortFields(
         const coverage = try snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(snapshot, field.field, mapping, .{
             .execution_deadline_ns = effective_req.execution_deadline_ns,
             .cancellation = effective_req.cancellation,
-        });
+        }, false);
         if (coverage.status != .covered) {
             const reason = typedDocValuesCoverageRejectionReason(coverage.status) orelse .missing_doc_values_capability;
             logNativeSortPlanRejection(
@@ -38522,4 +38542,62 @@ test "time series exact keyword filters admit empty shards without accepting mis
     defer a.free(bytes);
     try writer.addSegment(bytes);
     try std.testing.expect(!try searchQueryCanUseSnapshot(writer.snapshot(), query, .{}, schema, false));
+}
+
+test "optional numeric range coverage survives compaction and rejects unproven inputs" {
+    const a = std.testing.allocator;
+    const numeric: runtime_schema_mod.FieldMapping = .{ .field_type = .numeric, .doc_values = true };
+    const schema: runtime_schema_mod.TableSchema = .{
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{.{ .path = "body", .emitted_name = "body", .analyzer = "standard" }} }},
+        .exact_fields = &.{
+            .{ .field = "rank", .source_field = "rank", .mapping = numeric },
+            .{ .field = "size", .source_field = "size", .mapping = numeric },
+        },
+    };
+    const populated = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{
+        .{ .key = "a", .value = "{\"rank\":6}" },
+        .{ .key = "b", .value = "{\"size\":6}" },
+    }, .{}, schema)).?;
+    defer a.free(populated);
+    const empty = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{
+        .{ .key = "c", .value = "{\"body\":\"beacon\",\"rank\":null}" },
+    }, .{}, schema)).?;
+    defer a.free(empty);
+    const conflicted = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{
+        .{ .key = "d", .value = "{\"body\":\"beacon\",\"rank\":[6]}" },
+        .{ .key = "e", .value = "{\"rank\":6}" },
+    }, .{}, schema)).?;
+    defer a.free(conflicted);
+    const legacy = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{
+        .{ .key = "f", .value = "{\"body\":\"beacon\",\"rank\":6}" },
+    }, .{}, null)).?;
+    defer a.free(legacy);
+
+    const merged = try segment_mod.mergeSegments(a, &.{ populated, empty });
+    defer a.free(merged);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(merged);
+    const rank: search_mod.SearchQuery = .{ .numeric_range = .{ .field = "rank", .min = 6, .max = 6, .inclusive_max = true } };
+    const size: search_mod.SearchQuery = .{ .numeric_range = .{ .field = "size", .min = 6, .max = 6, .inclusive_max = true } };
+    for ([_]search_mod.SearchQuery{ rank, size }, 0..) |query, expected_doc_num| {
+        try std.testing.expect(try searchQueryCanUseSnapshot(writer.snapshot(), query, .{}, schema, false));
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const filter = try search_mod.searchQueryToFilterArena(arena.allocator(), query);
+        const matches = try writer.snapshot().executeFilter(a, filter);
+        defer a.free(matches);
+        try std.testing.expectEqualSlices(u32, &.{@intCast(expected_doc_num)}, matches);
+    }
+    try std.testing.expectEqual(TypedDocValuesCoverageStatus.sparse_live_doc_values, try snapshotTypedDocValuesCoverageForMapping(writer.snapshot(), "rank", numeric));
+    try writer.addSegment(conflicted);
+    try std.testing.expect(!try searchQueryCanUseSnapshot(writer.snapshot(), rank, .{}, schema, false));
+    try std.testing.expect(try searchQueryCanUseSnapshot(writer.snapshot(), size, .{}, schema, false));
+
+    const mixed = try segment_mod.mergeSegments(a, &.{ populated, legacy });
+    defer a.free(mixed);
+    var legacy_writer = try index_mod.IndexWriter.init(a);
+    defer legacy_writer.deinit();
+    try legacy_writer.addSegment(mixed);
+    try std.testing.expect(!try searchQueryCanUseSnapshot(legacy_writer.snapshot(), rank, .{}, schema, false));
 }

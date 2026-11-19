@@ -525,6 +525,8 @@ pub const TextDocument = struct {
     index_sort_values: []const NamedSortValue = &.{},
     /// A mapped projection may reject a non-null scalar or multivalued key.
     index_sort_projection_valid: bool = true,
+    /// Exact numeric fields whose source and typed projection agree for this row.
+    complete_numeric_fields: []const []const u8 = &.{},
     id: []const u8,
     stored_data: []const u8,
     text_fields: []const TextField,
@@ -749,6 +751,7 @@ fn estimateTextDocumentInputBytes(alloc: Allocator, doc: TextDocument) !u64 {
         aliases.finish();
     }
     var total: u64 = @intCast(doc.id.len + doc.stored_data.len);
+    total +|= doc.complete_numeric_fields.len * @sizeOf([]const u8);
     if (doc.stored_source_bytes != 0) total +|= estimateTypedSourceBytes(doc.stored_source.?, &aliases);
     total +|= @as(u64, @intCast(doc.text_fields.len)) * (@sizeOf(TextField) + 16);
     for (doc.text_fields) |field| {
@@ -1370,6 +1373,31 @@ fn writeTextSegmentWithScratch(
         });
         producer_count += 1;
     }
+    var numeric_coverage: std.StringHashMapUnmanaged(usize) = .empty;
+    defer numeric_coverage.deinit(alloc);
+    for (docs) |doc| {
+        for (doc.complete_numeric_fields) |name| {
+            const count = try numeric_coverage.getOrPutValue(alloc, name, 0);
+            count.value_ptr.* += 1;
+        }
+    }
+    var witnesses: std.ArrayListUnmanaged(segment_mod.NumericRangeWitness) = .empty;
+    defer witnesses.deinit(alloc);
+    var coverage_it = numeric_coverage.iterator();
+    while (coverage_it.next()) |entry| {
+        if (entry.value_ptr.* != docs.len) continue;
+        const name = entry.key_ptr.*;
+        const collector = typed_fields.getPtr(name);
+        if (collector) |typed| if (typed.conflicted) continue;
+        const populated = if (collector) |typed|
+            (typed.writer != null and typed.writer.?.entries.items.len != 0) or typed.staged.items.len != 0
+        else
+            false;
+        try witnesses.append(alloc, .{ .field = name, .coverage = if (populated) .populated else .empty });
+        if (!populated and !field_indices.contains(name)) _ = try seg_writer.addField(name);
+    }
+    try seg_writer.addNumericRangeWitnesses(witnesses.items);
+
     var source_fields: std.StringHashMapUnmanaged(void) = .empty;
     defer source_fields.deinit(alloc);
     if (options.store_source_columns and options.store_document_source) {

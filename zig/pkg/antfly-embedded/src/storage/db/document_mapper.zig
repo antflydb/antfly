@@ -1041,6 +1041,7 @@ pub const TextProjectionBatchBuilder = struct {
         const order = if (!has_selected_field) try mappedIndexSortProjection(self.arena, extraction_root, self.schema, extracted.typed_fields) else IndexSortProjection{};
         try self.text_docs.append(self.arena, .{
             .index_sort_values = order.values,
+            .complete_numeric_fields = if (has_selected_field) &.{} else try completeNumericFields(self.arena, extraction_root, self.schema, extracted.typed_fields orelse &.{}),
             .index_sort_projection_valid = order.valid and !has_selected_field,
             .id = doc.key,
             .stored_data = if (self.store_source_columns) "" else doc.stored_data,
@@ -1529,6 +1530,7 @@ pub fn splitProjectionDocsEnd(docs: []const introducer_mod.TextDocument, start: 
 
 fn estimateProjectedTextDocBytes(doc: introducer_mod.TextDocument) usize {
     var total: usize = 64 + doc.id.len + @max(doc.stored_data.len, @as(usize, @intCast(doc.stored_source_bytes)));
+    total +|= doc.complete_numeric_fields.len * @sizeOf([]const u8);
     for (doc.text_fields) |field| {
         total +|= 16 + field.field_name.len + field.text.len;
     }
@@ -3109,6 +3111,51 @@ fn mappedTypedDocValueFieldAlloc(
         .value_type = typedValueType(typed_value),
         .value = typed_value,
     };
+}
+
+fn completeNumericFields(
+    alloc: Allocator,
+    root: std.json.Value,
+    maybe_schema: ?runtime_schema.TableSchema,
+    projected: []const introducer_mod.TypedFieldValue,
+) ![]const []const u8 {
+    const schema = maybe_schema orelse return &.{};
+    if (root != .object) return &.{};
+    var complete: std.ArrayList([]const u8) = .empty;
+    for (schema.exact_fields) |field| {
+        if (!runtime_schema.supportsNumericRangeCoverage(field)) continue;
+
+        const raw = numericCoverageSourceValue(root, field.source_field) orelse continue;
+        const expected: ?f64 = switch (raw) {
+            .null => null,
+            .integer => |number| @floatFromInt(number),
+            .float => |number| if (std.math.isFinite(number)) number else continue,
+            else => continue,
+        };
+        var emitted: ?f64 = null;
+        const valid = for (projected) |typed| {
+            if (!std.mem.eql(u8, typed.field_name, field.field)) continue;
+            if (typed.conflicted or typed.value != .numeric_val or emitted != null) break false;
+            emitted = typed_dv.numericValueAsF64(typed.value.numeric_val);
+        } else emitted == expected;
+        if (valid) try complete.append(alloc, field.field);
+    }
+    return complete.toOwnedSlice(alloc);
+}
+
+/// A literal dotted key can alias the typed column, and a multivalued
+/// ancestor can contribute more than one source value. Reject both.
+fn numericCoverageSourceValue(root: std.json.Value, path: []const u8) ?std.json.Value {
+    var value = root;
+    var remaining = path;
+    while (value == .object) {
+        const dot = std.mem.indexOfScalar(u8, remaining, '.') orelse
+            return value.object.get(remaining) orelse .null;
+        if (value.object.contains(remaining)) return null;
+        value = value.object.get(remaining[0..dot]) orelse .null;
+        remaining = remaining[dot + 1 ..];
+    }
+    return if (value == .null) .null else null;
 }
 
 const IndexSortProjection = struct { values: []const introducer_mod.NamedSortValue = &.{}, valid: bool = true };

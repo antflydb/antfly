@@ -2023,6 +2023,18 @@ pub fn hasHistoricalDeclaredTextExclusions(schema: TableSchema) bool {
 /// Resolve a declared mapping for a concrete field path without requiring a
 /// sample value for `match_mapping_type`. Use this only for schema/config
 /// validation paths that still require physical coverage before queryability.
+/// Only exact numeric fields bound to their own source path can use a
+/// projection witness. Inferred and generated fields retain existing admission rules.
+pub fn supportsNumericRangeCoverage(field: ExactField) bool {
+    return field.mapping.field_type == .numeric and field.mapping.doc_values and
+        std.mem.eql(u8, field.field, field.source_field) and
+        field.field.len != 0 and field.field[0] != '/' and field.field[0] != '_';
+}
+
+pub fn hasNumericRangeCoverageMapping(schema: TableSchema, path: []const u8) bool {
+    return supportsNumericRangeCoverage(findExactField(schema.exact_fields, path) orelse return false);
+}
+
 pub fn resolveDeclaredFieldType(schema: TableSchema, path: []const u8) ?FieldMapping {
     if (findExactField(schema.exact_fields, path)) |field| return field.mapping;
     const field_name = fieldNameFromPath(path);
