@@ -19,13 +19,27 @@ checkpoint contracts; it does not imply those additional source APIs exist today
 A native data node can serve a configured Antfly publication over pgwire. The
 slot binds to that publication at creation. It retains whole committed
 transactions in `pgoutput` format and advances retention after durable client
-feedback. This deployment path currently serves one native history root and
-requires slot creation with `NOEXPORT_SNAPSHOT`.
+feedback. The qualified deployment uses one native history root. Clients can
+start with `NOEXPORT_SNAPSHOT` or create a slot with `EXPORT_SNAPSHOT` and adopt
+its initial LSN after importing the cut in a repeatable-read SQL transaction.
 
-The production e2e test uses PostgreSQL 18.6 `pg_recvlogical` with
-`proto_version=1`. It creates a publication and slot, streams and acknowledges
-a coordinated SQL insert, restarts both Antfly processes, verifies that the
-acknowledged transaction is not replayed, and drops the slot.
+The end-to-end suite ran against Antfly revision `7774536cf6`, which reports
+PostgreSQL 16.0 wire compatibility. Stock `psql` and `pg_recvlogical` 18.6 used
+`pgoutput` protocol version 1 with an authenticated publication over a native
+table with a `BIGINT` primary key and `TEXT` payload. The streaming test covers
+feedback, restart, resume without replay of acknowledged transactions, and slot
+drop. The exported-snapshot test reads the pre-cut row using `psql` and verifies
+that `pg_recvlogical` receives the post-cut update with its full old image. Run
+both cases from the `zig` directory.
+
+```sh
+ANTFLY_BIN="$PWD/zig-out/bin/antfly" uv run --project e2e/antfly pytest e2e/antfly/test_pgwire_replication.py
+```
+
+The [Debezium qualification driver](e2e/antfly/clients/debezium/README.md) passes
+its PostgreSQL 17.6 control with the stock 3.3.0.Final connector. The Antfly run
+reaches connector catalog discovery after login and fails during startup.
+Debezium snapshot and streaming qualification remains open.
 
 Provision a dedicated mounted directory for the slot spool. Every data node
 serving the publication or reclaiming its spool must see the same files and
