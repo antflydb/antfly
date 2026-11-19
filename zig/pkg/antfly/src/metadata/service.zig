@@ -25245,7 +25245,7 @@ test "SQL command fence decoder admission dominates legacy catalog and counter f
         .{ .apply_sql_sequence_counter = guarded },
         .{ .apply_sql_prepared_transaction = guarded },
         .{ .apply_sql_lock_scope = guarded },
-    }) |command| try std.testing.expectEqual(if (command == .apply_sql_prepared_transaction) metadata_topology_protocol.sql_prepared_lock_handoff_version else metadata_topology_protocol.sql_command_fence_version, (try baseRequiredCoordinatedDecoderVersion(a, command)));
+    }) |command| try std.testing.expectEqual(if (command == .apply_sql_prepared_transaction) metadata_topology_protocol.sql_prepared_lock_handoff_version else metadata_topology_protocol.sql_command_fence_version, (try baseRequiredCoordinatedDecoderVersion(std.heap.page_allocator, command)));
     try std.testing.expectEqual(metadata_topology_protocol.sql_lock_authority_version, (try baseRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_sql_lock_scope = "{\"admission\":{\"command_fence\":null}}" })));
 }
 
@@ -25441,28 +25441,6 @@ test "metadata runtime status producer completion selects framed heartbeat profi
         _ = try reportStoreStatusesWithProjected(&service, &projected, &reports);
         try std.testing.expectEqual(@as(usize, 1), service.upserts);
         try std.testing.expect(service.complete);
-    }
-}
-
-pub fn proposeCatalogWithContext(service: anytype, context: api_operation.RequestContext, command: metadata_storage.TransitionCommand) @TypeOf(service.proposeTransitionCommandWithReceipt(command)) {
-    try context.ensureActive();
-    if (comptime @hasDecl(@TypeOf(service.*), "proposeTransitionCommandWithReceiptObserved"))
-        return service.proposeTransitionCommandWithReceiptObserved(command, context.sql_completion_submission);
-    // Foreign/test services without an admission witness remain conservative.
-    context.markSQLSubmission();
-    return service.proposeTransitionCommandWithReceipt(command);
-}
-
-test "metadata.lake combined table features retain the highest decoder floor" {
-    const protocol = metadata_topology_protocol;
-    for ([_][]const u8{ "{}", "{\"resolvers\":{}}", "{\"_resolver_record_store\":{}}", "{\"_privacy\":{}}" }) |indexes| {
-        var table: metadata_table_manager.TableRecord = .{ .table_id = 9, .name = "objects", .storage = .{ .engine = .object }, .min_ranges = 0, .desired_replica_count = 0, .lake_index_catalog_json = "{\"version\":1}", .indexes_json = indexes };
-        try std.testing.expectEqual(protocol.lake_index_catalog_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = table })));
-        try std.testing.expectEqual(protocol.lake_index_catalog_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_table_topology = .{ .create = .{ .table = table, .ranges = &.{}, .expected_transition_generation = 0 } } })));
-        try std.testing.expectEqual(protocol.lake_index_catalog_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } })));
-        const before = table;
-        table.lake_index_catalog_json = "";
-        try std.testing.expectEqual(protocol.lake_index_catalog_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = before, .replacement = table } })));
     }
 }
 

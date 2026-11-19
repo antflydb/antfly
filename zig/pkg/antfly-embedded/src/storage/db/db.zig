@@ -3745,7 +3745,7 @@ pub const DB = struct {
         return self.captureRelationalStatementSnapshotWithGraphs(&.{});
     }
 
-    pub const GraphStatementSnapshot = if (storage_engine.enabled) opaque {} else @import("read_statement_snapshot.zig").Graph;
+    pub const GraphStatementSnapshot = @import("read_session_backend").GraphStatementSnapshot;
 
     pub fn relationalGraphSnapshotPage(self: *DB, cut: *RelationalStatementSnapshot, alloc: Allocator, request: @import("../graph_read_snapshot.zig").Request) !@import("../graph_read_snapshot.zig").Page {
         if (comptime storage_engine.enabled) return storage_engine.call("relationalGraphSnapshotPage", .{ self, cut.handle, alloc, request });

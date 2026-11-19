@@ -40,6 +40,7 @@ pub const StatementReadFence = struct {
         self.owner = null;
     }
 };
+pub const GraphStatementSnapshot = opaque {};
 pub const Statement = struct {
     handle: contract.Handle,
     schema_version: u32,

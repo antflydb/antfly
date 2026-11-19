@@ -97,7 +97,7 @@ test "internal isolated controls preserve neutral document versions across owner
     const a = std.testing.allocator;
     const inventory = @import("../storage/db/artifact_inventory.zig");
     const catalogs: inventory.Catalogs = .{};
-    const requests = [_]db_mod.types.BatchRequest{
+    const requests = [_]db_types.BatchRequest{
         .{ .activate_range_tracking = true },
         .{ .artifact_catalog = .{
             .namespace = @splat(1),
@@ -707,8 +707,8 @@ pub const fromPublic = db_types.fromPublicMutation;
 
 test "internal batch commit requirements survive native owner and forwarded codecs" {
     const a = std.testing.allocator;
-    for ([_]?db_mod.types.CommitRequires{ null, .none, .direct_enrichments }) |requirement| {
-        const request: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .sync_level = .write, .commit_requires = requirement };
+    for ([_]?db_types.CommitRequires{ null, .none, .direct_enrichments }) |requirement| {
+        const request: db_types.BatchRequest = .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .sync_level = .write, .commit_requires = requirement };
         const wire = try encodeBatchRequest(a, request);
         defer a.free(wire);
         var forwarded = try parseInternalBatchRequest(a, wire);
@@ -3728,12 +3728,12 @@ test "internal batch graph endpoint cleanup command isolates planned effects" {
     defer parsed.deinit(alloc);
     try std.testing.expect(parsed.req.graph_endpoint_cleanup_planned);
     try std.testing.expectEqual(.admit_current, parsed.req.document_version_scheme);
-    try db_mod.types.validateGraphEndpointCleanupCommand(parsed.req);
+    try db_types.validateGraphEndpointCleanupCommand(parsed.req);
     const forwarded = try encodeBatchRequest(alloc, parsed.req);
     defer alloc.free(forwarded);
     var forwarded_parsed = try parseInternalBatchRequest(alloc, forwarded);
     defer forwarded_parsed.deinit(alloc);
-    try db_mod.types.validateGraphEndpointCleanupCommand(forwarded_parsed.req);
+    try db_types.validateGraphEndpointCleanupCommand(forwarded_parsed.req);
     try std.testing.expectEqualStrings("hub", parsed.req.graph_endpoint_cleanup_guards[0].endpoint);
     try std.testing.expectEqual(@as(u64, 0), parsed.req.graph_endpoint_cleanup_guards[0].generation);
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .deletes = &.{job} }));
@@ -4107,7 +4107,7 @@ test "distributed txn private control wire keeps document revision metadata inde
     const catalogs: inventory.Catalogs = .{ .indexes = "AIDX\x02\x00\x00\x00\x00\x00\x00\x00", .enrichments = "[]", .resolvers = "[]" };
     const upload = @import("../storage/db/artifact_publication_transport.zig");
     const hashes = [_]upload.Digest{upload.chunkDigest(0, "data")};
-    const requests = [_]db_mod.types.BatchRequest{
+    const requests = [_]db_types.BatchRequest{
         .{ .activate_range_tracking = true, .sync_level = .write },
         .{ .row_policy_publication = .{ .table_id = 7, .expected_generation = 11, .expected_catalog_epoch = 13, .expected_phase = .pending_install, .owner_group_id = 17, .expected_descriptor_digest = @splat(0xab) }, .row_policy_install_bundle = "{\"table_id\":7}" },
         .{ .artifact_catalog = .{ .namespace = @splat(1), .binding = .{ .epoch = 1, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(a) }, .catalogs = catalogs } },
@@ -4118,7 +4118,7 @@ test "distributed txn private control wire keeps document revision metadata inde
         .{ .graph_endpoint_cleanup = true },
         .{ .merge_proof_adoption = .{ .transition_id = 7, .attempt = .{ .donor_term = 3, .sequence = 4 }, .source_pin = @splat(1), .proof_digest = @splat(2), .record_digest = @splat(3) } },
     };
-    for (requests) |request| for ([_]db_mod.types.DocumentVersionScheme{ .admit_current, .legacy, .revision_v1 }) |scheme| {
+    for (requests) |request| for ([_]db_types.DocumentVersionScheme{ .admit_current, .legacy, .revision_v1 }) |scheme| {
         var versioned = request;
         versioned.document_version_scheme = scheme;
         const bytes = try encodeBatchRequest(a, versioned);
