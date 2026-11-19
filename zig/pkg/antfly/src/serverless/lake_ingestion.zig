@@ -70,8 +70,21 @@ pub fn coverage(a: A, table: catalog.types.Table) !u64 {
     var p = try std.json.parseFromSlice(V, a, table.metadata_json, .{});
     defer p.deinit();
     const properties = try catalog.metadata.get(p.value, "properties");
-    const value = properties.object.get("antfly.wal.coverage") orelse return 0;
+    return propertyCoverage(properties.object);
+}
+fn propertyCoverage(properties: std.json.ObjectMap) !u64 {
+    const value = properties.get("antfly.wal.coverage") orelse return 0;
     return std.fmt.parseInt(u64, try catalog.metadata.str(value), 10);
+}
+fn requireSourceProperties(a: A, properties: std.json.ObjectMap, batch: Batch) !void {
+    const source = properties.get("antfly.cdc.source") orelse return error.LakeSourceConflict;
+    const epoch = properties.get("antfly.cdc.epoch") orelse return error.LakeSourceConflict;
+    const keys = properties.get("antfly.cdc.key-fields") orelse return error.LakeSourceConflict;
+    const key_definition = try std.json.Stringify.valueAlloc(a, batch.key_fields, .{});
+    defer a.free(key_definition);
+    if (!std.mem.eql(u8, try catalog.metadata.str(source), batch.source) or
+        !std.mem.eql(u8, try catalog.metadata.str(epoch), batch.epoch) or
+        !std.mem.eql(u8, try catalog.metadata.str(keys), key_definition)) return error.LakeSourceConflict;
 }
 fn matchesPrevious(previous: Batch, batch: Batch) bool {
     return batch.follows(previous);
@@ -85,7 +98,58 @@ pub fn accept(a: A, binding: Binding, unresolved_options: Options, context: Cont
     if (body.len == 0 or body.len > catalog.types.max_commit_bytes) return error.LakeWriteTooLarge;
     var parsed = try std.json.parseFromSlice(Batch, a, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    const batch = parsed.value;
+    return acceptResolvedBatch(a, binding, options, context, parsed.value);
+}
+
+/// Internal capture callers can admit a typed transaction through the same
+/// durable owner, checkpoint, and idempotency checks as /lake/changes.
+pub fn acceptBatch(a: A, binding: Binding, unresolved_options: Options, context: Context, batch: Batch) !u64 {
+    return acceptResolvedBatch(a, binding, try unresolved_options.resolveOwner(a, context), context, batch);
+}
+
+pub const BatchOutcome = struct {
+    accepted_sequence: u64,
+    committed: bool,
+};
+
+/// Resolve an exact admission from durable WAL identity and confirm whether
+/// the catalog has committed its sequence. Absence never advances progress.
+pub fn observeBatch(a: A, binding: Binding, unresolved_options: Options, context: Context, batch: Batch) !?BatchOutcome {
+    const options = try unresolved_options.resolveOwner(a, context);
+    const payload = try std.json.Stringify.valueAlloc(a, batch, .{});
+    defer a.free(payload);
+    var opened = try openQueue(a, binding, options);
+    defer opened.deinit();
+    const base = try prefix(a, opened.prefix, binding, options);
+    defer a.free(base);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null };
+    const accepted = (try observedSequence(arena.allocator(), store, batch, payload)) orelse return null;
+    var current = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
+    defer current.deinit(a);
+    const metadata = try catalog.metadata.parse(arena.allocator(), current.table.metadata_json);
+    const properties = (try catalog.metadata.get(metadata, "properties")).object;
+    const covered = try propertyCoverage(properties);
+    if (covered >= accepted) {
+        try requireSourceProperties(arena.allocator(), properties, batch);
+        if (covered == accepted) {
+            const checkpoint = properties.get("antfly.cdc.checkpoint") orelse return error.LakeCheckpointConflict;
+            if (!std.mem.eql(u8, try catalog.metadata.str(checkpoint), batch.checkpoint)) return error.LakeCheckpointConflict;
+        }
+    }
+    try context.ensureActive();
+    return .{ .accepted_sequence = accepted, .committed = covered >= accepted };
+}
+
+fn observedSequence(a: A, store: wal.Store, batch: Batch, payload: []const u8) !?u64 {
+    const operation_id = &std.fmt.bytesToHex(try batch.identity(a), .lower);
+    var admission = try store.beginAdmission(a, operation_id, payload);
+    defer admission.deinit();
+    return admission.observation.accepted;
+}
+
+fn acceptResolvedBatch(a: A, binding: Binding, options: Options, context: Context, batch: Batch) !u64 {
     const payload = try std.json.Stringify.valueAlloc(a, batch, .{});
     defer a.free(payload);
     var opened = try openQueue(a, binding, options);
@@ -125,12 +189,7 @@ pub fn accept(a: A, binding: Binding, unresolved_options: Options, context: Cont
         const checkpoint = props.get("antfly.cdc.checkpoint");
         if ((checkpoint == null) != (batch.expected_checkpoint == null)) return error.LakeCheckpointConflict;
         if (checkpoint) |v| if (!std.mem.eql(u8, try catalog.metadata.str(v), batch.expected_checkpoint.?)) return error.LakeCheckpointConflict;
-        if (props.get("antfly.cdc.source")) |source| {
-            const key_definition = try std.json.Stringify.valueAlloc(scratch, batch.key_fields, .{});
-            if (!std.mem.eql(u8, try catalog.metadata.str(source), batch.source) or
-                !std.mem.eql(u8, try catalog.metadata.str(props.get("antfly.cdc.epoch").?), batch.epoch) or
-                !std.mem.eql(u8, try catalog.metadata.str(props.get("antfly.cdc.key-fields").?), key_definition)) return error.LakeSourceConflict;
-        }
+        if (props.contains("antfly.cdc.source")) try requireSourceProperties(scratch, props, batch);
     }
     try context.ensureActive();
     const accepted = try admission.append(covered);
@@ -583,7 +642,13 @@ test "external lake filesystem WAL group commit folds pending transactions into 
         "{\"batch_id\":\"b4\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"3\",\"checkpoint\":\"4\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":3}}]}",
         "{\"batch_id\":\"b5\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"4\",\"checkpoint\":\"5\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":4}}]}",
     };
+    const retry = try std.json.parseFromSliceLeaky(Batch, a, payloads[1], .{});
+    try std.testing.expectEqual(@as(?BatchOutcome, null), try observeBatch(a, binding, options, .{}, retry));
     for (payloads, 1..) |payload, lsn| try std.testing.expectEqual(@as(u64, lsn), try accept(a, binding, options, .{}, payload));
+    try std.testing.expectEqual(BatchOutcome{ .accepted_sequence = 2, .committed = false }, (try observeBatch(a, binding, options, .{}, retry)).?);
+    var changed = retry;
+    changed.checkpoint = "different";
+    try std.testing.expectError(error.WalIdempotencyConflict, observeBatch(a, binding, options, .{}, changed));
     // Four changes fit: b1..b3 fold into one snapshot; b4 would exceed the limit.
     try std.testing.expect(try drainBounded(a, binding, options, .{}, 4, max_group_payload_bytes));
     const first = try managed.load(a);
@@ -619,7 +684,8 @@ test "external lake filesystem WAL group commit folds pending transactions into 
     try std.testing.expectEqual(@as(u64, 7), try coverage(a, try managed.load(a)));
     try std.testing.expect(!try drain(a, binding, options, .{}));
     // The exact original requests stay receipts after their group publishes.
-    try std.testing.expectEqual(@as(u64, 2), try accept(a, binding, options, .{}, payloads[1]));
+    try std.testing.expectEqual(@as(u64, 2), try acceptBatch(a, binding, options, .{}, retry));
+    try std.testing.expectEqual(BatchOutcome{ .accepted_sequence = 2, .committed = true }, (try observeBatch(a, binding, options, .{}, retry)).?);
     // Empty polls use the same WAL admission and catalog commit path. They
     // advance coverage without manufacturing data/delete files or losing rows.
     const polls = [_][]const u8{
