@@ -1034,6 +1034,10 @@ pub const GraphPredicateCache = struct {
         return lock;
     }
     pub fn get(self: *@This(), a: Allocator, key: []const u8, control: query_mod.ExecutionControl) !?roaring.RoaringBitmap {
+        return self.getScoped(a, key, control, null);
+    }
+
+    pub fn getScoped(self: *@This(), a: Allocator, key: []const u8, control: query_mod.ExecutionControl, scope: ?*const roaring.RoaringBitmap) !?roaring.RoaringBitmap {
         try control.check();
         while (!self.mutex.tryLock()) {
             try control.check();
@@ -1054,6 +1058,16 @@ pub const GraphPredicateCache = struct {
         const entry = pinned orelse return null;
         defer entry.release();
         try control.check();
+        if (scope) |domain| {
+            var rows = roaring.RoaringBitmap.init(a);
+            errdefer rows.deinit();
+            var ids = domain.iterator();
+            while (ids.next()) |id| {
+                try control.check();
+                if (entry.rows.contains(id)) try rows.add(id);
+            }
+            return rows;
+        }
         var rows = try entry.rows.cloneExact(a);
         errdefer rows.deinit();
         try control.check();

@@ -47067,6 +47067,7 @@ pub const DB = struct {
             .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .dense_index = denseIndexCallback,
             .lookup_doc_key = denseDocKeyCallback,
             .resolve_hit_key = resolveDenseHitKeyCallback,
@@ -47212,6 +47213,7 @@ pub const DB = struct {
             .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .dense_index = denseIndexCallback,
             .lookup_doc_key = denseDocKeyCallback,
             .resolve_hit_key = resolveDenseHitKeyCallback,
@@ -47280,6 +47282,7 @@ pub const DB = struct {
             .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .sparse_index = sparseIndexCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
@@ -49270,6 +49273,7 @@ pub const DB = struct {
         req: types.SearchRequest,
         keys: []const []const u8,
         include: *const doc_set.ResolvedDocSet,
+        exclude: *const doc_set.ResolvedDocSet,
 
         fn collect(ctx: *anyopaque, alloc: Allocator) !std.AutoHashMapUnmanaged(doc_set.DocOrdinal, []const u8) {
             const self: *GraphPredicateFrontier = @ptrCast(@alignCast(ctx));
@@ -49292,7 +49296,7 @@ pub const DB = struct {
             for (self.keys, ordinals) |key, maybe_ordinal| {
                 try control.check();
                 const ordinal = maybe_ordinal orelse continue;
-                if (!self.include.containsOrdinal(ordinal)) continue;
+                if (!self.include.containsOrdinal(ordinal) or self.exclude.containsOrdinal(ordinal)) continue;
                 if (prior) |filter| {
                     if (!containsGraphFrontierRow(&filter.include, &allowed_keys, key, ordinal) or containsGraphFrontierRow(&filter.exclude, &denied_keys, key, ordinal)) continue;
                 }
@@ -49337,11 +49341,21 @@ pub const DB = struct {
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .identity_read_generation = req.identity_read_generation,
         };
-        var input = GraphPredicateFrontier{ .db = self, .req = req, .keys = keys orelse &.{}, .include = &filter.include };
+        var input = GraphPredicateFrontier{ .db = self, .req = req, .keys = keys orelse &.{}, .include = &filter.include, .exclude = &filter.exclude };
         const frontier: ?db_query_search.GraphPredicateFrontier = if (keys != null) .{ .ptr = &input, .collect = GraphPredicateFrontier.collect } else null;
         const budget = native.graph_memory.?.tracked.budget.?;
+        var residual_exclusion = false;
+        if (req.exclusion_query_json.len > 0) {
+            filter.exclude = db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json, null, budget, &native.frontier_scoped) catch |err| switch (err) {
+                error.GraphResidualFrontierRequired => pending: {
+                    residual_exclusion = true;
+                    break :pending .none;
+                },
+                else => return err,
+            };
+        }
         if (req.filter_query_json.len > 0) filter.include = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.filter_query_json, frontier, budget, &native.frontier_scoped);
-        if (req.exclusion_query_json.len > 0) filter.exclude = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json, frontier, budget, &native.frontier_scoped);
+        if (residual_exclusion) filter.exclude = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json, frontier, budget, &native.frontier_scoped);
         if (req.resolved_doc_filter) |raw| {
             const prior: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(raw));
             var prior_include = if (prior.include == .doc_keys) try self.graphPriorKeyOrdinalsAlloc(a, prior.include.doc_keys, req.identity_read_generation) else null;
@@ -156449,7 +156463,17 @@ test "optional numeric range graph admission preserves legacy indexed predicates
     const a = std.testing.allocator;
     var tmp = try TestDirectory.init("graph-legacy-range");
     defer tmp.cleanup();
-    var db = try DB.open(a, tmp.path(), .{});
+    const PendingDenseMigration = struct {
+        fn authorityPermitted(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    var db = try DB.open(a, tmp.path(), .{
+        .index_backends = .{ .dense_native_migration_policy_source = .{
+            .ptr = &tmp,
+            .authority_permitted = PendingDenseMigration.authorityPermitted,
+        } },
+    });
     defer db.close();
     // Mapped numeric values are dense, but this generation predates source
     // witnesses. A dynamic mapping builds that physical shape.
@@ -156465,10 +156489,11 @@ test "optional numeric range graph admission preserves legacy indexed predicates
         } }},
     });
     try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{ .name = "dv", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"external\":true}" });
     try db.batch(.{ .sync_level = .full_index, .writes = &.{
-        .{ .key = "a", .value = "{\"body\":\"beacon\",\"rank\":9007199254740992}" },
-        .{ .key = "b", .value = "{\"body\":\"beacon\",\"rank\":9007199254740993}" },
-        .{ .key = "c", .value = "{\"body\":\"mast\",\"rank\":9007199254740993}" },
+        .{ .key = "a", .value = "{\"body\":\"beacon\",\"rank\":9007199254740992,\"_embeddings\":{\"dv\":[1,0]}}" },
+        .{ .key = "b", .value = "{\"body\":\"beacon\",\"rank\":9007199254740993,\"_embeddings\":{\"dv\":[1,0]}}" },
+        .{ .key = "c", .value = "{\"body\":\"mast\",\"rank\":9007199254740993,\"_embeddings\":{\"dv\":[1,0]}}" },
     } });
     const snapshot = db.core.index_manager.textIndex("ft").?.acquireSnapshot();
     defer snapshot.release();
@@ -156493,6 +156518,39 @@ test "optional numeric range graph admission preserves legacy indexed predicates
 
     const disjunction = cases[1].json;
     const conjunction = cases[0].json;
+    for ([_]struct { filter: []const u8, exclusion: []const u8, expected: []const u8 }{
+        .{ .filter = conjunction, .exclusion = "", .expected = "b" },
+        .{ .filter = "", .exclusion = conjunction, .expected = "a" },
+    }) |test_case| {
+        var lexical = try db.search(a, .{
+            .index_name = "ft",
+            .limit = 3,
+            .include_stored = false,
+            .full_text = .{ .match = .{ .field = "body", .text = "beacon" } },
+            .filter_query_json = test_case.filter,
+            .exclusion_query_json = test_case.exclusion,
+        });
+        defer lexical.deinit();
+        try std.testing.expectEqual(@as(usize, 1), lexical.hits.len);
+        try std.testing.expectEqualStrings(test_case.expected, lexical.hits[0].id);
+        var dense = try db.searchDenseProfiled(a, .{
+            .index_name = "dv",
+            .primary_text_index_name = "ft",
+            .limit = 3,
+            .include_stored = false,
+            .filter_query_json = test_case.filter,
+            .exclusion_query_json = test_case.exclusion,
+        }, .{ .vector = &.{ 1, 0 }, .k = 3 });
+        defer dense.result.deinit();
+        if (test_case.filter.len != 0) {
+            try std.testing.expectEqual(@as(usize, 1), dense.result.hits.len);
+            try std.testing.expectEqualStrings(test_case.expected, dense.result.hits[0].id);
+        } else {
+            try std.testing.expectEqual(@as(usize, 2), dense.result.hits.len);
+            for (dense.result.hits) |hit| try std.testing.expect(!std.mem.eql(u8, hit.id, "b"));
+        }
+    }
+
     var budget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(.{ .max_scanned_anchors = 1 });
     var admission = DB.GraphNodeAdmissionCache.init(&db, a, .{
         .index_name = "ft",
@@ -156520,6 +156578,21 @@ test "optional numeric range graph admission preserves legacy indexed predicates
     const stale_key = try internal_keys.documentKeyAlloc(a, "a");
     defer a.free(stale_key);
     try db.core.store.delete(stale_key);
+    const excluded = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = conjunction,
+        .exclusion_query_json = "{\"doc_id\":[\"a\"]}",
+    }, &.{ "a", "b" });
+    defer a.free(excluded);
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, excluded);
+
+    const decided = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = "{\"bool\":{\"should\":[" ++ range ++ "," ++ match ++ "," ++ match ++ "],\"minimum_should_match\":2}}",
+    }, &.{"a"});
+    defer a.free(decided);
+    try std.testing.expectEqualSlices(bool, &.{true}, decided);
+
     const bounded = try db.filterGraphKeysAlloc(a, .{ .index_name = "ft", .filter_query_json = conjunction }, &.{"b"});
     defer a.free(bounded);
     try std.testing.expectEqualSlices(bool, &.{true}, bounded);

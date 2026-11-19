@@ -969,6 +969,7 @@ pub const TextProjectionBatchBuilder = struct {
     numeric_coverage_terminals: std.StringHashMapUnmanaged(*NumericCoverageNode) = .empty,
     numeric_coverage_emitted: std.ArrayListUnmanaged(*NumericCoverageNode) = .empty,
     numeric_coverage_root: NumericCoverageNode = .{},
+    omitted_text_sources: OmittedTextSources = .empty,
     numeric_coverage_fields: ?[]const []const u8 = null,
     numeric_witness_segment_bytes: usize = 0,
 
@@ -1040,14 +1041,14 @@ pub const TextProjectionBatchBuilder = struct {
         else if (self.schema == null and doc.schema_less_fast_projection)
             ExtractedTextFields{ .fields = doc.schema_less_text_fields }
         else
-            try extractTextFieldsFromValue(self.arena, extraction_root, self.text_analysis, self.schema, self.observed_field_analyzers);
+            try extractTextFieldsFromValue(self.arena, extraction_root, self.text_analysis, self.schema, self.observed_field_analyzers, &self.omitted_text_sources);
         if (!retain_empty and extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0 and !extractedHasTypedFields(extracted)) return;
 
         const order = if (!has_selected_field) try mappedIndexSortProjection(self.arena, extraction_root, self.schema, extracted.typed_fields) else IndexSortProjection{};
         const had_numeric_schema = self.numeric_coverage_fields != null;
-        const has_numeric_source = !has_selected_field and extraction_root == .object and self.schema != null;
+        const has_numeric_source = !has_selected_field and doc.root == .object and self.schema != null;
         const rejections = if (has_numeric_source)
-            try self.numericCoverageRejections(extraction_root.object, extracted.typed_fields orelse &.{})
+            try self.numericCoverageRejections(doc.root.object, extracted.typed_fields orelse &.{})
         else
             &.{};
         const shared = self.numeric_coverage_fields orelse &.{};
@@ -2805,7 +2806,7 @@ fn extractTextFields(
 ) !ExtractedTextFields {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
     defer parsed.deinit();
-    return try extractTextFieldsFromValue(alloc, parsed.value, text_analysis, schema, observed_field_analyzers);
+    return try extractTextFieldsFromValue(alloc, parsed.value, text_analysis, schema, observed_field_analyzers, null);
 }
 
 fn extractTextFieldsFromValue(
@@ -2814,6 +2815,7 @@ fn extractTextFieldsFromValue(
     text_analysis: introducer_mod.TextAnalysisConfig,
     schema: ?runtime_schema.TableSchema,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
+    omitted_sources: ?*OmittedTextSources,
 ) !ExtractedTextFields {
     if (root != .object) return .{ .fields = &.{} };
 
@@ -2843,7 +2845,7 @@ fn extractTextFieldsFromValue(
             null;
 
         if (document_schema) |resolved| {
-            try appendSchemaTextFields(alloc, &fields, root, runtime, resolved, text_analysis, observed_field_analyzers, false);
+            try appendSchemaTextFields(alloc, &fields, root, runtime, resolved, text_analysis, observed_field_analyzers, false, omitted_sources);
         }
         try appendDynamicSchemaTextFields(alloc, &fields, &typed_fields, root, runtime, document_schema, text_analysis, observed_field_analyzers);
         try appendSchemaTypedDocValueFields(alloc, &typed_fields, root, runtime);
@@ -2873,7 +2875,7 @@ pub fn highlightTextFieldsFromValue(
     text_analysis: introducer_mod.TextAnalysisConfig,
     schema: ?runtime_schema.TableSchema,
 ) ![]const HighlightTextField {
-    return highlightTextFieldsFromValueWithSelectedField(alloc, root, text_analysis, schema, null);
+    return highlightTextFieldsFromValueWithSelectedField(alloc, root, text_analysis, schema, null, null);
 }
 
 /// Keep highlight provenance identical to TextProjectionBatchBuilder, including
@@ -2885,7 +2887,7 @@ pub fn highlightTextFieldsFromValueWithSelectedField(
     schema: ?runtime_schema.TableSchema,
     selected_field: ?[]const u8,
 ) ![]const HighlightTextField {
-    const extracted = if (selected_field) |field| try extractSelectedTextField(alloc, root, field) else try extractTextFieldsFromValue(alloc, root, text_analysis, schema, null);
+    const extracted = if (selected_field) |field| try extractSelectedTextField(alloc, root, field) else try extractTextFieldsFromValue(alloc, root, text_analysis, schema, null, null);
     var fields = std.ArrayListUnmanaged(HighlightTextField).empty;
     for (extracted.fields) |field| {
         try fields.append(alloc, .{
@@ -2932,12 +2934,38 @@ pub fn compileHighlightRouting(alloc: Allocator, text_analysis: introducer_mod.T
     const documents = try alloc.alloc(HighlightDocumentRoutes, table.full_text_documents.len);
     for (table.full_text_documents, documents) |document, *out| {
         var fields: std.ArrayListUnmanaged(introducer_mod.TextField) = .empty;
-        try appendSchemaTextFields(alloc, &fields, .{ .object = .empty }, table, document, text_analysis, null, true);
+        try appendSchemaTextFields(alloc, &fields, .{ .object = .empty }, table, document, text_analysis, null, true, null);
         const routes = try alloc.alloc(HighlightTextRoute, fields.items.len);
         for (fields.items, routes) |field, *route| route.* = .{ .source_field = field.source_field orelse field.field_name, .indexed_field = field.field_name, .analyzer = introducer_mod.effectiveTextFieldAnalyzer(field, text_analysis) };
         out.* = .{ .fields = routes };
     }
     return documents;
+}
+
+const OmittedTextSources = std.StringHashMapUnmanaged([]const []const u8);
+
+fn omittedTextSourcesAlloc(
+    alloc: Allocator,
+    exact_fields: []const runtime_schema.ExactField,
+    document: runtime_schema.FullTextDocument,
+) ![]const []const u8 {
+    var declared: std.StringHashMapUnmanaged(void) = .empty;
+    defer declared.deinit(alloc);
+    for (document.declared_paths) |path| try declared.put(alloc, path, {});
+    var emitted: std.StringHashMapUnmanaged(void) = .empty;
+    defer emitted.deinit(alloc);
+    for (document.fields) |field| {
+        if (std.mem.eql(u8, field.path, field.emitted_name)) try emitted.put(alloc, field.path, {});
+    }
+    var sources: std.ArrayList([]const u8) = .empty;
+    errdefer sources.deinit(alloc);
+    for (exact_fields) |field| {
+        if (field.mapping.do_index or !std.mem.eql(u8, field.field, field.source_field)) continue;
+        if (!declared.contains(field.source_field) or emitted.contains(field.source_field) or
+            runtime_schema.pathFallsUnderAnyPrefix(document.unindexed_paths, field.source_field)) continue;
+        try sources.append(alloc, field.source_field);
+    }
+    return sources.toOwnedSlice(alloc);
 }
 
 fn appendSchemaTextFields(
@@ -2949,6 +2977,7 @@ fn appendSchemaTextFields(
     text_analysis: introducer_mod.TextAnalysisConfig,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
     metadata_only: bool,
+    omitted_sources: ?*OmittedTextSources,
 ) !void {
     var physical_schema = schema;
     if (document_schema.physical_exact_fields) |rules| physical_schema.exact_fields = rules;
@@ -2993,22 +3022,20 @@ fn appendSchemaTextFields(
             }
         }
     }
-    // A disabled root can still declare separately indexed named subfields.
-    // Its source remains available even though the root emits no postings.
-    for (physical_schema.exact_fields) |field| {
-        if (field.mapping.do_index or !std.mem.eql(u8, field.field, field.source_field)) continue;
-        if (!runtime_schema.containsPath(document_schema.declared_paths, field.source_field) or
-            runtime_schema.pathFallsUnderAnyPrefix(document_schema.unindexed_paths, field.source_field)) continue;
-        // Current ASCH contains the source and the loop above handled it.
-        // Keep this path for epochs emitted by the short-lived omitted-source
-        // producer, without indexing another document type's declarations.
-        if (for (document_schema.fields) |declared| {
-            if (std.mem.eql(u8, declared.path, field.source_field) and std.mem.eql(u8, declared.path, declared.emitted_name)) break true;
-        } else false) continue;
+    // Compatibility for the omitted-source schema producer.
+    const sources = if (omitted_sources) |cache| cached: {
+        if (cache.get(document_schema.name)) |paths| break :cached paths;
+        const paths = try omittedTextSourcesAlloc(alloc, physical_schema.exact_fields, document_schema);
+        errdefer alloc.free(paths);
+        try cache.put(alloc, document_schema.name, paths);
+        break :cached paths;
+    } else try omittedTextSourcesAlloc(alloc, physical_schema.exact_fields, document_schema);
+    defer if (omitted_sources == null) alloc.free(sources);
+    for (sources) |path| {
         var values: std.ArrayListUnmanaged([]const u8) = .empty;
         defer values.deinit(alloc);
-        if (metadata_only) try values.append(alloc, "") else try collectFieldValues(alloc, &values, root, field.source_field);
-        for (values.items) |text| try appendMappedSubfieldTextFields(alloc, fields, field.source_field, text, physical_schema, text_analysis, observed_field_analyzers);
+        if (metadata_only) try values.append(alloc, "") else try collectFieldValues(alloc, &values, root, path);
+        for (values.items) |text| try appendMappedSubfieldTextFields(alloc, fields, path, text, physical_schema, text_analysis, observed_field_analyzers);
     }
 }
 
