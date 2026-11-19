@@ -163,7 +163,7 @@ pub const StreamOwner = struct {
     check: *const fn (*anyopaque, Port.Request) anyerror!void,
 
     pub fn port(self: *StreamOwner) Port {
-        return .{ .ptr = self, .apply = apply, .bootstrap_committed = bootstrapCommitted, .stage_bootstrap = stageBootstrap };
+        return .{ .ptr = self, .apply = apply, .bootstrap_committed = bootstrapCommitted, .stage_bootstrap = stageBootstrap, .stage_snapshot_page = stageSnapshotPage };
     }
 
     const Guard = struct {
@@ -178,20 +178,27 @@ pub const StreamOwner = struct {
 
     fn apply(raw: *anyopaque, backing: A, request: Port.Request) !Port.Outcome {
         const self: *StreamOwner = @ptrCast(@alignCast(raw));
-        return self.execute(backing, request, .apply);
+        return self.execute(backing, request, .apply, null);
     }
 
     fn bootstrapCommitted(raw: *anyopaque, backing: A, request: Port.Request) !bool {
         const self: *StreamOwner = @ptrCast(@alignCast(raw));
-        return (try self.execute(backing, request, .observe_bootstrap)) == .committed;
+        return (try self.execute(backing, request, .observe_bootstrap, null)) == .committed;
     }
 
     fn stageBootstrap(raw: *anyopaque, backing: A, request: Port.Request) !void {
         const self: *StreamOwner = @ptrCast(@alignCast(raw));
-        _ = try self.execute(backing, request, .stage_bootstrap);
+        _ = try self.execute(backing, request, .stage_bootstrap, null);
     }
 
-    fn execute(self: *StreamOwner, backing: A, request: Port.Request, mode: enum { apply, observe_bootstrap, stage_bootstrap }) !Port.Outcome {
+    fn stageSnapshotPage(raw: *anyopaque, backing: A, request: Port.Request) ![32]u8 {
+        const self: *StreamOwner = @ptrCast(@alignCast(raw));
+        var digest: [32]u8 = undefined;
+        _ = try self.execute(backing, request, .stage_page, &digest);
+        return digest;
+    }
+
+    fn execute(self: *StreamOwner, backing: A, request: Port.Request, mode: enum { apply, observe_bootstrap, stage_bootstrap, stage_page }, page_digest: ?*[32]u8) !Port.Outcome {
         if (request.table.table_id == 0 or request.table.table_id != request.cutover.table_id or request.cutover.cutover_authority_id == 0) return error.UnsupportedReplicationRoute;
         var arena = std.heap.ArenaAllocator.init(backing);
         defer arena.deinit();
@@ -232,6 +239,20 @@ pub const StreamOwner = struct {
             retireBootstrapStage(a, bound.binding, options, context, bootstrap);
             try context.ensureActive();
             return .committed;
+        }
+        if (mode == .stage_page or request.snapshot_chunks != null) {
+            if (request.previous_checkpoint != null or request.changes.len != 0 or request.checkpoint.len == 0 or
+                !std.mem.eql(u8, request.checkpoint, request.cutover.prepared_checkpoint)) return error.InvalidReplicationCheckpoint;
+            const snapshot = try bootstrapIdentity(a, source, epoch, request.checkpoint, identity.key_columns);
+            if (mode == .stage_page) {
+                if (request.snapshot_chunks != null) return error.InvalidReplicationCheckpoint;
+                const rows = request.snapshot_rows orelse return error.InvalidReplicationCheckpoint;
+                page_digest.?.* = try writeBootstrapPage(a, bound.binding, options, context, snapshot, rows);
+            } else {
+                if (mode != .stage_bootstrap or request.snapshot_rows != null) return error.InvalidReplicationCheckpoint;
+                try sealBootstrapPages(a, bound.binding, options, context, snapshot, request.snapshot_chunks.?);
+            }
+            return .accepted;
         }
         if (mode == .stage_bootstrap and request.snapshot_rows == null) return error.InvalidReplicationCheckpoint;
         const batch = if (request.snapshot_rows) |rows| blk: {
@@ -282,7 +303,28 @@ fn removeBootstrapStage(a: A, binding: Binding, options: Options, context: Conte
     var opened = try openQueue(a, binding, options);
     defer opened.deinit();
     const base = try prefix(a, opened.prefix, binding, options);
-    const key = try bootstrapStageKey(a, base, batch);
+    const stage = try bootstrapStageKey(a, base, batch);
+    const manifest = try std.fmt.allocPrint(a, "{s}.manifest", .{stage});
+    var client = opened.client;
+    const cancellation = catalog.types.contextCancellation(&context);
+    var root = client.getObject(opened.bucket, manifest, .{ .cancellation = cancellation }) catch |err| switch (err) {
+        error.NotFound, error.ObjectNotFound, error.FileNotFound => {
+            try removeBootstrapObject(&opened, context, stage);
+            return;
+        },
+        else => return err,
+    };
+    defer root.deinit(client.allocator);
+    const pages = try std.json.parseFromSliceLeaky([]const [32]u8, a, root.body, .{});
+    if (pages.len > max_bootstrap_pages) return error.LakeWriteTooLarge;
+    for (pages) |digest| {
+        const page = try std.fmt.allocPrint(a, "{s}.pages/{s}", .{ stage, &std.fmt.bytesToHex(digest, .lower) });
+        try removeBootstrapObject(&opened, context, page);
+    }
+    try removeBootstrapObject(&opened, context, manifest);
+}
+
+fn removeBootstrapObject(opened: *local.serverless_object_store_support.OpenedObjectStore, context: Context, key: []const u8) !void {
     var client = opened.client;
     const cancellation = catalog.types.contextCancellation(&context);
     var current = client.statObjectWithOptions(opened.bucket, key, .{ .cancellation = cancellation }) catch |err| switch (err) {
@@ -302,12 +344,77 @@ fn bootstrapStageKey(a: A, base: []const u8, batch: Batch) ![]u8 {
     return std.fmt.allocPrint(a, "{s}-bootstrap/{s}.json", .{ base, &std.fmt.bytesToHex(try batch.identity(a), .lower) });
 }
 
+const max_bootstrap_pages = 1024;
+
+fn writeBootstrapPage(a: A, binding: Binding, options: Options, context: Context, batch: Batch, rows: []const V) ![32]u8 {
+    if (rows.len == 0 or rows.len > max_group_changes) return error.LakeWriteTooLarge;
+    const bytes = try std.json.Stringify.valueAlloc(a, rows, .{});
+    if (bytes.len > catalog.types.max_commit_bytes) return error.LakeWriteTooLarge;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    var opened = try openQueue(a, binding, options);
+    defer opened.deinit();
+    const base = try prefix(a, opened.prefix, binding, options);
+    const stage = try bootstrapStageKey(a, base, batch);
+    const page = try std.fmt.allocPrint(a, "{s}.pages/{s}", .{ stage, &std.fmt.bytesToHex(digest, .lower) });
+    try writeImmutableBootstrap(&opened, context, page, bytes);
+    return digest;
+}
+
+fn sealBootstrapPages(a: A, binding: Binding, options: Options, context: Context, batch: Batch, pages: []const [32]u8) !void {
+    if (pages.len > max_bootstrap_pages) return error.LakeWriteTooLarge;
+    var opened = try openQueue(a, binding, options);
+    defer opened.deinit();
+    const base = try prefix(a, opened.prefix, binding, options);
+    const stage = try bootstrapStageKey(a, base, batch);
+    const manifest = try std.fmt.allocPrint(a, "{s}.manifest", .{stage});
+    const bytes = try std.json.Stringify.valueAlloc(a, pages, .{});
+    try writeImmutableBootstrap(&opened, context, manifest, bytes);
+}
+
+fn readBootstrapPages(a: A, opened: *local.serverless_object_store_support.OpenedObjectStore, context: Context, stage: []const u8, expected: Batch) !?Batch {
+    var client = opened.client;
+    const cancellation = catalog.types.contextCancellation(&context);
+    const manifest = try std.fmt.allocPrint(a, "{s}.manifest", .{stage});
+    var root = client.getObject(opened.bucket, manifest, .{ .cancellation = cancellation }) catch |err| switch (err) {
+        error.NotFound, error.ObjectNotFound, error.FileNotFound => return null,
+        else => return err,
+    };
+    defer root.deinit(client.allocator);
+    const pages = try std.json.parseFromSliceLeaky([]const [32]u8, a, root.body, .{});
+    if (pages.len > max_bootstrap_pages) return error.LakeWriteTooLarge;
+    var changes: std.ArrayList(Batch.Change) = .empty;
+    var total_bytes: usize = 0;
+    for (pages) |digest| {
+        try context.ensureActive();
+        const key = try std.fmt.allocPrint(a, "{s}.pages/{s}", .{ stage, &std.fmt.bytesToHex(digest, .lower) });
+        var page = try client.getObject(opened.bucket, key, .{ .cancellation = cancellation });
+        defer page.deinit(client.allocator);
+        if (page.body.len > catalog.types.max_commit_bytes - total_bytes) return error.LakeWriteTooLarge;
+        total_bytes += page.body.len;
+        var actual: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(page.body, &actual, .{});
+        if (!std.mem.eql(u8, &digest, &actual)) return error.ArtifactIntegrityMismatch;
+        const rows = try std.json.parseFromSliceLeaky([]const V, a, page.body, .{ .allocate = .alloc_always });
+        if (rows.len > catalog.row_commit.max_bootstrap_rows - changes.items.len) return error.LakeWriteTooLarge;
+        for (rows) |row| try changes.append(a, .{ .op = .upsert, .row = row });
+    }
+    var batch = expected;
+    batch.changes = changes.items;
+    try batch.validate(catalog.row_commit.max_bootstrap_rows);
+    return batch;
+}
+
 fn writeBootstrapStage(a: A, binding: Binding, options: Options, context: Context, batch: Batch) !void {
     var opened = try openQueue(a, binding, options);
     defer opened.deinit();
     const base = try prefix(a, opened.prefix, binding, options);
     const key = try bootstrapStageKey(a, base, batch);
     const bytes = try std.json.Stringify.valueAlloc(a, batch, .{});
+    try writeImmutableBootstrap(&opened, context, key, bytes);
+}
+
+fn writeImmutableBootstrap(opened: *local.serverless_object_store_support.OpenedObjectStore, context: Context, key: []const u8, bytes: []const u8) !void {
     var client = opened.client;
     try context.ensureActive();
     var stored = client.putObject(opened.bucket, key, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
@@ -336,6 +443,9 @@ fn recoverPendingBootstrap(a: A, binding: Binding, unresolved: Options, context:
     const bytes = if (record) |accepted| accepted.payload else blk: {
         var client = opened.client;
         const key = try bootstrapStageKey(a, base, expected);
+        if (try readBootstrapPages(a, &opened, context, key, expected)) |assembled| {
+            break :blk try std.json.Stringify.valueAlloc(a, assembled, .{});
+        }
         var staged = client.getObject(opened.bucket, key, .{ .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
             error.NotFound, error.ObjectNotFound, error.FileNotFound => return false,
             else => return err,
@@ -1241,12 +1351,19 @@ test "external lake filesystem WAL applies the managed PostgreSQL stream owner p
     var recovery = snapshot;
     recovery.snapshot_rows = null;
     try std.testing.expect(!try port.bootstrap_committed.?(port.ptr, alloc, recovery));
-    try port.stage_bootstrap.?(port.ptr, alloc, snapshot);
-    try port.stage_bootstrap.?(port.ptr, alloc, snapshot);
+    const digest = try port.stage_snapshot_page.?(port.ptr, alloc, snapshot);
+    try std.testing.expectEqual(digest, try port.stage_snapshot_page.?(port.ptr, alloc, snapshot));
+    try std.testing.expect(!try port.bootstrap_committed.?(port.ptr, alloc, recovery));
+    var seal = snapshot;
+    seal.snapshot_rows = null;
+    seal.snapshot_chunks = &.{digest};
+    try port.stage_bootstrap.?(port.ptr, alloc, seal);
     var queue = try openQueue(a, bound.binding, options);
     defer queue.deinit();
     const queue_prefix = try prefix(a, queue.prefix, bound.binding, options);
-    const staged_key = try bootstrapStageKey(a, queue_prefix, try bootstrapIdentity(a, "postgres:9:2", "12", "cut", &.{"id"}));
+    const stage = try bootstrapStageKey(a, queue_prefix, try bootstrapIdentity(a, "postgres:9:2", "12", "cut", &.{"id"}));
+    const staged_key = try std.fmt.allocPrint(a, "{s}.manifest", .{stage});
+    const page_key = try std.fmt.allocPrint(a, "{s}.pages/{s}", .{ stage, &std.fmt.bytesToHex(digest, .lower) });
     var staged_object = try queue.client.statObject(queue.bucket, staged_key);
     staged_object.deinit(queue.client.allocator);
     try std.testing.expectEqual(@as(u64, 0), try watermark(a, bound.binding, options, .{}));
@@ -1260,6 +1377,7 @@ test "external lake filesystem WAL applies the managed PostgreSQL stream owner p
     staged_object.deinit(queue.client.allocator);
     try std.testing.expect(try port.bootstrap_committed.?(port.ptr, alloc, recovery));
     try std.testing.expectError(error.FileNotFound, queue.client.statObject(queue.bucket, staged_key));
+    try std.testing.expectError(error.FileNotFound, queue.client.statObject(queue.bucket, page_key));
     try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, snapshot));
     try std.testing.expect(try port.bootstrap_committed.?(port.ptr, alloc, recovery));
     try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, request));

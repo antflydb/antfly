@@ -895,7 +895,7 @@ pub const SnapshotBackfillRunner = struct {
             prepared_checkpoint,
         );
 
-        try callUpsertStatus(status_sink, .{
+        const prepared_status: metadata_table_manager.ReplicationSourceStatusRecord = .{
             .table_id = table.table_id,
             .source_ordinal = source_ordinal,
             .source_kind = parsed.type_name,
@@ -924,7 +924,8 @@ pub const SnapshotBackfillRunner = struct {
             .cutover_config_fingerprint = progress_cutover_config_fingerprint.*,
             .cutover_provider_identity = progress_cutover_provider_identity.*,
             .updated_at_ms = ioNowMillis(self.io),
-        });
+        };
+        try callUpsertStatus(status_sink, prepared_status);
         try self.reachLifecycle(
             .provider_prepared,
             table.table_id,
@@ -943,10 +944,8 @@ pub const SnapshotBackfillRunner = struct {
         defer bulk_ingest_tables.deinit(self.alloc);
         if (lake_owner == null) try beginBackfillBulkIngestWindow(self.alloc, self.write_source, table.name, parsed, &bulk_ingest_tables);
         if (lake_owner != null and (prepared_snapshot == null or effective_start_offset != 0 or snapshot_order_fields.len == 0)) return error.ReplicationExactCutoverRequired;
-        var lake_arena = std.heap.ArenaAllocator.init(self.alloc);
-        defer lake_arena.deinit();
-        const lake_alloc = lake_arena.allocator();
-        var lake_rows: std.ArrayList(std.json.Value) = .empty;
+        var lake_pages: std.ArrayList([32]u8) = .empty;
+        defer lake_pages.deinit(self.alloc);
         var lake_bytes: usize = 0;
         const lake_catalog = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog;
         errdefer abortBackfillBulkIngestWindow(self.write_source, bulk_ingest_tables.items);
@@ -1032,15 +1031,25 @@ pub const SnapshotBackfillRunner = struct {
                 );
             }
 
-            if (lake_owner != null) {
-                if (result.rows.len > lake_catalog.row_commit.max_bootstrap_rows - lake_rows.items.len) return error.LakeWriteTooLarge;
+            if (lake_owner) |owner| {
+                if (result.rows.len > lake_catalog.row_commit.max_bootstrap_rows - summary.final_offset) return error.LakeWriteTooLarge;
+                const stage_page = owner.stage_snapshot_page orelse return error.UnsupportedReplicationRoute;
                 for (result.rows) |row| {
                     const encoded = try std.json.Stringify.valueAlloc(self.alloc, row, .{});
                     defer self.alloc.free(encoded);
                     if (encoded.len > lake_catalog.types.max_commit_bytes - lake_bytes) return error.LakeWriteTooLarge;
                     lake_bytes += encoded.len;
-                    try lake_rows.append(lake_alloc, try cloneJsonValueAllocLocal(lake_alloc, row));
                 }
+                const page = try stage_page(owner.ptr, self.alloc, .{
+                    .table = table,
+                    .cutover = prepared_status,
+                    .previous_checkpoint = null,
+                    .checkpoint = prepared_checkpoint,
+                    .changes = &.{},
+                    .snapshot_rows = result.rows,
+                    .deadline_ns = try self.workDeadlineNs(),
+                });
+                try lake_pages.append(self.alloc, page);
             } else if (parsed.has_update_transforms or parsed.has_routes) {
                 for (result.rows) |row| {
                     try self.checkpointWork();
@@ -1233,13 +1242,13 @@ pub const SnapshotBackfillRunner = struct {
                 .updated_at_ms = ioNowMillis(self.io),
             };
             const stage = owner.stage_bootstrap orelse return error.UnsupportedReplicationRoute;
-            const request: ExternalStreamDestination.Request = .{
+            var request: ExternalStreamDestination.Request = .{
                 .table = table,
                 .cutover = pending,
                 .previous_checkpoint = null,
                 .checkpoint = prepared_checkpoint,
                 .changes = &.{},
-                .snapshot_rows = lake_rows.items,
+                .snapshot_chunks = lake_pages.items,
                 .deadline_ns = try self.workDeadlineNs(),
             };
             try stage(owner.ptr, self.alloc, request);
@@ -1249,8 +1258,9 @@ pub const SnapshotBackfillRunner = struct {
             try callUpsertStatus(status_sink, pending);
             progress_offset.* = summary.final_offset;
             lake_publish_pending.* = true;
-            const outcome = try owner.apply(owner.ptr, self.alloc, request);
-            if (outcome != .committed) return error.SourceOutcomeUnresolved;
+            request.snapshot_chunks = null;
+            const recover = owner.bootstrap_committed orelse return error.UnsupportedReplicationRoute;
+            if (!try recover(owner.ptr, self.alloc, request)) return error.SourceOutcomeUnresolved;
             try self.checkpointWork();
             try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
             try callCheckCutoverAuthority(status_sink, table.replication_sources_json, pending);
@@ -1711,6 +1721,7 @@ pub const ExternalStreamDestination = struct {
     /// not authorize retiring a slot or replacing a pending admission.
     bootstrap_committed: ?*const fn (*anyopaque, Allocator, Request) anyerror!bool = null,
     stage_bootstrap: ?*const fn (*anyopaque, Allocator, Request) anyerror!void = null,
+    stage_snapshot_page: ?*const fn (*anyopaque, Allocator, Request) anyerror![32]u8 = null,
 
     pub const Outcome = enum { accepted, committed };
     pub const Request = struct {
@@ -1722,6 +1733,8 @@ pub const ExternalStreamDestination = struct {
         /// The entire qualified snapshot at the prepared provider cut.
         /// An empty slice commits a cut with zero visible rows.
         snapshot_rows: ?[]const std.json.Value = null,
+        /// Ordered page digests supplied only when sealing a completed capture.
+        snapshot_chunks: ?[]const [32]u8 = null,
         deadline_ns: ?u64,
     };
 };
@@ -4755,26 +4768,29 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
     try std.testing.expect(std.mem.indexOf(u8, final_status.slot_name, "_af_") != null);
 
     const Lake = struct {
+        fn page(_: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) ![32]u8 {
+            const rows = request.snapshot_rows.?;
+            try std.testing.expectEqual(@as(usize, 1), rows.len);
+            return @splat(if (std.mem.eql(u8, rows[0].object.get("id").?.string, "doc:1")) 1 else 2);
+        }
         fn stage(raw: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) !void {
             const sink: *StatusSink = @ptrCast(@alignCast(raw));
             try std.testing.expectEqualStrings("snapshot", sink.records.items[sink.records.items.len - 1].phase);
-            try std.testing.expectEqual(@as(usize, 2), request.snapshot_rows.?.len);
+            try std.testing.expectEqualSlices([32]u8, &.{ @splat(1), @splat(2) }, request.snapshot_chunks.?);
         }
-        fn apply(raw: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) !ExternalStreamDestination.Outcome {
+        fn apply(_: *anyopaque, _: Allocator, _: ExternalStreamDestination.Request) !ExternalStreamDestination.Outcome {
+            return error.UnexpectedBootstrapReplay;
+        }
+        fn observe(raw: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) !bool {
             const sink: *StatusSink = @ptrCast(@alignCast(raw));
             const pending = sink.records.items[sink.records.items.len - 1];
             try std.testing.expectEqualStrings(iceberg_snapshot_publish_pending, pending.phase);
             try std.testing.expectEqualStrings("lsn:exact", request.checkpoint);
-            try std.testing.expectEqual(@as(usize, 2), request.snapshot_rows.?.len);
-            try std.testing.expectEqualStrings("doc:1", request.snapshot_rows.?[0].object.get("id").?.string);
-            try std.testing.expectEqualStrings("doc:2", request.snapshot_rows.?[1].object.get("id").?.string);
-            return .committed;
-        }
-        fn observe(_: *anyopaque, _: Allocator, _: ExternalStreamDestination.Request) !bool {
-            return error.UnexpectedBootstrapRecovery;
+            try std.testing.expect(request.snapshot_rows == null);
+            return true;
         }
     };
-    runner.external_destination = .{ .ptr = &status_sink, .apply = Lake.apply, .bootstrap_committed = Lake.observe, .stage_bootstrap = Lake.stage };
+    runner.external_destination = .{ .ptr = &status_sink, .apply = Lake.apply, .bootstrap_committed = Lake.observe, .stage_bootstrap = Lake.stage, .stage_snapshot_page = Lake.page };
     const captured = try runner.runTableSource(&status_sink, .{
         .table_id = 12,
         .name = "lake",
