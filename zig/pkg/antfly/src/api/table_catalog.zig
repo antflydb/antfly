@@ -839,7 +839,7 @@ pub const RoutingSession = struct {
         };
     }
 
-    pub fn routePlan(self: *const RoutingSession, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, budget: RoutingBudget) !?CatalogRoutePlan {
+    fn routePlan(self: *const RoutingSession, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, budget: RoutingBudget) !?CatalogRoutePlan {
         try budget.checkpoint();
         const table_index = self.table_indexes.get(table_name) orelse return null;
         const table = &self.snapshot.value.tables[table_index];
@@ -3294,7 +3294,7 @@ fn metadataServerValidateGroupRetirement(
 }
 
 fn sortRangeRefs(ranges: []const *const metadata_table_manager.RangeRecord) void {
-    std.sort.insertion(*const metadata_table_manager.RangeRecord, @constCast(ranges), {}, struct {
+    std.sort.block(*const metadata_table_manager.RangeRecord, @constCast(ranges), {}, struct {
         fn lessThan(_: void, a: *const metadata_table_manager.RangeRecord, b: *const metadata_table_manager.RangeRecord) bool {
             return std.mem.order(u8, a.start_key, b.start_key) == .lt;
         }

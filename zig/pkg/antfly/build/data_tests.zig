@@ -260,7 +260,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby apply failures without stopping run round",
         "remote metadata deadline ",
-        "remote repair routing refreshes only the requested table",
+        "remote repair routing ",
     };
     const lib_data_runtime_tests = @import("linked_tests.zig").add(b, .{
         .name = "data-runtime-tests",

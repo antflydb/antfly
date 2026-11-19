@@ -27730,7 +27730,7 @@ const RemoteMetadataSource = struct {
         // The route plan carries topology and groups, without physical-owner
         // descriptors or execution-index materialization.
         try budget.checkpoint();
-        var result = try remoteAwaitRoute(ptr, self.alloc, table_name, .all_ranges, deadline, 10 * std.time.ns_per_ms);
+        var result = try self.awaitRemoteRoute(self.alloc, table_name, .all_ranges, deadline, 10 * std.time.ns_per_ms, .linearizable);
         defer result.deinit(self.alloc);
         try budget.checkpoint();
         const plan = switch (result) {
@@ -28407,6 +28407,18 @@ const RemoteMetadataSource = struct {
         probe_interval_ns: u64,
     ) !antfly.public_api.table_catalog.AwaitRouteResult {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        return self.awaitRemoteRoute(alloc, table_name, query, deadline_ns, probe_interval_ns, .eventual_positive);
+    }
+
+    fn awaitRemoteRoute(
+        self: *RemoteMetadataSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        query: antfly.public_api.table_catalog.RouteQuery,
+        deadline_ns: u64,
+        probe_interval_ns: u64,
+        legacy_consistency: enum { eventual_positive, linearizable },
+    ) !antfly.public_api.table_catalog.AwaitRouteResult {
         const request = antfly.metadata_api.CatalogRouteResolveRequest{ .query = routeQueryForWire(table_name, query) };
         var legacy_count: usize = 0;
         var incompatible_count: usize = 0;
@@ -28470,7 +28482,10 @@ const RemoteMetadataSource = struct {
                 },
             }
         }
-        if (legacy_count > 0) return try self.remoteLegacyAwaitRoute(alloc, table_name, query, deadline_ns, probe_interval_ns);
+        if (legacy_count > 0) return switch (legacy_consistency) {
+            .eventual_positive => self.remoteLegacyAwaitRoute(alloc, table_name, query, deadline_ns, probe_interval_ns),
+            .linearizable => self.remoteLinearizableRoute(alloc, table_name, query, deadline_ns),
+        };
         if (incompatible_count == self.base_uris.len) return error.MetadataRoutingProtocolIncompatible;
         return .timed_out;
     }
@@ -28515,6 +28530,16 @@ const RemoteMetadataSource = struct {
             const wait_ns = @min(optimistic_deadline_ns - now_ns, @max(probe_interval_ns, std.time.ns_per_ms));
             try self.io.sleep(.fromNanoseconds(wait_ns), .awake);
         }
+        return self.remoteLinearizableRoute(alloc, table_name, query, deadline_ns);
+    }
+
+    fn remoteLinearizableRoute(
+        self: *RemoteMetadataSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        query: antfly.public_api.table_catalog.RouteQuery,
+        deadline_ns: u64,
+    ) !antfly.public_api.table_catalog.AwaitRouteResult {
         if (self.awakeNs() >= deadline_ns) return .timed_out;
         var authoritative = self.remoteRoutingSnapshotWithMode(deadline_ns, true) catch |err| switch (err) {
             error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return .timed_out,
@@ -47432,6 +47457,57 @@ fn consumerTests() type {
             try std.testing.expect(!(try resolve(&source, "docs", 7001, .{})).?.group_present);
             try std.testing.expectEqual(@as(usize, 3), stub.scoped_reads);
             try std.testing.expectEqual(@as(usize, 0), stub.unexpected_reads);
+        }
+
+        test "remote repair routing rejects stale legacy positives" {
+            const alloc = std.testing.allocator;
+            const Stub = struct {
+                legacy_eventual_reads: usize = 0,
+                legacy_authoritative_reads: usize = 0,
+                split_published: bool = false,
+
+                fn execute(raw: *anyopaque, response_alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (std.mem.endsWith(u8, request.uri, "/capabilities")) return .{ .status = 404 };
+                    const linearizable = std.mem.endsWith(u8, request.uri, "/linearizable-snapshot");
+                    if (linearizable) {
+                        self.legacy_authoritative_reads += 1;
+                    } else if (std.mem.endsWith(u8, request.uri, "/snapshot")) {
+                        self.legacy_eventual_reads += 1;
+                    } else return error.TestUnexpectedResult;
+                    var tables = [_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }};
+                    var ranges = [_]antfly.metadata.table_manager.RangeRecord{
+                        .{ .table_id = 7, .group_id = 7001, .start_key = "" },
+                        .{ .table_id = 7, .group_id = 7002, .start_key = "m" },
+                    };
+                    const split_visible = linearizable and self.split_published;
+                    if (split_visible) ranges[0].end_key = "m";
+                    const snapshot: antfly.metadata_api.AdminSnapshot = .{
+                        .status = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .metrics = .{} },
+                        .tables = &tables,
+                        .ranges = ranges[0..if (split_visible) 2 else 1],
+                        .stores = &.{},
+                        .placement_intents = &.{},
+                        .split_transitions = &.{},
+                        .merge_transitions = &.{},
+                    };
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(response_alloc, snapshot, .{}) };
+                }
+            };
+            var stub: Stub = .{};
+            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://legacy.test"}, &.{.{ .ptr = &stub, .vtable = &.{ .execute = Stub.execute } }}, std.testing.io);
+            defer source.deinit();
+            const catalog = source.catalogSource();
+            const resolve = catalog.vtable.repair_route.?;
+            const dispatched = (try resolve(catalog.ptr, "docs", 7001, .{})).?;
+            try std.testing.expect(dispatched.group_present);
+            stub.split_published = true;
+            const verified = (try resolve(catalog.ptr, "docs", null, .{})).?;
+            try std.testing.expect(dispatched.fence != verified.fence);
+            const new_shard = (try resolve(catalog.ptr, "docs", 7002, .{})).?;
+            try std.testing.expect(new_shard.group_present);
+            try std.testing.expectEqual(@as(usize, 0), stub.legacy_eventual_reads);
+            try std.testing.expectEqual(@as(usize, 3), stub.legacy_authoritative_reads);
         }
 
         test "remote graph routing reuses fenced generations and refreshes changed revisions" {

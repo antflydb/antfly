@@ -15369,6 +15369,66 @@ pub const RaftApplyStore = struct {
         };
     }
 
+    /// Scope the read to the derived table name and range membership indexes.
+    /// Capture the authority, revision, and physical bounds in one transaction.
+    pub fn captureCatalogTableProjection(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8, deadline_ns: ?u64) !CatalogProjectionSnapshot {
+        try catalogProjectionDeadline(deadline_ns, null);
+        var txn = try self.store.beginReadTxn();
+        requireDerivedCatalogIndexesTxn(&txn, group_id) catch |err| {
+            txn.abort();
+            if (err != error.InvalidDerivedCatalogIndex) return err;
+            // Only a newly installed or old on-disk projection needs to
+            // initialize its durable indexes. Ordinary catalog writes keep
+            // them current and the read path does not take the apply lock.
+            txn = try self.beginQueryCatalogReadTxn(group_id);
+        };
+        defer txn.abort();
+
+        const cursor = try readCatalogCursorTxn(&txn, group_id);
+        var result: CatalogProjectionSnapshot = .{
+            .metadata_incarnation = cursor.metadata_incarnation,
+            .catalog_revision = cursor.revision,
+            .tables = &.{},
+            .ranges = &.{},
+        };
+        const identity = (try self.getTableByNameResultTxn(system_catalog.ResolvedTable, alloc, &txn, group_id, name)) orelse {
+            try catalogProjectionDeadline(deadline_ns, null);
+            return result;
+        };
+        defer identity.deinit(alloc);
+        const ids = try self.indexedTableRangeIdsTxnUntil(alloc, &txn, group_id, identity.table_id, deadline_ns);
+        defer alloc.free(ids);
+        const ranges = try alloc.alloc(metadata.RangeRecord, ids.len);
+        var filled: usize = 0;
+        errdefer {
+            for (ranges[0..filled]) |range| metadata_table_manager.freeRange(alloc, range);
+            alloc.free(ranges);
+        }
+        var membership: topology_protocol.RangeMembershipAccumulator = .{};
+        for (ids, ranges, 0..) |group, *range, index| {
+            if (index % 64 == 0) try catalogProjectionDeadline(deadline_ns, null);
+            var key_buf: [160]u8 = undefined;
+            const encoded = txn.get(try rangeKeyForGroup(&key_buf, group_id, group)) catch |err| switch (err) {
+                error.NotFound => return error.InvalidDerivedCatalogIndex,
+                else => return err,
+            };
+            var pos: usize = 0;
+            range.* = try readRangeRecordProjected(alloc, encoded, &pos, true);
+            filled += 1;
+            if (range.table_id != identity.table_id or range.group_id != group) return error.InvalidDerivedCatalogIndex;
+            try membership.add(group);
+        }
+        const fence = try self.loadTableTransitionFenceTxn(&txn, group_id, identity.table_id);
+        if (!membership.finish(identity.table_id).eql(fence.membership(identity.table_id))) return error.InvalidDerivedCatalogIndex;
+        try catalogProjectionDeadline(deadline_ns, null);
+        const tables = try alloc.alloc(metadata.TableRecord, 1);
+        errdefer alloc.free(tables);
+        tables[0] = try metadata_table_manager.cloneRoutingTable(alloc, .{ .table_id = identity.table_id, .name = identity.name });
+        result.tables = tables;
+        result.ranges = ranges;
+        return result;
+    }
+
     /// Read the durable authority and applied revision from one storage
     /// transaction. Unlike listener epochs, this cursor survives restarts and
     /// is comparable across replicas of the same metadata group.
@@ -15376,6 +15436,10 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
 
+        return readCatalogCursorTxn(&txn, group_id);
+    }
+
+    fn readCatalogCursorTxn(txn: *docstore.DocStore.Txn, group_id: u64) !CatalogCursor {
         var revision_key_buf: [160]u8 = undefined;
         const revision_key = try catalogRevisionKeyForGroup(&revision_key_buf, group_id);
         const applied = txn.get(revision_key) catch |err| switch (err) {
@@ -22195,7 +22259,17 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         table_id: u64,
     ) ![]u64 {
-        _ = self;
+        return self.indexedTableRangeIdsTxnUntil(alloc, txn, group_id, table_id, null);
+    }
+
+    fn indexedTableRangeIdsTxnUntil(
+        _: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+        deadline_ns: ?u64,
+    ) ![]u64 {
         var prefix_buf: [192]u8 = undefined;
         const prefix = try tableRangeIndexPrefixForTable(&prefix_buf, group_id, table_id);
         var ids = std.ArrayListUnmanaged(u64).empty;
@@ -22205,6 +22279,7 @@ pub const RaftApplyStore = struct {
         var entry = try cursor.seekAtOrAfter(prefix);
         while (entry) |row| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, row.key, prefix)) break;
+            if (ids.items.len % 64 == 0) try catalogProjectionDeadline(deadline_ns, null);
             if (row.value.len != @sizeOf(u64)) return error.InvalidDerivedCatalogIndex;
             try ids.append(alloc, std.mem.readInt(u64, row.value[0..@sizeOf(u64)], .little));
         }
@@ -32167,9 +32242,13 @@ fn readRequiredString(
     encoded: []const u8,
     pos: *usize,
 ) ![]u8 {
+    return alloc.dupe(u8, try borrowRequiredString(encoded, pos));
+}
+
+fn borrowRequiredString(encoded: []const u8, pos: *usize) ![]const u8 {
     const value_len = try readInt(encoded, pos, u32);
     if (pos.* + value_len > encoded.len) return error.InvalidMetadataTransitionEncoding;
-    const value = try alloc.dupe(u8, encoded[pos.* .. pos.* + value_len]);
+    const value = encoded[pos.* .. pos.* + value_len];
     pos.* += value_len;
     return value;
 }
@@ -32395,6 +32474,15 @@ fn readRangeRecord(
     encoded: []const u8,
     pos: *usize,
 ) !metadata.RangeRecord {
+    return readRangeRecordProjected(alloc, encoded, pos, false);
+}
+
+fn readRangeRestorePrefixString(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize, comptime routing_only: bool) ![]const u8 {
+    const text = if (pos.* < encoded.len) try borrowRequiredString(encoded, pos) else "";
+    return if (routing_only) "" else try alloc.dupe(u8, text);
+}
+
+fn readRangeRecordProjected(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize, comptime routing_only: bool) !metadata.RangeRecord {
     const group_id = try readInt(encoded, pos, u64);
     const table_id = try readInt(encoded, pos, u64);
     const start_len = try readInt(encoded, pos, u32);
@@ -32404,21 +32492,12 @@ fn readRangeRecord(
     pos.* += start_len;
     const end_key = try readOptionalString(alloc, encoded, pos);
     errdefer if (end_key) |value| alloc.free(value);
-    const restore_backup_id = if (pos.* < encoded.len)
-        try readRequiredString(alloc, encoded, pos)
-    else
-        try alloc.dupe(u8, "");
-    errdefer alloc.free(restore_backup_id);
-    const restore_location = if (pos.* < encoded.len)
-        try readRequiredString(alloc, encoded, pos)
-    else
-        try alloc.dupe(u8, "");
-    errdefer alloc.free(restore_location);
-    const restore_snapshot_path = if (pos.* < encoded.len)
-        try readRequiredString(alloc, encoded, pos)
-    else
-        try alloc.dupe(u8, "");
-    errdefer alloc.free(restore_snapshot_path);
+    const restore_backup_id = try readRangeRestorePrefixString(alloc, encoded, pos, routing_only);
+    errdefer if (!routing_only) alloc.free(restore_backup_id);
+    const restore_location = try readRangeRestorePrefixString(alloc, encoded, pos, routing_only);
+    errdefer if (!routing_only) alloc.free(restore_location);
+    const restore_snapshot_path = try readRangeRestorePrefixString(alloc, encoded, pos, routing_only);
+    errdefer if (!routing_only) alloc.free(restore_snapshot_path);
     const range_id = if (pos.* < encoded.len)
         try readInt(encoded, pos, u64)
     else
@@ -32431,6 +32510,15 @@ fn readRangeRecord(
         try readInt(encoded, pos, u64)
     else
         0;
+    if (routing_only) return .{
+        .group_id = group_id,
+        .range_id = if (range_id == 0) group_id else range_id,
+        .table_id = table_id,
+        .start_key = start_key,
+        .end_key = end_key,
+        .doc_identity_shard_id = doc_identity_shard_id,
+        .doc_identity_range_id = doc_identity_range_id,
+    };
     // Range values are independently length-delimited by the metadata store.
     // Older v1 values end after the identity fields, so appended fields must
     // remain optional for rolling upgrades and snapshot/log replay.
@@ -34891,6 +34979,17 @@ test "metadata raft apply store catalog projection uses storage snapshot indepen
         try std.testing.expectEqual(snapshot.tables[0].table_id, snapshot.ranges[0].table_id);
         try std.testing.expectEqualStrings("{\"title\":{\"type\":\"text\"}}", snapshot.tables[0].schema_json);
         try std.testing.expectEqualStrings("m", snapshot.ranges[0].start_key);
+        const point = try store.captureCatalogTableProjection(std.testing.allocator, 41, snapshot.tables[0].name, null);
+        defer store.freeTables(std.testing.allocator, point.tables);
+        defer store.freeRanges(std.testing.allocator, point.ranges);
+        try std.testing.expectEqual(snapshot.catalog_revision, point.catalog_revision);
+        try std.testing.expect(point.tables[0].schema_json.len == 0);
+        try std.testing.expectEqual(snapshot.ranges[0].doc_identity_shard_id, point.ranges[0].doc_identity_shard_id);
+        try std.testing.expectEqualStrings("m", point.ranges[0].start_key);
+        const missing = try store.captureCatalogTableProjection(std.testing.allocator, 41, "missing", null);
+        try std.testing.expectEqual(snapshot.catalog_revision, missing.catalog_revision);
+        try std.testing.expectEqual(@as(usize, 0), missing.tables.len);
+        try std.testing.expectEqual(@as(usize, 0), missing.ranges.len);
     }
 }
 
