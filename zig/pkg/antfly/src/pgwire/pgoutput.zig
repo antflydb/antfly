@@ -199,9 +199,14 @@ pub fn copyData(a: A, message: union(enum) { wal: WalData, keepalive: Keepalive 
     switch (message) {
         .wal => |m| {
             if (@backingInt(m.end) < @backingInt(m.start)) return error.InvalidPgoutput;
+            // PostgreSQL's logical WAL sender advertises InvalidXLogRecPtr
+            // for type and relation descriptions. They occupy spool bytes
+            // but clients must be able to decode them while locating a
+            // previously saved row or commit position.
+            const schema_description = m.payload.len != 0 and (m.payload[0] == 'R' or m.payload[0] == 'Y');
             try e.byte('w');
-            try e.int(u64, @backingInt(m.start));
-            try e.int(u64, @backingInt(m.end));
+            try e.int(u64, if (schema_description) 0 else @backingInt(m.start));
+            try e.int(u64, if (schema_description) 0 else @backingInt(m.end));
             try e.int(i64, m.server_time);
             try e.bytes(m.payload);
         },
@@ -247,6 +252,16 @@ test "pgoutput v1 independent wire fixtures preserve signed fields and tuple dis
     defer a.free(update);
     try std.testing.expectEqualSlices(u8, "U\x00\x00\x00\x2aO\x00\x03t\x00\x00\x00\x01an" ++ "t\x00\x00\x00\x00N\x00\x03t\x00\x00\x00\x01bu" ++ "b\x00\x00\x00\x02\x00\xff", update);
 }
+test "pgoutput CopyData advertises no WAL position for schema descriptions" {
+    const a = std.testing.allocator;
+    const relation = try encode(a, .{ .relation = .{ .oid = 42, .namespace = "public", .name = "rows", .identity = .full, .columns = &.{.{ .key = true, .name = "id", .type_oid = 20 }} } }, 128);
+    defer a.free(relation);
+    const wire = try copyData(a, .{ .wal = .{ .start = @fromBackingInt(@as(u64, 22)), .end = @fromBackingInt(@as(u64, 250)), .server_time = 1, .payload = relation } }, 128);
+    defer a.free(wire);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), wire[6..22]);
+    try std.testing.expectEqualSlices(u8, relation, wire[30..]);
+}
+
 test "pgoutput CopyData frames and feedback use network order without trusting positions" {
     const a = std.testing.allocator;
     const wire = try copyData(a, .{ .wal = .{ .start = @fromBackingInt(@intCast(1)), .end = @fromBackingInt(@intCast(2)), .server_time = -1, .payload = "xyz" } }, 128);
