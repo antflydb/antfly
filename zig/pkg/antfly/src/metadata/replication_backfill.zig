@@ -1598,11 +1598,31 @@ pub const SnapshotBackfillCoordinator = struct {
     }
 };
 
+/// Storage-owner port for complete external destination transactions. A
+/// durable admission receipt can survive retry while catalog commitment is
+/// pending. Only commitment authorizes advancing the provider checkpoint.
+pub const ExternalStreamDestination = struct {
+    ptr: *anyopaque,
+    apply: *const fn (*anyopaque, Allocator, Request) anyerror!Outcome,
+
+    pub const Outcome = enum { accepted, committed };
+    pub const Request = struct {
+        table: metadata_table_manager.TableRecord,
+        source_ordinal: u32,
+        cutover_authority_id: u64,
+        previous_checkpoint: ?[]const u8,
+        checkpoint: []const u8,
+        changes: []const foreign_mod.ReplicationChange,
+        deadline_ns: ?u64,
+    };
+};
+
 pub const StreamingReplicationRunner = struct {
     alloc: Allocator,
     io: std.Io = std.Options.debug_io,
     registry: *foreign_mod.Registry,
     write_source: table_writes_api.TableWriteSource,
+    external_destination: ?ExternalStreamDestination = null,
     secret_store: ?*secrets.FileStore = null,
     batch_size: usize = 256,
     work_permit: ?WorkPermit = null,
@@ -1733,6 +1753,21 @@ pub const StreamingReplicationRunner = struct {
         };
     }
 
+    fn applyExternal(self: *StreamingReplicationRunner, owner: ExternalStreamDestination, table: metadata_table_manager.TableRecord, source_ordinal: u32, status: ?metadata_table_manager.ReplicationSourceStatusRecord, previous: []const u8, checkpoint: []const u8, changes: []const foreign_mod.ReplicationChange) !void {
+        const authority = if (status) |record| record.cutover_authority_id else 0;
+        if (authority == 0) return error.UnsupportedReplicationRoute;
+        const outcome = try owner.apply(owner.ptr, self.alloc, .{
+            .table = table,
+            .source_ordinal = source_ordinal,
+            .cutover_authority_id = authority,
+            .previous_checkpoint = if (previous.len != 0) previous else null,
+            .checkpoint = checkpoint,
+            .changes = changes,
+            .deadline_ns = try self.workDeadlineNs(),
+        });
+        if (outcome != .committed) return error.SourceOutcomeUnresolved;
+    }
+
     fn runTableSourceInner(
         self: *StreamingReplicationRunner,
         status_sink: anytype,
@@ -1748,6 +1783,14 @@ pub const StreamingReplicationRunner = struct {
         try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
         var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer);
         defer parsed.deinit(self.alloc);
+        var binding = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json);
+        defer if (binding) |*external| external.deinit(self.alloc);
+        const destination = if (binding) |external| blk: {
+            if (external.binding.format != .iceberg or external.binding.write_policy != .iceberg_writer) return error.UnsupportedReplicationRoute;
+            try external.binding.validateSupported();
+            if (external.binding.row_identity == null or parsed.routes.len != 0 or parsed.on_update_json != null or parsed.on_delete_json != null) return error.UnsupportedReplicationRoute;
+            break :blk self.external_destination orelse return error.UnsupportedReplicationRoute;
+        } else null;
 
         var resolved_dsn = try secrets.resolveReferenceWithGenerationOwned(self.alloc, self.secret_store, parsed.dsn);
         defer resolved_dsn.deinit(self.alloc);
@@ -1839,7 +1882,8 @@ pub const StreamingReplicationRunner = struct {
 
         if (result.changes.len == 0) {
             try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
-            if (result.checkpoint.len > 0) {
+            if (result.checkpoint.len > 0 and !std.mem.eql(u8, result.checkpoint, progress_checkpoint.items)) {
+                if (destination) |owner| try self.applyExternal(owner, table, source_ordinal, existing_status, progress_checkpoint.items, result.checkpoint, &.{});
                 progress_checkpoint.clearRetainingCapacity();
                 try progress_checkpoint.appendSlice(self.alloc, result.checkpoint);
             }
@@ -1913,7 +1957,15 @@ pub const StreamingReplicationRunner = struct {
             }
             // Advance the provider frontier after complete durable effects;
             // index visibility is an independent publication obligation.
-            const apply_summary = try applyReplicationTransaction(self.alloc, self.write_source, table.name, transaction, parsed, cdc_apply_sync_level);
+            const apply_summary = if (destination) |owner| blk: {
+                try self.applyExternal(owner, table, source_ordinal, existing_status, progress_checkpoint.items, change.checkpoint, transaction);
+                var applied: ReplicationApplySummary = .{};
+                for (transaction) |member| switch (member.op) {
+                    .insert, .update => applied.writes_applied += 1,
+                    .delete => applied.deletes_applied += 1,
+                };
+                break :blk applied;
+            } else try applyReplicationTransaction(self.alloc, self.write_source, table.name, transaction, parsed, cdc_apply_sync_level);
             for (transaction) |member| {
                 try self.reachLifecycle(
                     .stream_change_applied,
@@ -7243,6 +7295,23 @@ test "metadata replication stream resumes complete durable transactions while de
         failed: bool = false,
         polls: usize = 0,
         resumed: bool = false,
+        external_calls: usize = 0,
+
+        fn external(raw: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) !ExternalStreamDestination.Outcome {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            self.external_calls += 1;
+            try std.testing.expectEqual(@as(u64, 9), request.cutover_authority_id);
+            if (self.external_calls == 1) {
+                try std.testing.expectEqualStrings("initial", request.previous_checkpoint.?);
+                try std.testing.expectEqualStrings("first-commit", request.checkpoint);
+                try std.testing.expectEqual(@as(usize, 1), request.changes.len);
+                return .committed;
+            }
+            try std.testing.expectEqualStrings("first-commit", request.previous_checkpoint.?);
+            try std.testing.expectEqualStrings("second-commit", request.checkpoint);
+            try std.testing.expectEqual(@as(usize, 2), request.changes.len);
+            return if (self.external_calls == 2) .accepted else .committed;
+        }
 
         fn batch(ptr: *anyopaque, _: Allocator, _: []const u8, request: db_mod.types.BatchRequest) !?void {
             // Model a permanently unavailable derived index. The real stream
@@ -7310,6 +7379,10 @@ test "metadata replication stream resumes complete durable transactions while de
             errdefer metadata_table_manager.freeReplicationSourceStatus(self.alloc, owned);
             try self.records.append(self.alloc, owned);
         }
+        pub fn replicationSourceAuthorityCurrent(_: *@This(), _: []const u8, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+            try std.testing.expectEqual(@as(u64, 9), record.cutover_authority_id);
+        }
+
         fn deinit(self: *@This()) void {
             for (self.records.items) |record| metadata_table_manager.freeReplicationSourceStatus(self.alloc, record);
             self.records.deinit(self.alloc);
@@ -7341,6 +7414,20 @@ test "metadata replication stream resumes complete durable transactions while de
     try std.testing.expectEqual(@as(usize, 2), resumed.changes_applied);
     try std.testing.expectEqual(@as(usize, 3), state.calls);
     try std.testing.expectEqualStrings("second-commit", sink.records.items[sink.records.items.len - 1].checkpoint);
+    var external_table = table;
+    external_table.schema_json =
+        \\{"base_source":{"kind":"external","table_id":"lake","uri":"file:///lake","format":"iceberg","write_policy":"iceberg_writer","catalog":{"type":"managed"},"row_identity":{"key_columns":["id"]}}}
+    ;
+    runner.external_destination = .{ .ptr = &state, .apply = State.external };
+    var status = failed;
+    status.cutover_authority_id = 9;
+    try std.testing.expectError(error.SourceOutcomeUnresolved, runner.runTableSourceFromCheckpoint(&sink, external_table, 0, 0, "", "initial", status));
+    const pending = sink.records.items[sink.records.items.len - 1];
+    try std.testing.expectEqualStrings("first-commit", pending.checkpoint);
+    _ = try runner.runTableSourceFromCheckpoint(&sink, external_table, 0, 0, "", pending.checkpoint, pending);
+    try std.testing.expectEqualStrings("second-commit", sink.records.items[sink.records.items.len - 1].checkpoint);
+    try std.testing.expectEqual(@as(usize, 3), state.external_calls);
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
 }
 
 test "metadata replication stream applies insert update and delete through bound write source" {
