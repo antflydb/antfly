@@ -208,8 +208,13 @@ pub const StreamOwner = struct {
             var current = try configured.executeLakeCatalogAlloc(a, bound.binding, options, context, .load);
             defer current.deinit(a);
             const properties = try catalogProperties(try catalog.metadata.parse(a, current.table.metadata_json));
-            const marker = properties.get("antfly.cdc.bootstrap-cut") orelse return .accepted;
-            if (!std.mem.eql(u8, try catalog.metadata.str(marker), request.checkpoint) or try propertyCoverage(properties) == 0) return .accepted;
+            const covered = try propertyCoverage(properties);
+            const marker = properties.get("antfly.cdc.bootstrap-cut") orelse {
+                if (covered != 0) return .accepted;
+                const outcome = try recoverPendingBootstrap(a, bound.binding, options, context, source, epoch, request.checkpoint, identity.key_columns);
+                return if (outcome) .committed else .accepted;
+            };
+            if (!std.mem.eql(u8, try catalog.metadata.str(marker), request.checkpoint) or covered == 0) return .accepted;
             try requireSourceProperties(a, properties, .{
                 .batch_id = "",
                 .source = source,
@@ -246,6 +251,26 @@ pub const StreamOwner = struct {
         return if (outcome.committed) .committed else .accepted;
     }
 };
+
+/// Resume only the first admitted bootstrap for the requested incarnation.
+fn recoverPendingBootstrap(a: A, binding: Binding, unresolved: Options, context: Context, source: []const u8, epoch: []const u8, checkpoint: []const u8, keys: []const []const u8) !bool {
+    const options = try unresolved.resolveOwner(a, context);
+    var opened = try openQueue(a, binding, options);
+    defer opened.deinit();
+    const base = try prefix(a, opened.prefix, binding, options);
+    defer a.free(base);
+    const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null };
+    const record = (try store.next(a, 0)) orelse return false;
+    const batch = try std.json.parseFromSliceLeaky(Batch, a, record.payload, .{});
+    if (!batch.bootstrap or batch.expected_checkpoint != null or
+        !std.mem.eql(u8, batch.source, source) or !std.mem.eql(u8, batch.epoch, epoch) or
+        !std.mem.eql(u8, batch.checkpoint, checkpoint) or !keyFieldsEqual(batch.key_fields, keys)) return false;
+    const observed = (try observeBatch(a, binding, options, context, batch)) orelse return error.LakeWalCoverageGap;
+    if (observed.accepted_sequence != record.lsn) return error.LakeWalCoverageGap;
+    const outcome = try applyBatch(a, binding, options, context, batch);
+    if (outcome.accepted_sequence != record.lsn) return error.LakeWalCoverageGap;
+    return outcome.committed;
+}
 
 pub const BatchOutcome = struct {
     accepted_sequence: u64,
@@ -1130,6 +1155,24 @@ test "external lake filesystem WAL applies the managed PostgreSQL stream owner p
     var recovery = snapshot;
     recovery.snapshot_rows = null;
     try std.testing.expect(!try port.bootstrap_committed.?(port.ptr, alloc, recovery));
+    // Simulate process loss after WAL admission and before catalog commit.
+    const retained_snapshot: Batch = .{
+        .batch_id = try std.fmt.allocPrint(a, "antfly-bootstrap-{s}", .{&catalog.types.digestHex("cut")}),
+        .source = "postgres:9:2",
+        .epoch = "12",
+        .checkpoint = "cut",
+        .key_fields = &.{"id"},
+        .changes = &.{.{ .op = .upsert, .row = initial_row }},
+        .bootstrap = true,
+    };
+    try std.testing.expectEqual(@as(u64, 1), try acceptBatch(a, bound.binding, options, .{}, retained_snapshot));
+    try std.testing.expectEqual(@as(u64, 0), try coverage(a, try managed.load(a)));
+    var wrong_cut = recovery;
+    wrong_cut.checkpoint = "other";
+    wrong_cut.cutover.prepared_checkpoint = "other";
+    try std.testing.expect(!try port.bootstrap_committed.?(port.ptr, alloc, wrong_cut));
+    try std.testing.expectEqual(@as(u64, 0), try coverage(a, try managed.load(a)));
+    try std.testing.expect(try port.bootstrap_committed.?(port.ptr, alloc, recovery));
     try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, snapshot));
     try std.testing.expect(try port.bootstrap_committed.?(port.ptr, alloc, recovery));
     try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, request));
