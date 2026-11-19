@@ -1063,6 +1063,14 @@ pub const Session = struct {
                     self.replicationDeadline(@intCast(request_value.deadline.raw.nanoseconds));
                     try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
                     var poll = stream.poll(stream.context, scratch.allocator(), request_value, sent, limits.frame_bytes - 30) catch |err| {
+                        if (err == error.ReplicationReadDeferred and !self.cancel_requested.load(.acquire) and self.replicationNow() < deadline) {
+                            // The backend guarantees that this failure moved
+                            // no cursor. Require a fresh authorized read before
+                            // emitting data or a keepalive for this position.
+                            self.replicationDeadline(deadline);
+                            try select.concurrent(.tick, replicationTick, .{ self.io, limits.replication_poll_ms });
+                            continue;
+                        }
                         std.log.debug("PostgreSQL replication poll failed err={s}", .{@errorName(err)});
                         return err;
                     };

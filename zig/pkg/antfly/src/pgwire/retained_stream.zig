@@ -76,7 +76,12 @@ pub fn Bridge(comptime Host: type) type {
             // immediately. A fetch arena would retain them through every
             // nested metadata and artifact read in this poll.
             const backing = request.scratch_allocator orelse a;
-            var page = try self.owner.poll(self.host.service, self.host.registry, self.host, backing, @backingInt(after), maximum, req);
+            var page = self.owner.poll(self.host.service, self.host.registry, self.host, backing, @backingInt(after), maximum, req) catch |err| switch (err) {
+                // The retained reader advances its frontier only after it
+                // obtains the complete payload and verifies the live slot.
+                error.Canceled, error.Cancelled, error.DeadlineExceeded, error.ReadUnavailable, error.ConcurrencyUnavailable, error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionResetByPeer, error.Timeout => return error.ReplicationReadDeferred,
+                else => return err,
+            };
             defer page.deinit();
             var result: backend.ReplicationPoll = .{ .end_lsn = @fromBackingInt(page.end_lsn) };
             if (page.bytes) |bytes| {

@@ -34,14 +34,21 @@ IMAGE = "antfly-debezium-qualification:3.3.0"
 POSTGRES = "postgres:17.6-bookworm@sha256:f3bd19c606e442c3d7bdfa8002e03fe260a1023351e0ea4598032022b68dd6e3"
 
 
+class CommandFailure(RuntimeError):
+    def __init__(self, result):
+        super().__init__(
+            f"command failed ({result.returncode}): {result.stderr[-8000:]}"
+        )
+        self.stdout = result.stdout
+        self.stderr = result.stderr
+
+
 def command(*args, timeout=120, env=None):
     result = subprocess.run(
         args, capture_output=True, text=True, timeout=timeout, env=env
     )
     if result.returncode:
-        raise RuntimeError(
-            f"command failed ({result.returncode}): {result.stderr[-8000:]}"
-        )
+        raise CommandFailure(result)
     return result.stdout.strip()
 
 
@@ -198,6 +205,8 @@ def run(options, directory):
             "psql",
             "-v",
             "ON_ERROR_STOP=1",
+            "-v",
+            "VERBOSITY=verbose",
             "-At",
             *(arg for text in statements for arg in ("-c", text)),
         )
@@ -301,12 +310,25 @@ def run(options, directory):
             scaled.to_bytes((scaled.bit_length() + 8) // 8, "big", signed=True)
         ).decode()
         assert after["amount"] == expected_decimal, snapshot
-        sql(
-            "BEGIN",
-            f"INSERT INTO public.{table} {columns} VALUES (2, 'stream', 2.5, false)",
-            f"UPDATE public.{table} SET label='updated' WHERE id=1",
-            "COMMIT",
-        )
+        for attempt in range(4):
+            try:
+                sql(
+                    "BEGIN",
+                    f"INSERT INTO public.{table} {columns} VALUES (2, 'stream', 2.5, false)",
+                    f"UPDATE public.{table} SET label='updated' WHERE id=1",
+                    "COMMIT",
+                )
+                break
+            except CommandFailure as error:
+                # ON_ERROR_STOP skipped COMMIT when UPDATE returned a
+                # temporary read error. Closing psql aborts the staged insert.
+                if (
+                    attempt == 3
+                    or "ERROR:  53300:" not in error.stderr
+                    or error.stdout.splitlines() != ["BEGIN", "INSERT 0 1"]
+                ):
+                    raise
+                time.sleep(0.05 * (2**attempt))
         inserted = client.wait(lambda event: row(event, "c", 2))
         updated = client.wait(lambda event: row(event, "u", 1))
         assert updated["value"]["before"]["label"] == "snapshot", updated
@@ -315,8 +337,14 @@ def run(options, directory):
         # PostgreSQL's Debezium transaction id includes each record's LSN;
         # source.txId is the stable transaction identity across row messages.
         assert inserted["value"]["source"]["txId"] == updated["value"]["source"]["txId"]
-        assert inserted["value"]["transaction"]["total_order"] == 1
-        assert updated["value"]["transaction"]["total_order"] == 2
+        # PostgreSQL emits WAL record order. Antfly emits each transaction's
+        # net row effects in durable storage-key order.
+        transaction_rows = [
+            event for event in client.events if row(event, "c", 2) or row(event, "u", 1)
+        ]
+        assert [
+            event["value"]["transaction"]["total_order"] for event in transaction_rows
+        ] == [1, 2]
         client.wait(
             lambda event: (
                 event.get("topic") == "qualification.transaction"

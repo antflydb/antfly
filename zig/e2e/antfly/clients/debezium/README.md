@@ -81,7 +81,8 @@ The qualified publication contains one native relational table on one retained
 root, with an integer primary key, text, numeric, and boolean columns and
 `REPLICA IDENTITY FULL`. Use a replication principal authorized for the
 whole table. The stream delivers committed text-format inserts, updates, and
-deletes with transaction boundaries and durable per-slot positions.
+deletes with transaction boundaries and durable per-slot positions. Antfly
+orders a committed transaction's net effects by retained storage key.
 Binary tuples, in-progress transaction streaming, two-phase replication,
 native PostgreSQL failover slots, and physical replication are unsupported.
 Logical-message options produce the same row stream. Multi-table and
