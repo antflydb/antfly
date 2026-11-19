@@ -157,6 +157,22 @@ pub const BatchOutcome = struct {
     committed: bool,
 };
 
+/// Admit an exact batch and give the existing durable catalog worker one
+/// bounded opportunity to commit it. A retry reconciles the original WAL
+/// receipt and catalog intent. Callers may checkpoint only a committed result.
+pub fn applyBatch(a: A, binding: Binding, unresolved_options: Options, context: Context, batch: Batch) !BatchOutcome {
+    const options = try unresolved_options.resolveOwner(a, context);
+    const sequence = try acceptResolvedBatch(a, binding, options, context, batch);
+    const observed = (try observeBatch(a, binding, options, context, batch)) orelse return error.LakeWalCoverageGap;
+    if (observed.accepted_sequence != sequence) return error.LakeWalCoverageGap;
+    if (observed.committed) return observed;
+
+    _ = try drain(a, binding, options, context);
+    const refreshed = (try observeBatch(a, binding, options, context, batch)) orelse return error.LakeWalCoverageGap;
+    if (refreshed.accepted_sequence != sequence) return error.LakeWalCoverageGap;
+    return refreshed;
+}
+
 /// Resolve an exact admission from durable WAL identity and confirm whether
 /// the catalog has committed its sequence. Absence never advances progress.
 pub fn observeBatch(a: A, binding: Binding, unresolved_options: Options, context: Context, batch: Batch) !?BatchOutcome {
@@ -759,9 +775,10 @@ test "external lake filesystem WAL group commit folds pending transactions into 
     var incomplete = update;
     incomplete.row_complete = false;
     try std.testing.expectError(error.ReplicationProjectionIncomplete, postgresBatch(a, "s", "1", "8", checkpoint, &.{"id"}, &.{incomplete}));
-    try std.testing.expectEqual(@as(u64, 10), try acceptBatch(a, binding, options, .{}, captured));
-    try std.testing.expect(try drain(a, binding, options, .{}));
-    try std.testing.expectEqual(BatchOutcome{ .accepted_sequence = 10, .committed = true }, (try observeBatch(a, binding, options, .{}, captured)).?);
+    const committed: BatchOutcome = .{ .accepted_sequence = 10, .committed = true };
+    try std.testing.expectEqual(committed, try applyBatch(a, binding, options, .{}, captured));
+    try std.testing.expectEqual(committed, try applyBatch(a, binding, options, .{}, captured));
+    try std.testing.expectEqual(@as(u64, 10), try watermark(a, binding, options, .{}));
     const polled_snapshots = (try catalog.metadata.get(polled_root, "snapshots")).array.items;
     const before_poll = polled_snapshots[polled_snapshots.len - 2];
     const after_poll = polled_snapshots[polled_snapshots.len - 1];
