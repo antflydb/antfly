@@ -69,8 +69,12 @@ pub fn destinationFiles(a: A, files: local.serverless_object_store_support.Opene
 pub fn coverage(a: A, table: catalog.types.Table) !u64 {
     var p = try std.json.parseFromSlice(V, a, table.metadata_json, .{});
     defer p.deinit();
-    const properties = try catalog.metadata.get(p.value, "properties");
-    return propertyCoverage(properties.object);
+    return propertyCoverage(try catalogProperties(p.value));
+}
+fn catalogProperties(metadata: V) !std.json.ObjectMap {
+    const properties = try catalog.metadata.get(metadata, "properties");
+    if (properties != .object) return error.InvalidLakeMetadata;
+    return properties.object;
 }
 fn propertyCoverage(properties: std.json.ObjectMap) !u64 {
     const value = properties.get("antfly.wal.coverage") orelse return 0;
@@ -129,7 +133,7 @@ pub fn observeBatch(a: A, binding: Binding, unresolved_options: Options, context
     var current = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
     defer current.deinit(a);
     const metadata = try catalog.metadata.parse(arena.allocator(), current.table.metadata_json);
-    const properties = (try catalog.metadata.get(metadata, "properties")).object;
+    const properties = try catalogProperties(metadata);
     const covered = try propertyCoverage(properties);
     if (covered >= accepted) {
         try requireSourceProperties(arena.allocator(), properties, batch);
@@ -185,7 +189,7 @@ fn acceptResolvedBatch(a: A, binding: Binding, options: Options, context: Contex
     } else {
         var metadata = try std.json.parseFromSlice(V, a, current.table.metadata_json, .{});
         defer metadata.deinit();
-        const props = (try catalog.metadata.get(metadata.value, "properties")).object;
+        const props = try catalogProperties(metadata.value);
         const checkpoint = props.get("antfly.cdc.checkpoint");
         if ((checkpoint == null) != (batch.expected_checkpoint == null)) return error.LakeCheckpointConflict;
         if (checkpoint) |v| if (!std.mem.eql(u8, try catalog.metadata.str(v), batch.expected_checkpoint.?)) return error.LakeCheckpointConflict;
