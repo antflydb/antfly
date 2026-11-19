@@ -113,6 +113,74 @@ def sync_counter(config):
     return function
 
 
+CALIBRATION_WRITES = 16
+
+
+def calibration_main(engine, library, path, counter_path, results):
+    """Counts the shim's syncs across sequential durable writes by one writer.
+    Each must issue at least one durability barrier; fewer observed means
+    this engine syncs through a path the shim cannot see (Linux io_uring
+    submits FSYNC without a libc call)."""
+    config = {"sync_counter": counter_path}
+    syncs = sync_counter(config)
+    if syncs is None:
+        results.put(None)
+        return
+    if engine == "sqlite":
+        bootstrap("sqlite", path, False, None, 1)
+        with contextlib.closing(sqlite_open(path)) as db:
+            before = syncs()
+            for sequence in range(CALIBRATION_WRITES):
+                db.execute("BEGIN IMMEDIATE")
+                db.execute(UPSERT, (key(0, sequence), encoded(payload(0, sequence))))
+                db.execute("COMMIT")
+            results.put(syncs() - before)
+    else:
+        af = sdk(library)
+        with af.create(path, no_sync=False, busy_timeout=TIMEOUT) as db:
+            before = syncs()
+            for sequence in range(CALIBRATION_WRITES):
+                db.batch_json(
+                    {
+                        "inserts": {key(0, sequence): payload(0, sequence)},
+                        "sync_level": "write",
+                    }
+                )
+            results.put(syncs() - before)
+
+
+def sync_counter_observes(engine, library, directory, counter):
+    """Whether the preloaded counter sees this engine's durability barriers."""
+    if counter is None:
+        return False
+    path = (
+        directory
+        / f"sync-calibration-{engine}.{'db' if engine == 'sqlite' else 'aflite'}"
+    )
+    for stale in directory.glob(path.name + "*"):
+        stale.unlink()
+    ctx = mp.get_context("spawn")
+    results = ctx.Queue()
+    process = ctx.Process(
+        target=calibration_main,
+        args=(engine, str(library), path, str(counter), results),
+    )
+    preload = os.environ.get(PRELOAD_VARIABLE)
+    os.environ[PRELOAD_VARIABLE] = str(counter)
+    try:
+        process.start()
+    finally:
+        if preload is None:
+            os.environ.pop(PRELOAD_VARIABLE, None)
+        else:
+            os.environ[PRELOAD_VARIABLE] = preload
+    observed = results.get(timeout=300)
+    process.join(timeout=60)
+    for done in directory.glob(path.name + "*"):
+        done.unlink()
+    return observed is not None and observed >= CALIBRATION_WRITES
+
+
 def payload(worker, sequence, text_bytes=1024):
     token = f"matchedworker{worker}sequence{sequence}"
     prefix = token + " "
@@ -208,7 +276,13 @@ END;
             db.run_until_idle()
 
 
-def worker_main(config, worker, ready, start, begin, stop, results):
+# Every Nth acknowledged full-text write is searched on the writer's own
+# handle right away, outside the timed call: full_index must already make it
+# visible, before any later write, drain or close could.
+VISIBILITY_SAMPLE_INTERVAL = 64
+
+
+def worker_main(config, worker, ready, start, begin, stop, results, release, closes):
     db = None
     result = {
         "worker": worker,
@@ -216,6 +290,8 @@ def worker_main(config, worker, ready, start, begin, stop, results):
         "busy_calls": 0,
         "latencies_ns": [],
         "error": None,
+        "visibility_samples": 0,
+        "visibility_failures": [],
     }
     syncs = sync_counter(config)
     try:
@@ -233,6 +309,15 @@ def worker_main(config, worker, ready, start, begin, stop, results):
                     raise
 
             busy = (sqlite3.OperationalError,)
+
+            def search_keys(token):
+                return sorted(
+                    row[0]
+                    for row in db.execute(
+                        "SELECT documents.id FROM search JOIN documents ON documents.rowid=search.rowid WHERE search MATCH ?",
+                        (token,),
+                    )
+                )
         else:
             af = sdk(config["library"])
             db = af.open(config["path"], no_sync=False, busy_timeout=TIMEOUT)
@@ -248,6 +333,18 @@ def worker_main(config, worker, ready, start, begin, stop, results):
                     db.batch_json(request)
 
             busy = (af.BusyError,)
+
+            def search_keys(token):
+                found = db.search(
+                    {
+                        "full_text_search": {"match": {"field": "text", "text": token}},
+                        "limit": 16,
+                    }
+                )
+                return sorted(
+                    hit["_id"] for hit in found["responses"][0]["hits"]["hits"]
+                )
+
         ready.put({"worker": worker, "ready": True})
         assert start.wait(120)
         while time.monotonic() < begin.value:
@@ -292,6 +389,18 @@ def worker_main(config, worker, ready, start, begin, stop, results):
                 # zero-Busy gate, including any post-commit visibility refusal.
                 continue
             result["latencies_ns"].append(time.perf_counter_ns() - began)
+            if (
+                config["indexed"]
+                and sequence % VISIBILITY_SAMPLE_INTERVAL
+                == VISIBILITY_SAMPLE_INTERVAL - 1
+            ):
+                token = f"matchedworker{worker}sequence{sequence}"
+                found = search_keys(token)
+                result["visibility_samples"] += 1
+                if found != [document_key]:
+                    result["visibility_failures"].append(
+                        {"token": token, "found": found}
+                    )
             sequence += 1
         result["successful_calls"] = sequence
         result["ended"] = time.monotonic()
@@ -302,23 +411,30 @@ def worker_main(config, worker, ready, start, begin, stop, results):
         stop.set()
         ready.put({"worker": worker, "ready": False})
     finally:
+        # Verification runs while this handle stays open: closing first could
+        # sync or drain a visibility failure away before it is checked.
+        results.put(result)
+        release.wait(TIMEOUT + 600)
         closing = time.monotonic()
+        closed = {"worker": worker, "close_error": None}
         if db is not None:
             try:
                 db.close()
             except BaseException:
-                result["close_error"] = traceback.format_exc()
-        result["close_seconds"] = time.monotonic() - closing
-        results.put(result)
+                closed["close_error"] = traceback.format_exc()
+        closed["close_seconds"] = time.monotonic() - closing
+        closes.put(closed)
 
 
-def thread_group_main(config, workers, ready, start, begin, stop, results):
+def thread_group_main(
+    config, workers, ready, start, begin, stop, results, release, closes
+):
     """Runs every worker as a thread of one process, each with its own
     connection, so they share the engine's in-process group commit."""
     threads = [
         threading.Thread(
             target=worker_main,
-            args=(config, worker, ready, start, begin, stop, results),
+            args=(config, worker, ready, start, begin, stop, results, release, closes),
         )
         for worker in workers
     ]
@@ -340,7 +456,7 @@ def timed_syncs(config, rows):
     )
 
 
-def verify(engine, path, indexed, library, worker_results):
+def verify(engine, path, indexed, library, worker_results, final=True):
     counts = {row["worker"]: row["successful_calls"] for row in worker_results}
     assert sorted(counts) == list(range(len(worker_results)))
     began = time.monotonic()
@@ -349,8 +465,9 @@ def verify(engine, path, indexed, library, worker_results):
     if engine == "sqlite":
         db = sqlite_open(path)
         with contextlib.closing(db):
-            assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-            if indexed:
+            if final:
+                assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+            if final and indexed:
                 db.execute(
                     "INSERT INTO search(search,rank) VALUES('integrity-check',1)"
                 )
@@ -376,7 +493,8 @@ def verify(engine, path, indexed, library, worker_results):
                 )
 
             checked = verify_rows(counts, indexed, lookup, search_keys)
-            assert db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+            if final:
+                assert db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
     else:
         af = sdk(library)
         with af.open(path, no_sync=False, busy_timeout=TIMEOUT) as db:
@@ -395,8 +513,9 @@ def verify(engine, path, indexed, library, worker_results):
             # full_index acknowledged every write as searchable: check before
             # any drain, which could repair a missed acknowledgement.
             checked = verify_rows(counts, indexed, db.lookup, search_keys)
-            db.run_until_idle()
-            assert db.check()["valid"]
+            if final:
+                db.run_until_idle()
+                assert db.check()["valid"]
     return {
         "every_latest_value_checked": True,
         "primary_rows_checked": checked,
@@ -466,7 +585,25 @@ def cleanup(path):
         check.returncode in (0, 1)
         and not check.stdout.strip()
         and not check.stderr.strip()
-    ), "Fixture still open or cannot inspect"
+    ), (
+        "Fixture still open or cannot inspect",
+        check.stdout,
+        check.stderr,
+        subprocess.run(
+            [
+                "ps",
+                "-o",
+                "pid,ppid,command",
+                "-p",
+                ",".join(
+                    line[1:] for line in check.stdout.split() if line.startswith("p")
+                )
+                or "0",
+            ],
+            capture_output=True,
+            text=True,
+        ).stdout,
+    )
     removed = 0
     for p in paths:
         assert not p.is_symlink()
@@ -508,8 +645,13 @@ def run_case(config):
         config["workers"],
     )
     ctx = mp.get_context("spawn")
-    ready, results = ctx.Queue(), ctx.Queue()
-    start, stop, begin = ctx.Event(), ctx.Event(), ctx.Value("d", 0)
+    ready, results, closes = ctx.Queue(), ctx.Queue(), ctx.Queue()
+    start, stop, begin, release = (
+        ctx.Event(),
+        ctx.Event(),
+        ctx.Value("d", 0),
+        ctx.Event(),
+    )
     if config["worker_model"] == "thread":
         processes = [
             ctx.Process(
@@ -522,6 +664,8 @@ def run_case(config):
                     begin,
                     stop,
                     results,
+                    release,
+                    closes,
                 ),
             )
         ]
@@ -529,13 +673,24 @@ def run_case(config):
         processes = [
             ctx.Process(
                 target=worker_main,
-                args=(config, worker, ready, start, begin, stop, results),
+                args=(
+                    config,
+                    worker,
+                    ready,
+                    start,
+                    begin,
+                    stop,
+                    results,
+                    release,
+                    closes,
+                ),
             )
             for worker in range(config["workers"])
         ]
     preload = os.environ.get(PRELOAD_VARIABLE)
-    rows, samples = [], []
+    rows, samples, closed = [], [], []
     contamination = []
+    live_verification = None
     try:
         if config.get("sync_counter"):
             os.environ[PRELOAD_VARIABLE] = config["sync_counter"]
@@ -569,12 +724,28 @@ def run_case(config):
             if not config["smoke"] and time.monotonic() >= next_inspection:
                 contamination.extend(compiler_processes())
                 next_inspection = time.monotonic() + 2
+        assert all(not row.get("error") for row in rows), rows
+        # Writers still hold their handles: nothing their close would sync or
+        # drain has happened yet.
+        live_verification = verify(
+            config["engine"],
+            config["path"],
+            config["indexed"],
+            config["library"],
+            rows,
+            final=False,
+        )
+        release.set()
+        while len(closed) < config["workers"]:
+            assert time.monotonic() < deadline + TIMEOUT + 60, "Worker close watchdog"
+            closed.append(closes.get(timeout=TIMEOUT + 60))
         for process in processes:
             process.join(timeout=30)
             assert process.exitcode == 0
     finally:
         stop.set()
         start.set()
+        release.set()
         for process in processes:
             if process.is_alive():
                 process.terminate()
@@ -589,12 +760,15 @@ def run_case(config):
     # below) instead of aborting; treat the within-run SQLite-vs-Lite
     # ratio, not absolute rates, as the signal when this is non-empty.
     compiler_contamination_samples = len(contamination)
-    assert all(not row.get("error") and not row.get("close_error") for row in rows), (
-        rows
-    )
+    assert all(not row.get("close_error") for row in closed), closed
+    for row in rows:
+        row["close_seconds"] = next(
+            c["close_seconds"] for c in closed if c["worker"] == row["worker"]
+        )
     verification = verify(
         config["engine"], config["path"], config["indexed"], config["library"], rows
     )
+    verification["checked_with_writers_open"] = live_verification is not None
     latencies = sorted(value for row in rows for value in row.pop("latencies_ns"))
     elapsed = max(row["ended"] for row in rows) - min(row["started"] for row in rows)
     syncs = timed_syncs(config, rows)
@@ -629,8 +803,14 @@ def run_case(config):
     }
     result["all_workers_progressed"] = all(row["successful_calls"] > 0 for row in rows)
     result["zero_busy"] = result["busy_calls"] == 0
+    result["visibility_samples"] = sum(row["visibility_samples"] for row in rows)
+    result["visibility_failures"] = [
+        f for row in rows for f in row["visibility_failures"]
+    ]
     result["qualification_passed"] = (
-        result["all_workers_progressed"] and result["zero_busy"]
+        result["all_workers_progressed"]
+        and result["zero_busy"]
+        and not result["visibility_failures"]
     )
     result["cleanup"] = cleanup(config["path"])
     return result
@@ -677,6 +857,10 @@ def main():
     assert not args.output.exists()
     counter = build_sync_counter(args.directory)
     library = Path(args.library).resolve()
+    counter_observes = {
+        engine: sync_counter_observes(engine, library, args.directory, counter)
+        for engine in (["antfly", "sqlite"] if args.engine == "both" else [args.engine])
+    }
     library_sha = hashlib.file_digest(library.open("rb"), "sha256").hexdigest()
     script_sha = hashlib.file_digest(Path(__file__).open("rb"), "sha256").hexdigest()
     with sqlite3.connect(":memory:") as metadata_db:
@@ -716,6 +900,7 @@ def main():
         "payload_bytes_text": 1024,
         "documents_per_transaction": 1,
         "keys_per_worker": 128,
+        "sync_counter_observes": counter_observes,
         "sync_counter": "fsync, fdatasync and F_FULLFSYNC/F_BARRIERFSYNC calls in the worker processes during the timed window"
         if counter
         else None,
@@ -799,7 +984,9 @@ def main():
                                 "engine": engine,
                                 "batch_path": batch_path,
                                 "worker_model": worker_model,
-                                "sync_counter": str(counter) if counter else None,
+                                "sync_counter": str(counter)
+                                if counter and counter_observes[engine]
+                                else None,
                                 "path": args.directory
                                 / (engine + path_tag + "." + suffix),
                                 "indexed": indexed,
