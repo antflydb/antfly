@@ -490,6 +490,14 @@ pub const CatalogReplicationSlots = struct {
         return @import("../pgwire/values.zig").HistoricalSnapshot.decode(a, raw);
     }
 
+    pub fn readExportedSnapshotCatalogPage(self: CatalogReplicationSlots, a: std.mem.Allocator, name: []const u8, namespace: control.Namespace, table: catalog.Table, after: ?[]const u8, rows: u32, bytes: u32, context: operation.RequestContext) !catalog.Page {
+        if (std.mem.readInt(u64, namespace[0..8], .big) != table.id) return error.ChangefeedResynchronizationRequired;
+        const offset = if (after) |cursor| std.fmt.parseUnsigned(u32, cursor, 10) catch return error.HistoryCheckpointConflict else 0;
+        var raw = try self.readExportedSnapshot(a, name, namespace, offset, rows, bytes, context);
+        defer raw.deinit();
+        return @import("../pgwire/values.zig").historicalCatalogPage(a, raw, table);
+    }
+
     pub fn dropWrite(self: CatalogReplicationSlots, a: std.mem.Allocator, name: []const u8, now: u64, context: operation.RequestContext) !control.Write {
         var observed = try self.readOwned(a, name, context);
         defer observed.deinit();
@@ -3916,6 +3924,9 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
 
         try std.testing.expectError(error.InvalidReplicationSnapshot, slots.readExportedSnapshot(alloc, "invalid", namespace, 0, 1, 4096, .{}));
         try std.testing.expectError(error.ChangefeedCapabilityUnsupported, slots.readExportedSnapshotRows(alloc, &token.name(), namespace, 0, 1, 4096, .{}));
+        const sql_table: catalog.Table = .{ .id = after.members[0].table.table_id, .physical_name = "physical", .schema_version = 1, .columns = &.{} };
+        try std.testing.expectError(error.HistoryCheckpointConflict, slots.readExportedSnapshotCatalogPage(alloc, &token.name(), namespace, sql_table, "bad", 1, 4096, .{}));
+        try std.testing.expectError(error.ChangefeedCapabilityUnsupported, slots.readExportedSnapshotCatalogPage(alloc, &token.name(), namespace, sql_table, null, 1, 4096, .{}));
     }
     {
         var tmp = std.testing.tmpDir(.{});

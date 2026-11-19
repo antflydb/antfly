@@ -312,6 +312,7 @@ pub const HistoricalSnapshot = struct {
     rows: []const []const @import("backend.zig").Cell,
     next_row: u32,
     done: bool,
+    schema_version: u32,
 
     pub fn deinit(self: *HistoricalSnapshot) void {
         self.arena.deinit();
@@ -338,9 +339,37 @@ pub const HistoricalSnapshot = struct {
             try historicalCells(a, schema, &layout, raw.value, cells, true);
             row.* = cells;
         }
-        return .{ .arena = arena, .columns = columns, .rows = rows, .next_row = page.next_row, .done = page.done };
+        return .{ .arena = arena, .columns = columns, .rows = rows, .next_row = page.next_row, .done = page.done, .schema_version = schema.version };
     }
 };
+
+/// Adapt a pinned physical page to the SQL catalog scan contract. The
+/// executor keeps evaluating predicates and projecting columns above the scan.
+pub fn historicalCatalogPage(alloc: std.mem.Allocator, page: history_sources.api_local_table_writes.table_write_source.history_page.BootstrapPage, table: history_sources.sql_catalog.Table) !history_sources.sql_catalog.Page {
+    if (table.storage_mode != .relational or table.graph != null or table.external_base_source != null)
+        return error.ChangefeedCapabilityUnsupported;
+    var decoded = try HistoricalSnapshot.decode(alloc, page);
+    errdefer decoded.deinit();
+    if (table.schema_version != decoded.schema_version) return error.ChangefeedResynchronizationRequired;
+    const a = decoded.arena.allocator();
+    const rows = try a.alloc(history_sources.sql_catalog.Row, page.rows.len);
+    for (page.rows, decoded.rows, rows) |physical, cells, *out| {
+        const id = (try history_sources.storage_internal_keys.decodeStoredDocumentRowKeyAlloc(a, physical.key)) orelse return error.HistoryCorrupt;
+        var object: std.json.ObjectMap = .{};
+        const sql_nulls = try a.alloc(bool, cells.len);
+        for (decoded.columns, cells, sql_nulls) |column, cell, *sql_null| {
+            const value = if (cell.json_bytes) |raw|
+                try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .allocate = .alloc_always, .parse_numbers = false })
+            else
+                cell.value;
+            try object.put(a, column.name, value);
+            sql_null.* = cell.sql_null;
+        }
+        out.* = .{ .id = id, .version = 0, .value = .{ .object = object }, .sql_nulls = sql_nulls };
+    }
+    const after = if (decoded.done) null else try std.fmt.allocPrint(a, "{d}", .{decoded.next_row});
+    return .{ .rows = rows, .after = after, .owned_arena = decoded.arena };
+}
 
 /// A relation mapping frozen by the publication at the retained schema cut.
 /// Key ordinals are in relation order and refer to historical columns.
@@ -460,6 +489,11 @@ test "pgwire retained ordinal row preserves historical column types and null ide
     const pinned = page.arena.allocator();
     page.schema = try HistorySchema.serializeSchema(pinned, schema);
     page.rows = &.{.{ .key = try history_sources.storage_internal_keys.relationalRowKeyAlloc(pinned, "id=17"), .value = try pinned.dupe(u8, image) }};
+    const table: history_sources.sql_catalog.Table = .{ .id = 7, .physical_name = "docs", .schema_version = schema.version, .columns = &.{} };
+    page.done = false;
+    const catalog_page = try historicalCatalogPage(std.testing.allocator, page, table);
+    defer catalog_page.deinit();
+    page.done = true;
     var snapshot = try HistoricalSnapshot.decode(std.testing.allocator, page);
     defer snapshot.deinit();
     @memset(@constCast(page.rows[0].value), 0);
@@ -471,6 +505,10 @@ test "pgwire retained ordinal row preserves historical column types and null ide
     try std.testing.expect(!snapshot.rows[0][1].sql_null);
     try std.testing.expectEqualStrings("null", snapshot.rows[0][1].json_bytes.?);
     try std.testing.expect(snapshot.rows[0][2].sql_null);
+    try std.testing.expectEqualStrings("8", catalog_page.after.?);
+    try std.testing.expectEqualStrings("id=17", catalog_page.rows[0].id);
+    try std.testing.expectEqual(@as(i64, 17), try integer(catalog_page.rows[0].value.object.get("id").?));
+    try std.testing.expectEqualSlices(bool, &.{ false, false, true }, catalog_page.rows[0].sql_nulls.?);
 
     try std.testing.expectEqual(@as(u32, 23), try columnOid(try historicalColumn(schema.relational_columns[0])));
     const relation: HistoricalRelation = .{ .oid = 42, .namespace = "public", .name = "docs", .identity = .default, .key_ordinals = &.{0} };
