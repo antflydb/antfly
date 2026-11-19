@@ -169,22 +169,26 @@ pub const Routed = struct {
 
     pub fn init(source: roots.Source, captured: *const roots.Captured) !Routed {
         if (captured.roots.len != 1) return error.ChangefeedCapabilityUnsupported;
-        return .{ .namespace = captured.roots[0].namespace, .source = source, .captured = captured };
+        return initForRoot(source, captured, captured.roots[0].namespace);
+    }
+
+    pub fn initForRoot(source: roots.Source, captured: *const roots.Captured, namespace: control.Namespace) !Routed {
+        _ = try captured.find(namespace);
+        return .{ .namespace = namespace, .source = source, .captured = captured };
     }
 
     pub fn validateScope(self: *Routed, state: control.State) !control.Table {
         try state.validate();
         const definition = state.definition orelse return error.ChangefeedConflict;
-        if ((definition.start == .snapshot_then_changes and self.source.bootstrap_pages == null) or definition.events != 1 or definition.tables.len != 1)
+        if ((definition.start == .snapshot_then_changes and self.source.bootstrap_pages == null) or definition.events != 1)
             return error.ChangefeedCapabilityUnsupported;
-        const table = definition.tables[0];
-        if (table.contract != .native_document) return error.ChangefeedCapabilityUnsupported;
+        try self.captured.validateInitialRoutes(state.roots);
         const selected = try self.captured.find(self.namespace);
-        if (selected.fence.table_id != table.table_id or !same(selected.table_binding, table.binding))
-            return error.ChangefeedResynchronizationRequired;
-        if (state.roots.len != 1 or !same(state.roots[0].namespace, self.namespace) or
-            state.roots[0].ownership_epoch != 1 or state.roots[0].released)
-            return error.ChangefeedResynchronizationRequired;
+        const table = for (definition.tables) |table| {
+            if (selected.fence.table_id == table.table_id) break table;
+        } else return error.ChangefeedResynchronizationRequired;
+        if (table.contract != .native_document) return error.ChangefeedCapabilityUnsupported;
+        if (!same(selected.table_binding, table.binding)) return error.ChangefeedResynchronizationRequired;
         return table;
     }
 
@@ -192,7 +196,7 @@ pub const Routed = struct {
         try request.ensureActive();
         _ = try self.validateScope(state);
         if (state.phase != .bootstrap) return error.ChangefeedResynchronizationRequired;
-        const root = state.roots[0];
+        const root = state.roots[try state.rootIndex(self.namespace)];
         const pin = root.snapshot orelse return error.ChangefeedResynchronizationRequired;
         if (root.snapshot_released or root.consumer_epoch == 0) return error.ChangefeedResynchronizationRequired;
         if (now == 0 or now >= state.expires_at or now >= pin.expires_at) return error.ChangefeedLeaseExpired;
@@ -226,12 +230,13 @@ pub const Routed = struct {
         _ = try self.validateScope(state);
         if (state.phase != .streaming) return error.ChangefeedResynchronizationRequired;
         if (now == 0 or now >= state.expires_at) return error.ChangefeedLeaseExpired;
-        const root = state.roots[0];
+        const index = try state.rootIndex(self.namespace);
+        const root = state.roots[index];
         if (root.consumer_epoch == 0) return error.ChangefeedResynchronizationRequired;
         const selected = try self.captured.find(self.namespace);
         const positions = try state.rootsAt(a, cursor);
         defer a.free(positions);
-        const after = positions[0].delivered;
+        const after = positions[index].delivered;
         var page = try self.source.pages.read(a, selected.fence, selected.table_name, .{
             .version = 1,
             .request = .{

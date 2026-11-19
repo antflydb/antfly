@@ -405,10 +405,10 @@ pub const test_support = if (@import("builtin").is_test) struct {
         try std.testing.expectEqual(@as(usize, 1), fake.mutations);
         fake.commit = true;
         const commands = @import("sql_pgwire.zig").SlotCommands;
-        const created = try commands.create(port, scratch, .{ .slot = configuration.name }, write, 101, "qualified-snapshot", context);
+        const created = try commands.create(port, scratch, .{ .slot = configuration.name, .snapshot = .nothing }, write, 101, context);
         try std.testing.expectEqualStrings("CREATE_REPLICATION_SLOT", created.command_tag);
         try std.testing.expectEqualStrings("0/2000", created.rows[0][1].string);
-        try std.testing.expectEqualStrings("qualified-snapshot", created.rows[0][2].string);
+        try std.testing.expect(created.rows[0][2] == .null);
         try std.testing.expect(created.mutation_outcome == .committed);
         try std.testing.expectEqual(@as(usize, 2), fake.mutations);
         const original_start = try port.readSlotStart(a, write, 101, context);

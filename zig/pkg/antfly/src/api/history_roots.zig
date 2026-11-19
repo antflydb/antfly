@@ -60,7 +60,39 @@ pub const Captured = struct {
         for (self.roots, plans) |root, *plan| plan.* = .{ .namespace = root.namespace, .ownership_epoch = 1 };
         return plans;
     }
+
+    /// Initial ownership only. A replacement root needs a verified handoff
+    /// before a feed can use the new route to advance its retained cursor.
+    pub fn validateInitialRoutes(self: *const Captured, planned: []const control.Root) !void {
+        if (planned.len != self.roots.len) return error.ChangefeedResynchronizationRequired;
+        for (planned, self.roots) |root, route| {
+            if (!std.mem.eql(u8, &root.namespace, &route.namespace) or root.ownership_epoch != 1 or root.released)
+                return error.ChangefeedResynchronizationRequired;
+        }
+    }
 };
+
+test "history root discovery validates the complete installed route vector" {
+    var routes = [_]Root{
+        .{ .namespace = @splat(1), .table_name = "docs", .table_binding = @splat(1), .fence = undefined },
+        .{ .namespace = @splat(2), .table_name = "docs", .table_binding = @splat(1), .fence = undefined },
+    };
+    const captured: Captured = .{ .roots = &routes, .allocator = std.testing.allocator, .session = undefined };
+    var planned = [_]control.Root{
+        .{ .namespace = routes[0].namespace, .ownership_epoch = 1, .grant_sequence = 1 },
+        .{ .namespace = routes[1].namespace, .ownership_epoch = 1, .grant_sequence = 1 },
+    };
+    try captured.validateInitialRoutes(&planned);
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, captured.validateInitialRoutes(planned[0..1]));
+    planned[1].released = true;
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, captured.validateInitialRoutes(&planned));
+    planned[1].released = false;
+    planned[1].ownership_epoch = 2;
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, captured.validateInitialRoutes(&planned));
+    planned[1].ownership_epoch = 1;
+    routes[1].namespace = @splat(3);
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, captured.validateInitialRoutes(&planned));
+}
 pub const Source = struct {
     catalog: catalog_api.CatalogSource,
     controls: @import("history_control_operations.zig").Port,
@@ -426,6 +458,11 @@ pub const test_support = if (@import("builtin").is_test) struct {
         defer arena.deinit();
         var state = try (control.Mutation{ .create = .{ .id = @splat(4), .definition = definition, .now = 100, .expires_at = 1000 } }).apply(arena.allocator(), .{}, .{ .incarnation = @splat(9), .sequence = 1 });
         state = try (control.Mutation{ .plan_roots = plans }).apply(arena.allocator(), state, .{ .incarnation = @splat(9), .sequence = 2 });
+        const Routed = @import("../metadata/native_changefeed_root.zig").Routed;
+        var adapter = try Routed.initForRoot(allocation_fixture.source(), &captured, captured.roots[1].namespace);
+        try std.testing.expectEqual(selected[0].table_id, (try adapter.validateScope(state)).table_id);
+        var relational = try Routed.initForRoot(allocation_fixture.source(), &captured, captured.roots[2].namespace);
+        try std.testing.expectError(error.ChangefeedCapabilityUnsupported, relational.validateScope(state));
         const root = captured.roots[0];
         try allocation_fixture.source().validate(a, state, root.namespace, root.fence, root.table_name, .{});
         var wrong_fence = root.fence;
