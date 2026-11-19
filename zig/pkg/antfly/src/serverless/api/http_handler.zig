@@ -33,6 +33,7 @@ const graph_path_weight_diagnostic = @import("antfly_local_sources").graph_path_
 const graph_work_budget_diagnostic = @import("antfly_local_sources").graph_work_budget_diagnostic;
 const public_search_request = @import("antfly_local_sources").api_public_search_request;
 const public_text_query = @import("antfly_local_sources").api_public_text_query;
+const internal_query_operations = @import("../../api/internal_query_operations.zig");
 const public_table_http = @import("../../api/public_table_http.zig");
 const table_contract = @import("../../api/table_contract.zig");
 const tables_api = @import("../../api/tables.zig");
@@ -119,7 +120,6 @@ pub const HttpResponse = http_types.HttpResponse;
 
 const SearchExecution = struct {
     plan: query_mod.SearchPlan,
-    status: catalog_types.BuildStatus,
     session: ?query_mod.QuerySession,
     hits: []query_mod.QuerySearchHit,
     execution_stats: query_mod.QuerySearchExecutionStats,
@@ -130,7 +130,6 @@ const SearchExecution = struct {
     pub fn deinit(self: *SearchExecution, alloc: Allocator) void {
         query_mod.freeSearchHits(alloc, self.hits);
         if (self.session) |*session| session.deinit();
-        self.status.deinit(alloc);
         self.plan.deinit(alloc);
         self.* = undefined;
     }
@@ -264,6 +263,10 @@ pub const HttpHandler = struct {
     live_read_options: ?query_mod.LiveSession.Options = null,
     managed_query_embedder: ?*managed_embedder.ManagedEmbedder = null,
     embedding_provider_runtime: ?*managed_embedder.ProviderRuntime = null,
+    embedding_cache: ?internal_query_operations.QueryEmbeddingCache = null,
+    inference_api_url: ?[]const u8 = null,
+    inference_api_key: ?[]const u8 = null,
+    embedding_secret_store: ?*@import("antfly_local_sources").common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     io: ?std.Io = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
@@ -1389,9 +1392,9 @@ pub const HttpHandler = struct {
         diagnostics: ?*api_operation.RequestDiagnostics,
     ) !SearchExecution {
         try cancellation.check();
-        var status = try self.catalog.buildStatus(namespace);
-        errdefer status.deinit(self.alloc);
-        var plan = try query_mod.parseSearchPlanAlloc(self.alloc, body, status.published_search_sources);
+        var session = try self.query.openHeadSessionWithCancellation(namespace, cancellation);
+        errdefer session.deinit();
+        var plan = try query_mod.parseSearchPlanAlloc(self.alloc, body, session.manifest.stats.published_search_sources);
         errdefer plan.deinit(self.alloc);
         const requested_offset = plan.request.offset;
         const requested_limit = plan.request.limit;
@@ -1399,10 +1402,10 @@ pub const HttpHandler = struct {
             plan.request.offset = 0;
             plan.request.limit = std.math.maxInt(usize);
         }
-        try self.resolveSemanticQueryRequest(table_name, &plan, cancellation);
-
-        var session = try self.query.openHeadSessionWithCancellation(namespace, cancellation);
-        errdefer session.deinit();
+        // The serving generation owns the producer configuration. A catalog
+        // update can become visible before its replacement vectors do.
+        self.resolveSemanticQueryRequest(table_name, session.manifest.stats.indexes_json, &plan, cancellation, diagnostics) catch |err|
+            return internal_query_operations.normalizeQueryEmbeddingOperationalError(err) orelse err;
         session.setCancellation(cancellation);
         session.setDiagnostics(diagnostics);
         // Install the runtime before any query work. Graph-metric reranking
@@ -1418,7 +1421,6 @@ pub const HttpHandler = struct {
 
         return .{
             .plan = plan,
-            .status = status,
             .session = session,
             .hits = hits,
             .execution_stats = execution_stats,
@@ -1428,7 +1430,7 @@ pub const HttpHandler = struct {
         };
     }
 
-    fn executePublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
+    fn executePublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken, diagnostics: ?*api_operation.RequestDiagnostics) anyerror![]u8 {
         try cancellation.check();
         var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch
             return error.InvalidQueryRequest;
@@ -1471,10 +1473,10 @@ pub const HttpHandler = struct {
                 var owned = parsed_join;
                 owned.deinit(self.alloc);
             }
-            return try self.executeSupportedJoinedPublicTableQueryRequest(table_name, body, parsed_join.join, parsed_join.foreign_sources, cancellation, null);
+            return try self.executeSupportedJoinedPublicTableQueryRequest(table_name, body, parsed_join.join, parsed_join.foreign_sources, cancellation, diagnostics);
         }
 
-        return try self.executePlainPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, cancellation, null);
+        return try self.executePlainPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, cancellation, diagnostics);
     }
 
     fn executeForeignPublicTableQueryJsonValueAlloc(
@@ -1857,6 +1859,7 @@ pub const HttpHandler = struct {
         cancellation: CancellationToken,
         diagnostics: ?*api_operation.RequestDiagnostics,
     ) anyerror![]u8 {
+        const started_ns = if (diagnostics) |value| value.query_started_ns orelse platform_time.monotonicNs() else platform_time.monotonicNs();
         try cancellation.check();
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
@@ -1888,6 +1891,13 @@ pub const HttpHandler = struct {
 
         var execution = self.executePublishedSearch(namespace, table_name, body, cancellation, diagnostics) catch |err| {
             switch (err) {
+                error.QueryEmbeddingInputTooLarge,
+                error.QueryEmbeddingOverloaded,
+                error.EmbedRateLimited,
+                error.EmbedTransientFailure,
+                error.EmbedUpstreamFailure,
+                error.Timeout,
+                => return err,
                 error.InvalidQueryRequest,
                 error.EmbeddingIndexNotFound,
                 error.InvalidEmbeddingDimensions,
@@ -1953,6 +1963,7 @@ pub const HttpHandler = struct {
             computed.results = &.{};
         }
 
+        meta.took_ms = @intCast((platform_time.monotonicNs() -| started_ns) / std.time.ns_per_ms);
         var response = try query_api.encodeQueryResponses(
             self.alloc,
             table_name,
@@ -3115,7 +3126,7 @@ pub const HttpHandler = struct {
         }) catch return error.InvalidQueryRequest;
         defer parsed_request.deinit();
         const request = parsed_request.value;
-        const started_ns = platform_time.monotonicNs();
+        const started_ns = if (diagnostics) |value| value.query_started_ns orelse platform_time.monotonicNs() else platform_time.monotonicNs();
         const graph_queries = public_graph_query.parseCanonicalGraphQueriesAlloc(self.alloc, request) catch |err| {
             std.log.warn("serverless public graph request admission failed table={s} err={}", .{ table_name, err });
             return err;
@@ -4153,13 +4164,16 @@ pub const HttpHandler = struct {
             };
         }
 
+        var status = try self.catalog.buildStatus(execution.session.?.namespace());
+        defer status.deinit(self.alloc);
+
         return try jsonResponse(self.alloc, 200, query_types.QuerySearchResult{
             .namespace = execution.session.?.namespace(),
             .version = execution.session.?.version(),
             .view = .published,
             .published_wal_end_lsn = execution.session.?.manifest.wal_end_lsn,
-            .latest_wal_lsn = execution.status.latest_wal_lsn,
-            .freshness_lag_records = execution.status.latest_wal_lsn -| execution.session.?.manifest.wal_end_lsn,
+            .latest_wal_lsn = status.latest_wal_lsn,
+            .freshness_lag_records = status.latest_wal_lsn -| execution.session.?.manifest.wal_end_lsn,
             .query_text = execution.plan.request.text,
             .mode = execution.plan.request.mode,
             .operator = execution.plan.request.operator,
@@ -4179,7 +4193,7 @@ pub const HttpHandler = struct {
             .hit_count = execution.hits.len,
             .hits = out_hits,
             .aggregations = aggregations,
-            .enrichment = queryEnrichmentStatus(execution.status, execution.session.?.manifest.stats.document_count),
+            .enrichment = queryEnrichmentStatus(status, execution.session.?.manifest.stats.document_count),
         });
     }
 
@@ -4232,13 +4246,16 @@ pub const HttpHandler = struct {
             };
         }
 
+        var status = try self.catalog.buildStatus(execution.session.?.namespace());
+        defer status.deinit(self.alloc);
+
         return try jsonResponse(self.alloc, 200, query_types.TableQuerySearchResult{
             .table_name = table_name,
             .version = execution.session.?.version(),
             .view = .published,
             .published_wal_end_lsn = execution.session.?.manifest.wal_end_lsn,
-            .latest_wal_lsn = execution.status.latest_wal_lsn,
-            .freshness_lag_records = execution.status.latest_wal_lsn -| execution.session.?.manifest.wal_end_lsn,
+            .latest_wal_lsn = status.latest_wal_lsn,
+            .freshness_lag_records = status.latest_wal_lsn -| execution.session.?.manifest.wal_end_lsn,
             .query_text = execution.plan.request.text,
             .mode = execution.plan.request.mode,
             .operator = execution.plan.request.operator,
@@ -4258,7 +4275,7 @@ pub const HttpHandler = struct {
             .hit_count = execution.hits.len,
             .hits = out_hits,
             .aggregations = aggregations,
-            .enrichment = queryEnrichmentStatus(execution.status, execution.session.?.manifest.stats.document_count),
+            .enrichment = queryEnrichmentStatus(status, execution.session.?.manifest.stats.document_count),
         });
     }
 
@@ -4316,41 +4333,54 @@ pub const HttpHandler = struct {
         return try self.tableQueryGraphShortestPathResponse(&session, table_name, namespace, req);
     }
 
-    fn resolveSemanticQueryRequest(self: *HttpHandler, table_name: ?[]const u8, plan: *query_mod.SearchPlan, cancellation: CancellationToken) !void {
+    fn resolveSemanticQueryRequest(self: *HttpHandler, table_name: ?[]const u8, published_indexes_json: []const u8, plan: *query_mod.SearchPlan, cancellation: CancellationToken, diagnostics: ?*api_operation.RequestDiagnostics) !void {
         try cancellation.check();
         const semantic_search = plan.request.semantic_search orelse return;
         if (plan.request.vector != null) return error.InvalidQueryRequest;
 
-        // Signal background enrichment to yield the embedder while this
-        // query-time embed runs (see enrichment_types.interactive_embed_inflight).
-        _ = db_mod.enrichment_types.interactive_embed_inflight.fetchAdd(1, .monotonic);
-        defer _ = db_mod.enrichment_types.interactive_embed_inflight.fetchSub(1, .monotonic);
-
         const index_name = (plan.vectorSource() orelse return error.InvalidQueryRequest).index_name;
-        if (table_name) |name| {
-            var table = (try self.catalog.getTableAlloc(self.alloc, name)) orelse return error.InvalidQueryRequest;
-            defer table.deinit(self.alloc);
-
-            var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(self.alloc, table.indexes_json, .{
+        const principal = if (diagnostics) |value| value.query_principal else null;
+        const options: internal_query_operations.QueryEmbeddingOptions = .{
+            .storage = self.embedding_cache,
+            .retry_not_before_ns = if (diagnostics) |value| &value.query_embedding_retry_not_before_ns else null,
+            .domain = if (principal != null) .principal else .anonymous,
+            .scope = if (principal) |value| value.subject else "",
+            .cancellation = cancellation,
+            .request_id = if (diagnostics) |value| value.request_id else "",
+            .deadline_ns = if (diagnostics) |value| value.query_deadline_ns else null,
+        };
+        var legacy_table = if (published_indexes_json.len == 0)
+            if (table_name) |name| (try self.catalog.getTableAlloc(self.alloc, name)) orelse return error.InvalidQueryRequest else null
+        else
+            null;
+        defer if (legacy_table) |*table| table.deinit(self.alloc);
+        const indexes_json: ?[]const u8 = if (published_indexes_json.len != 0)
+            published_indexes_json
+        else if (legacy_table) |table|
+            table.indexes_json
+        else
+            null;
+        if (indexes_json) |indexes| {
+            var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(self.alloc, indexes, .{
                 .io = self.io,
                 .remote_content = self.remote_content,
                 .provider_runtime = self.embedding_provider_runtime,
+                .remote_capability_cache = if (self.embedding_provider_runtime) |provider| &provider.remote_capability_cache else null,
+                .inference_api_url = self.inference_api_url,
+                .inference_api_key = self.inference_api_key,
+                .secret_store = self.embedding_secret_store,
             });
             defer runtime.deinit();
             if (runtime.hasDenseEntries()) {
-                plan.request.vector = if (plan.request.embedding_template) |value|
-                    try runtime.embedQueryWithTemplateAndCancellation(self.alloc, index_name, semantic_search, value, cancellation)
-                else
-                    try runtime.embedQueryWithCancellation(self.alloc, index_name, semantic_search, cancellation);
+                // Object vector segments do not carry an accepted producer
+                // revision. A pin in catalog metadata cannot certify them.
+                plan.request.vector = try internal_query_operations.computeManagedQueryVector(&runtime, self.alloc, index_name, semantic_search, plan.request.embedding_template, options);
                 return;
             }
         }
 
         const runtime = self.managed_query_embedder orelse return error.InvalidQueryRequest;
-        plan.request.vector = if (plan.request.embedding_template) |value|
-            try runtime.embedQueryWithTemplateAndCancellation(self.alloc, index_name, semantic_search, value, cancellation)
-        else
-            try runtime.embedQueryWithCancellation(self.alloc, index_name, semantic_search, cancellation);
+        plan.request.vector = try internal_query_operations.computeManagedQueryVector(runtime, self.alloc, index_name, semantic_search, plan.request.embedding_template, options);
     }
 
     fn handleQueryGraphNeighbors(self: *HttpHandler, namespace: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
@@ -6316,9 +6346,15 @@ pub const HttpHandler = struct {
         _ = alloc;
         _ = row_filter_json;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
-        const guard = http_types.RequestGuard{ .context = request };
-        request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
-        return self.executePublicTableQueryJsonAlloc(table_name, body, guard.token()) catch |err| switch (normalizePublicAggregationError(err)) {
+        const context = request.platformDeadline() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
+        const guard = http_types.RequestGuard{ .context = context };
+        var local_diagnostics: api_operation.RequestDiagnostics = .{};
+        const diagnostics = request.diagnostics orelse &local_diagnostics;
+        diagnostics.query_started_ns = context.query_started_ns orelse platform_time.monotonicNs();
+        diagnostics.request_id = context.request_id;
+        diagnostics.query_deadline_ns = context.deadline_ns;
+        diagnostics.query_principal = context.principal;
+        return self.executePublicTableQueryJsonAlloc(table_name, body, guard.token(), diagnostics) catch |err| switch (normalizePublicAggregationError(err)) {
             error.ManifestReadLeaseContended, error.ManifestVersionRetired, error.StorageBusy => return error.StorageReadTemporarilyUnavailable,
             error.ManifestReadLeaseExpired, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
@@ -6348,7 +6384,14 @@ pub const HttpHandler = struct {
             error.GraphExternalAliasDocumentFilterUnsupported => return error.GraphExternalAliasDocumentFilterUnsupported,
             error.GraphExternalAliasSourceUnsupported => return error.GraphExternalAliasSourceUnsupported,
             error.GraphReverseVariablePathUnsupported => return error.GraphReverseVariablePathUnsupported,
-            error.Canceled => return error.Canceled,
+            error.QueryEmbeddingInputTooLarge,
+            error.QueryEmbeddingOverloaded,
+            error.EmbedRateLimited,
+            error.EmbedTransientFailure,
+            error.EmbedUpstreamFailure,
+            error.Timeout,
+            error.Canceled,
+            => |operation| return operation,
             else => {
                 if (public_table_http.queryCancellationError(err)) |operation| return operation;
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
@@ -10311,10 +10354,12 @@ fn adaptPublicTableQueryResponse(alloc: Allocator, response: public_table_http.O
     if (response.status == 200) {
         return try typedJsonResponse(metadata_openapi.QueryResponses, alloc, response.status, response.body);
     }
-    return if (response.json)
+    var adapted = if (response.json)
         try jsonSliceResponse(alloc, response.status, response.body)
     else
         try textResponse(alloc, response.status, response.body);
+    adapted.retry_after_seconds = response.retry_after_seconds;
+    return adapted;
 }
 
 test "typed index status response rejects extended variant fields but raw json preserves them" {
@@ -10650,6 +10695,12 @@ test "serverless public table query adapter preserves structured error content t
     var text_response = try adaptPublicTableQueryResponse(alloc, public_text_response);
     defer text_response.deinit(alloc);
     try std.testing.expectEqualStrings("text/plain", text_response.content_type);
+    var retryable = try public_table_http.queryTemporarilyUnavailableOwnedResponse(alloc, .query_embedding_temporarily_unavailable);
+    defer retryable.deinit(alloc);
+    retryable.retry_after_seconds = 19;
+    var adapted_retry = try adaptPublicTableQueryResponse(alloc, retryable);
+    defer adapted_retry.deinit(alloc);
+    try std.testing.expectEqual(@as(?u32, 19), adapted_retry.retry_after_seconds);
 }
 
 test "serverless http handler serves internal namespace lifecycle, admission, and query head" {
@@ -11547,6 +11598,64 @@ test "http handler join parser accepts foreign source maps" {
 
     try std.testing.expectEqualStrings("customers", parsed.join.right_table);
     try std.testing.expect(parsed.foreign_sources.contains("pg_customers"));
+}
+
+test "serverless fallback semantic query reuses embeddings for the same principal" {
+    const alloc = std.testing.allocator;
+    const Provider = struct {
+        calls: usize = 0,
+
+        fn embedDense(raw: *anyopaque, a: Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), texts.len);
+            self.calls += 1;
+            const rows = try a.alloc([]f32, 1);
+            errdefer a.free(rows);
+            rows[0] = try a.dupe(f32, &.{ 1, 0 });
+            return rows;
+        }
+
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("antfly_local_sources").storage_db_enrichment_embedder.SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var provider = Provider{};
+    const name = "semantic";
+    const index_config =
+        "{\"semantic\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":2,\"embedder\":{\"provider\":\"antfly\",\"model\":\"test-fallback\"}}}";
+    var managed = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, index_config, .{
+        .antfly_provider = .{ .ptr = &provider, .embed_dense_texts = Provider.embedDense, .embed_sparse_texts = Provider.embedSparse },
+    });
+    defer managed.deinit();
+    var budget = @import("antfly_cache_budget").CacheBudget.init(1024 * 1024);
+    var cache = @import("antfly_inference_query_embedding_cache").QueryEmbeddingCache.init(alloc, std.testing.io, .{});
+    defer cache.deinit(&budget);
+    var handler: HttpHandler = .{
+        .alloc = alloc,
+        .api = undefined,
+        .catalog = undefined,
+        .manifests = undefined,
+        .progress = undefined,
+        .query = undefined,
+        .runtime_status = undefined,
+        .managed_query_embedder = &managed,
+        .embedding_cache = .{ .cache = &cache, .budget = &budget },
+    };
+    var diagnostics: api_operation.RequestDiagnostics = .{ .request_id = "object-fallback" };
+    for ([_][]const u8{ "alice", "alice", "bob" }) |principal| {
+        diagnostics.query_principal = .{ .kind = .user, .subject = principal };
+        var plan = try query_mod.parseSearchPlanAlloc(
+            alloc,
+            "{\"semantic_search\":\"same query\"}",
+            search_sources.publishedSearchSourcesForNames(name, search_sources.default_sparse_embedding_index_name),
+        );
+        defer plan.deinit(alloc);
+        // A published definition is authoritative even if it has no
+        // managed provider for the request; the live catalog is untouched.
+        try handler.resolveSemanticQueryRequest("live-catalog", "{}", &plan, .none, &diagnostics);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 0 }, plan.request.vector.?);
+    }
+    try std.testing.expectEqual(@as(usize, 2), provider.calls);
 }
 
 test "serverless local table query routes a foreign right join before plain search" {

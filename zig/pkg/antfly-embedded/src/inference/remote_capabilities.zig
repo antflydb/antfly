@@ -24,11 +24,18 @@ const httpx = @import("httpx");
 const work = @import("antfly_inference_work");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
+const capability_selector_absent_header = "X-Antfly-Capability-Selector-Absent";
+const capability_selector_rejected_header = "X-Antfly-Capability-Selector-Rejected";
 const capability_cache_ttl_ns: u64 = 30 * std.time.ns_per_s;
+const capability_refresh_retry_ns: u64 = 5 * std.time.ns_per_s;
 const capability_cache_stale_ns: u64 = 5 * 60 * std.time.ns_per_s;
 const capability_cache_max_entries: usize = 64;
+// Reserve cold discovery independently of the vector cache; hot reads and
+// existing-flight waiters need no additional provider slot.
+const capability_cache_max_flights: usize = 16;
 const capability_discovery_timeout_ns: u64 = 30 * std.time.ns_per_s;
 const capability_activation_timeout_ns: u64 = 5 * 60 * std.time.ns_per_s;
+pub const parent_request_id_header = "X-Antfly-Parent-Request-ID";
 pub const model_activation_header = "X-Antfly-Model-Activation";
 const capability_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;
 const capability_catalog_response_bytes: usize = 4 << 20;
@@ -83,6 +90,8 @@ const CachedCapability = struct {
     descriptor_revision: ?CapabilityRevision = null,
     expires_at_ns: u64,
     stale_until_ns: u64,
+    refresh_not_before_ns: u64 = 0,
+    cold_failure: ?anyerror = null,
 };
 
 const FailedDiscoveryCompletion = struct {
@@ -126,6 +135,7 @@ const CapabilityFlight = struct {
     routing_token: ?RoutingToken = null,
     descriptor_revision: ?CapabilityRevision = null,
     err: ?anyerror = null,
+    retry_not_before_ns: u64 = 0,
     // An execution-side stale response is an authoritative revocation. A
     // discovery response that was already in flight at that boundary cannot
     // publish its older lease afterward.
@@ -140,8 +150,12 @@ const CapabilityFlight = struct {
 };
 
 pub const WaitContext = struct {
+    retry_not_before_ns: ?*u64 = null,
     deadline_ns: ?u64 = null,
     cancellation: CancellationToken = .none,
+    /// The cache owner also owns the HTTP client through cache teardown.
+    refresh_in_background: bool = false,
+    passive_refresh: bool = false,
 
     fn check(self: @This(), now_ns: u64) !void {
         try self.cancellation.check();
@@ -161,6 +175,7 @@ pub const Cache = struct {
     entries: std.StringHashMapUnmanaged(CachedCapability) = .empty,
     flights: std.StringHashMapUnmanaged(*CapabilityFlight) = .empty,
     closing: bool = false,
+    refreshes: std.Io.Group = .init,
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io) Cache {
         return .{ .alloc = alloc, .io = io };
@@ -169,6 +184,9 @@ pub const Cache = struct {
     pub fn deinit(self: *Cache) void {
         self.mutex.lockUncancelable(self.io);
         self.closing = true;
+        self.mutex.unlock(self.io);
+        self.refreshes.cancel(self.io);
+        self.mutex.lockUncancelable(self.io);
         while (self.flights.count() != 0) {
             var flights = self.flights.iterator();
             const flight = flights.next().?.value_ptr.*;
@@ -249,6 +267,7 @@ pub const Cache = struct {
         const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, operation, headers);
         defer self.alloc.free(key);
         while (true) {
+            if (wait_context.retry_not_before_ns) |hint| hint.* = 0;
             try wait_context.check(monotonicNowNs(self.io));
             const now_ns = monotonicNowNs(self.io);
 
@@ -257,14 +276,37 @@ pub const Cache = struct {
                 self.mutex.unlock(self.io);
                 return error.CapabilityCacheClosed;
             }
-            if (self.entries.get(key)) |entry| {
-                if (now_ns < entry.expires_at_ns) {
-                    self.mutex.unlock(self.io);
-                    return .{
-                        .capabilities = entry.value,
-                        .routing_token = entry.routing_token,
-                        .descriptor_revision = entry.descriptor_revision,
-                    };
+            if (wait_context.passive_refresh and !self.entries.contains(key)) {
+                self.mutex.unlock(self.io);
+                return error.CapabilityDiscoveryInvalidated;
+            }
+            if (self.entries.getPtr(key)) |entry| {
+                if (entry.cold_failure) |failure| {
+                    if (now_ns < entry.refresh_not_before_ns) {
+                        if (wait_context.retry_not_before_ns) |hint| hint.* = entry.refresh_not_before_ns;
+                        self.mutex.unlock(self.io);
+                        return failure;
+                    }
+                    self.removeEntryLocked(key);
+                } else {
+                    const stale_usable = now_ns < entry.stale_until_ns and entry.value != null;
+                    if (now_ns < entry.expires_at_ns or (stale_usable and !wait_context.passive_refresh and
+                        (wait_context.refresh_in_background or now_ns < entry.refresh_not_before_ns)))
+                    {
+                        if (wait_context.refresh_in_background and now_ns >= entry.expires_at_ns and
+                            now_ns >= entry.refresh_not_before_ns and !self.flights.contains(key))
+                        {
+                            entry.refresh_not_before_ns = now_ns +| capability_refresh_retry_ns;
+                            self.scheduleRefreshLocked(http, inference_url, model, operation, headers) catch {};
+                        }
+                        const observed = entry.*;
+                        self.mutex.unlock(self.io);
+                        return .{
+                            .capabilities = observed.value,
+                            .routing_token = observed.routing_token,
+                            .descriptor_revision = observed.descriptor_revision,
+                        };
+                    }
                 }
             }
             if (self.flights.get(key)) |flight| {
@@ -297,11 +339,13 @@ pub const Cache = struct {
                 const routing_token = flight.routing_token;
                 const descriptor_revision = flight.descriptor_revision;
                 const flight_err = flight.err;
+                const shared_retry = flight.retry_not_before_ns;
                 self.releaseFlightLocked(flight);
                 self.mutex.unlock(self.io);
                 if (flight_err) |err| {
                     if (err == error.CapabilityDiscoveryOwnerAbandoned or
                         err == error.CapabilityDiscoveryInvalidated) continue;
+                    if (wait_context.retry_not_before_ns) |hint| hint.* = shared_retry;
                     return err;
                 }
                 return .{
@@ -311,6 +355,10 @@ pub const Cache = struct {
                 };
             }
 
+            if (self.flights.count() >= capability_cache_max_flights) {
+                self.mutex.unlock(self.io);
+                return error.QueryEmbeddingOverloaded;
+            }
             const flight = self.alloc.create(CapabilityFlight) catch |err| {
                 self.mutex.unlock(self.io);
                 return err;
@@ -328,6 +376,9 @@ pub const Cache = struct {
             };
             self.mutex.unlock(self.io);
 
+            var discovery_retry: u64 = 0;
+            var discovery_context = wait_context;
+            discovery_context.retry_not_before_ns = &discovery_retry;
             const discovered = self.discoverWithStaleRefresh(
                 http,
                 inference_url,
@@ -335,7 +386,7 @@ pub const Cache = struct {
                 operation,
                 headers,
                 key,
-                wait_context,
+                discovery_context,
             );
             if (discovered) |value| {
                 const owner_context_error: ?anyerror = blk: {
@@ -415,17 +466,29 @@ pub const Cache = struct {
                     self.mutex.unlock(self.io);
                     return legacyCapabilityLeaseForOwner(owner_context_error);
                 }
-                // Authoritative rejection, routing-stale responses, and invalid
-                // contracts revoke the cached plan. Only explicitly transient
-                // discovery failures are eligible for stale-if-error behavior.
-                if (err != error.RemoteCapabilityDiscoveryTransient)
-                    self.removeEntryLocked(key);
+                const now_after_discovery = monotonicNowNs(self.io);
+                self.recordDiscoveryFailureLocked(key, err, wait_context.passive_refresh, now_after_discovery, discovery_retry);
                 const completion = classifyFailedDiscovery(
                     self.entries.get(key),
-                    monotonicNowNs(self.io),
+                    now_after_discovery,
                     owner_context_error,
                     err,
                 );
+                if (owner_context_error == null and completion.err != null and
+                    (err == error.RemoteCapabilityDiscoveryTransient or err == error.RemoteCapabilitySelectorAbsent))
+                {
+                    // A failed cold flight has no lease to defer. Remember its
+                    // cooldown in the same bounded cache as positive entries.
+                    const cooldown = @max(discovery_retry, now_after_discovery +| capability_refresh_retry_ns);
+                    discovery_retry = cooldown;
+                    self.putEntryLocked(key, .{
+                        .value = null,
+                        .expires_at_ns = 0,
+                        .stale_until_ns = discovery_retry,
+                        .refresh_not_before_ns = discovery_retry,
+                        .cold_failure = err,
+                    }) catch {};
+                }
                 if (completion.err == null and self.retireRejectedFlightLocked(flight, .{ .routing_token = completion.routing_token, .descriptor_revision = completion.descriptor_revision })) {
                     self.mutex.unlock(self.io);
                     continue;
@@ -434,6 +497,7 @@ pub const Cache = struct {
                 flight.routing_token = completion.routing_token;
                 flight.descriptor_revision = completion.descriptor_revision;
                 flight.err = completion.err;
+                flight.retry_not_before_ns = if (completion.err != null and owner_context_error == null) discovery_retry else 0;
                 flight.done = true;
                 flight.ready.set(self.io);
                 const value = flight.value;
@@ -443,7 +507,10 @@ pub const Cache = struct {
                 self.releaseFlightLocked(flight);
                 self.mutex.unlock(self.io);
                 if (owner_context_error) |context_err| return context_err;
-                if (flight_err) |flight_error| return flight_error;
+                if (flight_err) |flight_error| {
+                    if (wait_context.retry_not_before_ns) |hint| hint.* = discovery_retry;
+                    return flight_error;
+                }
                 return .{
                     .capabilities = value,
                     .routing_token = routing_token,
@@ -451,6 +518,64 @@ pub const Cache = struct {
                 };
             }
         }
+    }
+
+    fn recordDiscoveryFailureLocked(self: *Cache, key: []const u8, err: anyerror, passive_refresh: bool, now_ns: u64, retry_not_before_ns: u64) void {
+        // An expired background deadline leaves the current lease usable until
+        // its stale deadline. Authoritative rejection revokes it immediately.
+        if (err != error.RemoteCapabilityDiscoveryTransient and !(passive_refresh and err == error.Timeout)) {
+            self.removeEntryLocked(key);
+        } else if (self.entries.getPtr(key)) |entry| {
+            entry.refresh_not_before_ns = @max(now_ns +| capability_refresh_retry_ns, retry_not_before_ns);
+        }
+    }
+
+    const Refresh = struct {
+        arena: std.heap.ArenaAllocator,
+        cache: *Cache,
+        http: *httpx.Client,
+        url: []const u8,
+        model: []const u8,
+        operation: work.Operation,
+        headers: []const [2][]const u8,
+
+        fn run(refresh: Refresh) void {
+            var arena = refresh.arena;
+            defer arena.deinit();
+            const now = monotonicNowNs(refresh.cache.io);
+            _ = refresh.cache.getOrDiscoverLeaseWithContext(refresh.http, refresh.url, refresh.model, refresh.operation, refresh.headers, .{
+                .passive_refresh = true,
+                .deadline_ns = now +| capability_discovery_timeout_ns,
+            }) catch return;
+        }
+    };
+
+    fn scheduleRefreshLocked(
+        self: *Cache,
+        http: *httpx.Client,
+        url: []const u8,
+        model: []const u8,
+        operation: work.Operation,
+        headers: []const [2][]const u8,
+    ) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+        const owned_headers = try alloc.alloc([2][]const u8, headers.len);
+        for (headers, owned_headers) |header, *owned| {
+            owned.* = .{ try alloc.dupe(u8, header[0]), try alloc.dupe(u8, header[1]) };
+        }
+        const owned_url = try alloc.dupe(u8, url);
+        const owned_model = try alloc.dupe(u8, model);
+        try self.refreshes.concurrent(self.io, Refresh.run, .{Refresh{
+            .arena = arena,
+            .cache = self,
+            .http = http,
+            .url = owned_url,
+            .model = owned_model,
+            .operation = operation,
+            .headers = owned_headers,
+        }});
     }
 
     fn admitLocked(
@@ -461,13 +586,16 @@ pub const Cache = struct {
         descriptor_revision: ?CapabilityRevision,
         now_ns: u64,
     ) !void {
-        const cached = CachedCapability{
+        return self.putEntryLocked(key, .{
             .value = value,
             .routing_token = routing_token,
             .descriptor_revision = descriptor_revision,
             .expires_at_ns = now_ns +| capability_cache_ttl_ns,
             .stale_until_ns = now_ns +| capability_cache_stale_ns,
-        };
+        });
+    }
+
+    fn putEntryLocked(self: *Cache, key: []const u8, cached: CachedCapability) !void {
         if (self.entries.getPtr(key)) |entry| {
             entry.* = cached;
             return;
@@ -535,6 +663,7 @@ pub const Cache = struct {
         // omitting the token here would downgrade a lease-aware proxy request
         // into an unfenced legacy request.
         const entry = self.entries.get(key) orelse return error.InferenceCapabilitiesUnavailable;
+        if (entry.cold_failure) |failure| return failure;
         return entry.routing_token;
     }
 
@@ -692,6 +821,7 @@ fn capabilityCacheKeyAlloc(
 ) ![]u8 {
     var auth_hasher = std.crypto.hash.sha2.Sha256.init(.{});
     for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header[0], parent_request_id_header)) continue;
         auth_hasher.update(header[0]);
         auth_hasher.update(&.{0});
         auth_hasher.update(header[1]);
@@ -731,6 +861,7 @@ fn trimOperationSuffix(value: []const u8) []const u8 {
         "/chat/completions",
         "/generate/batch",
         "/embeddings",
+        "/transcribe",
     }) |suffix| {
         if (std.mem.endsWith(u8, out, suffix)) {
             return std.mem.trimEnd(u8, out[0 .. out.len - suffix.len], "/");
@@ -1112,7 +1243,8 @@ pub fn parseModelCapabilities(
     model: []const u8,
     task: work.Task,
 ) !?work.InferenceCapabilities {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch |err|
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidInferenceCapabilities;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidInferenceCapabilities;
     const catalog = parsed.value.object.get(taskCatalogName(task)) orelse return null;
@@ -1289,7 +1421,27 @@ fn discoverWithContext(
     headers: []const [2][]const u8,
     context: WaitContext,
 ) !DiscoveredCapability {
-    return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, headers, context, true);
+    return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, headers, context, !context.passive_refresh) catch |err| {
+        if (context.passive_refresh and err == error.RemoteCapabilityDiscoveryUnsupported) return error.RemoteCapabilityDiscoveryTransient;
+        return err;
+    };
+}
+
+fn recordDiscoveryRetryHint(alloc: std.mem.Allocator, io: std.Io, response: httpx.Response, context: WaitContext) void {
+    const hint = context.retry_not_before_ns orelse return;
+    const seconds = if (response.headers.get("Retry-After")) |value|
+        std.fmt.parseUnsigned(u64, std.mem.trim(u8, value, " \t"), 10) catch 0
+    else
+        0;
+    var delay_ms = seconds *| 1000;
+    if (response.body) |body| if (body.len <= 4096) {
+        const parsed = std.json.parseFromSlice(struct { retry_after_ms: ?u64 = null }, alloc, body, .{ .ignore_unknown_fields = true }) catch null;
+        if (parsed) |value| {
+            defer value.deinit();
+            delay_ms = @max(delay_ms, value.value.retry_after_ms orelse 0);
+        }
+    };
+    if (delay_ms != 0) hint.* = @max(hint.*, monotonicNowNs(io) +| (delay_ms *| std.time.ns_per_ms));
 }
 
 fn loadMissingModelInstance(
@@ -1338,7 +1490,9 @@ fn loadMissingModelInstance(
     defer response.deinit();
     if (response.ok()) return true;
     if (response.status.code == 404 or response.status.code == 405 or response.status.code == 501) return false;
-    return modelInstanceStatusError(alloc, response.status.code, response.body orelse "");
+    const failure = modelInstanceStatusError(alloc, response.status.code, response.body orelse "");
+    if (failure == error.RemoteCapabilityDiscoveryTransient) recordDiscoveryRetryHint(alloc, io, response, context);
+    return failure;
 }
 
 // Loading has its own error contract: an instance can be evicted between
@@ -1359,6 +1513,28 @@ fn modelInstanceStatusError(alloc: std.mem.Allocator, status: u16, body: []const
             return error.RemoteCapabilityDiscoveryTransient;
     }
     return discoveryStatusError(status, false);
+}
+
+// Hosted external offerings use the compatibility list and execute without a
+// native capability lease. Older edges can advertise activation on this path.
+fn catalogListsExternalEmbedding(alloc: std.mem.Allocator, payload: []const u8, model: []const u8) !bool {
+    const Item = struct {
+        id: []const u8 = "",
+        supported_operations: []const []const u8 = &.{},
+    };
+    const Catalog = struct { data: []const Item = &.{} };
+    var catalog = std.json.parseFromSlice(Catalog, alloc, payload, .{ .ignore_unknown_fields = true }) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return false;
+    };
+    defer catalog.deinit();
+    for (catalog.value.data) |item| {
+        if (!std.mem.eql(u8, item.id, model)) continue;
+        for (item.supported_operations) |operation| {
+            if (std.mem.eql(u8, operation, "embeddings")) return true;
+        }
+    }
+    return false;
 }
 
 fn discoverWithContextOnce(
@@ -1384,8 +1560,9 @@ fn discoverWithContextOnce(
         @as(u64, 30_000),
         (remaining_ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms,
     ));
-    const url = try scopedModelsUrlAlloc(alloc, inference_url, model, operation);
-    defer alloc.free(url);
+    const scoped_url = try scopedModelsUrlAlloc(alloc, inference_url, model, operation);
+    defer alloc.free(scoped_url);
+    const url = scoped_url;
     var response = http.get(url, .{
         .follow_redirects = false,
         .headers = headers,
@@ -1401,20 +1578,51 @@ fn discoverWithContextOnce(
         return error.RemoteCapabilityDiscoveryTransient;
     };
     defer response.deinit();
-    const activation_advertised = if (response.headers.get(model_activation_header)) |value| std.ascii.eqlIgnoreCase(value, "supported") else false;
+    const activation_advertised = if (response.headers.get(model_activation_header)) |value|
+        std.ascii.eqlIgnoreCase(value, "supported")
+    else
+        false;
     // Ordinary catalog discovery remains read-only. Only an execution-owned,
     // single-flight lookup may load a missing instance, and only when the
     // service explicitly advertises the existing model-instance protocol.
     if (!response.ok()) {
+        const failure = discoveryResponseError(response);
+        if (failure == error.RemoteCapabilityDiscoveryTransient) recordDiscoveryRetryHint(alloc, io, response, context);
         if (allow_activation and activation_advertised and response.status.code == 503 and
             try loadMissingModelInstance(alloc, io, http, inference_url, model, operation, headers, context))
             return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, headers, context, false);
-        return discoveryResponseError(response);
+        if (!allow_activation and !context.passive_refresh and failure == error.RemoteCapabilityDiscoveryUnsupported)
+            return error.RemoteCapabilitySelectorAbsent;
+        return failure;
     }
-    const capabilities = try parseModelCapabilities(alloc, response.body orelse return error.InvalidInferenceCapabilities, model, operation.task());
-    if (capabilities == null and allow_activation and activation_advertised and
-        try loadMissingModelInstance(alloc, io, http, inference_url, model, operation, headers, context))
-        return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, headers, context, false);
+    const body = response.body orelse return error.InvalidInferenceCapabilities;
+    const capabilities = try parseModelCapabilities(alloc, body, model, operation.task());
+    if (capabilities == null) {
+        if (response.headers.get(capability_selector_rejected_header)) |value| {
+            if (std.ascii.eqlIgnoreCase(value, "true")) return error.RemoteCapabilityDiscoveryRejected;
+        }
+        const selector_absent = if (response.headers.get(capability_selector_absent_header)) |value|
+            std.ascii.eqlIgnoreCase(value, "true")
+        else
+            false;
+        if (!selector_absent and allow_activation and activation_advertised and operation.task() == .embed and
+            try catalogListsExternalEmbedding(alloc, body, model))
+            return .{ .value = null, .routing_token = null, .descriptor_revision = null };
+        if (allow_activation and activation_advertised) {
+            const loaded = loadMissingModelInstance(alloc, io, http, inference_url, model, operation, headers, context) catch |err| {
+                // Discovery already disproved the previous descriptor.
+                if (err == error.RemoteCapabilityDiscoveryTransient) return error.RemoteCapabilitySelectorAbsent;
+                return err;
+            };
+            if (loaded) return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, headers, context, false) catch |err| {
+                if (err == error.RemoteCapabilityDiscoveryTransient) return error.RemoteCapabilitySelectorAbsent;
+                return err;
+            };
+        }
+        if (selector_absent or activation_advertised or (!allow_activation and !context.passive_refresh))
+            return error.RemoteCapabilitySelectorAbsent;
+        if (context.passive_refresh) return error.RemoteCapabilityDiscoveryTransient;
+    }
     const routing_token = if (response.headers.get(capability_token_header)) |value|
         try RoutingToken.init(value)
     else
@@ -1437,6 +1645,36 @@ const DiscoveredCapability = struct {
     routing_token: ?RoutingToken,
     descriptor_revision: ?CapabilityRevision,
 };
+
+test "remote capability discovery admits hot reads at the cold-flight limit" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var cache = Cache.init(a, io);
+    defer cache.deinit();
+    var http = httpx.Client.init(a, io);
+    defer http.deinit();
+    var flights: [capability_cache_max_flights]CapabilityFlight = undefined;
+    var admitted: usize = 0;
+    defer for (flights[0..admitted]) |flight| {
+        _ = cache.flights.remove(flight.key);
+        a.free(flight.key);
+    };
+    for (&flights, 0..) |*flight, index| {
+        const key = try std.fmt.allocPrint(a, "flight-{d}", .{index});
+        cache.flights.put(a, key, flight) catch |err| {
+            a.free(key);
+            return err;
+        };
+        flight.* = .{ .key = key };
+        admitted += 1;
+    }
+    const url = "http://inference.invalid";
+    const hot_key = try capabilityCacheKeyAlloc(a, url, "hot-model", .embed, &.{});
+    defer a.free(hot_key);
+    try cache.admitLocked(hot_key, null, null, null, monotonicNowNs(io));
+    _ = try cache.getOrDiscoverLease(&http, url, "hot-model", .embed, &.{});
+    try std.testing.expectError(error.QueryEmbeddingOverloaded, cache.getOrDiscoverLease(&http, url, "cold-model", .embed, &.{}));
+}
 
 test "remote Antfly capability cache retains and invalidates routing token with descriptor" {
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -1853,11 +2091,39 @@ test "capability stale-if-error is limited to transient discovery failures" {
     for ([_]anyerror{
         error.InferenceCapabilitiesStale,
         error.RemoteCapabilityDiscoveryRejected,
+        error.RemoteCapabilitySelectorAbsent,
         error.InvalidInferenceCapabilities,
     }) |authoritative_error| {
         const completion = classifyFailedDiscovery(stale, 1, null, authoritative_error);
         try std.testing.expectEqual(authoritative_error, completion.err.?);
     }
+}
+
+test "passive capability timeout keeps the stale lease and delays another refresh" {
+    var cache = Cache.init(std.testing.allocator, std.Options.debug_io);
+    defer cache.deinit();
+    const key = try std.testing.allocator.dupe(u8, "capability");
+    cache.entries.put(std.testing.allocator, key, .{
+        .value = null,
+        .expires_at_ns = 0,
+        .stale_until_ns = 60 * std.time.ns_per_s,
+    }) catch |err| {
+        std.testing.allocator.free(key);
+        return err;
+    };
+
+    const now = 30 * std.time.ns_per_s;
+    cache.recordDiscoveryFailureLocked("capability", error.Timeout, true, now, 0);
+    const preserved = cache.entries.get("capability").?;
+    try std.testing.expectEqual(60 * std.time.ns_per_s, preserved.stale_until_ns);
+    try std.testing.expectEqual(now + capability_refresh_retry_ns, preserved.refresh_not_before_ns);
+
+    const retry_at = now + 20 * std.time.ns_per_s;
+    cache.recordDiscoveryFailureLocked("capability", error.RemoteCapabilityDiscoveryTransient, true, now, retry_at);
+    try std.testing.expectEqual(retry_at, cache.entries.get("capability").?.refresh_not_before_ns);
+
+    cache.recordDiscoveryFailureLocked("capability", error.InferenceEndpointAccessDenied, true, now, 0);
+    try std.testing.expect(!cache.entries.contains("capability"));
 }
 
 test "capability discovery HTTP failures retain authoritative status semantics" {
@@ -2270,11 +2536,21 @@ test "remote Antfly discovery never activates without execution opt in and propa
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    for ([_]enum { readonly, unadvertised, denied, unsupported }{ .readonly, .unadvertised, .denied, .unsupported }) |mode| {
-        const advertised_headers: []const httpx.testing_mod.HeaderPair = if (mode != .unadvertised) &.{.{ .name = model_activation_header, .value = "supported" }} else &.{};
+    for ([_]enum { readonly, unadvertised, external, absent, rejected, catalog_busy, activation_busy, denied, unsupported, still_absent }{ .readonly, .unadvertised, .external, .absent, .rejected, .catalog_busy, .activation_busy, .denied, .unsupported, .still_absent }) |mode| {
+        const advertised_headers: []const httpx.testing_mod.HeaderPair = switch (mode) {
+            .unadvertised, .catalog_busy => &.{},
+            .rejected => &.{.{ .name = capability_selector_rejected_header, .value = "true" }},
+            .absent => &.{.{ .name = capability_selector_absent_header, .value = "true" }},
+            else => &.{.{ .name = model_activation_header, .value = "supported" }},
+        };
         var server = try httpx.TestServer.start(a, io, &.{
-            .{ .method = .GET, .path = "/ai/v1/models", .max_uses = 1, .respond = .{ .headers = advertised_headers, .body = "{\"readers\":{}}" } },
-            .{ .method = .POST, .path = "/ai/v1/models/instances", .respond = .{ .status = if (mode == .denied) 403 else 404, .body = "denied" } },
+            .{ .method = .GET, .path = "/ai/v1/models", .max_uses = if (mode == .still_absent) 2 else 1, .respond = .{ .status = if (mode == .catalog_busy) 503 else 200, .headers = advertised_headers, .body = if (mode == .catalog_busy) "{\"retry_after_ms\":5000}" else if (mode == .external) "{\"data\":[{\"id\":\"florence\",\"supported_operations\":[\"embeddings\"]}]}" else "{\"readers\":{}}" } },
+            .{ .method = .POST, .path = "/ai/v1/models/instances", .respond = .{ .status = switch (mode) {
+                .denied => 403,
+                .still_absent => 200,
+                .activation_busy => 503,
+                else => 404,
+            }, .headers = if (mode == .activation_busy) &.{.{ .name = "Retry-After", .value = "5" }} else &.{}, .body = "denied" } },
         });
         defer server.deinit();
         var http = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
@@ -2282,27 +2558,39 @@ test "remote Antfly discovery never activates without execution opt in and propa
         var group = std.Io.Group.init;
         var outcome: ?DiscoveredCapability = null;
         var failure: ?anyerror = null;
+        var retry_not_before_ns: u64 = 0;
         const Fiber = struct {
-            fn run(alloc: std.mem.Allocator, h: *httpx.Client, endpoint: []const u8, readonly: bool, out: *?DiscoveredCapability, failed: *?anyerror) std.Io.Cancelable!void {
+            fn run(alloc: std.mem.Allocator, h: *httpx.Client, endpoint: []const u8, readonly: bool, operation: work.Operation, out: *?DiscoveredCapability, failed: *?anyerror, retry_hint: *u64) std.Io.Cancelable!void {
                 if (readonly) {
                     const value = discover(alloc, h, endpoint, "florence", .read, &.{}) catch |err| {
                         failed.* = err;
                         return;
                     };
                     out.* = .{ .value = value, .routing_token = null, .descriptor_revision = null };
-                } else out.* = discoverWithContext(alloc, h.io, h, endpoint, "florence", .read, &.{}, .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s }) catch |err| {
+                } else out.* = discoverWithContext(alloc, h.io, h, endpoint, "florence", operation, &.{}, .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s, .retry_not_before_ns = retry_hint }) catch |err| {
                     failed.* = err;
                     return;
                 };
             }
         };
-        try group.concurrent(io, Fiber.run, .{ a, &http, server.baseUrl(), mode == .readonly, &outcome, &failure });
+        try group.concurrent(io, Fiber.run, .{ a, &http, server.baseUrl(), mode == .readonly, if (mode == .external) .embed else .read, &outcome, &failure, &retry_not_before_ns });
         try server.handleOne();
-        if (mode == .denied or mode == .unsupported) try server.handleOne();
+        if (mode == .denied or mode == .unsupported or mode == .still_absent or mode == .activation_busy) try server.handleOne();
+        if (mode == .still_absent) try server.handleOne();
         try group.await(io);
-        if (mode == .denied) try std.testing.expectEqual(error.InferenceEndpointAccessDenied, failure.?) else {
-            if (failure) |err| return err;
-            try std.testing.expect(outcome.?.value == null);
+        switch (mode) {
+            .denied => try std.testing.expectEqual(error.InferenceEndpointAccessDenied, failure.?),
+            .rejected => try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, failure.?),
+            .catalog_busy, .activation_busy => {
+                const expected = if (mode == .catalog_busy) error.RemoteCapabilityDiscoveryTransient else error.RemoteCapabilitySelectorAbsent;
+                try std.testing.expectEqual(expected, failure.?);
+                try std.testing.expect(retry_not_before_ns > monotonicNowNs(io));
+            },
+            .absent, .unsupported, .still_absent => try std.testing.expectEqual(error.RemoteCapabilitySelectorAbsent, failure.?),
+            .readonly, .unadvertised, .external => {
+                if (failure) |err| return err;
+                try std.testing.expect(outcome.?.value == null);
+            },
         }
     }
 }

@@ -7456,6 +7456,7 @@ pub const AntflyApiHandler = struct {
                 body_data,
                 authenticated_identity,
                 &cancellation,
+                ctx.header("x-request-id") orelse "",
             );
             return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
         }
@@ -7472,6 +7473,7 @@ pub const AntflyApiHandler = struct {
             authenticated_identity,
             &cancellation,
             delivery.sink(),
+            ctx.header("x-request-id") orelse "",
         );
         if (delivery.writer) |*writer| {
             defer resp.deinit(self.api_server.alloc);
@@ -9125,7 +9127,7 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(logical);
         var cancellation = requestCancellation(ctx);
         var delivery: QueryDelivery = .{ .ctx = ctx };
-        var resp = self.api_server.handleAdmittedPublicTableQueryWithDelivery(logical, body_data, ctx.header("content-type"), authenticated_identity, &cancellation, delivery.sink()) catch |err| return err;
+        var resp = self.api_server.handleAdmittedPublicTableQueryWithDelivery(logical, body_data, ctx.header("content-type"), authenticated_identity, &cancellation, delivery.sink(), ctx.header("x-request-id") orelse "") catch |err| return err;
         if (delivery.writer) |*writer| {
             defer resp.deinit(self.api_server.alloc);
             // A post-commit error closes the stream; never send a second status.
