@@ -473,17 +473,18 @@ def wait_visible(
             failure_event.wait(min(0.25, max(0, deadline - time.monotonic())))
             continue
         check_health()
-        if state.get("total_indexed") == count and (
-            state.get("query_visible_doc_count") == count
-            if require_query_visible_count
-            else state.get("readiness", {}).get("queryable") is True
-        ):
-            return state
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             raise RuntimeError(
                 f"{index_name} index visibility did not reach {count}: {state}"
             )
-        failure_event.wait(min(0.25, max(0, deadline - time.monotonic())))
+        if state.get("total_indexed") == count and (
+            state.get("query_visible_doc_count") == count
+            if require_query_visible_count
+            else state.get("readiness", {}).get("complete") is True
+        ):
+            return state
+        failure_event.wait(min(0.25, remaining))
 
 
 def write_server_wrapper(path, binary, limit):

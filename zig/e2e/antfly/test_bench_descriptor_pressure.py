@@ -782,7 +782,7 @@ def test_visibility_status_timeouts_cannot_extend_overall_deadline(monkeypatch):
     assert len(calls) == 1
 
 
-def test_lexical_visibility_waits_for_queryability_within_shared_deadline(monkeypatch):
+def test_lexical_visibility_waits_for_completion_within_shared_deadline(monkeypatch):
     import bench_descriptor_pressure as bench
 
     clock = [297.0]
@@ -794,7 +794,7 @@ def test_lexical_visibility_waits_for_queryability_within_shared_deadline(monkey
         return {
             "status": {
                 "total_indexed": 256,
-                "readiness": {"queryable": len(requests) > 1},
+                "readiness": {"queryable": True, "complete": len(requests) > 1},
             }
         }
 
@@ -814,12 +814,35 @@ def test_lexical_visibility_waits_for_queryability_within_shared_deadline(monkey
         check_health=lambda: None,
         failure_event=SimpleNamespace(wait=wait),
     )
-    assert status["readiness"]["queryable"]
+    assert status["readiness"]["complete"]
     assert requests == [
         ("/tables/documents/indexes/lexical", 3.0),
         ("/tables/documents/indexes/lexical", 2.75),
     ]
     assert waits == [0.25]
+
+
+def test_visibility_rejects_complete_status_at_deadline(monkeypatch):
+    import bench_descriptor_pressure as bench
+
+    clock = [297.0]
+
+    def call(_session, _url, _method, _path, *, timeout):
+        assert timeout == 3.0
+        clock[0] = 300.0
+        return {"status": {"total_indexed": 256, "query_visible_doc_count": 256}}
+
+    monkeypatch.setattr(bench, "call", call)
+    monkeypatch.setattr(bench.time, "monotonic", lambda: clock[0])
+    with pytest.raises(RuntimeError, match="vec index visibility did not reach 256"):
+        bench.wait_visible(
+            None,
+            "http://unused",
+            256,
+            deadline=300.0,
+            check_health=lambda: None,
+            failure_event=None,
+        )
 
 
 @pytest.fixture
