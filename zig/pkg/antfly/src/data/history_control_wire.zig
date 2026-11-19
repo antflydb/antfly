@@ -60,9 +60,10 @@ pub const Response = struct {
             if (reference) |ref| {
                 const consumer = result.consumer orelse return error.InvalidHistoryControlWire;
                 if (consumer.epoch != ref.epoch or !std.mem.eql(u8, &consumer.id, &ref.consumer)) return error.InvalidHistoryControlWire;
-            } else if (request.command == .enroll) {
+            } else if (request.command == .enroll or request.command == .capture_bootstrap) {
+                const grant = if (request.command == .enroll) request.command.enroll else request.command.capture_bootstrap.grant;
                 const consumer = result.consumer orelse return error.InvalidHistoryControlWire;
-                if (consumer.epoch == 0 or !std.mem.eql(u8, &consumer.id, &request.command.enroll.consumer)) return error.InvalidHistoryControlWire;
+                if (consumer.epoch == 0 or !std.mem.eql(u8, &consumer.id, &grant.consumer)) return error.InvalidHistoryControlWire;
             } else if (result.consumer != null) return error.InvalidHistoryControlWire;
             switch (request.command) {
                 .acknowledge => |value| if (result.consumer.?.acknowledged < value.next) return error.InvalidHistoryControlWire,

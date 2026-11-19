@@ -26458,7 +26458,7 @@ pub const DB = struct {
             } else try doc_identity.writeNamespaceTxn(&txn, self.core.identity_namespace);
             try @import("../source_authority.zig").bind(&txn, .raft, namespace);
             const outcome: OrderedHistoryOutcome = if (rejection) |reason| .{ .rejected = reason } else .{
-                .applied = @import("../history_consumer.zig").apply(&txn, command) catch |err| {
+                .applied = @import("../history_consumer.zig").apply(self.alloc, &txn, command) catch |err| {
                     rejection = ordered.Rejection.fromError(err) orelse return err;
                     // A reducer may have staged writes before rejecting. Abort
                     // everything before recording that terminal outcome separately.
@@ -26647,7 +26647,7 @@ pub const DB = struct {
         if (try doc_identity.loadNamespaceTxn(&txn)) |stored| {
             if (!stored.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
         } else try doc_identity.writeNamespaceTxn(&txn, self.core.identity_namespace);
-        const result = try @import("../history_consumer.zig").apply(&txn, command);
+        const result = try @import("../history_consumer.zig").apply(self.alloc, &txn, command);
         try txn.commit();
         return result;
     }

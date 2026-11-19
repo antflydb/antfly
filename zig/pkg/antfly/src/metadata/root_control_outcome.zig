@@ -67,7 +67,7 @@ fn validateRequestWithCeiling(a: std.mem.Allocator, state: control.State, namesp
     } else return error.ChangefeedConflict;
     if (table.contract != .native_document and table.contract != .native_relational) return error.ChangefeedCapabilityUnsupported;
     switch (input.command) {
-        .configure_policy, .inspect_policy => return error.ChangefeedCapabilityUnsupported,
+        .configure_policy, .inspect_policy, .capture_bootstrap, .release_bootstrap => return error.ChangefeedCapabilityUnsupported,
         .enroll => |v| {
             if (state.definition.?.start == .snapshot_then_changes and item.consumer_epoch == 0) return error.ChangefeedCapabilityUnsupported;
             try v.validate();
@@ -112,7 +112,7 @@ pub fn settle(a: std.mem.Allocator, state: control.State, namespace: control.Nam
         .rejected => |code| .{ .rejected = @backingInt(code) },
         .superseded => return error.ChangefeedConflict,
         .applied => |result| switch (input.command) {
-            .configure_policy, .inspect_policy => return error.ChangefeedCapabilityUnsupported,
+            .configure_policy, .inspect_policy, .capture_bootstrap, .release_bootstrap => return error.ChangefeedCapabilityUnsupported,
             .enroll => .{ .enrolled = .{ .consumer_epoch = result.consumer.?.epoch, .start = result.consumer.?.start } },
             .acknowledge => |v| .{ .acknowledged = .{ .consumer_epoch = item.consumer_epoch, .previous = item.reclaimed_through, .next = v.next } },
             .renew => .{ .renewed = .{ .consumer_epoch = item.consumer_epoch, .expires_at = result.consumer.?.expires_at_seconds } },

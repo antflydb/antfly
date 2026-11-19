@@ -22,6 +22,7 @@ const control = @import("antfly_local_sources").api_local_table_writes.table_wri
 pub const required_protocol_version = @import("../common/data_raft_protocol.zig").batch_history_control_protocol_version;
 pub fn requiredProtocol(command: control.Command) u16 {
     return switch (command) {
+        .capture_bootstrap, .release_bootstrap => @import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version,
         .configure_policy, .inspect_policy => @import("../common/data_raft_protocol.zig").batch_history_policy_protocol_version,
         .enroll => |grant| if (grant.require_commit_clock)
             @import("../common/data_raft_protocol.zig").batch_history_clock_enrollment_protocol_version
@@ -227,6 +228,23 @@ test "history control entry root policy requires its complete activation floor" 
     try std.testing.expectEqualDeep(entry, decoded.value());
     entry.protocol = required_protocol_version;
     try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, entry.validate());
+}
+
+test "history control entry bootstrap requires all applying members to support capture" {
+    const a = std.testing.allocator;
+    const command: control.Command = .{ .capture_bootstrap = .{
+        .grant = .{ .namespace = @splat(1), .authority = @splat(2), .sequence = 1, .consumer = @splat(3), .definition = @splat(4), .expires_at_seconds = 500, .policy_revision = 1 },
+        .expires_at_seconds = 250,
+    } };
+    const version = requiredProtocol(command);
+    const entry: Entry = .{ .table = "docs", .protocol = version, .storage_owner = .{ .lsm_root_generation = 0, .identity = .{ .table_id = 0x0101010101010101, .shard_id = 0x0101010101010101, .range_id = 0x0101010101010101 }, .schema_json = "{}", .indexes_json = "{}" }, .history_control = .{ .command = command } };
+    try std.testing.expectEqual(@as(u16, 50), version);
+    try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, encode(a, entry, version - 1));
+    const bytes = try encode(a, entry, version);
+    defer a.free(bytes);
+    var decoded = try decode(a, bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(entry, decoded.value());
 }
 
 test "history control entry policy receipts retain strict bounded canonical encoding" {

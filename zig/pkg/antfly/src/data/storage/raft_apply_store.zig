@@ -2473,7 +2473,7 @@ pub const RaftApplyStore = struct {
         }
         if (applying == .history_control) {
             if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
-            try operations.append(alloc, .{ .require_batch_protocol = @import("../history_control_entry.zig").required_protocol_version });
+            try operations.append(alloc, .{ .require_batch_protocol = applying.history_control.value().protocol });
             // No row mutation or split delta is manufactured. The native
             // owner must complete before the shared applied watermark moves.
             return;

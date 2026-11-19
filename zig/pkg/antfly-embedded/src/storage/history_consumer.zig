@@ -451,6 +451,8 @@ pub fn inspectPolicy(txn: anytype, scope: PolicyScope) !PolicySnapshot {
 
 pub const Command = union(enum) {
     enroll: Grant,
+    capture_bootstrap: struct { grant: Grant, expires_at_seconds: u64 },
+    release_bootstrap: struct { reference: Reference, digest: Digest },
     inspect: Reference,
     acknowledge: struct { reference: Reference, previous: u64, next: u64 },
     renew: struct { reference: Reference, previous: u64, next: u64 },
@@ -466,6 +468,8 @@ pub const Command = union(enum) {
             .configure_policy => |value| value.namespace,
             .inspect_policy => |value| value.namespace,
             .enroll => |value| value.namespace,
+            .capture_bootstrap => |value| value.grant.namespace,
+            .release_bootstrap => |value| value.reference.namespace,
             .inspect => |value| value.namespace,
             .retire => |value| value.namespace,
             .collect => |value| value.namespace,
@@ -494,7 +498,7 @@ pub const Result = struct {
 };
 /// Apply inside the ordered owner's one atomic storage transaction. Errors must
 /// abort that transaction, including errors after staging an admission/release.
-pub fn apply(txn: anytype, command: Command) !Result {
+pub fn apply(a: std.mem.Allocator, txn: anytype, command: Command) !Result {
     return switch (command) {
         .configure_policy => |value| blk: {
             const state = try stateFor(txn, value.namespace, value.authority);
@@ -504,6 +508,11 @@ pub fn apply(txn: anytype, command: Command) !Result {
         },
         .inspect_policy => |value| .{ .policy = try inspectPolicy(txn, value) },
         .enroll => |value| .{ .consumer = try enroll(txn, value) },
+        .capture_bootstrap => |value| .{ .consumer = (try captureBootstrap(a, txn, value.grant, value.expires_at_seconds)).consumer },
+        .release_bootstrap => |value| blk: {
+            try releaseBootstrap(txn, value.reference, value.digest);
+            break :blk .{};
+        },
         .inspect => |value| .{ .consumer = try inspect(txn, value) },
         .acknowledge => |value| blk: {
             try acknowledge(txn, value.reference, value.previous, value.next);

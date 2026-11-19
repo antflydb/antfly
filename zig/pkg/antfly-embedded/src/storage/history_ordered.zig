@@ -30,6 +30,7 @@ pub const Rejection = enum(u8) {
     checkpoint_conflict = 5,
     full = 6,
     prepared_transactions = 7,
+    bootstrap_too_large = 8,
     pub fn fromError(err: anyerror) ?Rejection {
         return switch (err) {
             error.InvalidHistoryAdmission => .invalid,
@@ -39,6 +40,7 @@ pub const Rejection = enum(u8) {
             error.HistoryCheckpointConflict => .checkpoint_conflict,
             error.HistoryFull => .full,
             error.HistoryPreparedTransactionsPresent => .prepared_transactions,
+            error.HistoryTooLarge => .bootstrap_too_large,
             else => null,
         };
     }
@@ -51,6 +53,7 @@ pub const Rejection = enum(u8) {
             .checkpoint_conflict => error.HistoryCheckpointConflict,
             .full => error.HistoryFull,
             .prepared_transactions => error.HistoryPreparedTransactionsPresent,
+            .bootstrap_too_large => error.HistoryTooLarge,
         };
     }
 };

@@ -41072,6 +41072,39 @@ fn implementationTests() type {
                 try std.testing.expectEqualDeep(record, try ordered.Record.decode(&(try record.encode())));
             }
         }
+        test "ordered history consumer captures bootstrap with replay at its original cut" {
+            const a = std.testing.allocator;
+            const history = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ordered-bootstrap-control", .{tmp.sub_path});
+            defer a.free(path);
+            const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .online_source_authority = .raft, .start_optional_runtimes = false, .start_index_workers = false, .start_resolver_workers = false };
+            var db = try db_mod.DB.open(a, path, options);
+            var open = true;
+            defer if (open) db.close();
+            var namespace: [24]u8 = undefined;
+            std.mem.writeInt(u64, namespace[0..8], 7, .big);
+            std.mem.writeInt(u64, namespace[8..16], 1, .big);
+            std.mem.writeInt(u64, namespace[16..24], 1, .big);
+            const grant: history.Grant = .{ .namespace = namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1 };
+            const capture: history.Command = .{ .capture_bootstrap = .{ .grant = grant, .expires_at_seconds = 500 } };
+            try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "one", .value = "{\"v\":1}" }} }, .{ .term = 1, .index = 1 }, false);
+            const applied = try db.applyOrderedHistoryConsumerControl(capture, .{ .term = 1, .index = 2 }, false);
+            const enrolled = applied.applied.consumer.?;
+            try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "one", .value = "{\"v\":2}" }} }, .{ .term = 1, .index = 3 }, false);
+            db.close();
+            open = false;
+            db = try db_mod.DB.open(a, path, options);
+            open = true;
+            try std.testing.expectEqualDeep(applied, try db.applyOrderedHistoryConsumerControl(capture, .{ .term = 1, .index = 2 }, false));
+            try std.testing.expectEqualDeep(applied, try db.applyOrderedHistoryConsumerControl(capture, .{ .term = 1, .index = 4 }, false));
+            const ref: history.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = enrolled.epoch, .grant = grant.sequence, .definition = grant.definition };
+            var tail = try db.orderedHistoryPage(a, .{ .reference = ref, .after = .{ .sequence = enrolled.start }, .now_seconds = 100 }, 4);
+            defer tail.deinit();
+            try std.testing.expectEqualStrings("{\"v\":2}", tail.events[0].after.?);
+        }
+
         test "provisioned native history root retains committed images across writer reopen and fences replacement" {
             if (comptime control_only_storage_sources) return error.SkipZigTest;
             const a = std.testing.allocator;
