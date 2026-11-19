@@ -989,6 +989,19 @@ const GraphOrdinalNavigation = struct {
     }
 };
 
+pub fn scopedGraphMembership(a: Allocator, left: *const roaring.RoaringBitmap, right: *const roaring.RoaringBitmap, control: query_mod.ExecutionControl) !roaring.RoaringBitmap {
+    try control.check();
+    var result = roaring.RoaringBitmap.init(a);
+    errdefer result.deinit();
+    const smaller, const larger = if (left.cardinality() <= right.cardinality()) .{ left, right } else .{ right, left };
+    var rows = smaller.iterator();
+    while (rows.next()) |doc| {
+        try control.check();
+        if (larger.contains(doc)) try result.add(doc);
+    }
+    return result;
+}
+
 pub const GraphPredicateCache = struct {
     pub const max_bytes: usize = 64 * 1024 * 1024;
     const Entry = struct {
@@ -1118,16 +1131,7 @@ pub const GraphPredicateCache = struct {
         const entry = pinned orelse return null;
         defer entry.release();
         try control.check();
-        if (scope) |domain| {
-            var rows = roaring.RoaringBitmap.init(a);
-            errdefer rows.deinit();
-            var ids = domain.iterator();
-            while (ids.next()) |id| {
-                try control.check();
-                if (entry.rows.contains(id)) try rows.add(id);
-            }
-            return rows;
-        }
+        if (scope) |domain| return try scopedGraphMembership(a, &entry.rows, domain, control);
         if (entry.rows.cloneStorageBound() > clone_limit) return error.GraphCacheCloneTooLarge;
         var rows = try entry.rows.cloneExact(a);
         errdefer rows.deinit();

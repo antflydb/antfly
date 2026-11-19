@@ -156567,6 +156567,19 @@ test "optional numeric range graph admission preserves legacy indexed predicates
         try std.testing.expectEqualSlices(bool, case.expected, rows);
     }
 
+    var standalone = try db.searchDenseProfiled(a, .{
+        .index_name = "dv",
+        .primary_text_index_name = "ft",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"range\":{\"rank\":{\"gt\":9007199254740992.5}}}",
+        .filter_doc_ids = &.{ "a", "b" },
+    }, .{ .vector = &.{ 1, 0 }, .k = 1 });
+    defer standalone.result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), standalone.result.hits.len);
+    try std.testing.expectEqualStrings("b", standalone.result.hits[0].id);
+    try std.testing.expectEqual(@as(u64, 1), standalone.profile.native_filter_candidate_count);
+
     const disjunction = cases[1].json;
     const conjunction = cases[0].json;
     for ([_]struct { filter: []const u8, exclusion: []const u8, expected: []const u8 }{

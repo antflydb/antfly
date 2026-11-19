@@ -9551,32 +9551,85 @@ const IndexedPredicateEvaluator = struct {
 
     const LocalCache = IndexedClauseCache;
     const FrontierProbeInput = struct {
-        const Entry = struct { ordinal: u32, previous: ?u32 };
+        const Batch = struct {
+            pairs: []u64,
+            ordinals: std.AutoHashMapUnmanaged(u32, u32),
+
+            fn deinit(self: *Batch, alloc: Allocator) void {
+                alloc.free(self.pairs);
+                self.ordinals.deinit(alloc);
+            }
+
+            fn appendDocs(self: Batch, ordinal: u32, selection: *roaring.RoaringBitmap, control: query_mod.ExecutionControl) !void {
+                const key = @as(u64, ordinal) << 32;
+                var low: usize = 0;
+                var high = self.pairs.len;
+                while (low < high) {
+                    const mid = low + (high - low) / 2;
+                    if (self.pairs[mid] < key) low = mid + 1 else high = mid;
+                }
+                while (low < self.pairs.len and self.pairs[low] >> 32 == ordinal) : (low += 1) {
+                    try control.check();
+                    try selection.add(@truncate(self.pairs[low]));
+                }
+            }
+        };
 
         attempted: bool = false,
-        heads: std.AutoHashMapUnmanaged(u32, u32) = .empty,
-        entries: std.AutoHashMapUnmanaged(u32, Entry) = .empty,
+        batches: std.ArrayListUnmanaged(Batch) = .empty,
         covered: ?roaring.RoaringBitmap = null,
         scanned_legacy: ?roaring.RoaringBitmap = null,
 
         fn deinit(self: *FrontierProbeInput, alloc: Allocator) void {
-            self.heads.deinit(alloc);
-            self.entries.deinit(alloc);
+            for (self.batches.items) |*batch| batch.deinit(alloc);
+            self.batches.deinit(alloc);
             if (self.covered) |*covered| covered.deinit();
             if (self.scanned_legacy) |*scanned| scanned.deinit();
         }
 
-        fn add(self: *FrontierProbeInput, alloc: Allocator, doc: u32, ordinal: u32) !void {
-            if (self.entries.get(doc)) |existing| {
-                if (existing.ordinal != ordinal) return error.InvalidSegment;
-                return;
-            }
-            try self.entries.ensureUnusedCapacity(alloc, 1);
-            const previous = self.heads.get(ordinal);
-            try self.heads.put(alloc, ordinal, doc);
-            self.entries.putAssumeCapacity(doc, .{ .ordinal = ordinal, .previous = previous });
+        fn ordinalForDoc(self: *const FrontierProbeInput, doc: u32) !u32 {
+            for (self.batches.items) |batch| if (batch.ordinals.get(doc)) |ordinal| return ordinal;
+            return error.InvalidData;
         }
     };
+
+    fn extendProbeMemo(self: IndexedPredicateEvaluator, memo: *FrontierProbeInput, missing: std.AutoHashMapUnmanaged(u32, []const u8), complete: ?std.AutoHashMapUnmanaged(u32, []const u8)) !void {
+        const scanned = &memo.scanned_legacy.?;
+        var newly_scanned = roaring.RoaringBitmap.init(self.alloc);
+        defer newly_scanned.deinit();
+        var resolved = try self.snapshot.extendGraphFrontierDocNumsAlloc(self.alloc, missing, complete, scanned, &newly_scanned, self.control);
+        defer resolved.deinit();
+
+        // Transfer the physical-to-ordinal map instead of rehashing the
+        // resolver's output. Only the compact seek directory is additional.
+        resolved.bitmap.deinit();
+        resolved.bitmap = roaring.RoaringBitmap.init(self.alloc);
+        const pairs = try self.alloc.alloc(u64, resolved.ordinals.count());
+        errdefer self.alloc.free(pairs);
+        var entries = resolved.ordinals.iterator();
+        var n: usize = 0;
+        while (entries.next()) |entry| : (n += 1) {
+            try self.control.check();
+            pairs[n] = (@as(u64, entry.value_ptr.*) << 32) | entry.key_ptr.*;
+        }
+        std.mem.sort(u64, pairs, {}, std.sort.asc(u64));
+        try self.control.check();
+
+        var combined: ?roaring.RoaringBitmap = null;
+        errdefer if (combined) |*bitmap| bitmap.deinit();
+        if (newly_scanned.cardinality() != 0) {
+            combined = try scanned.cloneExact(self.alloc);
+            try combined.?.orWith(&newly_scanned);
+        }
+        if (pairs.len != 0) {
+            try memo.batches.append(self.alloc, .{ .pairs = pairs, .ordinals = resolved.ordinals });
+            resolved.ordinals = .empty;
+        }
+        if (combined) |bitmap| {
+            scanned.deinit();
+            scanned.* = bitmap;
+        }
+    }
 
     fn indexed(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery) !bool {
         return searchQueryCanUseSnapshotWithControl(self.snapshot, query, self.analysis, self.schema, false, self.control);
@@ -9681,29 +9734,14 @@ const IndexedPredicateEvaluator = struct {
         }
         if (missing.count() != 0) {
             if (memo.scanned_legacy == null) memo.scanned_legacy = roaring.RoaringBitmap.init(self.alloc);
-            const scanned = &memo.scanned_legacy.?;
-            var newly_scanned = roaring.RoaringBitmap.init(self.alloc);
-            defer newly_scanned.deinit();
             const available = if (self.budget) |budget| budget.max_retained_state_bytes -| budget.retained_state_bytes else std.math.maxInt(usize);
             const complete_legacy = @as(u64, frontier.count()) * 96 + 4096 <= available;
-            var resolved = if (complete_legacy)
-                self.snapshot.extendGraphFrontierDocNumsAlloc(self.alloc, missing, frontier, scanned, &newly_scanned, self.control) catch |err| switch (err) {
-                    error.OutOfMemory => fallback: {
-                        newly_scanned.deinit();
-                        newly_scanned = roaring.RoaringBitmap.init(self.alloc);
-                        break :fallback try self.snapshot.extendGraphFrontierDocNumsAlloc(self.alloc, missing, null, scanned, &newly_scanned, self.control);
-                    },
+            if (complete_legacy) {
+                self.extendProbeMemo(memo, missing, frontier) catch |err| switch (err) {
+                    error.OutOfMemory => try self.extendProbeMemo(memo, missing, null),
                     else => return err,
-                }
-            else
-                try self.snapshot.extendGraphFrontierDocNumsAlloc(self.alloc, missing, null, scanned, &newly_scanned, self.control);
-            defer resolved.deinit();
-            var pairs = resolved.ordinals.iterator();
-            while (pairs.next()) |pair| {
-                try self.control.check();
-                try memo.add(self.alloc, pair.key_ptr.*, pair.value_ptr.*);
-            }
-            try scanned.orWith(&newly_scanned);
+                };
+            } else try self.extendProbeMemo(memo, missing, null);
             var ordinals = missing.keyIterator();
             while (ordinals.next()) |ordinal| try covered.add(ordinal.*);
         }
@@ -9711,12 +9749,8 @@ const IndexedPredicateEvaluator = struct {
         defer physical_candidates.deinit();
         requested = scope.iterator();
         while (requested.next()) |ordinal| {
-            var doc = memo.heads.get(ordinal);
-            while (doc) |physical| {
-                try self.control.check();
-                try physical_candidates.add(physical);
-                doc = memo.entries.get(physical).?.previous;
-            }
+            try self.control.check();
+            for (memo.batches.items) |batch| try batch.appendDocs(ordinal, &physical_candidates, self.control);
         }
         const filter = (try search_mod.searchQueryToFilterArena(self.scratch, query)).withControl(self.control);
         const plan = try query_mod.PredicateProbePlan.compile(filter);
@@ -9771,7 +9805,7 @@ const IndexedPredicateEvaluator = struct {
                 var docs = matched.iterator();
                 while (docs.next()) |doc| {
                     try self.control.check();
-                    try rows.add((memo.entries.get(offset + doc) orelse return error.InvalidData).ordinal);
+                    try rows.add(try memo.ordinalForDoc(offset + doc));
                 }
             }
             offset = upper;
@@ -9781,14 +9815,7 @@ const IndexedPredicateEvaluator = struct {
 
     fn copyMembership(self: IndexedPredicateEvaluator, source: *const roaring.RoaringBitmap, scope: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
         const domain = scope orelse return source.cloneExact(self.alloc);
-        var result = roaring.RoaringBitmap.init(self.alloc);
-        errdefer result.deinit();
-        var ids = domain.iterator();
-        while (ids.next()) |id| {
-            try self.control.check();
-            if (source.contains(id)) try result.add(id);
-        }
-        return result;
+        return index_mod.scopedGraphMembership(self.alloc, source, domain, self.control);
     }
 
     fn initialScope(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery) !roaring.RoaringBitmap {
@@ -10315,6 +10342,19 @@ pub fn graphIndexedPredicateAlloc(
     unreachable;
 }
 
+fn hasStoredStandardRange(query: search_mod.SearchQuery) bool {
+    return switch (query) {
+        .numeric_range => |range| range.stored_standard_range != null,
+        .bool_query => |boolean| blk: {
+            for ([_][]const search_mod.SearchQuery{ boolean.must, boolean.should, boolean.must_not }) |children| {
+                for (children) |child| if (hasStoredStandardRange(child)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
 fn collectStructuredFilterResolvedDocSetAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -10342,7 +10382,7 @@ fn collectStructuredFilterResolvedDocSetAlloc(
         .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
         null,
     )) |native| return native;
-    if (!(try patternFilterContainsMatch(parsed, 0))) return null;
+    if (!hasStoredStandardRange(search_query) and !(try patternFilterContainsMatch(parsed, 0))) return null;
     return collectMixedStructuredFilterAlloc(alloc, arena_alloc, req, executor, text_entry, search_query, filter_query_json) catch |err| switch (err) {
         error.UnsupportedQueryRequest => null,
         else => return err,
@@ -13346,24 +13386,35 @@ const NativeSortPredicate = struct {
     }
     fn hasExactNumericSource(snapshot: *const index_mod.IndexSnapshot, segment_index: usize, field: []const u8, req: types.SearchRequest) !bool {
         try checkSearchRequestDeadline(req);
-        var lease = try snapshot.leaseSegment(segment_index);
+        var lease = snapshot.leaseSegment(segment_index) catch |err| switch (err) {
+            error.OutOfMemory, error.StorageReadTemporarilyUnavailable => return false,
+            else => return err,
+        };
         defer lease.deinit();
         const segment = lease.entry;
         const witness = segment.reader.numericRangeCoverage(field) catch |err| switch (err) {
-            error.CrcMismatch, error.InvalidSegment, error.StorageReadTemporarilyUnavailable => return false,
+            error.CrcMismatch, error.InvalidSegment, error.OutOfMemory, error.StorageReadTemporarilyUnavailable => return false,
             else => return err,
         };
         if (witness != .populated) return false;
-        const coverage = segment.typedDocValuesCoverageWithValidation(field, .{
-            .execution_deadline_ns = req.execution_deadline_ns,
-            .cancellation = req.cancellation,
-        }) catch |err| switch (err) {
-            error.StorageReadTemporarilyUnavailable => return false,
+        var typed = (segment.reader.typedDocValuesScoped(segment.reader.alloc, field) catch |err| switch (err) {
+            error.CrcMismatch, error.InvalidSegment, error.InvalidData, error.OutOfMemory, error.StorageReadTemporarilyUnavailable => return false,
             else => return err,
-        };
-        // A standard range can compare an explicit null as a scalar. Only
-        // dense exact numeric coverage rules out such live source values.
-        return if (coverage) |proof| proof.status == .covered and proof.value_type == .numeric_val else false;
+        }) orelse return false;
+        defer typed.deinit();
+        if (typed.value_type != .numeric_val) return false;
+
+        // Indexed chunks attest increasing IDs. Contiguous first/last/count
+        // entries establish density without opening their compressed payloads.
+        var next: u64 = 0;
+        for (0..typed.num_chunks) |chunk| {
+            try checkSearchRequestDeadline(req);
+            const info = typed.chunkInfo(@intCast(chunk)) orelse return false;
+            if (info.count == 0 or info.first != next) return false;
+            next += info.count;
+            if (next != @as(u64, info.last) + 1 or next > segment.reader.doc_count) return false;
+        }
+        return next == segment.reader.doc_count;
     }
 
     /// Each key is monotone only inside a constant preceding-key group. Exact
