@@ -1175,6 +1175,34 @@ pub const Contributions = struct {
         try txn.put(&activationKey(id), progress);
     }
 
+    pub const ScanCheckpoint = struct {
+        owner_epoch: u64,
+        /// Owned by the caller. Null means the scan is pinned before its first page.
+        after: ?[]u8,
+
+        pub fn deinit(self: ScanCheckpoint, alloc: A) void {
+            if (self.after) |after| alloc.free(after);
+        }
+    };
+
+    /// Recover the checkpoint under the full activation attempt identity and
+    /// one storage snapshot. A held fence without scan progress returns null.
+    pub fn scanCheckpoint(alloc: A, txn: anytype, id: Digest, fence: SourceFence) !?ScanCheckpoint {
+        const current = (try SourceFence.read(txn)) orelse return error.GraphConstraintNotReady;
+        if (!std.meta.eql(current, fence)) return error.GraphConstraintAttemptConflict;
+        const state = Storage.load(txn, id) catch |err| {
+            if (err == error.NotFound) return null;
+            return err;
+        };
+        if (state.phase != .validating or state.revision != 0) return error.GraphConstraintNotReady;
+        const progress = (try readActivationProgress(txn, id)) orelse return null;
+        if (!std.mem.eql(u8, &progress.snapshot, &fence.snapshot)) return error.GraphConstraintRevisionChanged;
+        return .{
+            .owner_epoch = state.owner_epoch,
+            .after = if (progress.after) |after| try alloc.dupe(u8, after) else null,
+        };
+    }
+
     /// Load the persisted cursor for the pinned snapshot when resuming work.
     pub fn activationCursor(alloc: A, txn: anytype, id: Digest, epoch: u64, snapshot: Digest) !?[]u8 {
         _ = try activationState(txn, id, epoch);
@@ -1725,11 +1753,16 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     var budget: Contributions.validation.Budget = .{ .clock = .{ .now = Txn.now, .context = &txn } };
     var witness: Contributions.validation.Witness = .{};
     try std.testing.expectError(error.GraphConstraintNotReady, Contributions.seedActivationPage(alloc, &txn, existing_id, 1, versions, null, &initial, &budget, &witness));
+    try std.testing.expect((try Contributions.scanCheckpoint(alloc, &txn, existing_id, fence)) == null);
     try Contributions.beginActivation(&txn, existing_id, 1, versions);
     try Contributions.beginActivation(&txn, existing_id, 1, versions);
     try std.testing.expectError(error.GraphConstraintRevisionChanged, Contributions.beginActivation(&txn, existing_id, 1, @splat(9)));
     try std.testing.expectEqualDeep(versions, (try Contributions.activationSnapshot(&txn, existing_id, 1)).?);
     try std.testing.expect((try Contributions.activationCursor(alloc, &txn, existing_id, 1, versions)) == null);
+    const before_first_page = (try Contributions.scanCheckpoint(alloc, &txn, existing_id, fence)).?;
+    defer before_first_page.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), before_first_page.owner_epoch);
+    try std.testing.expect(before_first_page.after == null);
     try Contributions.seedActivationPage(alloc, &txn, existing_id, 1, versions, null, &initial, &budget, &witness);
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, existing_id, 1));
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.begin(&txn, existing_id, 1, 0, testAttempt(7)));
@@ -1744,8 +1777,13 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     try std.testing.expectError(error.GraphConstraintAttemptConflict, stale_cut.stageScan(alloc, &txn));
     try takeover.stageScan(alloc, &txn);
     try takeover.stageScan(alloc, &txn);
+    try std.testing.expectError(error.GraphConstraintAttemptConflict, Contributions.scanCheckpoint(alloc, &txn, existing_id, stale_cut.fence));
+    const checkpoint = (try Contributions.scanCheckpoint(alloc, &txn, existing_id, fence)).?;
+    defer checkpoint.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), checkpoint.owner_epoch);
     const first_cursor = (try Contributions.activationCursor(alloc, &txn, existing_id, 2, versions)).?;
     defer alloc.free(first_cursor);
+    try std.testing.expectEqualSlices(u8, first_cursor, checkpoint.after.?);
     const cycle: []const Contributions.Replacement = &.{
         .{ .owner = @splat(1), .source = "b", .targets = &.{"a"} },
     };

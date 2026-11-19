@@ -26929,11 +26929,17 @@ pub const DB = struct {
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         var request = try std.json.parseFromSlice(struct {
-            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt },
+            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, dag_activation_checkpoint, merge_copy_receipt },
             scope: ?@import("online_source_contract.zig").Scope = null,
+            dag_scan: ?struct {
+                namespace: [24]u8,
+                domain: [32]u8,
+                fence: @import("../../graph/dag_authority.zig").SourceFence,
+            } = null,
         }, alloc, request_json, .{});
         defer request.deinit();
         if ((request.value.mode == .online_source_status) != (request.value.scope != null)) return error.InvalidOnlineSourceCommand;
+        if ((request.value.mode == .dag_activation_checkpoint) != (request.value.dag_scan != null)) return error.InvalidBatchRequest;
         var output: std.Io.Writer.Allocating = .init(alloc);
         errdefer output.deinit();
         var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
@@ -26959,6 +26965,12 @@ pub const DB = struct {
             },
             .status => try @import("relational_integrity_json.zig").write(try self.relationalTopologyStatus(), &stream),
             .online_source_status => try @import("relational_integrity_json.zig").write(try self.onlineSourceStatus(request.value.scope.?), &stream),
+            .dag_activation_checkpoint => {
+                const scan_request = request.value.dag_scan.?;
+                const checkpoint = try self.dagActivationCheckpoint(alloc, scan_request.namespace, scan_request.domain, scan_request.fence);
+                defer if (checkpoint) |value| value.deinit(alloc);
+                try @import("relational_integrity_json.zig").write(checkpoint, &stream);
+            },
             .merge_copy_receipt => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
@@ -28794,6 +28806,22 @@ pub const DB = struct {
             defer self.core.unlockApply();
             try applyDerivedBatchInlineAssumeApply(&batch_ctx, prepared_value.batch);
         }
+    }
+
+    /// Read a private activation checkpoint after the caller has established
+    /// an owner read barrier for this physical root.
+    fn dagActivationCheckpoint(
+        self: *DB,
+        alloc: Allocator,
+        namespace: [24]u8,
+        domain: [32]u8,
+        fence: @import("../../graph/dag_authority.zig").SourceFence,
+    ) !?@import("../../graph/dag_authority.zig").Contributions.ScanCheckpoint {
+        if (!std.mem.eql(u8, &namespace, &@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace)))
+            return error.GraphConstraintRevisionChanged;
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        return @import("../../graph/dag_authority.zig").Contributions.scanCheckpoint(alloc, &read, domain, fence);
     }
 
     fn applyDagSourceFence(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
@@ -156026,14 +156054,21 @@ test "db ordered DAG source fence persists with the apply receipt" {
         .replacements = &.{.{ .owner = owner, .source = "b", .targets = &.{"a"} }},
     };
     try std.testing.expectError(error.GraphCycle, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 4 }, true));
-    {
-        var read = try db.core.store.beginReadTxn();
-        defer read.abort();
-        try std.testing.expectEqualDeep(fence.snapshot, (try dag.Contributions.activationSnapshot(&read, domain, 1)).?);
-        const saved = (try dag.Contributions.activationCursor(a, &read, domain, 1, fence.snapshot)).?;
-        defer a.free(saved);
-        try std.testing.expectEqualSlices(u8, &cursor, saved);
-    }
+    const checkpoint = (try db.dagActivationCheckpoint(a, request.dag_source_fence.?.namespace, domain, fence)).?;
+    defer checkpoint.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), checkpoint.owner_epoch);
+    try std.testing.expectEqualSlices(u8, &cursor, checkpoint.after.?);
+    const lookup_control = try std.json.Stringify.valueAlloc(a, .{
+        .mode = @as(enum { dag_activation_checkpoint }, .dag_activation_checkpoint),
+        .dag_scan = .{ .namespace = request.dag_source_fence.?.namespace, .domain = domain, .fence = fence },
+    }, .{ .emit_strings_as_arrays = true });
+    defer a.free(lookup_control);
+    var result = (try db.lookup(a, "", .{ .relational_topology_json = lookup_control })).?;
+    defer result.deinit(a);
+    const decoded = try std.json.parseFromSlice(dag.Contributions.ScanCheckpoint, a, result.json, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(checkpoint, decoded.value);
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, db.dagActivationCheckpoint(a, @splat(255), domain, fence));
     request.dag_source_fence.?.scan = null;
     request.dag_source_fence.?.action = .release;
     try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 5 }, true);

@@ -62,16 +62,19 @@ its fence only after draining prepared writers, in the same serialized writer
 that excludes new votes. Topology admission and activation fences exclude each
 other, and topology drain includes authority-only prepared participants.
 The private ordered source-fence command commits acquisition, release, scan
-initialization, takeover, or a bounded scan page with its apply receipt. It rejects delayed
-acquisitions for released attempts and checks the full fence identity before
-staging scan work. An owner takeover preserves the pinned scan cursor and
-fences subsequent proposals from the old owner. An active source fence allows an ordered catalog change only
-when activation proofs match its pinned snapshot. Raft protocol version 31
-gates these commands, DAG-bearing transaction prepare, and catalog activation
-proofs. The source-fence command currently requires a root without asynchronous
-standby mirroring. The activation coordinator still needs to execute the
-protocol across roots, enumerate the pinned graph, and certify end of input. Regular index admission and direct
-graph-index open still reject DAG.
+initialization, takeover, or a bounded scan page with its apply receipt. It
+rejects delayed acquisitions for released attempts and checks the full fence
+identity before staging scan work. An owner takeover preserves the pinned scan
+cursor and fences subsequent proposals from the old owner. A private native
+lookup returns the current owner epoch and cursor from one storage snapshot.
+The hosted caller must establish the owner read barrier before the lookup.
+An active source fence allows an ordered catalog change only when activation
+proofs match its pinned snapshot. Raft protocol version 31 gates these commands,
+DAG-bearing transaction prepare, and catalog activation proofs. The source-fence
+command currently requires a root without asynchronous standby mirroring. The
+activation coordinator still needs to execute the protocol across roots,
+enumerate the pinned graph, and certify end of input. Regular index admission
+and direct graph-index open still reject DAG.
 An existing distributed reservation remains under the original coordinator,
 and the publication coordinator still needs to enlist the authority under
 the source and contender guards. Document-derived and explicit writers still
