@@ -129,7 +129,7 @@ fn recipeFromBound(a: A, table: catalog.Table, bound: binding.Bound) !?Recipe {
     errdefer a.free(inputs);
     for (inputs, bound.inputs, bound.specs) |*input, slot, spec| {
         if (slot == null and spec.kind != .count) return error.InvalidSqlBackendResponse;
-        if (spec.kind == .pattern_set) {
+        if (spec.kind == .pattern_set or spec.kind == .array_agg) {
             a.free(keys);
             a.free(inputs);
             return null;

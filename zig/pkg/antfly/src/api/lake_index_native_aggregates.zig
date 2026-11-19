@@ -53,7 +53,7 @@ pub fn recipeFor(a: A, table: local.sql_catalog.Table, config: std.json.Value, m
     const operation = mat.object.get("op") orelse return error.InvalidAlgebraicConfig;
     if (operation != .string) return error.InvalidAlgebraicConfig;
     const kind = std.meta.stringToEnum(operators.Aggregate.Kind, operation.string) orelse return null;
-    if (kind == .pattern_set) return null;
+    if (kind == .pattern_set or kind == .array_agg) return null;
     const measure = mat.object.get("measure") orelse mat.object.get("value_field");
     const input: ?local.sql_catalog.Column = if (measure) |value| key: {
         if (value == .null) break :key null;

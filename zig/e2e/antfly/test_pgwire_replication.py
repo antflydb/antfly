@@ -169,7 +169,7 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot):
         type_registry_query = (
             "SELECT t.oid, t.typname, t.typelem, t.typbasetype, t.typtypmod, t.typcategory, e.values "
             "FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid "
-            "LEFT JOIN (SELECT t.enumtypid AS id, count(t.enumlabel) AS values FROM pg_catalog.pg_enum t "
+            "LEFT JOIN (SELECT t.enumtypid AS id, array_agg(t.enumlabel) AS values FROM pg_catalog.pg_enum t "
             "GROUP BY id) e ON t.oid = e.id WHERE n.nspname != 'pg_toast' AND t.oid IN (23,1007) ORDER BY t.oid"
         )
         discovery = subprocess.check_output(

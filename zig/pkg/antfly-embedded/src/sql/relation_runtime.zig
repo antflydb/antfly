@@ -736,6 +736,31 @@ test "SQL generate_series accepts expression bounds and alias columns" {
     try std.testing.expectError(error.SqlZeroSeriesStep, @import("runtime.zig").execute(allocator, backend.backend(), &zero, &.{}, .{}));
 }
 
+test "SQL array_agg retains scalar types, duplicates, and nulls" {
+    const a = std.testing.allocator;
+    var backend: SetTestBackend = .{};
+    var spill: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &backend, .checkpoint = SetTestBackend.checkpoint };
+    defer spill.deinit();
+    const Case = struct { sql: []const u8, expected: []const u8 };
+    for ([_]Case{
+        .{ .sql = "SELECT a.items[1], a.items[2], a.items[3] FROM (SELECT array_agg(t.label) AS items FROM (VALUES ('a'),(NULL),('a')) t(label)) a", .expected = "[[\"a\",null,\"a\"]]" },
+        .{ .sql = "SELECT array_agg(n) IS NULL FROM (SELECT 1 AS n WHERE false) t", .expected = "[[true]]" },
+        .{ .sql = "SELECT e.id, e.labels[1] FROM (SELECT t.enumtypid AS id, array_agg(t.enumlabel) AS labels FROM (VALUES (3,'label')) t(enumtypid,enumlabel) GROUP BY id) e", .expected = "[[\"3\",\"label\"]]" },
+    }) |case| {
+        var compiled = try @import("compiler.zig").compile(a, case.sql, .{});
+        defer compiled.deinit();
+        for ([_]bool{ false, true }) |use_spill| {
+            var source = backend.backend();
+            source.spill_manager = if (use_spill) &spill else null;
+            var result = try @import("runtime.zig").execute(a, source, &compiled, &.{}, .{ .page_rows = 1 });
+            defer result.deinit();
+            const json = try std.json.Stringify.valueAlloc(a, result.output.rows, .{});
+            defer a.free(json);
+            try std.testing.expectEqualStrings(case.expected, json);
+        }
+    }
+}
+
 test "SQL derived GROUP BY resolves output aliases after source fields" {
     const a = std.testing.allocator;
     var backend: SetTestBackend = .{};

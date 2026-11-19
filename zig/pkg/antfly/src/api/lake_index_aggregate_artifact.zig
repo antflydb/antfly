@@ -1305,7 +1305,7 @@ pub const Reader = struct {
         for (request.order, self.root.recipe.keys[0..request.order.len]) |order, key| {
             if (!std.mem.eql(u8, order.column, key.path) or order.descending != reverse or (key.nullable and order.nulls_first != reverse)) return false;
         }
-        for (self.root.recipe.inputs) |input| if (input.spec.distinct or input.spec.kind == .pattern_set) return false;
+        for (self.root.recipe.inputs) |input| if (input.spec.distinct or input.spec.kind == .pattern_set or input.spec.kind == .array_agg) return false;
         self.reverse = reverse;
         if (self.root.state_tree != null) {
             self.tree_maximum = request.maximum_groups;

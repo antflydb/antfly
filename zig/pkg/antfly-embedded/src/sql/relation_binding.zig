@@ -403,6 +403,7 @@ const Builder = struct {
                     break :blk switch (kind) {
                         .avg => .{ .cast = .{ .operand = argument, .type = .number } },
                         .bool_and, .bool_or => .{ .cast = .{ .operand = argument, .type = .boolean } },
+                        .array_agg => .{ .call = .{ .name = "$array", .args = try self.alloc.dupe(*const ast.Scalar, &.{argument}) } },
                         .pattern_set => .{ .cast = .{ .operand = try self.scalarNode(.{ .cast = .{ .operand = argument, .type = .string } }), .type = .json } },
                         else => argument.*,
                     };

@@ -500,7 +500,7 @@ pub const Grouped = struct {
     }
     fn reduceNativeBlock(self: *Grouped, block: *spill.Sequential.OwnedBlock, ordinal_base: u64) !usize {
         if (self.fallback != null or block.count() < 2 or block.count() > 256 or block.width() != self.specs.len + 1) return 0;
-        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set) return 0;
+        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or spec.kind == .array_agg) return 0;
         const first_marker = try block.cell(0, 0);
         if (first_marker.sql_null) return 0;
         const partial_state = first_marker.value == .bool and first_marker.value.bool;
