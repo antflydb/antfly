@@ -67,7 +67,14 @@ fn validateRequestWithCeiling(a: std.mem.Allocator, state: control.State, namesp
     } else return error.ChangefeedConflict;
     if (table.contract != .native_document and table.contract != .native_relational) return error.ChangefeedCapabilityUnsupported;
     switch (input.command) {
-        .configure_policy, .inspect_policy, .capture_bootstrap, .release_bootstrap => return error.ChangefeedCapabilityUnsupported,
+        .configure_policy, .inspect_policy, .release_bootstrap => return error.ChangefeedCapabilityUnsupported,
+        .capture_bootstrap => |v| {
+            if (state.phase != .enrolling or state.definition.?.start != .snapshot_then_changes or item.consumer_epoch != 0 or v.expires_at_seconds != state.bootstrap_expires_at)
+                return error.ChangefeedConflict;
+            const grant = v.grant;
+            try grant.validate();
+            if (!same(grant.authority, state.authority) or !same(grant.consumer, state.consumerId()) or !same(grant.definition, state.definition.?.identity()) or grant.sequence != item.grant_sequence or grant.policy_revision != table.policy_revision or grant.expires_at_seconds > state.expires_at) return error.ChangefeedConflict;
+        },
         .enroll => |v| {
             if (state.definition.?.start == .snapshot_then_changes and item.consumer_epoch == 0) return error.ChangefeedCapabilityUnsupported;
             try v.validate();
@@ -138,14 +145,19 @@ pub const test_support = if (@import("builtin").is_test) struct {
         return mutation.apply(a, state, .{ .incarnation = @splat(9), .sequence = state.authority_sequence + 1 });
     }
     pub fn make(a: std.mem.Allocator, bad_authority: bool) !control.State {
+        return makeFor(a, bad_authority, .now);
+    }
+
+    pub fn makeFor(a: std.mem.Allocator, bad_authority: bool, start: control.Start) !control.State {
         const fence: metadata.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
         var namespace: [24]u8 = undefined;
         std.mem.writeInt(u64, namespace[0..8], 7, .big);
         std.mem.writeInt(u64, namespace[8..16], 17, .big);
         std.mem.writeInt(u64, namespace[16..24], 19, .big);
-        var state = try apply(a, .{}, .{ .create = .{ .id = @splat(4), .definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = @splat(3), .policy_revision = 1, .contract = .native_document }} }, .now = 100, .expires_at = 1000 } });
+        var state = try apply(a, .{}, .{ .create = .{ .id = @splat(4), .definition = .{ .start = start, .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = @splat(3), .policy_revision = 1, .contract = .native_document }} }, .now = 100, .expires_at = 1000, .bootstrap_expires_at = if (start == .now) 0 else 500 } });
         state = try apply(a, state, .{ .plan_roots = &.{.{ .namespace = namespace, .ownership_epoch = 1 }} });
-        const input: wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .enroll = .{ .namespace = namespace, .authority = if (bad_authority) @splat(8) else state.authority, .sequence = state.roots[0].grant_sequence, .consumer = state.consumerId(), .definition = state.definition.?.identity(), .expires_at_seconds = 1000, .policy_revision = 1 } } };
+        const grant: @FieldType(@TypeOf(@as(wire.Request, undefined).command), "enroll") = .{ .namespace = namespace, .authority = if (bad_authority) @splat(8) else state.authority, .sequence = state.roots[0].grant_sequence, .consumer = state.consumerId(), .definition = state.definition.?.identity(), .expires_at_seconds = 1000, .policy_revision = 1 };
+        const input: wire.Request = .{ .version = 1, .operation = .submit, .command = if (start == .now) .{ .enroll = grant } else .{ .capture_bootstrap = .{ .grant = grant, .expires_at_seconds = 500 } } };
         const payload: intent.Payload = .{ .command = try std.json.Stringify.valueAlloc(a, input, .{}), .fence = try std.json.Stringify.valueAlloc(a, fence, .{}), .table = "docs" };
         state = try apply(a, state, .{ .root_control = .{ .namespace = namespace, .operation = .{ .prepare = .{ .ownership_epoch = 1, .grant_sequence = state.roots[0].grant_sequence, .payload = payload } } } });
         const sequence = state.roots[0].pending_control.?.sequence;

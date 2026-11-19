@@ -220,6 +220,9 @@ fn perform(svc: anytype, policy: anytype, port: operations.Port, a: A, state: co
         }
     }
     if (!response.confirmed()) return result;
+    // The control receipt proves enrollment. Only an independently qualified
+    // grant read binds the immutable snapshot image to the metadata cut.
+    if (input.command == .capture_bootstrap and response.outcome.? == .applied) return result;
     var latest = load(svc, a, state.id, request) catch |err| {
         result.deferred_error = err;
         return result;

@@ -54,6 +54,7 @@ pub const Payload = struct {
 /// A proof is a private audit binding, not a public credential or authorization.
 pub const Effect = union(enum) {
     enrolled: struct { consumer_epoch: u64, start: u64 },
+    snapshot_enrolled: struct { consumer_epoch: u64, start: u64, digest: Digest, expires_at: u64 },
     acknowledged: struct { consumer_epoch: u64, previous: u64, next: u64 },
     renewed: struct { consumer_epoch: u64, expires_at: u64 },
     retired: struct { sequence: u64 },
@@ -62,10 +63,11 @@ pub const Effect = union(enum) {
     pub fn validate(self: Effect) !void {
         switch (self) {
             .enrolled => |v| if (v.consumer_epoch == 0) return error.InvalidChangefeed,
+            .snapshot_enrolled => |v| if (v.consumer_epoch == 0 or v.expires_at == 0 or std.mem.allEqual(u8, &v.digest, 0)) return error.InvalidChangefeed,
             .acknowledged => |v| if (v.consumer_epoch == 0 or v.next < v.previous) return error.InvalidChangefeed,
             .renewed => |v| if (v.consumer_epoch == 0 or v.expires_at == 0) return error.InvalidChangefeed,
             .retired => |v| if (v.sequence == 0) return error.InvalidChangefeed,
-            .rejected => |code| if (code == 0 or code > 7) return error.InvalidChangefeed,
+            .rejected => |code| if (code == 0 or code > 8) return error.InvalidChangefeed,
             .maintenance => {},
         }
     }

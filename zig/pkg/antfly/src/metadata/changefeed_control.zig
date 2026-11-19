@@ -23,6 +23,7 @@ pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
 pub const protocol_version: u16 = 109;
 pub const verified_bootstrap_protocol_version: u16 = 111;
+pub const qualified_bootstrap_protocol_version: u16 = 112;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
@@ -468,6 +469,11 @@ pub const Mutation = union(enum) {
     finish_close,
     restart: struct { definition: Definition, now: u64, expires_at: u64, bootstrap_expires_at: u64 = 0 },
     pub fn requiredProtocol(self: Mutation) u16 {
+        if (self == .root_control) switch (self.root_control.operation) {
+            .reconciled => |result| if (result.effect == .progress and result.effect.progress == .snapshot_enrolled) return qualified_bootstrap_protocol_version,
+            .settled => |result| if (result.effect == .rejected and result.effect.rejected == 8) return qualified_bootstrap_protocol_version,
+            else => {},
+        };
         return if (self == .finish_verified_bootstrap) verified_bootstrap_protocol_version else protocol_version;
     }
 
@@ -954,6 +960,16 @@ fn applyRootControlEffect(state: State, target: *Root, pending: root_intent.Stat
                 target.acknowledged = .{ .sequence = v.start };
                 target.reclaimed_through = v.start;
             }
+        },
+        .snapshot_enrolled => |v| {
+            if (state.phase != .enrolling or state.definition.?.start != .snapshot_then_changes or before.consumer_epoch != 0 or v.expires_at != state.bootstrap_expires_at)
+                return error.ChangefeedConflict;
+            target.consumer_epoch = v.consumer_epoch;
+            target.start = v.start;
+            target.delivered = .{ .sequence = v.start };
+            target.acknowledged = .{ .sequence = v.start };
+            target.reclaimed_through = v.start;
+            target.snapshot = .{ .id = state.consumerId(), .digest = v.digest, .expires_at = v.expires_at };
         },
         .acknowledged => |v| {
             if (before.consumer_epoch != v.consumer_epoch or before.reclaimed_through != v.previous or v.next > before.acknowledged.sequence) return error.ChangefeedConflict;

@@ -284,20 +284,23 @@ pub fn enrollRoot(client: *MetadataClient, policy: anytype, a: A, state: control
     const item = state.roots[try state.rootIndex(root.namespace)];
     if (state.phase != .enrolling or item.consumer_epoch != 0) return error.ChangefeedConflict;
     if (item.pending_control != null) return driveRoot(client, policy, a, state, root.namespace, context);
-    try prepareRoot(client, policy, a, state.id, root, .{
-        .version = 1,
-        .operation = .submit,
-        .command = .{ .enroll = .{
-            .namespace = root.namespace,
-            .authority = state.authority,
-            .consumer = state.consumerId(),
-            .definition = (state.definition orelse return error.ChangefeedConflict).identity(),
-            .sequence = item.grant_sequence,
-            .expires_at_seconds = state.expires_at,
-            .policy_revision = policy_revision,
-            .require_commit_clock = state.definition.?.tables[0].contract == .native_relational,
-        } },
-    }, context);
+    const definition = state.definition orelse return error.ChangefeedConflict;
+    const native = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
+    const grant: native.Grant = .{
+        .namespace = root.namespace,
+        .authority = state.authority,
+        .consumer = state.consumerId(),
+        .definition = definition.identity(),
+        .sequence = item.grant_sequence,
+        .expires_at_seconds = state.expires_at,
+        .policy_revision = policy_revision,
+        .require_commit_clock = definition.tables[0].contract == .native_relational,
+    };
+    const command: native.Command = if (definition.start == .snapshot_then_changes)
+        .{ .capture_bootstrap = .{ .grant = grant, .expires_at_seconds = state.bootstrap_expires_at } }
+    else
+        .{ .enroll = grant };
+    try prepareRoot(client, policy, a, state.id, root, .{ .version = 1, .operation = .submit, .command = command }, context);
 }
 
 pub fn prepareRoot(client: *MetadataClient, policy: anytype, a: A, id: control.Id, root: Root, command: @import("history_control_operations.zig").wire.Request, request: Context) !void {
@@ -310,10 +313,15 @@ pub fn prepareRoot(client: *MetadataClient, policy: anytype, a: A, id: control.I
 
 pub fn driveRoot(client: *MetadataClient, policy: anytype, a: A, state: control.State, namespace: control.Namespace, request: Context) !void {
     const item = state.roots[try state.rootIndex(namespace)];
-    const result = if (item.pending_control.?.stage == .dispatching)
+    const pending = item.pending_control.?;
+    const driver_outcome = @import("../metadata/root_control_outcome.zig");
+    const is_capture = (try driver_outcome.validateRequest(a, state, namespace, pending.payload)).input.command == .capture_bootstrap;
+    var result = if (pending.stage == .dispatching)
         try enrollment.reconcile(client, policy, policy.source.grants, a, state.id, namespace, request)
     else
         try enrollment.drive(client, policy, policy.source.controls, a, state.id, namespace, request);
+    if (is_capture and (result.status == .accepted or result.status == .superseded))
+        result = try enrollment.reconcile(client, policy, policy.source.grants, a, state.id, namespace, request);
     switch (result.status) {
         .settled => {
             const effect = result.settlement.?.effect;

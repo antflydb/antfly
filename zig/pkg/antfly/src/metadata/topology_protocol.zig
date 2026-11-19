@@ -140,7 +140,7 @@ const std = @import("std");
 /// Version 109 advances empty slot projections without allocating LSNs.
 /// Version 110 coordinates durable PostgreSQL publication changes.
 /// Version 111 binds feed bootstrap completion to the acknowledged snapshot cut.
-pub const current_version: u16 = 111;
+pub const current_version: u16 = 112;
 pub const pg_publication_version: u16 = @import("pg_publication.zig").protocol_version;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;

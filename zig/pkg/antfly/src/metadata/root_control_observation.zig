@@ -29,7 +29,7 @@ pub fn request(a: std.mem.Allocator, state: control.State, namespace: control.Na
     const pending = item.pending_control orelse return error.ChangefeedConflict;
     if (pending.stage == .prepared) return error.ChangefeedConflict;
     const validated = try outcome.validateRequest(a, state, namespace, pending.payload);
-    return .{ .version = 1, .identity = .{ .namespace = namespace, .authority = state.authority, .consumer = state.consumerId(), .definition = state.definition.?.identity(), .sequence = item.grant_sequence, .policy_revision = validated.policy_revision } };
+    return .{ .version = 1, .identity = .{ .namespace = namespace, .authority = state.authority, .consumer = state.consumerId(), .definition = state.definition.?.identity(), .sequence = item.grant_sequence, .policy_revision = validated.policy_revision, .include_bootstrap = validated.input.command == .capture_bootstrap } };
 }
 pub fn resolve(a: std.mem.Allocator, state: control.State, namespace: control.Namespace, observed: native.GrantObservation) !?intent.Reconciliation {
     const input = try request(a, state, namespace);
@@ -52,7 +52,13 @@ pub fn resolve(a: std.mem.Allocator, state: control.State, namespace: control.Na
         if (current.policy_revision != validated.policy_revision or current.expires_at_seconds > state.expires_at) return error.ChangefeedConflict;
         if (item.consumer_epoch != 0 and (current.epoch != item.consumer_epoch or current.start != item.start or current.acknowledged < item.reclaimed_through or current.acknowledged > item.acknowledged.sequence)) return error.ChangefeedConflict;
         switch (command) {
-            .configure_policy, .inspect_policy, .capture_bootstrap, .release_bootstrap => return error.ChangefeedCapabilityUnsupported,
+            .configure_policy, .inspect_policy, .release_bootstrap => return error.ChangefeedCapabilityUnsupported,
+            .capture_bootstrap => |capture| {
+                const pin = observed.active.bootstrap orelse return null;
+                if (pin.expires_at_seconds != capture.expires_at_seconds or observed.active.limit != capture.grant.limit or current.acknowledged != current.start)
+                    return error.ChangefeedConflict;
+                break :effect .{ .progress = .{ .snapshot_enrolled = .{ .consumer_epoch = current.epoch, .start = current.start, .digest = pin.digest, .expires_at = pin.expires_at_seconds } } };
+            },
             .enroll => |grant| {
                 if (observed.active.limit != grant.limit) return error.ChangefeedConflict;
                 if (item.consumer_epoch == 0 and current.acknowledged != current.start) return error.ChangefeedConflict;
@@ -78,11 +84,31 @@ pub fn resolve(a: std.mem.Allocator, state: control.State, namespace: control.Na
 
 pub const test_support = if (@import("builtin").is_test) struct {
     const fixture = outcome.test_support;
+    fn bootstrapContracts(scratch: std.mem.Allocator, a: std.mem.Allocator) !void {
+        const state = try fixture.makeFor(scratch, false, .snapshot_then_changes);
+        const ns = state.roots[0].namespace;
+        const input = try request(a, state, ns);
+        try std.testing.expect(input.identity.include_bootstrap);
+        const accepted = try outcome.validateRequest(a, state, ns, state.roots[0].pending_control.?.payload);
+        var observed: native.GrantObservation = .{ .active = .{ .grant = input.identity.sequence, .limit = accepted.input.command.capture_bootstrap.grant.limit, .consumer = .{ .id = input.identity.consumer, .epoch = 7, .start = 3, .acknowledged = 3, .expires_at_seconds = 1000, .policy_revision = 1 } } };
+        try std.testing.expect((try resolve(a, state, ns, observed)) == null);
+        observed.active.bootstrap = .{ .digest = @splat(5), .expires_at_seconds = 499 };
+        try std.testing.expectError(error.ChangefeedConflict, resolve(a, state, ns, observed));
+        observed.active.bootstrap.?.expires_at_seconds = 500;
+        const proof = (try resolve(a, state, ns, observed)).?;
+        const mutation: control.Mutation = .{ .root_control = .{ .namespace = ns, .operation = .{ .reconciled = proof } } };
+        try std.testing.expectEqual(control.qualified_bootstrap_protocol_version, mutation.requiredProtocol());
+        const enrolled = try fixture.apply(scratch, state, mutation);
+        try std.testing.expect(enrolled.roots[0].pending_control == null);
+        try std.testing.expectEqual(@as(u64, 3), enrolled.roots[0].start);
+        try std.testing.expectEqualDeep(control.Snapshot{ .id = state.consumerId(), .digest = @splat(5), .expires_at = 500 }, enrolled.roots[0].snapshot.?);
+    }
     pub fn contracts() !void {
         const a = std.testing.allocator;
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const scratch = arena.allocator();
+        try bootstrapContracts(scratch, a);
         var state = try fixture.make(scratch, false);
         const roots = try scratch.dupe(control.Root, state.roots);
         roots[0].pending_control.?.stage = .dispatching;
