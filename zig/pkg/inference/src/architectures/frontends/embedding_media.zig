@@ -4,11 +4,11 @@
 //! Captured media towers and ordered text/media composition. Processor outputs
 //! remain runtime operands. Layout, validity masks and row maps specialize.
 const std = @import("std");
-const capture = @import("capture.zig");
-const Tensor = @import("../backends/tensor.zig").Tensor;
-const ops = @import("../ops/ops.zig");
-const encoder = @import("../architectures/embedding_gemma2.zig");
-const projector = @import("../architectures/gemma4_projector.zig");
+const capture = @import("../../execution/capture.zig");
+const Tensor = @import("../../backends/tensor.zig").Tensor;
+const ops = @import("../../ops/ops.zig");
+const encoder = @import("../embedding_gemma2.zig");
+const projector = @import("../gemma4_projector.zig");
 
 pub const Kind = enum(i64) { image = 1, audio = 2, video = 3 };
 const Media = struct {
@@ -27,10 +27,7 @@ const Media = struct {
         };
     }
 };
-fn named(inputs: []const capture.Input, name: []const u8) ?Tensor {
-    for (inputs) |input| if (std.mem.eql(u8, input.tensor.name, name)) return input.tensor;
-    return null;
-}
+const named = capture.findTensor;
 const Inputs = struct {
     ids: Tensor,
     mask: Tensor,
@@ -70,10 +67,7 @@ pub fn hasMedia(inputs: []const capture.Input) bool {
     return named(inputs, "pixel_values") != null or named(inputs, "media_layout") != null;
 }
 fn parse(cfg: encoder.Config, inputs: []const capture.Input) !Inputs {
-    for (inputs, 0..) |input, index| {
-        _ = try capture.inputShape(input.tensor);
-        for (inputs[0..index]) |previous| if (std.mem.eql(u8, previous.tensor.name, input.tensor.name)) return error.DuplicateInputs;
-    }
+    try capture.validateHostInputs(inputs);
     const id = named(inputs, "input_ids") orelse return error.MissingInputs;
     const m = named(inputs, "attention_mask") orelse return error.MissingInputs;
     const r = named(inputs, "media_rows") orelse return error.MissingInputs;

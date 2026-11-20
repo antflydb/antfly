@@ -25,13 +25,14 @@ const file = @import("util/c_file.zig");
 const backend_choice = @import("native_backend_choice.zig");
 
 pub fn main(a: std.mem.Allocator, io: std.Io, args: []const []const u8, extract: bool) !void {
-    const usage = "usage: antfly inference {s} <models-dir> --request <json-file> [--request <json-file> ...] [--backend native|metal|auto] [--repeat N]\n";
+    const usage = "usage: antfly inference {s} <models-dir> --request <json-file> [--request <json-file> ...] [--backend native|metal|cuda|xla|auto] [--repeat N]\n" ++ @import("execution/pjrt_options.zig").usage ++ "\n";
     if (args.len < 3) {
         std.debug.print(usage, .{if (extract) "extract" else "decisions"});
         return error.InvalidArguments;
     }
     var backend: backend_choice.Choice = .auto;
     var repeat: usize = 1;
+    var pjrt: @import("execution/pjrt_options.zig").Options = .{};
     var paths: std.ArrayList([]const u8) = .empty;
     defer paths.deinit(a);
     var i: usize = 1;
@@ -40,7 +41,9 @@ pub fn main(a: std.mem.Allocator, io: std.Io, args: []const []const u8, extract:
             std.debug.print(usage, .{if (extract) "extract" else "decisions"});
             return error.InvalidArguments;
         }
-        if (std.mem.eql(u8, args[i], "--request")) {
+        if (try pjrt.parse(args[i], args[i + 1])) {
+            continue;
+        } else if (std.mem.eql(u8, args[i], "--request")) {
             try paths.append(a, args[i + 1]);
         } else if (std.mem.eql(u8, args[i], "--backend")) {
             backend = backend_choice.parse(args[i + 1]) orelse return error.InvalidBackend;
@@ -72,6 +75,10 @@ pub fn main(a: std.mem.Allocator, io: std.Io, args: []const []const u8, extract:
     try node.attachIo(io);
     backend_choice.configureSessionPreference(&node.session_manager, backend);
     backend_choice.configureSessionPreference(&node.model_manager.session_manager, backend);
+    if (backend == .xla) {
+        try pjrt.configure(&node.session_manager);
+        try pjrt.configure(&node.model_manager.session_manager);
+    }
     var buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &buffer);
     const timings = try a.alloc(u64, requests.len * repeat);

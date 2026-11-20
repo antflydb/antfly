@@ -172,7 +172,7 @@ pub fn packetGeometrySupported(key_heads: usize, value_heads: usize, dim: usize,
 
 pub const Module = struct {
     program: Program = .{},
-    bf16_prefill: ?@import("lighton_prefill.zig").Module = null,
+    bf16_prefill: ?@import("recurrent_prefill.zig").Module = null,
     bf16_prefill_configured: bool = false,
 
     prefix_shared_qk_calls: usize = 0,
@@ -201,7 +201,7 @@ pub const Module = struct {
         if (self.bf16_prefill_configured) return;
         if (path) |name| {
             if (ctx.info.compute_major != 12 or ctx.info.compute_minor != 1) return error.LightOnPrefillUnsupportedDevice;
-            self.bf16_prefill = try @import("lighton_prefill.zig").Module.init(name);
+            self.bf16_prefill = try @import("recurrent_prefill.zig").Module.init(name);
         }
         self.bf16_prefill_configured = true;
     }

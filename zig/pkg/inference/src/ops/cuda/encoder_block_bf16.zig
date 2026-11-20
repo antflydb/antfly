@@ -24,7 +24,7 @@ const cudnn = @import("cudnn_sdpa.zig");
 
 /// Generic BF16 execution starts at Ampere; the embedded PTX requires CUDA 13.
 /// Specialized fused GEMMs retain their own narrower device checks.
-pub fn deviceSupported(device: @import("lighton_device_policy.zig").Device) bool {
+pub fn deviceSupported(device: @import("recurrent_device_policy.zig").Device) bool {
     return device.portableKernels();
 }
 

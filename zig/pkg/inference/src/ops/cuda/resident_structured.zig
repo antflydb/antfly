@@ -18,7 +18,7 @@
 //! integer metadata is retained for validation/grouping, never converted to f32.
 const std = @import("std");
 const cuda = @import("cuda_compute.zig");
-const api = cuda.gliner25_api;
+const api = cuda.resident_structured_api;
 const ops = @import("../ops.zig");
 const boundary = ops.gliner_boundary_device;
 const resident = ops.resident_training;

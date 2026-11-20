@@ -179,10 +179,11 @@ test "required backend gates compiled backend execution" {
     );
 
     manager.required_backend = .pjrt;
-    try std.testing.expectError(
-        error.RequiredBackendUnavailable,
-        validateRequiredCompiledBackend(&manager, .pjrt),
-    );
+    if (build_options.enable_pjrt) {
+        try validateRequiredCompiledBackend(&manager, .pjrt);
+    } else {
+        try std.testing.expectError(error.RequiredBackendUnavailable, validateRequiredCompiledBackend(&manager, .pjrt));
+    }
 
     manager.required_backend = null;
     manager.required_backend_invalid = true;

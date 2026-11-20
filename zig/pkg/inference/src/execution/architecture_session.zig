@@ -7659,7 +7659,7 @@ fn archRunCachedDecoder(ptr: *anyopaque, state: *@import("resident_decoder.zig")
     if (comptime !build_options.enable_pjrt) return error.PjrtNotEnabled;
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     if (self.backend_type != .pjrt or self.arch_config != .gpt or state.failed) return error.UnsupportedResidentDecode;
-    var forward = @import("decoder_frontend.zig").resolve(&self.arch_config.gpt);
+    var forward = @import("../architectures/frontends/decoder.zig").resolve(&self.arch_config.gpt);
     forward.precision = self.backend_data.pjrt.precision;
     forward.residual_storage = self.backend_data.pjrt.residual_storage;
     forward.resident_capacity = state.capacity;
@@ -7979,11 +7979,11 @@ fn decisionProgramEncoder(config: ArchConfig, span_encoder_family: manifest_mod.
 }
 fn validateDecisionProgram(ptr: *anyopaque, inputs: []const @import("capture.zig").Input) anyerror!void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    _ = try @import("marker_classifier.zig").validate(decisionProgramEncoder(self.arch_config, self.gliner_span_encoder_family) orelse return error.UnsupportedModelProgram, inputs);
+    _ = try @import("../architectures/frontends/marker_classifier.zig").validate(decisionProgramEncoder(self.arch_config, self.gliner_span_encoder_family) orelse return error.UnsupportedModelProgram, inputs);
 }
 fn forwardDecisionProgram(ptr: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const @import("capture.zig").Input) anyerror![]@import("capture.zig").Output {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    return @import("marker_classifier.zig").run(decisionProgramEncoder(self.arch_config, self.gliner_span_encoder_family) orelse return error.UnsupportedModelProgram, cb, allocator, inputs);
+    return @import("../architectures/frontends/marker_classifier.zig").run(decisionProgramEncoder(self.arch_config, self.gliner_span_encoder_family) orelse return error.UnsupportedModelProgram, cb, allocator, inputs);
 }
 
 fn auxiliaryProjectorStore(self: *ArchSession) ?*tensor_store_mod.GgufStore {
@@ -8008,16 +8008,16 @@ fn resolveArchModelProgram(ptr: *anyopaque, stage: @import("model_frontend.zig")
         .forward, .readout => .{ .context = self, .fingerprint = 4, .output_names = &.{"logits"}, .validate = validateDecisionProgram, .run = forwardDecisionProgram },
         else => null,
     };
-    if (stage == .readout and self.arch_config == .gliner_boundary) return @import("boundary_head_frontend.zig").resolve(&self.arch_config.gliner_boundary);
+    if (stage == .readout and self.arch_config == .gliner_boundary) return @import("../architectures/frontends/boundary_head.zig").resolve(&self.arch_config.gliner_boundary);
     if ((self.task != .generic and !(self.task == .extractor and self.arch_config == .gliner_boundary)) or self.glide_head != null) return null;
-    if (self.arch_config == .whisper) return @import("whisper_frontend.zig").resolve(&self.arch_config.whisper, stage);
+    if (self.arch_config == .whisper) return @import("../architectures/frontends/whisper.zig").resolve(&self.arch_config.whisper, stage);
     if (stage == .audio_projection and self.arch_config == .gpt) {
-        if (auxiliaryProjectorStore(self)) |metadata| return @import("projector_frontend.zig").audio(metadata);
+        if (auxiliaryProjectorStore(self)) |metadata| return @import("../architectures/frontends/projector.zig").audio(metadata);
         return null;
     }
     if (stage == .image_projection and self.arch_config == .gpt) {
-        if (auxiliaryProjectorStore(self)) |metadata| return @import("projector_frontend.zig").image(metadata);
-        if (self.arch_config.gpt.hasQwen35VisionArchitectureContract()) return @import("patch_projector_frontend.zig").image(&self.arch_config.gpt);
+        if (auxiliaryProjectorStore(self)) |metadata| return @import("../architectures/frontends/projector.zig").image(metadata);
+        if (self.arch_config.gpt.hasQwen35VisionArchitectureContract()) return @import("../architectures/frontends/patch_projector.zig").image(&self.arch_config.gpt);
         return null;
     }
     const encoder = switch (self.arch_config) {
@@ -8027,7 +8027,7 @@ fn resolveArchModelProgram(ptr: *anyopaque, stage: @import("model_frontend.zig")
     };
     return switch (stage) {
         .forward => if (encoder) .{ .context = self, .fingerprint = 0, .output_names = &.{"last_hidden_state"}, .validate = archValidateProgramInputs, .run = archProgramForward } else null,
-        .decoder => if (self.arch_config == .gpt) @import("decoder_frontend.zig").resolve(&self.arch_config.gpt) else null,
+        .decoder => if (self.arch_config == .gpt) @import("../architectures/frontends/decoder.zig").resolve(&self.arch_config.gpt) else null,
         .embedding => if (self.arch_config == .embedding_gemma2) .{ .context = self, .fingerprint = 1, .output_names = &.{"sentence_embedding"}, .validate = archValidateProgramInputs, .run = archEmbeddingProgramForward } else null,
         else => null,
     };
@@ -8076,7 +8076,7 @@ fn programTextInputs(inputs: []const @import("capture.zig").Input) !ProgramTextI
 }
 fn archValidateProgramInputs(ptr: *anyopaque, inputs: []const @import("capture.zig").Input) anyerror!void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    if (self.arch_config == .embedding_gemma2 and @import("embedding_media_frontend.zig").hasMedia(inputs)) return @import("embedding_media_frontend.zig").validate(self.arch_config.embedding_gemma2, inputs);
+    if (self.arch_config == .embedding_gemma2 and @import("../architectures/frontends/embedding_media.zig").hasMedia(inputs)) return @import("../architectures/frontends/embedding_media.zig").validate(self.arch_config.embedding_gemma2, inputs);
     if (self.arch_config == .gpt) {
         _ = try programDecoderInputs(inputs, self.arch_config.gpt);
         return;
@@ -8165,7 +8165,7 @@ fn archProgramForward(ptr: *anyopaque, cb: *const ops.ComputeBackend, allocator:
 fn archEmbeddingProgramForward(ptr: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const @import("capture.zig").Input) anyerror![]@import("capture.zig").Output {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     if (self.arch_config != .embedding_gemma2) return error.UnsupportedModelProgram;
-    if (@import("embedding_media_frontend.zig").hasMedia(inputs)) return @import("embedding_media_frontend.zig").run(self.arch_config.embedding_gemma2, cb, allocator, inputs);
+    if (@import("../architectures/frontends/embedding_media.zig").hasMedia(inputs)) return @import("../architectures/frontends/embedding_media.zig").run(self.arch_config.embedding_gemma2, cb, allocator, inputs);
     const parsed = try programTextInputs(inputs);
     const bi = parsed.text;
     const count = parsed.dimensions orelse return error.MissingInputs;
@@ -9551,7 +9551,7 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
             if (ids.shape.len != 2 or ids.shape[0] != 1 or ids.shape[1] <= 0 or batch != 1) return error.InvalidInputShape;
             const cfg = self.arch_config.gpt;
             const rows: usize = @intCast(ids.shape[1]);
-            return try @import("decoder_frontend.zig").geometry(cfg, rows, rows);
+            return try @import("../architectures/frontends/decoder.zig").geometry(cfg, rows, rows);
         }
     }
     const first = inputs.get(0);

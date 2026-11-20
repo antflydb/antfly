@@ -37,12 +37,14 @@ const BackendChoice = enum {
     native,
     metal,
     cuda,
+    xla,
 };
 
 const Options = struct {
     model_dir: []const u8,
     audio_path: []const u8,
     backend: BackendChoice = .auto,
+    pjrt: @import("execution/pjrt_options.zig").Options = .{},
     /// Backend for the decoder session. `auto` keeps the decoder on the
     /// primary session; `native` loads a CPU copy for the decoder so the
     /// two placements can be measured against each other.
@@ -62,6 +64,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     session_manager.native_call_policy = .in_process;
     session_manager.process_termination_available = false;
     configureBackendPreference(&session_manager, opts.backend);
+    try opts.pjrt.applyPolicy(&session_manager);
+    if (opts.backend == .xla) try opts.pjrt.configure(&session_manager);
 
     if (enc_dec_mod.findEncoderDecoderPaths(allocator, opts.model_dir)) |paths| {
         defer allocator.free(paths.encoder);
@@ -121,6 +125,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             .native => .native,
             .metal => .metal,
             .cuda => .cuda,
+            .xla => .pjrt,
             .auto => unreachable,
         };
         if (model.session.backend() == desired) break :blk model.session;
@@ -173,7 +178,11 @@ fn parseArgs(args: []const []const u8) !Options {
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--backend")) {
+        if (std.mem.startsWith(u8, arg, "--pjrt-")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            if (!try opts.pjrt.parse(arg, args[i])) return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--backend")) {
             i += 1;
             if (i >= args.len) return error.MissingBackendValue;
             opts.backend = parseBackendChoice(args[i]) orelse return error.InvalidBackend;
@@ -249,6 +258,7 @@ fn jsonEncodeString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
 }
 
 fn parseBackendChoice(value: []const u8) ?BackendChoice {
+    if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .xla;
     if (std.mem.eql(u8, value, "auto")) return .auto;
     if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
@@ -258,6 +268,7 @@ fn parseBackendChoice(value: []const u8) ?BackendChoice {
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     session_manager.preferred_backends = switch (choice) {
+        .xla => &.{backends.BackendType.pjrt},
         .auto => if (build_options.enable_metal)
             &.{ backends.BackendType.metal, backends.BackendType.native }
         else if (build_options.enable_cuda)
@@ -271,6 +282,7 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
 }
 
 fn ensureRequestedBackendAvailable(choice: BackendChoice) !void {
+    if (choice == .xla and !build_options.enable_pjrt) return error.PjrtNotEnabled;
     if (choice == .cuda and !build_options.enable_cuda) return error.CudaNotEnabled;
     if (choice != .metal) return;
     if (native_backend_guard.checkMetal(build_options.enable_metal, metal_runtime.metalDeviceAvailable())) |failure| {
@@ -281,10 +293,11 @@ fn ensureRequestedBackendAvailable(choice: BackendChoice) !void {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference transcribe <model-dir> <audio.wav> [--backend auto|native|metal|cuda] [--decoder-backend auto|native|metal|cuda] [--language <lang>]
+        \\usage: antfly inference transcribe <model-dir> <audio.wav> [--backend auto|native|metal|cuda|xla] [--decoder-backend auto|native|metal|cuda|xla] [--language <lang>]
         \\  Runs local audio transcription and prints a JSON response to stdout.
         \\
     , .{});
+    print("{s}\n", .{@import("execution/pjrt_options.zig").usage});
 }
 
 test "parseArgs accepts backend and language" {
@@ -351,4 +364,13 @@ test "Whisper CUDA checkpoint transcribes English with reusable model state" {
             try std.testing.expect(std.mem.indexOf(u8, result.text, word) != null);
         try writeResultJson(a, std.mem.span(model_dir), result.text, result.language, result.timing);
     }
+}
+
+test "task CLI accepts explicit PJRT device precision and memory policy" {
+    const options = try parseArgs(&.{ "model", "audio.wav", "--backend", "xla", "--pjrt-device", "cuda", "--pjrt-capacity-bytes", "1024", "--pjrt-device-bytes", "4096", "--pjrt-precision", "bf16" });
+    try std.testing.expectEqual(BackendChoice.xla, options.backend);
+    const policy = try options.pjrt.sessionOptions();
+    try std.testing.expect(policy.memory_policy.? == .cuda);
+    try std.testing.expectEqual(@as(usize, 1024), policy.memory_policy.?.cuda.capacity_bytes);
+    try std.testing.expectEqual(BackendChoice.xla, parseBackendChoice("pjrt").?);
 }

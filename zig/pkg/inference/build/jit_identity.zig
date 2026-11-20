@@ -113,7 +113,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
     };
     const cuda_dependencies = [_][]const u8{
         "src/graph/cuda_execution_contract.zig",
-        "src/ops/cuda/lighton_device_policy.zig",
+        "src/ops/cuda/recurrent_device_policy.zig",
         "src/ops/cuda/driver_contract.zig",
         "src/ops/cuda/artifact.zig",
         "src/ops/cuda/context.zig",

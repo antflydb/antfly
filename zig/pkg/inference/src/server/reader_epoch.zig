@@ -1321,7 +1321,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         /// Synchronous pre-graph hook. Executor owns the actual step/FIFO;
         /// Page/State storage remains owned while pause excludes every other
         /// consumer. No completed forward work is replayed on a metadata race.
-        fn prepareCapturedGraph(raw: *anyopaque, cb: *const ops.ComputeBackend, descriptor: @import("../ops/cuda/lighton_decode_graph.zig").Descriptor, phase: *@import("../ops/cuda/lighton_decode_graph.zig").GraphPhase, outside: @import("../graph/execution.zig").CapturedGraphOutside, control: InferenceExecutionControl) !bool {
+        fn prepareCapturedGraph(raw: *anyopaque, cb: *const ops.ComputeBackend, descriptor: @import("../ops/cuda/bounded_decode_graph.zig").Descriptor, phase: *@import("../ops/cuda/bounded_decode_graph.zig").GraphPhase, outside: @import("../graph/execution.zig").CapturedGraphOutside, control: InferenceExecutionControl) !bool {
             if (comptime !build_options.enable_cuda) return false;
             const ctx: *LightOnStreamContext = @ptrCast(@alignCast(raw));
             const Cuda = @import("../ops/cuda/cuda_compute.zig").CudaCompute;

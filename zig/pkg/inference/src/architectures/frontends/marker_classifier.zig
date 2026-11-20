@@ -4,10 +4,10 @@
 //! Contextual marker classification: encoder semantics and the published MLP
 //! are reused by eager and compiled execution, with typed runtime row indices.
 const std = @import("std");
-const capture = @import("capture.zig");
-const ops = @import("../ops/ops.zig");
-const Tensor = @import("../backends/tensor.zig").Tensor;
-const Encoder = @import("../models/gliner_encoder.zig").Config;
+const capture = @import("../../execution/capture.zig");
+const ops = @import("../../ops/ops.zig");
+const Tensor = @import("../../backends/tensor.zig").Tensor;
+const Encoder = @import("../../models/gliner_encoder.zig").Config;
 const Parsed = struct { ids: Tensor, mask: Tensor, positions: Tensor, valid: Tensor };
 
 pub fn validate(config: Encoder, inputs: []const capture.Input) !Parsed {
@@ -17,9 +17,7 @@ pub fn validate(config: Encoder, inputs: []const capture.Input) !Parsed {
     for (inputs) |input| {
         const index: usize = if (std.mem.eql(u8, input.tensor.name, "input_ids")) 0 else if (std.mem.eql(u8, input.tensor.name, "attention_mask")) 1 else if (std.mem.eql(u8, input.tensor.name, "decision_marker_positions")) 2 else if (std.mem.eql(u8, input.tensor.name, "decision_marker_mask")) 3 else return error.UnexpectedModelProgramInput;
         if (slots[index] != null) return error.DuplicateInputs;
-        _ = try capture.inputShape(input.tensor);
-        if (input.tensor.dtype != .i64 or input.tensor.shape.len != 2 or !input.tensor.isAlignedFor(i64)) return error.InvalidInputShape;
-        for (input.tensor.shape) |dim| if (dim <= 0 or dim > std.math.maxInt(i32)) return error.InvalidInputShape;
+        try capture.requireHostTensor(input.tensor, .i64, 2);
         slots[index] = input.tensor;
     }
     const parsed = Parsed{ .ids = slots[0] orelse return error.MissingInputs, .mask = slots[1] orelse return error.MissingInputs, .positions = slots[2] orelse return error.MissingInputs, .valid = slots[3] orelse return error.MissingInputs };
@@ -50,26 +48,23 @@ pub fn run(config: Encoder, cb: *const ops.ComputeBackend, allocator: std.mem.Al
     const seq: usize = @intCast(parsed.ids.shape[1]);
     const labels: usize = @intCast(parsed.positions.shape[1]);
     const hidden = switch (config) {
-        .deberta => |cfg| try @import("../architectures/deberta.zig").forwardCt(cb, allocator, cfg, parsed.ids.asInt64(), parsed.mask.asInt64(), batch, seq, false),
-        .modern_bert => |cfg| try @import("../architectures/modern_bert.zig").forwardCT(cb, allocator, cfg, parsed.ids.asInt64(), parsed.mask.asInt64(), batch, seq),
+        .deberta => |cfg| try @import("../deberta.zig").forwardCt(cb, allocator, cfg, parsed.ids.asInt64(), parsed.mask.asInt64(), batch, seq, false),
+        .modern_bert => |cfg| try @import("../modern_bert.zig").forwardCT(cb, allocator, cfg, parsed.ids.asInt64(), parsed.mask.asInt64(), batch, seq),
     };
     defer cb.free(hidden);
-    const result = try @import("../architectures/gliner_decision_head.zig").forwardCt(cb, allocator, hidden, parsed.positions.asInt64(), parsed.valid.asInt64(), batch, seq, labels, config.geometry().hidden_size);
+    const result = try @import("../gliner_decision_head.zig").forwardCt(cb, allocator, hidden, parsed.positions.asInt64(), parsed.valid.asInt64(), batch, seq, labels, config.geometry().hidden_size);
     defer cb.free(result.logits);
     const shape = [_]i64{ @intCast(batch), @intCast(labels) };
     const logits = try cb.primReshape(result.logits, &shape);
     defer cb.free(logits);
-    const active = try @import("indexed_rows.zig").active(cb, allocator, parsed.valid.asInt64(), batch, labels);
+    const active = try @import("../../execution/indexed_rows.zig").active(cb, allocator, parsed.valid.asInt64(), batch, labels);
     defer cb.free(active);
     const masked_value = try cb.fromFloat32Shape(&.{-1.0e4}, &.{ 1, 1 });
     defer cb.free(masked_value);
     const masked = try cb.primBroadcastInDim(masked_value, &shape, &.{ 0, 1 }, &.{ 1, 1 });
     defer cb.free(masked);
     const output = try cb.primWhereSelect(active, logits, masked);
-    errdefer cb.free(output);
-    const outputs = try allocator.alloc(capture.Output, 1);
-    outputs[0] = .{ .name = "logits", .value = output };
-    return outputs;
+    return capture.publishOutput(allocator, cb, "logits", output);
 }
 
 test "model program marker classifier executes both encoder and readout with dynamic indices and masks" {
@@ -81,14 +76,14 @@ test "model program marker classifier executes both encoder and readout with dyn
     };
     defer client.deinit();
     const Source = struct {
-        weights: @import("../ops/native_compute.zig").WeightStore,
+        weights: @import("../../ops/native_compute.zig").WeightStore,
         config: Encoder = .{ .deberta = .{ .hidden_size = 2, .num_attention_heads = 1, .num_hidden_layers = 0, .intermediate_size = 4, .vocab_size = 4, .max_position_embeddings = 4, .position_buckets = 2 } },
         fn create(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!ops.ComputeBackend {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return @import("../backends/compute_factory.zig").createNative(allocator, &self.weights, null, null, .{});
+            return @import("../../backends/compute_factory.zig").createNative(allocator, &self.weights, null, null, .{});
         }
         fn import(_: *anyopaque, cb: *const ops.ComputeBackend, value: *const Tensor, _: std.mem.Allocator) anyerror!ops.CT {
-            const native: *@import("../ops/native_compute.zig").NativeCompute = @ptrCast(@alignCast(cb.ptr));
+            const native: *@import("../../ops/native_compute.zig").NativeCompute = @ptrCast(@alignCast(cb.ptr));
             return native.importHostTensor(value);
         }
         fn forward(ptr: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const capture.Input) anyerror![]capture.Output {
@@ -124,7 +119,7 @@ test "model program marker classifier executes both encoder and readout with dyn
     defer valid.deinit();
     var reference = try Source.create(&source, a);
     defer reference.deinit();
-    var cache = @import("captured_forward.zig").Cache{};
+    var cache = @import("../../execution/captured_forward.zig").Cache{};
     defer cache.deinit(a);
     for (0..2) |iteration| {
         if (iteration == 1) {

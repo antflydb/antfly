@@ -5,10 +5,10 @@
 //! decoding and grid selection precede this stage; learned arithmetic stays
 //! in the shared tensor program.
 const std = @import("std");
-const capture = @import("capture.zig");
-const ops = @import("../ops/ops.zig");
-const Config = @import("../models/gpt.zig").Config;
-const projector = @import("../architectures/qwen3vl_projector.zig");
+const capture = @import("../../execution/capture.zig");
+const ops = @import("../../ops/ops.zig");
+const Config = @import("../../models/gpt.zig").Config;
+const projector = @import("../qwen3vl_projector.zig");
 
 pub fn image(config: *Config) capture.Forward {
     return .{ .context = config, .fingerprint = 7, .output_names = &.{"image_features"}, .validate = validate, .run = run };
@@ -17,10 +17,10 @@ pub fn image(config: *Config) capture.Forward {
 fn validate(raw: *anyopaque, inputs: []const capture.Input) !void {
     const config: *Config = @ptrCast(@alignCast(raw));
     if (inputs.len != 2) return error.UnexpectedModelProgramInput;
+    try capture.validateHostInputs(inputs);
     var patches: ?capture.Input = null;
     var grid: ?capture.Input = null;
     for (inputs) |input| {
-        _ = try capture.inputShape(input.tensor);
         if (std.mem.eql(u8, input.tensor.name, "patch_values")) {
             if (patches != null) return error.DuplicateInputs;
             patches = input;
@@ -45,8 +45,5 @@ fn run(raw: *anyopaque, cb: *const ops.ComputeBackend, a: std.mem.Allocator, inp
     const input = try cb.fromFloat32Shape(p.asFloat32(), &.{ @intCast(p.shape[1]), @intCast(p.shape[2]) });
     defer cb.free(input);
     const output = try projector.encodeNamedPatchTensorResident(cb, a, config.*, input, geometry);
-    errdefer cb.free(output);
-    const outputs = try a.alloc(capture.Output, 1);
-    outputs[0] = .{ .name = "image_features", .value = output };
-    return outputs;
+    return capture.publishOutput(a, cb, "image_features", output);
 }

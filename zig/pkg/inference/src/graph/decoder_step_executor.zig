@@ -748,7 +748,7 @@ pub const Executor = struct {
         var order: [128]usize = undefined;
         for (items, 0..) |item, i| sequences[i] = item.state.sequence_id orelse
             return self.tryOrderedLightOnCudaDecodeGraph(claimed, items, input_ids, first_context);
-        try @import("../ops/cuda/lighton_decode_graph.zig").canonicalOrder(sequences[0..claimed.len], order[0..claimed.len]);
+        try @import("../ops/cuda/bounded_decode_graph.zig").canonicalOrder(sequences[0..claimed.len], order[0..claimed.len]);
         var identity = true;
         for (order[0..claimed.len], 0..) |original, row| identity = identity and original == row;
         if (identity) return self.tryOrderedLightOnCudaDecodeGraph(claimed, items, input_ids, first_context);
@@ -950,7 +950,7 @@ pub const Executor = struct {
         const attention_count = recipe.attention_count;
         var position_snapshot: [384]u32 = undefined;
         @memcpy(position_snapshot[0..positions.len], positions);
-        const graph_owner = @import("../ops/cuda/lighton_decode_graph.zig");
+        const graph_owner = @import("../ops/cuda/bounded_decode_graph.zig");
         const descriptor = graph_owner.Descriptor{ .epoch = self.lighton_cuda_execution_id, .key = key.words[0..key.len], .positions = position_snapshot[0..positions.len], .rows = claimed.len, .hidden = self.context.gpt_config.hidden_size, .vocab = self.context.gpt_config.vocab_size, .future_tokens = max_future, .attention_layers = attention_count, .recurrent_layers = self.context.gpt_config.num_hidden_layers - attention_count };
         var funding_phase: graph_owner.GraphPhase = undefined;
         try funding_phase.initInto(descriptor);
@@ -977,7 +977,7 @@ pub const Executor = struct {
             if (verified.max_future != max_future or verified.attention_count != attention_count or (!verified_key.same or verified_key.len != key.len) or !std.mem.eql(u32, position_snapshot[0..positions.len], current_positions)) return self.declineLightOnGraph(7);
         }
         // The callback may have parked/restored; read the actual owner NOW.
-        const prepared = (try C.beginLightOnDecodeGraph(self.context.cb, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() }, &funding_phase, self.lighton_cuda_execution_id, key.words[0..key.len], position_snapshot[0..positions.len], claimed.len, self.context.gpt_config.hidden_size, self.context.gpt_config.vocab_size, max_future, attention_count, self.context.gpt_config.num_hidden_layers - attention_count)) orelse return self.declineLightOnGraph(7);
+        const prepared = (try C.beginBoundedDecodeGraph(self.context.cb, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() }, &funding_phase, self.lighton_cuda_execution_id, key.words[0..key.len], position_snapshot[0..positions.len], claimed.len, self.context.gpt_config.hidden_size, self.context.gpt_config.vocab_size, max_future, attention_count, self.context.gpt_config.num_hidden_layers - attention_count)) orelse return self.declineLightOnGraph(7);
         // All graph tokens are consumed/published. Pure metadata can now retire
         // at this B even if later scalar/host reads park and rotate it again.
         try funding_phase.close(.{ .boundary = self.context.cleanupEpoch() });
@@ -1015,7 +1015,7 @@ pub const Executor = struct {
                     render.max_tokens = @max(render.max_tokens, item.kv_sequence_len);
                 }
             }
-            fn run(raw: *anyopaque, claim: *C.LightOnGraphClaim) !void {
+            fn run(raw: *anyopaque, claim: *C.BoundedDecodeClaim) !void {
                 const render: *@This() = @ptrCast(@alignCast(raw));
                 const pipeline = render.pipeline;
                 for (0..2) |step| {
@@ -1041,7 +1041,7 @@ pub const Executor = struct {
             }
         };
         var render = Render{ .pipeline = self, .items = items, .burst = &burst, .head = head };
-        if (graph.compute.lighton_decode_graph.phase == .replay) try render.advanceCpu();
+        if (graph.compute.bounded_decode_graph.phase == .replay) try render.advanceCpu();
         try self.context.cb.checkExecutionControl();
         try graph.run(&render, Render.run, self.context.cleanup_owner, self.context.cleanupEpoch());
         graph.noteKvTokens(storage, render.max_tokens);
@@ -1386,7 +1386,7 @@ pub const Executor = struct {
             const storage = work.decode_state.kv_storage orelse continue;
             const pool = storage.storage.config;
             const head_dim = config.headDim();
-            attention = attention or (@import("../ops/cuda/lighton_prefill_attention.zig").Shape{
+            attention = attention or (@import("../ops/cuda/paged_prefill_attention.zig").Shape{
                 .batch = 1,
                 .rows = item.query_sequence_len,
                 .tokens = item.kv_sequence_len,

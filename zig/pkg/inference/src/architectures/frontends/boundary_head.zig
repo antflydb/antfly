@@ -6,12 +6,12 @@
 //! parameters shared by all specializations of the loaded session.
 const std = @import("std");
 const ml = @import("ml").graph;
-const capture = @import("capture.zig");
-const program = @import("program.zig");
-const core = @import("../architectures/gliner/boundary_graph.zig");
-const candidates = @import("../architectures/gliner/boundary_graph_candidates.zig");
-const tasks = @import("../architectures/gliner/boundary_graph_tasks.zig");
-const Config = @import("../models/gliner_boundary.zig").Config;
+const capture = @import("../../execution/capture.zig");
+const program = @import("../../execution/program.zig");
+const core = @import("../gliner/boundary_graph.zig");
+const candidates = @import("../gliner/boundary_graph_candidates.zig");
+const tasks = @import("../gliner/boundary_graph_tasks.zig");
+const Config = @import("../../models/gliner_boundary.zig").Config;
 
 pub fn resolve(config: *Config) capture.Forward {
     return .{ .context = config, .fingerprint = 8, .author = author, .validate = validate, .output_abi = outputNames };
@@ -31,23 +31,19 @@ fn outputNames(raw: *anyopaque, inputs: []const capture.Input) ![]const []const 
     return &base;
 }
 
-fn find(inputs: []const capture.Input, name: []const u8) ?capture.Input {
-    for (inputs) |input| if (std.mem.eql(u8, input.tensor.name, name)) return input;
-    return null;
-}
+const find = capture.findInput;
 
 fn validate(raw: *anyopaque, inputs: []const capture.Input) !void {
     const config: *Config = @ptrCast(@alignCast(raw));
     try config.head.validate();
-    for (inputs, 0..) |input, index| {
-        _ = try capture.inputShape(input.tensor);
+    try capture.validateHostInputs(inputs);
+    for (inputs) |input| {
         switch (input.tensor.dtype) {
             .f32 => if (!input.tensor.isAlignedFor(f32)) return error.InvalidInputShape,
             .i32 => if (!input.tensor.isAlignedFor(i32)) return error.InvalidInputShape,
             .i64 => if (!input.tensor.isAlignedFor(i64)) return error.InvalidInputShape,
             else => return error.InvalidInputShape,
         }
-        for (inputs[0..index]) |previous| if (std.mem.eql(u8, previous.tensor.name, input.tensor.name)) return error.DuplicateInputs;
         if (!std.mem.startsWith(u8, input.tensor.name, "head.")) return error.UnexpectedModelProgramInput;
     }
     const source = (find(inputs, "head.text_states") orelse (find(inputs, "head.classification_states") orelse return error.MissingInputs)).tensor;
@@ -132,7 +128,7 @@ fn author(raw: *anyopaque, a: std.mem.Allocator, inputs: []const capture.Input) 
         } else if (find(inputs, "head.record.field_membership")) |membership| {
             const mode = (find(inputs, "head.record.mode") orelse return error.MissingInputs).tensor;
             if (mode.dtype != .i64 or !mode.isAlignedFor(i64) or mode.asInt64().len != 1 or mode.asInt64()[0] < 0 or mode.asInt64()[0] > 2 or membership.tensor.shape.len != 2 or membership.tensor.shape[0] <= 0 or membership.tensor.shape[1] <= 0) return error.InvalidInputShape;
-            const record_mode: @import("../pipelines/extraction_schema.zig").RecordMode = @fromBackingInt(@as(u2, @intCast(mode.asInt64()[0])));
+            const record_mode: @import("../../pipelines/extraction_schema.zig").RecordMode = @fromBackingInt(@as(u2, @intCast(mode.asInt64()[0])));
             const result = try tasks.buildRecordGroupDense(&g, .{
                 .mode = record_mode,
                 .fields = @intCast(membership.tensor.shape[0]),

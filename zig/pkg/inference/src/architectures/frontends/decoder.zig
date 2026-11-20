@@ -5,19 +5,19 @@
 //! last hidden row reaches the vocabulary projection. Prefix values and text
 //! IDs remain runtime operands; rotary layout is explicit control metadata.
 const std = @import("std");
-const capture = @import("capture.zig");
-const ops = @import("../ops/ops.zig");
-const Tensor = @import("../backends/tensor.zig").Tensor;
-const gpt = @import("../architectures/gpt.zig");
-const Config = @import("../models/gpt.zig").Config;
+const capture = @import("../../execution/capture.zig");
+const ops = @import("../../ops/ops.zig");
+const Tensor = @import("../../backends/tensor.zig").Tensor;
+const gpt = @import("../gpt.zig");
+const Config = @import("../../models/gpt.zig").Config;
 
 /// The query width and resident key extent are distinct in cached decode.
 /// Declares public logits independently of a generic session's hidden output.
-pub fn geometry(config: Config, rows: usize, keys: usize) !@import("../backends/session.zig").RunGeometry {
+pub fn geometry(config: Config, rows: usize, keys: usize) !@import("../../backends/session.zig").RunGeometry {
     if (rows == 0 or keys < rows or keys > config.max_position_embeddings) return error.InvalidInputShape;
     var width: usize = config.hidden_size;
     for (0..config.num_hidden_layers) |layer| width = @max(width, try std.math.mul(usize, config.num_attention_heads, config.effectiveHeadDimForLayer(layer)));
-    var workspace = try @import("stage_workspace.zig").attentionFfn(1, rows, keys, width, config.num_attention_heads, config.intermediate_size);
+    var workspace = try @import("../../execution/stage_workspace.zig").attentionFfn(1, rows, keys, width, config.num_attention_heads, config.intermediate_size);
     if (config.qwen35_has_linear_attention) {
         const matrix = try std.math.mul(usize, config.qwen35_linear_num_value_heads, try std.math.mul(usize, config.qwen35_linear_key_head_dim, config.qwen35_linear_value_head_dim));
         workspace = try std.math.add(usize, workspace, try std.math.mul(usize, matrix, 2 * @sizeOf(f32)));
@@ -42,6 +42,7 @@ const Inputs = struct {
 };
 
 fn parse(config: Config, inputs: []const capture.Input) !Inputs {
+    try capture.validateHostInputs(inputs);
     var ids: ?Tensor = null;
     var ple: ?Tensor = null;
     var prefix: ?Tensor = null;
@@ -49,7 +50,6 @@ fn parse(config: Config, inputs: []const capture.Input) !Inputs {
     var visibility: ?Tensor = null;
     var logits_row: ?Tensor = null;
     for (inputs) |input| {
-        _ = try capture.inputShape(input.tensor);
         const slot = if (std.mem.eql(u8, input.tensor.name, "input_ids")) &ids else if (std.mem.eql(u8, input.tensor.name, "ple_input_ids")) &ple else if (std.mem.eql(u8, input.tensor.name, "input_embeddings")) &prefix else if (std.mem.eql(u8, input.tensor.name, "position_ids")) &positions else if (std.mem.eql(u8, input.tensor.name, "attention_or_mask")) &visibility else if (std.mem.eql(u8, input.tensor.name, "logits_row")) &logits_row else return error.UnexpectedModelProgramInput;
         if (slot.* != null) return error.DuplicateInputs;
         slot.* = input.tensor;

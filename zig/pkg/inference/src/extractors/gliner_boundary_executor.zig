@@ -631,7 +631,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
             pipeline_options.independent_rows = .{ .errors = row_errors[0..prepared.samples.len], .context = &row_check, .check_fn = RowCheck.check };
         }
         var result = if (options.compiled_session) |session|
-            try @import("../execution/boundary_program_execution.zig").run(session, allocator, config, &prepared, schemas, pipeline_options, engine_options)
+            try @import("../pipelines/gliner_boundary_program.zig").run(session, allocator, config, &prepared, schemas, pipeline_options, engine_options)
         else switch (cb.kind()) {
             .native, .wasm => native: {
                 var encoded = try engine.encodeNative(cb, allocator, config, &prepared, engine_options);

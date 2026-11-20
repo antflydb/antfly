@@ -586,7 +586,7 @@ test "optional recurrent prefill checked SDK free retains exact quota and closin
     const domain = try @import("../../runtime/tier/admission_domain.zig").Domain.create();
     defer domain.release();
     var ctx = PrefillSdkTable136.makeContext();
-    const R = @import("lighton_prefill.zig").Module;
+    const R = @import("recurrent_prefill.zig").Module;
     var module: R = .{ .library = undefined, .workspace = PrefillSdkTable136.recurrentWorkspace, .execute = PrefillSdkTable136.recurrentExecute };
     defer module.clearWorkspaceWithCleanup(&ctx, .{ .outside_execution = true }) catch @panic("recurrent136 SDK owner leak");
     const request = @import("prefill_workspace.zig").Request{ .kind = .recurrent, .library_identity = 1, .geometry_hash = 2, .device_bytes = 64 };

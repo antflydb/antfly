@@ -4,11 +4,11 @@
 //! Companion projector stage. Metadata describes the architecture; named
 //! operands come from the loaded session's shared immutable inventory.
 const std = @import("std");
-const capture = @import("capture.zig");
-const Tensor = @import("../backends/tensor.zig").Tensor;
-const Store = @import("../models/tensor_store.zig").GgufStore;
-const projector = @import("../architectures/gemma4_projector.zig");
-const ops = @import("../ops/ops.zig");
+const capture = @import("../../execution/capture.zig");
+const Tensor = @import("../../backends/tensor.zig").Tensor;
+const Store = @import("../../models/tensor_store.zig").GgufStore;
+const projector = @import("../gemma4_projector.zig");
+const ops = @import("../../ops/ops.zig");
 
 pub fn image(metadata: *Store) capture.Forward {
     return .{ .context = metadata, .fingerprint = 6, .output_names = &.{"image_features"}, .input_info = &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ -1, 3, -1, -1 } }}, .validate = validateImage, .run = imageForward };
@@ -38,12 +38,7 @@ fn imageForward(raw: *anyopaque, cb: *const ops.ComputeBackend, a: std.mem.Alloc
     const source = try cb.fromFloat32Shape(input.asFloat32(), &.{ @intCast(batch), 3, @intCast(height), @intCast(width) });
     defer cb.free(source);
     const encoded = try projector.encodeNamedPixelTensorResident(cb, a, metadata, source, width, height, batch);
-    defer cb.free(encoded.tensor);
-    const shaped = try cb.primReshape(encoded.tensor, &.{ @intCast(batch), @intCast(encoded.tokens / batch), @intCast(layout.hidden) });
-    errdefer cb.free(shaped);
-    const outputs = try a.alloc(capture.Output, 1);
-    outputs[0] = .{ .name = "image_features", .value = shaped };
-    return outputs;
+    return capture.publishReshapedOutput(a, cb, encoded.tensor, "image_features", &.{ @intCast(batch), @intCast(encoded.tokens / batch), @intCast(layout.hidden) });
 }
 
 pub fn audio(metadata: *Store) capture.Forward {
@@ -52,10 +47,10 @@ pub fn audio(metadata: *Store) capture.Forward {
 
 fn audioInputs(metadata: *Store, inputs: []const capture.Input) !struct { features: Tensor, mask: Tensor } {
     if (inputs.len != 2) return error.UnexpectedModelProgramInput;
+    try capture.validateHostInputs(inputs);
     var features: ?Tensor = null;
     var mask: ?Tensor = null;
     for (inputs) |input| {
-        _ = try capture.inputShape(input.tensor);
         const slot = if (std.mem.eql(u8, input.tensor.name, "audio_values")) &features else if (std.mem.eql(u8, input.tensor.name, "audio_mask")) &mask else return error.UnexpectedModelProgramInput;
         if (slot.* != null) return error.DuplicateInputs;
         slot.* = input.tensor;
@@ -87,8 +82,5 @@ fn audioForward(raw: *anyopaque, cb: *const ops.ComputeBackend, a: std.mem.Alloc
     const input = try cb.fromFloat32Shape(source.features.asFloat32(), &.{ 1, @intCast(frames), @intCast(width) });
     defer cb.free(input);
     const encoded = try projector.encodeNamedAudioTensorResident(cb, a, metadata, input, mask, frames, width);
-    errdefer cb.free(encoded.embeddings);
-    const outputs = try a.alloc(capture.Output, 1);
-    outputs[0] = .{ .name = "audio_features", .value = encoded.embeddings };
-    return outputs;
+    return capture.publishOutput(a, cb, "audio_features", encoded.embeddings);
 }

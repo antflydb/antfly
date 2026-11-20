@@ -38,12 +38,14 @@ const BackendChoice = enum {
     native,
     metal,
     cuda,
+    xla,
 };
 
 const Options = struct {
     model_dir: []const u8,
     image_path: []const u8,
     backend: BackendChoice = .auto,
+    pjrt: @import("execution/pjrt_options.zig").Options = .{},
     prompt: ?[]const u8 = null,
     max_tokens: ?usize = null,
     cache_dtype: ?[]const u8 = null,
@@ -88,6 +90,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     session_manager.native_call_policy = .in_process;
     session_manager.process_termination_available = false;
     configureBackendPreference(&session_manager, opts.backend);
+    try opts.pjrt.applyPolicy(&session_manager);
+    if (opts.backend == .xla) try opts.pjrt.configure(&session_manager);
 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
@@ -183,11 +187,16 @@ fn runGenerativeReader(allocator: std.mem.Allocator, io: std.Io, opts: Options, 
     });
     defer node.deinit();
     try node.attachIo(io);
+    if (opts.backend == .xla) {
+        try opts.pjrt.configure(&node.session_manager);
+        try opts.pjrt.configure(&node.model_manager.session_manager);
+    }
     const backend: ?backends.BackendType = switch (opts.backend) {
         .auto => null,
         .native => .native,
         .metal => .metal,
         .cuda => .cuda,
+        .xla => .pjrt,
     };
     try node.warmModel(allocator, .{ .name = model_dir, .kind = .reader, .backend = backend });
     const load_ns = nowNs() - load_start_ns;
@@ -217,7 +226,11 @@ fn parseArgs(args: []const []const u8) !Options {
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--backend")) {
+        if (std.mem.startsWith(u8, arg, "--pjrt-")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            if (!try opts.pjrt.parse(arg, args[i])) return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--backend")) {
             i += 1;
             if (i >= args.len) return error.MissingBackendValue;
             opts.backend = parseBackendChoice(args[i]) orelse return error.InvalidBackend;
@@ -645,6 +658,7 @@ fn jsonEncodeString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
 }
 
 fn parseBackendChoice(value: []const u8) ?BackendChoice {
+    if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .xla;
     if (std.mem.eql(u8, value, "auto")) return .auto;
     if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
@@ -654,6 +668,7 @@ fn parseBackendChoice(value: []const u8) ?BackendChoice {
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     session_manager.preferred_backends = switch (choice) {
+        .xla => &.{backends.BackendType.pjrt},
         .auto => if (build_options.enable_cuda)
             &.{ backends.BackendType.cuda, backends.BackendType.native }
         else if (build_options.enable_metal)
@@ -668,6 +683,7 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
 
 fn ensureRequestedBackendAvailable(choice: BackendChoice) !void {
     switch (choice) {
+        .xla => if (!build_options.enable_pjrt) return error.PjrtNotEnabled,
         .auto, .native => return,
         .cuda => if (!build_options.enable_cuda) return error.BackendUnavailable,
         .metal => {
@@ -682,11 +698,12 @@ fn ensureRequestedBackendAvailable(choice: BackendChoice) !void {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference read <model-dir> <image-path> [--backend auto|native|metal|cuda] [--prompt <prompt>] [--max-tokens <n>] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--warmup-iters <n>] [--measure-iters <n>] [--json-timing <path>]
+        \\usage: antfly inference read <model-dir> <image-path> [--backend auto|native|metal|cuda|xla] [--prompt <prompt>] [--max-tokens <n>] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--warmup-iters <n>] [--measure-iters <n>] [--json-timing <path>]
         \\  Runs local document/image reading and prints a JSON response to stdout.
         \\  With --measure-iters, keeps the model loaded and prints warm request latency JSON. --json-timing also writes that JSON to a file.
         \\
     , .{});
+    print("{s}\n", .{@import("execution/pjrt_options.zig").usage});
 }
 
 test "parseArgs accepts backend, prompt, and max tokens" {
@@ -823,4 +840,13 @@ test "standalone reader discovery skips vocabulary-sized tokenizer files" {
     var bounded = @import("runtime/bounded_allocator.zig").BoundedAllocator{ .backing = allocator, .limit = 128 * 1024 };
     try std.testing.expect(try usesGenerativeReadExecutor(bounded.allocator(), path));
     try std.testing.expect(!bounded.denied);
+}
+
+test "task CLI accepts explicit PJRT device precision and memory policy" {
+    const options = try parseArgs(&.{ "model", "image.png", "--backend", "xla", "--pjrt-device", "cuda", "--pjrt-capacity-bytes", "1024", "--pjrt-device-bytes", "4096", "--pjrt-precision", "bf16" });
+    try std.testing.expectEqual(BackendChoice.xla, options.backend);
+    const policy = try options.pjrt.sessionOptions();
+    try std.testing.expect(policy.memory_policy.? == .cuda);
+    try std.testing.expectEqual(@as(usize, 1024), policy.memory_policy.?.cuda.capacity_bytes);
+    try std.testing.expectEqual(BackendChoice.xla, parseBackendChoice("pjrt").?);
 }

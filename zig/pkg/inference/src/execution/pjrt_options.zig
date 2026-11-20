@@ -6,6 +6,8 @@
 const std = @import("std");
 const factory = @import("../architectures/session_factory.zig");
 
+pub const usage = "PJRT: --backend xla [--pjrt-device cpu|cuda] [--pjrt-precision f32|bf16]. CUDA requires --pjrt-capacity-bytes N and --pjrt-device-bytes N; --pjrt-unified-memory true|false selects the admitted allocation policy.";
+
 pub const Options = struct {
     device: enum { cpu, cuda } = .cpu,
     unified_memory: bool = false,
@@ -57,10 +59,16 @@ pub const Options = struct {
     }
 
     pub fn configure(self: Options, manager: *@import("../backends/backends.zig").SessionManager) !void {
-        const options = try self.sessionOptions();
+        try self.applyPolicy(manager);
         manager.preferred_backends = &.{.pjrt};
         manager.required_backend = .pjrt;
         manager.required_backend_invalid = false;
+    }
+
+    /// Carry provider policy without changing native/Metal/CUDA placement. This
+    /// also lets an explicitly placed decoder share one task's PJRT policy.
+    pub fn applyPolicy(self: Options, manager: *@import("../backends/backends.zig").SessionManager) !void {
+        const options = try self.sessionOptions();
         manager.pjrt_memory_policy = options.memory_policy;
         manager.pjrt_precision = options.precision;
         manager.pjrt_gemm = options.gemm;
@@ -90,4 +98,19 @@ test "PJRT options require explicit feasible CUDA capacities and preserve select
     try std.testing.expectEqual(.vendor, result.gemm);
     try std.testing.expectEqual(.bf16, result.precision);
     try std.testing.expectError(error.InvalidPjrtBucket, value.parse("--pjrt-media-bucket-rows", "257"));
+}
+
+test "task PJRT policy is independent of placement and explicit selection cannot fall back" {
+    var manager = @import("../backends/backends.zig").SessionManager.init(std.testing.allocator);
+    manager.preferred_backends = &.{.native};
+    var options = Options{ .device = .cuda, .capacity_bytes = 1024, .device_bytes = 4096, .precision = .bf16 };
+    try options.applyPolicy(&manager);
+    try std.testing.expectEqual(@import("../backends/backends.zig").BackendType.native, manager.preferred_backends[0]);
+    try std.testing.expect(manager.pjrt_memory_policy.? == .cuda);
+    try std.testing.expectEqual(@as(usize, 1024), manager.pjrt_memory_policy.?.cuda.capacity_bytes);
+    try options.configure(&manager);
+    try std.testing.expectEqual(@import("../backends/backends.zig").BackendType.pjrt, manager.preferred_backends[0]);
+    try std.testing.expectEqual(@as(?@import("../backends/backends.zig").BackendType, .pjrt), manager.required_backend);
+    options.capacity_bytes = 8192;
+    try std.testing.expectError(error.InvalidPjrtMemoryPolicy, options.applyPolicy(&manager));
 }

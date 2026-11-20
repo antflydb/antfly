@@ -380,7 +380,7 @@ test {
         _ = @import("ops/cuda/encoder_multimodal.zig");
         // Keep focused boundary-kernel tests discoverable without relying on
         // an unrelated device test to instantiate the resident adapter.
-        _ = @import("ops/cuda/gliner25.zig");
+        _ = @import("ops/cuda/resident_structured.zig");
         _ = @import("ops/resident_program_ops.zig");
     }
     _ = @import("ml");

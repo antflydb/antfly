@@ -13,7 +13,7 @@ test "model program real EG2 media stages preserve native image composition and 
     const a = std.testing.allocator;
     const capture = @import("capture.zig");
     const projector = @import("../architectures/gemma4_projector.zig");
-    const media = @import("embedding_media_frontend.zig");
+    const media = @import("../architectures/frontends/embedding_media.zig");
     const ops = @import("../ops/ops.zig");
     const Source = struct {
         session: @import("../backends/backends.zig").Session,
@@ -485,7 +485,7 @@ test "model program public decoder prefix keeps new embeddings and token tails d
     var reference = try factory.getComputeBackend(native, a);
     defer reference.deinit();
     var config = factory.getGptConfig(native) orelse return error.WrongModelArchitecture;
-    const frontend = @import("decoder_frontend.zig").resolve(&config);
+    const frontend = @import("../architectures/frontends/decoder.zig").resolve(&config);
     const prefix_values = try a.alloc(f32, 2 * config.hidden_size);
     defer a.free(prefix_values);
     for (0..2) |round| {

@@ -83,6 +83,48 @@ buffer planning. They do not make the portable whole-model Tile prototype a
 production replacement for native tuned programs. Numerical sharing and schedule
 qualification remain separate from moving model ownership.
 
+## Shared stage adapters across supported models
+
+`architectures/frontends/` owns the semantic stage adapters for Whisper's
+encoder/decoder, dense Qwen-family decoding and prefix programs, companion and
+patch projectors, embedding media, structured extraction heads, and contextual
+marker classification for GLiNER-DECIDE. The loaded
+session publishes them through `execution/model_frontend.zig`; capture,
+`ModelProgram`, `Executable`, precision and physical buffers remain shared.
+`execution/capture.zig` owns common host ABI validation and single-output
+publication, including failure cleanup. Architecture adapters retain vocabulary,
+mask, rotary, configuration and checkpoint interpretation.
+
+GLiNER boundary task orchestration lives in
+`pipelines/gliner_boundary_program.zig`. Its DeBERTa/Ettin CUDA checkpoint-role
+and qualified geometry selectors live in `backends/structured_encoder_cuda.zig`.
+The reusable CUDA operation bindings are `resident_structured.zig`; numerical
+programs, deterministic profiles and F32/BF16 gates remain unchanged.
+
+LightOnOCR and Qwen hybrid execution use operation-named retained native owners:
+`bounded_decode_graph.zig`, `recurrent_prefill.zig`,
+`paged_prefill_attention.zig` and `recurrent_device_policy.zig`. These own their
+existing graph/SDK/storage lifetimes and admitted schedules. Historical device
+exports, optional-library ABI names and telemetry remain compatibility names.
+The migration does not apply Gemma4's shared-KV policy to other architectures.
+Whisper keeps encoder-decoder/cross-attention state; Qwen keeps its own dense or
+recurrent state, rotary geometry and cache contracts.
+
+Task CLIs for reading, transcription, extraction and decisions accept the same
+explicit PJRT CPU/CUDA precision and memory policy. A task requesting XLA loads
+a PJRT session and cannot silently use the native preference that compiled
+partitioned generation uses for its seed. Automatic native placement retains
+its existing order, and CUDA policy still requires explicit feasible device and
+capacity bounds.
+
+Explicit placement does not grant serving qualification. In particular, the
+GLiNER-DECIDE marker encoder/readout stages execute through PJRT, but the public
+span decision route still rejects PJRT until its artifact/backend qualification
+and managed admission contract are established. The CLI reports that rejection
+instead of silently substituting native execution. Managed GLiNER fixtures must
+declare their classifier contract; a raw upstream acquisition receipt is not an
+executable model manifest.
+
 ## Kernel ownership and validation
 
 `ops/kernel_descriptor.zig` describes operation semantics and requirements;

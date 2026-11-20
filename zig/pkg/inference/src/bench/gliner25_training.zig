@@ -43,7 +43,7 @@ fn emit(a: Allocator, out: *std.Io.Writer, value: anytype) !void {
     try out.flush();
 }
 pub fn sync(owner: *native.Trainer) !void {
-    try inference.native_compute.cuda.gliner25_api.synchronizeAndDrainDeferredDeviceFrees(owner.backend.cuda_backend.?);
+    try inference.native_compute.cuda.resident_structured_api.synchronizeAndDrainDeferredDeviceFrees(owner.backend.cuda_backend.?);
 }
 fn benchmarkName(name: []const u8) []const u8 {
     // Removing the published classifier's Dropout changes its Sequential

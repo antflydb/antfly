@@ -963,7 +963,7 @@ fn encodeGroup(
     head_limits: head.Limits,
     compiled_session: ?@import("../backends/session.zig").Session,
 ) !pipeline.WindowResult {
-    if (compiled_session) |session| return @import("../execution/boundary_program_execution.zig").runWindows(session, allocator, output_allocator, config, prepared, schemas, pipeline_options, engine_options);
+    if (compiled_session) |session| return @import("../pipelines/gliner_boundary_program.zig").runWindows(session, allocator, output_allocator, config, prepared, schemas, pipeline_options, engine_options);
     return switch (cb.kind()) {
         .native, .wasm => native: {
             var encoded = try engine.encodeNative(cb, allocator, config, prepared, engine_options);

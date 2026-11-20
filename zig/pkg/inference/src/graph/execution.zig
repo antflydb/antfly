@@ -61,7 +61,7 @@ pub const CapturedGraphOutside = struct {
 };
 
 pub const CapturedGraphPreparation = if (build_options.enable_cuda) struct {
-    const graph = @import("../ops/cuda/lighton_decode_graph.zig");
+    const graph = @import("../ops/cuda/bounded_decode_graph.zig");
     ptr: *anyopaque,
     prepare_fn: *const fn (*anyopaque, *const ops.ComputeBackend, graph.Descriptor, *graph.GraphPhase, CapturedGraphOutside, InferenceExecutionControl) anyerror!bool,
 } else struct {};

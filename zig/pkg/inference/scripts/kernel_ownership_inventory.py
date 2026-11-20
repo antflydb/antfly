@@ -61,9 +61,10 @@ def verify_shared_dependencies(root):
     core = root / "zig/lib/tile/src"
     cache = root / "zig/pkg/inference/src/ops/cuda/retained_execution_cache.zig"
     bindings = cache.with_name("encoder_multimodal.zig")
+    retained = [cache.with_name(name + ".zig") for name in ("bounded_decode_graph", "recurrent_prefill", "paged_prefill_attention", "recurrent_device_policy")]
     imports = re.compile(r'@import\(\s*"([^"\n]+)"\s*\)')
     checked = []
-    for source in sorted(core.rglob("*.zig")) + [f for f in (cache, bindings) if f.is_file()]:
+    for source in sorted(core.rglob("*.zig")) + [f for f in (cache, bindings, *retained) if f.is_file()]:
         # Imports inside line comments are documentation, not dependencies.
         text = re.sub(r"//[^\n]*", "", source.read_text())
         tile = source.is_relative_to(core)
@@ -83,9 +84,19 @@ def verify_shared_dependencies(root):
                 contracts = {package / "ops/kernel_geometry.zig", package / "graph/backend_contracts.zig"}
                 if source == bindings:
                     contracts.add(package / "ops/ops.zig")
+                if source in retained:
+                    contracts.update({package / "backends/session.zig", package / "test_error_logs.zig"})
                 if target not in contracts and not any(target.is_relative_to(directory) for directory in allowed):
                     raise ValueError("retained CUDA cache imports model/backend adapter: " + name)
         checked.append({"source": str(source.relative_to(root)), **fingerprint(source.read_bytes())})
+    # Generic execution publishes contracts; configuration/weight-name frontends
+    # belong to architectures, independently of CPU/CUDA/Metal/PJRT selection.
+    package = root / "zig/pkg/inference/src"
+    for source in sorted((package / "execution").glob("*frontend.zig")):
+        for name in imports.findall(re.sub(r"//[^\n]*", "", source.read_text())):
+            target = (source.parent / name).resolve()
+            if any(target.is_relative_to(package / folder) for folder in ("models", "architectures", "pipelines")):
+                raise ValueError("model frontend belongs in architecture adapter: " + str(source))
     return checked
 
 

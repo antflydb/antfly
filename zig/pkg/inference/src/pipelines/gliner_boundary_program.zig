@@ -12,10 +12,10 @@ const engine = @import("../architectures/gliner/boundary_engine.zig");
 const head = @import("../architectures/gliner/boundary_head.zig");
 const math = @import("../architectures/gliner/boundary_ops.zig");
 const tasks = @import("../architectures/gliner/boundary_tasks.zig");
-const processor = @import("../pipelines/gliner_boundary_processor.zig");
-const scoring = @import("../pipelines/gliner_boundary_scoring.zig");
-const pipeline = @import("../pipelines/gliner_boundary_pipeline.zig");
-const schema = @import("../pipelines/extraction_schema.zig");
+const processor = @import("gliner_boundary_processor.zig");
+const scoring = @import("gliner_boundary_scoring.zig");
+const pipeline = @import("gliner_boundary_pipeline.zig");
+const schema = @import("extraction_schema.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const A = std.mem.Allocator;
 

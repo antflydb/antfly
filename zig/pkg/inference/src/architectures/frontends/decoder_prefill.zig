@@ -5,11 +5,11 @@
 //! produce final hidden rows and explicit KV operands. GPU graphs retain only
 //! program-owned storage, never a request's paged KV addresses or sequence ID.
 const std = @import("std");
-const capture = @import("capture.zig");
-const ops = @import("../ops/ops.zig");
-const gpt = @import("../architectures/gpt.zig");
-const Config = @import("../models/gpt.zig").Config;
-const Scope = @import("forward_kv_reuse.zig").Scope;
+const capture = @import("../../execution/capture.zig");
+const ops = @import("../../ops/ops.zig");
+const gpt = @import("../gpt.zig");
+const Config = @import("../../models/gpt.zig").Config;
+const Scope = @import("../../execution/forward_kv_reuse.zig").Scope;
 const maximum_layers = 128;
 const output_names = names: {
     @setEvalBranchQuota(100000);
@@ -101,8 +101,8 @@ fn run(raw: *anyopaque, cb: *const ops.ComputeBackend, a: std.mem.Allocator, inp
 
 test "functional prefix exports KV and preserves ordinary decoder hidden values" {
     const a = std.testing.allocator;
-    const native = @import("../ops/native_compute.zig");
-    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const native = @import("../../ops/native_compute.zig");
+    const Tensor = @import("../../backends/tensor.zig").Tensor;
     var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
     defer weights.deinitOwned();
     const Item = struct { name: []const u8, shape: []const i64 };
@@ -159,7 +159,7 @@ test "functional prefix exports KV and preserves ordinary decoder hidden values"
     // A functional prefix must not form a host fallback island between native
     // CUDA operations. This validates the actual ordinary model trace too.
     for (traced.graph.nodes.items, 0..) |node, index| {
-        const decision = @import("../graph/cuda_capabilities.zig").decide(.{ .graph = &traced.graph, .node_id = @intCast(index), .op = node.op });
+        const decision = @import("../../graph/cuda_capabilities.zig").decide(.{ .graph = &traced.graph, .node_id = @intCast(index), .op = node.op });
         try std.testing.expect(decision.can_execute);
     }
     const outputs = try run(&spec, &cb, a, &declared);
@@ -191,7 +191,7 @@ test "functional prefix exports KV and preserves ordinary decoder hidden values"
     // hidden value rather than requesting another prefix execution.
     const raw_last = try cb.sliceRows2D(a, raw_outputs[0].value, 1, 1, config.hidden_size);
     defer cb.free(raw_last);
-    const token = (try @import("../backends/decoder_tail_runtime.zig").forwardGreedyTokenTensorFromFinalHidden(&cb, a, config, raw_last, .rms, 999)) orelse return error.UnexpectedTailDecline;
+    const token = (try @import("../../backends/decoder_tail_runtime.zig").forwardGreedyTokenTensorFromFinalHidden(&cb, a, config, raw_last, .rms, 999)) orelse return error.UnexpectedTailDecline;
     defer if (token.token_tensor) |value| cb.free(value);
     const lm_head = try cb.getWeight("lm_head.weight");
     defer cb.free(lm_head);
@@ -212,13 +212,13 @@ test "functional prefix exports KV and preserves ordinary decoder hidden values"
         if (index == best) continue;
         if (alternate == null or value > full[config.vocab_size + alternate.?]) alternate = index;
     }
-    const suppressed = (try @import("../backends/decoder_tail_runtime.zig").forwardGreedyTokenTensorFromFinalHidden(&cb, a, suppressed_config, raw_last, .rms, 999)) orelse return error.UnexpectedTailDecline;
+    const suppressed = (try @import("../../backends/decoder_tail_runtime.zig").forwardGreedyTokenTensorFromFinalHidden(&cb, a, suppressed_config, raw_last, .rms, 999)) orelse return error.UnexpectedTailDecline;
     defer if (suppressed.token_tensor) |value| cb.free(value);
     try std.testing.expectEqual(alternate.?, suppressed.token_id);
     const normalized = try gpt.greedyLastTokenTensorFromFinalHiddenRetain(&cb, a, suppressed_config, .{ .hidden = outputs[0].value, .total_rows = 2 });
     defer if (normalized.token_tensor) |value| cb.free(value);
     try std.testing.expectEqual(alternate.?, normalized.token_id);
-    const generic = (try @import("../backends/decoder_tail_runtime.zig").forwardGreedyFromFinalHidden(&cb, a, suppressed_config, raw_last, .rms, 999)) orelse return error.UnexpectedTailDecline;
+    const generic = (try @import("../../backends/decoder_tail_runtime.zig").forwardGreedyFromFinalHidden(&cb, a, suppressed_config, raw_last, .rms, 999)) orelse return error.UnexpectedTailDecline;
     try std.testing.expectEqual(@as(i64, @intCast(alternate.?)), generic);
     inline for (.{ false, true }) |positioned| {
         const current = try cb.fromFloat32Shape(input.asFloat32(), &.{ 2, 4 });

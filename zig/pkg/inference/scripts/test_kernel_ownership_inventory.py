@@ -74,6 +74,15 @@ class OwnershipInventoryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "imports model/backend adapter"):
             ownership.verify_shared_dependencies(self.root)
 
+    def test_generic_frontend_cannot_interpret_model_configuration(self):
+        source = self.package / "src/execution/new_frontend.zig"
+        source.parent.mkdir(parents=True)
+        source.write_text('const model = @import("../models/gpt.zig");\n')
+        with self.assertRaisesRegex(ValueError, "model frontend belongs in architecture adapter"):
+            ownership.verify_shared_dependencies(self.root)
+        source.write_text('const capture = @import("capture.zig");\n')
+        ownership.verify_shared_dependencies(self.root)
+
     def test_shared_program_owner_is_a_verified_build_input(self):
         self.inventory["tile_source_inputs"] = ["leaf.cuh"]
         self.inventory["native_regions"][0]["programs"] = [{"operation": "projection.dot", "source": "leaf.cuh", "scope": "phase", "precision": "F32", "schedule": "serial"}]

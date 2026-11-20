@@ -1881,7 +1881,7 @@ class RuntimeCacheTest(unittest.TestCase):
                     native_templates.append(self.own("zig/pkg/inference/src/ops/cuda/encoder_multimodal.zig"))
                     native_templates.extend(self.own("zig/pkg/inference/" + name) for name in (
                         "src/graph/cuda_execution_contract.zig",
-                        "src/ops/cuda/lighton_device_policy.zig",
+                        "src/ops/cuda/recurrent_device_policy.zig",
                         "src/ops/cuda/kernels/local_relative_attention_program.cuh",
                         "src/ops/cuda/kernels/source_scalar_programs.cuh",
                         "src/ops/cuda/kernels/score_softmax_bf16_program.cuh",

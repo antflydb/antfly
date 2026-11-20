@@ -54058,8 +54058,8 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                 if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
             }
             var result = Record(tokens_per_page){};
-            const captures_before = compute.lighton_decode_graph.captures;
-            const replays_before = compute.lighton_decode_graph.replays;
+            const captures_before = compute.bounded_decode_graph.captures;
+            const replays_before = compute.bounded_decode_graph.replays;
             // BEGIN OPTIONAL_DSO138_COUNTER_BEFORE
             const optional_dso_before = if (resident_text_prefix)
                 (if (compute.lighton_recurrent.bf16_prefill) |*value| value.calls else if (require_dso) return error.ActualOptionalPrefillLibraryMissing else 0)
@@ -54191,15 +54191,15 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                     for (1..collector.steps) |step| result.tokens[row][count + step] = collector.second[(step - 1) * 2 + row];
                     try std.testing.expectEqual(prefix_tokens + count + collector.steps - 1, state[row].total_tokens);
                 }
-                if (resident_text_prefix) std.debug.print("UNIFIED_READER_MIXED_CADENCE graph_enabled={d} count_before={d} remaining={d} steps={d} captures={d} replays={d} peer_done={d}\n", .{ @intFromBool(graph_enabled), count, tokens_per_page - count, collector.steps, compute.lighton_decode_graph.captures - captures_before, compute.lighton_decode_graph.replays - replays_before, @intFromBool(result.peer_replay) });
+                if (resident_text_prefix) std.debug.print("UNIFIED_READER_MIXED_CADENCE graph_enabled={d} count_before={d} remaining={d} steps={d} captures={d} replays={d} peer_done={d}\n", .{ @intFromBool(graph_enabled), count, tokens_per_page - count, collector.steps, compute.bounded_decode_graph.captures - captures_before, compute.bounded_decode_graph.replays - replays_before, @intFromBool(result.peer_replay) });
                 count += collector.steps;
                 // Exercise an actual public warm PAGE admission/refund after a
                 // NONEMPTY captured graph has already replayed, before more replay.
-                if (graph_enabled and !result.peer_replay and compute.lighton_decode_graph.replays > replays_before and count < tokens_per_page) {
-                    const graph = compute.lighton_decode_graph.graph;
-                    const arena = compute.lighton_decode_graph.arena.ptr;
-                    const metadata = compute.lighton_decode_graph.metadata.ptr;
-                    const plan = compute.lighton_decode_graph.plan;
+                if (graph_enabled and !result.peer_replay and compute.bounded_decode_graph.replays > replays_before and count < tokens_per_page) {
+                    const graph = compute.bounded_decode_graph.graph;
+                    const arena = compute.bounded_decode_graph.arena.ptr;
+                    const metadata = compute.bounded_decode_graph.metadata.ptr;
+                    const plan = compute.bounded_decode_graph.plan;
                     const workspace = C.peekLightOnGraphWorkspacePointer(cb) orelse return error.MissingActualGraphWorkspace;
                     probe.phase = .peer;
                     probe.row = null;
@@ -54216,19 +54216,19 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                     peer_page.release(&peer_pool);
                     peer_owned = false;
                     try std.testing.expect(graph != null and arena != 0 and metadata != 0 and plan != null);
-                    try std.testing.expectEqual(graph, compute.lighton_decode_graph.graph);
-                    try std.testing.expectEqual(arena, compute.lighton_decode_graph.arena.ptr);
-                    try std.testing.expectEqual(metadata, compute.lighton_decode_graph.metadata.ptr);
-                    try std.testing.expectEqual(plan, compute.lighton_decode_graph.plan);
+                    try std.testing.expectEqual(graph, compute.bounded_decode_graph.graph);
+                    try std.testing.expectEqual(arena, compute.bounded_decode_graph.arena.ptr);
+                    try std.testing.expectEqual(metadata, compute.bounded_decode_graph.metadata.ptr);
+                    try std.testing.expectEqual(plan, compute.bounded_decode_graph.plan);
                     try std.testing.expectEqual(workspace, C.peekLightOnGraphWorkspacePointer(cb).?);
-                    replay_before_peer = compute.lighton_decode_graph.replays;
+                    replay_before_peer = compute.bounded_decode_graph.replays;
                     if (resident_text_prefix) std.debug.print("UNIFIED_READER_MIXED_PEER count={d} remaining={d} replay_before_peer={d}\n", .{ count, tokens_per_page - count, replay_before_peer });
                     result.peer_replay = true;
                 }
                 if (probe.failure) |err| return failure(err, graph_enabled, "supplier");
             }
-            result.captures = compute.lighton_decode_graph.captures - captures_before;
-            result.replays = compute.lighton_decode_graph.replays - replays_before;
+            result.captures = compute.bounded_decode_graph.captures - captures_before;
+            result.replays = compute.bounded_decode_graph.replays - replays_before;
             result.reentries = probe.numerical;
             result.worker_reentries = probe.worker_reentries;
             // BEGIN OPTIONAL_DSO138_COUNTER_AFTER
@@ -54243,9 +54243,9 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
             }
             // END OPTIONAL_DSO138_COUNTER_AFTER
             if (graph_enabled) {
-                std.debug.print("UNIFIED_READER_H1024 captures={d} replays={d} attempts={d} declines={any} phase={s} reentries={d}\n", .{ result.captures, result.replays, executor.lighton_graph_attempts, executor.lighton_graph_declines, @tagName(compute.lighton_decode_graph.phase), result.reentries });
+                std.debug.print("UNIFIED_READER_H1024 captures={d} replays={d} attempts={d} declines={any} phase={s} reentries={d}\n", .{ result.captures, result.replays, executor.lighton_graph_attempts, executor.lighton_graph_declines, @tagName(compute.bounded_decode_graph.phase), result.reentries });
                 try std.testing.expect(result.captures > 0 and result.replays > 0 and result.peer_replay);
-                try std.testing.expect(compute.lighton_decode_graph.replays > replay_before_peer);
+                try std.testing.expect(compute.bounded_decode_graph.replays > replay_before_peer);
                 try std.testing.expect(result.reentries > 0 and result.worker_reentries > 0);
             }
             // Foreground cleanup invalidation is intentional only HERE, after

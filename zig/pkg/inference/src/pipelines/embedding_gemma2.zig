@@ -903,7 +903,7 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
 /// Owned processor operands. Repeated video slots borrow an earlier owner;
 /// their source indices are part of the compiled program's specialization.
 const CompiledMedia = struct {
-    kind: @import("../execution/embedding_media_frontend.zig").Kind,
+    kind: @import("../architectures/frontends/embedding_media.zig").Kind,
     values: []f32,
     shape: [4]i64,
     rank: usize,

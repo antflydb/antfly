@@ -26,7 +26,7 @@ const Quota = @import("cache_quota.zig").Quota;
 pub const Module = struct {
     metadata_mutex: std.atomic.Mutex = .unlocked,
     library: std.DynLib,
-    attention: ?@import("lighton_prefill_attention.zig").Module = null,
+    attention: ?@import("paged_prefill_attention.zig").Module = null,
     workspace: *const fn (*const anyopaque) callconv(.c) usize,
     execute: *const fn (*const anyopaque, driver.CUdeviceptr, usize, c_int, driver.CUstream) callconv(.c) c_int,
     geometry_workspace: ?*const fn (*const @import("prefill_geometry.zig").Geometry) callconv(.c) usize = null,
@@ -71,7 +71,7 @@ pub const Module = struct {
         return .{
             .library = library,
             .geometry_workspace = geometry_workspace,
-            .attention = try @import("lighton_prefill_attention.zig").Module.init(&library),
+            .attention = try @import("paged_prefill_attention.zig").Module.init(&library),
             .workspace = library.lookup(*const fn (*const anyopaque) callconv(.c) usize, "antfly_lighton_prefill_workspace") orelse return error.LightOnPrefillAbiMismatch,
             .execute = library.lookup(*const fn (*const anyopaque, driver.CUdeviceptr, usize, c_int, driver.CUstream) callconv(.c) c_int, "antfly_lighton_prefill_execute") orelse return error.LightOnPrefillAbiMismatch,
         };

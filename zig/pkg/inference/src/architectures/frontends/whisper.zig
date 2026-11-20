@@ -4,11 +4,11 @@
 //! Configuration and typed stage adapters; all arithmetic stays in the ordinary
 //! architecture forward and the shared semantic graph/backend implementations.
 const std = @import("std");
-const capture = @import("capture.zig");
-const frontend = @import("model_frontend.zig");
-const whisper = @import("../architectures/whisper.zig");
-const ops = @import("../ops/ops.zig");
-const Tensor = @import("../backends/tensor.zig").Tensor;
+const capture = @import("../../execution/capture.zig");
+const frontend = @import("../../execution/model_frontend.zig");
+const whisper = @import("../whisper.zig");
+const ops = @import("../../ops/ops.zig");
+const Tensor = @import("../../backends/tensor.zig").Tensor;
 
 pub fn resolve(config: *whisper.Config, stage: frontend.Stage) ?capture.Forward {
     return switch (stage) {
@@ -18,25 +18,12 @@ pub fn resolve(config: *whisper.Config, stage: frontend.Stage) ?capture.Forward 
     };
 }
 
-fn get(inputs: []const capture.Input, name: []const u8) !?Tensor {
-    var found: ?Tensor = null;
-    for (inputs) |input| if (std.mem.eql(u8, name, input.tensor.name)) {
-        if (found != null) return error.DuplicateInputs;
-        found = input.tensor;
-    };
-    return found;
-}
+const get = capture.findUniqueTensor;
 fn check(config: whisper.Config) !void {
     if (config.d_model == 0 or config.num_mel_bins == 0 or config.vocab_size == 0 or config.encoder_attention_heads == 0 or config.decoder_attention_heads == 0) return error.InvalidModelConfig;
     if (config.d_model % config.encoder_attention_heads != 0 or config.d_model % config.decoder_attention_heads != 0) return error.InvalidModelConfig;
 }
-fn typed(value: Tensor, dtype: @import("../backends/tensor.zig").DType, rank: usize) !void {
-    _ = try capture.inputShape(value);
-    if (value.dtype != dtype or value.shape.len != rank) return error.InvalidInputShape;
-    for (value.shape) |dim| if (dim <= 0 or dim > std.math.maxInt(i32)) return error.InvalidInputShape;
-    if (dtype == .i64 and !value.isAlignedFor(i64)) return error.InvalidInputShape;
-    if (dtype == .f32 and !value.isAlignedFor(f32)) return error.InvalidInputShape;
-}
+const typed = capture.requireHostTensor;
 fn validateEncoder(ptr: *anyopaque, inputs: []const capture.Input) anyerror!void {
     const cfg: *const whisper.Config = @ptrCast(@alignCast(ptr));
     try check(cfg.*);
@@ -66,14 +53,7 @@ fn validateDecoder(ptr: *anyopaque, inputs: []const capture.Input) anyerror!void
         for (mask.asInt64()) |value| if (value != 0 and value != 1) return error.InvalidAttentionMask;
     }
 }
-fn output(allocator: std.mem.Allocator, cb: *const ops.ComputeBackend, value: ops.CT, name: []const u8, shape: []const i64) ![]capture.Output {
-    defer cb.free(value);
-    const shaped = try cb.primReshape(value, shape);
-    errdefer cb.free(shaped);
-    const outputs = try allocator.alloc(capture.Output, 1);
-    outputs[0] = .{ .name = name, .value = shaped };
-    return outputs;
-}
+const output = capture.publishReshapedOutput;
 fn encoder(ptr: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const capture.Input) anyerror![]capture.Output {
     try validateEncoder(ptr, inputs);
     const cfg: *const whisper.Config = @ptrCast(@alignCast(ptr));
@@ -110,15 +90,15 @@ test "model program Whisper encoder and decoder execute through PJRT across cach
         else => return err,
     };
     defer client.deinit();
-    const fixture = @import("testing/incremental_encoder_decoder.zig");
+    const fixture = @import("../../execution/testing/incremental_encoder_decoder.zig");
     const Source = struct {
-        weights: @import("../ops/native_compute.zig").WeightStore,
+        weights: @import("../../ops/native_compute.zig").WeightStore,
         fn create(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!ops.ComputeBackend {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return @import("../backends/compute_factory.zig").createNative(allocator, &self.weights, null, null, .{});
+            return @import("../../backends/compute_factory.zig").createNative(allocator, &self.weights, null, null, .{});
         }
         fn import(_: *anyopaque, cb: *const ops.ComputeBackend, value: *const Tensor, _: std.mem.Allocator) anyerror!ops.CT {
-            const native: *@import("../ops/native_compute.zig").NativeCompute = @ptrCast(@alignCast(cb.ptr));
+            const native: *@import("../../ops/native_compute.zig").NativeCompute = @ptrCast(@alignCast(cb.ptr));
             return native.importHostTensor(value);
         }
     };
@@ -128,9 +108,9 @@ test "model program Whisper encoder and decoder execute through PJRT across cach
     var cfg = fixture.config;
     var reference = try Source.create(&source, a);
     defer reference.deinit();
-    var cache = @import("captured_forward.zig").Cache{};
+    var cache = @import("../../execution/captured_forward.zig").Cache{};
     defer cache.deinit(a);
-    const provider = @import("captured_forward.zig").Provider{ .context = &source, .create = Source.create, .import = Source.import, .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = @ptrCast(&client) } };
+    const provider = @import("../../execution/captured_forward.zig").Provider{ .context = &source, .create = Source.create, .import = Source.import, .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = @ptrCast(&client) } };
     var mel = try Tensor.initFloat32(a, "input_features", &.{ 1, 2, 4 }, &.{ 0.2, 0.5, -0.1, 0.4, 0.3, -0.2, 0.7, 0.1 });
     defer mel.deinit();
     var ids = try Tensor.initInt64(a, "decoder_input_ids", &.{ 1, 2 }, &.{ 0, 1 });

@@ -35,8 +35,8 @@ pub const Device = struct {
         return self.major == 12 and self.minor == 1;
     }
 
-    pub fn automatic(self: Device, lighton: bool, cublaslt: bool, requested: ?bool) bool {
-        return (requested orelse true) and lighton and cublaslt and self.portableKernels();
+    pub fn automatic(self: Device, model_supported: bool, cublaslt: bool, requested: ?bool) bool {
+        return (requested orelse true) and model_supported and cublaslt and self.portableKernels();
     }
 };
 

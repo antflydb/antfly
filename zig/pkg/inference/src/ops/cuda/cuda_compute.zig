@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const structured_encoder_binding = @import("../../backends/structured_encoder_cuda.zig");
 const cuda_enabled = @import("build_options").enable_cuda;
 const ops = @import("../ops.zig");
 const kernel_geometry = ops.kernel_descriptor.kernel_geometry;
@@ -71,7 +72,7 @@ const platform = @import("antfly_platform");
 const linalg = @import("inference_linalg");
 
 const CT = ops.CT;
-const gliner25 = @import("gliner25.zig");
+const resident_structured = @import("resident_structured.zig");
 
 pub const CudaTensor = struct {
     /// Optional cold receiver payload. Header/shape allocator stays synchronous;
@@ -2429,7 +2430,7 @@ pub const CudaCompute = struct {
         }
         fn beginGeneration(self: *CapturedCacheRoots, compute: *CudaCompute, current: @import("../../execution/cleanup_context.zig").Context) !void {
             if (current.outside_execution or current.boundary == null) return error.MissingCurrentCleanupEpoch;
-            const graph = &compute.lighton_decode_graph;
+            const graph = &compute.bounded_decode_graph;
             if (self.epoch != graph.epoch_id or self.generation != graph.invalidations) {
                 // A changed generation is published by clear/reset only
                 // after its existing checked wait and graph destruction.
@@ -2440,7 +2441,7 @@ pub const CudaCompute = struct {
             graph.captured_roots_identity = self.identity();
         }
         fn selected(self: *CapturedCacheRoots, compute: *CudaCompute, key: []const u8, tensor: *CudaTensor) !void {
-            const graph = &compute.lighton_decode_graph;
+            const graph = &compute.bounded_decode_graph;
             if (!graph.active) return;
             if (graph.captured_roots_identity != self.identity() or self.epoch != graph.epoch_id or self.generation != graph.invalidations) return error.CapturedCacheOwnerChanged;
             const bytes = blk: {
@@ -2470,17 +2471,17 @@ pub const CudaCompute = struct {
         /// A historical graph authored without this explicit owner cannot park.
         pub fn prepareToPark(self: *CapturedCacheRoots, cb: *const ops.ComputeBackend, expected: *CudaCompute) !void {
             if (!acceptsPhysicalImplementation(cb.vtable) or cb.ptr != @as(*anyopaque, @ptrCast(expected)) or expected.captured_cache_roots != self) return error.CapturedCacheOwnerChanged;
-            if (expected.execution_scope != null or expected.lighton_decode_graph.active or expected.ctx.debug_graph_capture_active or expected.debug_cuda_graph_capture_active) return error.ReaderEpochBackendBusy;
+            if (expected.execution_scope != null or expected.bounded_decode_graph.active or expected.ctx.debug_graph_capture_active or expected.debug_cuda_graph_capture_active) return error.ReaderEpochBackendBusy;
             if (expected.ctx.driver.fns.cuStreamIsCapturing == null or try expected.ctx.streamCaptureActive()) return error.ReaderEpochBackendBusy;
             try expected.ctx.synchronize();
-            const graph = &expected.lighton_decode_graph;
+            const graph = &expected.bounded_decode_graph;
             if (graph.graph != null and (graph.captured_roots_identity != self.identity() or self.epoch != graph.epoch_id or self.generation != graph.invalidations)) return error.UnownedCapturedProgram;
         }
         pub fn finishAfterGraph(self: *CapturedCacheRoots, cb: *const ops.ComputeBackend, expected: *CudaCompute, current: @import("../../execution/cleanup_context.zig").Context) !void {
             if (!acceptsPhysicalImplementation(cb.vtable) or cb.ptr != @as(*anyopaque, @ptrCast(expected))) return error.UnsupportedReaderEpochBackend;
             if (current.outside_execution or current.boundary == null) return error.MissingCurrentCleanupEpoch;
             if (expected.captured_cache_roots == self) return error.CapturedCacheOwnerStillBound;
-            const graph = &expected.lighton_decode_graph;
+            const graph = &expected.bounded_decode_graph;
             if (graph.graph != null and graph.captured_roots_identity == self.identity()) return error.CapturedProgramStillLive;
             try expected.ctx.synchronize();
             self.releaseRoots(expected, current);
@@ -2491,7 +2492,7 @@ pub const CudaCompute = struct {
     /// allocated vendor workspace. The epoch holds the model, roots, and stable
     /// RunBudget through restoration; no old cleanup authority is captured.
     pub const ReaderEpochPark = struct {
-        graph: @import("lighton_decode_graph.zig").Module = .{},
+        graph: @import("bounded_decode_graph.zig").Module = .{},
         workspace: scratch_mod.DeviceScratch = .{},
         budget: ?*run_memory.RunBudget = null,
         policy: @import("runtime_policy.zig").Policy = .{},
@@ -2507,11 +2508,11 @@ pub const CudaCompute = struct {
             try roots.prepareToPark(cb, expected);
             // No active claim may refer to the module's final address. Step
             // exclusion remains owned, and checked completion above is final.
-            if (!expected.lighton_decode_graph.mutex.tryLock()) return error.ReaderEpochBackendBusy;
-            expected.lighton_decode_graph.mutex.unlock();
+            if (!expected.bounded_decode_graph.mutex.tryLock()) return error.ReaderEpochBackendBusy;
+            expected.bounded_decode_graph.mutex.unlock();
             try roots.unbind(cb, expected);
-            self.* = .{ .graph = expected.lighton_decode_graph, .workspace = expected.cublaslt_workspace_scratch, .budget = expected.run_budget, .policy = expected.runtime_policy, .compute = expected, .roots = roots };
-            expected.lighton_decode_graph = .{};
+            self.* = .{ .graph = expected.bounded_decode_graph, .workspace = expected.cublaslt_workspace_scratch, .budget = expected.run_budget, .policy = expected.runtime_policy, .compute = expected, .roots = roots };
+            expected.bounded_decode_graph = .{};
             expected.cublaslt_workspace_scratch = .{};
             expected.configureRunBudget(null);
         }
@@ -2521,7 +2522,7 @@ pub const CudaCompute = struct {
         pub fn prepareRestore(self: *ReaderEpochPark, cb: *const ops.ComputeBackend, expected: *CudaCompute) !void {
             if (self.compute != expected or self.budget == null or self.roots == null) return error.ForeignReaderEpochPark;
             if (cb.vtable != &scoped_run_budget_vtable or cb.ptr != @as(*anyopaque, @ptrCast(expected))) return error.UnsupportedReaderEpochBackend;
-            if (expected.run_budget != null or expected.captured_cache_roots != null or expected.execution_scope != null or expected.lighton_decode_graph.active or expected.lighton_decode_graph.graph != null or expected.lighton_decode_graph.plan != null or expected.debug_cuda_graph_capture_active or expected.ctx.debug_graph_capture_active or expected.audio_execution_active or expected.lighton_burst_readback.busy) return error.ReaderEpochBackendBusy;
+            if (expected.run_budget != null or expected.captured_cache_roots != null or expected.execution_scope != null or expected.bounded_decode_graph.active or expected.bounded_decode_graph.graph != null or expected.bounded_decode_graph.plan != null or expected.debug_cuda_graph_capture_active or expected.ctx.debug_graph_capture_active or expected.audio_execution_active or expected.lighton_burst_readback.busy) return error.ReaderEpochBackendBusy;
             if (expected.ctx.driver.fns.cuStreamIsCapturing == null or try expected.ctx.streamCaptureActive()) return error.ReaderEpochBackendBusy;
             try expected.ctx.synchronize();
             // Peer scratch belongs to its completed request. Preserve the old
@@ -2542,8 +2543,8 @@ pub const CudaCompute = struct {
         pub fn restore(self: *ReaderEpochPark, cb: *const ops.ComputeBackend, expected: *CudaCompute) !void {
             if (self.compute != expected or !self.restore_prepared or self.roots == null or self.budget == null) return error.ForeignReaderEpochPark;
             if (cb.vtable != &scoped_run_budget_vtable or cb.ptr != @as(*anyopaque, @ptrCast(expected))) return error.UnsupportedReaderEpochBackend;
-            if (expected.run_budget != self.budget or expected.captured_cache_roots != null or expected.execution_scope != null or expected.lighton_decode_graph.graph != null or expected.lighton_decode_graph.plan != null or expected.cublaslt_workspace_scratch.buffer.ptr != 0) return error.ReaderEpochBackendBusy;
-            expected.lighton_decode_graph = self.graph;
+            if (expected.run_budget != self.budget or expected.captured_cache_roots != null or expected.execution_scope != null or expected.bounded_decode_graph.graph != null or expected.bounded_decode_graph.plan != null or expected.cublaslt_workspace_scratch.buffer.ptr != 0) return error.ReaderEpochBackendBusy;
+            expected.bounded_decode_graph = self.graph;
             expected.cublaslt_workspace_scratch = self.workspace;
             expected.captured_cache_roots = self.roots;
             self.* = .{};
@@ -3059,7 +3060,7 @@ pub const CudaCompute = struct {
         if (self.capability_profile != .lightonocr3) return null;
         const prefill = if (self.lighton_recurrent.bf16_prefill) |*value| value else return null;
         const attention = if (prefill.attention) |*value| value else return null;
-        const A = @import("lighton_prefill_attention.zig");
+        const A = @import("paged_prefill_attention.zig");
         return .{ .kind = .attention, .library_identity = @intFromPtr(attention.make_plan), .geometry_hash = 0, .device_bytes = A.device_bytes, .host_bytes = A.host_bytes + A.host_plan_bytes };
     }
     /// Fixed library scratch is optional independently charged backing. The
@@ -3074,7 +3075,7 @@ pub const CudaCompute = struct {
         if (!((cfg.num_attention_heads == 8 and cfg.effectiveKVHeads() == 2) or (cfg.num_attention_heads == 16 and cfg.effectiveKVHeads() == 4)) or cfg.headDim() != 256) return;
         try builder.add(.{ .external_prefill = request });
     }
-    fn externalPrefillRawSnapshot(self: *const CudaCompute, request: @import("prefill_workspace.zig").Request) @import("lighton_prefill.zig").Module.QuotaSnapshot {
+    fn externalPrefillRawSnapshot(self: *const CudaCompute, request: @import("prefill_workspace.zig").Request) @import("recurrent_prefill.zig").Module.QuotaSnapshot {
         const owner = &self.lighton_recurrent.bf16_prefill.?;
         if (request.kind == .recurrent_existing) return owner.quotaSnapshot();
         const value = owner.attention.?.storageSnapshot();
@@ -3691,7 +3692,7 @@ pub const CudaCompute = struct {
         return self.lightOnGraphDecision() == .enabled;
     }
 
-    fn lightOnGraphDecision(self: *const CudaCompute) @import("lighton_device_policy.zig").GraphDecision {
+    fn lightOnGraphDecision(self: *const CudaCompute) @import("recurrent_device_policy.zig").GraphDecision {
         if (!self.lighton_decode_graph_enabled) return .operator_disabled;
         if (self.capability_profile != .lightonocr3) return .model_unsupported;
         if (self.ctx.info.compute_major < 8) return .compute_unsupported;
@@ -3714,7 +3715,7 @@ pub const CudaCompute = struct {
         if (cb.kind() != .cuda) return;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (self.capability_profile != .lightonocr3 or self.ctx.debug_graph_capture_active or self.debug_cuda_graph_capture_active) return;
-        if (self.lighton_decode_graph.graph != null) return error.InvalidExecutionPlan;
+        if (self.bounded_decode_graph.graph != null) return error.InvalidExecutionPlan;
         if (self.cublaslt) |*blas| _ = try blas.reserveTensorCorePlanSlots(&self.ctx, 64);
     }
 
@@ -3734,7 +3735,7 @@ pub const CudaCompute = struct {
             return endLightOnDecodeGraphEpochWithCleanup(cb, epoch, scoped);
         }
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        const owner = &self.lighton_decode_graph;
+        const owner = &self.bounded_decode_graph;
         if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
         defer owner.mutex.unlock();
         if (owner.epoch_id != epoch) return;
@@ -3744,7 +3745,7 @@ pub const CudaCompute = struct {
     pub fn endLightOnDecodeGraphEpoch(cb: *const ops.ComputeBackend, epoch: u64) void {
         if (!acceptsPhysicalImplementation(cb.vtable) or epoch == 0) return;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        const owner = &self.lighton_decode_graph;
+        const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         defer owner.mutex.unlock();
         if (owner.epoch_id != epoch) return;
@@ -3754,14 +3755,14 @@ pub const CudaCompute = struct {
     pub fn invalidateLightOnDecodeGraph(cb: *const ops.ComputeBackend) void {
         if (!acceptsPhysicalImplementation(cb.vtable)) return;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        if (self.lighton_decode_graph_enabled) self.lighton_decode_graph.invalidate(&self.ctx);
+        if (self.lighton_decode_graph_enabled) self.bounded_decode_graph.invalidate(&self.ctx);
     }
     pub fn lightOnGraphWeightPointer(cb: *const ops.ComputeBackend, weight: CT) ?driver_mod.CUdeviceptr {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const tensor = tensorFromCt(weight);
         if (tensor.dtype != .bf16 or tensor.quant_type != null or !isImmutableResidentWeight(self, tensor)) {
-            if (self.lighton_decode_graph.weight_declines_logged < 2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
-                self.lighton_decode_graph.weight_declines_logged += 1;
+            if (self.bounded_decode_graph.weight_declines_logged < 2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+                self.bounded_decode_graph.weight_declines_logged += 1;
                 std.debug.print("LIGHTONOCR3 cuda_model_graph_weight_decline bf16={d} quantized={d} training={d} owned_by_tensor={d} exact_resident={d}\n", .{ @intFromBool(tensor.dtype == .bf16), @intFromBool(tensor.quant_type != null), @intFromBool(tensor.strict_resident_training), @intFromBool(tensor.owned_by_tensor), @intFromBool(residentTensorForSlot(self, tensor) == tensor) });
             }
             return null;
@@ -3785,8 +3786,8 @@ pub const CudaCompute = struct {
         const eligible = state.ctx == &self.ctx and state.initialized and !state.failed and
             state.release_context == @as(*anyopaque, @ptrCast(self)) and state.release_buffer == &recycleLightOnStateBuffer and
             state.recurrent.ptr != 0 and state.history[0].ptr != 0 and state.history[1].ptr != 0;
-        if (!eligible and self.lighton_decode_graph.state_declines_logged == 0 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
-            self.lighton_decode_graph.state_declines_logged += 1;
+        if (!eligible and self.bounded_decode_graph.state_declines_logged == 0 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+            self.bounded_decode_graph.state_declines_logged += 1;
             std.debug.print("LIGHTONOCR3 cuda_model_graph_state_decline ctx={d} initialized={d} failed={d} release_owner={d} release_callback={d} buffers={d}\n", .{ @intFromBool(state.ctx == &self.ctx), @intFromBool(state.initialized), @intFromBool(state.failed), @intFromBool(state.release_context == @as(*anyopaque, @ptrCast(self))), @intFromBool(state.release_buffer == &recycleLightOnStateBuffer), @intFromBool(state.recurrent.ptr != 0 and state.history[0].ptr != 0 and state.history[1].ptr != 0) });
         }
         return eligible;
@@ -3812,16 +3813,16 @@ pub const CudaCompute = struct {
         }
         return count;
     }
-    pub const LightOnGraphClaim = struct {
+    pub const BoundedDecodeClaim = struct {
         compute: *CudaCompute,
         future_tokens: usize,
         pub fn deinit(self: *@This()) void {
-            self.compute.lighton_decode_graph.active = false;
+            self.compute.bounded_decode_graph.active = false;
             self.compute.execution_scope = null;
-            self.compute.lighton_decode_graph.mutex.unlock();
+            self.compute.bounded_decode_graph.mutex.unlock();
         }
         pub fn burst(self: *@This(), embedding: CT, vocab: usize) !LightOnTokenBurst {
-            const owner = &self.compute.lighton_decode_graph;
+            const owner = &self.compute.bounded_decode_graph;
             if (vocab != owner.vocab) return error.InvalidShape;
             const shape = try allocShape2(self.compute.allocator, 2, owner.rows);
             errdefer self.compute.allocator.free(shape);
@@ -3830,7 +3831,7 @@ pub const CudaCompute = struct {
             return .{ .owner = self.compute, .bank = bank, .embedding_weight = embedding, .suppress = .{}, .suppress_count = 0, .rows = owner.rows, .steps = 2, .hidden = owner.hidden, .vocab = vocab };
         }
         pub fn projectHead(self: *@This(), cb: *const ops.ComputeBackend, input_ct: CT, weight: CT) !CT {
-            const owner = &self.compute.lighton_decode_graph;
+            const owner = &self.compute.bounded_decode_graph;
             std.debug.assert(cb.ptr == @as(*anyopaque, @ptrCast(self.compute)));
             if (owner.head.ptr == 0 or self.compute.execution_scope == null)
                 return cb.linearNoBias(input_ct, weight, owner.rows, owner.hidden, owner.vocab);
@@ -3848,14 +3849,14 @@ pub const CudaCompute = struct {
             return output;
         }
         pub fn setInput(self: *@This(), input_ct: CT) !void {
-            const owner = &self.compute.lighton_decode_graph;
+            const owner = &self.compute.bounded_decode_graph;
             const source = tensorFromCt(input_ct);
             try ensureF32(source);
             try ensureCount(source, owner.rows * owner.hidden);
             try copyFromDeviceTracked(self.compute, owner.input(), source.buffer, source.elem_count * 4);
         }
         pub fn input(self: *@This()) !CT {
-            const owner = &self.compute.lighton_decode_graph;
+            const owner = &self.compute.bounded_decode_graph;
             const shape = try allocShape2(self.compute.allocator, owner.rows, owner.hidden);
             errdefer self.compute.allocator.free(shape);
             const tensor = try createTensor(self.compute, owner.input(), shape, owner.rows * owner.hidden);
@@ -3863,15 +3864,15 @@ pub const CudaCompute = struct {
             return tensor;
         }
         pub fn beginStep(self: *@This(), step: usize) void {
-            self.compute.lighton_decode_graph.capture_step = @intCast(step);
+            self.compute.bounded_decode_graph.capture_step = @intCast(step);
         }
         pub fn advance(self: *@This()) !void {
-            const owner = &self.compute.lighton_decode_graph;
+            const owner = &self.compute.bounded_decode_graph;
             try self.compute.lighton_attention.advanceGraph(&self.compute.ctx, owner.positions().ptr, owner.counter().ptr, @intCast(owner.rows * 3));
         }
         pub fn run(self: *@This(), context: *anyopaque, callback: *const fn (*anyopaque, *@This()) anyerror!void, cleanup_owner: ?*const @import("../../execution/cleanup_owner.zig").Owner, cleanup_epoch: ?*const @import("../../execution/retirement_sink.zig").Epoch) !void {
             const compute = self.compute;
-            const owner = &compute.lighton_decode_graph;
+            const owner = &compute.bounded_decode_graph;
             if (owner.phase == .replay) {
                 try compute.ctx.launchGraph(owner.graph);
                 owner.replays += 1;
@@ -3935,7 +3936,7 @@ pub const CudaCompute = struct {
             } else owner.phase = .learn;
         }
         pub fn read(self: *@This(), burst_value: *LightOnTokenBurst, tokens: []u32) !void {
-            const owner = &self.compute.lighton_decode_graph;
+            const owner = &self.compute.bounded_decode_graph;
             if (tokens.len != 2 * owner.rows) return error.InvalidShape;
             var host: [768]u32 = undefined;
             const bytes = owner.progress_offset + 4 - owner.bank_offset;
@@ -3967,7 +3968,7 @@ pub const CudaCompute = struct {
     pub fn invalidateLightOnDecodeGraphWithCleanup(cb: *const ops.ComputeBackend, current: CacheCleanup) !void {
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        if (!self.lighton_decode_graph_enabled and self.lighton_decode_graph.metadata.ptr == 0 and self.lighton_decode_graph.arena.ptr == 0 and self.lighton_decode_graph.head.ptr == 0 and self.lighton_decode_graph.graph == null and self.lighton_decode_graph.pending_graph == null) return;
+        if (!self.lighton_decode_graph_enabled and self.bounded_decode_graph.metadata.ptr == 0 and self.bounded_decode_graph.arena.ptr == 0 and self.bounded_decode_graph.head.ptr == 0 and self.bounded_decode_graph.graph == null and self.bounded_decode_graph.pending_graph == null) return;
         if (current.outside_execution) {
             if (current.boundary != null or current.operation != null) return error.ConflictingCleanupAuthority;
             var pending: @import("../../execution/resource_retirement.zig").SynchronousOutsideRawLeases = .{};
@@ -3980,8 +3981,8 @@ pub const CudaCompute = struct {
             const scoped = try local.synchronousOutsideContext(&pending);
             return invalidateLightOnDecodeGraphWithCleanup(cb, scoped);
         }
-        if (!self.lighton_decode_graph.mutex.tryLock()) return error.ReaderEpochBackendBusy;
-        defer self.lighton_decode_graph.mutex.unlock();
+        if (!self.bounded_decode_graph.mutex.tryLock()) return error.ReaderEpochBackendBusy;
+        defer self.bounded_decode_graph.mutex.unlock();
         try self.clearCapturedGraphWithCleanup(current);
     }
     pub fn externalPrefillEnabled(cb: *const ops.ComputeBackend) bool {
@@ -4070,7 +4071,7 @@ pub const CudaCompute = struct {
         if (phase.descriptor.attention) if (owner.attention) |*attention| {
             if (attention.device.ptr == 0 or attention.failed) {
                 try attention.clearWithCleanup(&self.ctx, current);
-                const A = @import("lighton_prefill_attention.zig");
+                const A = @import("paged_prefill_attention.zig");
                 phase.requests[phase.request_count] = .{ .external_prefill = .{ .kind = .attention, .library_identity = @intFromPtr(owner.workspace), .geometry_hash = hash, .device_bytes = A.device_bytes, .host_bytes = A.host_bytes + A.host_plan_bytes } };
                 phase.request_count += 1;
             }
@@ -4167,7 +4168,7 @@ pub const CudaCompute = struct {
         return !try self.ctx.streamCaptureActive();
     }
 
-    pub fn inspectCapturedGraphPhase(cb: *const ops.ComputeBackend, phase: *@import("lighton_decode_graph.zig").GraphPhase, current: CacheCleanup) !GraphPhaseDecision {
+    pub fn inspectCapturedGraphPhase(cb: *const ops.ComputeBackend, phase: *@import("bounded_decode_graph.zig").GraphPhase, current: CacheCleanup) !GraphPhaseDecision {
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const descriptor = phase.descriptor;
@@ -4178,7 +4179,7 @@ pub const CudaCompute = struct {
             descriptor.future_tokens == 0 or descriptor.future_tokens > @import("paged_attention_bf16.zig").max_native_context_tokens or
             (descriptor.hidden != 1024 and descriptor.hidden != 2560) or (descriptor.rows > 64 and (descriptor.rows % 64 == 1 or !self.lighton_ragged_recurrent_enabled))) return .unsupported;
         if (self.execution_scope != null) return .unsupported;
-        const owner = &self.lighton_decode_graph;
+        const owner = &self.bounded_decode_graph;
         if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
         defer owner.mutex.unlock();
         if (owner.disabled_epoch == descriptor.epoch) return .unsupported;
@@ -4212,13 +4213,13 @@ pub const CudaCompute = struct {
     }
     /// Reader restored its SAME graph/workspace under actual owner lanes.
     /// Revalidate the full concrete snapshot and policy, never a weak hash.
-    pub fn bindCapturedGraphPhase(cb: *const ops.ComputeBackend, phase: *@import("lighton_decode_graph.zig").GraphPhase, current: CacheCleanup) !bool {
+    pub fn bindCapturedGraphPhase(cb: *const ops.ComputeBackend, phase: *@import("bounded_decode_graph.zig").GraphPhase, current: CacheCleanup) !bool {
         if (!acceptsPhysicalImplementation(cb.vtable) or @intFromPtr(cb.ptr) != phase.expected_compute) return error.UnsupportedReaderEpochBackend;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (current.outside_execution or current.boundary == null or try current.boundary.?.isSealed()) return error.MissingCurrentCleanupEpoch;
         if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return error.ReaderEpochBackendBusy;
         if (!sameCacheAdmission(self.ctx.video_cache_budget.admission, phase.admission)) return error.PreparedCachePlanChanged;
-        const owner = &self.lighton_decode_graph;
+        const owner = &self.bounded_decode_graph;
         if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
         defer owner.mutex.unlock();
         if (!std.meta.eql(owner.snapshot(), phase.old)) return error.PreparedCachePlanChanged;
@@ -4235,11 +4236,11 @@ pub const CudaCompute = struct {
         return true;
     }
     pub fn clearCapturedGraphWithCleanup(self: *CudaCompute, current: CacheCleanup) !void {
-        try self.lighton_decode_graph.clearWithCleanup(&self.ctx, current);
+        try self.bounded_decode_graph.clearWithCleanup(&self.ctx, current);
         if (self.captured_cache_roots) |roots| roots.releaseRoots(self, current);
     }
 
-    pub fn beginLightOnDecodeGraph(cb: *const ops.ComputeBackend, current: @import("../../execution/cleanup_context.zig").Context, graph_phase: ?*@import("lighton_decode_graph.zig").GraphPhase, epoch: u64, key: []const u64, positions: []const u32, rows: usize, hidden: usize, vocab: usize, future_tokens: usize, attention_layers: usize, recurrent_layers: usize) !?LightOnGraphClaim {
+    pub fn beginBoundedDecodeGraph(cb: *const ops.ComputeBackend, current: @import("../../execution/cleanup_context.zig").Context, graph_phase: ?*@import("bounded_decode_graph.zig").GraphPhase, epoch: u64, key: []const u64, positions: []const u32, rows: usize, hidden: usize, vocab: usize, future_tokens: usize, attention_layers: usize, recurrent_layers: usize) !?BoundedDecodeClaim {
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
         if (!lightOnDecodeGraphEnabled(cb) or epoch == 0 or rows < 2 or rows > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or vocab == 0 or future_tokens == 0 or future_tokens > @import("paged_attention_bf16.zig").max_native_context_tokens or positions.len != rows * 3 or (hidden != 1024 and hidden != 2560)) return null;
         if (rows > 64 and rows % 64 == 1) return null;
@@ -4250,7 +4251,7 @@ pub const CudaCompute = struct {
             const descriptor = prepared_phase.descriptor;
             if (prepared_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or descriptor.attention_layers != attention_layers or descriptor.recurrent_layers != recurrent_layers or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions)) return error.PreparedCachePlanChanged;
         }
-        const owner = &self.lighton_decode_graph;
+        const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;
         defer if (!claimed) owner.mutex.unlock();
@@ -6293,7 +6294,7 @@ pub const CudaCompute = struct {
     audio_plans: @import("audio_execution_plan.zig").Cache = .{},
     audio_execution_active: bool = false,
     execution_scope: ?*@import("execution_arena.zig").Scope = null,
-    lighton_decode_graph: @import("lighton_decode_graph.zig").Module = .{},
+    bounded_decode_graph: @import("bounded_decode_graph.zig").Module = .{},
     captured_cache_roots: ?*CapturedCacheRoots = null,
     // Armed only by real managed cold publication after legacy roots upgraded.
     // Existing hits stay usable; new norm roots require actual cold Funding.
@@ -6722,7 +6723,7 @@ pub const CudaCompute = struct {
             var auxiliary_quotas = try self.detachAuxiliaryCacheData(current);
             for (&auxiliary_quotas) |*quota| try quota.releaseAfterSdkDeath(current);
             try self.clearCapturedGraphWithCleanup(current);
-            self.lighton_decode_graph.epoch_id = 0;
+            self.bounded_decode_graph.epoch_id = 0;
             if (self.lighton_recurrent.bf16_prefill) |*prefill| try prefill.clearWorkspaceWithCleanup(&self.ctx, current);
             try self.embedding_gemma2_execution.clearWithCleanup(self.allocator, &self.ctx, current);
             try self.embedding_gemma2_resize.clearWithCleanup(&self.ctx, current);
@@ -8601,7 +8602,7 @@ pub const CudaCompute = struct {
         if (profile == .embedding_gemma2 or cudaF32TiledAttentionEnabled()) if (cublaslt) |*blas| {
             blas.attention_plan_cache_enabled = true;
         };
-        const lighton_device = @import("lighton_device_policy.zig").Device{ .major = ctx.info.compute_major, .minor = ctx.info.compute_minor, .driver_version = ctx.info.driver_version };
+        const lighton_device = @import("recurrent_device_policy.zig").Device{ .major = ctx.info.compute_major, .minor = ctx.info.compute_minor, .driver_version = ctx.info.driver_version };
         const lighton_auto = lighton_device.automatic(profile == .lightonocr3, cublaslt != null and cudaCublasLtEnabled(), null);
         // The adapter selects arithmetic; generic/default model constructors
         // retain their previous handles and allocations.
@@ -8743,7 +8744,7 @@ pub const CudaCompute = struct {
         while (projection_quotas.next()) |value| try value.quota.validateCleanup(current);
         var pair_quotas = self.lighton_gate_up_cache.valueIterator();
         while (pair_quotas.next()) |value| try value.quota.validateCleanup(current);
-        try self.lighton_decode_graph.validateCleanup(current);
+        try self.bounded_decode_graph.validateCleanup(current);
         try self.audio_plans.validateCleanup(current);
         try self.embedding_gemma2_resize.validateCleanup(current);
         try self.embedding_gemma2_execution.validateCleanup(current);
@@ -8866,7 +8867,7 @@ pub const CudaCompute = struct {
             std.debug.print("OCR_CUDA temp_scan_diagnostic_interval=1024 alloc_ops={d} alloc_samples={d} alloc_cpu_samples={d} alloc_cpu_ns={d} alloc_wall_ns={d} alloc_entries={d} release_ops={d} release_samples={d} release_cpu_samples={d} release_cpu_ns={d} release_wall_ns={d} release_entries={d}\n", .{ search.operations, search.samples, search.cpu_samples, search.cpu_ns, search.wall_ns, search.entries, release.operations, release.samples, release.cpu_samples, release.cpu_ns, release.wall_ns, release.entries });
         }
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
-            std.debug.print("LIGHTONOCR3 cuda_model_graph_captures={d} cuda_model_graph_replays={d} cuda_model_graph_admission_denials={d} cuda_model_graph_wide_replays={d} cuda_model_graph_max_replay_rows={d}\n", .{ self.lighton_decode_graph.captures, self.lighton_decode_graph.replays, self.lighton_decode_graph.admission_denials, self.lighton_decode_graph.wide_replays, self.lighton_decode_graph.max_replay_rows });
+            std.debug.print("LIGHTONOCR3 cuda_model_graph_captures={d} cuda_model_graph_replays={d} cuda_model_graph_admission_denials={d} cuda_model_graph_wide_replays={d} cuda_model_graph_max_replay_rows={d}\n", .{ self.bounded_decode_graph.captures, self.bounded_decode_graph.replays, self.bounded_decode_graph.admission_denials, self.bounded_decode_graph.wide_replays, self.bounded_decode_graph.max_replay_rows });
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_model_graph_enabled={d} state_pool={d} lazy={d} training={d}\n", .{ @intFromBool(self.lighton_decode_graph_enabled), @intFromBool(self.lighton_state_pool_enabled), @intFromBool(self.lazy_host_store != null), @intFromBool(self.resident_training_cache) });
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
@@ -8904,7 +8905,7 @@ pub const CudaCompute = struct {
             std.debug.print("LIGHTONOCR3 cuda_fused_gdn_decode_calls={d} cuda_fused_gdn_decode_pages={d}\n", .{ self.lighton_recurrent.fused_decode_calls, self.lighton_recurrent.fused_decode_pages });
         if (self.lighton_recurrent.bf16_prefill) |*prefill| {
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("CUDA external_prefill_preparations={d} external_prefill_declines={d}\n", .{ self.external_prefill_preparations, self.external_prefill_declines });
-            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) if (prefill.attention) |fast| std.debug.print("LIGHTONOCR3 cuda_native_prefill_attention_calls={d} plans={d} metadata_slots={d} slot_reuses={d}\n", .{ fast.calls, fast.plans, @import("lighton_prefill_attention.zig").metadata_slots, fast.slot_reuses });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) if (prefill.attention) |fast| std.debug.print("LIGHTONOCR3 cuda_native_prefill_attention_calls={d} plans={d} metadata_slots={d} slot_reuses={d}\n", .{ fast.calls, fast.plans, @import("paged_prefill_attention.zig").metadata_slots, fast.slot_reuses });
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
                 std.debug.print("LIGHTONOCR3 cuda_bf16_recurrent_prefill_calls={d} workspace_peak={d}\n", .{ prefill.calls, prefill.workspace_peak });
         }
@@ -9203,7 +9204,7 @@ pub const CudaCompute = struct {
         return tryCapturedPrefillOutput(cb, a, config, input, ple, dc, .{ .last_row = true, .final_norm = false });
     }
 
-    pub fn tryCapturedPrefillOutput(cb: *const ops.ComputeBackend, a: std.mem.Allocator, config: gpt_model.Config, input: CT, ple: ?CT, dc: *const gpt_arch.DecodeContext, output_contract: @import("../../execution/prefill_frontend.zig").HiddenOutput) !?CT {
+    pub fn tryCapturedPrefillOutput(cb: *const ops.ComputeBackend, a: std.mem.Allocator, config: gpt_model.Config, input: CT, ple: ?CT, dc: *const gpt_arch.DecodeContext, output_contract: @import("../../architectures/frontends/decoder_prefill.zig").HiddenOutput) !?CT {
         if (comptime !cuda_enabled) return null;
         if (!acceptsPhysicalImplementation(cb.vtable)) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -9227,7 +9228,7 @@ pub const CudaCompute = struct {
         // share this owner without inventing aliases or copying embeddings.
         // An admitted error propagates; it must not retry an eager KV write.
         const rows = dc.query_sequence_len;
-        var spec = @import("../../execution/prefill_frontend.zig").Spec{ .config = config, .rows = rows, .output = output_contract, .attn_or_mask = dc.attn_or_mask };
+        var spec = @import("../../architectures/frontends/decoder_prefill.zig").Spec{ .config = config, .rows = rows, .output = output_contract, .attn_or_mask = dc.attn_or_mask };
         const hidden_shape = [_]i64{ @intCast(rows), config.hidden_size };
         const ple_shape = [_]i64{ @intCast(rows), @intCast(config.num_hidden_layers * config.ple_hidden_size) };
         const Capture = @import("../../execution/capture.zig");
@@ -10359,7 +10360,7 @@ pub const CudaCompute = struct {
     }
 
     fn insertWeightFromLoadedBorrowedKey(self: *CudaCompute, owned_key: []const u8, loaded: *const weight_source_mod.LoadedWeight) !void {
-        if (self.strict_f32_weights and !glinerQ8EncoderWeight(self.gliner_encoder_attention, owned_key, loaded)) {
+        if (self.strict_f32_weights and !structured_encoder_binding.ettinQ8EncoderWeight(self.gliner_encoder_attention, owned_key, loaded)) {
             if (loaded.quantized or loaded.quantized_storage != null) return error.UnsupportedTensorType;
             if (loaded.tensor.dtype == .f32) return self.insertWeightFromTensorBorrowedKey(owned_key, &loaded.tensor);
             var converted = try weight_source_mod.convertToF32(self.allocator, &loaded.tensor);
@@ -10404,8 +10405,8 @@ pub const CudaCompute = struct {
             errdefer device.free(&self.ctx);
             try copyMappedWeightFromHostTracked(self, device, storage.raw_bytes, if (storage.raw_mmap_backed) storage.raw_mmap_source_bytes else null);
             const gliner_f16 = self.gliner_q8_f16_mirrors and canUseF16TensorCoreWeights(self) and
-                (glinerQ8ProjectionWeight(self.gliner_encoder_attention, owned_key, loaded) or
-                    decideDebertaQ8ProjectionWeight(self.qualified_decide_q8, owned_key, loaded));
+                (structured_encoder_binding.ettinQ8ProjectionWeight(self.gliner_encoder_attention, owned_key, loaded) or
+                    structured_encoder_binding.debertaQ8ProjectionWeight(self.qualified_decide_q8, owned_key, loaded));
             var tc_quant = if (gliner_f16) null else try self.prepareTensorCoreQuantOnUpload(storage.tensor_type, storage.shape, device, storage.raw_bytes);
             errdefer if (tc_quant) |*packed_quant| releaseDeviceBuffer(self, &packed_quant.buffer);
             var gliner_mirror = buffer_mod.DeviceBuffer{};
@@ -10490,7 +10491,7 @@ pub const CudaCompute = struct {
         // parameters intentionally continue through F32: norms, biases, and
         // scalar graph operators retain their existing numerical behavior.
         if (loaded.tensor.dtype == .f16 and loaded.tensor.shape.len >= 2 and
-            (cudaShouldKeepF16WeightOnDevice(owned_key) or
+            (structured_encoder_binding.keepsF16Weight(owned_key) or
                 cudaShouldKeepGemma4PleF16(self, owned_key, &loaded.tensor) or
                 (self.capability_profile == .florence2 and self.florence_f16_weights_enabled and
                     cudaShouldKeepFlorenceF16Weight(owned_key, loaded.tensor.shape.len))) and
@@ -10562,7 +10563,7 @@ pub const CudaCompute = struct {
             // The raw-layout kernel consumes the original resident bytes.
             // Keep the packed compatibility route when its optional symbol is absent.
             if (self.gemma4_raw_q4_prefill) return null;
-        } else if (!(isTensorCoreQuantLinearShape(in_dim, out_dim) or (known == .Q8_0 and isGliner1BQ8LinearShape(in_dim, out_dim)))) {
+        } else if (!(isTensorCoreQuantLinearShape(in_dim, out_dim) or (known == .Q8_0 and structured_encoder_binding.ettinProjectionShape(in_dim, out_dim)))) {
             return null;
         }
 
@@ -11798,7 +11799,7 @@ const CudaKvDeviceStorage = struct {
 
     fn releaseSequence(ctx: *anyopaque, sequence_id: kv_storage_runtime.SequenceId) void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
-        if (self.compute.lighton_decode_graph_enabled) self.compute.lighton_decode_graph.invalidate(&self.compute.ctx);
+        if (self.compute.lighton_decode_graph_enabled) self.compute.bounded_decode_graph.invalidate(&self.compute.ctx);
         if (self.match_binding) |binding| if (binding.sequence == sequence_id) {
             binding.deinit();
             self.allocator.destroy(binding);
@@ -11839,7 +11840,7 @@ const CudaKvDeviceStorage = struct {
         retained_token_count: usize,
     ) void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
-        if (self.compute.lighton_decode_graph_enabled) self.compute.lighton_decode_graph.invalidate(&self.compute.ctx);
+        if (self.compute.lighton_decode_graph_enabled) self.compute.bounded_decode_graph.invalidate(&self.compute.ctx);
         self.revision = std.math.add(u64, self.revision, 1) catch std.math.maxInt(u64);
         // A completed lookahead forward may be rolled back within its exact
         // tail. Never revive a failed forward or cross evicted/fitted history.
@@ -12259,21 +12260,6 @@ fn canUseF16TensorCoreWeights(self: *const CudaCompute) bool {
         self.kernels.embedding_lookup_i32_f16_weight_f32 != null;
 }
 
-/// Only retain FP16 tensors for operations with a fully device-resident FP16
-/// implementation. GLiNER's DeBERTa token embedding, per-layer dense
-/// projections, and span projection MLPs are consumed by FP16 tensor-core
-/// GEMM routes. The relative position table and the CountLSTM/transformer head
-/// still have F32-only consumers, so those exceptional tensors remain F32.
-/// Keep this operation-capability policy explicit rather than shape-dependent:
-/// silently promoting every two-dimensional head tensor can make an otherwise
-/// supported model fail much later in an unrelated elementwise operation.
-fn cudaShouldKeepF16WeightOnDevice(name: []const u8) bool {
-    if (std.mem.eql(u8, name, "embeddings.word_embeddings.weight")) return true;
-    if (std.mem.startsWith(u8, name, "encoder.layer.") and std.mem.endsWith(u8, name, ".weight")) return true;
-    return std.mem.startsWith(u8, name, "span_rep.span_rep_layer.") and
-        std.mem.endsWith(u8, name, ".weight");
-}
-
 /// Only matrix consumers whose CUDA route supports F16. Florence's image
 /// projection needs a transpose, and convolutions/position lookup helpers
 /// retain their F32 contract. Norms and biases never enter this allowlist.
@@ -12468,7 +12454,7 @@ fn cudaHybridQ4Bf16WeightsEnabled() bool {
     return load_plan.retainQ4_0Bf16Mirror();
 }
 
-fn lightOnDevice(self: *const CudaCompute) @import("lighton_device_policy.zig").Device {
+fn lightOnDevice(self: *const CudaCompute) @import("recurrent_device_policy.zig").Device {
     return .{ .major = self.ctx.info.compute_major, .minor = self.ctx.info.compute_minor, .driver_version = self.ctx.info.driver_version };
 }
 
@@ -12682,67 +12668,22 @@ fn isApprovedQuantLinearShape(in_dim: usize, out_dim: usize) bool {
     return false;
 }
 
-// Exact bias-free Ettin projections; classifier and auxiliary heads stay F32.
-fn isGliner1BQ8LinearShape(in_dim: usize, out_dim: usize) bool {
-    return (in_dim == 1792 and (out_dim == 5376 or out_dim == 1792 or out_dim == 7680)) or
-        (in_dim == 3840 and out_dim == 1792);
-}
-
-fn glinerQ8EncoderWeight(enabled: bool, name: []const u8, loaded: *const weight_source_mod.LoadedWeight) bool {
-    if (!enabled) return false;
-    const storage = loaded.quantized_storage orelse return false;
-    if (knownQuantTensorType(storage.tensor_type) != .Q8_0 or storage.shape.len != 2) return false;
-    if (std.mem.eql(u8, name, "model.embeddings.tok_embeddings.weight"))
-        return std.mem.eql(i64, storage.shape, &.{ 50378, 1792 });
-    const prefix = "model.layers.";
-    if (!std.mem.startsWith(u8, name, prefix)) return false;
-    const suffix_start = std.mem.indexOfScalarPos(u8, name, prefix.len, '.') orelse return false;
-    const layer = std.fmt.parseInt(u32, name[prefix.len..suffix_start], 10) catch return false;
-    if (layer >= 28) return false;
-    const suffix = name[suffix_start..];
-    const shape: []const i64 = if (std.mem.eql(u8, suffix, ".attn.Wqkv.weight")) &.{ 5376, 1792 } else if (std.mem.eql(u8, suffix, ".attn.Wo.weight")) &.{ 1792, 1792 } else if (std.mem.eql(u8, suffix, ".mlp.Wi.weight")) &.{ 7680, 1792 } else if (std.mem.eql(u8, suffix, ".mlp.Wo.weight")) &.{ 1792, 3840 } else return false;
-    return std.mem.eql(i64, storage.shape, shape);
-}
-
-fn glinerQ8ProjectionWeight(enabled: bool, name: []const u8, loaded: *const weight_source_mod.LoadedWeight) bool {
-    return std.mem.startsWith(u8, name, "model.layers.") and glinerQ8EncoderWeight(enabled, name, loaded);
-}
-
-fn decideDebertaQ8ProjectionWeight(enabled: bool, name: []const u8, loaded: *const weight_source_mod.LoadedWeight) bool {
-    if (!enabled) return false;
-    const storage = loaded.quantized_storage orelse return false;
-    if (knownQuantTensorType(storage.tensor_type) != .Q8_0 or storage.shape.len != 2) return false;
-    const prefix = "encoder.layer.";
-    if (!std.mem.startsWith(u8, name, prefix)) return false;
-    const suffix_start = std.mem.indexOfScalarPos(u8, name, prefix.len, '.') orelse return false;
-    const layer = std.fmt.parseInt(u32, name[prefix.len..suffix_start], 10) catch return false;
-    if (layer >= 24) return false;
-    const suffix = name[suffix_start..];
-    const shape: []const i64 = if (std.mem.eql(u8, suffix, ".intermediate.dense.weight")) &.{ 4096, 1024 } else if (std.mem.eql(u8, suffix, ".output.dense.weight")) &.{ 1024, 4096 } else if (std.mem.eql(u8, suffix, ".attention.self.query_proj.weight") or
-        std.mem.eql(u8, suffix, ".attention.self.key_proj.weight") or
-        std.mem.eql(u8, suffix, ".attention.self.value_proj.weight") or
-        std.mem.eql(u8, suffix, ".attention.self.pos_query_proj.weight") or
-        std.mem.eql(u8, suffix, ".attention.self.pos_key_proj.weight") or
-        std.mem.eql(u8, suffix, ".attention.output.dense.weight")) &.{ 1024, 1024 } else return false;
-    return std.mem.eql(i64, storage.shape, shape);
-}
-
 test "Decide Q8 projection mirrors bind exact encoder roles" {
     var loaded = weight_source_mod.LoadedWeight{
         .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &.{}, .name = "", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false },
         .quantized = true,
         .quantized_storage = .{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = &.{}, .shape = &.{ 1024, 1024 }, .allocator = std.testing.allocator },
     };
-    try std.testing.expect(decideDebertaQ8ProjectionWeight(true, "encoder.layer.23.attention.self.query_proj.weight", &loaded));
-    try std.testing.expect(!decideDebertaQ8ProjectionWeight(false, "encoder.layer.0.attention.self.query_proj.weight", &loaded));
-    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "encoder.layer.24.attention.self.query_proj.weight", &loaded));
-    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "embeddings.word_embeddings.weight", &loaded));
-    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "classifier.0.weight", &loaded));
-    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "encoder.layer.0.output.dense.weight", &loaded));
+    try std.testing.expect(structured_encoder_binding.debertaQ8ProjectionWeight(true, "encoder.layer.23.attention.self.query_proj.weight", &loaded));
+    try std.testing.expect(!structured_encoder_binding.debertaQ8ProjectionWeight(false, "encoder.layer.0.attention.self.query_proj.weight", &loaded));
+    try std.testing.expect(!structured_encoder_binding.debertaQ8ProjectionWeight(true, "encoder.layer.24.attention.self.query_proj.weight", &loaded));
+    try std.testing.expect(!structured_encoder_binding.debertaQ8ProjectionWeight(true, "embeddings.word_embeddings.weight", &loaded));
+    try std.testing.expect(!structured_encoder_binding.debertaQ8ProjectionWeight(true, "classifier.0.weight", &loaded));
+    try std.testing.expect(!structured_encoder_binding.debertaQ8ProjectionWeight(true, "encoder.layer.0.output.dense.weight", &loaded));
     loaded.quantized_storage.?.shape = &.{ 1024, 4096 };
-    try std.testing.expect(decideDebertaQ8ProjectionWeight(true, "encoder.layer.0.output.dense.weight", &loaded));
+    try std.testing.expect(structured_encoder_binding.debertaQ8ProjectionWeight(true, "encoder.layer.0.output.dense.weight", &loaded));
     loaded.quantized_storage.?.tensor_type = .{ .known = .Q4_0 };
-    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "encoder.layer.0.output.dense.weight", &loaded));
+    try std.testing.expect(!structured_encoder_binding.debertaQ8ProjectionWeight(true, "encoder.layer.0.output.dense.weight", &loaded));
 }
 
 /// Bounded host staging: the largest 1B projection needs 26.25 MiB of half
@@ -12774,25 +12715,25 @@ test "GLiNER Decide CUDA Q8 upload keeps heads dense and binds encoder roles" {
         .quantized = true,
         .quantized_storage = .{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = &.{}, .shape = &.{ 5376, 1792 }, .allocator = std.testing.allocator },
     };
-    try std.testing.expect(glinerQ8EncoderWeight(true, "model.layers.0.attn.Wqkv.weight", &loaded));
-    try std.testing.expect(!glinerQ8EncoderWeight(false, "model.layers.0.attn.Wqkv.weight", &loaded));
-    try std.testing.expect(!glinerQ8EncoderWeight(true, "model.layers.28.attn.Wqkv.weight", &loaded));
-    try std.testing.expect(!glinerQ8EncoderWeight(true, "model.layers.0.attn.Wo.weight", &loaded));
-    try std.testing.expect(!glinerQ8EncoderWeight(true, "classifier.0.weight", &loaded));
+    try std.testing.expect(structured_encoder_binding.ettinQ8EncoderWeight(true, "model.layers.0.attn.Wqkv.weight", &loaded));
+    try std.testing.expect(!structured_encoder_binding.ettinQ8EncoderWeight(false, "model.layers.0.attn.Wqkv.weight", &loaded));
+    try std.testing.expect(!structured_encoder_binding.ettinQ8EncoderWeight(true, "model.layers.28.attn.Wqkv.weight", &loaded));
+    try std.testing.expect(!structured_encoder_binding.ettinQ8EncoderWeight(true, "model.layers.0.attn.Wo.weight", &loaded));
+    try std.testing.expect(!structured_encoder_binding.ettinQ8EncoderWeight(true, "classifier.0.weight", &loaded));
     loaded.quantized_storage.?.tensor_type = .{ .known = .Q4_0 };
-    try std.testing.expect(!glinerQ8EncoderWeight(true, "model.layers.0.attn.Wqkv.weight", &loaded));
+    try std.testing.expect(!structured_encoder_binding.ettinQ8EncoderWeight(true, "model.layers.0.attn.Wqkv.weight", &loaded));
     loaded.quantized_storage.?.tensor_type = .{ .known = .Q8_0 };
     loaded.quantized_storage.?.shape = &.{ 50378, 1792 };
-    try std.testing.expect(glinerQ8EncoderWeight(true, "model.embeddings.tok_embeddings.weight", &loaded));
-    try std.testing.expect(!glinerQ8ProjectionWeight(true, "model.embeddings.tok_embeddings.weight", &loaded));
+    try std.testing.expect(structured_encoder_binding.ettinQ8EncoderWeight(true, "model.embeddings.tok_embeddings.weight", &loaded));
+    try std.testing.expect(!structured_encoder_binding.ettinQ8ProjectionWeight(true, "model.embeddings.tok_embeddings.weight", &loaded));
     loaded.quantized_storage.?.shape = &.{1792};
-    try std.testing.expect(!glinerQ8EncoderWeight(true, "model.embeddings.norm.weight", &loaded));
+    try std.testing.expect(!structured_encoder_binding.ettinQ8EncoderWeight(true, "model.embeddings.norm.weight", &loaded));
     for ([_][2]usize{ .{ 1792, 5376 }, .{ 1792, 1792 }, .{ 1792, 7680 }, .{ 3840, 1792 } }) |dims| {
-        try std.testing.expect(isGliner1BQ8LinearShape(dims[0], dims[1]));
+        try std.testing.expect(structured_encoder_binding.ettinProjectionShape(dims[0], dims[1]));
         // Q4 and existing encoder dispatch do not inherit the new shapes.
         try std.testing.expect(!isTensorCoreQuantLinearShape(dims[0], dims[1]));
     }
-    try std.testing.expect(!isGliner1BQ8LinearShape(1792, 3584));
+    try std.testing.expect(!structured_encoder_binding.ettinProjectionShape(1792, 3584));
 }
 
 test "GLiNER Decide CUDA Q8 half staging validates bytes and finite range" {
@@ -12827,7 +12768,7 @@ fn isQ4_0TcHmmaShape(in_dim: usize, out_dim: usize) bool {
 }
 
 fn useMxbaiQ8TiledKernel(rows: usize, in_dim: usize, out_dim: usize) bool {
-    return cudaQ8TiledKernelsEnabled() and rows > 0 and in_dim % 256 == 0 and (isApprovedQuantLinearShape(in_dim, out_dim) or isGliner1BQ8LinearShape(in_dim, out_dim));
+    return cudaQ8TiledKernelsEnabled() and rows > 0 and in_dim % 256 == 0 and (isApprovedQuantLinearShape(in_dim, out_dim) or structured_encoder_binding.ettinProjectionShape(in_dim, out_dim));
 }
 
 fn mxbaiQ8Variant(rows: usize, in_dim: usize, out_dim: usize) ?kernels_mod.QMatmulVariant {
@@ -12987,18 +12928,10 @@ fn q4KMin(scales: []const u8, sub: usize) u8 {
     return (scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4);
 }
 
-fn isGlinerSpanQ4Shape(rows: usize, in_dim: usize, out_dim: usize) bool {
-    if (rows < 2) return false;
-    if (in_dim == 768 and out_dim == 3072) return true;
-    if (in_dim == 3072 and out_dim == 768) return true;
-    if (in_dim == 1536 and out_dim == 3072) return true;
-    return false;
-}
-
 fn useGlinerSpanQ4Kernel(self: *const CudaCompute, rows: usize, in_dim: usize, out_dim: usize) bool {
     return cudaGlinerSpanQ4KernelsEnabled() and
         self.kernels.hasGlinerSpanQ4KPrimitives() and
-        isGlinerSpanQ4Shape(rows, in_dim, out_dim);
+        structured_encoder_binding.spanQ4ProjectionShape(rows, in_dim, out_dim);
 }
 
 fn tensorFromCt(tensor: CT) *CudaTensor {
@@ -13135,7 +13068,7 @@ fn beginRequestUsing(ctx: *anyopaque, current: CacheCleanup) anyerror!void {
     // independent of sampling and response plumbing.
     if (self.ctx.debug_graph_capture_active) return error.InvalidCudaState;
     try self.clearCapturedGraphWithCleanup(current);
-    self.lighton_decode_graph.epoch_id = 0;
+    self.bounded_decode_graph.epoch_id = 0;
     try synchronizeAndDrainDeferredDeviceFrees(self);
     // Allocation paths may hold the temp-buffer mutex. They only request a
     // trim; retire idle program frames here after completion, outside those
@@ -18101,7 +18034,7 @@ fn invalidateCapturedGraphForMutation(self: *CudaCompute, backend: *const ops.Co
         try CudaCompute.invalidateLightOnDecodeGraphWithCleanup(backend, current);
     } else if (self.lighton_decode_graph_enabled) {
         // Legacy raw/empty custody only. No inferred outside authority.
-        self.lighton_decode_graph.invalidate(&self.ctx);
+        self.bounded_decode_graph.invalidate(&self.ctx);
     }
 }
 
@@ -18126,7 +18059,7 @@ fn recycleLightOnStateBufferWithCleanup(context: *anyopaque, buffer: *buffer_mod
 fn recycleLightOnStateBuffer(context: *anyopaque, buffer: *buffer_mod.DeviceBuffer) void {
     if (buffer.ptr == 0) return;
     const self: *CudaCompute = @ptrCast(@alignCast(context));
-    if (self.lighton_decode_graph_enabled) self.lighton_decode_graph.invalidate(&self.ctx);
+    if (self.lighton_decode_graph_enabled) self.bounded_decode_graph.invalidate(&self.ctx);
     recycleLightOnStateBufferAfterInvalidation(self, buffer);
 }
 fn recycleLightOnStateBufferAfterInvalidation(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) void {
@@ -18263,7 +18196,7 @@ fn modelConstantOp(ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT {
         }
         self.embedding_gemma2_constant_hits += 1;
         if (std.mem.startsWith(u8, key, "audio_tower.prepared.query_scale.")) self.embedding_gemma2_audio_constant_hits += 1;
-        if (self.lighton_decode_graph.active) if (self.captured_cache_roots) |roots| try roots.selected(self, key, snapshot);
+        if (self.bounded_decode_graph.active) if (self.captured_cache_roots) |roots| try roots.selected(self, key, snapshot);
         return borrowModelConstant(self, snapshot);
     }
     self.embedding_gemma2_constant_misses += 1;
@@ -18299,7 +18232,7 @@ fn modelConstantOp(ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT {
     try self.ctx.synchronize();
     snapshot.* = .{ .buffer = buffer, .dtype = source.dtype, .shape = shape, .elem_count = source.elem_count, .model_constant = true, .model_constant_quota = .none };
     const result = try borrowModelConstant(self, snapshot);
-    if (self.lighton_decode_graph.active) if (self.captured_cache_roots) |roots| roots.selected(self, key, snapshot) catch |err| {
+    if (self.bounded_decode_graph.active) if (self.captured_cache_roots) |roots| roots.selected(self, key, snapshot) catch |err| {
         freeTensor(self, result);
         return err;
     };
@@ -31641,7 +31574,7 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
     // Optional mixed-precision library only. Retain the original default,
     // decode kernels, and unsupported storage/layout routes. KV suffixes have
     // already been appended exactly once; failures here fail the claim.
-    if (self.capability_profile == .lightonocr3 and (@import("lighton_prefill_attention.zig").Shape{
+    if (self.capability_profile == .lightonocr3 and (@import("paged_prefill_attention.zig").Shape{
         .batch = batch,
         .rows = attention.query_sequence_len,
         .tokens = attention.kv_sequence_len,
@@ -31996,7 +31929,7 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
         // the same block IDs. Read the authoritative table used by KV writes;
         // copy it now because the storage helper reuses one scratch array.
         const blocks = try storage.logicalBlocksWithReservations(view.kv_cache.sequence_id);
-        const count = if (self.lighton_decode_graph.active)
+        const count = if (self.bounded_decode_graph.active)
             blocks.len
         else
             std.math.divCeil(usize, tokens, params.page_size) catch return error.InvalidPagedKvState;
@@ -32007,11 +31940,11 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     }
     const chunk128 = module.useChunk128(self.lighton_attention_chunk128, heads);
     const chunk_size: usize = if (chunk128) 128 else 32;
-    const planned_tokens = if (self.lighton_decode_graph.active) self.lighton_decode_graph.future_tokens else max_tokens;
+    const planned_tokens = if (self.bounded_decode_graph.active) self.bounded_decode_graph.future_tokens else max_tokens;
     params.chunks = @intCast((planned_tokens + chunk_size - 1) / chunk_size);
-    if (self.lighton_decode_graph.active) {
-        params.graph_progress = self.lighton_decode_graph.counter().ptr;
-        params.graph_step = self.lighton_decode_graph.capture_step;
+    if (self.bounded_decode_graph.active) {
+        params.graph_progress = self.bounded_decode_graph.counter().ptr;
+        params.graph_step = self.bounded_decode_graph.capture_step;
     }
     // Allocate and qualify the module before the first KV mutation. Physical
     // buffers use the existing budgeted temporary pool and retire on this stream.
@@ -32067,7 +32000,7 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
         break :direct true;
     };
     if (!direct_suffix) {
-        if (self.lighton_decode_graph.active and self.lighton_decode_graph.phase != .warm)
+        if (self.bounded_decode_graph.active and self.bounded_decode_graph.phase != .warm)
             return error.CudaGraphCaptureUnsafeKvWrite;
         for (views, 0..) |view, i| {
             const tokens = params.pages[i].tokens;
@@ -33538,13 +33471,13 @@ fn rope(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: u
 const lighton_mrope_position_capacity: usize = 2 * 16 * 4096;
 
 fn lightOnOwnedDecodeCapture(self: *const CudaCompute) bool {
-    return self.lighton_decode_graph.active and self.lighton_decode_graph.epoch_id != 0 and
+    return self.bounded_decode_graph.active and self.bounded_decode_graph.epoch_id != 0 and
         self.execution_scope != null and self.execution_scope.?.base != 0 and self.ctx.debug_graph_capture_active;
 }
 
 fn cachedLightOnMropePositions(self: *CudaCompute, positions: []const u32) !?buffer_mod.DeviceBuffer {
-    if (self.lighton_decode_graph.active) {
-        const owner = &self.lighton_decode_graph;
+    if (self.bounded_decode_graph.active) {
+        const owner = &self.bounded_decode_graph;
         if (positions.len != owner.rows * 3) return error.InvalidShape;
         for (positions, owner.next_positions[0..positions.len]) |position, base|
             if (position != try std.math.add(u32, base, owner.capture_step)) return error.InvalidExecutionPlan;
@@ -36625,8 +36558,8 @@ const vtable: ops.ComputeBackend.VTable = .{
             .localRelative = &gemma4AudioLocalAttentionOp,
         },
         .relative_encoder = .{
-            .trainingAttention = &gliner25.debertaTrainingAttentionV1,
-            .trainingAttentionBackward = &gliner25.debertaTrainingAttentionBackwardV1,
+            .trainingAttention = &resident_structured.debertaTrainingAttentionV1,
+            .trainingAttentionBackward = &resident_structured.debertaTrainingAttentionBackwardV1,
         },
 
         .replay = .{
@@ -36664,9 +36597,9 @@ const vtable: ops.ComputeBackend.VTable = .{
         },
         .token_selection = .{ .encodeLogitsStats = &rowSelectionStatsEncode, .readLogitsStats = &rowSelectionStatsRead },
         .relative_boundary = .{
-            .device = &gliner25.glinerBoundaryDevice,
-            .download = &gliner25.glinerBoundaryDownload,
-            .scope = &gliner25.glinerBoundaryScope,
+            .device = &resident_structured.glinerBoundaryDevice,
+            .download = &resident_structured.glinerBoundaryDownload,
+            .scope = &resident_structured.glinerBoundaryScope,
         },
     },
     .embeddingLookup = &embeddingLookup,
@@ -36792,19 +36725,19 @@ const vtable: ops.ComputeBackend.VTable = .{
     .depthwiseCausalConv1d = &gemma4AudioDepthwiseCausalConv1dOp,
     .depthwiseCausalConv1dSegmented = &gemma4AudioDepthwiseSegmentedOp,
     .evalTensor = &evalTensorOp,
-    .residentTrainingPrimitive = &gliner25.residentTrainingPrimitive,
-    .snapshotTensorShape = &gliner25.snapshotTensorShape,
-    .residentTrainingNorm = &gliner25.residentTrainingNorm,
-    .residentTrainingValidate = &gliner25.residentTrainingValidate,
-    .residentTrainingInstruction = &gliner25.residentTrainingInstruction,
-    .elementwiseLossGradient = &gliner25.elementwiseLossGradient,
-    .consistencyLossGradient = &gliner25.consistencyLossGradient,
-    .recordLossGradient = &gliner25.recordLossGradient,
-    .listwiseLossGradient = &gliner25.listwiseLossGradient,
+    .residentTrainingPrimitive = &resident_structured.residentTrainingPrimitive,
+    .snapshotTensorShape = &resident_structured.snapshotTensorShape,
+    .residentTrainingNorm = &resident_structured.residentTrainingNorm,
+    .residentTrainingValidate = &resident_structured.residentTrainingValidate,
+    .residentTrainingInstruction = &resident_structured.residentTrainingInstruction,
+    .elementwiseLossGradient = &resident_structured.elementwiseLossGradient,
+    .consistencyLossGradient = &resident_structured.consistencyLossGradient,
+    .recordLossGradient = &resident_structured.recordLossGradient,
+    .listwiseLossGradient = &resident_structured.listwiseLossGradient,
     .trainingOverwriteF32 = &trainingOverwriteF32Op,
     .trainingZeroF32 = &trainingZeroF32Op,
     .trainingAccumulateF32 = &trainingAccumulateF32Op,
-    .trainingAdamWManyF32 = &gliner25.trainingAdamWManyF32,
+    .trainingAdamWManyF32 = &resident_structured.trainingAdamWManyF32,
     .trainingSumSquaresManyF32 = &trainingSumSquaresManyF32Op,
     .trainingSynchronize = &trainingSynchronizeOp,
     .subtract = &primSubtractOp,
@@ -37317,7 +37250,7 @@ test "CUDA A4B pipeline rolls back partial worker startup and drains blocked pro
 }
 
 /// Internal CUDA operations shared with the strict GLiNER2.5 adapter.
-pub const gliner25_api = struct {
+pub const resident_structured_api = struct {
     pub const ownsResidentTensor = residentTensorOwnedBy;
     pub const tensorReadOnly = cudaTensorReadOnly;
     pub const makeRetainedTensorView = makeRetainedTensorViewImpl;
@@ -44719,7 +44652,7 @@ test "LightOnOCR3 CUDA optional BF16 prefill scratch preserves admission across 
     var compute = try CudaCompute.testing.init(std.testing.allocator);
     defer compute.deinit();
     if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
-    var prefill = try @import("lighton_prefill.zig").Module.init(path);
+    var prefill = try @import("recurrent_prefill.zig").Module.init(path);
     defer prefill.deinit(&compute.ctx);
     var controller = memory.AdmissionController{};
     compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 1023, .scratch_limit_bytes = 1023 }, .check_live_memory = false };
@@ -44747,7 +44680,7 @@ test "LightOnOCR3 CUDA decoder graph arena admission rejects partial allocations
     var compute = try CudaCompute.testing.init(std.testing.allocator);
     defer compute.deinit();
     var controller = memory.AdmissionController{};
-    var owner = @import("lighton_decode_graph.zig").Module{};
+    var owner = @import("bounded_decode_graph.zig").Module{};
     defer owner.clear(&compute.ctx) catch {};
     const positions = [_]u32{ 10, 20, 30, 40, 50, 60 };
     const key = [_]u64{ 1, 2, 3 };
@@ -44796,7 +44729,7 @@ test "LightOnOCR3 CUDA wide graph head has independent admission and never enter
     var compute = try CudaCompute.testing.init(std.testing.allocator);
     defer compute.deinit();
     var controller = memory.AdmissionController{};
-    var owner = @import("lighton_decode_graph.zig").Module{};
+    var owner = @import("bounded_decode_graph.zig").Module{};
     defer owner.clear(&compute.ctx) catch {};
     const positions: [384]u32 = @splat(10);
     const key = [_]u64{ 1, 2, 3 };
@@ -44893,7 +44826,7 @@ test "LightOnOCR3 CUDA bounded GEMM refresh drains at an exclusive boundary and 
 test "LightOnOCR3 CUDA optional paged prefill owner admits host and GPU bytes before allocating and drains on clear" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const memory = @import("../../runtime/tier/memory.zig");
-    const module = @import("lighton_prefill_attention.zig");
+    const module = @import("paged_prefill_attention.zig");
     var compute = try CudaCompute.testing.init(std.testing.allocator);
     defer compute.deinit();
     const NoPlan = struct {
@@ -46129,7 +46062,7 @@ test "LightOn CUDA graph capability has no benchmark GPU allowlist and explains 
     compute.ctx.debug_graph_capture_active = false;
     compute.resident_training_cache = false;
     compute.lazy_host_store = null;
-    const Decision = @import("lighton_device_policy.zig").GraphDecision;
+    const Decision = @import("recurrent_device_policy.zig").GraphDecision;
     for ([_][2]i32{ .{ 8, 0 }, .{ 8, 9 }, .{ 9, 0 }, .{ 12, 1 } }) |cc| {
         compute.ctx.info.compute_major = cc[0];
         compute.ctx.info.compute_minor = cc[1];
@@ -55353,7 +55286,7 @@ test "CUDA auxiliary cache actual backing upgrades exact raw quota and retires o
 }
 
 test "captured graph funding rejects copied backend tables before invalid context SDK or scope access" {
-    const Graph = @import("lighton_decode_graph.zig");
+    const Graph = @import("bounded_decode_graph.zig");
     const positions = [_]u32{ 1, 2, 3, 4, 5, 6 };
     const key = [_]u64{ 1, 2 };
     var phase: Graph.GraphPhase = undefined;
@@ -55364,12 +55297,12 @@ test "captured graph funding rejects copied backend tables before invalid contex
     const backend = ops.ComputeBackend{ .ptr = @ptrFromInt(1), .vtable = &copied };
     try std.testing.expectError(error.UnsupportedReaderEpochBackend, CudaCompute.inspectCapturedGraphPhase(&backend, &phase, .{}));
     try std.testing.expectError(error.UnsupportedReaderEpochBackend, CudaCompute.bindCapturedGraphPhase(&backend, &phase, .{}));
-    try std.testing.expectError(error.UnsupportedReaderEpochBackend, CudaCompute.beginLightOnDecodeGraph(&backend, .{}, &phase, 1, &key, &positions, 2, 1024, 8, 16, 1, 1));
+    try std.testing.expectError(error.UnsupportedReaderEpochBackend, CudaCompute.beginBoundedDecodeGraph(&backend, .{}, &phase, 1, &key, &positions, 2, 1024, 8, 16, 1, 1));
 }
 
 test "captured graph prefunded nonempty program and learned workspace replay after exact reader custody park and peer request" {
     if (comptime !cuda_enabled) return error.SkipZigTest;
-    const Graph = @import("lighton_decode_graph.zig");
+    const Graph = @import("bounded_decode_graph.zig");
     const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
     const Session = @import("../../backends/session.zig").Session;
     const Sink = @import("../../execution/retirement_sink.zig");
@@ -55403,7 +55336,7 @@ test "captured graph prefunded nonempty program and learned workspace replay aft
     var parked = CudaCompute.ReaderEpochPark{};
     defer {
         if (compute.ctx.debug_graph_capture_active) {
-            compute.lighton_decode_graph.pending_graph = compute.ctx.endStreamCapture() catch platform.inference_process_supervisor.restartWorker();
+            compute.bounded_decode_graph.pending_graph = compute.ctx.endStreamCapture() catch platform.inference_process_supervisor.restartWorker();
         }
         if (parked.compute != null) {
             parked.prepareRestore(&scoped, &compute) catch platform.inference_process_supervisor.restartWorker();
@@ -55431,10 +55364,10 @@ test "captured graph prefunded nonempty program and learned workspace replay aft
     try storage.prepareOutside(&model);
     defer storage.destroyOutside();
     try storage.bind(.{ .boundary = &epoch });
-    try compute.lighton_decode_graph.resetPrepared(&compute.ctx, &storage);
-    compute.lighton_decode_graph.epoch_id = 1;
+    try compute.bounded_decode_graph.resetPrepared(&compute.ctx, &storage);
+    compute.bounded_decode_graph.epoch_id = 1;
     try storage.close(.{ .boundary = &epoch });
-    const owner = &compute.lighton_decode_graph;
+    const owner = &compute.bounded_decode_graph;
     owner.plan.?.allocate(1024, 0x1000);
     owner.plan.?.release(0x1000);
     try std.testing.expect(owner.plan.?.finishNoOutput());
@@ -55479,7 +55412,7 @@ test "captured graph prefunded nonempty program and learned workspace replay aft
     guard.finish();
     epoch.release();
     try std.testing.expect(compute.run_budget == null);
-    try std.testing.expect(compute.lighton_decode_graph.graph == null);
+    try std.testing.expect(compute.bounded_decode_graph.graph == null);
     // An actual peer request mutates its own request state/workspace while the
     // old graph and all its captured addresses remain in exclusive park custody.
     guard = try sink.enter();
@@ -55620,7 +55553,7 @@ test "CUDA checked deferred drain reports each successful SDK death before a lat
 
 test "CUDA actual nonempty managed graph outside State cleanup refunds only after real KV and graph mutex unlock" {
     if (comptime !cuda_enabled) return error.SkipZigTest;
-    const Graph = @import("lighton_decode_graph.zig");
+    const Graph = @import("bounded_decode_graph.zig");
     const Memory = @import("../../runtime/tier/memory.zig");
     const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
     const Session = @import("../../backends/session.zig").Session;
@@ -55638,7 +55571,7 @@ test "CUDA actual nonempty managed graph outside State cleanup refunds only afte
         held: bool = false,
         fn check(self: *@This()) void {
             if (!self.kv.tryLock()) self.held = true else self.kv.unlock();
-            if (!self.compute.lighton_decode_graph.mutex.tryLock()) self.held = true else self.compute.lighton_decode_graph.mutex.unlock();
+            if (!self.compute.bounded_decode_graph.mutex.tryLock()) self.held = true else self.compute.bounded_decode_graph.mutex.unlock();
         }
         fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -55695,7 +55628,7 @@ test "CUDA actual nonempty managed graph outside State cleanup refunds only afte
     var epoch = try guard.retainEpoch();
     defer epoch.release();
     try phase.bind(.{ .boundary = &epoch });
-    const graph = &compute.lighton_decode_graph;
+    const graph = &compute.bounded_decode_graph;
     try graph.resetPrepared(&compute.ctx, &phase);
     graph.epoch_id = 1;
     try phase.close(.{ .boundary = &epoch });
@@ -55798,7 +55731,7 @@ test "CUDA legacy three raw graph quotas preserve explicit outside invalidate an
         held: bool = false,
         releases: usize = 0,
         fn check(self: *@This()) void {
-            if (!self.compute.lighton_decode_graph.mutex.tryLock()) self.held = true else self.compute.lighton_decode_graph.mutex.unlock();
+            if (!self.compute.bounded_decode_graph.mutex.tryLock()) self.held = true else self.compute.bounded_decode_graph.mutex.unlock();
         }
         fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -55824,7 +55757,7 @@ test "CUDA legacy three raw graph quotas preserve explicit outside invalidate an
     const key = [_]u64{ 1, 2, 3 };
     const positions: [384]u32 = @splat(1);
     for (0..2) |method| {
-        const graph = &compute.lighton_decode_graph;
+        const graph = &compute.bounded_decode_graph;
         try graph.reset(&compute.ctx, &key, &positions, 128, 1024, 8);
         graph.epoch_id = method + 1;
         graph.plan.?.allocate(512, 0x1000);

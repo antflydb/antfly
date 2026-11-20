@@ -126,7 +126,7 @@ pub const Decoder = struct {
                 valid_rows = @intCast(row + 1);
             };
             if (self.position > self.limit or valid_rows > self.limit - self.position) return error.InvalidResidentDecodePosition;
-            return @import("decoder_frontend.zig").geometry(self.config, rows, self.capacity);
+            return @import("../architectures/frontends/decoder.zig").geometry(self.config, rows, self.capacity);
         };
         return error.MissingInputs;
     }

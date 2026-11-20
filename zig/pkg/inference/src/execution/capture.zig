@@ -57,6 +57,56 @@ pub const Input = struct {
     }
 };
 
+/// Shared host-stage ABI checks. Model adapters retain names, ranks, masks,
+/// vocabulary bounds and architecture-specific geometry. No tensor is uploaded.
+pub fn validateHostInputs(inputs: []const Input) !void {
+    for (inputs, 0..) |input, index| {
+        _ = try inputShape(input.tensor);
+        for (inputs[0..index]) |previous| if (std.mem.eql(u8, previous.tensor.name, input.tensor.name)) return error.DuplicateInputs;
+    }
+}
+
+pub fn findInput(inputs: []const Input, name: []const u8) ?Input {
+    for (inputs) |input| if (std.mem.eql(u8, input.tensor.name, name)) return input;
+    return null;
+}
+pub fn findTensor(inputs: []const Input, name: []const u8) ?tensor.Tensor {
+    return if (findInput(inputs, name)) |input| input.tensor else null;
+}
+pub fn findUniqueTensor(inputs: []const Input, name: []const u8) !?tensor.Tensor {
+    var found: ?tensor.Tensor = null;
+    for (inputs) |input| if (std.mem.eql(u8, input.tensor.name, name)) {
+        if (found != null) return error.DuplicateInputs;
+        found = input.tensor;
+    };
+    return found;
+}
+pub fn requireHostTensor(value: tensor.Tensor, dtype: tensor.DType, rank: usize) !void {
+    _ = try inputShape(value);
+    if (value.dtype != dtype or value.shape.len != rank) return error.InvalidInputShape;
+    for (value.shape) |dim| if (dim <= 0 or dim > std.math.maxInt(i32)) return error.InvalidInputShape;
+    const aligned = switch (dtype) {
+        .f32 => value.isAlignedFor(f32),
+        .i32 => value.isAlignedFor(i32),
+        .i64 => value.isAlignedFor(i64),
+        else => true,
+    };
+    if (!aligned) return error.InvalidInputShape;
+}
+
+/// Ownership transfers even on publication failure. Borrowed request inputs
+/// must be retained by the provider before being published through this API.
+pub fn publishOutput(a: std.mem.Allocator, cb: *const ops.ComputeBackend, name: []const u8, value: ops.CT) ![]Output {
+    errdefer cb.free(value);
+    const outputs = try a.alloc(Output, 1);
+    outputs[0] = .{ .name = name, .value = value };
+    return outputs;
+}
+pub fn publishReshapedOutput(a: std.mem.Allocator, cb: *const ops.ComputeBackend, value: ops.CT, name: []const u8, shape: []const i64) ![]Output {
+    defer cb.free(value);
+    return publishOutput(a, cb, name, try cb.primReshape(value, shape));
+}
+
 pub const Output = struct {
     name: []const u8,
     value: ops.CT,
@@ -113,7 +163,7 @@ pub fn inputShape(input: tensor.Tensor) !ml.graph.Shape {
 pub fn specializationKey(forward: Forward, inputs: []const Input) ![32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(std.mem.asBytes(&forward.fingerprint));
-    hash.update(&.{ @intFromEnum(forward.optimization), @intFromEnum(forward.device_inputs) });
+    hash.update(&.{ @backingInt(forward.optimization), @backingInt(forward.device_inputs) });
     hash.update(std.mem.asBytes(&forward.resident_capacity));
     hash.update(&.{@intFromBool(forward.resident_initial)});
     hash.update(&.{@backingInt(forward.precision)});
@@ -278,4 +328,41 @@ test "model program precision participates in specialization identity" {
     forward.residual_storage = .activation;
     forward.precision = .bf16;
     try std.testing.expect(!std.mem.eql(u8, &strict, &try specializationKey(forward, &.{})));
+}
+
+test "shared model stage contracts reject duplicate malformed and misaligned inputs" {
+    const a = std.testing.allocator;
+    var value = try tensor.Tensor.initFloat32(a, "features", &.{ 1, 2 }, &.{ 1, 2 });
+    defer value.deinit();
+    const inputs = [_]Input{.{ .tensor = value }};
+    try validateHostInputs(&inputs);
+    try requireHostTensor(value, .f32, 2);
+    try std.testing.expect((try findUniqueTensor(&inputs, "missing")) == null);
+    try std.testing.expectEqual(value.data.ptr, (try findUniqueTensor(&inputs, "features")).?.data.ptr);
+    try std.testing.expectError(error.DuplicateInputs, validateHostInputs(&.{ inputs[0], inputs[0] }));
+    try std.testing.expectError(error.DuplicateInputs, findUniqueTensor(&.{ inputs[0], inputs[0] }, "features"));
+    try std.testing.expectError(error.InvalidInputShape, requireHostTensor(value, .i64, 2));
+    var malformed = value;
+    malformed.data = malformed.data[0..4];
+    try std.testing.expectError(error.InvalidInputShape, validateHostInputs(&.{.{ .tensor = malformed }}));
+    var bytes: [16]u8 align(8) = @splat(0);
+    var misaligned = value;
+    misaligned.data = bytes[1..9];
+    try std.testing.expectError(error.InvalidInputShape, requireHostTensor(misaligned, .f32, 2));
+}
+
+test "shared model stage publication owns reshaped outputs and refunds failed allocation" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testStagePublication, .{});
+}
+fn testStagePublication(a: std.mem.Allocator) !void {
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    const value = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    const outputs = try publishReshapedOutput(a, &cb, value, "logits", &.{ 1, 4 });
+    defer a.free(outputs);
+    defer cb.free(outputs[0].value);
+    const actual = try cb.toFloat32(outputs[0].value, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, actual);
 }
