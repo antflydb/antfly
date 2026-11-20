@@ -1369,21 +1369,59 @@ pub const RoaringBitmap = struct {
     }
 
     pub fn orWith(self: *RoaringBitmap, other: *const RoaringBitmap) !void {
+        if (self == other or other.keys.items.len == 0) return;
         self.invalidateRankCache();
-        for (other.keys.items, other.containers.items) |ok, *oc| {
-            if (oc.isEmpty()) continue;
-            const insert_idx = self.lowerChunk(ok);
-            if (insert_idx < self.keys.items.len and self.keys.items[insert_idx] == ok) {
-                try orContainers(self.alloc, &self.containers.items[insert_idx], oc);
-            } else {
-                var container = try cloneContainer(self.alloc, oc);
-                errdefer container.deinit(self.alloc);
-                try self.keys.ensureUnusedCapacity(self.alloc, 1);
-                try self.containers.ensureUnusedCapacity(self.alloc, 1);
-                self.keys.insertAssumeCapacity(insert_idx, ok);
-                self.containers.insertAssumeCapacity(insert_idx, container);
-            }
+
+        var extra: usize = 0;
+        var left: usize = 0;
+        for (other.keys.items, other.containers.items) |key, *container| {
+            while (left < self.keys.items.len and self.keys.items[left] < key) left += 1;
+            if ((left == self.keys.items.len or self.keys.items[left] != key) and !container.isEmpty()) extra += 1;
         }
+
+        var remaining = self.keys.items.len;
+        const total = remaining + extra;
+        try self.keys.ensureTotalCapacity(self.alloc, total);
+        try self.containers.ensureTotalCapacity(self.alloc, total);
+        self.keys.items.len = total;
+        self.containers.items.len = total;
+
+        // Merge backward so the reserved tail can hold results without a
+        // second directory. On failure, retain the completed union suffix
+        // and the original left prefix as a valid partial union.
+        var write = total;
+        errdefer {
+            const end = remaining + total - write;
+            std.mem.copyForwards(u16, self.keys.items[remaining..end], self.keys.items[write..total]);
+            std.mem.copyForwards(Container, self.containers.items[remaining..end], self.containers.items[write..total]);
+            self.keys.shrinkRetainingCapacity(end);
+            self.containers.shrinkRetainingCapacity(end);
+        }
+        var right = other.keys.items.len;
+        while (right != 0) {
+            right -= 1;
+            const key = other.keys.items[right];
+            const container = &other.containers.items[right];
+            if (container.isEmpty()) continue;
+
+            while (remaining != 0 and self.keys.items[remaining - 1] > key) {
+                remaining -= 1;
+                write -= 1;
+                if (write != remaining) {
+                    self.keys.items[write] = self.keys.items[remaining];
+                    self.containers.items[write] = self.containers.items[remaining];
+                }
+            }
+            const merged = if (remaining != 0 and self.keys.items[remaining - 1] == key) merged: {
+                try orContainers(self.alloc, &self.containers.items[remaining - 1], container);
+                remaining -= 1;
+                break :merged self.containers.items[remaining];
+            } else try cloneContainer(self.alloc, container);
+            write -= 1;
+            self.keys.items[write] = key;
+            self.containers.items[write] = merged;
+        }
+        std.debug.assert(write == remaining);
     }
 
     pub fn andNotWith(self: *RoaringBitmap, other: *const RoaringBitmap) void {
@@ -3150,4 +3188,64 @@ test "optional numeric range sorted removals drop earlier empty containers" {
     remove.finish();
     try std.testing.expect(bitmap.isEmpty());
     try std.testing.expectEqual(@as(usize, 0), bitmap.containers.capacity);
+}
+
+test "optional numeric range union merges interleaved chunk directories" {
+    const alloc = std.testing.allocator;
+    var left = RoaringBitmap.init(alloc);
+    defer left.deinit();
+    var right = RoaringBitmap.init(alloc);
+    defer right.deinit();
+    for (0..1024) |chunk| {
+        const base: u32 = @as(u32, @intCast(chunk)) << 16;
+        if (chunk % 2 == 0) {
+            try left.add(base + 1);
+        } else {
+            try right.add(base + 1);
+        }
+        if (chunk % 3 == 0) try right.add(base + 2);
+    }
+    try left.orWith(&right);
+    var rows = left.iterator();
+    for (0..1024) |chunk| {
+        const base: u32 = @as(u32, @intCast(chunk)) << 16;
+        try std.testing.expectEqual(base + 1, rows.next().?);
+        if (chunk % 3 == 0) try std.testing.expectEqual(base + 2, rows.next().?);
+    }
+    try std.testing.expect(rows.next() == null);
+    try left.orWith(&left);
+    try std.testing.expectEqual(@as(usize, 1366), left.cardinality());
+}
+
+test "optional numeric range union keeps its directory valid after allocation failure" {
+    const alloc = std.testing.allocator;
+    const left_values = [_]u32{ 65537, 3 * 65536 + 1, 5 * 65536 + 1 };
+    const right_values = [_]u32{ 1, 2 * 65536 + 1, 4 * 65536 + 1, 5 * 65536 + 2 };
+    var right = RoaringBitmap.init(alloc);
+    defer right.deinit();
+    for (right_values) |value| try right.add(value);
+    var saw_failure = false;
+    for (0..8) |offset| {
+        var failing: std.testing.FailingAllocator = .init(alloc, .{});
+        var left = RoaringBitmap.init(failing.allocator());
+        defer left.deinit();
+        for (left_values) |value| try left.add(value);
+        failing.fail_index = failing.alloc_index + offset;
+        left.orWith(&right) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            saw_failure = true;
+            for (left_values) |value| try std.testing.expect(left.contains(value));
+            var rows = left.iterator();
+            var prev = rows.next().?;
+            while (rows.next()) |row| {
+                try std.testing.expect(row > prev);
+                prev = row;
+            }
+            failing.fail_index = std.math.maxInt(usize);
+            try left.orWith(&right);
+        };
+        try std.testing.expectEqual(@as(usize, left_values.len + right_values.len), left.cardinality());
+        for (left_values ++ right_values) |value| try std.testing.expect(left.contains(value));
+    }
+    try std.testing.expect(saw_failure);
 }

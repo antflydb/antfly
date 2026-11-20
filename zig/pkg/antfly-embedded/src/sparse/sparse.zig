@@ -5808,6 +5808,7 @@ pub const SparseIndex = struct {
             error.InvalidData,
             error.InvalidSegment,
             error.InvalidTableFile,
+            error.CorruptInput,
             error.CrcMismatch,
             error.TableBlockChecksumMismatch,
             error.InputOutput,
@@ -7653,7 +7654,7 @@ test "optional numeric range sparse proof falls back on transient reads and prop
         .vtable = &.{ .abort = Failure.abort, .get = Failure.get, .open_cursor = Failure.cursor, .open_read_scope = Failure.openScope },
     };
     defer txn.abort();
-    for ([_]anyerror{ error.StorageReadTemporarilyUnavailable, error.InvalidTableFile, error.TableBlockChecksumMismatch, error.EndOfStream, error.InputOutput, error.FileNotFound, error.WouldBlock, error.OutOfMemory }) |err| {
+    for ([_]anyerror{ error.StorageReadTemporarilyUnavailable, error.InvalidTableFile, error.CorruptInput, error.TableBlockChecksumMismatch, error.EndOfStream, error.InputOutput, error.FileNotFound, error.WouldBlock, error.OutOfMemory }) |err| {
         failure.err = err;
         var proven = [_]bool{true};
         try std.testing.expect(!try SparseIndex.tryProveProjectionDocNums(alloc, &txn, &.{1}, &.{"doc"}, &proven, .{}));
