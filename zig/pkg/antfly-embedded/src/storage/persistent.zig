@@ -2649,13 +2649,20 @@ pub const PersistentIndex = struct {
             if (already_copied) continue;
 
             if (deletion_bytes) |bytes| {
-                var bitmap = try roaring.RoaringBitmap.fromPersistedDeletionBytes(alloc, bytes, doc_count.?);
+                const decoded = try roaring.RoaringBitmap.fromPersistedDeletionBytesWithLayout(alloc, bytes, doc_count.?);
+                var bitmap = decoded.bitmap;
+                defer bitmap.deinit();
+                if (decoded.legacy) {
+                    const canonical = try bitmap.toBytes(alloc);
+                    defer alloc.free(canonical);
+                    try dest_txn.put(.deletions, &seg_key, canonical);
+                } else {
+                    try dest_txn.put(.deletions, &seg_key, bytes);
+                }
                 if (!bitmap.isEmpty()) {
                     replacement_deleted[replacements_initialized] = bitmap;
-                } else {
-                    bitmap.deinit();
+                    bitmap = roaring.RoaringBitmap.init(alloc);
                 }
-                try dest_txn.put(.deletions, &seg_key, bytes);
             }
 
             replacements[replacements_initialized] = .{
@@ -5095,6 +5102,18 @@ test "persistent index hands off right-only segments to child index" {
     try src.indexSegment(right_seg);
     try std.testing.expect(try src.deleteById("doc:z"));
 
+    const right_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 2)));
+    {
+        // Simulate a deletion mask written before canonical serialization.
+        var legacy: [6 + 8192]u8 = @splat(0);
+        legacy[0] = 1;
+        legacy[6] = 2;
+        var txn = try src.beginWriteMainTxn();
+        errdefer txn.abort();
+        try txn.put(.deletions, &right_key, &legacy);
+        try txn.commit();
+    }
+
     const mixed_seg = try buildMultiDocSegment(alloc, &.{
         .{ .doc_id = "doc:f", .term = "foxtrot" },
         .{ .doc_id = "doc:t", .term = "tango" },
@@ -5123,6 +5142,16 @@ test "persistent index hands off right-only segments to child index" {
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
     try std.testing.expectEqualStrings("doc:m", ranges[0].min_doc_key);
     try std.testing.expectEqualStrings("doc:z", ranges[0].max_doc_key);
+
+    {
+        var txn = try dest.beginReadMainTxn();
+        defer txn.abort();
+        const mask = try txn.get(.deletions, &right_key);
+        try std.testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0, 0, 0, 1, 0 }, mask);
+        var bitmap = try roaring.RoaringBitmap.fromBytes(alloc, mask);
+        defer bitmap.deinit();
+        try std.testing.expect(bitmap.contains(1));
+    }
 
     const snap = dest.snapshot();
     try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());

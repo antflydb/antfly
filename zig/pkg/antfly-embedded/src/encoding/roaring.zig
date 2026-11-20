@@ -1298,18 +1298,28 @@ pub const RoaringBitmap = struct {
         return decodeBytes(alloc, data, null);
     }
 
+    pub fn fromPersistedDeletionBytes(alloc: Allocator, data: []const u8, doc_count: u32) !RoaringBitmap {
+        return (try fromPersistedDeletionBytesWithLayout(alloc, data, doc_count)).bitmap;
+    }
+
     /// Older deletion records wrote the in-memory container representation,
     /// which could differ from the encoding implied by the cardinality.
-    pub fn fromPersistedDeletionBytes(alloc: Allocator, data: []const u8, doc_count: u32) !RoaringBitmap {
+    pub fn fromPersistedDeletionBytesWithLayout(alloc: Allocator, data: []const u8, doc_count: u32) !struct {
+        bitmap: RoaringBitmap,
+        legacy: bool,
+    } {
         var result = fromBytes(alloc, data) catch |err| switch (err) {
-            error.InvalidRoaringBitmap => return decodeLegacyDeletionBytes(alloc, data, doc_count),
+            error.InvalidRoaringBitmap => return .{
+                .bitmap = try decodeLegacyDeletionBytes(alloc, data, doc_count),
+                .legacy = true,
+            },
             else => return err,
         };
         errdefer result.deinit();
         if (result.maximum()) |ordinal| {
             if (ordinal >= doc_count) return error.InvalidRoaringBitmap;
         }
-        return result;
+        return .{ .bitmap = result, .legacy = false };
     }
 
     fn decodeBytes(alloc: Allocator, data: []const u8, legacy_alternate: ?[]const bool) !RoaringBitmap {
@@ -1359,7 +1369,23 @@ pub const RoaringBitmap = struct {
             cumulative[i] = running;
             running += card;
             const dense = (card > array_max) != (legacy_alternate != null and legacy_alternate.?[i]);
-            if (dense) {
+            if (dense and card <= array_max) {
+                var array: std.ArrayListUnmanaged(u16) = .empty;
+                errdefer array.deinit(alloc);
+                try array.ensureTotalCapacityPrecise(alloc, card);
+                for (0..bitmap_words) |word_index| {
+                    var word = std.mem.readInt(u64, data[pos..][0..8], .little);
+                    pos += 8;
+                    if (@popCount(word) > card - array.items.len) return error.InvalidRoaringBitmap;
+                    while (word != 0) {
+                        const bit: usize = @ctz(word);
+                        array.appendAssumeCapacity(@intCast(word_index * 64 + bit));
+                        word &= word - 1;
+                    }
+                }
+                if (array.items.len != card) return error.InvalidRoaringBitmap;
+                bm.containers.appendAssumeCapacity(.{ .array = array });
+            } else if (dense) {
                 // Bitmap container
                 const words = try alloc.alloc(u64, bitmap_words);
                 errdefer alloc.free(words);
@@ -3573,6 +3599,8 @@ test "optional numeric range persisted deletion decoder recovers older mixed con
     try std.testing.expectError(error.InvalidRoaringBitmap, RoaringBitmap.fromBytes(alloc, &legacy));
     var recovered = try RoaringBitmap.fromPersistedDeletionBytes(alloc, &legacy, 3 * 65536);
     defer recovered.deinit();
+    try std.testing.expect(recovered.containers.items[1] == .array);
+    try std.testing.expectEqual(@as(usize, 3), recovered.containers.items[1].array.capacity);
     var deleted = recovered.iterator();
     for ([_]u32{ 10, 65536, 65536 + 102, 65536 + 9999, 2 * 65536 + 14, 2 * 65536 + 20 }) |expected| {
         try std.testing.expectEqual(@as(?u32, expected), deleted.next());
