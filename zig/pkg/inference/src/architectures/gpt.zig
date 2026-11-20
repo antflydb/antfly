@@ -13293,7 +13293,7 @@ fn computePleVectorsFromTokenEmbeddingTensorPath(
 
     const embed_scale_val = @sqrt(@as(f32, @floatFromInt(ple_dim)));
     const combine_scale_val: f32 = 1.0 / @sqrt(2.0);
-    if (try cb.rmsNormAddWeightedEmbeddingTensor(model_proj_raw, proj_norm_w, token_w, input_token, total, num_layers, ple_dim, config.norm_eps, embed_scale_val * combine_scale_val, combine_scale_val)) |fused| {
+    if (try cb.rmsNormAddWeightedEmbeddingTensor(model_proj_raw, proj_norm_w, token_w, input_token, total, num_layers, ple_dim, config.pleProjectionNormEps(), embed_scale_val * combine_scale_val, combine_scale_val)) |fused| {
         cb.free(model_proj_raw);
         return fused;
     }
@@ -13302,7 +13302,7 @@ fn computePleVectorsFromTokenEmbeddingTensorPath(
         defer cb.free(model_proj_raw);
         defer cb.free(reshaped);
 
-        const normed_flat = try cb.rmsNorm(reshaped, proj_norm_w, ple_dim, config.norm_eps);
+        const normed_flat = try cb.rmsNorm(reshaped, proj_norm_w, ple_dim, config.pleProjectionNormEps());
         defer cb.free(normed_flat);
 
         const normed_proj = (try cb.reshape2d(normed_flat, total, ple_total_dim)) orelse
@@ -13354,7 +13354,7 @@ fn computePleVectorsFromTokenPath(
         defer cb.free(model_proj_raw);
         defer cb.free(reshaped);
 
-        const normed_flat = try cb.rmsNorm(reshaped, proj_norm_w, ple_dim, config.norm_eps);
+        const normed_flat = try cb.rmsNorm(reshaped, proj_norm_w, ple_dim, config.pleProjectionNormEps());
         defer cb.free(normed_flat);
 
         const normed_proj = (try cb.reshape2d(normed_flat, total, ple_total_dim)) orelse
@@ -13362,7 +13362,8 @@ fn computePleVectorsFromTokenPath(
         defer cb.free(normed_proj);
 
         // HF: (RMSNorm(proj) + embed * sqrt(ple_dim)) * (1/sqrt(2))
-        // RMSNorm is scale-invariant so 1/sqrt(hidden) pre-norm factor washes out.
+        // Fold the pre-norm scale into epsilon: RMSNorm(x/sqrt(H), eps)
+        // equals RMSNorm(x, H*eps), including low-variance projection rows.
         const embed_scale_val = @sqrt(@as(f32, @floatFromInt(ple_dim)));
         const combine_scale_val: f32 = 1.0 / @sqrt(2.0);
         if (try cb.addWeightedScalars(token_embd_raw, normed_proj, embed_scale_val * combine_scale_val, combine_scale_val)) |fused| {
@@ -13389,7 +13390,7 @@ fn computePleVectorsFromTokenPath(
 
     // CPU fallback (native path): rmsNorm handles chunked dim natively.
     defer cb.free(model_proj_raw);
-    const normed_proj = try cb.rmsNorm(model_proj_raw, proj_norm_w, ple_dim, config.norm_eps);
+    const normed_proj = try cb.rmsNorm(model_proj_raw, proj_norm_w, ple_dim, config.pleProjectionNormEps());
     defer cb.free(normed_proj);
 
     const token_data = try cb.toFloat32(token_embd_raw, allocator);
@@ -13591,6 +13592,48 @@ fn applyReluSquared(cb: *const ComputeBackend, input: CT) !CT {
 }
 
 // --- Embedding weight helper ---
+
+test "Gemma4 PLE context normalization preserves projection scale with nonzero epsilon" {
+    const a = std.testing.allocator;
+    var store = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(a, &store);
+    var compute = native_compute_mod.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const matrix = [_]f32{ 0.01, 0, 0, 0, 0, 0.02, 0, 0, 0, 0, 0.03, 0, 0, 0, 0, 0.04 };
+    const tokens = [_]f32{ 0.2, -0.3, 0.4, -0.5, -0.1, 0.2, -0.3, 0.4 };
+    const norm_weight = [_]f32{ 1.25, 0.75 };
+    try putDeepSeekV4TestWeight(a, &store, "model.embed_tokens_per_layer.weight", &.{ 2, 4 }, &tokens);
+    try putDeepSeekV4TestWeight(a, &store, "model.per_layer_model_projection.weight", &.{ 4, 4 }, &matrix);
+    try putDeepSeekV4TestWeight(a, &store, "model.per_layer_projection_norm.weight", &.{2}, &norm_weight);
+    const hidden_values = [_]f32{ 0.5, -0.25, 0.125, -0.0625, 0.125, 0.25, -0.5, 0.0625 };
+    const hidden = try cb.fromFloat32Shape(&hidden_values, &.{ 2, 4 });
+    defer cb.free(hidden);
+    for ([_]f32{ 0, 1e-6, 1e-3 }) |epsilon| {
+        const cfg = Config{ .family = .gemma, .hidden_size = 4, .num_hidden_layers = 2, .ple_hidden_size = 2, .norm_eps = epsilon };
+        const output = (try computePleVectors(&cb, a, cfg, &.{ 0, 1 }, hidden, 2)).?;
+        defer cb.free(output);
+        const values = try cb.toFloat32(output, a);
+        defer a.free(values);
+        // Independent literal reference: scale the projection before RMSNorm,
+        // rather than using the production epsilon transformation.
+        for (0..2) |row| for (0..2) |layer| {
+            var scaled: [2]f32 = undefined;
+            for (0..2) |d| {
+                const col = layer * 2 + d;
+                var dot: f32 = 0;
+                for (0..4) |k| dot += hidden_values[row * 4 + k] * matrix[col * 4 + k];
+                scaled[d] = dot / @sqrt(@as(f32, 4));
+            }
+            const inv = 1.0 / @sqrt((scaled[0] * scaled[0] + scaled[1] * scaled[1]) / 2 + epsilon);
+            for (0..2) |d| {
+                const i = row * 4 + layer * 2 + d;
+                const expected = (scaled[d] * inv * norm_weight[d] + tokens[i] * @sqrt(@as(f32, 2))) / @sqrt(@as(f32, 2));
+                try std.testing.expectApproxEqAbs(expected, values[i], 2e-6);
+            }
+        };
+    }
+}
 
 test "gemma4 q attention scale is not duplicated for rope attention" {
     try std.testing.expect(attentionQueryRopeScale(0, 256) == null);
