@@ -46721,6 +46721,10 @@ pub const DB = struct {
     }
 
     fn lookupLiveIdentityDirectoryCallback(ctx: ?*anyopaque, alloc: Allocator, keys: []const []const u8, generation: ?u64) anyerror!?[]?doc_set.DocOrdinal {
+        return lookupLiveIdentityDirectoryAlloc(ctx, alloc, keys, generation, true);
+    }
+
+    fn lookupLiveIdentityDirectoryAlloc(ctx: ?*anyopaque, alloc: Allocator, keys: []const []const u8, generation: ?u64, require_complete: bool) !?[]?doc_set.DocOrdinal {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         var txn = try self.core.store.beginProbeTxn();
         defer txn.abort();
@@ -46732,6 +46736,7 @@ pub const DB = struct {
         errdefer alloc.free(ordinals);
         for (keys, ordinals) |key, *slot| {
             const id = slot.* orelse try doc_identity.lookupLiveOrdinalTxn(alloc, &txn, key) orelse {
+                if (!require_complete) continue;
                 // A stored row with neither lookup key can predate the live
                 // directory. Let the compatibility path consult reverse IDs.
                 const stored_key = try encodeStoreLookupKeyAlloc(self, alloc, key);
@@ -46744,6 +46749,8 @@ pub const DB = struct {
                 return null;
             };
             const state = (try doc_identity.lookupStateTxn(&txn, id)) orelse {
+                slot.* = null;
+                if (!require_complete) continue;
                 alloc.free(ordinals);
                 return null;
             };
@@ -49576,7 +49583,7 @@ pub const DB = struct {
     }
 
     fn graphPriorKeyOrdinalsAlloc(self: *DB, alloc: Allocator, keys: []const []const u8, generation: ?u64) !doc_set.ResolvedDocSet {
-        const ordinals = (try lookupLiveIdentityDirectoryCallback(self, alloc, keys, generation)) orelse
+        const ordinals = (try lookupLiveIdentityDirectoryAlloc(self, alloc, keys, generation, false)) orelse
             try self.lookupLiveDocOrdinalsNoLock(alloc, keys, generation);
         defer alloc.free(ordinals);
         var bitmap = @import("../../encoding/roaring.zig").RoaringBitmap.init(alloc);
@@ -49647,7 +49654,7 @@ pub const DB = struct {
         const ordinals = if (keys) |ids| try self.lookupLiveDocOrdinalsNoLock(a, ids, req.identity_read_generation) else null;
         defer if (ordinals) |ids| a.free(ids);
         if (ordinals) |ids| if (std.mem.indexOfScalar(?doc_set.DocOrdinal, ids, null) != null) {
-            if (try lookupLiveIdentityDirectoryCallback(self, a, keys.?, req.identity_read_generation)) |known| {
+            if (try lookupLiveIdentityDirectoryAlloc(self, a, keys.?, req.identity_read_generation, false)) |known| {
                 defer a.free(known);
                 for (ids, known) |*slot, ordinal| slot.* = slot.* orelse ordinal;
             }
@@ -49679,7 +49686,9 @@ pub const DB = struct {
             .include = &filter.include,
             .exclude = &filter.exclude,
         };
-        const frontier: ?db_query_search.GraphPredicateFrontier = if (keys != null) .{ .ptr = &input, .key_domain = key_domain, .collect = GraphPredicateFrontier.collect } else null;
+        var key_probe = db_query_search.GraphKeyProbe{};
+        defer key_probe.deinit(a);
+        const frontier: ?db_query_search.GraphPredicateFrontier = if (keys != null) .{ .ptr = &input, .key_domain = key_domain, .key_probe = if (key_domain) &key_probe else null, .collect = GraphPredicateFrontier.collect } else null;
         if (key_domain) native.frontier_scoped = true;
         const budget = native.graph_memory.?.tracked.budget.?;
         // Indexed exclusions can narrow policy work. Residual exclusions
@@ -49762,10 +49771,19 @@ pub const DB = struct {
         );
         errdefer alloc.free(ordinals);
 
-        const legacy = try self.graphLegacyVisibilityAlloc(alloc, keys, ordinals, req);
+        const recovered = if (std.mem.indexOfScalar(?doc_set.DocOrdinal, ordinals, null) != null)
+            try lookupLiveIdentityDirectoryAlloc(self, alloc, keys, req.identity_read_generation, false)
+        else
+            null;
+        defer if (recovered) |values| alloc.free(values);
+        const membership_ordinals = if (recovered) |values| values: {
+            for (values, ordinals) |*slot, original| slot.* = original orelse slot.*;
+            break :values values;
+        } else ordinals;
+        const legacy = try self.graphLegacyVisibilityAlloc(alloc, keys, membership_ordinals, req);
         defer alloc.free(legacy);
         var live_count: usize = 0;
-        for (ordinals, legacy) |ordinal, present| {
+        for (membership_ordinals, legacy) |ordinal, present| {
             if (ordinal != null or present) live_count += 1;
         }
 
@@ -49792,7 +49810,7 @@ pub const DB = struct {
             for (hits[0..initialized]) |*hit| hit.deinit(alloc);
             if (hits.len > 0) alloc.free(hits);
         };
-        for (keys, ordinals, legacy, 0..) |key, ordinal, present, i| {
+        for (keys, membership_ordinals, legacy, 0..) |key, ordinal, present, i| {
             if (ordinal == null and !present) continue;
             const id = try alloc.dupe(u8, key);
             errdefer alloc.free(id);
@@ -49841,7 +49859,7 @@ pub const DB = struct {
         errdefer if (stored_data) |items| freeOptionalOwnedBytes(alloc, items);
 
         var filtered_index: usize = 0;
-        for (keys, ordinals, legacy, 0..) |key, ordinal, present, i| {
+        for (keys, membership_ordinals, legacy, 0..) |key, ordinal, present, i| {
             if (ordinal == null and !present) continue;
             const allowed = filtered_index < filtered.hits.len and
                 std.mem.eql(u8, key, filtered.hits[filtered_index].id);
@@ -156913,6 +156931,7 @@ test "optional numeric range reconciles witnessed text coverage with primary ide
         .exact_fields = &.{.{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .numeric, .doc_values = true } }},
     });
     try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{ .name = "partial_ft", .kind = .full_text, .config_json = "{\"field\":\"title\"}" });
     try db.addIndex(.{ .name = "dv", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"external\":true}" });
     try db.batch(.{ .sync_level = .full_index, .writes = &.{
         .{ .key = "a", .value = "{\"body\":\"beacon\",\"rank\":2,\"_embeddings\":{\"dv\":[1,0]}}" },
@@ -157026,6 +157045,21 @@ test "optional numeric range reconciles witnessed text coverage with primary ide
         try txn.commit();
     }
     const relay = "{\"match\":{\"field\":\"body\",\"text\":\"relay\"}}";
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.filterGraphKeysAlloc(a, .{
+        .index_name = "partial_ft",
+        .exclusion_query_json = relay,
+    }, &.{"b"}));
+    const legacy_key = try encodeStoreLookupKeyAlloc(&db, a, "prior-legacy");
+    defer a.free(legacy_key);
+    try db.core.store.put(legacy_key, "{\"body\":\"legacy\"}");
+    const mixed_prior = doc_set.ResolvedDocFilter{ .exclude = .{ .doc_keys = &.{ "prior-legacy", "b" } } };
+    const prior_mask = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = relay,
+        .resolved_doc_filter = &mixed_prior,
+    }, &.{"b"});
+    defer a.free(prior_mask);
+    try std.testing.expectEqualSlices(bool, &.{false}, prior_mask);
     const relay_range = "{\"conjuncts\":[" ++ relay ++ ",{\"range\":{\"rank\":{\"gte\":1}}}]}";
     var admission = try db.filterGraphKeysWithOrdinalsAlloc(a, .{
         .index_name = "ft",
@@ -157113,6 +157147,22 @@ test "optional numeric range prefilters dense search without a text index" {
     defer legacy_scope.deinit(a);
     try std.testing.expectEqual(@as(?usize, 1), legacy_scope.rows.estimatedCardinality());
     try std.testing.expectEqualStrings("a", legacy_scope.legacy.doc_keys[0]);
+
+    const all_range = "{\"range\":{\"rank\":{\"gte\":9007199254740992}}}";
+    for ([_]struct { exclusion: []const u8, count: usize }{
+        .{ .exclusion = "", .count = 2 },
+        .{ .exclusion = all_range, .count = 0 },
+    }) |case| {
+        var mixed = try db.searchDenseProfiled(a, .{
+            .index_name = "dv",
+            .limit = 2,
+            .include_stored = false,
+            .filter_query_json = all_range,
+            .exclusion_query_json = case.exclusion,
+        }, .{ .vector = &.{ 1, 0 }, .k = 2 });
+        defer mixed.result.deinit();
+        try std.testing.expectEqual(case.count, mixed.result.hits.len);
+    }
 
     for ([_][]const []const u8{ &.{}, &.{ "a", "b" } }) |ids| {
         var result = try db.searchDenseProfiled(a, .{

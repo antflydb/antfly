@@ -1886,6 +1886,8 @@ const NativeDenseConstraints = struct {
 
 const NativeDocIdConstraints = struct {
     positive_filter: bool = false,
+    legacy_filter: doc_set.ResolvedDocSet = .none,
+    legacy_exclude: doc_set.ResolvedDocSet = .none,
     primary_include: doc_set.ResolvedDocSet = .all,
     filter_doc_ids: []const []const u8 = &.{},
     exclude_doc_ids: []const []const u8 = &.{},
@@ -1907,6 +1909,8 @@ const NativeDocIdConstraints = struct {
         if (self.filter_doc_nums_owned and self.filter_doc_nums.len > 0) alloc.free(@constCast(self.filter_doc_nums));
         if (self.exclude_doc_nums_owned and self.exclude_doc_nums.len > 0) alloc.free(@constCast(self.exclude_doc_nums));
         if (self.broad_live_exclude_doc_nums_owned and self.broad_live_exclude_doc_nums.len > 0) alloc.free(@constCast(self.broad_live_exclude_doc_nums));
+        self.legacy_filter.deinit(alloc);
+        self.legacy_exclude.deinit(alloc);
         self.primary_include.deinit(alloc);
         self.* = undefined;
     }
@@ -1951,6 +1955,8 @@ pub const StructuredFilterResolverExecutor = struct {
     lookup_live_identity: ?*const fn (?*anyopaque, Allocator, []const []const u8, ?u64) anyerror!?[]?doc_set.DocOrdinal = null,
     primary_residual_scope: ?PrimaryResidualScope = null,
     range_projection_current: ?RangeProjectionCurrent = null,
+    retain_legacy_union: bool = false,
+    legacy_matches: ?*doc_set.ResolvedDocSet = null,
     structured_visibility_verified: ?*bool = null,
     live_filter_doc_set: ?*const fn (
         ctx: ?*anyopaque,
@@ -2523,6 +2529,7 @@ fn deriveNativeDocIdConstraintsAlloc(
         var visible = false;
         var resolver = active_executor;
         resolver.structured_visibility_verified = &visible;
+        if (resolver.retain_legacy_union) resolver.legacy_matches = &out.legacy_filter;
         if (try collectStructuredFilterWithinConstraints(alloc, req, resolver, &out, req.filter_query_json)) |resolved| {
             var owned_resolved = resolved;
             defer owned_resolved.deinit(alloc);
@@ -2598,7 +2605,14 @@ fn deriveNativeDocIdConstraintsAlloc(
         var visible = false;
         var resolver = active_executor;
         resolver.structured_visibility_verified = &visible;
-        if (try collectStructuredFilterWithinConstraints(alloc, req, resolver, &out, req.exclusion_query_json)) |resolved| {
+        if (resolver.retain_legacy_union) resolver.legacy_matches = &out.legacy_exclude;
+        // A positive residual union includes keys outside its ordinal operand.
+        // Evaluate the exclusion over the request scope in this case.
+        const resolved_exclusion = if (out.legacy_filter == .none)
+            try collectStructuredFilterWithinConstraints(alloc, req, resolver, &out, req.exclusion_query_json)
+        else
+            try collectStructuredFilterResolvedDocSetAlloc(alloc, req, resolver, req.exclusion_query_json);
+        if (resolved_exclusion) |resolved| {
             var owned_resolved = resolved;
             defer owned_resolved.deinit(alloc);
             const filter = doc_set.ResolvedDocFilter{
@@ -2650,6 +2664,12 @@ fn deriveNativeDocIdConstraintsAlloc(
             }
         }
         if (bench_query_profile) exclusion_json_ns += platform_time.monotonicNs() - phase_start_ns;
+    }
+
+    if (active_executor.text_snapshot_for_doc_num_projection) |snapshot| {
+        const control = query_mod.ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
+        try mergeLegacyResidualTextDocNumsAlloc(alloc, snapshot, &out.legacy_filter, &out.filter_doc_nums, &out.filter_doc_nums_owned, control);
+        try mergeLegacyResidualTextDocNumsAlloc(alloc, snapshot, &out.legacy_exclude, &out.exclude_doc_nums, &out.exclude_doc_nums_owned, control);
     }
 
     if (active_executor.apply_live_all_docs and !out.positive_filter) {
@@ -2753,6 +2773,39 @@ fn applyResolvedTextDocNumFilterAlloc(
             out.resolved_stored_filters = true;
         },
     }
+}
+
+fn mergeLegacyResidualTextDocNumsAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    legacy: *const doc_set.ResolvedDocSet,
+    doc_nums: *[]const u32,
+    owned: *bool,
+    control: query_mod.ExecutionControl,
+) !void {
+    if (legacy.* != .doc_keys) return;
+    var frontier: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+    defer frontier.deinit(alloc);
+    for (legacy.doc_keys, 0..) |key, i| {
+        try control.check();
+        try frontier.put(alloc, std.math.cast(u32, i) orelse return error.InvalidData, key);
+    }
+    var documents = try snapshot.collectGraphKeyFrontierDocNumsAlloc(alloc, frontier, control);
+    defer documents.deinit();
+    if (documents.bitmap.cardinality() == 0) return;
+    const added = try alloc.alloc(u32, documents.bitmap.cardinality());
+    defer alloc.free(added);
+    var iter = documents.bitmap.iterator();
+    for (added) |*number| number.* = iter.next().?;
+    try mergeResidualDocNumsAlloc(alloc, doc_nums, owned, added);
+}
+
+fn mergeResidualDocNumsAlloc(alloc: Allocator, doc_nums: *[]const u32, owned: *bool, added: []const u32) !void {
+    if (added.len == 0) return;
+    const merged = try unionDocNumsAlloc(alloc, doc_nums.*, added);
+    if (owned.* and doc_nums.*.len != 0) alloc.free(doc_nums.*);
+    doc_nums.* = merged;
+    owned.* = true;
 }
 
 fn applyResolvedDocFilterAlloc(
@@ -9752,6 +9805,7 @@ const IndexedPredicateEvaluator = struct {
     key_domain: ?*const std.StringHashMapUnmanaged(u32) = null,
     skip_unmapped: bool = false,
     reconcile_primary_ranges: bool = false,
+    empty_analyzed_fields_authoritative: bool = false,
     range_projection_is_current: bool = true,
     presence_cache_prefix: ?[]const u8 = null,
     local_cache: ?LocalCache = null,
@@ -9908,7 +9962,7 @@ const IndexedPredicateEvaluator = struct {
 
     fn indexed(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery) !bool {
         if (self.reconcile_primary_ranges and hasStoredStandardRange(query)) return false;
-        return searchQueryCanUseSnapshotWithControl(self.snapshot, query, self.analysis, self.schema, false, self.control);
+        return searchQueryCanUseSnapshotWithCoverage(self.snapshot, query, self.analysis, self.schema, false, self.control, self.empty_analyzed_fields_authoritative);
     }
 
     fn executeIndexed(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery) !roaring.RoaringBitmap {
@@ -10914,9 +10968,29 @@ const IndexedPredicateEvaluator = struct {
     }
 };
 
+pub const GraphKeyProbe = struct {
+    snapshot: ?*index_mod.IndexSnapshot = null,
+    memo: IndexedPredicateEvaluator.FrontierProbeInput = .{},
+
+    pub fn deinit(self: *GraphKeyProbe, alloc: Allocator) void {
+        self.memo.deinit(alloc);
+        if (self.snapshot) |snapshot| snapshot.release();
+        self.* = .{};
+    }
+
+    fn forSnapshot(self: *GraphKeyProbe, alloc: Allocator, snapshot: *index_mod.IndexSnapshot) *IndexedPredicateEvaluator.FrontierProbeInput {
+        if (self.snapshot != snapshot) {
+            self.deinit(alloc);
+            self.snapshot = snapshot.retain();
+        }
+        return &self.memo;
+    }
+};
+
 pub const GraphPredicateFrontier = struct {
     ptr: *anyopaque,
     key_domain: bool = false,
+    key_probe: ?*GraphKeyProbe = null,
     collect: *const fn (*anyopaque, Allocator) anyerror!std.AutoHashMapUnmanaged(doc_set.DocOrdinal, []const u8),
 };
 
@@ -10945,7 +11019,8 @@ pub fn graphIndexedPredicateAlloc(
     if (patternFilterValueHasRole(parsed)) return error.UnsupportedQueryRequest;
     const search_query = try patternFilterValueToSearchQuery(scratch, parsed, entry.text_analysis, entry.runtime_schema);
     const has_range = hasStoredStandardRange(search_query);
-    const projection_current = if (has_range) try isRangeProjectionCurrent(executor, a, entry.config.name) else false;
+    const complete_source = entry.coversPrimaryDocuments() and entry.source_artifact_names.len == 0;
+    const projection_current = if (has_range or (complete_source and try patternFilterContainsMatch(parsed, 0))) try isRangeProjectionCurrent(executor, a, entry.config.name) else false;
     const snapshot = entry.persistent.acquireSnapshot();
     defer snapshot.release();
     var deletion_hash = std.hash.Wyhash.init(0);
@@ -10971,7 +11046,8 @@ pub fn graphIndexedPredicateAlloc(
         .cache_prefix = key,
         .presence_cache_prefix = if (has_range) try std.fmt.allocPrint(scratch, "graph-presence:{d}:{d}:{d}:{d}", .{ entry.instance_id, entry.projection_revision, req.identity_read_generation orelse 0, deletion_hash.final() }) else null,
         .local_cache = local_cache,
-        .probe_input = &probe_input,
+        .probe_input = if (frontier) |input| if (input.key_probe) |shared| shared.forSnapshot(a, snapshot) else &probe_input else &probe_input,
+        .empty_analyzed_fields_authoritative = complete_source and projection_current,
     };
     matcher.reconcile_primary_ranges = has_range;
     const primary_ids = containsPrimaryIds(search_query);
@@ -11294,6 +11370,16 @@ fn collectPrimaryResidualRange(
 }
 
 fn mergeResidualPopulationMatches(alloc: Allocator, scratch: Allocator, executor: StructuredFilterResolverExecutor, known: *const doc_set.ResolvedDocSet, legacy: *const doc_set.ResolvedDocSet) !doc_set.ResolvedDocSet {
+    if (executor.legacy_matches) |sidecar| {
+        if (known.* == .ordinals or known.* == .ordinal_bitmap) {
+            std.debug.assert(sidecar.* == .none);
+            var rows = try doc_set.cloneAlloc(alloc, known);
+            errdefer rows.deinit(alloc);
+            sidecar.* = try doc_set.cloneAlloc(alloc, legacy);
+            return rows;
+        }
+        if (known.* == .none) return doc_set.cloneAlloc(alloc, legacy);
+    }
     const project = executor.resolve_doc_set_doc_ids.?;
     const known_ids = (try project(executor.ctx, scratch, known, executor.identity_read_generation)) orelse return error.UnsupportedQueryRequest;
     const legacy_ids = (try project(executor.ctx, scratch, legacy, executor.identity_read_generation)) orelse return error.UnsupportedQueryRequest;
@@ -11449,7 +11535,8 @@ fn collectMixedStructuredFilterAlloc(
         null;
     const has_range = hasStoredStandardRange(query);
     const policy_has_range = if (policy_query) |auth| hasStoredStandardRange(auth) else false;
-    const projection_current = if (has_range or policy_has_range) try isRangeProjectionCurrent(executor, alloc, entry.config.name) else false;
+    const projection_current = if (has_range or policy_has_range or requiresAnalyzedMatch(query) or
+        (if (policy_query) |auth| requiresAnalyzedMatch(auth) else false)) try isRangeProjectionCurrent(executor, alloc, entry.config.name) else false;
     const snapshot = entry.persistent.acquireSnapshot();
     defer snapshot.release();
     var deletions = std.hash.Wyhash.init(0);
@@ -11464,6 +11551,7 @@ fn collectMixedStructuredFilterAlloc(
     const matcher = IndexedPredicateEvaluator{
         .snapshot = snapshot,
         .range_projection_is_current = projection_current,
+        .empty_analyzed_fields_authoritative = entry.coversPrimaryDocuments() and projection_current,
         .analysis = entry.text_analysis,
         .schema = entry.runtime_schema,
         .executor = executor,
@@ -12075,6 +12163,18 @@ fn searchQueryCanUseSnapshotWithControl(
     allow_analyzed_terms: bool,
     control: query_mod.ExecutionControl,
 ) !bool {
+    return searchQueryCanUseSnapshotWithCoverage(snapshot, query, text_analysis, runtime_schema, allow_analyzed_terms, control, false);
+}
+
+fn searchQueryCanUseSnapshotWithCoverage(
+    snapshot: *const index_mod.IndexSnapshot,
+    query: search_mod.SearchQuery,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+    allow_analyzed_terms: bool,
+    control: query_mod.ExecutionControl,
+    empty_analyzed_fields_authoritative: bool,
+) !bool {
     try control.check();
     return switch (query) {
         .match_none,
@@ -12084,7 +12184,7 @@ fn searchQueryCanUseSnapshotWithControl(
         => true,
         .knn => false,
         .hybrid => false,
-        .match => true,
+        .match => |item| (empty_analyzed_fields_authoritative and analyzedFieldHasSourceCoverage(runtime_schema, item.field)) or try snapshot.hasInvertedField(item.field),
         .phrase => |item| try snapshot.hasInvertedField(item.field),
         .term_phrase => |item| try snapshot.hasInvertedField(item.field),
         .multi_phrase => |item| try snapshot.hasInvertedField(item.field),
@@ -12110,16 +12210,42 @@ fn searchQueryCanUseSnapshotWithControl(
         .regexp => |item| try snapshot.hasInvertedField(item.field),
         .bool_query => |item| {
             for (item.must) |child| {
-                if (!(try searchQueryCanUseSnapshotWithControl(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms, control))) return false;
+                if (!(try searchQueryCanUseSnapshotWithCoverage(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms, control, empty_analyzed_fields_authoritative))) return false;
             }
             for (item.should) |child| {
-                if (!(try searchQueryCanUseSnapshotWithControl(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms, control))) return false;
+                if (!(try searchQueryCanUseSnapshotWithCoverage(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms, control, empty_analyzed_fields_authoritative))) return false;
             }
             for (item.must_not) |child| {
-                if (!(try searchQueryCanUseSnapshotWithControl(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms, control))) return false;
+                if (!(try searchQueryCanUseSnapshotWithCoverage(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms, control, empty_analyzed_fields_authoritative))) return false;
             }
             return true;
         },
+    };
+}
+
+fn analyzedFieldHasSourceCoverage(schema: ?runtime_schema_mod.TableSchema, field: []const u8) bool {
+    if (schema) |selected| {
+        for (selected.full_text_documents) |document| {
+            if (runtime_schema_mod.pathFallsUnderAnyPrefix(document.unindexed_paths, field)) return false;
+            for (document.fields) |mapping| {
+                if (std.mem.eql(u8, mapping.emitted_name, field) and
+                    runtime_schema_mod.pathFallsUnderAnyPrefix(document.unindexed_paths, mapping.path)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn requiresAnalyzedMatch(query: search_mod.SearchQuery) bool {
+    return switch (query) {
+        .match => true,
+        .bool_query => |boolean| found: {
+            for ([_][]const search_mod.SearchQuery{ boolean.must, boolean.should, boolean.must_not }) |clauses| {
+                for (clauses) |child| if (requiresAnalyzedMatch(child)) break :found true;
+            }
+            break :found false;
+        },
+        else => false,
     };
 }
 
@@ -14010,6 +14136,7 @@ fn deriveNativeDenseConstraintsAlloc(
         .live_filter_doc_set = executor.live_filter_doc_set,
         .nonvisible_doc_set = executor.nonvisible_doc_set,
         .project_ordinals_to_doc_ids = false,
+        .retain_legacy_union = executor.lookup_vector_ids_for_ordinals != null,
         .apply_live_all_docs = apply_broad_live_docs,
     });
     if (bench_profile) doc_constraints_ns = platform_time.monotonicNs() - doc_constraints_start_ns;
@@ -14018,6 +14145,7 @@ fn deriveNativeDenseConstraintsAlloc(
     if (doc_constraints.positive_filter) {
         var mapped: []u64 = &.{};
         var mapped_owned = false;
+        errdefer if (mapped_owned) alloc.free(mapped);
         if (doc_constraints.filter_doc_nums.len > 0) {
             const phase_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
             mapped = try denseVectorIdsForDocNumsAlloc(alloc, doc_constraints.filter_doc_nums, executor, index_name);
@@ -14038,6 +14166,14 @@ fn deriveNativeDenseConstraintsAlloc(
             } else {
                 mapped = mapped_doc_ids;
             }
+            mapped_owned = true;
+        }
+        if (doc_constraints.legacy_filter == .doc_keys) {
+            const legacy = try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.legacy_filter.doc_keys, executor, index_name);
+            defer alloc.free(legacy);
+            const merged = try unionVectorIdsAlloc(alloc, mapped, legacy);
+            if (mapped_owned) alloc.free(mapped);
+            mapped = merged;
             mapped_owned = true;
         }
         if (out.positive_filter) {
@@ -14075,6 +14211,10 @@ fn deriveNativeDenseConstraintsAlloc(
         const mapped_excludes = try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.exclude_doc_ids, executor, index_name);
         if (bench_profile) exclude_doc_ids_ns += platform_time.monotonicNs() - phase_start_ns;
         try mergeNativeExcludeIds(alloc, &out, mapped_excludes, req.exclude_ids);
+    }
+    if (doc_constraints.legacy_exclude == .doc_keys) {
+        const legacy = try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.legacy_exclude.doc_keys, executor, index_name);
+        try mergeNativeExcludeIds(alloc, &out, legacy, req.exclude_ids);
     }
     if (out.exclude_ids.len == 0 and req.exclude_ids.len > 0) {
         out.exclude_ids = req.exclude_ids;
@@ -15885,6 +16025,9 @@ pub fn searchTextQuery(
         .live_filter_doc_set = executor.live_filter_doc_set,
         .nonvisible_doc_set = executor.nonvisible_doc_set,
         .project_ordinals_to_doc_ids = false,
+        .retain_legacy_union = !chunk_backed and
+            (constraint_req.filter_query_json.len != 0 or constraint_req.exclusion_query_json.len != 0) and
+            try snapshot.hasDocOrdinalCoverage(),
         .text_snapshot_for_doc_num_projection = snapshot,
         .apply_live_all_docs = apply_broad_live_all_docs,
     });
@@ -19943,6 +20086,8 @@ pub fn searchSparse(
         .range_projection_current = executor.range_projection_current,
         .live_filter_doc_set = executor.live_filter_doc_set,
         .nonvisible_doc_set = executor.nonvisible_doc_set,
+        .retain_legacy_union = executor.lookup_doc_nums_for_ordinals != null and
+            !chunk_backed and !multi_source_members and executor.native_key == null,
         .lookup_doc_nums_for_ordinals = executor.lookup_doc_nums_for_ordinals,
         .doc_num_index_name = req.index_name orelse entry.config.name,
         .require_doc_num_projection_mapper = true,
@@ -19951,6 +20096,21 @@ pub fn searchSparse(
     });
     if (bench_query_profile) constraint_ns = platform_time.monotonicNs() - constraint_start_ns;
     defer native_constraints.deinit(alloc);
+    if (native_constraints.legacy_filter != .none or native_constraints.legacy_exclude != .none) {
+        try checkSearchRequestDeadline(req);
+        var read = try entry.index.beginReadTxn();
+        defer read.abort();
+        if (native_constraints.legacy_filter == .doc_keys) {
+            const numbers = try entry.index.docNumsForDocIdsAlloc(alloc, &read, native_constraints.legacy_filter.doc_keys);
+            defer alloc.free(numbers);
+            try mergeResidualDocNumsAlloc(alloc, &native_constraints.filter_doc_nums, &native_constraints.filter_doc_nums_owned, numbers);
+        }
+        if (native_constraints.legacy_exclude == .doc_keys) {
+            const numbers = try entry.index.docNumsForDocIdsAlloc(alloc, &read, native_constraints.legacy_exclude.doc_keys);
+            defer alloc.free(numbers);
+            try mergeResidualDocNumsAlloc(alloc, &native_constraints.exclude_doc_nums, &native_constraints.exclude_doc_nums_owned, numbers);
+        }
+    }
     try projectConstraintKeys(alloc, executor.ctx, executor.native_key, &native_constraints);
     const unresolved_stored_filters =
         (req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
@@ -19999,6 +20159,7 @@ pub fn searchSparse(
     const sparse_doc_nums_are_ordinals =
         !chunk_backed and
         !multi_source_members and
+        native_constraints.legacy_filter == .none and
         native_constraints.positive_filter and
         native_constraints.filter_doc_nums.len > 0 and
         native_constraints.filter_doc_ids.len == 0;

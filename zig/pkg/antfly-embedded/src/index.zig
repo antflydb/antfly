@@ -2446,7 +2446,7 @@ pub const IndexSnapshot = struct {
         return self.extendGraphFrontierDocNumsAlloc(alloc, frontier, null, &scanned, &scanned, control);
     }
 
-    pub fn collectGraphKeyFrontierDocNumsAlloc(self: *IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl) !GraphFrontierDocs {
+    pub fn collectGraphKeyFrontierDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl) !GraphFrontierDocs {
         var docs = GraphFrontierDocs.init(alloc);
         errdefer docs.deinit();
         var keys: std.StringHashMapUnmanaged(u32) = .empty;
