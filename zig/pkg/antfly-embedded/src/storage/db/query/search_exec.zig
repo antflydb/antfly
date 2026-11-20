@@ -11424,17 +11424,25 @@ const IndexedPredicateEvaluator = struct {
         var row = std.heap.ArenaAllocator.init(self.alloc);
         defer row.deinit();
 
+        var rejected = if (prefilled) matches.sortedRemover() else {};
+        defer if (prefilled) rejected.finish();
+
         var docs = scope.iterator();
         while (true) {
             try self.control.check();
+            var skipped: [64]u32 = undefined;
+            var skipped_count: usize = 0;
             var frontier_keys: [64][]const u8 = undefined;
             var ordinals: [64]doc_set.DocOrdinal = undefined;
             var count: usize = 0;
-            while (count < ordinals.len) {
+            while (count + skipped_count < ordinals.len) {
                 const ordinal = docs.next() orelse break;
                 if (self.missing_rows) |missing| {
                     if (missing.contains(ordinal)) {
-                        if (prefilled) matches.removeRetainingStorage(ordinal);
+                        if (prefilled) {
+                            skipped[skipped_count] = ordinal;
+                            skipped_count += 1;
+                        }
                         continue;
                     }
                 }
@@ -11442,7 +11450,11 @@ const IndexedPredicateEvaluator = struct {
                 if (self.frontier) |frontier| frontier_keys[count] = frontier.get(ordinal) orelse return error.InvalidData;
                 count += 1;
             }
-            if (count == 0) break;
+            if (count == 0) {
+                if (skipped_count == 0) break;
+                if (prefilled) for (skipped[0..skipped_count]) |ordinal| rejected.remove(ordinal);
+                continue;
+            }
             if (self.budget) |budget| try budget.consumeAnchors(count);
             _ = row.reset(.retain_capacity);
             const scratch = row.allocator();
@@ -11455,19 +11467,24 @@ const IndexedPredicateEvaluator = struct {
             };
             const stored = try load(self.executor.ctx, scratch, keys);
             if (stored.len != count) return error.InvalidData;
+            var skipped_pos: usize = 0;
             for (keys, ordinals[0..count], stored) |key, ordinal, raw| {
+                if (prefilled) while (skipped_pos < skipped_count and skipped[skipped_pos] < ordinal) : (skipped_pos += 1) {
+                    rejected.remove(skipped[skipped_pos]);
+                };
                 try self.control.check();
                 const value = raw orelse {
                     const missing = self.missing_rows orelse return error.StorageReadTemporarilyUnavailable;
                     try missing.add(ordinal);
-                    if (prefilled) matches.removeRetainingStorage(ordinal);
+                    if (prefilled) rejected.remove(ordinal);
                     continue;
                 };
                 const matched = try predicate.matchesStored(scratch, key, value);
                 if (prefilled) {
-                    if (!matched) matches.removeRetainingStorage(ordinal);
+                    if (!matched) rejected.remove(ordinal);
                 } else if (matched) try matches.add(ordinal);
             }
+            if (prefilled) for (skipped[skipped_pos..skipped_count]) |ordinal| rejected.remove(ordinal);
         }
     }
 
@@ -12588,6 +12605,10 @@ test "optional numeric range returns full stored results after residual or union
             try std.testing.expectEqual(self.expected_count, keys.len);
             const values = try scratch.alloc(?[]u8, keys.len);
             for (keys, values) |key, *value| {
+                if (std.mem.eql(u8, key, "absent")) {
+                    value.* = null;
+                    continue;
+                }
                 value.* = try scratch.dupe(u8, if (std.mem.eql(u8, key, "stored")) "{\"rank\":8}" else "{\"rank\":1}");
             }
             return values;
@@ -12603,6 +12624,9 @@ test "optional numeric range returns full stored results after residual or union
     defer keys.deinit(alloc);
     try keys.put(alloc, 1, "native");
     try keys.put(alloc, 2, "stored");
+    try keys.put(alloc, 3, "absent");
+    try keys.put(alloc, 4, "known missing");
+    try keys.put(alloc, 5, "reject");
     var memo: IndexedPredicateEvaluator.FrontierProbeInput = .{ .covered = roaring.RoaringBitmap.init(alloc) };
     defer memo.deinit(alloc);
     try memo.covered.?.add(1);
@@ -12663,6 +12687,25 @@ test "optional numeric range returns full stored results after residual or union
     defer next_clause.deinit();
     try std.testing.expectEqual(@as(usize, 0), budget.remaining_anchors);
     try std.testing.expect(next_clause.eql(&retried));
+
+    loader = .{ .fail_first = false, .expected_count = 3 };
+    var larger_scope = roaring.RoaringBitmap.init(alloc);
+    defer larger_scope.deinit();
+    try larger_scope.addRange(1, 6);
+    var missing = roaring.RoaringBitmap.init(alloc);
+    defer missing.deinit();
+    try missing.add(4);
+    budgeted.missing_rows = &missing;
+    budget.remaining_anchors = 3;
+    var selective = IndexedPredicateEvaluator.RangeEvidence.init(alloc);
+    try selective.covered.add(1);
+    try selective.matches.add(1);
+    var pruned = try budgeted.finishMixedRange(parsed.value, &larger_scope, selective);
+    defer pruned.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loader.calls);
+    try std.testing.expectEqual(@as(usize, 0), budget.remaining_anchors);
+    try std.testing.expect(pruned.eql(&exact_budget));
+    try std.testing.expect(missing.contains(3));
 }
 
 const ResidualIdentityContext = struct {
