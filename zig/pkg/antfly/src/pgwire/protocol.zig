@@ -72,6 +72,7 @@ const Portal = struct {
     types: []const backend.Type,
     formats: []const u16,
     description: backend.Description,
+    describe_stamp: ?backend.DescriptionStamp = null,
     namespace: ?[]const u8 = null,
     search_path: ?commands.SearchPath = null,
     result: ?backend.Result = null,
@@ -430,6 +431,15 @@ pub const Session = struct {
         return self.describeTyped(alloc, statement, types, &.{});
     }
 
+    // Only the session thread opens scopes. The cancel dispatcher observes
+    // the outer scope continuously through binding and retained-reader checks.
+    fn beginExecutionScope(self: *Session) bool {
+        if (self.executing.load(.acquire)) return false;
+        self.cancel_requested.store(false, .release);
+        self.executing.store(true, .release);
+        return true;
+    }
+
     fn describeTyped(self: *Session, alloc: std.mem.Allocator, statement: []const u8, types: []const backend.Type, descriptors: []const backend.Parameter) !backend.Description {
         if (try commands.settingCommand(alloc, statement)) |setting| {
             if (types.len != 0) return error.InvalidParameter;
@@ -447,9 +457,8 @@ pub const Session = struct {
                 .discard_all => &.{},
             } };
         }
-        self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
+        const outer = self.beginExecutionScope();
+        defer if (outer) self.executing.store(false, .release);
         var req = self.request(statement, &.{}, types);
         req.parameter_descriptors = descriptors;
         try req.check();
@@ -476,9 +485,8 @@ pub const Session = struct {
         const check = self.source.vtable.description_current orelse return false;
         const stamp = description.stamp orelse return false;
         if (!stamp.reusable) return false;
-        self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
+        const outer = self.beginExecutionScope();
+        defer if (outer) self.executing.store(false, .release);
         const req = self.request(statement, &.{}, description.parameter_types);
         try req.check();
         return check(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req, description);
@@ -504,9 +512,11 @@ pub const Session = struct {
         return current;
     }
 
-    fn checkedPortalDescription(self: *Session, alloc: std.mem.Allocator, portal: *Portal) !backend.Description {
+    fn checkedPortalDescription(self: *Session, alloc: std.mem.Allocator, portal: *Portal, describe_only: bool) !backend.Description {
         const bound = portal.description;
-        if (try self.descriptionCurrent(alloc, portal.statement, bound)) return bound;
+        var probe = bound;
+        if (describe_only) probe.stamp = portal.describe_stamp orelse bound.stamp;
+        if (try self.descriptionCurrent(alloc, portal.statement, probe)) return probe;
         const current = try self.rebindCached(alloc, portal.statement, bound);
         if (bound.binding_guard) |before| {
             if (if (bound.stamp) |s| s.catalog else null) |previous| {
@@ -1111,7 +1121,9 @@ pub const Session = struct {
                         defer self.request_search_path = previous_path;
                         var scratch = std.heap.ArenaAllocator.init(self.alloc);
                         defer scratch.deinit();
-                        _ = try self.checkedPortalDescription(scratch.allocator(), portal);
+                        const outer = self.beginExecutionScope();
+                        defer if (outer) self.executing.store(false, .release);
+                        const current = try self.checkedPortalDescription(scratch.allocator(), portal, true);
                         var req = self.request(portal.statement, portal.parameters, portal.types);
                         req.binding_guard = portal.description.binding_guard;
                         req.setting_epoch = portal.description.setting_epoch;
@@ -1124,6 +1136,10 @@ pub const Session = struct {
                                 try authority.validate(authority.ptr, scratch.allocator(), self.identity orelse return error.AuthenticationFailed, req, false);
                             }
                         }
+                        try req.check();
+                        // Only the value stamp is reusable. The original guard
+                        // belongs to the captured reader and lives in its arena.
+                        portal.describe_stamp = current.stamp;
                         try self.rowDescription(portal.description.columns, portal.formats);
                     },
                     else => return error.ProtocolViolation,
@@ -1149,7 +1165,8 @@ pub const Session = struct {
                 };
                 if (!portal.stream_opened) {
                     self.read_receipt_budget = .{};
-                    portal.description = try self.checkedPortalDescription(portal.arena.allocator(), portal);
+                    portal.description = try self.checkedPortalDescription(portal.arena.allocator(), portal, false);
+                    portal.describe_stamp = portal.description.stamp;
                     portal.stream_opened = true;
                     if (self.session_id) |id| portal.session_id = try portal.arena.allocator().dupe(u8, id);
                     if (self.source.vtable.open_stream) |open| if (try commands.settingCommand(portal.arena.allocator(), portal.statement) == null) {

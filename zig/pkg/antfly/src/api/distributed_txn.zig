@@ -1192,6 +1192,9 @@ pub const ExecuteOptions = struct {
     /// Preserve the terminal coordinator decision for an externally supplied
     /// transaction ID's retry window.
     retain_terminal: bool = false,
+    /// The session owner holds execution ownership and just sealed the plan
+    /// for the first time. A previously sealed plan might have submitted.
+    fresh_retained_id: bool = false,
     /// Only callers with an externally reusable transaction ID can safely
     /// surface a post-decision error. An ephemeral caller would retry under a
     /// new ID and reapply non-idempotent transforms.
@@ -1637,6 +1640,11 @@ fn executeMultiTableCommitOnce(
                 // (for example while mirroring or waiting for an index). Read
                 // the participant record before deciding whether abort is
                 // still legal.
+                if (err == error.DecisionNotProposed and (!options.retain_terminal or options.fresh_retained_id) and !resume_committed) {
+                    abort_on_error = false;
+                    try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
+                    return error.TopologyChanged;
+                }
                 const durable_status = resolveCoordinatorDecisionAfterFailure(
                     alloc,
                     worker,
@@ -6707,6 +6715,41 @@ fn consumerTests() type {
                 .propose,
                 null,
             ));
+            const Rejected = struct {
+                commits: usize = 0,
+                aborts: usize = 0,
+                probes: usize = 0,
+                fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+                fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (req.status == .aborted) {
+                        self.aborts += 1;
+                        return;
+                    }
+                    self.commits += 1;
+                    return error.DecisionNotProposed;
+                }
+                fn probe(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64) !db_mod.types.TxnStatus {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.probes += 1;
+                    return .committed;
+                }
+            };
+            for ([_]ExecuteOptions{ .{}, .{ .retain_terminal = true, .fresh_retained_id = true }, .{ .retain_terminal = true } }, 0..) |options, index| {
+                var rejected = Rejected{};
+                const worker = ParticipantWorker{ .ptr = &rejected, .vtable = &.{ .begin_group = Recorder.begin, .prepare_group = Rejected.prepare, .resolve_group = Rejected.resolve, .status_group = Recorder.status, .status_group_until = Rejected.probe } };
+                const result = executeMultiTableCommitWithOptions(std.testing.allocator, FakeCatalog.iface(), worker, txn_id, 10_000, 10_001, &.{.{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} }}, .write, null, options);
+                try std.testing.expectEqual(@as(usize, 1), rejected.commits);
+                if (index == 2) {
+                    try std.testing.expectError(error.CommitVisibilityNotSatisfied, result);
+                    try std.testing.expectEqual(@as(usize, 0), rejected.aborts);
+                    try std.testing.expect(rejected.probes > 0);
+                } else {
+                    try std.testing.expectError(error.TopologyChanged, result);
+                    try std.testing.expectEqual(@as(usize, 1), rejected.aborts);
+                    try std.testing.expectEqual(@as(usize, 0), rejected.probes);
+                }
+            }
         }
 
         test "distributed txn coordinator returns unknown group without restarting the transaction" {

@@ -8043,6 +8043,13 @@ pub const MetadataService = struct {
         );
     }
 
+    pub fn decisionAdmission(self: *MetadataService, request: metadata_api.DecisionAdmissionRequest, budget: @import("../api/table_catalog.zig").RoutingBudget) !metadata_api.DecisionAdmission {
+        try budget.checkpoint();
+        try self.ensureLinearizableReadWithContext(.{ .deadline_ns = budget.deadline_ns, .deadline_io = budget.io, .cancellation = budget.cancellation });
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return store.decisionAdmission(self.alloc, self.metadata_group_id, request, budget);
+    }
+
     pub fn ownerReadiness(self: *MetadataService, request: metadata_api.OwnerReadinessRequest, budget: @import("../api/table_catalog.zig").RoutingBudget) !metadata_api.OwnerReadiness {
         try budget.checkpoint();
         try self.ensureLinearizableReadWithContext(.{ .deadline_ns = budget.deadline_ns, .deadline_io = budget.io, .cancellation = budget.cancellation });
@@ -12187,6 +12194,13 @@ pub const MetadataHttpService = struct {
             self.catalogProjectionSource(),
             deadline_ns,
         );
+    }
+
+    pub fn decisionAdmission(self: *MetadataHttpService, request: metadata_api.DecisionAdmissionRequest, budget: @import("../api/table_catalog.zig").RoutingBudget) !metadata_api.DecisionAdmission {
+        try budget.checkpoint();
+        try self.ensureLinearizableReadWithContext(.{ .deadline_ns = budget.deadline_ns, .deadline_io = budget.io, .cancellation = budget.cancellation });
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return store.decisionAdmission(self.alloc, self.metadata_group_id, request, budget);
     }
 
     pub fn ownerReadiness(self: *MetadataHttpService, request: metadata_api.OwnerReadinessRequest, budget: @import("../api/table_catalog.zig").RoutingBudget) !metadata_api.OwnerReadiness {

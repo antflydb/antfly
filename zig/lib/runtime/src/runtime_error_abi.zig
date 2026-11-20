@@ -1118,6 +1118,7 @@ pub const Detail = enum(c_int) {
     storage_kernel_owner_stale_descriptor,
     object_table_definition_conflict,
     row_policy_limit_exceeded,
+    decision_not_proposed,
 };
 
 pub const Status = extern struct {
@@ -1757,6 +1758,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnknownGroup => status(.not_found, .unknown_group),
         error.TxnNotFound => status(.not_found, .txn_not_found),
         error.Conflict => status(.conflict, .conflict),
+        error.DecisionNotProposed => status(.conflict, .decision_not_proposed),
         error.DecisionConflict => status(.conflict, .decision_conflict),
         error.TableTransitionActive => status(.conflict, .table_transition_active),
         error.SchemaInUse => status(.conflict, .schema_in_use),
@@ -2833,6 +2835,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .txn_not_found => "TxnNotFound",
         .conflict => "Conflict",
         .decision_conflict => "DecisionConflict",
+        .decision_not_proposed => "DecisionNotProposed",
         .table_transition_active => "TableTransitionActive",
         .schema_in_use => "SchemaInUse",
         .transaction_too_large => "TransactionTooLarge",

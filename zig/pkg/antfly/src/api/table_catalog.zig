@@ -116,6 +116,7 @@ pub const CatalogSource = struct {
         linearizable_table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         /// Fresh metadata barrier with a fixed-size result, independent of jobs.
         owner_readiness: ?*const fn (*anyopaque, metadata_api.OwnerReadinessRequest, RoutingBudget) anyerror!metadata_api.OwnerReadiness = null,
+        decision_admission: ?*const fn (*anyopaque, metadata_api.DecisionAdmissionRequest, RoutingBudget) anyerror!metadata_api.DecisionAdmission = null,
         privacy_policy_binding: ?*const fn (*anyopaque, []const u8, ?u64) anyerror!metadata_api.PrivacyPolicyBinding = null,
         free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
         /// Request-scoped route capabilities may pin DB identity through this
@@ -228,6 +229,7 @@ pub const CatalogSource = struct {
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataServiceLinearizableTableRoutingSnapshot,
                 .owner_readiness = metadataServiceOwnerReadiness,
+                .decision_admission = metadataServiceDecisionAdmission,
                 .privacy_policy_binding = metadataServicePrivacyPolicyBinding,
                 .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataServiceWaitForRoutingChange,
@@ -252,6 +254,7 @@ pub const CatalogSource = struct {
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataHttpServiceLinearizableTableRoutingSnapshot,
                 .owner_readiness = metadataHttpServiceOwnerReadiness,
+                .decision_admission = metadataHttpServiceDecisionAdmission,
                 .privacy_policy_binding = metadataHttpServicePrivacyPolicyBinding,
                 .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataHttpServiceWaitForRoutingChange,
@@ -276,6 +279,7 @@ pub const CatalogSource = struct {
                 .linearizable_routing_snapshot = metadataServerLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataServerLinearizableTableRoutingSnapshot,
                 .owner_readiness = metadataServerOwnerReadiness,
+                .decision_admission = metadataServerDecisionAdmission,
                 .privacy_policy_binding = metadataServerPrivacyPolicyBinding,
                 .free_routing_snapshot = metadataServerFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataServerWaitForRoutingChange,
@@ -1718,13 +1722,87 @@ pub fn validateTransactionTopologyEpoch(
 /// wire fence. Older owners reject this token when comparing their range epoch.
 /// Zero is reserved exclusively for decision recovery.
 pub fn transactionDecisionEpoch(snapshot: *const metadata_api.AdminSnapshot, topology_epoch: u64) u64 {
+    return decisionEpochForAuthority(snapshot.status.metadata_group_id, snapshot.status.metadata_incarnation, topology_epoch);
+}
+
+fn decisionEpochForAuthority(metadata_group: u64, incarnation: ?metadata_api.MetadataClusterIncarnation, topology_epoch: u64) u64 {
     var hash = std.hash.Wyhash.init(topology_epoch);
     hash.update("antfly/txn-decision/v1");
     var group: [8]u8 = undefined;
-    std.mem.writeInt(u64, &group, snapshot.status.metadata_group_id, .little);
+    std.mem.writeInt(u64, &group, metadata_group, .little);
     hash.update(&group);
-    if (snapshot.status.metadata_incarnation) |incarnation| hash.update(&incarnation);
+    if (incarnation) |id| hash.update(&id);
     return @max(1, hash.final());
+}
+
+fn decisionCatalog(catalog: CatalogSource) CatalogSource {
+    if (catalog.vtable == &RoutingSession.vtable) return decisionCatalog(RoutingSession.cast(catalog.ptr).base);
+    return catalog;
+}
+
+fn generationDecisionRoute(generation: *RoutingGeneration, table_name: []const u8, group_id: u64, budget: RoutingBudget) !metadata_api.CatalogRouteFence {
+    const session = &generation.indexed;
+    const view = try session.tableRoutingView(table_name, budget);
+    var fence = (try RoutingSession.routeFence(session, group_id)) orelse return error.TopologyChanged;
+    if (fence.table_id != view.table_id) return error.TopologyChanged;
+    fence.protocol = metadata_api.CatalogRouteFence.decision_protocol;
+    return fence;
+}
+
+pub fn raftDecisionRoute(alloc: std.mem.Allocator, source: CatalogSource, table_name: []const u8, epoch: u64, group: u64, budget: RoutingBudget) !metadata_api.CatalogRouteFence {
+    const catalog = decisionCatalog(source);
+    if (catalog.vtable.acquire_routing_generation) |acquire| {
+        const generation = try acquire(catalog.ptr, budget, true);
+        defer generation.release();
+        const fence = try generationDecisionRoute(generation, table_name, group, budget);
+        if (epoch != fence.topology_epoch and epoch != decisionEpochForAuthority(fence.metadata_group_id, fence.metadata_incarnation, fence.topology_epoch)) return error.TopologyChanged;
+        return fence;
+    }
+    // Private immutable catalogs may supply only a bounded snapshot. This
+    // selection runs before Raft dispatch and holds no proposal admission.
+    var fence = (try checkedTransactionRoute(alloc, catalog, table_name, epoch, true, group)) orelse return error.TopologyChanged;
+    fence.protocol = metadata_api.CatalogRouteFence.decision_protocol;
+    return fence;
+}
+
+pub fn validateRaftDecision(source: CatalogSource, table_name: []const u8, fence: metadata_api.CatalogRouteFence, budget: RoutingBudget) !void {
+    const catalog = decisionCatalog(source);
+    const capture = catalog.vtable.decision_admission orelse return error.CatalogRouteFenceUnsupported;
+    const acquire = catalog.vtable.acquire_routing_generation orelse return error.CatalogRouteFenceUnsupported;
+    var refresh = false;
+    while (true) {
+        try budget.checkpoint();
+        const check = try capture(catalog.ptr, .{ .table_id = fence.table_id, .table_name = table_name }, budget);
+        if (!check.stable or check.metadata_group_id != fence.metadata_group_id or !std.meta.eql(check.metadata_incarnation, fence.metadata_incarnation)) return error.TopologyChanged;
+        // The transition proof linearizes the cached route only when both
+        // name the same durable catalog revision and authority.
+        const generation = try acquire(catalog.ptr, budget, refresh);
+        defer generation.release();
+        const cut = generation.indexed.snapshot.value;
+        if (cut.catalog_revision != check.catalog_revision or cut.metadata_group_id != check.metadata_group_id or !std.meta.eql(cut.metadata_incarnation, check.metadata_incarnation)) {
+            refresh = true;
+            continue;
+        }
+        const current = try generationDecisionRoute(generation, table_name, fence.route.group_id, budget);
+        if (current.table_id != fence.table_id or current.topology_epoch != fence.topology_epoch or !std.meta.eql(current.route, fence.route)) return error.TopologyChanged;
+        return budget.checkpoint();
+    }
+}
+
+pub fn localDecisionRoute(alloc: std.mem.Allocator, source: CatalogSource, table_name: []const u8, epoch: u64, group: u64, cancellation: @import("antfly_cancellation").CancellationToken) !metadata_api.CatalogRouteFence {
+    const catalog = decisionCatalog(source);
+    var budget = catalog.budget(null);
+    budget.deadline_ns = budget.nowNs() +| @as(u64, metadata_api.catalog_route_default_deadline_ms) * std.time.ns_per_ms;
+    budget.cancellation = cancellation;
+    const fence = raftDecisionRoute(alloc, catalog, table_name, epoch, group, budget) catch |err| switch (err) {
+        error.TableNotFound, error.TopologyChanged => return error.DecisionNotProposed,
+        else => return err,
+    };
+    if (catalog.vtable.acquire_routing_generation != null) validateRaftDecision(catalog, table_name, fence, budget) catch |err| switch (err) {
+        error.TableNotFound, error.TopologyChanged => return error.DecisionNotProposed,
+        else => return err,
+    };
+    return fence;
 }
 
 pub fn validateTransactionEpoch(alloc: std.mem.Allocator, catalog: CatalogSource, table_name: []const u8, expected_epoch: u64, decision: bool) !void {
@@ -1906,7 +1984,7 @@ pub fn validateTransactionTopologyStableSnapshot(
     }
 }
 
-fn onlineMergeAllowsTransactions(transition: metadata_transition_state.MergeTransitionRecord) bool {
+pub fn onlineMergeAllowsTransactions(transition: metadata_transition_state.MergeTransitionRecord) bool {
     const online = transition.online orelse return false;
     switch (online.phase) {
         .admit, .publish, .snapshot, .tail => {},
@@ -3115,6 +3193,11 @@ fn metadataServiceOwnerReadiness(ptr: *anyopaque, request: metadata_api.OwnerRea
     return svc.ownerReadiness(request, budget);
 }
 
+fn metadataServiceDecisionAdmission(ptr: *anyopaque, request: metadata_api.DecisionAdmissionRequest, budget: RoutingBudget) !metadata_api.DecisionAdmission {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return svc.decisionAdmission(request, budget);
+}
+
 fn metadataServicePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
     svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
@@ -3215,6 +3298,11 @@ fn metadataHttpServiceOwnerReadiness(ptr: *anyopaque, request: metadata_api.Owne
     return svc.ownerReadiness(request, budget);
 }
 
+fn metadataHttpServiceDecisionAdmission(ptr: *anyopaque, request: metadata_api.DecisionAdmissionRequest, budget: RoutingBudget) !metadata_api.DecisionAdmission {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return svc.decisionAdmission(request, budget);
+}
+
 fn metadataHttpServicePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
@@ -3313,6 +3401,11 @@ fn metadataServerLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: [
 fn metadataServerOwnerReadiness(ptr: *anyopaque, request: metadata_api.OwnerReadinessRequest, budget: RoutingBudget) !metadata_api.OwnerReadiness {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     return srv.svc.ownerReadiness(request, budget);
+}
+
+fn metadataServerDecisionAdmission(ptr: *anyopaque, request: metadata_api.DecisionAdmissionRequest, budget: RoutingBudget) !metadata_api.DecisionAdmission {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    return srv.svc.decisionAdmission(request, budget);
 }
 
 fn metadataServerPrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
@@ -3824,6 +3917,17 @@ fn consumerTests() type {
                 fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
                     return @as(*metadata_api.AdminSnapshot, @ptrCast(@alignCast(ptr))).*;
                 }
+                fn acquire(ptr: *anyopaque, budget: RoutingBudget, _: bool) !*RoutingGeneration {
+                    const cut = try snapshot(ptr);
+                    return RoutingGeneration.create(std.testing.allocator, .{ .metadata_group_id = cut.status.metadata_group_id, .metadata_incarnation = cut.status.metadata_incarnation, .tables = cut.tables, .ranges = cut.ranges }, budget);
+                }
+                fn admit(ptr: *anyopaque, req: metadata_api.DecisionAdmissionRequest, budget: RoutingBudget) !metadata_api.DecisionAdmission {
+                    try budget.checkpoint();
+                    const cut = try snapshot(ptr);
+                    const table = tables_api.findTableByName(&cut, req.table_name) orelse return error.TableNotFound;
+                    const stable = if (validateTransactionTopologyStableSnapshot(&cut, table.*)) true else |_| false;
+                    return .{ .stable = stable, .metadata_group_id = cut.status.metadata_group_id, .metadata_incarnation = cut.status.metadata_incarnation, .catalog_revision = 0 };
+                }
                 fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
             var tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 1, .name = "rows" }};
@@ -3853,7 +3957,7 @@ fn consumerTests() type {
                 .split_transitions = &.{},
                 .merge_transitions = &merges,
             };
-            const source: CatalogSource = .{ .ptr = &snapshot, .vtable = &.{ .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.free } };
+            const source: CatalogSource = .{ .ptr = &snapshot, .vtable = &.{ .decision_admission = Source.admit, .acquire_routing_generation = Source.acquire, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.free } };
             const epoch = try transactionTopologyEpoch(std.testing.allocator, source, "rows");
             const decision = transactionDecisionEpoch(&snapshot, epoch);
             const fence = (try checkedTransactionRoute(std.testing.allocator, source, "rows", decision, true, 2)).?;
@@ -3877,6 +3981,12 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     try std.testing.expectEqual(@as(u64, 2), route.route.group_id);
                     try std.testing.expect(req.transaction.? == .resolve);
+                    try std.testing.expectEqual(metadata_api.CatalogRouteFence.decision_protocol, route.protocol);
+                    const bytes = try std.json.Stringify.valueAlloc(a, route, .{});
+                    defer a.free(bytes);
+                    const wire = try std.json.parseFromSlice(metadata_api.CatalogRouteFence, a, bytes, .{});
+                    defer wire.deinit();
+                    try std.testing.expect(wire.value.protocol != metadata_api.catalog_route_fence_protocol_current);
                     if (self.replace) self.catalog.status.metadata_incarnation = @splat(7);
                     var admitted = try self.source.acquireProposalAdmission(a, table, route, std.math.maxInt(u64), cancel, true);
                     defer admitted.deinit();
@@ -3889,7 +3999,7 @@ fn consumerTests() type {
             _ = owner.withRaftBatcher(.{ .ptr = &probe, .vtable = &.{ .batch_group = Probe.unbound, .batch_group_local = Probe.unbound, .batch_group_routed_with_cancellation = Probe.routed } });
             try std.testing.expect((try owner.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 2, "rows", @splat(1), .committed, 1, decision, .write, .none)) != null);
             probe.replace = true;
-            try std.testing.expectError(error.TopologyChanged, owner.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 2, "rows", @splat(1), .committed, 1, decision, .write, .none));
+            try std.testing.expectError(error.DecisionNotProposed, owner.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 2, "rows", @splat(1), .committed, 1, decision, .write, .none));
             try std.testing.expectEqual(@as(usize, 1), probe.accepted);
             try std.testing.expectError(error.TopologyChanged, validateTransactionEpoch(std.testing.allocator, source, "rows", decision, true));
             try validateTransactionTopologyEpoch(std.testing.allocator, source, "rows", epoch);

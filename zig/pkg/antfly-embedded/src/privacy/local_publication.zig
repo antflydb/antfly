@@ -42,8 +42,12 @@ pub fn encodeDigest(version: [64]u8, source_digest: [32]u8, output: []const u8) 
     return value;
 }
 pub fn expectedOutput(a: A, read: anytype, artifact: []const u8, version: [64]u8, source: []const u8) ![64]u8 {
+    return expectedOutputFingerprint(a, read, artifact, version, contract.fingerprint(source));
+}
+
+pub fn expectedOutputFingerprint(a: A, read: anytype, artifact: []const u8, version: [64]u8, fingerprint: [64]u8) ![64]u8 {
     const actual = keys.readDocumentMetadata(a, read, prefix, compact_prefix, artifact) catch |err| if (err == error.NotFound) return error.PrivacyPublicationPending else return err;
-    if (actual.len != 192 or !std.mem.eql(u8, actual[0..64], &version) or !std.mem.eql(u8, actual[64..128], &contract.fingerprint(source))) return error.PrivacyStale;
+    if (actual.len != 192 or !std.mem.eql(u8, actual[0..64], &version) or !std.mem.eql(u8, actual[64..128], &fingerprint)) return error.PrivacyStale;
     return actual[128..192].*;
 }
 

@@ -505,7 +505,7 @@ const OwnedRead = struct {
         self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .read_requirements = request.read_requirements, .shared_receipt_wait_budget = request.read_receipt_budget, .lake_visibility = if (request.read_requirements.visibility) |visibility| if (visibility == .accepted) .accepted else .committed else @fromBackingInt(@intCast(@backingInt(request.lake_visibility))), .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
         var transaction_lease: ?@import("transactions.zig").SessionRegistry.CommitExecution = null;
         defer if (transaction_lease) |lease| lease.release();
-        var tenure: ?u64 = null;
+        var tenure: ?u128 = null;
         if (self.session_id) |id_hex| {
             const id = @import("distributed_txn.zig").parseTxnIdHex(id_hex) catch return error.SqlTransactionNotActive;
             transaction_lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
@@ -716,7 +716,7 @@ const CursorAdmission = struct {
     native: *execution.Adapter,
     credential: *Credential,
     admitted: ReadRevision,
-    lease_epoch: ?u64,
+    lease_epoch: ?u128,
     previous: @FieldType(catalog.Backend, "execution_binding_validator") = null,
     captured: ?RetainedRead = null,
 
@@ -742,7 +742,7 @@ const RetainedRead = struct {
     policies: []const OwnedRead.Policy,
     bindings: []const Domain.CursorBinding,
     validated: ReadRevision,
-    lease_epoch: ?u64 = null,
+    lease_epoch: ?u128 = null,
     validated_stamp: ?wire.CatalogStamp = null,
     role_digest: ?[32]u8 = null,
     cut: Cut,

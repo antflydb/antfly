@@ -645,6 +645,15 @@ pub const TableWriteSource = struct {
             index_json: ?[]const u8,
             stamp: metadata_api.CatalogMutationStamp,
         ) anyerror!?void = null,
+        commit_transaction_with_fresh_id: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            txn_id: db_mod.types.TxnId,
+            begin_timestamp: u64,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+            cancellation: db_mod.types.CancellationToken,
+        ) anyerror!?distributed_txn.CommitOutcome = null,
     };
 
     pub fn activateRangeTracking(self: TableWriteSource, alloc: std.mem.Allocator, table: []const u8, context: @import("operation.zig").RequestContext) !void {
@@ -987,6 +996,21 @@ pub const TableWriteSource = struct {
         const fn_ptr = self.vtable.commit_transaction_with_id_with_cancellation orelse
             return try self.commitTransactionWithId(alloc, txn_id, begin_timestamp, tables, sync_level);
         return try BoundaryAbi.call("commit_transaction_with_id_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level, cancellation });
+    }
+
+    pub fn commitTransactionAttempt(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        first_attempt: bool,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
+        if (first_attempt) if (self.vtable.commit_transaction_with_fresh_id) |call|
+            return BoundaryAbi.call("commit_transaction_with_fresh_id", self.boundary_dispatch, call, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level, cancellation });
+        return self.commitTransactionWithIdAndCancellation(alloc, txn_id, begin_timestamp, tables, sync_level, cancellation);
     }
 
     pub fn acknowledgeTransactionCommit(

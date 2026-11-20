@@ -6229,10 +6229,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         var lease = if (decision_epoch != 0) try self.acquire(group_id, table_name) else try self.acquireTransactionOwner(alloc, group_id, table_name, req, context);
         defer lease.deinit();
         if (decision_epoch != 0) {
-            const route = (try table_catalog.checkedTransactionRoute(alloc, self.catalog, table_name, decision_epoch, true, group_id)) orelse return error.TopologyChanged;
+            const route = try table_catalog.localDecisionRoute(alloc, self.catalog, table_name, decision_epoch, group_id, context.cancellation);
             const expected = route.route.identity_namespace;
             const actual = lease.entry.identity;
-            if (actual.table_id != expected.table_id or actual.shard_id != expected.shard_id or actual.range_id != expected.range_id) return error.TopologyChanged;
+            if (actual.table_id != expected.table_id or actual.shard_id != expected.shard_id or actual.range_id != expected.range_id) return error.DecisionNotProposed;
         }
         try context.ensureActive();
         var response = try lease.owner().replicatedBatchJson(table_name, request_json);

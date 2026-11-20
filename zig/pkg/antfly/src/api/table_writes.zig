@@ -5289,6 +5289,8 @@ const TestEmbeddingRequest = struct {
     input: std.json.Value,
 };
 
+const CommitAttempt = enum { ephemeral, first, replayable };
+
 pub const TableWriteSource = @import("antfly_local_sources").api_local_table_writes.TableWriteSource;
 
 pub const DropCleanupContract = metadata_topology_protocol.DropCleanupContract;
@@ -11487,11 +11489,28 @@ pub const ProvisionedTableWriteSource = struct {
             // A transition can freeze an owner without changing its range list.
             // Validate transition state and the route on one cut while holding
             // the group and table gates through Raft index assignment.
-            const current = (try table_catalog.checkedTransactionRoute(alloc, self.catalog, table_name, fence.topology_epoch, false, fence.route.group_id)) orelse return error.TopologyChanged;
-            if (current.metadata_group_id != fence.metadata_group_id or
-                !std.meta.eql(current.metadata_incarnation, fence.metadata_incarnation) or
-                current.table_id != fence.table_id or !std.meta.eql(current.route, fence.route)) return error.TopologyChanged;
-            if (self.catalog.budget(null).nowNs() >= admission_deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+            var budget = self.catalog.budget(admission_deadline_ns);
+            const CancellationPair = struct {
+                request: db_mod.types.CancellationToken,
+                admission: db_mod.types.CancellationToken,
+
+                fn check(ptr: *const anyopaque) !void {
+                    const pair: *const @This() = @ptrCast(@alignCast(ptr));
+                    try pair.request.check();
+                    try pair.admission.check();
+                }
+
+                fn cancelled(ptr: *const anyopaque) bool {
+                    const pair: *const @This() = @ptrCast(@alignCast(ptr));
+                    return pair.request.isCancelled() or pair.admission.isCancelled();
+                }
+            };
+            const pair: CancellationPair = .{ .request = cancellation, .admission = fence.admission_cancellation };
+            budget.cancellation = if (pair.admission.ptr == null or std.meta.eql(pair.request, pair.admission)) pair.request else if (pair.request.ptr == null) pair.admission else .{ .ptr = &pair, .check_fn = CancellationPair.check, .is_cancelled_fn = CancellationPair.cancelled };
+            table_catalog.validateRaftDecision(self.catalog, table_name, fence, budget) catch |err| switch (err) {
+                error.TableNotFound, error.TopologyChanged => return error.DecisionNotProposed,
+                else => return err,
+            };
         } else try table_catalog.validateCatalogRouteFenceUntil(
             alloc,
             self.catalog,
@@ -20325,6 +20344,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .commit_batch_with_cancellation = commitBatchWithCancellation,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
+                .commit_transaction_with_fresh_id = commitTransactionWithFreshId,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .backup_table = backupTable,
                 .backup_pin_control = backupPinControl,
@@ -22379,7 +22399,7 @@ pub const ProvisionedTableWriteSource = struct {
         const txn_source: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const txn_io: ?Io = if (txn_source.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
-        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
+        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, .ephemeral, cancellation);
     }
 
     fn commitTransactionWithId(
@@ -22402,7 +22422,19 @@ pub const ProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        return try commitProvisionedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation);
+        return try commitProvisionedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, .replayable, cancellation);
+    }
+
+    fn commitTransactionWithFreshId(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
+        return try commitProvisionedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, .first, cancellation);
     }
 
     fn acknowledgeTransactionCommit(
@@ -22431,7 +22463,7 @@ pub const ProvisionedTableWriteSource = struct {
         begin_timestamp: u64,
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
-        retain_terminal: bool,
+        attempt: CommitAttempt,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
@@ -22449,7 +22481,8 @@ pub const ProvisionedTableWriteSource = struct {
             sync_level,
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
             .{
-                .retain_terminal = retain_terminal,
+                .retain_terminal = attempt != .ephemeral,
+                .fresh_retained_id = attempt == .first,
                 .report_post_commit_failure = false,
                 .fanout_io = self.tableActivityIo(),
                 .post_commit_cancellation = cancellation,
@@ -22488,7 +22521,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (try self.commitSingleGroupBatch(alloc, tables, sync_level, cancellation)) |outcome| return outcome;
         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
-        return commitProvisionedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation) catch |err| {
+        return commitProvisionedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, .ephemeral, cancellation) catch |err| {
             if (err == error.CommitDecisionUnknown)
                 public_table_http.setLastAmbiguousBatchTxnId(distributed_txn.encodeTxnIdHex(txn_id));
             return err;
@@ -23772,7 +23805,16 @@ pub const ProvisionedTableWriteSource = struct {
                 } },
             };
             if (topology_epoch != 0) {
-                const fence = (try table_catalog.checkedTransactionRoute(alloc, self.catalog, table_name, topology_epoch, true, group_id)) orelse return error.TopologyChanged;
+                var budget = self.catalog.budget(null);
+                budget.deadline_ns = budget.nowNs() +| @as(u64, metadata_api.catalog_route_default_deadline_ms) * std.time.ns_per_ms;
+                budget.cancellation = cancellation;
+                var fence = table_catalog.raftDecisionRoute(alloc, self.catalog, table_name, topology_epoch, group_id, budget) catch |err| switch (err) {
+                    error.TopologyChanged, error.TableNotFound => return error.DecisionNotProposed,
+                    else => return err,
+                };
+                fence.admission_deadline_ns = budget.deadline_ns;
+                fence.admission_deadline_io = budget.io;
+                fence.admission_cancellation = cancellation;
                 try batcher.batchGroupRoutedWithCancellation(alloc, fence, table_name, req, cancellation);
             } else {
                 self.beginGroupOperation(table_name, group_id);
@@ -23788,7 +23830,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
         if (topology_epoch != 0)
-            try table_catalog.validateTransactionEpoch(alloc, self.catalog, table_name, topology_epoch, true);
+            _ = try table_catalog.localDecisionRoute(alloc, self.catalog, table_name, topology_epoch, group_id, cancellation);
         if (status == .committed) {
             lockAtomic(&self.local_db_mutex);
             self.invalidateReadCache(table_name);
@@ -25893,6 +25935,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .commit_batch_with_cancellation = commitBatchWithCancellation,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
+                .commit_transaction_with_fresh_id = commitTransactionWithFreshId,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .backup_table = backupTable,
                 .backup_pin_control = backupPinControl,
@@ -26515,7 +26558,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const txn_source: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const txn_io: ?Io = if (txn_source.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
-        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
+        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, .ephemeral, cancellation);
     }
 
     fn commitBatch(
@@ -26547,7 +26590,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
-        return try commitHostedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
+        return try commitHostedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, .ephemeral, cancellation);
     }
 
     fn commitTransactionWithId(
@@ -26570,7 +26613,19 @@ pub const HostedProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        return try commitHostedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation);
+        return try commitHostedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, .replayable, cancellation);
+    }
+
+    fn commitTransactionWithFreshId(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
+        return try commitHostedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, .first, cancellation);
     }
 
     fn acknowledgeTransactionCommit(
@@ -26599,7 +26654,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         begin_timestamp: u64,
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
-        retain_terminal: bool,
+        attempt: CommitAttempt,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
@@ -26617,7 +26672,8 @@ pub const HostedProvisionedTableWriteSource = struct {
             sync_level,
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
             .{
-                .retain_terminal = retain_terminal,
+                .retain_terminal = attempt != .ephemeral,
+                .fresh_retained_id = attempt == .first,
                 .report_post_commit_failure = false,
                 .fanout_io = if (self.backend_runtime) |runtime| runtime.apiIo() else null,
                 .post_commit_cancellation = cancellation,
@@ -27010,8 +27066,11 @@ pub const HostedProvisionedTableWriteSource = struct {
             if (fence.route.group_id != group_id or fence.topology_epoch != topology_epoch) return error.TopologyChanged;
             try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table_name, fence, self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }));
         }
-        if (topology_epoch != 0)
-            try table_catalog.validateTransactionEpoch(alloc, self.catalog, table_name, topology_epoch, req.transaction != null and req.transaction.? == .resolve);
+        if (topology_epoch != 0) {
+            if (req.transaction != null and req.transaction.? == .resolve) {
+                _ = try table_catalog.localDecisionRoute(alloc, self.catalog, table_name, topology_epoch, group_id, context.cancellation);
+            } else try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        }
         if (!try batchUsesDurableTransactionContract(alloc, cached.db, req))
             try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
         try ensurePreDecisionContextActive(context);

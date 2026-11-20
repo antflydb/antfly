@@ -22,6 +22,9 @@ const Mock = struct {
     catalog_rebind: bool = false,
     cached_rename: bool = false,
     probe_change_at: ?usize = null,
+    compatible_revision: bool = false,
+    cancel_during_validation: bool = false,
+    session: ?*protocol.Session = null,
     replace_incarnation: bool = false,
     replace_before_setting_execute: bool = false,
     probes: usize = 0,
@@ -181,6 +184,11 @@ const Mock = struct {
         try request.check();
         if (self.expected_cursor_namespace) |expected| if (!std.mem.eql(u8, expected, request.namespace orelse "public")) return error.CatalogGenerationChanged;
         self.stream_validations += 1;
+        if (self.cancel_during_validation) {
+            const session = self.session.?;
+            if (session.executing.load(.acquire)) session.cancel_requested.store(true, .release);
+            try request.check();
+        }
         if (self.cursor_revoked or self.deny_stream_validation) return error.Forbidden;
     }
     fn nextPage(raw: *anyopaque, alloc: std.mem.Allocator, request: backend.Request, wanted: u32) !backend.StreamPage {
@@ -250,7 +258,7 @@ const Mock = struct {
         if (self.replace_before_setting_execute and self.describes == 3) self.catalog_revision += 1;
         if (self.probe_change_at != null or self.replace_before_setting_execute) return .{
             .stamp = .{ .catalog = .{ .catalog_revision = self.catalog_revision, .relation_epoch = .{ .incarnation = @splat(if (self.replace_incarnation) @intCast(self.catalog_revision) else 1), .revision = self.catalog_revision } }, .authority = 1, .reusable = !self.replace_before_setting_execute },
-            .binding_guard = if (self.replace_incarnation or self.catalog_revision == 1) "original table" else "replacement table",
+            .binding_guard = if (self.compatible_revision or self.replace_incarnation or self.catalog_revision == 1) "original table" else "replacement table",
             .columns = &.{},
         };
         if (self.cached_rename and self.describes > 1) return .{ .columns = &.{.{ .name = "renamed", .type = .integer }}, .parameter_types = &.{.integer} };
@@ -497,6 +505,8 @@ fn run(mock: *Mock, input: []const u8, limits: protocol.Limits) !std.Io.Writer.A
         session.deinit();
         mock.completion_safe_after_run = session.completion_safe;
     }
+    mock.session = &session;
+    defer mock.session = null;
     try session.run();
     return output;
 }
@@ -1728,6 +1738,38 @@ test "Describe Portal checks authorization before returning columns or executing
         try std.testing.expectEqual(@as(usize, @intFromBool(suspended)), mock.executions);
         try std.testing.expect(std.mem.indexOf(u8, output.written(), "42501") != null);
     }
+}
+
+test "Describe Portal reuses a compatible revision across frames" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "q", "UPDATE t SET n = 1", false);
+    try bind(&input.writer, "p", "q", null);
+    for (0..3) |_| try frame(&input.writer, 'D', "Pp\x00");
+    try frame(&input.writer, 'X', "");
+    var mock = Mock{ .probe_change_at = 2, .compatible_revision = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 2), mock.describes);
+    try std.testing.expectEqual(@as(usize, 4), mock.probes);
+}
+
+test "Describe Portal accepts cancellation during retained-reader validation" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "q", "SELECT n FROM t", false);
+    try bind(&input.writer, "p", "q", null);
+    try execute(&input.writer, "p", 1);
+    try frame(&input.writer, 'D', "Pp\x00");
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock = Mock{ .stream_rows = 2, .cancel_during_validation = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_validations);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "57014") != null);
 }
 
 test "Describe validates native portal authority after suspension and exhaustion" {

@@ -71,8 +71,8 @@ pub const Coordinator = struct {
         defer plan.deinit();
         // Once the durable plan is sealed, no error is safe to turn into a
         // replay invitation. Maintenance owns completion under this same id.
-        const outcome = (source.commitTransactionWithIdAndCancellation(alloc, id, info.begin_timestamp, plan.value, info.sync_level, self.context.cancellation) catch |err| {
-            if (transactions.classifyCommitRejection(info, err) == .fresh) {
+        const outcome = (source.commitTransactionAttempt(alloc, id, info.begin_timestamp, plan.value, info.sync_level, plan.first_attempt, self.context.cancellation) catch |err| {
+            if (transactions.classifyCommitRejection(plan.first_attempt, err) == .fresh) {
                 _ = (server.txn_sessions.recordTerminalAbort(alloc, id) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
                 return .{ .outcome = .aborted, .reconciliation_id = id };
             }

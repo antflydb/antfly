@@ -51691,6 +51691,14 @@ fn hydrateVirtualPdfPageUnits(self: *DB, output: Allocator, txn: *docstore_mod.D
     while (offset < keys.len) {
         const end = @min(offset + 128, keys.len);
         _ = batch.reset(.retain_capacity);
+        var receipts: ?@import("privacy_read.zig").PageValidation = if (policy) |active| .{ .alloc = batch.allocator(), .policy = active } else null;
+        defer if (receipts) |*cache| cache.deinit();
+        // Proof borrows expire per candidate. Header borrows live through
+        // the entire sorted wave, so each needs its own scope on the same txn.
+        var proof_backing = inference_work.ReclaimingInvocationAllocator.init(output);
+        const proof_allocator = proof_backing.allocator();
+        var proof_scope: ?backend_erased_mod.ReadScope = null;
+        defer if (proof_scope) |*read| read.close();
         var candidates: [128]Candidate = undefined;
         var count: usize = 0;
         for (offset..end) |i| {
@@ -51724,11 +51732,16 @@ fn hydrateVirtualPdfPageUnits(self: *DB, output: Allocator, txn: *docstore_mod.D
             for (probes[0..received], headers[0..received]) |probe, header| {
                 var item = probe.candidate;
                 if (header) |bytes| candidate: {
-                    if (policy) |active| {
-                        var backing = inference_work.ReclaimingInvocationAllocator.init(output);
-                        var validation = std.heap.ArenaAllocator.init(backing.allocator());
+                    if (receipts) |*cache| {
+                        if (proof_scope) |*read| read.reset() catch |err| {
+                            if (err != error.ReadScopeResetUnsupported) return err;
+                            read.close();
+                            proof_scope = null;
+                        };
+                        if (proof_scope == null) proof_scope = try txn.openReadScope(proof_allocator);
+                        var validation = std.heap.ArenaAllocator.init(proof_allocator);
                         defer validation.deinit();
-                        if (!try @import("privacy_read.zig").permitsVirtualPage(validation.allocator(), active, probe.key, bytes, txn)) break :candidate;
+                        if (!try cache.permits(validation.allocator(), probe.key, bytes, proof_scope.?, txn.payload_session)) break :candidate;
                     }
                     const meta = try @import("../artifact_payload.zig").Metadata.decode(bytes);
                     if (meta.sourceHash()) |source| {
@@ -156183,10 +156196,32 @@ test "source semantic media input virtual PDF pages require the physical vector 
         var txn = try db.core.store.beginReadTxn();
         defer txn.abort();
         const privacy = @import("privacy_read.zig");
-        try std.testing.expect(!try privacy.permitsVirtualPage(scratch, policy, orphan, &orphan_reference.encode(), &txn));
+        const CountingRead = struct {
+            inner: backend_erased_mod.ReadScope,
+            primary: []const u8,
+            primary_reads: *usize,
+            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                if (std.mem.eql(u8, self.primary, key)) self.primary_reads.* += 1;
+                return self.inner.get(key);
+            }
+            pub fn close(self: *@This()) void {
+                self.inner.close();
+            }
+        };
+        var primary_reads: usize = 0;
+        var scope = try backend_erased_mod.readScopeFrom(scratch, CountingRead{
+            .inner = try txn.openReadScope(scratch),
+            .primary = try internal_keys.documentKeyAlloc(scratch, "doc"),
+            .primary_reads = &primary_reads,
+        });
+        defer scope.close();
+        var cache = privacy.PageValidation{ .alloc = scratch, .policy = policy };
+        defer cache.deinit();
+        try std.testing.expect(!try cache.permits(scratch, orphan, &orphan_reference.encode(), scope, txn.payload_session));
         try std.testing.expectEqual(@as(usize, 0), external.fetched_bytes);
-        try std.testing.expect(try privacy.permitsVirtualPage(scratch, policy, vector_key, &reference.encode(), &txn));
-        try std.testing.expectEqual(vector.len, external.fetched_bytes);
+        for (0..2) |_| try std.testing.expect(try cache.permits(scratch, vector_key, &reference.encode(), scope, txn.payload_session));
+        try std.testing.expectEqual(@as(usize, 1), primary_reads);
+        try std.testing.expectEqual(2 * vector.len, external.fetched_bytes);
     }
     external.fetched_bytes = 0;
     try db.core.store.delete(witness);

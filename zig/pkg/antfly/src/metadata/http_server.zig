@@ -230,6 +230,7 @@ pub const AdminSource = struct {
         linearizable_table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         linearizable_routing_token: ?*const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.CatalogRoutingChangeToken = null,
         owner_readiness: ?*const fn (*anyopaque, metadata_api.OwnerReadinessRequest, operation.RequestContext) anyerror!metadata_api.OwnerReadiness = null,
+        decision_admission: ?*const fn (*anyopaque, metadata_api.DecisionAdmissionRequest, operation.RequestContext) anyerror!metadata_api.DecisionAdmission = null,
         privacy_policy_binding: ?*const fn (*anyopaque, []const u8, operation.RequestContext) anyerror!metadata_api.PrivacyPolicyBinding = null,
         free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
         wait_for_routing_change: ?*const fn (ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, confirm_absence: bool) anyerror!metadata_api.CatalogRoutingChangeResult = null,
@@ -663,6 +664,7 @@ pub const AdminSource = struct {
                 .linearizable_table_routing_snapshot = metadataServiceLinearizableTableRoutingSnapshot,
                 .linearizable_routing_token = metadataServiceRoutingToken,
                 .owner_readiness = metadataServiceOwnerReadiness,
+                .decision_admission = metadataServiceDecisionAdmission,
                 .privacy_policy_binding = metadataServicePrivacyPolicyBinding,
                 .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataServiceWaitForRoutingChange,
@@ -739,6 +741,7 @@ pub const AdminSource = struct {
                 .linearizable_table_routing_snapshot = metadataHttpServiceLinearizableTableRoutingSnapshot,
                 .linearizable_routing_token = metadataHttpServiceRoutingToken,
                 .owner_readiness = metadataHttpServiceOwnerReadiness,
+                .decision_admission = metadataHttpServiceDecisionAdmission,
                 .privacy_policy_binding = metadataHttpServicePrivacyPolicyBinding,
                 .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataHttpServiceWaitForRoutingChange,
@@ -1017,6 +1020,14 @@ pub const AdminSource = struct {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         try request.ensureActive();
         const result = try svc.ownerReadiness(input, .{ .deadline_ns = request.deadline_ns, .io = request.deadline_io, .cancellation = request.cancellation });
+        try request.ensureActive();
+        return result;
+    }
+
+    fn metadataServiceDecisionAdmission(ptr: *anyopaque, input: metadata_api.DecisionAdmissionRequest, request: operation.RequestContext) !metadata_api.DecisionAdmission {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try request.ensureActive();
+        const result = try svc.decisionAdmission(input, .{ .deadline_ns = request.deadline_ns, .io = request.deadline_io, .cancellation = request.cancellation });
         try request.ensureActive();
         return result;
     }
@@ -1565,6 +1576,14 @@ pub const AdminSource = struct {
         return result;
     }
 
+    fn metadataHttpServiceDecisionAdmission(ptr: *anyopaque, input: metadata_api.DecisionAdmissionRequest, request: operation.RequestContext) !metadata_api.DecisionAdmission {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try request.ensureActive();
+        const result = try svc.decisionAdmission(input, .{ .deadline_ns = request.deadline_ns, .io = request.deadline_io, .cancellation = request.cancellation });
+        try request.ensureActive();
+        return result;
+    }
+
     fn metadataHttpServicePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) !metadata_api.PrivacyPolicyBinding {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         try svc.ensureLinearizableReadWithContext(request);
@@ -2072,6 +2091,7 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_linearizable_table_routing_snapshot, httpx.Handler.bind(self, metadataLinearizableTableRoutingSnapshot));
         try server.post(routes.Routes.internal_routing_token, httpx.Handler.bind(self, metadataRoutingToken));
         try server.post(routes.Routes.internal_owner_readiness, httpx.Handler.bind(self, metadataOwnerReadiness));
+        try server.post(routes.Routes.internal_decision_admission, httpx.Handler.bind(self, metadataDecisionAdmission));
         try server.post(routes.Routes.internal_privacy_policy_binding, httpx.Handler.bind(self, metadataPrivacyPolicyBinding));
         try server.post(routes.Routes.internal_routing_change, httpx.Handler.bind(self, metadataRoutingChange));
         try server.post(routes.Routes.internal_routing_authority, httpx.Handler.bind(self, metadataRoutingChange));
@@ -2655,6 +2675,20 @@ pub const MetadataHttpServer = struct {
         const request = requestContext(ctx);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
         const capture = self.source.vtable.owner_readiness orelse return ctx.status(503).text("owner readiness unavailable");
+        const result = capture(self.source.ptr, parsed.value, request) catch |err| return metadataReadError(ctx, err);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return ctx.json(result);
+    }
+
+    fn metadataDecisionAdmission(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        const body = (try ctx.body()) orelse "";
+        var parsed = std.json.parseFromSlice(metadata_api.DecisionAdmissionRequest, ctx.allocator, body, .{ .allocate = .alloc_always }) catch return ctx.status(400).text("invalid decision admission request");
+        defer parsed.deinit();
+        if (parsed.value.table_id == 0 or parsed.value.table_name.len == 0) return ctx.status(400).text("invalid decision admission request");
+        const request = requestContext(ctx);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        const capture = self.source.vtable.decision_admission orelse return ctx.status(503).text("decision admission unavailable");
         const result = capture(self.source.ptr, parsed.value, request) catch |err| return metadataReadError(ctx, err);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
         return ctx.json(result);

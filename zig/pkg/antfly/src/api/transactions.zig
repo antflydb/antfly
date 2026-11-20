@@ -385,10 +385,21 @@ pub const OwnedTransactionCommitRequest = struct {
     }
 };
 
-pub const ExecutionPlan = std.json.Parsed([]const distributed_txn.TableCommitRequest);
+pub const ExecutionPlan = struct {
+    const Parsed = std.json.Parsed([]const distributed_txn.TableCommitRequest);
+    arena: *std.heap.ArenaAllocator,
+    value: []const distributed_txn.TableCommitRequest,
+    // Only the caller that durably chose this plan can prove a first dispatch.
+    first_attempt: bool = false,
+
+    pub fn deinit(self: @This()) void {
+        (Parsed{ .arena = self.arena, .value = self.value }).deinit();
+    }
+};
 
 pub fn parseExecutionPlan(alloc: std.mem.Allocator, bytes: []const u8) !ExecutionPlan {
-    return std.json.parseFromSlice([]const distributed_txn.TableCommitRequest, alloc, bytes, .{ .allocate = .alloc_always });
+    const parsed = try std.json.parseFromSlice([]const distributed_txn.TableCommitRequest, alloc, bytes, .{ .allocate = .alloc_always });
+    return .{ .arena = parsed.arena, .value = parsed.value };
 }
 
 fn encodeExecutionPlan(alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest) ![]u8 {
@@ -1821,6 +1832,8 @@ pub const DurableSessionStore = struct {
             error.NotFound => {},
             else => return err,
         };
+        // The lease and its generation watermark survive session retirement.
+        // Reusing an external ID must never recreate an earlier reader tenure.
         const recovery_key = try makeSessionRecoveryKey(self.alloc, txn_id);
         defer self.alloc.free(recovery_key);
         txn.delete(recovery_key) catch |err| switch (err) {
@@ -2160,6 +2173,45 @@ pub const SessionLeaseStore = struct {
         return try lease.load(alloc);
     }
 
+    fn certifyReader(self: *const SessionLeaseStore, a: std.mem.Allocator, id: db_mod.types.TxnId, owner: u64) !void {
+        if (self.mutation_mutex) |mutex| platform_sync.lockYielding(mutex);
+        defer if (self.mutation_mutex) |mutex| mutex.unlock();
+        switch (self.backend) {
+            .docstore => |db| {
+                var txn = try db.beginWriteTxn();
+                errdefer txn.abort();
+                if (try promoteReaderLease(a, &txn, id, owner)) try txn.commit() else txn.abort();
+            },
+            .runtime => |db| {
+                var txn = try db.beginWrite();
+                errdefer txn.abort();
+                if (try promoteReaderLease(a, &txn, id, owner)) try txn.commit() else txn.abort();
+            },
+        }
+    }
+
+    fn promoteReaderLease(a: std.mem.Allocator, txn: anytype, id: db_mod.types.TxnId, owner: u64) !bool {
+        const lease_key = try makeSessionLeaseKey(a, id);
+        defer a.free(lease_key);
+        const raw = txn.get(lease_key) catch |err| if (err == error.NotFound) return error.SessionLeaseLost else return err;
+        const lease = try std.json.parseFromSlice(lease_mod.LeaseRecord, a, raw, .{});
+        defer lease.deinit();
+        try requireReaderLease(lease.value, owner);
+        if (lease.value.epoch >= certified_lease_epoch) return false;
+        const key = try readerGenerationKey(a, id);
+        defer a.free(key);
+        const generation = std.math.add(u64, try readerGeneration(txn, key), 1) catch return error.LeaseEpochOverflow;
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, generation, .little);
+        var promoted = lease.value;
+        promoted.epoch = certified_lease_epoch;
+        const value = try std.json.Stringify.valueAlloc(a, promoted, .{});
+        defer a.free(value);
+        try txn.put(key, &encoded);
+        try txn.put(lease_key, value);
+        return true;
+    }
+
     pub fn renew(self: *const SessionLeaseStore, txn_id: db_mod.types.TxnId, owner_node_id: u64, now_ms: u64, ttl_ms: u64) !bool {
         if (self.mutation_mutex) |mutex| platform_sync.lockYielding(mutex);
         defer if (self.mutation_mutex) |mutex| mutex.unlock();
@@ -2196,13 +2248,13 @@ pub const SessionLeaseStore = struct {
 // propagation or generic execution errors.
 pub const CommitRejection = enum { none, fresh, ambiguous };
 
-pub fn classifyCommitRejection(before_dispatch: SessionInfo, err: anyerror) CommitRejection {
+pub fn classifyCommitRejection(first_attempt: bool, err: anyerror) CommitRejection {
     const rejected = switch (err) {
         error.TransactionTooLarge, error.InvalidBatchRequest, error.InvalidArgument, error.InvalidGraphEdges, error.UnsupportedTransformOperation, error.TopologyChanged, error.DecisionConflict, error.DocIdentityNamespaceMismatch, error.UnsupportedOperation, error.TableNotFound, error.UnknownGroup => true,
         else => false,
     };
     if (!rejected) return .none;
-    return if (before_dispatch.commit_execution_started) .ambiguous else .fresh;
+    return if (first_attempt) .fresh else .ambiguous;
 }
 
 pub const SessionRegistry = struct {
@@ -2484,10 +2536,20 @@ pub const SessionRegistry = struct {
         _ = try self.sqlReaderTenure(alloc, txn_id, principal, owner);
     }
 
-    pub fn sqlReaderTenure(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: []const u8, owner: u64) !?u64 {
+    pub fn sqlReaderTenure(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: []const u8, owner: u64) !?u128 {
         const stripe = self.sessionLock(txn_id);
         stripe.lock();
         defer stripe.unlock();
+        return self.readSqlTenureLocked(alloc, txn_id, principal, owner) catch |err| switch (err) {
+            error.LegacyReaderLease => blk: {
+                try self.lease_store.?.certifyReader(alloc, txn_id, owner);
+                break :blk try self.readSqlTenureLocked(alloc, txn_id, principal, owner);
+            },
+            else => err,
+        };
+    }
+
+    fn readSqlTenureLocked(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: []const u8, owner: u64) !?u128 {
         if (!self.durableMissIsAuthoritative()) {
             self.mutex.lock();
             if (self.sessions.getPtr(txn_id)) |session| {
@@ -2542,15 +2604,26 @@ pub const SessionRegistry = struct {
     /// Read-only SQL statements must not consume an obsolete cached session
     /// after another node adopts its durable owner lease.
     pub fn validateSqlLease(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, owner: u64) !void {
-        _ = try self.sqlLeaseTenure(alloc, txn_id, owner);
-    }
-
-    fn sqlLeaseTenure(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, owner: u64) !?u64 {
-        const store = self.lease_store orelse return null;
+        const store = self.lease_store orelse return;
         var record = (try store.load(alloc, txn_id)) orelse return error.SessionLeaseLost;
         defer lease_mod.deinitRecord(alloc, &record);
         try requireReaderLease(record, owner);
-        return record.epoch;
+    }
+
+    fn sqlLeaseTenure(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, owner: u64) !?u128 {
+        const store = self.lease_store orelse return null;
+        switch (store.backend) {
+            .docstore => |db| {
+                var read_txn = try db.beginReadTxn();
+                defer read_txn.abort();
+                return try readLeaseTenure(alloc, &read_txn, txn_id, owner);
+            },
+            .runtime => |db| {
+                var read_txn = try db.beginRead();
+                defer read_txn.abort();
+                return try readLeaseTenure(alloc, &read_txn, txn_id, owner);
+            },
+        }
     }
 
     pub fn setSqlFailed(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, failed: bool) !void {
@@ -3067,6 +3140,7 @@ pub const SessionRegistry = struct {
         candidate.execution_plan = try encodeExecutionPlan(alloc, if (selected) |value| value.tables else tables);
         var result = try parseExecutionPlan(alloc, candidate.execution_plan.?);
         errdefer result.deinit();
+        result.first_attempt = !candidate.commit_execution_started;
         candidate.commit_execution_started = true;
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
@@ -5948,14 +6022,33 @@ fn checkReaderPrefix(bytes: []const u8, principal: []const u8, owner: u64) !bool
     return true;
 }
 
-fn requireDurableReader(alloc: std.mem.Allocator, read: anytype, id: db_mod.types.TxnId, principal: []const u8, owner: u64, check_lease: bool) !?u64 {
+fn requireDurableReader(alloc: std.mem.Allocator, read: anytype, id: db_mod.types.TxnId, principal: []const u8, owner: u64, check_lease: bool) !?u128 {
     const key = try makeSessionKey(alloc, id);
     defer alloc.free(key);
     checkDurableReaderSession(alloc, read, key, id, principal, owner) catch |err| switch (err) {
         error.NotFound => return error.SqlTransactionNotActive,
         else => return err,
     };
-    if (!check_lease) return null;
+    return if (check_lease) try readLeaseTenure(alloc, read, id, owner) else null;
+}
+
+// Legacy adoption resets the epoch to zero. Reserve the high half for
+// certified leases and rotate a separate durable generation on each promotion.
+// Old writers can renew a certified tenure, but cannot restore its generation
+// after resetting the lease.
+const certified_lease_epoch: u64 = 1 << 63;
+
+fn readerGenerationKey(a: std.mem.Allocator, id: db_mod.types.TxnId) ![]u8 {
+    return std.fmt.allocPrint(a, "\x00\x00__api_txn_reader_generation__:{s}", .{std.fmt.bytesToHex(id, .lower)});
+}
+
+fn readerGeneration(txn: anytype, key: []const u8) !u64 {
+    const raw = txn.get(key) catch |err| if (err == error.NotFound) return 0 else return err;
+    if (raw.len != 8) return error.InvalidTransactionSessionRecord;
+    return std.mem.readInt(u64, raw[0..8], .little);
+}
+
+fn readLeaseTenure(alloc: std.mem.Allocator, read: anytype, id: db_mod.types.TxnId, owner: u64) !u128 {
     const lease_key = try makeSessionLeaseKey(alloc, id);
     defer alloc.free(lease_key);
     const raw = read.get(lease_key) catch |err| switch (err) {
@@ -5965,7 +6058,12 @@ fn requireDurableReader(alloc: std.mem.Allocator, read: anytype, id: db_mod.type
     const lease = try std.json.parseFromSlice(lease_mod.LeaseRecord, alloc, raw, .{});
     defer lease.deinit();
     try requireReaderLease(lease.value, owner);
-    return lease.value.epoch;
+    if (lease.value.epoch < certified_lease_epoch) return error.LegacyReaderLease;
+    const key = try readerGenerationKey(alloc, id);
+    defer alloc.free(key);
+    const generation = try readerGeneration(read, key);
+    if (generation == 0) return error.InvalidTransactionSessionRecord;
+    return (@as(u128, generation) << 64) | lease.value.epoch;
 }
 
 fn checkDurableReaderSession(alloc: std.mem.Allocator, read: anytype, key: []const u8, id: db_mod.types.TxnId, principal: []const u8, owner: u64) !void {
@@ -6844,6 +6942,7 @@ test "distributed txn sessions durably seal exact binary integrity plans before 
     // A retry that read different metadata cannot redirect the chosen plan.
     var retry = (try writer.sealExecutionPlan(alloc, session.txn_id, &.{.{ .table_name = "wrong" }})).?;
     defer retry.deinit();
+    try std.testing.expect(first.first_attempt and !retry.first_attempt);
     try std.testing.expectEqualStrings("docs", retry.value[0].table_name);
     // A stale preflight on a concurrent HTTP retry may not erase the plan.
     try std.testing.expect(!writer.removeBeforeExecution(alloc, session.txn_id));
@@ -7348,6 +7447,14 @@ test "SQL session metadata for a retained reader checks the shared session and l
     try std.testing.expectEqual(first + 3, (try registry.sqlReaderTenure(a, id, "alice", 7)).?);
     const lease_key = try makeSessionLeaseKey(a, id);
     defer a.free(lease_key);
+    // A base-version adopter rewrites the canonical lease with epoch zero.
+    // Its heartbeat may promote that back to one before this server observes it.
+    const live_legacy = try std.json.Stringify.valueAlloc(a, lease_mod.LeaseRecord{ .owner_id = "node:7", .expires_at_ms = now + 600_000, .epoch = 1 }, .{});
+    defer a.free(live_legacy);
+    try store.put(lease_key, live_legacy);
+    const reacquired = (try registry.sqlReaderTenure(a, id, "alice", 7)).?;
+    try std.testing.expect(reacquired != first);
+    try std.testing.expectEqual(reacquired, (try registry.sqlReaderTenure(a, id, "alice", 7)).?);
     try store.put(lease_key, "{\"owner_id\":\"node:7\",\"expires_at_ms\":1}");
     try std.testing.expectError(error.SessionLeaseLost, registry.requireActiveSqlReader(a, id, "alice", 7));
     try std.testing.expect(try leases.renew(id, 8, nextTxnTimestamp() / std.time.ns_per_ms, 60_000));
@@ -8468,14 +8575,11 @@ test "durable session mutations publish only after persistence succeeds: durable
 }
 
 test "SQL pgwire native commit rejection requires a fresh execution" {
-    const fresh: SessionInfo = .{ .txn_id = @splat(1), .begin_timestamp = 1, .sync_level = .write };
-    var replay = fresh;
-    replay.commit_execution_started = true;
     for ([_]anyerror{ error.TableNotFound, error.TopologyChanged, error.TransactionTooLarge, error.UnknownGroup }) |err| {
-        try std.testing.expectEqual(CommitRejection.fresh, classifyCommitRejection(fresh, err));
-        try std.testing.expectEqual(CommitRejection.ambiguous, classifyCommitRejection(replay, err));
+        try std.testing.expectEqual(CommitRejection.fresh, classifyCommitRejection(true, err));
+        try std.testing.expectEqual(CommitRejection.ambiguous, classifyCommitRejection(false, err));
     }
-    try std.testing.expectEqual(CommitRejection.none, classifyCommitRejection(fresh, error.CommitDecisionUnknown));
+    try std.testing.expectEqual(CommitRejection.none, classifyCommitRejection(true, error.CommitDecisionUnknown));
     const session: Session = .{ .txn_id = @splat(1), .owner_node_id = 0, .begin_timestamp = 1, .last_touched_timestamp = 1, .sync_level = .write, .commit_execution_started = true };
     try std.testing.expect(session.info().commit_execution_started);
 }

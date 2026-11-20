@@ -2797,6 +2797,10 @@ pub const ApiHttpClient = struct {
             }
             if (resp.status == 409) {
                 if (@import("relational_integrity_errors.zig").decode(resp.body)) |reason| return reason;
+                if (std.mem.eql(u8, resp.body, "decision not proposed")) {
+                    if (outcome != null and std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1)) return error.DecisionNotProposed;
+                    return error.RaftBatchWriteOutcomeUnknown;
+                }
                 if (std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), "OnlineMergeArtifactCatalogUncoordinated")) {
                     if (forwarding != null and (outcome == null or
                         !std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1)))
@@ -4526,6 +4530,7 @@ fn remoteGroupTxnPrepareConflictError(body: []const u8) anyerror {
 }
 
 fn remoteGroupTxnResolveConflictError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "decision not proposed")) return error.DecisionNotProposed;
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (std.mem.eql(u8, body, "topology changed") or std.mem.eql(u8, body, "TopologyChanged")) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;

@@ -70,10 +70,10 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
     defer plan.deinit();
     const writer = server.table_writes orelse return .{ .status = .unknown };
     const normalized = context.platformDeadline() catch return .{ .status = .unknown };
-    const outcome = (writer.commitTransactionWithIdAndCancellation(alloc, id, info.begin_timestamp, plan.value, .full_index, normalized.cancellation) catch |err| {
-        if (err == error.TransactionPrepareAbortedRowPolicyDenied) {
-            _ = registry.recordTerminalAbort(owned, id) catch return .{ .status = .unknown };
-            return .{ .status = .aborted, .failure = error.RowPolicyDenied };
+    const outcome = (writer.commitTransactionAttempt(alloc, id, info.begin_timestamp, plan.value, .full_index, plan.first_attempt, normalized.cancellation) catch |err| {
+        if (err == error.TransactionPrepareAbortedRowPolicyDenied or sessions.classifyCommitRejection(plan.first_attempt, err) == .fresh) {
+            _ = (registry.recordTerminalAbort(owned, id) catch null) orelse return .{ .status = .unknown };
+            return .{ .status = .aborted, .failure = if (err == error.TransactionPrepareAbortedRowPolicyDenied) error.RowPolicyDenied else err };
         }
         if (err == error.EnrichmentWorkerFailed) {
             _ = registry.recordTerminalCommitWithRepair(owned, id, .committed, true, null, null) catch return .{ .status = .committed_pending };

@@ -1103,6 +1103,7 @@ const LocalStandaloneMetadata = struct {
                 .table_routing_snapshot = catalogTableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = catalogTableRoutingSnapshot,
                 .owner_readiness = catalogOwnerReadiness,
+                .decision_admission = catalogDecisionAdmission,
                 .privacy_policy_binding = catalogPrivacyPolicyBinding,
                 .free_routing_snapshot = catalogFreeRoutingSnapshot,
                 .wait_for_routing_change = catalogWaitForRoutingChange,
@@ -2125,6 +2126,14 @@ const LocalStandaloneMetadata = struct {
         if (self.lifecycle_store) |store| if (try store.standaloneRevision() != self.durable_revision) try self.reloadLifecycleProjectionLocked();
 
         return self.routingSnapshotLocked(deadline_ns);
+    }
+
+    fn catalogDecisionAdmission(ptr: *anyopaque, request: antfly.metadata_api.DecisionAdmissionRequest, budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.DecisionAdmission {
+        const generation = try acquireRoutingGeneration(ptr, budget, true);
+        defer generation.release();
+        const catalog = generation.indexed.snapshot.value;
+        const view = try generation.indexed.tableRoutingView(request.table_name, budget);
+        return .{ .stable = view.table_id == request.table_id, .catalog_revision = catalog.catalog_revision, .metadata_group_id = catalog.metadata_group_id, .metadata_incarnation = catalog.metadata_incarnation };
     }
 
     fn catalogOwnerReadiness(ptr: *anyopaque, request: antfly.metadata_api.OwnerReadinessRequest, budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.OwnerReadiness {

@@ -4121,6 +4121,10 @@ pub const AntflyApiHandler = struct {
         ) catch |err| return switch (err) {
             error.RetainedEffectsFull => retainedPressureResponse(ctx, true),
             error.InvalidArgument => textResponse(ctx, 400, "invalid batch request"),
+            error.DecisionNotProposed => blk: {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
+                break :blk textResponse(ctx, 409, "decision not proposed");
+            },
             error.TopologyChanged => blk: {
                 try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
                 break :blk textResponse(ctx, 409, "topology changed");
@@ -4190,6 +4194,7 @@ pub const AntflyApiHandler = struct {
         return switch (err) {
             error.InvalidArgument => textResponse(ctx, 400, "invalid transaction request"),
             error.TransactionTooLarge => textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions"),
+            error.DecisionNotProposed => textResponse(ctx, 409, "decision not proposed"),
             error.DecisionConflict => textResponse(ctx, 409, "decision conflict"),
             error.TransactionConflict => textResponse(ctx, 409, "transaction conflict"),
             error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
@@ -6297,15 +6302,16 @@ pub const AntflyApiHandler = struct {
             execution_plan = (self.api_server.txn_sessions.sealExecutionPlan(alloc, txn_id, prepared.tables) catch |err|
                 return self.transactionPreparationError(ctx, err)) orelse return textResponse(ctx, 404, "not found");
         }
-        const outcome = (source.commitTransactionWithIdAndCancellation(
+        const outcome = (source.commitTransactionAttempt(
             alloc,
             txn_id,
             session.begin_timestamp,
             execution_plan.?.value,
             session.sync_level,
+            execution_plan.?.first_attempt,
             commit_request.cancellation,
         ) catch |err| rejected: {
-            const rejection = transactions_api.classifyCommitRejection(session, err);
+            const rejection = transactions_api.classifyCommitRejection(execution_plan.?.first_attempt, err);
             if (rejection == .ambiguous) return textResponse(ctx, 503, "transaction outcome is unknown; reconcile this transaction id before retrying");
             if (rejection == .fresh) {
                 // Publish the abort and settle consumers before attempting

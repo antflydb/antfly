@@ -5882,7 +5882,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "17";
+const derived_catalog_index_version = "18";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -12462,7 +12462,77 @@ pub const RaftApplyStore = struct {
         return result.toOwnedSlice(alloc);
     }
 
+    const decision_prefix = "\x00\x00__metadata_derived__:txn_decision:";
+
+    // Contracts are immutable over a transition's lifetime. Keep separate ID
+    // and name entries to match the compatibility checks on admin snapshots.
+    // Pre-contract transitions also bind whichever table owns either group.
+    fn indexDecisionTransition(txn: *docstore.DocStore.Txn, group: u64, record: anytype) !void {
+        const merge = @TypeOf(record) == metadata.MergeTransitionRecord;
+        const blocked = !transitionPhaseTerminal(record.phase) and
+            (!merge or !@import("../../api/table_catalog.zig").onlineMergeAllowsTransactions(record));
+        const contract = record.table_contract;
+        var name: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(contract.table_name, &name, .{});
+        var buf: [224]u8 = undefined;
+        const suffix = if (merge) "m" else "s";
+        for (0..3) |kind| {
+            const key = switch (kind) {
+                0 => if (contract.table_id != 0) try std.fmt.bufPrint(&buf, decision_prefix ++ "{d}:id:{d}:{s}{d}", .{ group, contract.table_id, suffix, record.transition_id }) else continue,
+                1 => if (contract.table_name.len != 0) try std.fmt.bufPrint(&buf, decision_prefix ++ "{d}:name:{x}:{s}{d}", .{ group, &name, suffix, record.transition_id }) else continue,
+                else => if (contract.table_id == 0) try std.fmt.bufPrint(&buf, decision_prefix ++ "{d}:legacy:{s}{d}", .{ group, suffix, record.transition_id }) else continue,
+            };
+            if (blocked) {
+                var owners: [16]u8 = undefined;
+                std.mem.writeInt(u64, owners[0..8], if (merge) record.donor_group_id else record.source_group_id, .little);
+                std.mem.writeInt(u64, owners[8..16], if (merge) record.receiver_group_id else record.destination_group_id, .little);
+                try txn.put(key, &owners);
+            } else txn.delete(key) catch |err| if (err != error.NotFound) return err;
+        }
+    }
+
+    pub fn decisionAdmission(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: @import("../api.zig").DecisionAdmissionRequest, budget: @import("../../api/table_catalog.zig").RoutingBudget) !@import("../api.zig").DecisionAdmission {
+        try budget.checkpoint();
+        var txn = try self.beginOwnerReadinessTxn(group);
+        defer txn.abort();
+        const cut = try readCatalogCursorTxn(&txn, group);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var name: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(request.table_name, &name, .{});
+        var buf: [224]u8 = undefined;
+        const stable = stable: {
+            for (0..3) |kind| {
+                try budget.checkpoint();
+                const prefix = switch (kind) {
+                    0 => try std.fmt.bufPrint(&buf, decision_prefix ++ "{d}:id:{d}:", .{ group, request.table_id }),
+                    1 => try std.fmt.bufPrint(&buf, decision_prefix ++ "{d}:name:{x}:", .{ group, &name }),
+                    else => try std.fmt.bufPrint(&buf, decision_prefix ++ "{d}:legacy:", .{group}),
+                };
+                var entry = try cursor.seekAtOrAfter(prefix);
+                while (entry) |kv| : (entry = try cursor.next()) {
+                    if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+                    if (kind != 2) break :stable false;
+                    try budget.checkpoint();
+                    if (kv.value.len != 16) return error.InvalidDerivedCatalogIndex;
+                    const owners = [2]u64{ std.mem.readInt(u64, kv.value[0..8], .little), std.mem.readInt(u64, kv.value[8..16], .little) };
+                    for (owners) |owner| {
+                        var key: [160]u8 = undefined;
+                        const raw = txn.get(try rangeKeyForGroup(&key, group, owner)) catch |err| if (err == error.NotFound) continue else return err;
+                        const range = try decodeRangeRecord(alloc, raw);
+                        defer metadata_table_manager.freeRange(alloc, range);
+                        if (range.table_id == request.table_id) break :stable false;
+                    }
+                }
+            }
+            break :stable true;
+        };
+        try budget.checkpoint();
+        return .{ .stable = stable, .metadata_group_id = group, .metadata_incarnation = cut.metadata_incarnation, .catalog_revision = cut.revision };
+    }
+
     fn putOwnerMergeIndexTxn(txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.MergeTransitionRecord) !void {
+        try indexDecisionTransition(txn, group_id, record);
         var value: [9]u8 = undefined;
         std.mem.writeInt(u64, value[0..8], record.transition_id, .little);
         // Cover the selected owner's role, not the catalog's permission flag.
@@ -18327,6 +18397,12 @@ pub const RaftApplyStore = struct {
             var member = try decodeExtensionMemberRecord(self.alloc, row.value);
             defer member.deinitOwned(self.alloc);
             try self.putExtensionTableOwnerIndexTxn(txn, group_id, member);
+        }
+        try self.deleteDerivedPrefixTxn(txn, try std.fmt.allocPrint(listing_alloc, decision_prefix ++ "{d}:", .{group_id}));
+        var split_buf: [160]u8 = undefined;
+        for (try docstore.DocStore.scanPrefixTxn(listing_alloc, txn, try splitTransitionPrefixForGroup(&split_buf, group_id))) |row| {
+            const record = try decodeSplitTransitionRecord(listing_alloc, row.value);
+            if (!transitionPhaseTerminal(record.phase)) try indexDecisionTransition(txn, group_id, record);
         }
         // Derived owner membership is rebuilt only on migration/restore.
         try self.deleteDerivedPrefixTxn(txn, try std.fmt.allocPrint(listing_alloc, "\x00\x00__metadata_derived__:owner_merge:{d}:", .{group_id}));
@@ -26772,6 +26848,7 @@ pub const RaftApplyStore = struct {
         const value = try encodeSplitTransitionRecord(self.alloc, record);
         defer self.alloc.free(value);
         try txn.put(key, value);
+        try indexDecisionTransition(txn, group_id, record);
         try self.updateTableTransitionFenceTxn(
             txn,
             group_id,
@@ -27058,6 +27135,7 @@ pub const RaftApplyStore = struct {
         defer self.alloc.free(transition_value);
         try txn.put(source_key, source_value);
         try txn.put(transition_key, transition_value);
+        try indexDecisionTransition(txn, group_id, record);
         try self.updateTableTransitionFenceTxn(
             txn,
             group_id,
@@ -46070,6 +46148,10 @@ test "selected owner readiness durable transition index rebuilds and retires act
         try txn.put(try mergeTransitionKeyForGroup(&key, 21, 100), "unrelated history");
         try txn.commit();
     }
+    const decision_request: @import("../api.zig").DecisionAdmissionRequest = .{ .table_id = active.table_contract.table_id, .table_name = active.table_contract.table_name };
+    try std.testing.expect(!(try store.decisionAdmission(a, 21, decision_request, .{})).stable);
+    try std.testing.expect(!(try store.decisionAdmission(a, 21, .{ .table_id = 9999, .table_name = active.table_contract.table_name }, .{})).stable);
+    try std.testing.expect((try store.decisionAdmission(a, 21, .{ .table_id = 9999, .table_name = "unrelated" }, .{})).stable);
     const selected = try store.ownerReadinessTransitions(a, 21, request, .{});
     defer a.free(selected);
     try std.testing.expectEqual(@as(usize, 1), selected.len);
@@ -46088,6 +46170,8 @@ test "selected owner readiness durable transition index rebuilds and retires act
         try RaftApplyStore.putOwnerMergeIndexTxn(&txn, 21, active);
         try txn.commit();
     }
+    try std.testing.expect((try store.decisionAdmission(a, 21, decision_request, .{})).stable);
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, store.decisionAdmission(a, 21, decision_request, .{ .deadline_ns = 0 }));
     const retired = try store.ownerReadinessTransitions(a, 21, request, .{});
     defer a.free(retired);
     try std.testing.expectEqual(@as(usize, 0), retired.len);

@@ -311,6 +311,14 @@ pub const CatalogRoutingSnapshot = struct {
 };
 
 /// Selected physical owners, bound to the same namespace as their routing cut.
+pub const DecisionAdmissionRequest = struct { table_id: u64, table_name: []const u8 };
+pub const DecisionAdmission = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: ?MetadataClusterIncarnation,
+    catalog_revision: u64,
+    stable: bool,
+};
+
 pub const OwnerReadinessRequest = struct {
     table_id: u64,
     owners: []const Owner,
