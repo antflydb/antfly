@@ -1006,7 +1006,7 @@ fn hydrateDirectChunkAncestors(
     const chunk_payloads = try loadDirectChunkPayloads(alloc, owned.hits, shaper);
     defer freeOptionalOwnedBytes(alloc, chunk_payloads);
 
-    if (req.include_stored) {
+    defer if (req.include_stored) {
         for (owned.hits, 0..) |*hit, i| {
             if (hit.stored_data != null) continue;
             if (chunk_payloads[i]) |payload| {
@@ -1014,7 +1014,7 @@ fn hydrateDirectChunkAncestors(
                 chunk_payloads[i] = null;
             }
         }
-    }
+    };
 
     try hydrateArtifactRevisions(alloc, &owned, chunk_payloads, shaper);
     if (!req.hierarchy_include_source and !req.hierarchy_include_unit) return owned;
@@ -1035,9 +1035,18 @@ fn hydrateDirectChunkAncestors(
             // A direct unit member and its unit ancestor share a storage key.
             // Reuse the complete member payload even when the hit itself has
             // already been projected to a smaller set of requested fields.
-            if (chunk_payloads[i] != null and std.mem.eql(u8, chunk_key, info.unit_key.?)) {
-                owned.hits[i].ancestor_unit_data = chunk_payloads[i];
-                chunk_payloads[i] = null;
+            if (std.mem.eql(u8, chunk_key, info.unit_key.?)) {
+                if (chunk_payloads[i]) |full| {
+                    if (req.include_stored and hit.stored_data == null) {
+                        owned.hits[i].ancestor_unit_data = try alloc.dupe(u8, full);
+                    } else {
+                        owned.hits[i].ancestor_unit_data = full;
+                        chunk_payloads[i] = null;
+                    }
+                }
+                // This key was already read, including a definitive miss.
+                alloc.free(info.unit_key.?);
+                infos[i].?.unit_key = null;
             } else unit_count += 1;
         }
     }
@@ -3794,30 +3803,39 @@ test "direct PDF member preserves stored page metadata with independent ancestor
     const Loader = struct {
         unit: []const u8,
         reads: usize = 0,
+        missing: bool = false,
         const page = "{\"unit_id\":\"page:000001\",\"text\":\"extracted text\",\"provenance\":{\"page_number\":1,\"width\":612}}";
         fn load(raw: ?*anyopaque, a: Allocator, key: []const u8) !?[]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             if (!std.mem.eql(u8, key, self.unit)) return null;
             self.reads += 1;
-            return try a.dupe(u8, page);
+            return if (self.missing) null else try a.dupe(u8, page);
         }
     };
     const unit = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc", "pages", "page:000001");
     defer alloc.free(unit);
     const embedding = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, unit, "visual");
     defer alloc.free(embedding);
-    const hits = try alloc.alloc(types.SearchHit, 1);
-    hits[0] = .{
-        .id = try alloc.dupe(u8, unit),
-        .artifact_ref = try artifact_ids.decodeArtifactRefAlloc(alloc, embedding),
-        .stored_data = try alloc.dupe(u8, "{\"unit_id\":\"page:000001\"}"),
-    };
-    var loader: Loader = .{ .unit = unit };
-    var result = try reshapeChunkBackedResult(alloc, .{ .return_mode = .member, .include_stored = true, .hierarchy_include_unit = true }, .{ .alloc = alloc, .hits = hits, .total_hits = 1 }, .{ .ctx = &loader, .load_stored = Loader.load, .resolve_parent_id = TestChunkParentShaper.resolveParentId, .load_parent_stored = TestChunkParentShaper.loadParentStored });
-    defer result.deinit();
-    try std.testing.expectEqualStrings("{\"unit_id\":\"page:000001\"}", result.hits[0].stored_data.?);
-    try std.testing.expectEqualStrings(Loader.page, result.hits[0].ancestor_unit_data.?);
-    try std.testing.expectEqual(@as(usize, 1), loader.reads);
+    const projected_page = "{\"unit_id\":\"page:000001\"}";
+    for ([_]bool{ true, false, false }, [_]bool{ false, false, true }) |projected, missing| {
+        const hits = try alloc.alloc(types.SearchHit, 1);
+        hits[0] = .{
+            .id = try alloc.dupe(u8, unit),
+            .artifact_ref = try artifact_ids.decodeArtifactRefAlloc(alloc, embedding),
+            .stored_data = if (projected) try alloc.dupe(u8, projected_page) else null,
+        };
+        var loader: Loader = .{ .unit = unit, .missing = missing };
+        var result = try reshapeChunkBackedResult(alloc, .{ .return_mode = .member, .include_stored = true, .hierarchy_include_unit = true }, .{ .alloc = alloc, .hits = hits, .total_hits = 1 }, .{ .ctx = &loader, .load_stored = Loader.load, .resolve_parent_id = TestChunkParentShaper.resolveParentId, .load_parent_stored = TestChunkParentShaper.loadParentStored });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), loader.reads);
+        if (missing) {
+            try std.testing.expect(result.hits[0].stored_data == null);
+            try std.testing.expect(result.hits[0].ancestor_unit_data == null);
+            continue;
+        }
+        try std.testing.expectEqualStrings(if (projected) projected_page else Loader.page, result.hits[0].stored_data.?);
+        try std.testing.expectEqualStrings(Loader.page, result.hits[0].ancestor_unit_data.?);
+    }
 }
 
 test "a dense chunk member reports its chunk with the chunk's revisions" {

@@ -3658,12 +3658,13 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
     var required = (try transitionBaseDecoderVersion(a, command));
     switch (command) {
         .apply_system_catalog => |bytes| {
-            const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind, expected_incarnation: ?[16]u8 = null, expected_resource_id: ?u64 = null, expected_tablespace_id: ?u64 = null } };
+            const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind, expected_incarnation: ?[16]u8 = null, expected_resource_id: ?u64 = null, expected_parent_id: ?u64 = null, expected_tablespace_id: ?u64 = null } };
             var parsed = std.json.parseFromSlice(Header, a, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return metadata_topology_protocol.current_version,
             };
             defer parsed.deinit();
+            if (parsed.value.mutation.expected_parent_id != null) required = @max(required, metadata_topology_protocol.bound_create_parent_version);
             if (parsed.value.mutation.expected_incarnation != null) required = @max(required, metadata_topology_protocol.bound_catalog_incarnation_version);
             if (parsed.value.mutation.expected_resource_id != null or parsed.value.mutation.expected_tablespace_id != null) required = @max(required, metadata_topology_protocol.bound_ddl_version);
             if (parsed.value.mutation.kind == .graph) required = @max(required, metadata_topology_protocol.graph_definition_version);
@@ -3749,6 +3750,8 @@ fn tableDecoderVersion(a: std.mem.Allocator, table: metadata_table_manager.Table
 }
 
 test "relation mutation admission requires guarded plan decoders only for incarnation-bound plans" {
+    const guarded_create: metadata_storage.TransitionCommand = .{ .apply_system_catalog = "{\"mutation\":{\"kind\":\"namespace\",\"expected_parent_id\":7}}" };
+    try std.testing.expectEqual(metadata_topology_protocol.bound_create_parent_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, guarded_create));
     const plan = "{\"expected_incarnation\":\"0123456789abcdef0123456789abcdef\"}";
     const nested = "{\"plan\":" ++ plan ++ "}";
     const commands = [_]metadata_storage.TransitionCommand{

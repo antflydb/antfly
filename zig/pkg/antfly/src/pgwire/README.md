@@ -131,7 +131,11 @@ proxy's login into an unbounded, cached grant or retry a canceled mutation.
   incarnation requires protocol 97. Policy DDL pins the policy ID
   and generation, and foreign-key and tablespace changes pin their named
   destination. An initial `MATCH PARTIAL` foreign key that installs a parent
-  witness index also requires protocol 97. Column and constraint edits pin the
+  witness index requires protocol 97 for versioned witness schemas. Protocol
+  98 fences incarnation-bound FK generation plans and restore staging, and
+  supports policy capacity checks during apply. Bound CREATE TABLE and CREATE
+  SCHEMA pin their destination namespace and database respectively. Catalog
+  commands carrying that parent ID require protocol 99. Column and constraint edits pin the
   owning schema version.
   A prepared DROP INDEX follows the index across unrelated column changes
   and rejects a dropped and recreated index. The metadata owner assigns

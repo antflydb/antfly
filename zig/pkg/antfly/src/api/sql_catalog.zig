@@ -612,15 +612,21 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
 
 /// Capture only objects the statement can mutate. CREATE retains its atomic
 /// name-allocation semantics. CREATE INDEX still binds its existing owner.
-pub fn bindsExisting(statement: ast.Statement) bool {
+pub fn bindsExisting(statement: ast.Statement, database: []const u8, namespace: []const u8) bool {
     return switch (statement) {
         .drop_table, .policy_ddl => true,
-        .create_table => |create| create.tablespace != null or for (create.constraints) |constraint| {
+        .create_table => |create| !builtinNamespace(create.table.database orelse database, create.table.namespace orelse namespace) or create.tablespace != null or for (create.constraints) |constraint| {
             if (constraint == .add_foreign_key and !std.mem.eql(u8, constraint.add_foreign_key.parent, create.table.table)) break true;
         } else false,
-        .catalog_ddl => |ddl| ddl.action != .create or ddl.kind == .index or ddl.tablespace != null,
+        .catalog_ddl => |ddl| ddl.action != .create or ddl.kind == .index or ddl.tablespace != null or
+            (ddl.kind == .namespace and !std.mem.eql(u8, ddl.name.database orelse database, domain.default_database_name)),
         else => false,
     };
+}
+
+// The built-in database and namespace cannot be renamed or dropped.
+fn builtinNamespace(database: []const u8, namespace: []const u8) bool {
+    return std.mem.eql(u8, database, domain.default_database_name) and std.mem.eql(u8, namespace, domain.default_namespace_name);
 }
 
 fn pinsSchemaVersion(statement: ast.Statement) bool {
@@ -732,12 +738,35 @@ pub fn describeGuard(server: *server_mod.ApiHttpServer, identity: ?server_mod.Au
                 i += 1;
             }
         }
-        return DdlGuard.encode(alloc, .{ .fk_parents = parents.items, .tablespace_id = try tablespaceId(server, identity, context, a, create.tablespace) });
+        const target: domain.Target = .{ .database = create.table.database orelse database, .namespace = create.table.namespace orelse namespace, .table = create.table.table };
+        try target.validate();
+        try authorizeTableAdmin(identity, a, target);
+        const parent: ?u64 = if (builtinNamespace(target.database, target.namespace)) null else server.catalogNamespaceId(a, context, target) catch |err| switch (err) {
+            error.DatabaseNotFound, error.NamespaceNotFound, error.CatalogNotFound => 0,
+            else => return err,
+        };
+        return DdlGuard.encode(alloc, .{ .parent_id = parent, .fk_parents = parents.items, .tablespace_id = try tablespaceId(server, identity, context, a, create.tablespace) });
     }
     if (statement == .catalog_ddl) {
         const ddl = statement.catalog_ddl;
-        if (ddl.action == .create and ddl.kind != .index)
-            return DdlGuard.encode(alloc, .{ .tablespace_id = try tablespaceId(server, identity, context, a, ddl.tablespace) });
+        if (ddl.action == .create and ddl.kind != .index) {
+            var objects: DdlGuard.Objects = .{ .tablespace_id = try tablespaceId(server, identity, context, a, ddl.tablespace) };
+            if (ddl.kind == .namespace) {
+                const db = ddl.name.database orelse database;
+                const route: @import("../system_catalog/routes.zig").Route = .{ .kind = .namespace, .database = db, .namespace = namespace, .name = ddl.name.table };
+                const resource = try @import("../system_catalog/routes.zig").resourceNameAlloc(a, route);
+                if (identity) |user| if (!server_mod.permissionsAllow(user.permissions, .namespace, resource, .admin)) return error.Forbidden;
+                objects.parent_id = if (std.mem.eql(u8, db, domain.default_database_name)) null else parent: {
+                    const bytes = server.source.systemCatalog(a, context, .{ .read = .{ .kind = .database, .name = db } }) catch |err| switch (err) {
+                        error.CatalogNotFound => break :parent 0,
+                        else => return err,
+                    };
+                    const state = try std.json.parseFromSliceLeaky(domain.State, a, bytes, .{});
+                    break :parent (state.find(.database, 0, db) orelse return error.InvalidSqlBackendResponse).id;
+                };
+            }
+            return DdlGuard.encode(alloc, objects);
+        }
         if (ddl.kind == .index) {
             const result = try resolveIndex(server, identity, context, database, namespace, a, ddl, path, ddl.action == .drop);
             return indexGuard(alloc, result, ddl.action == .create);
@@ -854,7 +883,7 @@ pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.Aut
     if (identity) |authenticated| if (!server_mod.permissionsAllow(authenticated.permissions, permission_kind, resource, .admin)) return error.Forbidden;
     if (input == .catalog_ddl and input.catalog_ddl.action == .alter_schema)
         return alterSchema(server, identity, context, allocators, target, input.catalog_ddl, null, bound);
-    var request: domain.Request = .{ .mutation = .{ .expected_incarnation = context.bound_catalog_incarnation, .expected_tablespace_id = if (bound) |obj| obj.tablespace_id else null, .expected_resource_id = if (bound) |obj| if (is_table) (try obj.table(1, 0)).id else obj.resource_id else null, .action = switch (input) {
+    var request: domain.Request = .{ .mutation = .{ .expected_incarnation = context.bound_catalog_incarnation, .expected_parent_id = if (bound) |obj| obj.parent_id else null, .expected_tablespace_id = if (bound) |obj| obj.tablespace_id else null, .expected_resource_id = if (bound) |obj| if (is_table) (try obj.table(1, 0)).id else obj.resource_id else null, .action = switch (input) {
         .create_table => .create,
         .drop_table => .drop,
         .catalog_ddl => |ddl| switch (ddl.action) {
@@ -884,9 +913,6 @@ pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.Aut
             const selected = try chooseGeneratedNames(server, context, a, allocators.scratch, target, create.schema_json, create.generated_constraint_names);
             generated_names = selected.names;
             const bound_schema = try server.bindForeignKeySchema(a, target, request.physical_name.?, selected.schema_json, "", identity, context);
-            if (try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(a, bound_schema) and
-                try @import("relational_witness_ddl.zig").needed(a, bound_schema, ""))
-                return error.ForeignKeyPartialSupportIndexRequired;
             const schema_value = try std.json.parseFromSliceLeaky(std.json.Value, a, bound_schema, .{ .parse_numbers = false });
             const body = try std.json.Stringify.valueAlloc(a, .{ .schema = schema_value, .indexes = std.json.Value{ .object = .empty } }, .{});
             var parsed = try tables.parseStoredCreateTableRequest(allocators.scratch, body);
@@ -894,7 +920,7 @@ pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.Aut
             defer parsed.deinit(allocators.scratch);
             if (create.tablespace) |tablespace| parsed.tablespace_name = try allocators.scratch.dupe(u8, tablespace);
             if (try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(a, bound_schema)) {
-                const plan = @import("fk_initial_create_plan_builder.zig").buildWithScratch(server, a, allocators.scratch, context, identity, target, parsed) catch |err| switch (err) {
+                const plan = @import("fk_initial_create_plan_builder.zig").buildWithScratch(server, a, allocators.scratch, context, identity, target, parsed, if (bound) |obj| obj.parent_id else null) catch |err| switch (err) {
                     error.CatalogAlreadyExists, error.TableAlreadyExists => return createConflict(server, context, a, target, generated_names, create.if_not_exists, err, allocators.scratch),
                     else => return err,
                 };

@@ -268,7 +268,26 @@ def exercise_bound_portals(server, password):
         migrator.execute("CREATE TABLE bound_child (id TEXT)")
         migrator.execute("DROP TABLE bound_child")
 
+        migrator.execute("CREATE SCHEMA portal_namespace")
+        for name, definition_sql in (
+            ("plain", "id TEXT"),
+            ("self_fk", "id TEXT PRIMARY KEY, p TEXT REFERENCES created_here(id)"),
+        ):
+            parse(
+                name, f"CREATE TABLE portal_namespace.created_here ({definition_sql})"
+            )
+            bind(name)
+            migrator.execute("DROP SCHEMA portal_namespace")
+            migrator.execute("CREATE SCHEMA portal_namespace")
+            execute(b"C40001")
+        migrator.execute("DROP SCHEMA portal_namespace")
+
         migrator.execute("CREATE DATABASE bound_placement")
+        parse("new_schema", "CREATE SCHEMA bound_placement.created_here")
+        bind("new_schema")
+        migrator.execute("DROP DATABASE bound_placement")
+        migrator.execute("CREATE DATABASE bound_placement")
+        execute(b"C40001")
         space = "CREATE TABLESPACE portal_space LOCATION 's3://bucket/path'"
         migrator.execute(space)
         parse("placement", "ALTER DATABASE bound_placement SET TABLESPACE portal_space")
@@ -333,6 +352,42 @@ def exercise_bound_portals(server, password):
             execute(b"C40001")
             bind("graph")
             execute()
+
+        migrator.execute("INSERT INTO graph_other (id, n) VALUES ('g', 42)")
+        graph_password = secrets.token_hex(16)
+        requests.post(
+            server.url + "/auth/v1/users/portal_reader",
+            auth=("admin", password),
+            json={
+                "password": graph_password,
+                "initial_policies": [
+                    {
+                        "resource_type": "graph",
+                        "resource": "portal_graph",
+                        "type": "read",
+                    },
+                    {
+                        "resource_type": "table",
+                        "resource": "graph_other",
+                        "type": "read",
+                    },
+                    {"resource_type": "namespace", "resource": "*", "type": "read"},
+                ],
+            },
+            timeout=10,
+        ).raise_for_status()
+        query = "SELECT q.n FROM GRAPH_TABLE(portal_graph MATCH(n IS D) COLUMNS(n.n AS n)) q"
+        with (
+            psycopg.connect(
+                url, user="portal_reader", password=graph_password, autocommit=True
+            ) as scoped,
+            psycopg.ClientCursor(scoped) as sql,
+        ):
+            assert scoped.execute(query, prepare=True).fetchall() == [(42,)]
+            sql.execute("BEGIN")
+            sql.execute("DECLARE held CURSOR WITH HOLD FOR " + query)
+            sql.execute("COMMIT")
+            assert sql.execute("FETCH ALL FROM held").fetchall() == [(42,)]
 
     print("Bound DML, DDL and graph identity across catalog changes: PASS", flush=True)
 

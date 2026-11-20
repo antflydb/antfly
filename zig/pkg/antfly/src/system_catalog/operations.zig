@@ -97,7 +97,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         });
     }
     const required_version = @max(if (request.mutation.native_service != null) protocol.native_service_tables_version else @as(u16, 0), @max(if (resolver_create) protocol.resolver_namespaces_version else @as(u16, 0), if (request.mutation.kind == .graph) protocol.graph_definition_version else if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version));
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (request.mutation.expected_incarnation != null) protocol.bound_catalog_incarnation_version else if (request.mutation.expected_resource_id != null or request.mutation.expected_tablespace_id != null) @max(protocol.bound_ddl_version, required_version) else required_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (request.mutation.expected_parent_id != null) protocol.bound_create_parent_version else if (request.mutation.expected_incarnation != null) protocol.bound_catalog_incarnation_version else if (request.mutation.expected_resource_id != null or request.mutation.expected_tablespace_id != null) @max(protocol.bound_ddl_version, required_version) else required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
@@ -282,7 +282,7 @@ pub fn mutatePolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: 
     return std.json.Stringify.valueAlloc(alloc, observed, .{});
 }
 
-fn serializePolicyDefinitionCommand(alloc: std.mem.Allocator, command: @import("antfly_local_sources").system_catalog_policies.Command) ![]u8 {
+pub fn serializePolicyDefinitionCommand(alloc: std.mem.Allocator, command: @import("antfly_local_sources").system_catalog_policies.Command) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(alloc);
     defer output.deinit();
     var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
@@ -477,12 +477,16 @@ pub fn mutatePolicyDefinition(svc: anytype, alloc: std.mem.Allocator, context: o
     if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
     const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .apply_sql_policies = bytes });
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
-    const observed = store.systemCatalogMeta(alloc, svc.metadata_group_id) catch return error.MetadataMutationOutcomeUnknown;
+    return policyDefinitionReceipt(alloc, store, svc.metadata_group_id, command.expected_revision, bytes);
+}
+
+pub fn policyDefinitionReceipt(alloc: std.mem.Allocator, store: anytype, group: u64, expected_revision: u64, bytes: []const u8) ![]u8 {
+    const observed = store.systemCatalogMeta(alloc, group) catch return error.MetadataMutationOutcomeUnknown;
     var expected_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &expected_hash, .{});
-    if (observed.revision != command.expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &expected_hash))
+    if (observed.revision != expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &expected_hash))
         return error.MetadataMutationOutcomeUnknown;
-    return std.json.Stringify.valueAlloc(alloc, observed, .{});
+    return std.json.Stringify.valueAlloc(alloc, observed, .{}) catch error.MetadataMutationOutcomeUnknown;
 }
 
 pub fn mutateSetting(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: settings.Request) ![]u8 {

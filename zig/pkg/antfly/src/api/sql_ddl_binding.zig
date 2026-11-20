@@ -38,6 +38,7 @@ pub const Guard = struct {
     pub const Objects = struct {
         fk_parents: []const ForeignKeyParent = &.{},
         tables: []const Table = &.{},
+        parent_id: ?u64 = null,
         resource_id: ?u64 = null,
         schema_version: ?u32 = null,
         policy: ?Policy = null,
@@ -47,6 +48,7 @@ pub const Guard = struct {
         // Admission checks the plan's exact parent and catalog revisions. Match
         // by constraint so even a swap between two existing parents is fenced.
         pub fn validateCreatePlan(self: Objects, a: std.mem.Allocator, plan: anytype) !void {
+            if (self.parent_id) |id| if (id != plan.namespace_id) return error.CatalogGenerationChanged;
             if (self.tablespace_id) |id| if (id != plan.tablespace_id) return error.CatalogGenerationChanged;
             var expected: std.StringHashMapUnmanaged(ForeignKeyParent) = .empty;
             defer expected.deinit(a);

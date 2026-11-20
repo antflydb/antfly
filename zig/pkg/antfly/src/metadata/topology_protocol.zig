@@ -134,7 +134,9 @@ pub const bound_catalog_incarnation_version: u16 = 96;
 pub const guarded_publication_version: u16 = 97;
 /// Generation plans can bind a catalog incarnation and policy creates can enforce capacity at apply.
 pub const guarded_generation_admission_version: u16 = 98;
-pub const current_version: u16 = guarded_generation_admission_version;
+/// Catalog CREATE can require the destination namespace or database observed at Bind.
+pub const bound_create_parent_version: u16 = 99;
+pub const current_version: u16 = bound_create_parent_version;
 
 pub fn restoreAdmissionDecoderVersion(ranges: anytype, fallback: u16) u16 {
     const empty: [32]u8 = @splat(0);

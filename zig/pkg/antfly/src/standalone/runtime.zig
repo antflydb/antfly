@@ -3086,23 +3086,22 @@ const LocalStandaloneMetadata = struct {
                 const store = self.lifecycle_store orelse return error.RowPolicyUnsupported;
                 if (!self.localPolicyPublicationSupported()) return error.RowPolicyUnsupported;
                 if (command.version != 1) return error.InvalidRowPolicyRecord;
-                try @import("../system_catalog/operations.zig").requirePolicyCapacity(store, group_ids.main_metadata_group_id, command);
+                const operations = @import("../system_catalog/operations.zig");
+                const group = group_ids.main_metadata_group_id;
+                try operations.validateBoundPolicy(alloc, store, group, command);
+                const current = try store.systemCatalogMeta(alloc, group);
+                if (current.revision != command.expected_revision) return error.RowPolicyCatalogChanged;
+                try operations.requirePolicyCapacity(store, group, command);
                 var proposed = command;
                 if (command.createsDefinition()) proposed.version = @import("antfly_local_sources").system_catalog_policies.capacity_checked_version;
-                try @import("../system_catalog/operations.zig").validateBoundPolicy(alloc, store, group_ids.main_metadata_group_id, command);
-                var encoded: std.Io.Writer.Allocating = .init(alloc);
-                defer encoded.deinit();
-                var stream: std.json.Stringify = .{ .writer = &encoded.writer, .options = .{} };
-                try @import("antfly_local_sources").storage_db_relational_integrity_json.write(proposed, &stream);
-                const bytes = encoded.written();
+                const bytes = try operations.serializePolicyDefinitionCommand(alloc, proposed);
+                defer alloc.free(bytes);
                 if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
                 try context.ensureActive();
-                try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_sql_policies = bytes });
+                context.markSQLSubmission();
+                try store.applyStandaloneCommand(group, .{ .apply_sql_policies = bytes });
                 self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
-                return std.json.Stringify.valueAlloc(alloc, system_catalog.Meta{
-                    .revision = self.systemCatalogState().revision,
-                    .next_id = self.systemCatalogState().next_id,
-                }, .{});
+                return operations.policyDefinitionReceipt(alloc, store, group, command.expected_revision, bytes);
             },
             .policy_publication_begin => |request| {
                 if (!context.setting_admin or !context.row_policy_install_authority) return error.Forbidden;
@@ -15608,6 +15607,12 @@ fn exerciseStandalonePolicyPublication(use_hot_standby: bool) !void {
         .change = .{ .put = record },
     } });
     alloc.free(definition);
+    var competing = record;
+    competing.name = "competing";
+    try std.testing.expectError(error.RowPolicyCatalogChanged, metadata.statusSource().systemCatalog(alloc, trusted, .{ .policy_definition_mutate = .{
+        .expected_revision = metadata.systemCatalogState().revision - 1,
+        .change = .{ .put = competing },
+    } }));
     const begin = try metadata.statusSource().systemCatalog(alloc, trusted, .{ .policy_publication_begin = .{
         .table_id = table_id,
         .enable = true,

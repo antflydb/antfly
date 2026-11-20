@@ -435,7 +435,30 @@ const OwnedRead = struct {
     columns: []const wire.Column,
     policies: []const Policy,
     detached: bool = false,
-    const Policy = struct { table: []const u8, filter: ?[]const u8, name: ?ast.Name = null, id: u64 = 0, schema_version: u32 = 0 };
+    const Policy = struct {
+        resource: []const u8,
+        filter: ?[]const u8,
+        name: ?ast.Name = null,
+        id: u64 = 0,
+        schema_version: u32 = 0,
+        graph_revision: ?u64 = null,
+
+        fn capture(a: std.mem.Allocator, identity: ?http.AuthenticatedIdentity, table: catalog.Table) !Policy {
+            if (table.graph) |graph| return .{
+                .resource = try a.dupe(u8, graph.graph.name),
+                .filter = null,
+                .id = graph.graph.incarnation,
+                .graph_revision = graph.graph.revision,
+            };
+            return .{
+                .resource = try a.dupe(u8, table.physical_name),
+                .filter = try http.resolveEffectiveRowFilterJson(a, identity, table.physical_name),
+                .id = table.id,
+                .schema_version = table.schema_version,
+                .name = if (table.scope) |scope| .{ .database = try a.dupe(u8, scope.database), .namespace = try a.dupe(u8, scope.namespace), .table = try a.dupe(u8, scope.name) } else null,
+            };
+        }
+    };
 
     fn open(adapter: *Adapter, alloc: std.mem.Allocator, credential: *Credential, request: wire.Request) !?wire.ReadStream {
         const server = adapter.server;
@@ -544,17 +567,16 @@ const OwnedRead = struct {
             transaction_lease = null;
         }
         const binding = self.stream.context.binding;
-        const policies = try arena.alloc(Policy, if (binding.relation) |relation| relation.scans.len else if (binding.table != null) 1 else 0);
-        for (policies, 0..) |*policy, i| {
+        var policies: std.ArrayList(Policy) = .empty;
+        const scan_count = if (binding.relation) |relation| relation.scans.len else @intFromBool(binding.table != null);
+        for (0..scan_count) |i| {
             const table = if (binding.relation) |relation| relation.scans[i].table else binding.table.?;
-            policy.* = .{ .table = try arena.dupe(u8, table.physical_name), .filter = try http.resolveEffectiveRowFilterJson(arena, self.identity, table.physical_name) };
-            if (table.scope) |scope| {
-                policy.name = .{ .database = try arena.dupe(u8, scope.database), .namespace = try arena.dupe(u8, scope.namespace), .table = try arena.dupe(u8, scope.name) };
-                policy.id = table.id;
-                policy.schema_version = table.schema_version;
-            }
+            try policies.append(arena, try Policy.capture(arena, self.identity, table));
+            if (table.graph) |graph| for (graph.dependencies) |dependency| {
+                try policies.append(arena, try Policy.capture(arena, self.identity, dependency));
+            };
         }
-        self.policies = policies;
+        self.policies = policies.items;
         const columns = try arena.alloc(wire.Column, self.stream.context.binding.columns.len);
         for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = try arena.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
         self.columns = columns;
@@ -587,11 +609,35 @@ const OwnedRead = struct {
         try validatePolicies(self.adapter.server.alloc, &current.?, self.identity.?, self.policies);
         var authority: Authority = .{ .credential = self.authority.credential, .identity = &current, .request = request };
         var adapter: execution.Adapter = .{ .server = self.adapter.server, .identity = &current, .context = try authority.context(), .database = original.database.?, .namespace = original.namespace.? };
-        const catalog_backend = adapter.backend();
-        for (self.policies) |policy| if (policy.name) |name| {
-            const table = try catalog_backend.vtable.resolve(catalog_backend.ptr, alloc, name, .read);
-            if (table.id != policy.id or table.schema_version != policy.schema_version or !std.mem.eql(u8, table.physical_name, policy.table)) return error.CatalogGenerationChanged;
-        };
+        const domain = @import("antfly_local_sources").system_catalog_domain;
+        var targets: std.ArrayList(domain.Target) = .empty;
+        var expected: std.ArrayList(Policy) = .empty;
+        var has_graph = false;
+        for (self.policies) |policy| {
+            if (policy.graph_revision) |version| {
+                has_graph = true;
+                const bytes = try adapter.server.source.systemCatalog(alloc, adapter.context, .{ .read = .{ .kind = .graph, .name = policy.resource } });
+                const cut = try std.json.parseFromSliceLeaky(domain.State, alloc, bytes, .{});
+                const graph = cut.find(.graph, 0, policy.resource) orelse return error.CatalogGenerationChanged;
+                if (graph.id != policy.id or graph.graph_revision != version) return error.CatalogGenerationChanged;
+                if (adapter.revision) |revision| if (cut.revision != revision) return error.CatalogGenerationChanged;
+                adapter.revision = cut.revision;
+            } else if (policy.name) |name| {
+                try targets.append(alloc, .{ .database = name.database.?, .namespace = name.namespace.?, .table = name.table });
+                try expected.append(alloc, policy);
+            }
+        }
+        // Verify even a graph with no label tables against the source epoch.
+        if (has_graph and targets.items.len == 0) _ = try adapter.resolveMany(alloc, &.{}, .read);
+        var offset: usize = 0;
+        while (offset < targets.items.len) {
+            const end = @min(offset + 256, targets.items.len);
+            const bindings = try adapter.resolveMany(alloc, targets.items[offset..end], .read);
+            for (bindings, expected.items[offset..end]) |table, policy| {
+                if (table.id != policy.id or table.schema_version != policy.schema_version or !std.mem.eql(u8, table.physical_name, policy.resource)) return error.CatalogGenerationChanged;
+            }
+            offset = end;
+        }
     }
 
     fn next(raw: *anyopaque, alloc: std.mem.Allocator, request: wire.Request, limit: u32) !wire.StreamPage {
@@ -636,9 +682,15 @@ const OwnedRead = struct {
         // permissions or filters. Buffered operator rows need this check too:
         // they need not cause another native cursor.next call.
         for (admitted.catalog_aliases) |alias| try http.projectCatalogIdentity(alloc, fresh, alias.logical, alias.physical);
+        if (policies.len == 0) return;
+        var local: [8]http.GraphPermissionCheck = undefined;
+        const checks = if (policies.len <= local.len) local[0..policies.len] else try alloc.alloc(http.GraphPermissionCheck, policies.len);
+        defer if (policies.len > local.len) alloc.free(checks);
+        for (policies, checks) |policy, *check| check.* = .{ .resource_type = if (policy.graph_revision != null) .graph else .table, .resource = policy.resource, .permission_type = .read };
+        if (!try http.resourcePermissionsCurrentlyAllowed(alloc, fresh.*, checks)) return error.Forbidden;
         for (policies) |policy| {
-            if (!(try http.tablePermissionCurrentlyAllowed(fresh.*, policy.table, .read))) return error.Forbidden;
-            const filter = try http.resolveEffectiveRowFilterJson(alloc, fresh.*, policy.table);
+            if (policy.graph_revision != null) continue;
+            const filter = try http.resolveEffectiveRowFilterJson(alloc, fresh.*, policy.resource);
             defer if (filter) |value| alloc.free(value);
             if ((filter == null) != (policy.filter == null) or
                 (filter != null and !std.mem.eql(u8, filter.?, policy.filter.?))) return error.Forbidden;
@@ -1032,7 +1084,7 @@ const Job = struct {
             var description = try describe_sql.describe(self.request.scratch_allocator orelse self.alloc, describe_backend, compiled, hints);
             defer description.deinit();
             const ddl_catalog = @import("sql_catalog.zig");
-            const guard = if (ddl_catalog.bindsExisting(compiled.statement)) blk: {
+            const guard = if (ddl_catalog.bindsExisting(compiled.statement, native_adapter.database, native_adapter.namespace)) blk: {
                 try probe.sample(self.alloc);
                 const bound = try ddl_catalog.describeGuard(server, identity, native_adapter.context, native_adapter.database, native_adapter.namespace, self.alloc, compiled.statement, native_adapter.ddl_search_path);
                 break :blk bound.bytes;
@@ -1058,7 +1110,7 @@ const Job = struct {
             };
             return;
         }
-        if (@import("sql_catalog.zig").bindsExisting(compiled.statement)) {
+        if (@import("sql_catalog.zig").bindsExisting(compiled.statement, native_adapter.database, native_adapter.namespace)) {
             if (self.request.binding_guard) |bytes| native_adapter.ddl_guard = try @import("sql_ddl_binding.zig").Guard.decode((try splitBinding(bytes)).targets);
         }
         const parameters = if (self.request.parameter_cells != null) self.request.parameters else try normalizeParameters(self.alloc, self.request.parameters, self.request.parameter_types);
@@ -2036,7 +2088,7 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     var projected = (try http.cloneCatalogIdentity(alloc, admitted)).?;
     defer projected.deinit(alloc);
     try http.projectCatalogIdentity(alloc, &projected, "docs", "private-table-17");
-    const retained_policies = [_]OwnedRead.Policy{.{ .table = "private-table-17", .filter = null }};
+    const retained_policies = [_]OwnedRead.Policy{.{ .resource = "private-table-17", .filter = null }};
     {
         var current = try credential.identity(alloc);
         defer current.deinit(alloc);
@@ -2474,7 +2526,7 @@ test "system catalog SQL pgwire retained policies survive repeated qualified pro
     try http.projectCatalogIdentity(a, &admitted, "\x00catalog:7:default6:public4:docs", "table:immutable");
     const filter = (try http.resolveEffectiveRowFilterJson(a, admitted, "table:immutable")).?;
     defer a.free(filter);
-    const policies = [_]OwnedRead.Policy{.{ .table = "table:immutable", .filter = filter }};
+    const policies = [_]OwnedRead.Policy{.{ .resource = "table:immutable", .filter = filter }};
     var fresh = (try http.cloneCatalogIdentity(a, .{ .username = @constCast("reader"), .permissions = &permissions, .row_filter = &restrictions })).?;
     defer fresh.deinit(a);
     try OwnedRead.validatePolicies(a, &fresh, admitted, &policies);
@@ -2499,7 +2551,7 @@ test "system catalog SQL pgwire retained policies keep namespace scopes isolated
     defer admitted.deinit(a);
     try http.projectCatalogIdentity(a, &admitted, "docs", "table:default");
     try http.projectCatalogIdentity(a, &admitted, tenant_table, "table:tenant");
-    const retained = [_]OwnedRead.Policy{.{ .table = "table:tenant", .filter = filters[1].filter }};
+    const retained = [_]OwnedRead.Policy{.{ .resource = "table:tenant", .filter = filters[1].filter }};
     var fresh = (try http.cloneCatalogIdentity(a, .{ .username = @constCast("reader"), .permissions = &permissions, .row_filter = &filters })).?;
     defer fresh.deinit(a);
     try OwnedRead.validatePolicies(a, &fresh, admitted, &retained);

@@ -6450,7 +6450,7 @@ pub const ApiHttpServer = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const plan = try @import("fk_initial_create_plan_builder.zig").buildWithScratch(self, a, alloc, context, identity, target, request);
+        const plan = try @import("fk_initial_create_plan_builder.zig").buildWithScratch(self, a, alloc, context, identity, target, request, null);
         return self.submitFkInitialCreatePlan(alloc, context, plan);
     }
 
@@ -18558,6 +18558,16 @@ pub const ApiHttpServer = struct {
         return response_body;
     }
 
+    pub fn catalogNamespaceId(self: *ApiHttpServer, a: std.mem.Allocator, context: api_operation.RequestContext, target: system_catalog.Target) !u64 {
+        if (std.mem.eql(u8, target.database, system_catalog.default_database_name) and std.mem.eql(u8, target.namespace, system_catalog.default_namespace_name))
+            return system_catalog.default_namespace_id;
+        const bytes = try self.source.systemCatalog(a, context, .{ .read = .{ .kind = .namespace, .database = target.database, .name = target.namespace } });
+        defer a.free(bytes);
+        var state = try std.json.parseFromSlice(system_catalog.State, a, bytes, .{});
+        defer state.deinit();
+        return (try state.value.namespaceFor(target.database, target.namespace)).id;
+    }
+
     /// Resolve public, namespace-relative REFERENCES names once at DDL ingress.
     /// Stored constraints use immutable identities, so rename never retargets
     /// an FK and drop/recreate cannot silently attach it to a different table.
@@ -18657,8 +18667,10 @@ pub const ApiHttpServer = struct {
         var revision: ?u64 = null;
         while (offset < names.len) {
             const chunk = names[offset..@min(offset + 256, names.len)];
-            const bytes = try self.source.systemCatalog(arena, context, .{ .resolve_many = .{ .storage_names = chunk, .expected_revision = revision } });
+            const bytes = try self.source.systemCatalog(arena, context, .{ .resolve_many = .{ .storage_names = chunk, .expected_revision = revision, .include_source_epoch = context.bound_catalog_incarnation != null } });
             const resolved = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, arena, bytes, .{});
+            try context.checkCatalogIncarnation(resolved.source_epoch);
+            if (revision) |expected| if (resolved.revision != expected) return error.CatalogGenerationChanged;
             if (resolved.logical_names.len != chunk.len) return error.UnsupportedOperation;
             revision = resolved.revision;
             for (chunk, resolved.logical_names, out[offset..][0..chunk.len]) |physical, logical, *result| {
@@ -30631,7 +30643,9 @@ pub fn resourcePermissionsCurrentlyAllowed(alloc: std.mem.Allocator, authenticat
     const identity = authenticated_identity orelse return true;
     for (checks) |check| if (!permissionsAllow(identity.permissions, check.resource_type, check.resource, check.permission_type)) return false;
     const manager = identity.live_user_manager orelse return true;
+    if (identity.catalog_aliases.len == 0) return manager.permissionsCurrentlyAllowed(identity.username, identity.credential_principal, checks);
     const logical = try alloc.dupe(usermgr.UserManager.PermissionCheck, checks);
+    defer alloc.free(logical);
     for (logical) |*check| if (check.resource_type == .table) {
         for (identity.catalog_aliases) |alias| if (std.mem.eql(u8, alias.physical, check.resource)) {
             check.resource = alias.logical;

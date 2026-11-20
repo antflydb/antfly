@@ -328,6 +328,7 @@ pub const Mutation = struct {
     /// Bound destructive SQL DDL. Zero attests absence for IF EXISTS.
     expected_resource_id: ?u64 = null,
     expected_incarnation: ?[16]u8 = null,
+    expected_parent_id: ?u64 = null,
     expected_tablespace_id: ?u64 = null,
     /// Populated only by native table admission, never accepted from public JSON.
     table_id: u64 = 0,
@@ -335,7 +336,7 @@ pub const Mutation = struct {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "expected_incarnation") or std.mem.eql(u8, name, "expected_graph_revision") or std.mem.eql(u8, name, "expected_resource_id") or std.mem.eql(u8, name, "expected_tablespace_id")) {
+            if (comptime std.mem.eql(u8, name, "expected_incarnation") or std.mem.eql(u8, name, "expected_graph_revision") or std.mem.eql(u8, name, "expected_resource_id") or std.mem.eql(u8, name, "expected_parent_id") or std.mem.eql(u8, name, "expected_tablespace_id")) {
                 if (@field(self, name)) |revision| {
                     try jw.objectField(name);
                     try jw.write(revision);
@@ -887,6 +888,10 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
         .namespace => ((try reader.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id,
         .table => (try reader.namespaceFor(request.database, request.namespace)).id,
     };
+    if (request.expected_parent_id) |expected| {
+        if (request.action != .create or (request.kind != .table and request.kind != .namespace)) return error.InvalidCatalogMutation;
+        if (parent_id != expected) return error.CatalogGenerationChanged;
+    }
     var found = try reader.lookup(request.kind, parent_id, request.name);
     if (found == null and request.kind == .table and parent_id == default_namespace_id and request.action != .create) {
         if (try reader.physicalByName(request.name)) |table| if (try reader.byId(.table, table.id) == null) {
