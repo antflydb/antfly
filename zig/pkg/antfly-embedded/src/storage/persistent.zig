@@ -1612,7 +1612,9 @@ pub const PersistentIndex = struct {
                     else => return err,
                 };
                 if (deletion_bytes) |bytes| {
-                    var bitmap = try roaring.RoaringBitmap.fromBytes(alloc, bytes);
+                    const segments = writer.snapshot().segments;
+                    const doc_count = segments[segments.len - 1].reader.doc_count;
+                    var bitmap = try roaring.RoaringBitmap.fromPersistedDeletionBytes(alloc, bytes, doc_count);
                     if (!bitmap.isEmpty()) {
                         writer.setDeletionBitmap(seg_id, bitmap);
                     } else {
@@ -2633,25 +2635,34 @@ pub const PersistentIndex = struct {
                 else => return err,
             };
 
-            if (collect_doc_keys) {
+            const already_copied = existing_dest.contains(entry.seg_id);
+            const doc_count = if (collect_doc_keys or (!already_copied and deletion_bytes != null)) count: {
                 var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
                 defer reader.deinit();
-                for (0..reader.doc_count) |doc_idx| {
+                if (collect_doc_keys) for (0..reader.doc_count) |doc_idx| {
                     const stored = (try reader.storedDoc(@intCast(doc_idx))) orelse continue;
                     try doc_keys.append(alloc, try alloc.dupe(u8, stored.id));
-                }
-            }
+                };
+                break :count reader.doc_count;
+            } else null;
 
-            if (existing_dest.contains(entry.seg_id)) continue;
+            if (already_copied) continue;
 
             if (deletion_bytes) |bytes| {
-                var bitmap = try roaring.RoaringBitmap.fromBytes(alloc, bytes);
+                const decoded = try roaring.RoaringBitmap.fromPersistedDeletionBytesWithLayout(alloc, bytes, doc_count.?);
+                var bitmap = decoded.bitmap;
+                defer bitmap.deinit();
+                if (decoded.legacy) {
+                    const canonical = try bitmap.toBytes(alloc);
+                    defer alloc.free(canonical);
+                    try dest_txn.put(.deletions, &seg_key, canonical);
+                } else {
+                    try dest_txn.put(.deletions, &seg_key, bytes);
+                }
                 if (!bitmap.isEmpty()) {
                     replacement_deleted[replacements_initialized] = bitmap;
-                } else {
-                    bitmap.deinit();
+                    bitmap = roaring.RoaringBitmap.init(alloc);
                 }
-                try dest_txn.put(.deletions, &seg_key, bytes);
             }
 
             replacements[replacements_initialized] = .{
@@ -4931,10 +4942,55 @@ test "persistent index open keeps recovered segment ownership on later catalog e
         var txn = try pi.beginWriteMainTxn();
         errdefer txn.abort();
         const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1)));
-        try txn.put(.deletions, &seg_key, "\x01\x00");
+        try txn.put(.deletions, &seg_key, "\x01");
         try txn.commit();
     }
 
+    try std.testing.expectError(error.InvalidRoaringBitmap, PersistentIndex.open(alloc, .{ .path = path }));
+}
+
+test "persistent index reopens legacy low-cardinality dense deletion records" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    {
+        var pi = try PersistentIndex.open(alloc, .{ .path = path });
+        defer pi.close();
+        const segment = try buildMultiDocSegment(alloc, &.{
+            .{ .doc_id = "doc:a", .term = "alpha" },
+            .{ .doc_id = "doc:b", .term = "beta" },
+        });
+        defer alloc.free(segment);
+        try pi.indexSegment(segment);
+        var legacy: [6 + 8192]u8 = @splat(0);
+        legacy[0] = 1;
+        legacy[6] = 2;
+
+        var txn = try pi.beginWriteMainTxn();
+        errdefer txn.abort();
+        const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1)));
+        try txn.put(.deletions, &seg_key, &legacy);
+        try txn.commit();
+    }
+
+    {
+        var pi = try PersistentIndex.open(alloc, .{ .path = path });
+        defer pi.close();
+        const deleted = pi.snapshot().segments[0].shared.deleted.?;
+        try std.testing.expectEqual(@as(usize, 1), deleted.cardinality());
+        try std.testing.expect(!deleted.contains(0));
+        try std.testing.expect(deleted.contains(1));
+
+        // A canonical bitmap is still invalid for a two-document segment
+        // if its deletion ordinal points past the last document.
+        var txn = try pi.beginWriteMainTxn();
+        errdefer txn.abort();
+        const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1)));
+        try txn.put(.deletions, &seg_key, &.{ 1, 0, 0, 0, 0, 0, 2, 0 });
+        try txn.commit();
+    }
     try std.testing.expectError(error.InvalidRoaringBitmap, PersistentIndex.open(alloc, .{ .path = path }));
 }
 
@@ -5046,6 +5102,18 @@ test "persistent index hands off right-only segments to child index" {
     try src.indexSegment(right_seg);
     try std.testing.expect(try src.deleteById("doc:z"));
 
+    const right_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 2)));
+    {
+        // Simulate a deletion mask written before canonical serialization.
+        var legacy: [6 + 8192]u8 = @splat(0);
+        legacy[0] = 1;
+        legacy[6] = 2;
+        var txn = try src.beginWriteMainTxn();
+        errdefer txn.abort();
+        try txn.put(.deletions, &right_key, &legacy);
+        try txn.commit();
+    }
+
     const mixed_seg = try buildMultiDocSegment(alloc, &.{
         .{ .doc_id = "doc:f", .term = "foxtrot" },
         .{ .doc_id = "doc:t", .term = "tango" },
@@ -5074,6 +5142,16 @@ test "persistent index hands off right-only segments to child index" {
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
     try std.testing.expectEqualStrings("doc:m", ranges[0].min_doc_key);
     try std.testing.expectEqualStrings("doc:z", ranges[0].max_doc_key);
+
+    {
+        var txn = try dest.beginReadMainTxn();
+        defer txn.abort();
+        const mask = try txn.get(.deletions, &right_key);
+        try std.testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0, 0, 0, 1, 0 }, mask);
+        var bitmap = try roaring.RoaringBitmap.fromBytes(alloc, mask);
+        defer bitmap.deinit();
+        try std.testing.expect(bitmap.contains(1));
+    }
 
     const snap = dest.snapshot();
     try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
