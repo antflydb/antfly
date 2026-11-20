@@ -196,7 +196,7 @@ pub fn planDagActivationPublication(
         const declaration = while (try entries.next()) |entry| {
             if (entry.kind == 3 and std.mem.eql(u8, entry.name, target.index_name)) break entry;
         } else return error.InvalidArtifactCatalogCommand;
-        const config = try std.json.parseFromSlice(struct {
+        const config = std.json.parseFromSlice(struct {
             edge_types: []const struct { name: []const u8, topology: ?[]const u8 = null },
         }, alloc, declaration.config, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
             error.OutOfMemory => return err,

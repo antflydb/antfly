@@ -71,8 +71,9 @@ contribution imported by an earlier page. A private native lookup returns the
 current owner epoch and cursor from one storage snapshot.
 A private source-page lookup reads generation-bound graph artifact rows from a
 fenced physical root using its owned key range, with bounded row and byte
-counts. The caller supplies the source catalog generation and must establish
-the owner read barrier before either lookup. The scan driver commits one
+counts. It checks the requested generation against the ordered catalog in
+the same snapshot as the source rows. The caller establishes the owner read
+barrier before either lookup. The scan driver commits one
 page at a time and persists a root-completion cursor even for an empty root,
 so resumption uses the authority checkpoint. The fence snapshot digest binds
 the ordered roots and source catalog generations for every activated domain.

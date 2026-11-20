@@ -65,6 +65,18 @@ pub fn scanAccepted(alloc: A, txn: anytype, request: activation.ScanRequest, sta
     const current = (try authority.SourceFence.read(txn)) orelse return error.GraphConstraintNotReady;
     if (!std.meta.eql(current, request.fence)) return error.GraphConstraintAttemptConflict;
 
+    // Read the generation from the same snapshot as the source fence.
+    const catalog = (try @import("artifact_inventory.zig").load(alloc, txn)) orelse
+        return error.GraphConstraintNotReady;
+    defer catalog.deinit();
+    if (!std.mem.eql(u8, &catalog.value.command.namespace, &request.namespace))
+        return error.GraphConstraintRevisionChanged;
+    var indexes = try @import("artifact_catalog_view.zig").Iterator.init(catalog.value.command.catalogs.indexes);
+    const generation = while (try indexes.next()) |index| {
+        if (index.kind == 3 and std.mem.eql(u8, index.name, request.index_name)) break index.generation;
+    } else return error.GraphConstraintRevisionChanged;
+    if (generation != request.generation) return error.GraphConstraintRevisionChanged;
+
     const lower = try keys.documentRangeLowerAlloc(alloc, start);
     const upper = if (end.len != 0)
         try keys.documentRangeLowerAlloc(alloc, end)

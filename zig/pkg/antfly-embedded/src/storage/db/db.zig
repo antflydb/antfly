@@ -156093,6 +156093,16 @@ test "db ordered DAG source fence persists with the apply receipt" {
     {
         var writer = try db.core.store.beginWriteTxn();
         errdefer writer.abort();
+        const inventory = @import("artifact_inventory.zig");
+        const catalogs: inventory.Catalogs = .{
+            .indexes = "AIDX\x02\x00\x00\x00\x01\x00\x00\x00" ++
+                "\x01\x00\x00\x00g\x03\x02\x00\x00\x00{}\x07\x00\x00\x00\x00\x00\x00\x00",
+        };
+        try inventory.stageOrdered(a, &writer, .{
+            .namespace = namespace,
+            .catalogs = catalogs,
+            .binding = .{ .epoch = 1, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(a) },
+        }, 1);
         try writer.put(graph_key, graph_value);
         try writer.commit();
     }
@@ -156119,6 +156129,18 @@ test "db ordered DAG source fence persists with the apply receipt" {
     try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 2 }, true);
     request.dag_source_fence.?.scan.?.root_count = null;
     const owner: dag.Digest = @splat(6);
+    const stale_query = try std.json.Stringify.valueAlloc(a, .{
+        .mode = @as(enum { dag_activation_source_page }, .dag_activation_source_page),
+        .dag_source_page = @as(effects.ScanRequest, .{
+            .namespace = namespace,
+            .fence = fence,
+            .index_name = "g",
+            .edge_type = "R",
+            .generation = 8,
+        }),
+    }, .{ .emit_strings_as_arrays = true });
+    defer a.free(stale_query);
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, db.lookup(a, "", .{ .relational_topology_json = stale_query }));
     var source_result = (try db.lookup(a, "", .{ .relational_topology_json = source_query })).?;
     defer source_result.deinit(a);
     const source_page = try std.json.parseFromSlice(effects.ScanPage, a, source_result.json, .{});
