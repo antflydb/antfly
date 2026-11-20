@@ -84,24 +84,9 @@ pub const Index = struct {
     /// Return transport selectors for logical pictures in presentation order.
     /// The first member selects the complete field/partition assembly on replay.
     pub fn select(self: Index) ![]usize {
-        if (self.pictures.len == 0 or self.timescale == 0) return error.EmptyVideo;
-        const order = try self.allocator.alloc(usize, self.pictures.len);
-        defer self.allocator.free(order);
-        for (order, 0..) |*id, i| id.* = i;
-        const Less = struct {
-            fn less(pictures: []const h264.Picture, l: usize, r: usize) bool {
-                return pictures[l].pts < pictures[r].pts or (pictures[l].pts == pictures[r].pts and pictures[l].first_packet < pictures[r].first_packet);
-            }
-        };
-        std.mem.sort(usize, order, @as([]const h264.Picture, self.pictures), Less.less);
-        const first = self.pictures[order[0]].pts;
-        const last = self.pictures[order[order.len - 1]];
-        const span = @as(i128, last.pts) + last.duration - first;
-        if (span <= 0) return error.InvalidSamplingMetadata;
-        const seconds = @as(f64, @floatFromInt(span)) / @as(f64, @floatFromInt(self.timescale));
-        const selected = try sampling.embeddingGemma2(self.allocator, .{ .total_frames = order.len, .fps = @as(f64, @floatFromInt(order.len)) / seconds, .duration_seconds = seconds }, .{});
-        for (selected) |*id| id.* = self.pictures[order[id.*]].first_packet;
-        return selected;
+        const ids = try sampling.referencePictures(self.allocator, self.pictures, self.timescale, .{}, .{});
+        for (ids) |*id| id.* = self.pictures[id.*].first_packet;
+        return ids;
     }
 };
 const Collector = struct {
@@ -442,7 +427,7 @@ pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Option
     defer if (registry orelse owned) |owner| owner.releasePlanningHeaders();
     var result = try @import("h264_headers.zig").planning(a, reader, options, registry orelse owned);
     errdefer result.deinit();
-    try result.reservation.resize(.{ .host_bytes = result.pictures.len * @sizeOf(h264.Picture) });
+    try result.reservation.resize(.{ .host_bytes = (result.storage orelse result.pictures).len * @sizeOf(h264.Picture) });
     return result;
 }
 pub fn index(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) !Index {
@@ -851,4 +836,26 @@ test "AVC header planning releases admission across allocation and resource fail
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "AVC header planning retains only compact pictures for a progressive track" {
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .identity = "frame-only", .storage = .{ .borrowed = @embedFile("../testdata/h264-baseline-p.mp4") } };
+    var original = try media.mp4.Reader.init(a, &source, .{});
+    defer original.deinit();
+    const packets = try a.alloc(media.mp4.Packet, 4096);
+    defer a.free(packets);
+    for (packets, 0..) |*packet, i| {
+        packet.* = original.packets[0];
+        packet.pts = @intCast(i);
+    }
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = packets.len * @sizeOf(h264.Picture) + 32 * 1024 } };
+    var input = source.view(a, &pool, .{});
+    var reader = original;
+    reader.input = &input;
+    reader.packets = packets;
+    var index_ = try planning(a, &reader, Options.forTrack(packets.len), null);
+    defer index_.deinit();
+    try std.testing.expectEqual(packets.len, index_.pictures.len);
+    try std.testing.expectEqual(packets.len - 1, index_.pictures[packets.len - 1].first_packet);
 }

@@ -453,11 +453,12 @@ pub const Session = struct {
                         const slice_type = try bits.ue();
                         const index = try self.entry(try bits.ue());
                         if (selected) |previous| if (previous != index) return error.MixedVideoPictures;
+                        const window_reset = selected == null and packet.avc_epoch_start;
                         selected = index;
                         const changed = self.active == null or !std.mem.eql(u8, &self.entries.items[self.active.?].sps_hash, &self.entries.items[index].sps_hash);
                         const compatible = self.active != null and layoutCompatible(self.entries.items[self.active.?].config, self.entries.items[index].config);
-                        if (changed and (self.active == null or nal[0] & 31 == 5 or !compatible)) {
-                            const independent = self.active != null and nal[0] & 31 != 5;
+                        if (window_reset or (changed and (self.active == null or nal[0] & 31 == 5 or !compatible))) {
+                            const independent = window_reset or (self.active != null and nal[0] & 31 != 5);
                             // Qualified non-IDR extension: incompatible storage starts
                             // with a complete I picture and an empty prediction DPB.
                             if (independent and slice_type % 5 != 2) return error.UnsupportedDynamicGeometry;
@@ -559,6 +560,7 @@ pub const Session = struct {
         for (self.epochs.items) |epoch| {
             if (epoch.end <= removed) continue;
             var rebased = epoch;
+            if (rebased.start < removed) rebased.independent = false;
             rebased.start -|= removed;
             rebased.end -= removed;
             self.epochs.items[keep] = rebased;
@@ -615,6 +617,11 @@ pub const Session = struct {
         if (lo == self.epochs.items.len or index < self.epochs.items[lo].start) return error.MissingVideoParameterSet;
         return self.epochs.items[lo];
     }
+    pub fn independentEpochStart(self: *const Session, target: usize) ?usize {
+        const epoch = self.epochAt(target) catch return null;
+        return if (epoch.independent) epoch.start else null;
+    }
+
     /// Last complete progressive IDR in this epoch at or before the target.
     pub fn progressiveRestart(self: *const Session, epoch_start: usize, target: usize) ?usize {
         const after = std.sort.upperBound(usize, self.progressive_idrs.items, target, packetOrder);

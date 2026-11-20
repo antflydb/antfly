@@ -57,6 +57,42 @@ pub fn embeddingGemma2(allocator: std.mem.Allocator, metadata: Metadata, options
     return output;
 }
 
+/// Return original picture ordinals in the reference processor's presentation
+/// order. Keep decode preroll in the reader but omit it from an explicit edit.
+pub fn referencePictures(a: std.mem.Allocator, pictures: anytype, scale: u32, edit: media.timeline.Edit, control: media.source.Control) ![]usize {
+    if (scale == 0 or pictures.len == 0) return error.EmptyVideo;
+    const order = try a.alloc(usize, pictures.len);
+    defer a.free(order);
+    var count: usize = 0;
+    for (pictures, 0..) |picture, id| {
+        if (id % 256 == 0) try control.check();
+        if (!edit.contains(picture.pts)) continue;
+        order[count] = id;
+        count += 1;
+    }
+    if (count == 0) return error.EmptyVideo;
+    const Less = struct {
+        fn less(items: @TypeOf(pictures), l: usize, r: usize) bool {
+            if (items[l].pts != items[r].pts) return items[l].pts < items[r].pts;
+            if (@hasField(@TypeOf(items[l]), "first_packet")) return items[l].first_packet < items[r].first_packet;
+            return l < r;
+        }
+    };
+    std.mem.sort(usize, order[0..count], pictures, Less.less);
+    const last = pictures[order[count - 1]];
+    const tail: ?u64 = last.duration;
+    const duration: i128 = edit.source_duration orelse (@as(i128, last.pts) + (tail orelse 0) - pictures[order[0]].pts);
+    const ids = try referenceOrdinals(a, count, duration, scale);
+    for (ids) |*id| id.* = order[id.*];
+    return ids;
+}
+
+pub fn referenceOrdinals(a: std.mem.Allocator, frames: usize, ticks: i128, scale: u32) ![]usize {
+    if (ticks <= 0 or scale == 0) return error.InvalidSamplingMetadata;
+    const seconds = @as(f64, @floatFromInt(ticks)) / @as(f64, @floatFromInt(scale));
+    return embeddingGemma2(a, .{ .total_frames = frames, .fps = @as(f64, @floatFromInt(frames)) / seconds, .duration_seconds = seconds }, .{});
+}
+
 pub const Interval = struct { start: i64, end: i64 };
 /// Native timestamp policy v1: each tick target chooses the earliest presented
 /// picture at or after that target in [start,end); duplicate IDs are omitted.

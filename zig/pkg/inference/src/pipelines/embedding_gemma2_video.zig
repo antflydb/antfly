@@ -218,9 +218,7 @@ pub const Inspection = struct {
         self.source = .{ .allocator = a, .identity = "video-inspection", .storage = .{ .borrowed = bytes }, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .admission_pool = &self.pool, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
         const input_source = if (borrowed) |reader| reader.input else if (configuration.webm) |input| input.reader.input else null;
         if (input_source) |source| {
-            self.source.storage = source.storage;
-            self.source.identity = source.identity;
-            self.source.limits = source.limits;
+            self.source = source.view(self.source.allocator, self.source.admission_pool, self.source.control);
         } else try validateInputSize(bytes.len, configuration.sampling);
         self.validated_bytes = if (borrowed) |reader| try sampledPacketBytes(reader, configuration.sampling) else bytes;
         const opened = if (configuration.webm == null and borrowed == null) try ContainerInput.openMode(a, &self.source, bytes, isWebm(bytes), configuration.sampling, video.mp4_coded.limits, .{}, true) else null;
@@ -307,7 +305,6 @@ pub const DecoderContinuation = struct {
     decoder: ?*video.h264.Incremental = null,
     parameter_sets: ?*video.h264_dynamic.Session = null,
     dynamic: ?video.h264_dynamic.Continuation = null,
-    replay_source: ?media.source.Source = null,
     apple: ?*video.apple.Continuation = null,
     session: ?@import("../backends/session.zig").Session = null,
     surface_permit: ?@import("../backends/session.zig").RunPermit = null,
@@ -368,24 +365,10 @@ pub const DecoderContinuation = struct {
         return self.decodeControlled(selected, packet_base, context, callback, self.reader.input.control);
     }
     pub fn decodeControlled(self: *@This(), selected: []const usize, packet_base: usize, context: *anyopaque, callback: video.h264.SelectionCallback, control: media.source.Control) !bool {
-        const Controls = struct {
-            original: media.source.Control,
-            current: media.source.Control,
-            fn check(raw: ?*const anyopaque) !void {
-                const checks: *const @This() = @ptrCast(@alignCast(raw.?));
-                try checks.original.check();
-                try checks.current.check();
-            }
-        };
-        var controls = Controls{ .original = self.reader.input.control, .current = control };
-        // Serialized continuation calls share the same read budget, including
-        // partial reads on failure. Only cancellation belongs to this call.
-        if (self.replay_source == null) self.replay_source = self.reader.input.*;
-        const source = &self.replay_source.?;
-        source.control = .{ .context = &controls, .check_fn = Controls.check };
-        defer source.control = controls.original;
+        const controls = media.source.ReadControl{ .source = self.reader.input.control, .worker = control };
+        var source = self.reader.input.view(self.reader.input.allocator, self.reader.input.admission_pool, controls.control());
         var reader = self.reader.*;
-        reader.input = source;
+        reader.input = &source;
         if (self.reader.track.codec != .avc) return false;
         var absolute: [32]usize = undefined;
         if (selected.len > absolute.len) return error.ResourceLimitExceeded;
@@ -516,7 +499,8 @@ pub const ReaderSelection = struct {
 /// A complete single-packet IDR with static parameter sets starts a new hash
 /// chain. Dynamic configuration and split pictures retain the conservative chain.
 fn readerProjectionKeys(a: std.mem.Allocator, reader: *const media.mp4.Reader, logical: *const video.h264_pictures.Index, selected: []const usize, control: media.source.Control) ![]CacheKey {
-    var input = reader.input.*;
+    const controls = media.source.ReadControl{ .source = reader.input.control, .worker = control };
+    var input = reader.input.view(reader.input.allocator, reader.input.admission_pool, controls.control());
     const keys = try a.alloc(CacheKey, selected.len);
     errdefer a.free(keys);
     var ends: [32]usize = undefined;
@@ -682,7 +666,8 @@ fn clipBinding(bytes: []const u8, reader: ?*const media.mp4.Reader, webm: ?WebmI
 }
 fn readerBinding(reader: *const media.mp4.Reader, sampling: Sampling, control: media.source.Control) ![32]u8 {
     try control.check();
-    var input = reader.input.*;
+    const controls = media.source.ReadControl{ .source = reader.input.control, .worker = control };
+    var input = reader.input.view(reader.input.allocator, reader.input.admission_pool, controls.control());
     var copy = reader.*;
     copy.input = &input;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1202,12 +1187,9 @@ pub fn inspectReaderPlan(a: std.mem.Allocator, borrowed: *const media.mp4.Reader
     return inspectReaderPlanWithSelection(a, borrowed, control, sampling, pool, metal, null);
 }
 pub fn inspectReaderPlanWithSelection(a: std.mem.Allocator, borrowed: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, metal: bool, selection: ?*const ReaderSelection) !Plan {
-    const bytes = try sampledPacketBytes(borrowed, sampling);
+    _ = try sampledPacketBytes(borrowed, sampling);
     const adapter = control.imageWorkControl();
-    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = borrowed.input.identity, .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
-    source.storage = borrowed.input.storage;
-    source.identity = borrowed.input.identity;
-    source.limits = borrowed.input.limits;
+    var source = borrowed.input.view(a, pool, .{ .context = adapter.context, .check_fn = adapter.check_fn });
     var reader = borrowed.*;
     reader.input = &source;
     const normalized = try normalizeHevc(a, &reader);
@@ -1437,7 +1419,7 @@ fn webmGemma4Plan(index: video.webm_pictures.Index, sampling: Sampling, control:
 }
 fn selectWebm(a: std.mem.Allocator, index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control, timeline: ?*const video.sampling.Timeline) ![]usize {
     if (try webmGemma4Plan(index, sampling, control)) |plan| return a.dupe(usize, plan.ids());
-    if (sampling == .reference) return index.select();
+    if (sampling == .reference) return index.selectWithAllocator(a, control);
     var owned: ?video.sampling.Timeline = if (timeline == null and index.sourceTimeline() != null) try index.presentationTimeline(a, control) else null;
     defer if (owned) |*value| value.deinit();
     const effective = timeline orelse if (owned) |*value| value else null;
@@ -1624,9 +1606,7 @@ pub const Prefetch = struct {
         if (self.webm_input == null and self.packet_reader == null) try validateInputSize(bytes.len, sampling);
         var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "embedding-video", .admission_pool = pool, .control = .{ .context = self, .check_fn = check }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
         if (self.webm_input) |input| {
-            source.storage = input.reader.input.storage;
-            source.identity = input.reader.input.identity;
-            source.limits = input.reader.input.limits;
+            source = input.reader.input.view(source.allocator, source.admission_pool, source.control);
         }
         var opened = if (inspection == null and self.webm_input == null and self.packet_reader == null) try ContainerInput.open(a, &source, bytes, sampling) else null;
         defer if (opened) |*owner| owner.deinit();
@@ -1635,9 +1615,7 @@ pub const Prefetch = struct {
         var reader: media.mp4.Reader = undefined;
         if (inspection) |owner| {
             const original = if (webm) owner.webm_reader.input else owner.reader.input;
-            source.storage = original.storage;
-            source.identity = original.identity;
-            source.limits = original.limits;
+            source = original.view(source.allocator, source.admission_pool, source.control);
             if (webm) {
                 webm_reader = owner.webm_reader;
                 webm_reader.input = &source;
@@ -1649,9 +1627,7 @@ pub const Prefetch = struct {
             webm_reader = if (self.webm_input) |input| input.reader.* else opened.?.webm;
             webm_reader.input = &source;
         } else if (self.packet_reader) |borrowed| {
-            source.storage = borrowed.input.storage;
-            source.identity = borrowed.input.identity;
-            source.limits = borrowed.input.limits;
+            source = borrowed.input.view(source.allocator, source.admission_pool, source.control);
             reader = borrowed.*;
             reader.input = &source;
         } else {
@@ -2131,9 +2107,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "embedding-video", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
     if (webm_input) |input| {
-        source.storage = input.reader.input.storage;
-        source.identity = input.reader.input.identity;
-        source.limits = input.reader.input.limits;
+        source = input.reader.input.view(source.allocator, source.admission_pool, source.control);
     }
     var opened = if (inspection == null and webm_input == null and borrowed == null) try ContainerInput.open(a, &source, bytes, sampling) else null;
     defer if (opened) |*owner| owner.deinit();
@@ -2142,9 +2116,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     var reader: media.mp4.Reader = undefined;
     if (inspection) |owner| {
         const original = if (webm) owner.webm_reader.input else owner.reader.input;
-        source.storage = original.storage;
-        source.identity = original.identity;
-        source.limits = original.limits;
+        source = original.view(source.allocator, source.admission_pool, source.control);
         if (webm) {
             webm_reader = owner.webm_reader;
             webm_reader.input = &source;
@@ -2156,9 +2128,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
         webm_reader = if (webm_input) |input| input.reader.* else opened.?.webm;
         webm_reader.input = &source;
     } else if (borrowed) |input| {
-        source.storage = input.input.storage;
-        source.identity = input.input.identity;
-        source.limits = input.input.limits;
+        source = input.input.view(source.allocator, source.admission_pool, source.control);
         reader = input.*;
         reader.input = &source;
     } else {
@@ -3716,7 +3686,7 @@ fn preparedReaderHash(a: std.mem.Allocator, producer: *Prefetch) ![32]u8 {
     hash.final(&output);
     return output;
 }
-test "embeddinggemma2 video borrowed packet preparation matches container and leaves caller read state untouched" {
+test "embeddinggemma2 video borrowed packet preparation matches container and accounts physical reads" {
     const a = std.testing.allocator;
     const bytes = @embedFile("../testdata/video/mjpeg.mov");
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "borrowed-window" };
@@ -3737,8 +3707,8 @@ test "embeddinggemma2 video borrowed packet preparation matches container and le
     defer borrowed.deinit();
     const borrowed_hash = try preparedReaderHash(a, borrowed);
     try std.testing.expectEqual(original_hash, borrowed_hash);
-    try std.testing.expectEqual(original_reads, source.reads);
-    try std.testing.expectEqual(original_total, source.total_bytes);
+    try std.testing.expect(source.reads > original_reads);
+    try std.testing.expect(source.total_bytes > original_total);
     try std.testing.expectError(error.Timeout, inspectReaderPlan(a, &reader, .{ .deadline_ns = 0 }, sampling, &pool, false));
     try @import("embedding_gemma2.zig").validateGroup(.{ .content = &.{.{ .sampled_video = .{ .reader = &reader, .sampling = sampling } }} }, .{});
     try std.testing.expectError(error.InvalidEmbeddingGroup, @import("embedding_gemma2.zig").validateGroup(.{ .content = &.{.{ .sampled_video = .{ .bytes = bytes, .reader = &reader, .sampling = sampling } }} }, .{}));
@@ -4338,7 +4308,9 @@ test "embeddinggemma2 video continuation preserves reference pictures across win
         defer limited.deinit();
         var first = Oracle{};
         try std.testing.expect(try limited.decode(&.{0}, 0, &first, Oracle.accept));
-        limited.replay_source.?.limits.max_reads = limited.replay_source.?.reads;
+        reader.input.limits.max_reads = reader.input.reads + 1;
+        var probe = try reader.input.read(0, 1);
+        probe.deinit();
         try std.testing.expectError(error.ResourceLimitExceeded, limited.decode(&.{1}, 0, &first, Oracle.accept));
     }
 }
@@ -4537,8 +4509,8 @@ test "embeddinggemma2 video range reader preparation matches borrowed packets wi
     const actual = try Prefetch.startReader(a, std.testing.io, null, &reader, .{}, sampling, &pool);
     defer actual.deinit();
     try std.testing.expectEqual(hash, try preparedReaderHash(a, actual));
-    try std.testing.expectEqual(received, source.reads);
-    try std.testing.expect(provider.reads > received);
+    try std.testing.expect(source.reads > received);
+    try std.testing.expectEqual(provider.reads, source.reads);
 }
 
 test "embeddinggemma2 video cohort capacity adapts to geometry and scratch budget" {
@@ -5881,10 +5853,12 @@ test "video inspection shares timestamps and decode metadata and honors cancella
             var count: Count = .{};
             var observed = configuration;
             observed.observer = .{ .context = &count, .accept = Count.accept };
-            try observeConfigured(a, bytes, null, .{}, observed);
+            const before_replay = entry.source.total_bytes;
+            const replayed = try observeConfiguredSourceBytes(a, bytes, null, .{}, observed);
             try std.testing.expectEqual(actual.len, count.frames);
             try std.testing.expectEqual(@as(usize, 1), scope.count);
-            try std.testing.expectEqual(reads, entry.source.reads);
+            try std.testing.expect(replayed > 0);
+            try std.testing.expectEqual(replayed, entry.source.total_bytes - before_replay);
         }
         try std.testing.expectError(error.Timeout, selectedConfiguredPresentationUs(a, bytes, .{ .deadline_ns = 0 }, configuration));
     }

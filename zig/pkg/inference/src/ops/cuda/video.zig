@@ -258,8 +258,7 @@ pub fn inspectEmbedding(allocator: std.mem.Allocator, bytes: []const u8, control
     try validateTrack(reader.track);
     const normalized = try normalizeDecoderTrack(allocator, &reader);
     defer if (normalized) |config| allocator.free(config);
-    const end_us = try validateTimeline(reader.track, reader.packets);
-    const sampler = try embeddingSamplerForReader(&reader, end_us);
+    const sampler = try embeddingSamplerForReader(&reader);
     const frame = Frame{ .device = 0, .pitch = 0, .width = reader.track.width, .height = reader.track.height, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = try quarterTurns(reader.track.display_matrix), .sar = try displayAspect(allocator, reader.track) };
     const display = try frame.displaySize();
     return .{ .width = reader.track.width, .height = reader.track.height, .frames = sampler.length, .codec = reader.track.codec, .display_width = display[0], .display_height = display[1] };
@@ -342,20 +341,26 @@ fn quarterTurns(matrix: [9]i32) !u32 {
     return error.UnsupportedVideoFormat;
 }
 
-fn embeddingSamplerForReader(reader: *const media.mp4.Reader, end_us: i64) !EmbeddingSampler {
+fn embeddingSamplerForReader(reader: *const media.mp4.Reader) !EmbeddingSampler {
     const track = reader.track;
+    try validateDecodeSpan(track, reader.packets);
     var frames: usize = 0;
-    var duration_us: i64 = 0;
-    for (reader.packets) |packet| {
-        const pts = try timestampUs(packet.pts, track.timescale);
-        if (pts < 0 or pts >= end_us) continue;
+    var first: i64 = std.math.maxInt(i64);
+    var last: i64 = std.math.minInt(i64);
+    var tail: u32 = 0;
+    for (reader.packets, 0..) |packet, i| {
+        if (i % 256 == 0) try reader.input.control.check();
+        if (!track.edit.contains(packet.pts)) continue;
         frames += 1;
-        const end = std.math.cast(i64, @as(i128, packet.pts) + packet.duration) orelse return error.InvalidVideoTimestamp;
-        duration_us = @max(duration_us, @min(end_us, try timestampUs(end, track.timescale)));
+        first = @min(first, packet.pts);
+        if (packet.pts >= last) {
+            last = packet.pts;
+            tail = packet.duration;
+        }
     }
-    // An empty edit shifts presentation time without adding content samples.
-    const content_duration_us = try embeddingContentDurationUs(track, duration_us);
-    return EmbeddingSampler.init(frames, content_duration_us, end_us);
+    if (frames == 0) return error.EmptyVideo;
+    const duration: i128 = track.edit.source_duration orelse (@as(i128, last) + tail - first);
+    return EmbeddingSampler.fromClock(frames, duration, track.timescale, track.edit);
 }
 
 /// EmbeddingGemma2: floor(duration * 1 FPS) samples, capped uniformly to 32.
@@ -366,25 +371,27 @@ pub const EmbeddingSampler = struct {
     next: usize = 0,
     frame: usize = 0,
     repetitions: usize = 1,
-    end_us: i64,
-    last_us: ?i64 = null,
+    edit: media.timeline.Edit = .{},
+    timescale: u32 = std.time.us_per_s,
+    last_pts: ?i64 = null,
 
     pub fn init(frame_count: usize, duration_us: i64, presentation_end_us: i64) !EmbeddingSampler {
-        if (frame_count == 0 or duration_us <= 0 or presentation_end_us <= 0) return error.EmptyVideo;
-        if (duration_us > max_duration_us) return error.VideoDurationExceeded;
-        const duration: u64 = @intCast(duration_us);
-        const samples: usize = @intCast(@max(1, duration / 1_000_000));
-        var self = EmbeddingSampler{ .end_us = presentation_end_us, .length = @min(samples, 32) };
-        for (0..self.length) |i| {
-            const sample = if (samples > 32) i * (samples - 1) / 31 else i;
-            self.indices[i] = @min(frame_count - 1, sample * frame_count * 1_000_000 / duration);
-        }
+        if (presentation_end_us <= 0) return error.EmptyVideo;
+        return fromClock(frame_count, duration_us, std.time.us_per_s, .{ .source_duration = presentation_end_us });
+    }
+    fn fromClock(frames: usize, ticks: i128, scale: u32, edit: media.timeline.Edit) !EmbeddingSampler {
+        if (frames == 0 or ticks <= 0) return error.EmptyVideo;
+        if (ticks * std.time.us_per_s > @as(i128, max_duration_us) * scale) return error.VideoDurationExceeded;
+        var self = EmbeddingSampler{ .edit = edit, .timescale = scale };
+        var fixed = std.heap.FixedBufferAllocator.init(std.mem.asBytes(&self.indices));
+        const selected = try @import("antfly_video").sampling.referenceOrdinals(fixed.allocator(), frames, ticks, scale);
+        self.length = selected.len;
         return self;
     }
     pub fn select(self: *EmbeddingSampler, pts: i64) !bool {
-        if (self.last_us) |last| if (pts < last) return error.NonMonotonicVideoPresentation;
-        self.last_us = pts;
-        if (pts < 0 or pts >= self.end_us) return false;
+        if (self.last_pts) |last| if (pts < last) return error.NonMonotonicVideoPresentation;
+        self.last_pts = pts;
+        if (!self.edit.contains(pts)) return false;
         const index = self.frame;
         self.frame += 1;
         if (self.next == self.length or index != self.indices[self.next]) return false;
@@ -482,9 +489,13 @@ const DecodeState = struct {
                 return -1;
             }) 1 else 0;
         }
+        const displayed_us = if (self.embedding_sampler) |sampler| timestampUs(pts, sampler.timescale) catch |err| {
+            self.failure = err;
+            return -1;
+        } else pts;
         const repetitions = if (self.embedding_sampler) |sampler| sampler.repetitions else 1;
         for (0..if (self.consumer.coalesce_repetitions) @as(usize, 1) else repetitions) |_| {
-            self.consumer.consume(self.consumer.context, .{ .device = device, .pitch = pitch, .width = width, .height = height, .planned_frames = if (self.selected_packets) |*selection| selection.plan.len else 0, .timestamp_us = if (self.selected_packets) |*plan| plan.timestamp_us else pts, .matrix = matrix, .full_range = full_range, .rotation = self.rotation, .sar = self.sar, .high_depth = @intFromBool(bit_depth == 10), .tone = if (transfer == 16) 1 else if (transfer == 18) 2 else 0, .repetitions = if (self.consumer.coalesce_repetitions) repetitions else 1 }) catch |err| {
+            self.consumer.consume(self.consumer.context, .{ .device = device, .pitch = pitch, .width = width, .height = height, .planned_frames = if (self.selected_packets) |*selection| selection.plan.len else 0, .timestamp_us = if (self.selected_packets) |*plan| plan.timestamp_us else displayed_us, .matrix = matrix, .full_range = full_range, .rotation = self.rotation, .sar = self.sar, .high_depth = @intFromBool(bit_depth == 10), .tone = if (transfer == 16) 1 else if (transfer == 18) 2 else 0, .repetitions = if (self.consumer.coalesce_repetitions) repetitions else 1 }) catch |err| {
                 self.failure = err;
                 break;
             };
@@ -530,21 +541,6 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     var reader = try media.mp4.Reader.init(allocator, &source, limits);
     defer reader.deinit();
     try validateTrack(reader.track);
-    try ctx.makeCurrent();
-    if (ctx.video_decoder_cache == null) {
-        try state.checkStatus(antfly_nvdec_open(&ctx.video_decoder_cache, ctx.stream, &state, DecodeState.callback));
-        ctx.video_decoder_release = antfly_nvdec_close;
-    }
-    const decoder = ctx.video_decoder_cache;
-    antfly_nvdec_set_budget(decoder.?, ctx, reserveDecoder, releaseDecoder);
-    var decoding = false;
-    var succeeded = false;
-    defer {
-        if (!decoding or succeeded) antfly_nvdec_finish(decoder.?) else {
-            antfly_nvdec_close(decoder.?);
-            ctx.video_decoder_cache = null;
-        }
-    }
     const normalized = try normalizeDecoderTrack(allocator, &reader);
     defer if (normalized) |config| allocator.free(config);
     const track = reader.track;
@@ -555,7 +551,7 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     if (reader.packets.len == 0) return error.EmptyVideo;
     if (sampling == .gemma4) {
         try validateDecodeSpan(track, reader.packets);
-    } else state.sampler.end_us = try validateTimeline(track, reader.packets);
+    } else if (sampling == .presentation_seconds) state.sampler.end_us = try validateTimeline(track, reader.packets);
     // NVDEC resolves active SPS/PPS itself and rejects unsupported sequences
     // before allocating surfaces. Sample the progressive access-unit timeline.
     // Validate the one-picture-per-sample contract against the display callbacks.
@@ -567,7 +563,7 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
         if (track.codec == .avc) state.avc_packet_count = reader.packets.len;
     }
     if (sampling == .embedding_gemma2) {
-        state.embedding_sampler = try embeddingSamplerForReader(&reader, state.sampler.end_us);
+        state.embedding_sampler = try embeddingSamplerForReader(&reader);
     }
     const codec: c_int = switch (track.codec) {
         .avc => 4,
@@ -575,7 +571,20 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
         .av1 => 11,
         .mjpeg => return error.UnsupportedVideoFormat,
     };
-    decoding = true;
+    try ctx.makeCurrent();
+    if (ctx.video_decoder_cache == null) {
+        try state.checkStatus(antfly_nvdec_open(&ctx.video_decoder_cache, ctx.stream, &state, DecodeState.callback));
+        ctx.video_decoder_release = antfly_nvdec_close;
+    }
+    const decoder = ctx.video_decoder_cache;
+    antfly_nvdec_set_budget(decoder.?, ctx, reserveDecoder, releaseDecoder);
+    var succeeded = false;
+    defer {
+        if (succeeded) antfly_nvdec_finish(decoder.?) else {
+            antfly_nvdec_close(decoder.?);
+            ctx.video_decoder_cache = null;
+        }
+    }
     try state.checkStatus(antfly_nvdec_begin(decoder.?, ctx.stream, &state, DecodeState.callback, track.width, track.height, codec, color.matrix, color.range, color.transfer, color.primaries, state.sar.horizontal, state.sar.vertical, @intFromBool(track.pixel_aspect_declared)));
     var annex: std.ArrayList(u8) = .empty;
     defer annex.deinit(allocator);
@@ -595,7 +604,7 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
             try annexPacket(allocator, &annex, lease.bytes, track.nal_length_bytes);
             break :converted annex.items;
         };
-        const pts = if (state.selected_packets != null) @as(i64, @intCast(index)) else try timestampUs(packet.pts, track.timescale);
+        const pts = if (state.selected_packets != null) @as(i64, @intCast(index)) else if (state.embedding_sampler != null) packet.pts else try timestampUs(packet.pts, track.timescale);
         const result = antfly_nvdec_packet(decoder.?, payload.ptr, @intCast(payload.len), pts, 0);
         if (state.failure) |err| return err;
         try state.checkStatus(result);
@@ -615,11 +624,6 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
 fn timestampUs(ticks: i64, timescale: u32) !i64 {
     if (timescale == 0) return error.InvalidVideoTimestamp;
     return std.math.cast(i64, @divFloor(@as(i128, ticks) * 1_000_000, timescale)) orelse error.InvalidVideoTimestamp;
-}
-
-fn embeddingContentDurationUs(track: media.mp4.Track, presentation_end_us: i64) !i64 {
-    if (track.edit.source_duration) |duration| return timestampUs(duration, track.timescale);
-    return presentation_end_us;
 }
 
 // NVDEC's work envelope bounds elapsed coded time, including preroll. The
@@ -1559,10 +1563,9 @@ test "embeddinggemma2 sampling excludes a leading empty edit from content durati
         .display_matrix = @splat(0),
         .edit = .{ .source_start = 20_480, .source_duration = 61_440 },
     };
-    const presentation_end_us = try timestampUs(track.edit.source_start + track.edit.source_duration.?, track.timescale);
-    const content_duration_us = try embeddingContentDurationUs(track, presentation_end_us);
-    const sampler = try EmbeddingSampler.init(60, content_duration_us, presentation_end_us);
-    try std.testing.expectEqual(@as(i64, 8_000_000), sampler.end_us);
+    var sampler = try EmbeddingSampler.fromClock(60, track.edit.source_duration.?, track.timescale, track.edit);
+    try std.testing.expect(!try sampler.select(track.edit.source_start - 1));
+    try std.testing.expect(try sampler.select(track.edit.source_start));
     try std.testing.expectEqualSlices(usize, &.{ 0, 10, 20, 30, 40, 50 }, sampler.indices[0..sampler.length]);
 }
 
@@ -1754,4 +1757,22 @@ test "NVDEC display geometry rejects out of range SAR before decoder admission" 
         const frame = Frame{ .device = 0, .pitch = 0, .width = 4096, .height = 2160, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = @intCast(rotation), .sar = .{ .horizontal = 4000000000, .vertical = 1000000000 } };
         try std.testing.expectEqual(if (rotation & 1 == 0) [2]u32{ 16384, 2160 } else [2]u32{ 2160, 16384 }, try frame.displaySize());
     }
+}
+
+test "embeddinggemma2 video sampler applies both edit endpoints in source ticks" {
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .identity = "edited", .storage = .{ .borrowed = @embedFile("../../testdata/video/closed.mp4") } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var view = reader;
+    view.track.timescale = 2_000_000;
+    view.track.edit = .{ .source_start = 1, .source_duration = 2_000_000 };
+    var packets: [3]media.mp4.Packet = @splat(reader.packets[0]);
+    for (&packets, [_]i64{ 0, 1, 2_000_001 }) |*packet, pts| packet.pts = pts;
+    view.packets = &packets;
+    var sampler = try embeddingSamplerForReader(&view);
+    try std.testing.expect(!try sampler.select(0));
+    try std.testing.expect(try sampler.select(1));
+    try std.testing.expect(!try sampler.select(2_000_001));
+    try std.testing.expectEqual(@as(usize, 1), sampler.frame);
 }

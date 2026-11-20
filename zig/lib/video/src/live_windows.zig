@@ -103,7 +103,7 @@ const ParameterOverlay = struct {
     const Entry = struct { index: usize, start: u64, packet: media.mp4.Packet, prefix: []const u8 };
     allocator: std.mem.Allocator,
     input: media.source.Source,
-    original: *media.source.Source,
+    original: media.source.Source,
     entries: []Entry,
     bytes: []u8,
     reservation: media.admission.Token,
@@ -194,7 +194,7 @@ pub fn attachPrefixes(window: *Window, prefixes: []const PacketPrefix, options: 
         offset = try std.math.add(u64, offset, total);
     }
     const overlay = try a.create(ParameterOverlay);
-    overlay.* = .{ .allocator = a, .original = reader.input, .bytes = bytes, .entries = entries, .reservation = reservation, .input = .{ .allocator = a, .identity = reader.input.identity, .limits = reader.input.limits, .control = options.stream.control, .admission_pool = options.stream.admission_pool, .storage = .{ .range = .{ .context = overlay, .read_at = ParameterOverlay.read, .length = offset } } } };
+    overlay.* = .{ .allocator = a, .original = reader.input.view(a, options.stream.admission_pool, options.stream.control), .bytes = bytes, .entries = entries, .reservation = reservation, .input = .{ .allocator = a, .identity = reader.input.identity, .limits = reader.input.limits, .control = options.stream.control, .admission_pool = options.stream.admission_pool, .storage = .{ .range = .{ .context = overlay, .read_at = ParameterOverlay.read, .length = offset } } } };
     for (entries) |entry| {
         reader.packets[entry.index].offset = entry.start;
         reader.packets[entry.index].size = @intCast(entry.prefix.len + entry.packet.size);

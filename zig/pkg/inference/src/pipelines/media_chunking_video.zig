@@ -187,6 +187,7 @@ pub const Owner = struct {
     }
     fn registrySeekCache(a: std.mem.Allocator, reader: *const media.mp4.Reader, registry: *const video.h264_dynamic.Session) video.decode_plan.SeekCache {
         var cache = video.decode_plan.SeekCache.forPage(a, reader, registry.progressive_idrs.items);
+        cache.registry = registry;
         for (registry.entries.items) |entry| {
             const cfg = entry.config;
             if (!cfg.frame_only or cfg.separate_planes or cfg.profile == 88) return cache;
@@ -316,6 +317,13 @@ pub const Owner = struct {
         const options = video.live_windows.Options{ .max_packets = self.limits.max_dependency_packets, .stream = .{ .max_bytes = self.limits.max_coded_window_bytes, .admission_pool = self.pool, .control = self.reader.input.control } };
         var window = try video.live_windows.borrowRuns(a, self.reader, runs, options);
         errdefer window.deinit();
+        if (self.registry) |registry| {
+            var local: usize = 0;
+            for (runs) |run| {
+                window.reader.packets[local].avc_epoch_start = registry.independentEpochStart(run.first) == run.first;
+                local += run.last - run.first + 1;
+            }
+        }
         try video.live_windows.attachPrefixes(&window, prefix_storage[0..prefix_count], options);
         for (window.reader.packets) |*packet| packet.pts = try std.math.sub(i64, packet.pts, self.origin);
         var result = Window{ .coded = window, .runs = storage, .run_count = count, .packet_base = runs[0].first, .source_binding = self.source_binding };
@@ -380,5 +388,36 @@ test "model aware media packet interval index matches closure for scattered fiel
         try std.testing.expectEqual(expected_stop, actual_stop);
         const selected = deps.ids[deps.lower(index, actual_first)..deps.lower(index, actual_stop)];
         for (selected) |id| try std.testing.expect(pictures[id].first_packet >= actual_first and pictures[id].first_packet < actual_stop);
+    }
+}
+
+test "model aware media restarts a compact AVC window at a non-IDR epoch, cold and cached" {
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .identity = "non-idr", .storage = .{ .borrowed = @embedFile("../testdata/video/h264-sps-intra-geometry.mp4") } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 64 * 1024 * 1024 } };
+    const limits = @import("media_chunk_limits.zig").Limits{ .max_dependency_packets = 1 };
+    var cold = try Owner.init(a, &reader, &pool, limits);
+    defer cold.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const snapshot = try Snapshot.copy(arena.allocator(), &cold);
+    var warm = try Owner.fromSnapshot(a, &reader, &pool, limits, &snapshot);
+    defer warm.deinit();
+    const epoch = cold.registry.?.epochs.items[1];
+    try std.testing.expect(epoch.independent and epoch.start > 0);
+    const tick = reader.packets[epoch.start].pts - cold.origin;
+    const ns: u64 = @intCast(@divFloor(@as(i128, tick) * std.time.ns_per_s, reader.track.timescale));
+    var expected = try video.h264.decodeFrame(a, &reader, epoch.start, .{});
+    defer expected.deinit();
+    for ([_]*Owner{ &cold, &warm }) |owner| {
+        var window = try owner.prepare(.{ .start_ns = @intCast(ns), .end_ns = @intCast(ns + std.time.ns_per_s), .max_frames = 1 });
+        defer window.deinit();
+        try std.testing.expectEqual(epoch.start, window.packet_base);
+        try std.testing.expectEqual(@as(usize, 1), window.coded.reader.packets.len);
+        var frame = try video.h264.decodeFrame(a, &window.coded.reader, 0, .{});
+        defer frame.deinit();
+        try std.testing.expectEqualSlices(u8, expected.nv12, frame.nv12);
     }
 }

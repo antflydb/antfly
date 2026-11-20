@@ -76,6 +76,8 @@ pub const Packet = struct {
     /// Source presentation ticks in Track.timescale, including the edit mapping.
     pts: i64,
     duration: u32,
+    /// Set by the AVC window planner on verified non-IDR reset pictures.
+    avc_epoch_start: bool = false,
     /// Container sync hint, not proof that an open GOP can start here.
     sync: bool,
 };

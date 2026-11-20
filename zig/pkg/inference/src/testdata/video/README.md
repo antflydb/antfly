@@ -73,3 +73,5 @@ aspect ratio, generated with FFmpeg (`testsrc`, `setsar=2/1`, H.264 Baseline and
 `h264-18001.mp4` is a 128×64 solid red, 300 fps AVC clip with 18,001 frames, no B frames, and a 30-frame GOP. Regenerate with `ffmpeg -f lavfi -i color=c=red:s=128x64:r=300 -frames:v 18001 -c:v libx264 -preset ultrafast -threads 1 -g 30 -bf 0 -pix_fmt yuv420p -movflags +faststart -an h264-18001.mp4`.
 
 `hevc-fragmented.mp4` remuxes the four-second `codecs/hevc-hvc1.mp4` fixture with FFmpeg stream copy, `-use_editlist 0 -movflags +empty_moov+default_base_moof+frag_keyframe`. Each tfdt is advanced by 1,966,080 ticks (120 seconds at 16,384 Hz).
+
+`h264-sps-intra-geometry.mp4` is the lib/video non-IDR intra geometry transition fixture used to verify independent chunk replay.

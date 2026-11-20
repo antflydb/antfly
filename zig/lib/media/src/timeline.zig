@@ -25,6 +25,11 @@ pub const Edit = struct {
     media_start: i64 = 0,
     source_start: i64 = 0,
     source_duration: ?i64 = null,
+    pub fn contains(self: Edit, pts: i64) bool {
+        const duration = self.source_duration orelse return true;
+        const relative = @as(i128, pts) - self.source_start;
+        return relative >= 0 and relative < duration;
+    }
     pub fn present(self: Edit, media_ticks: i64) !i64 {
         const value = @as(i128, media_ticks) - self.media_start + self.source_start;
         return std.math.cast(i64, value) orelse error.TimestampOverflow;

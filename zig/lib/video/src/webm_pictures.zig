@@ -101,9 +101,18 @@ pub const Index = struct {
     }
 
     pub fn select(self: Index) ![]usize {
+        return self.selectWithAllocator(self.allocator, if (self.reader) |reader| reader.input.control else .{});
+    }
+
+    pub fn selectWithAllocator(self: Index, a: std.mem.Allocator, control: media.source.Control) ![]usize {
         if (self.pictures.len == 0) return error.EmptyVideo;
-        const order = try self.allocator.alloc(usize, self.pictures.len);
-        defer self.allocator.free(order);
+        if (self.sourceTimeline()) |source| {
+            const times = try self.presentationTimes(a, control);
+            defer a.free(times);
+            return sampling.referencePictures(a, times, source.timescale, source.edit, control);
+        }
+        const order = try a.alloc(usize, self.pictures.len);
+        defer a.free(order);
         for (order, 0..) |*id, i| id.* = i;
         const Less = struct {
             fn less(pictures: []const Picture, l: usize, r: usize) bool {
@@ -128,7 +137,7 @@ pub const Index = struct {
         }
         const span = @as(i128, last.pts) - first + (tail orelse 0);
         const seconds: ?f64 = self.duration_seconds orelse if (span > 0) @as(f64, @floatFromInt(span)) / 1e9 else null;
-        const selected = try sampling.embeddingGemma2(self.allocator, .{ .total_frames = order.len, .duration_seconds = seconds, .fps = if (seconds) |s| @as(f64, @floatFromInt(order.len)) / s else null }, .{});
+        const selected = try sampling.embeddingGemma2(a, .{ .total_frames = order.len, .duration_seconds = seconds, .fps = if (seconds) |s| @as(f64, @floatFromInt(order.len)) / s else null }, .{});
         for (selected) |*id| id.* = order[id.*];
         return selected;
     }

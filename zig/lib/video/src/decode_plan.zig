@@ -90,6 +90,7 @@ pub const SeekCache = struct {
     // recently searched intervals. Dense storage remains useful for cold scans.
     verified: []const usize = &.{},
     complete: bool = false,
+    registry: ?*const @import("h264_dynamic.zig").Session = null,
     recent: [32]struct { first: usize, last: usize, anchor: usize } = undefined,
     recent_count: usize = 0,
     next_slot: usize = 0,
@@ -102,10 +103,12 @@ pub const SeekCache = struct {
             const value = self.nearest[index];
             return if (value == std.math.maxInt(usize)) null else value;
         }
+        const epoch_start = if (self.registry) |registry| registry.independentEpochStart(index) else null;
         if (self.complete) {
             const after = std.sort.upperBound(usize, self.verified, index, usizeOrder);
-            return if (after == 0) 0 else self.verified[after - 1];
+            return @max(epoch_start orelse 0, if (after == 0) 0 else self.verified[after - 1]);
         }
+        if (epoch_start == index) return index;
         for (self.recent[0..self.recent_count]) |range| if (index >= range.first and index <= range.last) return range.anchor;
         return if (std.sort.binarySearch(usize, self.verified, index, usizeOrder) != null) index else null;
     }

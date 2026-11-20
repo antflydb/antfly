@@ -218,6 +218,16 @@ pub fn timestampSelect(a: std.mem.Allocator, metadata: []const sampling_mod.Time
         .reference => error.InvalidSamplingPolicy,
     };
 }
+fn selectTimestampEdit(a: std.mem.Allocator, metadata: []const sampling_mod.TimedPicture, track: media.mp4.Track, sampling: Sampling, control: media.source.Control) ![]usize {
+    if (track.edit.source_duration == null) return timestampSelect(a, metadata, track.timescale, sampling, control);
+    var timeline = try sampling_mod.Timeline.initEdited(a, metadata, control, track.edit);
+    defer timeline.deinit();
+    return switch (sampling) {
+        .timestamps => |policy| timeline.select(a, track.timescale, policy, control, true),
+        .source_timestamps => |policy| timeline.select(a, track.timescale, policy, control, false),
+        else => error.InvalidSamplingPolicy,
+    };
+}
 pub fn selectLogical(a: std.mem.Allocator, reader: *const media.mp4.Reader, logical: h264_pictures.Index, sampling: Sampling, control: media.source.Control) ![]usize {
     if (sampling == .gemma4) {
         const plan = try gemma4Pictures(reader, logical.pictures, control);
@@ -228,9 +238,9 @@ pub fn selectLogical(a: std.mem.Allocator, reader: *const media.mp4.Reader, logi
         if (@as(i128, pts) * std.time.ns_per_s < @as(i128, end) * logical.timescale) return error.InvalidLiveWatermark;
     };
     if (sampling == .reference) {
-        const owned = try logical.select();
-        defer logical.allocator.free(owned);
-        return a.dupe(usize, owned);
+        const ids = try sampling_mod.referencePictures(a, logical.pictures, logical.timescale, reader.track.edit, control);
+        for (ids) |*id| id.* = logical.pictures[id.*].first_packet;
+        return ids;
     }
     const metadata = try a.alloc(sampling_mod.TimedPicture, logical.pictures.len);
     defer a.free(metadata);
@@ -238,7 +248,7 @@ pub fn selectLogical(a: std.mem.Allocator, reader: *const media.mp4.Reader, logi
         try control.check();
         item.* = .{ .pts = picture.pts, .duration = picture.duration };
     }
-    const selected = try timestampSelect(a, metadata, logical.timescale, sampling, control);
+    const selected = try selectTimestampEdit(a, metadata, reader.track, sampling, control);
     for (selected) |*id| id.* = logical.pictures[id.*].first_packet;
     return selected;
 }
@@ -265,26 +275,9 @@ pub fn selectConfigured(a: std.mem.Allocator, reader: *const media.mp4.Reader, s
         const metadata = try a.alloc(sampling_mod.TimedPicture, reader.packets.len);
         defer a.free(metadata);
         for (reader.packets, metadata) |packet, *item| item.* = .{ .pts = packet.pts, .duration = packet.duration };
-        return timestampSelect(a, metadata, reader.track.timescale, sampling, reader.input.control);
+        return selectTimestampEdit(a, metadata, reader.track, sampling, reader.input.control);
     }
-    if (reader.packets.len == 0 or reader.track.timescale == 0) return error.EmptyVideo;
-    const order = try a.alloc(usize, reader.packets.len);
-    defer a.free(order);
-    for (order, 0..) |*index, i| index.* = i;
-    const Less = struct {
-        fn less(packets: []const media.mp4.Packet, l: usize, r: usize) bool {
-            return packets[l].pts < packets[r].pts or (packets[l].pts == packets[r].pts and l < r);
-        }
-    };
-    std.mem.sort(usize, order, @as([]const media.mp4.Packet, reader.packets), Less.less);
-    const first = reader.packets[order[0]].pts;
-    const last = reader.packets[order[order.len - 1]];
-    const ticks = @as(i128, last.pts) + last.duration - first;
-    if (ticks <= 0) return error.InvalidSamplingMetadata;
-    const seconds = @as(f64, @floatFromInt(ticks)) / @as(f64, @floatFromInt(reader.track.timescale));
-    const sampled = try sampling_mod.embeddingGemma2(a, .{ .total_frames = order.len, .fps = @as(f64, @floatFromInt(order.len)) / seconds, .duration_seconds = seconds }, .{});
-    for (sampled) |*index| index.* = order[index.*];
-    return sampled;
+    return sampling_mod.referencePictures(a, reader.packets, reader.track.timescale, reader.track.edit, reader.input.control);
 }
 
 test "Gemma4 selects a solitary undated WebM output and a picture spanning the entire edit" {
@@ -296,4 +289,14 @@ test "Gemma4 selects a solitary undated WebM output and a picture spanning the e
     var held = try planPictures(10, .{ .source_start = 130, .source_duration = 20 }, &visible, null, null, .{});
     try std.testing.expectEqualSlices(usize, &.{0}, held.ids());
     try std.testing.expectEqualSlices(i64, &.{0}, held.timestamps());
+}
+
+test "reference pictures filter a trimmed MP4 edit before applying average FPS" {
+    const samples = [_]media.webm.SourceTimeline.Sample{
+        .{ .pts = 20, .duration = 10 }, .{ .pts = 10, .duration = 10 },
+        .{ .pts = 30, .duration = 10 }, .{ .pts = 0, .duration = 10 },
+    };
+    const ids = try sampling_mod.referencePictures(std.testing.allocator, &samples, 10, .{ .source_start = 10, .source_duration = 20 }, .{});
+    defer std.testing.allocator.free(ids);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, ids);
 }
