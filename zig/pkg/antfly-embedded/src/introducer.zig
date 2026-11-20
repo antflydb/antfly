@@ -520,11 +520,23 @@ pub const TypedFieldValue = struct {
 
 /// A document with raw text fields that will be analyzed before indexing.
 pub const NamedSortValue = struct { field_name: []const u8, value: segment_mod.SegmentIndexSortBoundValue };
+pub const NumericCoverageRejection = struct {
+    path: []const u8,
+    kind: enum { field, descendants, subtree, exact_source },
+};
+
 pub const TextDocument = struct {
     /// Native navigation tuples may include nulls without inventing typed column values.
     index_sort_values: []const NamedSortValue = &.{},
     /// A mapped projection may reject a non-null scalar or multivalued key.
     index_sort_projection_valid: bool = true,
+    /// Exact numeric fields whose source and typed projection agree for this row.
+    numeric_coverage_rejections: []const NumericCoverageRejection = &.{},
+    complete_numeric_fields: []const []const u8 = &.{},
+    /// When supplied, includes owned subsets and the builder's shared list
+    /// allocation on the row that creates it.
+    numeric_coverage_bytes: ?usize = null,
+    numeric_witness_segment_bytes: ?usize = null,
     id: []const u8,
     stored_data: []const u8,
     text_fields: []const TextField,
@@ -539,6 +551,14 @@ pub const TextDocument = struct {
     stored_source: ?std.json.Value = null,
     /// Exact typed source size for columnar builders without a JSON body.
     stored_source_bytes: u64 = 0,
+
+    pub fn numericCoverageInputBytes(self: TextDocument) usize {
+        return self.numeric_coverage_bytes orelse (self.complete_numeric_fields.len * @sizeOf([]const u8) + self.numeric_coverage_rejections.len * @sizeOf(NumericCoverageRejection));
+    }
+
+    pub fn numericWitnessSegmentBytes(self: TextDocument) usize {
+        return self.numeric_witness_segment_bytes orelse segment_mod.estimateNumericRangeWitnessBytes(self.complete_numeric_fields);
+    }
 };
 
 pub const TextField = struct {
@@ -749,6 +769,7 @@ fn estimateTextDocumentInputBytes(alloc: Allocator, doc: TextDocument) !u64 {
         aliases.finish();
     }
     var total: u64 = @intCast(doc.id.len + doc.stored_data.len);
+    total +|= doc.numericCoverageInputBytes();
     if (doc.stored_source_bytes != 0) total +|= estimateTypedSourceBytes(doc.stored_source.?, &aliases);
     total +|= @as(u64, @intCast(doc.text_fields.len)) * (@sizeOf(TextField) + 16);
     for (doc.text_fields) |field| {
@@ -768,6 +789,7 @@ fn estimateTextDocumentInputBytes(alloc: Allocator, doc: TextDocument) !u64 {
 
 pub fn estimateTextDocumentSegmentBytes(doc: TextDocument) u64 {
     var total: u64 = 64 + @as(u64, @intCast(doc.id.len)) + @max(doc.stored_data.len, doc.stored_source_bytes);
+    if (doc.doc_ordinal != null) total +|= @sizeOf(u64) + @sizeOf(u32);
     for (doc.text_fields) |field| {
         total +|= 16 + @as(u64, @intCast(field.field_name.len + field.text.len));
     }
@@ -788,7 +810,9 @@ pub fn estimateTextDocumentBuildMemoryBytes(alloc: Allocator, doc: TextDocument)
     }
     const typed_count: u64 = if (doc.typed_fields) |typed_fields| @intCast(typed_fields.len) else 0;
     const field_count: u64 = @intCast(doc.text_fields.len);
+    const inverse_ordinal_bytes: u64 = if (doc.doc_ordinal != null) 2 * @sizeOf(u64) + @sizeOf(u32) else 0;
     return (try estimateTextDocumentInputBytes(alloc, doc)) +
+        inverse_ordinal_bytes +
         estimateStoredDocBytes(&.{doc}) +
         text_bytes * 4 +
         field_count * 384 +
@@ -826,11 +850,13 @@ pub fn splitTextDocumentsForBuildBudget(
     var end = start;
     var build_bytes: u64 = 0;
     var segment_bytes: u64 = 0;
+    var witness_bytes: u64 = 0;
     while (end < docs.len) {
         const doc_build_bytes = try estimateTextDocumentBuildMemoryBytes(alloc, docs[end]);
         const doc_segment_bytes = estimateTextDocumentSegmentBytes(docs[end]);
         const next_build_bytes = build_bytes +| doc_build_bytes;
-        const next_segment_bytes = segment_bytes +| doc_segment_bytes;
+        const next_witness_bytes = @max(witness_bytes, docs[end].numericWitnessSegmentBytes());
+        const next_segment_bytes = segment_bytes +| doc_segment_bytes +| (next_witness_bytes - witness_bytes);
         if (end > start and next_build_bytes > target_build) {
             return .{
                 .end = end,
@@ -850,6 +876,7 @@ pub fn splitTextDocumentsForBuildBudget(
         end += 1;
         build_bytes = next_build_bytes;
         segment_bytes = next_segment_bytes;
+        witness_bytes = next_witness_bytes;
         if (end == start + 1 and (build_bytes > target_build or segment_bytes > target_segment)) {
             return .{
                 .end = end,
@@ -1370,6 +1397,70 @@ fn writeTextSegmentWithScratch(
         });
         producer_count += 1;
     }
+    var numeric_coverage: std.StringHashMapUnmanaged(usize) = .empty;
+    defer numeric_coverage.deinit(alloc);
+    var start: usize = 0;
+    while (start < docs.len) {
+        const complete = docs[start].complete_numeric_fields;
+        if (complete.len == 0) {
+            numeric_coverage.clearRetainingCapacity();
+            break;
+        }
+        // Ordinary rows share the schema's complete field list. Count a run
+        // once instead of hashing every declared field for every row.
+        var end = start + 1;
+        while (end < docs.len) : (end += 1) {
+            const next = docs[end].complete_numeric_fields;
+            if (next.ptr != complete.ptr or next.len != complete.len) break;
+        }
+        for (complete) |name| {
+            const count = try numeric_coverage.getOrPutValue(alloc, name, 0);
+            count.value_ptr.* += end - start;
+        }
+        start = end;
+    }
+    var rejected_fields: std.StringHashMapUnmanaged(void) = .empty;
+    defer rejected_fields.deinit(alloc);
+    var rejected_parents: std.StringHashMapUnmanaged(void) = .empty;
+    defer rejected_parents.deinit(alloc);
+    var projected_only: std.StringHashMapUnmanaged(void) = .empty;
+    defer projected_only.deinit(alloc);
+    if (numeric_coverage.count() != 0) for (docs) |doc| {
+        for (doc.numeric_coverage_rejections) |rejection| {
+            switch (rejection.kind) {
+                .field => try rejected_fields.put(alloc, rejection.path, {}),
+                .descendants => try rejected_parents.put(alloc, rejection.path, {}),
+                .subtree => {
+                    try rejected_fields.put(alloc, rejection.path, {});
+                    try rejected_parents.put(alloc, rejection.path, {});
+                },
+                .exact_source => try projected_only.put(alloc, rejection.path, {}),
+            }
+        }
+    };
+    var witnesses: std.ArrayListUnmanaged(segment_mod.NumericRangeWitness) = .empty;
+    defer witnesses.deinit(alloc);
+    var coverage_it = numeric_coverage.iterator();
+    fields: while (coverage_it.next()) |entry| {
+        if (entry.value_ptr.* != docs.len) continue;
+        const name = entry.key_ptr.*;
+        if (rejected_fields.contains(name)) continue;
+        var components = std.mem.splitScalar(u8, name, '.');
+        while (components.next() != null) {
+            const next = components.index orelse break;
+            if (rejected_parents.contains(name[0 .. next - 1])) continue :fields;
+        }
+        const collector = typed_fields.getPtr(name);
+        if (collector) |typed| if (typed.conflicted) continue;
+        const populated = if (collector) |typed|
+            (typed.writer != null and typed.writer.?.entries.items.len != 0) or typed.staged.items.len != 0
+        else
+            false;
+        const coverage: segment_mod.NumericRangeCoverage = if (!populated) .empty else if (projected_only.contains(name)) .projected else .populated;
+        try witnesses.append(alloc, .{ .field = name, .coverage = coverage });
+    }
+    try seg_writer.addNumericRangeWitnesses(witnesses.items);
+
     var source_fields: std.StringHashMapUnmanaged(void) = .empty;
     defer source_fields.deinit(alloc);
     if (options.store_source_columns and options.store_document_source) {
@@ -5743,4 +5834,23 @@ test "highlight compact alias indexing fits a bounded working set with one analy
         try std.testing.expectEqual(@as(usize, 1), result.hits.len);
         std.debug.print("ALIAS_INDEX_BUDGET input={d} tokens={d} peak={d} quota={d} analyses={d} reuses={d}\n", .{ text.len, profile.token_count, budget.peak, budget.limit, profile.shared_analysis_runs, profile.shared_analysis_reuses });
     }
+}
+
+test "optional numeric range witness bytes are budgeted once per segment" {
+    const a = std.testing.allocator;
+    const fields: []const []const u8 = &.{ "rank", "size" };
+    const docs = [_]TextDocument{
+        .{ .id = "a", .stored_data = "{}", .text_fields = &.{}, .complete_numeric_fields = fields },
+        .{ .id = "b", .stored_data = "{}", .text_fields = &.{}, .complete_numeric_fields = fields },
+    };
+    const row_bytes = estimateTextDocumentSegmentBytes(docs[0]);
+    const witness_bytes = docs[0].numericWitnessSegmentBytes();
+    const full = try splitTextDocumentsForBuildBudget(a, &docs, 0, .{ .target_segment_bytes = @intCast(row_bytes * 2 + witness_bytes) });
+    try std.testing.expectEqual(@as(usize, 2), full.end);
+    try std.testing.expectEqual(row_bytes * 2 + witness_bytes, full.estimated_segment_bytes);
+    const split = try splitTextDocumentsForBuildBudget(a, &docs, 0, .{ .target_segment_bytes = @intCast(row_bytes * 2 + witness_bytes - 1) });
+    try std.testing.expectEqual(@as(usize, 1), split.end);
+    try std.testing.expectEqual(TextBuildSplitReason.segment_bytes, split.reason);
+    const next = try splitTextDocumentsForBuildBudget(a, &docs, split.end, .{});
+    try std.testing.expectEqual(row_bytes + witness_bytes, next.estimated_segment_bytes);
 }
