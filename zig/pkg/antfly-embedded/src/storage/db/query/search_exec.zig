@@ -606,6 +606,7 @@ pub const MatchAllCandidateCollectOptions = struct {
     // Complete candidate seeds for collectors that do not require key order.
     exact_primary_keys: ?[]const []const u8 = null,
     exact_primary_ordinals: ?[]const doc_set.DocOrdinal = null,
+    require_complete_primary_population: bool = false,
 
     pub fn hasCompletePrimaryKeyScope(self: MatchAllCandidateCollectOptions) bool {
         if (self.exact_primary_keys != null) return true;
@@ -22058,6 +22059,141 @@ fn projectSortKeyDocNumsAlloc(
     }
 }
 
+fn projectAdmittedSortCandidates(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    candidates: []MatchAllCandidate,
+    control: QueryExecutionControl,
+) !void {
+    var ordinals: std.ArrayListUnmanaged(u32) = .empty;
+    defer ordinals.deinit(alloc);
+    for (candidates) |candidate| {
+        try control.check();
+        if (candidate.ordinal) |ordinal| try ordinals.append(alloc, ordinal);
+    }
+    var projected_ordinals: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    defer projected_ordinals.deinit(alloc);
+    if (ordinals.items.len != 0)
+        _ = try buildCompleteOrPartialTextDocIdMapAlloc(alloc, snapshot, &projected_ordinals, true, ordinals.items, control);
+    var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer keys.deinit(alloc);
+    for (candidates) |*candidate| {
+        try control.check();
+        if (candidate.ordinal) |ordinal| candidate.native_text_doc_id = projected_ordinals.get(ordinal);
+        if (candidate.native_text_doc_id == null) try keys.append(alloc, candidate.id);
+    }
+    if (keys.items.len == 0) return;
+    var projected_keys: std.StringHashMapUnmanaged(u32) = .empty;
+    defer projected_keys.deinit(alloc);
+    try projectSortKeyDocNumsAlloc(alloc, snapshot, keys.items, &.{}, &projected_keys, control);
+    for (candidates) |*candidate| {
+        if (candidate.native_text_doc_id == null) candidate.native_text_doc_id = projected_keys.get(candidate.id);
+    }
+}
+
+fn countBroadNativeSortCursor(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    options: MatchAllCandidateCollectOptions,
+    plan: SortExecutionPlan,
+    snapshot: *const index_mod.IndexSnapshot,
+    control: QueryExecutionControl,
+) !types.SearchResult {
+    const Batch = struct {
+        alloc: Allocator,
+        req: types.SearchRequest,
+        plan: SortExecutionPlan,
+        snapshot: *const index_mod.IndexSnapshot,
+        control: QueryExecutionControl,
+        items: [256]MatchAllCandidate = undefined,
+        len: usize = 0,
+        count: usize = 0,
+
+        fn clear(self: *@This()) void {
+            for (self.items[0..self.len]) |*candidate| candidate.deinit(self.alloc);
+            self.len = 0;
+        }
+
+        fn accept(raw: ?*anyopaque, candidate: *MatchAllCandidate) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.items[self.len] = candidate.take();
+            self.len += 1;
+            if (self.len == self.items.len) try self.flush();
+        }
+
+        fn flush(self: *@This()) !void {
+            if (self.len == 0) return;
+            defer self.clear();
+            const items = self.items[0..self.len];
+            try projectAdmittedSortCandidates(self.alloc, self.snapshot, items, self.control);
+            var sort_ctx = TextDocValueSortContext{ .snapshot = self.snapshot, .control = self.control };
+            defer sort_ctx.deinit();
+            const cursor = activeSortCursor(self.req);
+            const wanted: std.math.Order = if (self.req.search_before.len != 0) .lt else .gt;
+            for (items) |candidate| {
+                try self.control.check();
+                var order: std.math.Order = .eq;
+                for (self.req.order_by, cursor) |field, boundary| {
+                    const is_id = sortFieldIsId(field);
+                    var value: SortValue = if (is_id)
+                        .{ .string = candidate.id }
+                    else
+                        (try loadTextDocValueSortValue(&sort_ctx, self.alloc, .{
+                            .id = candidate.id,
+                            .native_text_doc_id = candidate.native_text_doc_id,
+                            .doc_ordinal = candidate.ordinal,
+                            .score = 1,
+                        }, field.field)) orelse return error.UnsupportedExactSort;
+                    defer if (!is_id) value.deinit(self.alloc);
+                    const comparable: SortValue = if (!is_id and sortFieldKindIsDatetime(self.plan, field) and value != .null_value)
+                        .{ .datetime_ns = sortValueAsDateTime(value) orelse return error.UnsupportedExactSort }
+                    else
+                        value;
+                    try validateSortValueForPlanField(self.plan, field, comparable);
+                    const bound = try sortValueFromCursorJsonForSortKey(self.plan, field.field, comparable, boundary);
+                    if (order == .eq) {
+                        const next = compareSortValues(comparable, bound);
+                        order = if (field.desc) next.invert() else next;
+                    }
+                }
+                if (order == wanted) self.count += 1;
+            }
+        }
+    };
+
+    try validateSortPageOptions(req);
+    try validateMatchAllSortDoesNotUseScore(req);
+    try validateSortExecutionPlanForRuntime(req, plan, .{ .ctx = null, .require_native = plan.require_native, .load = loadTextDocValueSortValue });
+    var batch = Batch{ .alloc = alloc, .req = req, .plan = plan, .snapshot = snapshot, .control = control };
+    defer batch.clear();
+    const stream = executor.collect_candidates_stream orelse return rejectSortCandidateStreamUnavailable(plan);
+    const profiling = req.profile or shouldLogBenchQueryProfile();
+    const started = if (profiling) platform_time.monotonicNs() else 0;
+    const stats = try stream(executor.ctx, alloc, req, options, &batch, Batch.accept);
+    try batch.flush();
+    try control.check();
+    var profile = SortCollectorProfile{ .candidate_count = stats.accepted_count };
+    observeSortCandidateSource(if (profiling) &profile else null, matchAllCandidateSourceForConstraints(options.constraints));
+    observeNativeFilterConstraints(if (profiling) &profile else null, options.constraints);
+    if (profiling) profile.total_ns = platform_time.monotonicNs() - started;
+    if (shouldLogBenchQueryProfile()) logBenchSortCollectorProfile(req, plan, true, profile);
+    return .{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = boundedU32(batch.count),
+        .total_hits_relation = if (stats.stopped_early or batch.count > std.math.maxInt(u32)) .gte else .exact,
+        .sort_profile = if (profiling) sortResultProfile(req, plan, true, profile) else null,
+        .graph_results = &.{},
+    };
+}
+
+fn sortFieldKindIsDatetime(plan: SortExecutionPlan, field: types.SortField) bool {
+    const schema = plan.runtime_schema orelse return false;
+    const mapping = sortFieldMapping(schema, field.field) orelse return false;
+    return mapping.field_type == .datetime;
+}
+
 fn resolveTextSortOrdinalScope(
     alloc: Allocator,
     scope_alloc: Allocator,
@@ -22891,7 +23027,7 @@ pub fn searchMatchAll(
         var exact_keys_arena = std.heap.ArenaAllocator.init(alloc);
         defer exact_keys_arena.deinit();
         const exact_key_alloc = exact_keys_arena.allocator();
-        var admission: MatchAllCandidateCollectOptions = .{ .constraints = &native_constraints };
+        var admission: MatchAllCandidateCollectOptions = .{ .constraints = &native_constraints, .require_complete_primary_population = !native_constraints.positive_filter };
         if (native_constraints.positive_filter) {
             if (filter_keys.len != 0 or !had_ordinal_scope) {
                 admission.exact_primary_keys = if (filter_keys.len == 0) legacy_keys else if (legacy_keys.len == 0)
@@ -22924,6 +23060,9 @@ pub fn searchMatchAll(
         const has_legacy = native_constraints.legacy_filter != .none or native_constraints.legacy_exclude != .none or
             native_constraints.filter_doc_ids.len != 0 or native_constraints.exclude_doc_ids.len != 0;
         const control = QueryExecutionControl{ .cancellation = exec_req.cancellation, .deadline_ns = exec_req.execution_deadline_ns };
+        if (postprocess_req.limit == 0 and !native_constraints.positive_filter) {
+            return countBroadNativeSortCursor(alloc, postprocess_req, executor, admission, planned_sort, sort_snapshot, control);
+        }
         if (!defer_projection and (had_ordinal_scope or !native_constraints.positive_filter)) {
             _ = try buildCompleteOrPartialTextDocIdMapAlloc(alloc, sort_snapshot, &ordinal_to_text_doc_id, true, only_ordinals, control);
         }
@@ -22954,13 +23093,7 @@ pub fn searchMatchAll(
         defer if (admitted) |*candidates| candidates.deinit(alloc);
         if (defer_projection) {
             admitted = try admitMatchAllSortCandidates(alloc, postprocess_req, executor, admission, exact_sort_budget, planned_sort);
-            const keys = try alloc.alloc([]const u8, admitted.?.items.len);
-            defer alloc.free(keys);
-            for (admitted.?.items, keys) |candidate, *key| key.* = candidate.id;
-            var projected: std.StringHashMapUnmanaged(u32) = .empty;
-            defer projected.deinit(alloc);
-            try projectSortKeyDocNumsAlloc(alloc, sort_snapshot, keys, &.{}, &projected, control);
-            for (admitted.?.items) |*candidate| candidate.native_text_doc_id = projected.get(candidate.id);
+            try projectAdmittedSortCandidates(alloc, sort_snapshot, admitted.?.items, control);
         } else {
             try projectSortKeyDocNumsAlloc(alloc, sort_snapshot, filter_keys, legacy_keys, &exceptional_sort_doc_nums, control);
         }

@@ -48940,6 +48940,10 @@ pub const DB = struct {
                 try self.scanExactScope(options);
                 return;
             }
+            if (options.require_complete_primary_population) {
+                try self.scanSourcePopulation();
+                return;
+            }
             // Explicit historical reads still need identities deleted since
             // that generation. Current reads use the compact live population.
             const historical = if (self.req.identity_read_generation) |generation| generation < try self.db.currentIdentityReadGeneration() else false;
@@ -49015,12 +49019,76 @@ pub const DB = struct {
             if (!self.stopped) _ = try self.drainExceptionalBefore(null);
         }
 
+        fn scanSourcePopulation(self: *@This()) !void {
+            const Scan = struct {
+                owner: *PrimaryMatchAllIdentityScan,
+                arena: std.heap.ArenaAllocator,
+                keys: [256][]const u8 = undefined,
+                len: usize = 0,
+
+                fn checkpoint(raw: ?*anyopaque, _: []const u8) !docstore_mod.DocStore.ScanAction {
+                    const source_batch: *@This() = @ptrCast(@alignCast(raw.?));
+                    try db_query_search.checkSearchRequestDeadline(source_batch.owner.req);
+                    return .@"continue";
+                }
+
+                fn visit(raw: ?*anyopaque, key: []const u8, _: []const u8) !docstore_mod.DocStore.ScanAction {
+                    const source_batch: *@This() = @ptrCast(@alignCast(raw.?));
+                    try db_query_search.checkSearchRequestDeadline(source_batch.owner.req);
+                    const id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(source_batch.arena.allocator(), key)) orelse return .@"continue";
+                    source_batch.keys[source_batch.len] = id;
+                    source_batch.len += 1;
+                    return if (source_batch.len == source_batch.keys.len) source_batch.flush() else .@"continue";
+                }
+
+                fn flush(source_batch: *@This()) !docstore_mod.DocStore.ScanAction {
+                    if (source_batch.len == 0) return .@"continue";
+                    const owner = source_batch.owner;
+                    const keys = source_batch.keys[0..source_batch.len];
+                    var visible: [256]bool = @splat(true);
+                    var ordinals: [256]?doc_set.DocOrdinal = @splat(null);
+                    {
+                        var txn = try owner.db.core.store.beginProbeTxn();
+                        defer txn.abort();
+                        const temp = source_batch.arena.allocator();
+                        const mapped = try doc_identity.lookupOrdinalsTxnAlloc(temp, &txn, keys);
+                        for (keys, mapped, 0..) |id, forward, i| {
+                            const ordinal = forward orelse try doc_identity.lookupLiveOrdinalTxn(temp, &txn, id) orelse continue;
+                            const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse continue;
+                            visible[i] = if (owner.req.identity_read_generation) |generation| state.isVisibleAt(generation) else state.isLive();
+                            if (visible[i]) ordinals[i] = ordinal;
+                        }
+                    }
+                    for (keys, ordinals[0..keys.len], visible[0..keys.len]) |id, ordinal, include| {
+                        if (include and try owner.visitor(owner.visitor_ctx, id, ordinal, true) == .stop) {
+                            owner.stopped = true;
+                            return .stop;
+                        }
+                    }
+                    source_batch.len = 0;
+                    _ = source_batch.arena.reset(.retain_capacity);
+                    return .@"continue";
+                }
+            };
+            const owner_range = self.db.core.byteRange();
+            const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, owner_range.start);
+            defer self.alloc.free(lower);
+            const upper = if (owner_range.end.len == 0) null else try internal_keys.documentRangeLowerAlloc(self.alloc, owner_range.end);
+            defer if (upper) |bound| self.alloc.free(bound);
+            var source_batch = Scan{ .owner = self, .arena = std.heap.ArenaAllocator.init(self.alloc) };
+            defer source_batch.arena.deinit();
+            var txn = try self.db.core.store.beginCurrentScanTxn();
+            defer txn.abort();
+            try self.db.core.store.scanStoredDocumentRowsReadTxnWithContext(&txn, lower, upper orelse &.{}, &source_batch, Scan.checkpoint, Scan.visit);
+            if (!self.stopped) _ = try source_batch.flush();
+        }
+
         fn scanExactScope(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !void {
             const owner_range = self.db.core.byteRange();
             for (options.exceptionalPrimaryKeys()) |id| {
                 try db_query_search.checkSearchRequestDeadline(self.req);
                 if (!owner_range.contains(id)) continue;
-                if (try self.visitId(id, null, false) == .stop) return;
+                if (try self.visitId(id, false) == .stop) return;
             }
             const ordinals = options.exact_primary_ordinals orelse return;
             var scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -49066,14 +49134,6 @@ pub const DB = struct {
                 return error.InvalidDocIdentity;
             const ordinal = std.mem.readInt(u32, value[0..4], .big);
             if (ordinal == 0) return error.InvalidDocIdentity;
-            const state = state: {
-                var txn = try self.db.core.store.beginProbeTxn();
-                defer txn.abort();
-                break :state (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse return error.InvalidDocIdentity;
-            };
-            if (self.req.identity_read_generation) |generation| {
-                if (!state.isVisibleAt(generation)) return .@"continue";
-            } else if (!state.isLive()) return error.InvalidDocIdentity;
             const body = key[2 .. key.len - 2];
             if (try internal_keys.decodeBodyView(body)) |id| return self.visitOrderedId(id, ordinal);
             const id = try internal_keys.decodeBodyAlloc(self.alloc, body);
@@ -49092,7 +49152,7 @@ pub const DB = struct {
                 while (self.exceptional_index < self.exceptional.len and
                     std.mem.eql(u8, self.exceptional[self.exceptional_index], id)) self.exceptional_index += 1;
                 try db_query_search.checkSearchRequestDeadline(self.req);
-                if (try self.visitId(id, null, true) == .stop) {
+                if (try self.visitId(id, true) == .stop) {
                     self.stopped = true;
                     return .stop;
                 }
@@ -49101,10 +49161,20 @@ pub const DB = struct {
         }
 
         fn visitOrderedId(self: *@This(), id: []const u8, ordinal: doc_set.DocOrdinal) !docstore_mod.DocStore.ScanAction {
+            const present = present: {
+                var txn = try self.db.core.store.beginProbeTxn();
+                defer txn.abort();
+                const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse return error.InvalidDocIdentity;
+                if (self.req.identity_read_generation) |generation| {
+                    if (!state.isVisibleAt(generation)) return .@"continue";
+                } else if (!state.isLive()) return error.InvalidDocIdentity;
+                break :present try sourcePresent(self.alloc, &txn, id);
+            };
+            if (!present) return .@"continue";
             if (try self.drainExceptionalBefore(id) == .stop) return .stop;
             while (self.exceptional_index < self.exceptional.len and
                 std.mem.eql(u8, self.exceptional[self.exceptional_index], id)) self.exceptional_index += 1;
-            const action = try self.visitId(id, ordinal, true);
+            const action = try self.visitor(self.visitor_ctx, id, ordinal, true);
             self.stopped = action == .stop;
             return action;
         }
@@ -49118,12 +49188,11 @@ pub const DB = struct {
             return txn.contains(relational_key);
         }
 
-        fn visitId(self: *@This(), id: []const u8, known_ordinal: ?doc_set.DocOrdinal, unique: bool) !docstore_mod.DocStore.ScanAction {
+        fn visitId(self: *@This(), id: []const u8, unique: bool) !docstore_mod.DocStore.ScanAction {
             const ordinal = identity: {
                 var txn = try self.db.core.store.beginProbeTxn();
                 defer txn.abort();
                 if (!try sourcePresent(self.alloc, &txn, id)) return .@"continue";
-                if (known_ordinal) |ordinal| break :identity ordinal;
                 const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, &txn, id)) orelse break :identity null;
                 const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse break :identity null;
                 if (!(if (self.req.identity_read_generation) |at| state.isVisibleAt(at) else state.isLive())) break :identity null;
@@ -157550,6 +157619,17 @@ test "optional numeric range keeps mixed primary matches for native field sortin
         defer mixed_page.deinit();
         try std.testing.expectEqual(@as(usize, 2), mixed_page.hits.len);
         try std.testing.expectEqualStrings("legacy", mixed_page.hits[1].id);
+        for ([_]bool{ false, true }) |with_cursor| {
+            var broad = try db_query_search.searchMatchAll(a, .{
+                .index_name = "ft",
+                .limit = 0,
+                .include_stored = false,
+                .search_after = if (with_cursor) mixed_page.hits[0].sort_values else &.{},
+                .order_by = &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } },
+            }, db.matchAllExecutor());
+            defer broad.deinit();
+            try std.testing.expectEqual(@as(u32, if (with_cursor) 1 else 2), broad.total_hits);
+        }
         {
             const c = struct {
                 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
