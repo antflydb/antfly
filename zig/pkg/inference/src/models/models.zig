@@ -73,3 +73,8 @@ pub const loaded_runtime = @import("loaded_runtime.zig");
 pub const managed_tokenizer = @import("managed_tokenizer.zig");
 pub const component_loader = @import("component_loader.zig");
 pub const composite_runtime = @import("composite_runtime.zig");
+
+test {
+    _ = @import("load_plan.zig");
+    _ = @import("session_loader.zig");
+}

@@ -193,6 +193,67 @@ Enable the backend under test for physical device coverage. Qualify numerical
 changes with independent references, retained native resource/schedule checks,
 and controlled baseline/candidate timing before retiring a fast path.
 
+## Indexed routes and resident encoder/decoder requests
+
+Prepared route variants retain a node-to-alias table and compressed consumer
+index. Refresh classifies each source once per pass, including source-wrapper
+consumers, before removing unsafe aliases. Exact frame dispatch reuses the same
+index; warm alias lookup does not scan the graph or alias table. The existing
+monotone selection fixed point and provider validation remain authoritative.
+
+Whisper compiled requests use the resident PJRT bank publication owner. Prefill
+produces self K/V and immutable encoder cross K/V; subsequent single-token
+programs consume those banks and runtime learned positions. Decode reachability
+stops at cross K/V before binding encoder projection inputs, so those weights
+and encoder activations are not copied, uploaded or projected again per token. Masks
+remain dynamic, including fully masked rows. Two non-donated generations and
+buffer headers are admitted before execution, and cancellation prevents bank
+publication. The task owns transcript, timestamp, language and retry semantics.
+Explicit decoder-cache controls are propagated through direct, serving and
+benchmark transcription paths. Unsupported arithmetic retains ordinary execution;
+explicit enablement rejects unsupported or denied state. Encoder source storage
+is borrowed immutably for the request, and source or mask changes reject reuse.
+
+Resident executable inputs and outputs have an explicit layout contract. Padded
+self-attention keys are excluded by predicates, independently of score magnitude.
+Single-query CUDA LayerNorm accumulates mean and variance in F64 before F32
+affine operations and publication; matrix and activation precision remain
+unchanged. This preserves the independent native F32 accuracy gate. Non-finite
+logits reject the generation before any prior cache buffers or cursor change.
+
+BF16 decoder branches retain their BF16 publication boundaries while CPU and
+CUDA GPT residual streams accumulate in F32. Automatic reduced-precision
+caching requires that qualified residual policy; unknown arithmetic keeps
+ordinary execution. Accuracy qualification retains its independent F32 reference,
+relative-error limit and generated-token checks.
+
+Opaque serial native calls use the same prepared Source owner as dispatched
+calls. The original scratch floor, final Tensor container, owned shape arrays
+and allocator headers are declared before numerical entry. KV outputs and
+foreign resource owners retain independent custody through final publication.
+
+Whisper position metadata uses checked per-row extents for both encoder and
+full-prefix decoder batches, independently of batch size. Prepared absolute
+embeddings enforce their configured context before weight access and transfer
+input ownership before fallible preparation.
+
+The native CUDA automatic shared-KV policy is restricted to the qualified
+SM121 device, exact dense geometry and complete unique Q4 donor inventory with
+checked tensor shapes. Other devices and artifacts retain compatibility policy;
+explicit experiments retain their existing overrides. Default donor mirrors are
+funded during managed model load from their checked BF16 matrix extents, on top
+of the original packed-weight floor. Config-backed GGUFs use the same inventory
+qualification as generator-only artifacts; raw constructors retain their
+caller-owned resource contract. If optional mirrors
+do not fit, admission retries the mandatory artifact before construction and
+passes that compatibility policy directly to the constructor. Explicit operator
+requests retain their original admission errors. Projector dispatch
+consults the loaded execution owner, rather than treating a process-wide policy
+as proof that a particular model installed the plan. Automatic decode replay
+requires that installed automatic policy, a bounded request KV reservation and
+the existing greedy/capture safety gates. Shadow checkpoint queries reject
+actual typed replay before reading or mutating source KV.
+
 ## Remaining migration boundaries
 
 Issue [#1166](https://github.com/antflydb/antfly/issues/1166) also requests a

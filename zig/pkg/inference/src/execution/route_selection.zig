@@ -35,6 +35,59 @@ fn nextEpoch() !u64 {
     }
 }
 
+/// Immutable topology for one prepared variant. Variant hits reuse these facts;
+/// selection refreshes never rescan the whole graph for each affine view.
+const AliasIndex = struct {
+    allocator: std.mem.Allocator,
+    by_node: []?usize,
+    offsets: []usize,
+    consumers: []NodeId,
+
+    fn init(a: std.mem.Allocator, nodes: usize, aliases: []const @import("metadata_alias.zig").Plan, graph: ?*const ml.graph.Graph) !AliasIndex {
+        const by_node = try a.alloc(?usize, if (aliases.len == 0) 0 else nodes);
+        errdefer a.free(by_node);
+        @memset(by_node, null);
+        for (aliases, 0..) |alias, index| {
+            if (alias.node >= nodes or alias.source >= nodes or by_node[alias.node] != null) return error.InvalidMetadataAlias;
+            by_node[alias.node] = index;
+        }
+        const indexed = graph != null and aliases.len != 0;
+        if (indexed and graph.?.nodeCount() != nodes) return error.InvalidReachabilityTable;
+        const offsets = try a.alloc(usize, if (indexed) nodes + 1 else 0);
+        errdefer a.free(offsets);
+        @memset(offsets, 0);
+        if (indexed) {
+            for (graph.?.nodes.items) |node| for (node.getInputs()) |input| {
+                if (input < nodes) offsets[input + 1] += 1;
+            };
+            for (1..offsets.len) |i| offsets[i] += offsets[i - 1];
+        }
+        const consumers = try a.alloc(NodeId, if (indexed) offsets[nodes] else 0);
+        errdefer a.free(consumers);
+        if (indexed) {
+            const cursor = try a.dupe(usize, offsets[0..nodes]);
+            defer a.free(cursor);
+            for (graph.?.nodes.items, 0..) |node, id| for (node.getInputs()) |input| {
+                if (input >= nodes) continue;
+                consumers[cursor[input]] = @intCast(id);
+                cursor[input] += 1;
+            };
+        }
+        return .{ .allocator = a, .by_node = by_node, .offsets = offsets, .consumers = consumers };
+    }
+    fn deinit(self: AliasIndex) void {
+        self.allocator.free(self.by_node);
+        self.allocator.free(self.offsets);
+        self.allocator.free(self.consumers);
+    }
+    fn aliasForNode(self: AliasIndex, node: NodeId) ?usize {
+        return if (node < self.by_node.len) self.by_node[node] else null;
+    }
+    fn uses(self: AliasIndex, node: NodeId) []const NodeId {
+        return if (node + 1 < self.offsets.len) self.consumers[self.offsets[node]..self.offsets[node + 1]] else &.{};
+    }
+};
+
 pub const Selection = struct {
     allocator: std.mem.Allocator,
     epoch: u64,
@@ -44,6 +97,7 @@ pub const Selection = struct {
     plane_counts: []u8,
     literal_enabled: []bool,
     alias_enabled: []bool = &.{},
+    alias_index: ?AliasIndex = null,
     invocation_nodes: []NodeId = &.{},
     planes_witnessed: []bool = &.{},
     literal_claim_selection: ?*physical.SharedLiteralStore.LiteralSelection = null,
@@ -91,8 +145,10 @@ pub const Selection = struct {
         const witnessed = try allocator.alloc(bool, selected.len);
         errdefer allocator.free(witnessed);
         @memset(witnessed, false);
+        const alias_index = try AliasIndex.init(allocator, selected.len, pool.metadata_aliases, pool.coverage_graph);
+        errdefer alias_index.deinit();
         const epoch = try nextEpoch();
-        var self = Selection{ .allocator = allocator, .epoch = epoch, .inputs = inputs, .routes = selected, .planes = planes, .plane_counts = counts, .literal_enabled = enabled, .alias_enabled = aliases, .planes_witnessed = witnessed };
+        var self = Selection{ .allocator = allocator, .epoch = epoch, .inputs = inputs, .routes = selected, .planes = planes, .plane_counts = counts, .literal_enabled = enabled, .alias_enabled = aliases, .alias_index = alias_index, .planes_witnessed = witnessed };
         errdefer self.clearRoutes();
         errdefer allocator.free(self.invocation_nodes);
         try self.refreshWithAuthority(pool, authority);
@@ -126,6 +182,8 @@ pub const Selection = struct {
         self.clearRoutes();
         if (self.literal_claim_selection) |claim| claim.release();
         self.literal_claim_selection = null;
+        const stable = try self.allocator.alloc(bool, if (self.alias_index) |index| index.by_node.len else 0);
+        defer self.allocator.free(stable);
         while (true) {
             try self.select(pool, authority);
             var changed = false;
@@ -139,28 +197,31 @@ pub const Selection = struct {
             };
             // Legacy lazy consumers may materialize their input wrapper. Never
             // freeze its affine planes for another exact consumer in that case.
-            if (pool.coverage_graph) |graph| for (pool.metadata_aliases, 0..) |alias, alias_index| {
-                if (!self.alias_enabled[alias_index] or self.plane_counts[alias.node] == 0) continue;
-                for (graph.nodes.items, 0..) |consumer, consumer_id| {
-                    if (pool.plan.slotForNode(@intCast(consumer_id)) == null) continue;
-                    var consumes = false;
-                    // The alias output AND its source wrapper must remain
-                    // representation-stable. A legacy source consumer can
-                    // materialize an existing resident view before this alias.
-                    for (consumer.getInputs()) |input| consumes = consumes or input == alias.node or input == alias.source;
-                    if (!consumes or self.routes[consumer_id] != null) continue;
-                    var exact_alias = false;
-                    for (pool.metadata_aliases, 0..) |next, next_index| if (next.node == consumer_id and self.alias_enabled[next_index] and self.plane_counts[consumer_id] == 1) {
-                        exact_alias = true;
-                        break;
-                    };
-                    if (!exact_alias) {
-                        self.alias_enabled[alias_index] = false;
-                        changed = true;
-                        break;
+            if (pool.coverage_graph != null and stable.len != 0) {
+                // Classify each source once, even when thousands of views fan
+                // out from it. Reuse the immutable consumer index on refresh.
+                @memset(stable, true);
+                for (stable, 0..) |*safe, source| {
+                    for (self.alias_index.?.uses(@intCast(source))) |consumer| {
+                        if (pool.plan.slotForNode(consumer) == null or self.routes[consumer] != null) continue;
+                        const exact_alias = if (self.alias_index.?.aliasForNode(consumer)) |next|
+                            self.alias_enabled[next] and self.plane_counts[consumer] == 1
+                        else
+                            false;
+                        if (!exact_alias) {
+                            safe.* = false;
+                            break;
+                        }
                     }
                 }
-            };
+                for (pool.metadata_aliases, 0..) |alias, index| {
+                    if (!self.alias_enabled[index] or self.plane_counts[alias.node] == 0) continue;
+                    if (!stable[alias.node] or !stable[alias.source]) {
+                        self.alias_enabled[index] = false;
+                        changed = true;
+                    }
+                }
+            }
             if (!changed) break;
             self.clearRoutes();
         }
@@ -189,9 +250,15 @@ pub const Selection = struct {
         self.allocator.free(self.plane_counts);
         self.allocator.free(self.literal_enabled);
         self.allocator.free(self.alias_enabled);
+        if (self.alias_index) |index| index.deinit();
         self.allocator.free(self.invocation_nodes);
         self.allocator.free(self.planes_witnessed);
         self.* = undefined;
+    }
+
+    pub fn enabledAliasIndex(self: *const Selection, node: NodeId) ?usize {
+        const index = (self.alias_index orelse return null).aliasForNode(node) orelse return null;
+        return if (self.alias_enabled[index]) index else null;
     }
 
     pub fn output(self: *const Selection, pool: *const physical.Pool, node: NodeId, bytes: usize) route.OutputSlot {
@@ -354,8 +421,9 @@ pub const Selection = struct {
 
     fn selectAlias(self: *Selection, pool: *const physical.Pool, node: NodeId) !bool {
         if (pool.plan.slotForNode(node) == null) return false;
-        for (pool.metadata_aliases, 0..) |alias, alias_index| {
-            if (alias.node != node or !self.alias_enabled[alias_index]) continue;
+        if (if (self.alias_index) |index| index.aliasForNode(node) else null) |alias_index| alias_candidate: {
+            if (!self.alias_enabled[alias_index]) break :alias_candidate;
+            const alias = pool.metadata_aliases[alias_index];
             const slot = pool.plan.slotForNode(node).?;
             const source = self.retainedInput(pool, alias.source);
             const incoming = source.value;
@@ -363,7 +431,7 @@ pub const Selection = struct {
                 // Preserve the existing ordinary GPU reshape facts/dispatch.
                 // No exact retained Frame hook is claimed for external inputs.
                 self.alias_enabled[alias_index] = false;
-                break;
+                break :alias_candidate;
             }
             for (pool.backends) |backend| {
                 if (backend.kind() != slot.backend) continue;
@@ -382,7 +450,7 @@ pub const Selection = struct {
             // Ordinary GPU input/legacy reshape behavior remains unchanged.
             if (slot.backend == .native) return false;
             self.alias_enabled[alias_index] = false;
-            break;
+            break :alias_candidate;
         }
         if (pool.plan.slotForNode(node)) |slot| if (slot.backend == .native) return false;
         if (node >= pool.reshape_sources.len) return false;
@@ -755,4 +823,36 @@ test "retained route input and exact mixed consumer preparation unwind every all
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, retainedRouteInputCase, .{});
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, currentConsumerReadOnlyCase, .{});
+}
+
+test "route alias topology indexes branches duplicate edges and allocation failure" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var graph = ml.graph.Graph.init(a);
+            defer graph.deinit();
+            var builder = ml.graph.Builder.init(&graph);
+            const shape = ml.graph.Shape.init(.f32, &.{2});
+            const root = try builder.parameter("root", shape);
+            const view = try builder.reshape(root, ml.graph.Shape.init(.f32, &.{ 1, 2 }));
+            const consumer = try builder.add(view, view);
+            const branch = try builder.neg(root);
+            const aliases = [_]@import("metadata_alias.zig").Plan{.{ .node = view, .source = root, .input = shape, .output = graph.node(view).output_shape, .kind = .reshape }};
+            const index = try AliasIndex.init(a, graph.nodeCount(), &aliases, &graph);
+            defer index.deinit();
+            try std.testing.expectEqual(@as(?usize, 0), index.aliasForNode(view));
+            try std.testing.expect(index.aliasForNode(root) == null);
+            try std.testing.expectEqualSlices(NodeId, &.{ view, branch }, index.uses(root));
+            try std.testing.expectEqualSlices(NodeId, &.{ consumer, consumer }, index.uses(view));
+            try std.testing.expectEqual(@as(usize, 0), index.uses(consumer).len);
+            const duplicate = AliasIndex.init(a, graph.nodeCount(), &.{ aliases[0], aliases[0] }, &graph);
+            if (duplicate) |unexpected| {
+                unexpected.deinit();
+                return error.TestUnexpectedResult;
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.InvalidMetadataAlias, err);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

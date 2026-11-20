@@ -963,6 +963,14 @@ pub const Module = struct {
         return .{ .name = name, .entry = entry, .auxiliary = aux };
     }
 
+    /// Pin the public buffer ABI independently of internal provider layouts.
+    /// Required when outputs become another executable's resident operands.
+    pub fn serializeEntryLayoutOptions(self: Module, alloc: Allocator) ![]u8 {
+        var program = try buildProgramShapeProto(alloc, self.entry);
+        defer program.deinit(alloc);
+        return @import("xla_proto").encodeEntryLayoutOptions(alloc, program);
+    }
+
     /// Serialize to HloModuleProto protobuf bytes. Caller owns the result.
     pub fn serialize(self: Module, alloc: Allocator) ![]u8 {
         var module_proto = try buildModuleProto(alloc, self);
@@ -1600,4 +1608,49 @@ test "BF16 gather widens selected rows instead of the complete operand" {
     try std.testing.expectEqual(table, gather.operand_ids[0]);
     try std.testing.expectEqual(ElementType.bf16, gather.shape.element_type);
     try std.testing.expectEqual(ElementType.f32, b.getInst(selected).shape.element_type);
+}
+
+test "resident entry layout options encode typed parameters and tuple results" {
+    const a = std.testing.allocator;
+    var b = Builder.init(a, "layouts");
+    defer b.deinit();
+    const ids = try b.parameter(0, Shape.init(.s64, &.{3}), "ids");
+    const bank = try b.parameter(1, Shape.init(.f32, &.{ 448, 768 }), "bank");
+    _ = try b.tuple(&.{ ids, bank });
+    const module = Module.init("layouts", b.build());
+    const options = try module.serializeEntryLayoutOptions(a);
+    defer a.free(options);
+    var signature = try buildProgramShapeProto(a, module.entry);
+    defer signature.deinit(a);
+    const wire = @import("protobuf").wire;
+    var cursor: usize = 0;
+    for (signature.parameters) |_| {
+        try std.testing.expectEqual(@as(u32, 1), (try wire.readTag(options, &cursor)).field);
+        const shape = try wire.readLengthDelimited(options, &cursor);
+        try std.testing.expect(shape.len != 0);
+    }
+    try std.testing.expectEqual(@as(u32, 3), (try wire.readTag(options, &cursor)).field);
+    const build = try wire.readLengthDelimited(options, &cursor);
+    try std.testing.expectEqual(options.len, cursor);
+    cursor = 0;
+    try std.testing.expectEqual(@as(u32, 2), (try wire.readTag(build, &cursor)).field);
+    const result = try wire.readLengthDelimited(build, &cursor);
+    try std.testing.expectEqual(build.len, cursor);
+    // A tuple result carries each bank's concrete layout, not a tuple-only
+    // marker that would leave the provider free to change the boundary ABI.
+    var shape_cursor: usize = 0;
+    try std.testing.expectEqual(@as(u32, 2), (try wire.readTag(result, &shape_cursor)).field);
+    try std.testing.expectEqual(@as(u64, 13), try wire.readVarint(result, &shape_cursor));
+    for (signature.result.tuple_shapes) |_| {
+        try std.testing.expectEqual(@as(u32, 4), (try wire.readTag(result, &shape_cursor)).field);
+        const child = try wire.readLengthDelimited(result, &shape_cursor);
+        var child_cursor: usize = 0;
+        var has_layout = false;
+        while (child_cursor < child.len) {
+            const tag = try wire.readTag(child, &child_cursor);
+            if (tag.field == 5) has_layout = true;
+            try wire.skipField(child, &child_cursor, tag.wire_type);
+        }
+        try std.testing.expect(has_layout);
+    }
 }

@@ -1211,7 +1211,9 @@ test "resident model outputs survive runtime eviction and release owners after m
             std.debug.assert(!self.closed);
             self.references -= 1;
             if (self.references == 0) {
-                if (!self.host_only) std.debug.assert(self.active_cleanup != 0);
+                // Device cleanup has ended before the final owner may close
+                // its provider/model lane. This is also required on host-only outputs.
+                std.debug.assert(self.active_cleanup == 0);
                 self.closed = true;
             }
         }

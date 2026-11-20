@@ -8610,7 +8610,7 @@ pub const CudaCompute = struct {
         // Actual source vision warms immutable full/tail vendor plans before
         // capture. Reuse the existing bounded library-owned cache; no numerical
         // lane, plan discovery, or metadata allocation occurs during replay.
-        if (profile == .embedding_gemma2 or cudaF32TiledAttentionEnabled()) if (cublaslt) |*blas| {
+        if (profile == .embedding_gemma2 or cudaF32TiledAttentionEnabled(profile == .gemma4 and ctx.info.compute_major == 12 and ctx.info.compute_minor == 1)) if (cublaslt) |*blas| {
             blas.attention_plan_cache_enabled = true;
         };
         const lighton_device = @import("recurrent_device_policy.zig").Device{ .major = ctx.info.compute_major, .minor = ctx.info.compute_minor, .driver_version = ctx.info.driver_version };
@@ -9467,10 +9467,10 @@ pub const CudaCompute = struct {
         if (cb.kind() != .cuda or cb.execution_owner != 0) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const explicit_mode = platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY") != null;
-        // An explicitly selected native execution plan uses the same bounded
-        // paged-KV replay contract on other qualified CUDA architectures.
-        // Keep automatic promotion scoped to the existing physical evidence.
-        const planned_replay = explicit_mode and self.gemma4_dense_qualified and self.gemma4_native_plan != null;
+        // Installed artifact-qualified automatic plans and explicit experiments
+        // share the same bounded paged-KV contract. Default promotion still
+        // requires pure greedy generation and every capture/storage safety gate.
+        const planned_replay = self.gemma4_dense_qualified and self.gemma4_native_plan != null and (explicit_mode or automaticNativeDecodeReplayQualified(self));
         if ((!self.gemma4_e4b_sm89_qualified and !planned_replay) or (explicit_mode and !cudaDecodeGraphReplayEnabled()) or
             (!explicit_mode and (!allow_default or
                 !cuda_artifact.hasBf16WmmaCodeFor(self.ctx.info.compute_major, self.ctx.info.compute_minor) or
@@ -9511,6 +9511,12 @@ pub const CudaCompute = struct {
             @import("../../graph/quant_kernel_cuda_renderer.zig").FlashPrefillQueryLengthPolicy.paged_f16_q2_to_8192_128k_v2.maxContextTokens()
         else
             32768;
+    }
+
+    pub fn nativePrefillPolicySelected(cb: *const ops.ComputeBackend) bool {
+        if (!acceptsPhysicalImplementation(cb.vtable)) return false;
+        const self: *const CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.gemma4_native_plan != null;
     }
 
     pub fn nativePrefillChunkRows(cb: *const ops.ComputeBackend, prompt_rows: usize, requested_rows: usize) ?usize {
@@ -16806,11 +16812,17 @@ fn cudaDecodeGraphReplayEnabled() bool {
 // A request-local reservation is installed only by the serialized fresh-
 // generation path. Automatic replay can decline the request; explicit off
 // and required policies retain their existing contracts.
+fn automaticNativeDecodeReplayQualified(self: *const CudaCompute) bool {
+    const plan = self.gemma4_native_plan orelse return false;
+    return plan.automatic and plan.projection == .bf16_donors and
+        self.ctx.info.compute_major == 12 and self.ctx.info.compute_minor == 1;
+}
+
 fn cudaRequestDecodeGraphReplayMode(self: *const CudaCompute) CudaDecodeGraphReplayMode {
     if (self.gemma4_request_replay_disabled) return .off;
     if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY") != null)
         return cudaDecodeGraphReplayMode();
-    return if (self.gemma4_e4b_sm89_qualified and self.gemma4_request_replay_capacity != null) .auto else .off;
+    return if ((self.gemma4_e4b_sm89_qualified or automaticNativeDecodeReplayQualified(self)) and self.gemma4_request_replay_capacity != null) .auto else .off;
 }
 
 const max_temp_pinned_slots = 16_384;
@@ -20727,7 +20739,7 @@ fn audioBatchLayoutsEnabledOp(ctx: *anyopaque) bool {
 fn audioLogMelEnabledOp(ctx: *anyopaque) bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     return (self.capability_profile == .embedding_gemma2 and self.embedding_gemma2_policy.audio_frontend_fused) or
-        (self.gemma4_dense_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_AUDIO_LOGMEL_FUSED", self.gemma4_e4b_sm89_qualified));
+        (self.gemma4_dense_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_AUDIO_LOGMEL_FUSED", self.gemma4_e4b_sm89_qualified or (self.gemma4_native_plan != null and self.ctx.info.compute_major == 12 and self.ctx.info.compute_minor == 1)));
 }
 fn audioLogMelOp(ctx: *anyopaque, pcm: CT, plan: CT, mask: CT, frames: usize, hop: usize, floor: f32) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
@@ -30592,8 +30604,8 @@ fn gemma4VisionNormRope(ctx: *anyopaque, input: CT, weight: CT, params: ops.Visi
     return createTensor(self, output, shape, count);
 }
 
-fn cudaF32TiledAttentionEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_F32_TILED_ATTENTION", false);
+fn cudaF32TiledAttentionEnabled(qualified_default: bool) bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_F32_TILED_ATTENTION", qualified_default);
 }
 
 /// Full-precision unmasked attention over strided BSHD views. Reuse the shared
@@ -30665,7 +30677,7 @@ fn sdpaUnmaskedAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: u
     // ordinary F32 callers and the historical SM89 selector precedence intact.
     const planned_f16 = allow_planned_f16 and f16_shape and f16_requested and self.ctx.info.compute_major == 12 and self.ctx.info.compute_minor == 1 and
         (if (self.gemma4_native_plan) |plan| plan.vision_f16 else false);
-    if (!planned_f16 and cudaF32TiledAttentionEnabled() and seq_len >= 512) {
+    if (!planned_f16 and cudaF32TiledAttentionEnabled(self.gemma4_native_plan != null and self.ctx.info.compute_major == 12 and self.ctx.info.compute_minor == 1) and seq_len >= 512) {
         if (try tryUnmaskedTiledF32Attention(self, q_ct, k_ct, v_ct, batch, seq_len, num_heads, head_dim)) |result| return result;
     }
     // Reuse the full-precision encoder kernel's warp-reduced scores. The
@@ -62026,7 +62038,19 @@ test "Gemma4 CUDA adaptive replay binds reserved page tables and resets request 
     var compute = try CudaCompute.init(a);
     defer compute.deinit();
     try compute.configureGemma4Dense(true, true);
-    if (!compute.gemma4_e4b_sm89_qualified) return error.SkipZigTest;
+    const native_automatic = compute.ctx.info.compute_major == 12 and compute.ctx.info.compute_minor == 1;
+    if (native_automatic) {
+        compute.gemma4_native_plan = .{ .projection = .bf16_donors, .automatic = true, .geometry = .{ .donor_layers = 24 } };
+    } else if (!compute.gemma4_e4b_sm89_qualified) return error.SkipZigTest;
+    if (native_automatic) {
+        try std.testing.expect(automaticNativeDecodeReplayQualified(&compute));
+        compute.gemma4_native_plan.?.automatic = false;
+        try std.testing.expect(!automaticNativeDecodeReplayQualified(&compute));
+        compute.gemma4_native_plan.?.automatic = true;
+        compute.gemma4_native_plan.?.projection = .packed_q4;
+        try std.testing.expect(!automaticNativeDecodeReplayQualified(&compute));
+        compute.gemma4_native_plan.?.projection = .bf16_donors;
+    }
     var cb = compute.computeBackend();
     const default_qualified = cuda_artifact.hasBf16WmmaCodeFor(compute.ctx.info.compute_major, compute.ctx.info.compute_minor) and
         compute.capture_gates.persistent_replay and compute.capture_gates.device_scalars and
@@ -62083,6 +62107,7 @@ test "Gemma4 CUDA adaptive replay binds reserved page tables and resets request 
     try std.testing.expect(cudaDebugGraphForcedKvReplayCapacityTokens(&compute) == null);
     _ = unsetenv("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY");
     compute.gemma4_e4b_sm89_qualified = false;
+    compute.gemma4_native_plan = null; // unknown profile has neither qualification
     try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, false)) == null);
     // Explicit native plans on other architectures need the same request-wide
     // capacity; otherwise every page crossing invalidates the captured graph.

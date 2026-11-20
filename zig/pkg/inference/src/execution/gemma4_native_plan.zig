@@ -9,13 +9,80 @@ const Config = @import("../models/gpt.zig").Config;
 
 pub const Projection = enum { packed_q4, bf16_donors };
 
-pub fn selected() ?Projection {
+/// Explicit values, including off/invalid values, override automatic policy.
+/// Probe only the same default device used by CudaContext; no context or model
+/// allocation is created. Unknown devices retain the compatibility route.
+pub fn explicitSelection() ?Projection {
     const value = platform.env.getenv("ANTFLY_INFERENCE_CUDA_GEMMA4_NATIVE_PLAN") orelse return null;
     return std.meta.stringToEnum(Projection, value);
+}
+var default_device: std.atomic.Value(u8) = .init(0);
+fn qualifiedDefaultDevice() bool {
+    if (comptime !@import("build_options").enable_cuda) return false;
+    const cached = default_device.load(.acquire);
+    if (cached != 0) return cached == 2;
+    var driver = @import("../ops/cuda/driver.zig").CudaDriver.open() catch return false;
+    defer driver.deinit();
+    driver.check(driver.fns.cuInit(0)) catch return false;
+    var device: @import("../ops/cuda/driver.zig").CUdevice = 0;
+    driver.check(driver.fns.cuDeviceGet(&device, 0)) catch return false;
+    var major: c_int = 0;
+    var minor: c_int = 0;
+    driver.check(driver.fns.cuDeviceComputeCapability(&major, &minor, device)) catch return false;
+    const qualified = automaticProjection(major, minor) != null and @import("../ops/cuda/artifact.zig").hasBf16WmmaCodeFor(major, minor);
+    default_device.store(if (qualified) 2 else 1, .release);
+    return qualified;
+}
+fn automaticProjection(major: i32, minor: i32) ?Projection {
+    return if (major == 12 and minor == 1) .bf16_donors else null;
+}
+pub fn selected() ?Projection {
+    if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_GEMMA4_NATIVE_PLAN") != null) return explicitSelection();
+    return if (qualifiedDefaultDevice()) .bf16_donors else null;
+}
+
+/// Automatic rollout is narrower than explicit experimental policy. Check
+/// parsed geometry and the actual donor storage inventory, never a model name.
+pub fn automaticGeometry(config: Config) bool {
+    return Geometry.resolve(config) != null and config.intermediate_size == 10240 and
+        config.sliding_window == 512 and config.sliding_window_pattern == 6 and
+        config.ple_hidden_size == 256 and config.vocab_size == 262144 and config.max_position_embeddings == 131072;
+}
+pub fn automaticArtifact(config: Config, file: ?*const @import("../gguf/format.zig").File) bool {
+    if (!automaticGeometry(config)) return false;
+    const geometry = Geometry.resolve(config).?;
+    var seen: [24]u8 = @splat(0);
+    if (geometry.donor_layers != seen.len) return false;
+    for ((file orelse return false).tensors) |tensor| {
+        if (!geometry.mirrorsWeight(tensor.name)) continue;
+        if ((tensor.tensor_type != .known or tensor.tensor_type.known != .Q4_0) or tensor.dimensions.len != 2 or !std.mem.startsWith(u8, tensor.name, "blk.")) return false;
+        const stem = tensor.name[4..];
+        const dot = std.mem.indexOfScalar(u8, stem, '.') orelse return false;
+        const layer = std.fmt.parseInt(usize, stem[0..dot], 10) catch return false;
+        const suffix = stem[dot + 1 ..];
+        const names = [_][]const u8{ "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight" };
+        const head = config.effectiveHeadDimForLayer(layer);
+        const q = @as(u64, config.num_attention_heads) * head;
+        const kv = @as(u64, config.num_key_value_heads) * head;
+        const h: u64 = config.hidden_size;
+        const f: u64 = config.intermediate_size;
+        const shapes = [_][2]u64{ .{ h, q }, .{ h, kv }, .{ h, kv }, .{ q, h }, .{ h, f }, .{ h, f }, .{ f, h } };
+        for (names, shapes, 0..) |name, shape, index| {
+            if (!std.mem.eql(u8, suffix, name)) continue;
+            const bit: u8 = @as(u8, 1) << @intCast(index);
+            if (seen[layer] & bit != 0 or !std.mem.eql(u64, tensor.dimensions, &shape)) return false;
+            seen[layer] |= bit;
+            break;
+        }
+    }
+    for (seen) |mask| if (mask != 0x7f) return false;
+    return true;
 }
 
 pub const Plan = struct {
     projection: Projection,
+    /// Installed only after exact artifact qualification and load admission.
+    automatic: bool = false,
     geometry: Geometry,
     wide_f32_vendor: bool = true,
     flash_prefill: bool = true,
@@ -43,12 +110,15 @@ pub const Plan = struct {
     }
 
     pub fn resolve(config: Config) ?Plan {
+        const projection = selected() orelse return null;
+        if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_GEMMA4_NATIVE_PLAN") == null and !automaticGeometry(config)) return null;
         return .{
-            .projection = selected() orelse return null,
+            .projection = projection,
+            .automatic = platform.env.getenv("ANTFLY_INFERENCE_CUDA_GEMMA4_NATIVE_PLAN") == null,
             .geometry = Geometry.resolve(config) orelse return null,
             .wide_f32_vendor = !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_WIDE_F32_VENDOR"),
             .flash_prefill = !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_PAGED_F16_FLASH"),
-            .capture_prefill = platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_CAPTURE_PREFILL"),
+            .capture_prefill = platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_PREFILL", platform.env.getenv("ANTFLY_INFERENCE_CUDA_GEMMA4_NATIVE_PLAN") == null and qualifiedDefaultDevice()),
             .trace_prefill = platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_TRACE_PREFILL_PROGRAM"),
             .warp_decode = platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_F16_WARP_DECODE", true),
             .vision_f16 = platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VISION_F16", true),
@@ -78,6 +148,20 @@ pub const Geometry = struct {
         // path. Other Gemma configurations continue through their own routes.
         const boundary = config.sharedKvPrefillDonorLayers() orelse return null;
         return .{ .donor_layers = boundary };
+    }
+
+    /// Additional resident storage for the selected donor representations.
+    /// Keep the original packed-weight/staging floor independently funded.
+    pub fn mirroredBf16Bytes(self: Geometry, file: *const @import("../gguf/format.zig").File) !usize {
+        var bytes: usize = 0;
+        for (file.tensors) |tensor| {
+            if (!self.mirrorsWeight(tensor.name)) continue;
+            if (tensor.dimensions.len != 2) return error.InvalidNativeMirrorInventory;
+            var elements: usize = 1;
+            for (tensor.dimensions) |dimension| elements = try std.math.mul(usize, elements, std.math.cast(usize, dimension) orelse return error.ResourceLimitExceeded);
+            bytes = try std.math.add(usize, bytes, try std.math.mul(usize, elements, @sizeOf(u16)));
+        }
+        return bytes;
     }
 
     /// Only the full-row donor span uses mirrored projection matrices in
@@ -134,11 +218,11 @@ test "Gemma4 CUDA full window budget floor preserves explicit limits" {
     var admitted = memory.RunBudget.init(floor);
     // Persistent weights share the model domain with each request. The
     // automatic floor must admit the planned chunk beside real residency.
-    try admitted.tryReserve(.{ .kind = .weight, .tier = .backend, .bytes = resident_bytes });
+    const weights = try admitted.tryReserveWeight(.backend, resident_bytes);
     try admitted.reserveEstimate(required);
     admitted.releaseEstimate(required);
     try std.testing.expectEqual(resident_bytes, admitted.backendTotalBytes());
-    admitted.release(.{ .kind = .weight, .tier = .backend, .bytes = resident_bytes });
+    admitted.release(weights);
     try std.testing.expectEqual(@as(usize, 0), admitted.backendTotalBytes());
     try std.testing.expectEqual(@as(usize, 0), admitted.hostTotalBytes());
     // The same request must still fail an operator's explicit KV cap. A
@@ -152,4 +236,47 @@ test "Gemma4 CUDA full window budget floor preserves explicit limits" {
         @field(override, name) = 1;
         try std.testing.expectEqual(@as(usize, 1), @field(memory.applyLimitOverrides(floor, override), name));
     }
+}
+
+test "native plan automatic projection is restricted to the qualified CUDA target" {
+    try std.testing.expectEqual(@as(?Projection, .bf16_donors), automaticProjection(12, 1));
+    for ([_][2]i32{ .{ 8, 0 }, .{ 8, 9 }, .{ 9, 0 }, .{ 12, 0 }, .{ 0, 0 } }) |device|
+        try std.testing.expectEqual(@as(?Projection, null), automaticProjection(device[0], device[1]));
+}
+
+test "native plan automatic artifact requires complete unique Q4 donors and exact geometry" {
+    const a = std.testing.allocator;
+    const gguf = @import("../gguf/format.zig");
+    const cfg = Config{ .family = .gemma, .position_encoding = .rope, .hidden_size = 2560, .num_hidden_layers = 42, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 512, .intermediate_size = 10240, .num_kv_shared_layers = 18, .sliding_window = 512, .sliding_window_pattern = 6, .ple_hidden_size = 256, .vocab_size = 262144, .max_position_embeddings = 131072 };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const tensors = try allocator.alloc(gguf.TensorInfo, 24 * 7);
+    const names = [_][]const u8{ "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight" };
+    for (0..24) |layer| {
+        const head: u64 = cfg.effectiveHeadDimForLayer(layer);
+        const shapes = [_][2]u64{ .{ 2560, 8 * head }, .{ 2560, 2 * head }, .{ 2560, 2 * head }, .{ 8 * head, 2560 }, .{ 2560, 10240 }, .{ 2560, 10240 }, .{ 10240, 2560 } };
+        for (names, shapes, 0..) |name, shape, index| tensors[layer * 7 + index] = .{ .name = try std.fmt.allocPrint(allocator, "blk.{d}.{s}", .{ layer, name }), .dimensions = try allocator.dupe(u64, &shape), .tensor_type = .{ .known = .Q4_0 }, .offset = 0, .data_offset = 0 };
+    }
+    var file = gguf.File{ .header = .{ .version = 3, .tensor_count = tensors.len, .metadata_count = 0 }, .metadata = &.{}, .tensors = tensors, .alignment = 32, .data_region_offset = 0 };
+    try std.testing.expect(automaticArtifact(cfg, &file));
+    if (comptime @sizeOf(usize) >= 8) try std.testing.expectEqual(@as(usize, 4508876800), try Geometry.resolve(cfg).?.mirroredBf16Bytes(&file));
+    try std.testing.expect(!automaticArtifact(cfg, null));
+    var other = cfg;
+    other.sliding_window = 1024;
+    try std.testing.expect(!automaticArtifact(other, &file));
+    tensors[0].tensor_type = .{ .known = .Q8_0 };
+    try std.testing.expect(!automaticArtifact(cfg, &file));
+    tensors[0].tensor_type = .{ .known = .Q4_0 };
+    tensors[0].dimensions[0] -= 1;
+    try std.testing.expect(!automaticArtifact(cfg, &file));
+    tensors[0].dimensions[0] += 1;
+    file.tensors = tensors[1..];
+    try std.testing.expect(!automaticArtifact(cfg, &file));
+    file.tensors = tensors;
+    const first = tensors[0];
+    tensors[0] = tensors[1];
+    try std.testing.expect(!automaticArtifact(cfg, &file));
+    tensors[0] = first;
+    try std.testing.expect(automaticArtifact(cfg, &file));
 }

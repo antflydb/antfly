@@ -516,6 +516,9 @@ pub fn createExecutorWithOptions(
     // 1. Compile partition to HLO bytes
     var compile_options = options;
     if (compile_options.mutable_parameters != null) compile_options.parameter_inputs = true;
+    // Single-query CUDA F32 LayerNorm lost full-model parity under fusion.
+    // Widen only its small reductions; keep matrix and storage policies intact.
+    if (options.resident_capacity != 0 and std.ascii.eqlIgnoreCase(try client.platformName(), "cuda")) compile_options.wide_single_row_norm = true;
     var result = try compiler.compilePartitionWithOptions(allocator, graph, part, cb, compile_options);
     defer result.deinit();
 
@@ -524,7 +527,10 @@ pub fn createExecutorWithOptions(
     // provider choose its tuned GEMM/fusion schedule; vendor reduction order is
     // not a portable numerical contract. Strict compilation still preserves
     // every explicit BF16 conversion. Qualify model accuracy independently.
-    var executable = try client.compileForDevice(result.hlo_bytes, result.output_node_ids.len, client.device);
+    var executable = if (result.entry_layout_options) |layouts|
+        try client.compileWithEntryLayouts(result.hlo_bytes, result.output_node_ids.len, client.device, layouts, allocator)
+    else
+        try client.compileForDevice(result.hlo_bytes, result.output_node_ids.len, client.device);
     var executable_owned = true;
     errdefer if (executable_owned) executable.deinit();
 

@@ -695,6 +695,20 @@ pub const Client = struct {
         return self.compileForDeviceWithSerializedOptions(hlo_bytes, num_outputs, target_device, compile_options);
     }
 
+    /// Resident boundary layouts are an ABI, not a provider scheduling hint.
+    /// Protobuf merges the additional executable-build message with the typed
+    /// replica/partition settings while retaining every precision/GEMM override.
+    pub fn compileWithEntryLayouts(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, target_device: *c.PjrtDevice, layouts: []const u8, allocator: std.mem.Allocator) !LoadedExecutable {
+        const defaults: []const u8 = switch (self.compile_options.gpu_gemm) {
+            .provider_default => &strict_compile_options,
+            .vendor => &vendor_gemm_compile_options,
+            .vendor_deterministic => &deterministic_vendor_compile_options,
+        };
+        const options = try std.mem.concat(allocator, u8, &.{ defaults, layouts });
+        defer allocator.free(options);
+        return self.compileForDeviceWithSerializedOptions(hlo_bytes, num_outputs, target_device, options);
+    }
+
     /// Explicit serialized options retain the same placement, output and
     /// program-size validation as the typed compilation API.
     pub fn compileWithSerializedOptions(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, compile_options: []const u8) PjrtError!LoadedExecutable {
@@ -1409,6 +1423,7 @@ test "compile and deserialize reject native output arity with balanced ownership
         var strict_compiles: usize = 0;
         var vendor_expected = false;
         var deterministic_expected = false;
+        var layouts_expected: ?[]const u8 = null;
         fn checkOptions(bytes: []const u8) !void {
             const wire = @import("protobuf").wire;
             var pos: usize = 0;
@@ -1430,7 +1445,9 @@ test "compile and deserialize reject native output arity with balanced ownership
                 try std.testing.expectEqual(@as(u64, if (std.mem.eql(u8, key, "xla_gpu_deterministic_ops")) 1 else 0), try wire.readVarint(value, &cursor));
                 try std.testing.expectEqual(value.len, cursor);
             }
-            try std.testing.expectEqual(bytes.len, pos);
+            if (layouts_expected) |layouts| {
+                try std.testing.expectEqualSlices(u8, layouts, bytes[pos..]);
+            } else try std.testing.expectEqual(bytes.len, pos);
         }
         fn compile(args: *c.ClientCompileArgs) callconv(.c) ?*c.PjrtError {
             checkOptions(args.compile_options.?[0..args.compile_options_size]) catch @panic("invalid precision compile options");
@@ -1486,6 +1503,23 @@ test "compile and deserialize reject native output arity with balanced ownership
     try std.testing.expectEqual(@as(usize, 5), Fake.strict_compiles);
     try std.testing.expectEqual(@as(usize, 6), Fake.loaded_destroyed);
     try std.testing.expectEqual(@as(usize, 6), Fake.executable_destroyed);
+    var builder = hlo.Builder.init(std.testing.allocator, "resident_layouts");
+    defer builder.deinit();
+    const bank = try builder.parameter(0, hlo.Shape.init(.f32, &.{ 448, 768 }), "bank");
+    _ = try builder.tuple(&.{bank});
+    const layouts = try hlo.Module.init("resident_layouts", builder.build()).serializeEntryLayoutOptions(std.testing.allocator);
+    defer std.testing.allocator.free(layouts);
+    Fake.layouts_expected = layouts;
+    defer Fake.layouts_expected = null;
+    for ([_]@FieldType(CompileOptions, "gpu_gemm"){ .provider_default, .vendor, .vendor_deterministic }) |policy| {
+        client.compile_options.gpu_gemm = policy;
+        Fake.vendor_expected = policy != .provider_default;
+        Fake.deterministic_expected = policy == .vendor_deterministic;
+        try std.testing.expectError(error.OutputCountMismatch, client.compileWithEntryLayouts("hlo", 2, client.device, layouts, std.testing.allocator));
+    }
+    try std.testing.expectEqual(@as(usize, 8), Fake.strict_compiles);
+    try std.testing.expectEqual(@as(usize, 9), Fake.loaded_destroyed);
+    try std.testing.expectEqual(@as(usize, 9), Fake.executable_destroyed);
 }
 
 test "float32 downloads use logical host bytes and reject invalid type size and shape" {

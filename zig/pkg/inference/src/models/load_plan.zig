@@ -45,6 +45,19 @@ pub const ModelLoadAdmissionPlan = struct {
     /// CUDA A4B serving excludes temporary GGUF staging and reuses the
     /// resident KV/scratch reservation through a bounded session sub-ledger.
     serving_floor: ?runtime.tier.memory.Limits = null,
+    /// Optional default CUDA mirrors, disjoint from the mandatory artifact.
+    /// Explicit operator requests never receive a compatibility fallback.
+    optional_cuda_peak_weight_bytes: usize = 0,
+    optional_cuda_resident_weight_bytes: usize = 0,
+
+    pub fn withoutOptionalCudaMirrors(self: @This()) @This() {
+        var mandatory = self;
+        mandatory.peak.backend_weight_bytes -= self.optional_cuda_peak_weight_bytes;
+        mandatory.resident.backend_weight_bytes -= self.optional_cuda_resident_weight_bytes;
+        mandatory.optional_cuda_peak_weight_bytes = 0;
+        mandatory.optional_cuda_resident_weight_bytes = 0;
+        return mandatory;
+    }
 };
 
 pub fn modelRunWorkspaceAllowance(weight_bytes: usize) usize {
@@ -648,6 +661,27 @@ pub fn withNativeAuxiliaryAdmission(man: manifest_mod.ModelManifest, backend: ba
 
 pub fn withNativeAuxiliaryAdmissionForPolicy(man: manifest_mod.ModelManifest, backend: backends.BackendType, base: ModelLoadAdmissionPlan, host_ple: bool) !ModelLoadAdmissionPlan {
     var result = base;
+    // Automatic donor mirrors apply only to the parsed qualified geometry.
+    // Do not inflate every CUDA model's load estimate on the same device.
+    const native_plan = @import("../execution/gemma4_native_plan.zig");
+    if (backend == .cuda and man.gguf_path != null and
+        native_plan.explicitSelection() == null and native_plan.selected() == .bf16_donors)
+    {
+        const root = man.source_root orelse return error.UnsupportedModelLoadPlan;
+        const store = try @import("tensor_store.zig").openFromManifest(man.allocator, man);
+        defer {
+            store.preserveFileCacheOnDeinit();
+            store.deinit();
+        }
+        const arch = try @import("../architectures/model_definition.zig").detectArchitectureWithGgufFile(man.allocator, root, man, store.ggufFile());
+        if (arch == .gpt and native_plan.automaticArtifact(arch.gpt, store.ggufFile())) {
+            const mirrors = try native_plan.Geometry.resolve(arch.gpt).?.mirroredBf16Bytes(store.ggufFile().?);
+            result.optional_cuda_peak_weight_bytes = mirrors;
+            result.optional_cuda_resident_weight_bytes = mirrors;
+            result.peak.backend_weight_bytes = try std.math.add(usize, result.peak.backend_weight_bytes, mirrors);
+            result.resident.backend_weight_bytes = try std.math.add(usize, result.resident.backend_weight_bytes, mirrors);
+        }
+    }
     if (backend == .cuda and host_ple and man.gguf_path != null) {
         const host_bytes = try session_factory.cudaPleHostBytesForPolicy(man.allocator, man.source_root orelse std.fs.path.dirname(man.gguf_path.?) orelse ".", man, host_ple);
         if (host_bytes != 0) {
@@ -871,4 +905,35 @@ fn cudaDecideQ8MirrorAdmission(man: manifest_mod.ModelManifest) runtime.tier.mem
     if (man.gliner_classification_head != .label_marker_mlp or man.gliner_span_encoder_family != .deberta or
         man.nativeWeightArtifactKind() != .gguf) return .{};
     return .{ .backend_weight_bytes = @import("../models/gliner_decide_qualification.zig").cuda_q8_projection_mirror_bytes };
+}
+
+test "automatic native load admission uses parsed inventory independent of generator marker" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const platform = @import("antfly_platform");
+    const path = platform.env.getenv("ANTFLY_CUDA_NATIVE_MODEL") orelse return error.SkipZigTest;
+    const native_plan = @import("../execution/gemma4_native_plan.zig");
+    if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_GEMMA4_NATIVE_PLAN") != null or native_plan.selected() != .bf16_donors) return error.SkipZigTest;
+    var manifest = try manifest_mod.loadFromDir(std.testing.allocator, path);
+    defer manifest.deinit();
+    // The discovery hint must not grant or withhold eligibility. Keep the
+    // actual selected artifact and derive geometry/storage from its metadata.
+    manifest.gguf_generator_gemma4 = false;
+    const plan = try estimateModelLoadAdmission(path, manifest, .{ .backend = .cuda }, null, false);
+    try std.testing.expectEqual(@as(usize, 4508876800), plan.optional_cuda_peak_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 4508876800), plan.optional_cuda_resident_weight_bytes);
+    var loaded = try @import("../architectures/model_definition.zig").LoadedModel.fromOwnedManifest(std.testing.allocator, path, try manifest.clone(std.testing.allocator));
+    defer loaded.deinit();
+    var prepared = try @import("host_weights.zig").prepare(std.testing.allocator, path, &loaded, .{ .intent = .device_upload });
+    defer prepared.deinit();
+    try std.testing.expect(loaded.weights == null);
+    try std.testing.expect(prepared.architecture == .gpt);
+    const owned_store = prepared.weights.tensor_store orelse return error.MissingPreparedWeightSource;
+    try std.testing.expect(native_plan.automaticArtifact(prepared.architecture.gpt, owned_store.ggufFile()));
+    const selected = @import("cuda_weights.zig").nativeExecutionPlan(&prepared, .{}) orelse return error.MissingPreparedNativeExecutionPlan;
+    try std.testing.expect(selected.automatic);
+    try std.testing.expectEqual(native_plan.Projection.bf16_donors, selected.projection);
+    try std.testing.expect(@import("cuda_weights.zig").nativeExecutionPlan(&prepared, .{ .allow_automatic_plan = false }) == null);
+    const mandatory = plan.withoutOptionalCudaMirrors();
+    try std.testing.expect(mandatory.peak.backend_weight_bytes < plan.peak.backend_weight_bytes);
+    try std.testing.expect(mandatory.resident.backend_weight_bytes < plan.resident.backend_weight_bytes);
 }

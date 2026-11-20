@@ -38,6 +38,11 @@ const ComputeBackend = ops.ComputeBackend;
 const CT = ops.CT;
 const prompt_rows = @import("../execution/decoder_prefill.zig");
 
+fn cudaNativePlanSelected(cb: *const ComputeBackend) bool {
+    if (comptime !@import("build_options").enable_cuda) return false;
+    return @import("../ops/cuda/cuda_compute.zig").CudaCompute.nativePrefillPolicySelected(cb);
+}
+
 const default_spatial_merge_size: usize = @intCast(
     projector_format_mod.gemma4_spatial_merge_size,
 );
@@ -360,7 +365,7 @@ pub fn encodeProjectedVideoWithSession(
         permit.deinit();
     };
     if (session) |source| {
-        if (!cfg.direct_unified and @import("../execution/gemma4_native_plan.zig").selected() != null) {
+        if (!cfg.direct_unified and cudaNativePlanSelected(cb)) {
             const patches = try std.math.mul(usize, cfg.maxPatchCount(), 2);
             const patch_width = try std.math.mul(usize, cfg.patch_size, cfg.patch_size * 3);
             const ingress_bytes = try std.math.mul(usize, patches, try std.math.mul(usize, patch_width, 2 * @sizeOf(f32)));
@@ -884,7 +889,7 @@ const ProjectorWeights = struct {
         if (self.gguf) |gguf| {
             var layout: [64]u8 = undefined;
             const compact = self.cb.kind() == .cuda and (platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_COMPACT_PROJECTOR") or
-                @import("../execution/gemma4_native_plan.zig").selected() != null);
+                cudaNativePlanSelected(self.cb));
             const kind = try std.fmt.bufPrint(&layout, "linear:{d}:{d}:{s}", .{ in_dim, out_dim, if (compact) "compact" else "f32" });
             var buffer: [256]u8 = undefined;
             const key = self.cudaWeightKey(&buffer, kind, tensor_name);
@@ -901,7 +906,7 @@ const ProjectorWeights = struct {
     fn cudaWeightKey(self: *const ProjectorWeights, buffer: []u8, layout: []const u8, name: []const u8) ?[]const u8 {
         const owner = self.owner orelse return null;
         if (self.cb.kind() != .cuda or (!platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_PROJECTOR_RESIDENCY") and
-            @import("../execution/gemma4_native_plan.zig").selected() == null)) return null;
+            !cudaNativePlanSelected(self.cb))) return null;
         return std.fmt.bufPrint(buffer, "projector.weight.{d}:{s}:{s}", .{ owner.cache_identity, layout, name }) catch null;
     }
 
@@ -1901,7 +1906,7 @@ pub fn encodeProjectedAudioInputs(cb: *const ComputeBackend, allocator: std.mem.
 
 /// Prompt projection can keep output rows on the same CUDA stream as the decoder.
 pub fn encodeProjectedAudioForPrompt(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, inputs: []const AudioInput) !ProjectedAudio {
-    if (cb.kind() != .cuda or @import("../execution/gemma4_native_plan.zig").selected() == null)
+    if (cb.kind() != .cuda or !cudaNativePlanSelected(cb))
         return encodeProjectedAudioInputs(cb, allocator, projector, inputs);
     const cfg = try parseAudioConfig(&projector.gguf.parsed);
     if (cfg.direct_unified) return encodeProjectedAudioInputs(cb, allocator, projector, inputs);

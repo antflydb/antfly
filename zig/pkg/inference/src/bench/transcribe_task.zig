@@ -194,6 +194,7 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
         var forced_scratch: [3]@typeInfo(@TypeOf(prompt.automatic_ids)).pointer.child = undefined;
         const forced_ids = try prompt.resolveWithTimestamps(&forced_scratch, null, options.transcribe_timestamps);
         var pipeline = inference.pipelines.transcription.TranscriptionPipeline.init(a, session, session, model.getTokenizer(), .{
+            .pjrt_decoder_cache = options.pjrt.decoder_cache,
             .max_length = config.max_target_positions,
             .max_output_tokens = max_output_tokens,
             .decoder_start_token_id = config.decoder_start_token_id,

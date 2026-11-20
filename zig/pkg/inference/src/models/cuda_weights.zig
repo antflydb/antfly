@@ -515,6 +515,23 @@ pub const PreparedCudaWeights = struct {
     }
 };
 
+/// Construction-only policy resolved by load admission. Never retained as a
+/// pointer or re-read from mutable process policy after the session is built.
+pub const LoadOptions = struct {
+    host_lease: ?*?runtime.tier.memory.AdmissionLease = null,
+    allow_automatic_plan: bool = true,
+};
+
+/// Selection borrows the prepared producer, after its source store has moved.
+/// The original LoadedModel no longer owns an inventory at this boundary.
+pub fn nativeExecutionPlan(prepared: *const host_weights.PreparedWeights, options: LoadOptions) ?@import("../execution/gemma4_native_plan.zig").Plan {
+    if (prepared.architecture != .gpt) return null;
+    const policy = @import("../execution/gemma4_native_plan.zig");
+    const explicit = platform.env.getenv("ANTFLY_INFERENCE_CUDA_GEMMA4_NATIVE_PLAN") != null;
+    const automatic = options.allow_automatic_plan and policy.automaticArtifact(prepared.architecture.gpt, if (prepared.weights.tensor_store) |store| store.ggufFile() else null);
+    return if (explicit or automatic) policy.Plan.resolve(prepared.architecture.gpt) else null;
+}
+
 pub fn prepare(
     allocator: std.mem.Allocator,
     requested_model_path: []const u8,
@@ -526,10 +543,10 @@ pub fn prepare(
     gliner_precision: GlinerCudaPrecision,
     selected_manifest: ?*const manifest_mod.ModelManifest,
 ) !PreparedCudaWeights {
-    return prepareWithHostLease(allocator, requested_model_path, override, config, load_context, a4b_request, required_profile_override, gliner_precision, selected_manifest, null);
+    return prepareWithOptions(allocator, requested_model_path, override, config, load_context, a4b_request, required_profile_override, gliner_precision, selected_manifest, .{});
 }
 
-pub fn prepareWithHostLease(
+pub fn prepareWithOptions(
     allocator: std.mem.Allocator,
     requested_model_path: []const u8,
     override: ?TaskOverride,
@@ -539,7 +556,7 @@ pub fn prepareWithHostLease(
     required_profile_override: ?CudaCapabilityProfile,
     gliner_precision: GlinerCudaPrecision,
     selected_manifest: ?*const manifest_mod.ModelManifest,
-    host_lease: ?*?@import("../runtime/tier/memory.zig").AdmissionLease,
+    options: LoadOptions,
 ) !PreparedCudaWeights {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
     const load_started_ns = platform.time.monotonicNs();
@@ -670,7 +687,7 @@ pub fn prepareWithHostLease(
         load_context,
     );
     errdefer backend_factory.closeCuda(allocator, cuda_compute);
-    if (host_lease) |slot| {
+    if (options.host_lease) |slot| {
         cuda_compute.gemma4_ple_host_lease = slot.*;
         slot.* = null;
     }
@@ -687,7 +704,7 @@ pub fn prepareWithHostLease(
     if (cuda_compute.gemma4_ple_host_lease != null and !cuda_compute.gemma4_ple_host_enabled)
         return error.InvalidCudaState;
     if (cuda_profile == .gemma4 and host_weights_owner.architecture == .gpt) {
-        cuda_compute.gemma4_native_plan = @import("../execution/gemma4_native_plan.zig").Plan.resolve(host_weights_owner.architecture.gpt);
+        cuda_compute.gemma4_native_plan = nativeExecutionPlan(&host_weights_owner, options);
         if (cuda_compute.gemma4_native_plan) |*plan| {
             cuda_compute.kernels.grouped_f16_flash_prefill = plan.flash_prefill;
             // GB10 has controlled text/image/audio/video parity and timing.

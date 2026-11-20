@@ -2986,36 +2986,33 @@ pub const Frame = struct {
     pub fn hasPreparedMetadataAlias(self: *const Frame, id: NodeId) bool {
         const selected = if (self.pool.selection) |*value| value else return false;
         if (id >= selected.plane_counts.len or selected.plane_counts[id] != 1) return false;
-        for (self.pool.metadata_aliases, 0..) |alias, index| if (index < selected.alias_enabled.len and alias.node == id and selected.alias_enabled[index]) return true;
-        return false;
+        return selected.enabledAliasIndex(id) != null;
     }
 
     fn executeMetadataAlias(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, id: NodeId) !?CT {
         const selection = if (self.pool.selection) |*value| value else return null;
-        for (self.pool.metadata_aliases, 0..) |alias, alias_index| {
-            if (alias.node != id or !selection.alias_enabled[alias_index]) continue;
-            if (id >= selection.plane_counts.len or selection.plane_counts[id] != 1) return null;
-            const functions = cb.vtable.kernels orelse return error.PreparedMetadataAliasChanged;
-            if (!functions.accepts(cb.vtable)) return error.PreparedMetadataAliasChanged;
-            var registered = false;
-            for (self.pool.backends) |backend| if (backend.ptr == cb.ptr and backend.vtable == cb.vtable) {
-                registered = true;
-                break;
-            };
-            if (!registered) return error.PreparedMetadataAliasChanged;
-            const make_alias = functions.createMetadataAlias orelse return error.PreparedMetadataAliasChanged;
-            const source = if (alias.source < values.len) values[alias.source] orelse return error.MissingValue else return error.MissingValue;
-            const incoming = selection.binding(self.pool, alias.source, selection.inputs.entries);
-            const primary = (try @import("dense_alias.zig").primary(incoming, cb.*, alias.input)) orelse return error.PreparedMetadataAliasChanged;
-            const request = @import("metadata_alias.zig").request(primary, selection.planes[id][0]);
-            const result = try make_alias(cb.ptr, source, &request);
-            // A faster Metal region/fusion may legitimately own the source
-            // outside this Frame. Without exact program credit, preserve its
-            // original retained primitive path rather than forcing a bank.
-            if (result == null and cb.kind() == .metal and self.pool.payload_coverage != .complete) return null;
-            return result orelse error.PreparedMetadataAliasChanged;
-        }
-        return null;
+        const alias_index = selection.enabledAliasIndex(id) orelse return null;
+        const alias = self.pool.metadata_aliases[alias_index];
+        if (id >= selection.plane_counts.len or selection.plane_counts[id] != 1) return null;
+        const functions = cb.vtable.kernels orelse return error.PreparedMetadataAliasChanged;
+        if (!functions.accepts(cb.vtable)) return error.PreparedMetadataAliasChanged;
+        var registered = false;
+        for (self.pool.backends) |backend| if (backend.ptr == cb.ptr and backend.vtable == cb.vtable) {
+            registered = true;
+            break;
+        };
+        if (!registered) return error.PreparedMetadataAliasChanged;
+        const make_alias = functions.createMetadataAlias orelse return error.PreparedMetadataAliasChanged;
+        const source = if (alias.source < values.len) values[alias.source] orelse return error.MissingValue else return error.MissingValue;
+        const incoming = selection.binding(self.pool, alias.source, selection.inputs.entries);
+        const primary = (try @import("dense_alias.zig").primary(incoming, cb.*, alias.input)) orelse return error.PreparedMetadataAliasChanged;
+        const request = @import("metadata_alias.zig").request(primary, selection.planes[id][0]);
+        const result = try make_alias(cb.ptr, source, &request);
+        // A faster Metal region/fusion may legitimately own the source
+        // outside this Frame. Without exact program credit, preserve its
+        // original retained primitive path rather than forcing a bank.
+        if (result == null and cb.kind() == .metal and self.pool.payload_coverage != .complete) return null;
+        return result orelse error.PreparedMetadataAliasChanged;
     }
 
     pub fn prepareNativeProgramViews(self: *Frame, cb: *const ops.ComputeBackend, graph: *const Graph, values: []?CT, cleanup: @import("cleanup_context.zig").Context) !void {
@@ -4195,7 +4192,8 @@ test "cached Native Frame refuses malformed bound input and output before math t
     std.mem.doNotOptimizeAway(&copied);
     try std.testing.expect(&copied != backend.vtable);
     const foreign = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied };
-    try std.testing.expectError(error.UnsupportedAuthoredNativeTarget, frame.executeNativeProgram(&foreign, values, output_node, null, &attention));
+    // Copied vtables fail the exact prepared-owner preflight before any authored dispatch.
+    try std.testing.expectError(error.UnpreparedNativeProgramViews, frame.executeNativeProgram(&foreign, values, output_node, null, &attention));
     lease.slot_authority.?.epoch += 1;
     const stale_output = frame.executeNativeProgram(&backend, values, output_node, null, &attention);
     lease.slot_authority.?.epoch -= 1;

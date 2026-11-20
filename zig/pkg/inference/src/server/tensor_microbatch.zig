@@ -460,41 +460,71 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
     return executeGroupMode(.host, items);
 }
 
-/// Called only after choosing physical serial execution. Queued/fused work
-/// uses its own allocator and lease, never a request-local borrowed estimate.
+/// Existing encoder/decoder stage adapter; fresh calls share the same Source
+/// owner as dispatched host calls. Explicit supplied permits keep their ABI.
 pub fn runSerial(allocator: std.mem.Allocator, session: session_mod.Session, permit: ?*session_mod.RunPermit, inputs: []const Tensor, control: ?Control) ![]Tensor {
     if (permit) |owned| return owned.runWithControl(inputs, allocator, control);
-    if (@import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(allocator)) |workspace| {
-        if (session.backend() == .native and try workspace.canBorrowRun(session, try session.planRun(inputs, null))) {
-            // An encoder and decoder can be distinct native sessions. Bind the
-            // actual callee for this scope, without retaining a temporary sink.
-            const previous = workspace.session;
-            const previous_context = workspace.admission_context;
-            try workspace.bindSession(session.withAdmissionControl(control));
-            defer {
-                workspace.session = previous;
-                workspace.admission_context = previous_context;
-            }
-            var scope = try workspace.admitRun(try session.planRun(inputs, null));
-            defer scope.deinit();
-            return scope.permit.runWithControl(inputs, allocator, control);
+    return runPreparedHost(allocator, session, session.execution_gate, inputs, control);
+}
+
+/// Fresh host dispatch shares the same Source owner as the task pipelines.
+/// Borrow only the current CPU source scratch; KV and foreign resource owners
+/// execute independently and transfer their final container after unlock.
+fn runPreparedHost(allocator: std.mem.Allocator, session: session_mod.Session, gate: ?*std.atomic.Mutex, inputs: []const Tensor, control: ?Control) ![]Tensor {
+    var request = try session.planRun(inputs, null);
+    const workspace = @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(allocator);
+    var borrowed: ?*@import("../backends/admitted_allocator.zig").AdmittedAllocator = null;
+    const previous = if (workspace) |owner| owner.session else null;
+    const previous_context = if (workspace) |owner| owner.admission_context else null;
+    defer if (borrowed) |owner| {
+        owner.session = previous;
+        owner.admission_context = previous_context;
+    };
+    if (workspace) |owner| if (session.backend() == .native and !session.preparesInvocation() and try owner.canBorrowRun(session, request)) {
+        const bound = owner.bindSession(session.withAdmissionControl(control));
+        if (bound) |_| borrowed = owner else |err| switch (err) {
+            error.ForeignAdmissionResourceOwner, error.InvalidAdmissionLeaseReduction => {},
         }
-        if (session.run_admission != null) {
-            // KV/accelerator output leases are distinct from request scratch.
-            // Execute under that owner, transferring only the small container.
-            const work = platform.allocator.concurrentFallback();
-            const outputs = try session.runWithControl(inputs, work, control);
-            errdefer destroy(work, outputs);
-            const result = try allocator.dupe(Tensor, outputs);
-            workspace.trim() catch {};
-            work.free(outputs);
-            return result;
+    };
+    if (borrowed != null) {
+        const admission = session.run_admission.?;
+        const original = try admission.planRequest(request, session.outputInfo());
+        // The original opaque work floor stays intact; this fresh Source also
+        // pays for its own allocator RunScope custody node before numerical entry.
+        const Owner = @import("../backends/admitted_allocator.zig").AdmittedAllocator;
+        // The run's ordinary IO estimate covers data payloads, but not the
+        // actual Tensor container, owned shape arrays and allocation headers.
+        // Declare those producers before entering the numerical lane too.
+        const infos = session.outputInfo();
+        var metadata = try Owner.allocationHostBytes(try std.math.mul(usize, infos.len, @sizeOf(Tensor)), .of(Tensor));
+        for (infos) |info| {
+            metadata = try std.math.add(usize, metadata, try Owner.allocationHostBytes(try std.math.mul(usize, info.shape.len, @sizeOf(i64)), .of(i64)));
+            metadata = try std.math.add(usize, metadata, Owner.allocationOverhead(.of(u64)));
         }
+        try Owner.declareRunHostAllocations(session, &request, try std.math.add(usize, original.protected.host_scratch_bytes, metadata), true);
     }
-    return session.runWithControl(inputs, allocator, control);
+    if (workspace != null and borrowed == null) try workspace.?.trim();
+    const work = if (workspace != null and borrowed == null) platform.allocator.concurrentFallback() else allocator;
+    var source: session_mod.PreparedSource = .{};
+    defer source.deinit();
+    try source.initShapesBeforeExecutionInto(session, session, gate, .{ .tensors = inputs }, request, borrowed, .host, work, control);
+    try source.bindInputsBeforeExecution(.{ .host = inputs }, .host);
+    try source.enter();
+    const outputs = try source.runHost(inputs);
+    if (workspace != null and borrowed == null) {
+        errdefer destroy(work, outputs);
+        const result = try allocator.dupe(Tensor, outputs);
+        // A refused optional shrink retains its old reservation; outputs
+        // have succeeded and must not be replayed or lose their custody.
+        workspace.?.trim() catch {};
+        work.free(outputs);
+        return result;
+    }
+    return outputs;
 }
 
 fn directMode(comptime placement: OutputPlacement, allocator: std.mem.Allocator, ticket: Ticket) !OutputType(placement) {
+    if (comptime placement == .host) if (ticket.permit == null) return runPreparedHost(allocator, ticket.session, ticket.gate, ticket.inputs, ticket.control);
     const control = ticket.control orelse Control{};
     // A caller's preprocessing/input owner remains alive independently of the
     // new exact execution. Release idle workspace before queueing ready work.

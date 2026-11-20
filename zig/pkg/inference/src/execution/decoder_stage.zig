@@ -59,6 +59,7 @@ pub const Decoder = struct {
     pub const Options = struct {
         allow_native: bool = true,
         allow_merged: bool = true,
+        compiled_cache: ?bool = null,
         output_rows: enum { final_available, full_prefix } = .final_available,
         expected_initial_query_rows: ?usize = null,
     };
@@ -71,6 +72,7 @@ pub const Decoder = struct {
     native: ?Native.State,
     options: Options,
     incremental: ?merged.State,
+    compiled: ?@import("resident_decoder.zig").Decoder = null,
 
     pub fn init(allocator: std.mem.Allocator, session: backends.Session, encoder: *const stages.EncoderOutputs, encoder_length: usize, encoder_mask: []const i64, vocab_size: usize, control: ?Control) !Decoder {
         return initWithOptions(allocator, session, encoder, encoder_length, encoder_mask, vocab_size, control, .{});
@@ -90,6 +92,8 @@ pub const Decoder = struct {
             break :blk try Native.fromResidentPrepared(session, allocator, control, try resident.retained(), .{ .expected_initial_query_rows = options.expected_initial_query_rows });
         } else if (options.allow_native and host != null) try Native.fromHostPrepared(session, allocator, control, host.?.asFloat32(), encoder_length, .{ .expected_initial_query_rows = options.expected_initial_query_rows }) else null;
         errdefer if (native) |*value| value.deinit();
+        var compiled = if (native == null and options.allow_native and host != null) try @import("resident_decoder.zig").Decoder.initEncoderDecoder(allocator, session, encoder_length, options.compiled_cache, control) else null;
+        errdefer if (compiled) |*value| value.deinit();
         return .{
             .allocator = allocator,
             .session = session,
@@ -98,13 +102,15 @@ pub const Decoder = struct {
             .vocab_size = vocab_size,
             .control = control,
             .native = native,
+            .compiled = compiled,
             .options = options,
-            .incremental = if (options.allow_merged and native == null and host != null) merged.State.init(allocator, session, host.?, encoder_mask, vocab_size) else null,
+            .incremental = if (options.allow_merged and native == null and compiled == null and host != null) merged.State.init(allocator, session, host.?, encoder_mask, vocab_size) else null,
         };
     }
 
     pub fn deinit(self: *Decoder) void {
         if (self.native) |*value| value.deinit();
+        if (self.compiled) |*value| value.deinit();
         if (self.incremental) |*value| value.deinit();
         self.* = undefined;
     }
@@ -129,6 +135,12 @@ pub const Decoder = struct {
                 row.owned_logits = try decoder.step(pending);
                 row.logits = row.owned_logits.?;
             }
+            return row;
+        }
+        if (self.compiled) |*decoder| {
+            const outputs = self.encoder.host;
+            row.owned_logits = try decoder.encoderDecoderText(prefix, outputs[0], self.encoder_mask, self.allocator, self.control);
+            row.logits = row.owned_logits.?;
             return row;
         }
         switch (self.encoder.*) {

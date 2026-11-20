@@ -73,6 +73,8 @@ pub const State = struct {
         for (outputs, executor.output_shapes) |*buffer, shape| if (!try buffer.matchesFloat32Shape(shape)) return error.InvalidResidentState;
         const logits = try outputs[0].toFloat32WithShape(a, executor.output_shapes[0]);
         errdefer a.free(logits);
+        // Reject invalid arithmetic before publishing any cache generation.
+        for (logits) |value| if (!std.math.isFinite(value)) return error.InvalidResidentDecoderOutput;
         if (control) |active| try active.check();
         // All fallible work is complete. Publish a complete bank generation;
         // the first bank moves directly from prefill, later old banks retire.

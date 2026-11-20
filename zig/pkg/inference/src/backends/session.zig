@@ -1673,6 +1673,7 @@ pub const ModelContract = struct {
     task: ?Task = null,
     /// Borrowed architecture semantics, preserved by session wrappers.
     decoder_config: ?*const @import("../models/gpt.zig").Config = null,
+    encoder_decoder_config: ?*const @import("../models/whisper.zig").Config = null,
     decoder_cache: DecoderCache = .{},
     embedding: ?Embedding = null,
     resolved: bool = false,

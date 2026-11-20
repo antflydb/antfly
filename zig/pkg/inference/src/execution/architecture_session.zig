@@ -497,7 +497,7 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
         const platform_name = try impl.backend_data.pjrt.client.?.platformName();
         impl.backend_data.pjrt.platform = if (std.ascii.eqlIgnoreCase(platform_name, "cpu") or std.ascii.eqlIgnoreCase(platform_name, "host")) .cpu else if (std.ascii.eqlIgnoreCase(platform_name, "cuda")) .cuda else .other;
         impl.backend_data.pjrt.parameters = @import("../graph/pjrt_parameters.zig").Store.init(allocator, &impl.backend_data.pjrt.client.?);
-        impl.backend_data.pjrt.residual_storage = if (impl.arch_config == .gpt and impl.backend_data.pjrt.platform == .cuda and preparation.pjrt_precision == .bf16) .f32 else .activation;
+        impl.backend_data.pjrt.residual_storage = if (impl.arch_config == .gpt and (impl.backend_data.pjrt.platform == .cuda or impl.backend_data.pjrt.platform == .cpu) and preparation.pjrt_precision == .bf16) .f32 else .activation;
     }
     const host_data = switch (preparation.backend) {
         .native => &impl.backend_data.native,
@@ -870,10 +870,10 @@ fn createCudaSessionWithRequiredProfile(
     gliner_precision: GlinerCudaPrecision,
     selected_manifest: ?*const manifest_mod.ModelManifest,
 ) !Session {
-    return createCudaSessionWithRequiredProfileAndHostLease(allocator, model_path, override, config, load_context, a4b_request, required_profile_override, gliner_precision, selected_manifest, null);
+    return createCudaSessionWithRequiredProfileAndOptions(allocator, model_path, override, config, load_context, a4b_request, required_profile_override, gliner_precision, selected_manifest, .{});
 }
 
-fn createCudaSessionWithRequiredProfileAndHostLease(
+fn createCudaSessionWithRequiredProfileAndOptions(
     allocator: std.mem.Allocator,
     model_path: []const u8,
     override: ?TaskOverride,
@@ -883,10 +883,10 @@ fn createCudaSessionWithRequiredProfileAndHostLease(
     required_profile_override: ?CudaCapabilityProfile,
     gliner_precision: GlinerCudaPrecision,
     selected_manifest: ?*const manifest_mod.ModelManifest,
-    host_lease: ?*?@import("../runtime/tier/memory.zig").AdmissionLease,
+    cuda_options: CudaLoadOptions,
 ) !Session {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
-    var prepared = try cuda_weights.prepareWithHostLease(allocator, model_path, override, config, load_context, a4b_request, required_profile_override, gliner_precision, selected_manifest, host_lease);
+    var prepared = try cuda_weights.prepareWithOptions(allocator, model_path, override, config, load_context, a4b_request, required_profile_override, gliner_precision, selected_manifest, cuda_options);
     defer prepared.deinit();
     const impl = try allocator.create(ArchSession);
     impl.* = .{
@@ -7191,6 +7191,7 @@ fn archSessionHandle(impl: *ArchSession) Session {
         .model_contract = .{
             .task = impl.task,
             .decoder_config = if (impl.arch_config == .gpt) &impl.arch_config.gpt else null,
+            .encoder_decoder_config = if (impl.arch_config == .whisper) &impl.arch_config.whisper else null,
             .decoder_cache = if (comptime build_options.enable_pjrt) if (impl.backend_type == .pjrt and impl.backend_data.pjrt.client != null)
                 @import("resident_decoder.zig").profileFor(&impl.backend_data.pjrt)
             else
@@ -7658,8 +7659,12 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
 fn archRunCachedDecoder(ptr: *anyopaque, state: *@import("resident_decoder.zig").Decoder, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) ![]Tensor {
     if (comptime !build_options.enable_pjrt) return error.PjrtNotEnabled;
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    if (self.backend_type != .pjrt or self.arch_config != .gpt or state.failed) return error.UnsupportedResidentDecode;
-    var forward = @import("../architectures/frontends/decoder.zig").resolve(&self.arch_config.gpt);
+    if (self.backend_type != .pjrt or state.failed) return error.UnsupportedResidentDecode;
+    var forward = switch (self.arch_config) {
+        .gpt => @import("../architectures/frontends/decoder.zig").resolve(&self.arch_config.gpt),
+        .whisper => @import("../architectures/frontends/whisper.zig").resolveCached(&self.arch_config.whisper),
+        else => return error.UnsupportedResidentDecode,
+    };
     forward.precision = self.backend_data.pjrt.precision;
     forward.residual_storage = self.backend_data.pjrt.residual_storage;
     forward.resident_capacity = state.capacity;
@@ -21438,10 +21443,12 @@ pub fn createSessionFromManifest(
     precision: ?GlinerCudaPrecision,
     allow_unqualified_precision: bool,
 ) !Session {
-    return createSessionFromManifestWithHostLease(allocator, model_path, manifest, backend, jit, load_context, a4b, precision, allow_unqualified_precision, null);
+    return createSessionFromManifestWithCudaOptions(allocator, model_path, manifest, backend, jit, load_context, a4b, precision, allow_unqualified_precision, .{});
 }
 
-pub fn createSessionFromManifestWithHostLease(
+pub const CudaLoadOptions = cuda_weights.LoadOptions;
+
+pub fn createSessionFromManifestWithCudaOptions(
     allocator: std.mem.Allocator,
     model_path: []const u8,
     manifest: *const manifest_mod.ModelManifest,
@@ -21451,7 +21458,7 @@ pub fn createSessionFromManifestWithHostLease(
     a4b: ?backend_contracts.A4bInferenceRequest,
     precision: ?GlinerCudaPrecision,
     allow_unqualified_precision: bool,
-    host_lease: ?*?@import("../runtime/tier/memory.zig").AdmissionLease,
+    cuda_options: CudaLoadOptions,
 ) !Session {
     return switch (backend) {
         .native => openHostSessionFromManifest(allocator, model_path, manifest, null, .{}),
@@ -21462,7 +21469,7 @@ pub fn createSessionFromManifestWithHostLease(
                 try requireQualifiedGlinerCudaPrecision(value, allow_unqualified_precision);
                 try requireGlinerCudaPrecisionManifest(manifest);
             }
-            break :blk createCudaSessionWithRequiredProfileAndHostLease(allocator, model_path, null, jit, load_context, a4b, null, precision orelse .fp32, manifest, host_lease);
+            break :blk createCudaSessionWithRequiredProfileAndOptions(allocator, model_path, null, jit, load_context, a4b, null, precision orelse .fp32, manifest, cuda_options);
         },
         else => error.UnsupportedBackend,
     };

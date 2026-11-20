@@ -113,7 +113,7 @@ fn timeMajorHidden(
 /// on the host. On Metal the whole pass is one frame on one compute
 /// encoder: the conv stem, a device transpose, and pre-norm blocks whose
 /// residual adds are folded into the following layer norm.
-fn encoderPositionIds(allocator: std.mem.Allocator, batch: usize, sequence: usize, maximum: usize) ![]i64 {
+fn rowPositionIds(allocator: std.mem.Allocator, batch: usize, sequence: usize, maximum: usize) ![]i64 {
     if (batch == 0 or sequence == 0) return error.InvalidInputShape;
     if (sequence > maximum) return error.SequenceTooLong;
     const total = std.math.mul(usize, batch, sequence) catch return error.ResourceLimitExceeded;
@@ -122,17 +122,21 @@ fn encoderPositionIds(allocator: std.mem.Allocator, batch: usize, sequence: usiz
     return ids;
 }
 
-test "tensor microbatch Whisper full context rows retain independent position IDs beyond the old stack ceiling" {
+test "tensor microbatch Whisper encoder and decoder rows retain independent position IDs beyond the old stack ceiling" {
     const a = std.testing.allocator;
-    const one = try encoderPositionIds(a, 1, 1500, 1500);
+    const one = try rowPositionIds(a, 1, 1500, 1500);
     defer a.free(one);
     for ([_]usize{ 2, 3, 4, 8 }) |rows| {
-        const ids = try encoderPositionIds(a, rows, 1500, 1500);
+        const ids = try rowPositionIds(a, rows, 1500, 1500);
         defer a.free(ids);
         for (0..rows) |row| try std.testing.expectEqualSlices(i64, one, ids[row * 1500 ..][0..1500]);
     }
-    try std.testing.expectError(error.SequenceTooLong, encoderPositionIds(std.testing.failing_allocator, 4, 1501, 1500));
-    try std.testing.expectError(error.ResourceLimitExceeded, encoderPositionIds(std.testing.failing_allocator, std.math.maxInt(usize), 1500, 1500));
+    const decoder_ids = try rowPositionIds(a, 8, 448, 448);
+    defer a.free(decoder_ids);
+    for (0..8) |row| for (0..448) |position| try std.testing.expectEqual(@as(i64, @intCast(position)), decoder_ids[row * 448 + position]);
+    try std.testing.expectError(error.OutOfMemory, rowPositionIds(std.testing.failing_allocator, 8, 448, 448));
+    try std.testing.expectError(error.SequenceTooLong, rowPositionIds(std.testing.failing_allocator, 4, 1501, 1500));
+    try std.testing.expectError(error.ResourceLimitExceeded, rowPositionIds(std.testing.failing_allocator, std.math.maxInt(usize), 1500, 1500));
 }
 
 pub fn encoderForward(
@@ -177,7 +181,7 @@ fn encoderForwardOutput(
     // Context belongs to each audio row. A fixed buffer sized for flattened
     // positions accidentally rejected three or four ordinary 30-second rows.
     const enc_time = time_steps / 2 + time_steps % 2;
-    const pos_ids = try encoderPositionIds(allocator, batch, enc_time, config.max_source_positions);
+    const pos_ids = try rowPositionIds(allocator, batch, enc_time, config.max_source_positions);
     defer allocator.free(pos_ids);
     const total = pos_ids.len;
 
@@ -443,6 +447,12 @@ pub fn decoderForwardTensor(
     return decoderForwardOutput(true, cb, allocator, config, decoder_input_ids, encoder_hidden, encoder_mask, batch, dec_seq, enc_seq);
 }
 
+/// Runtime learned positions for compiled incremental execution. The ordinary
+/// full-prefix path uses the same body with row-local generated positions.
+pub fn decoderForwardTensorAtPositions(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, ids: []const i64, positions: []const i64, encoder_hidden: CT, mask: []const i64, batch: usize, rows: usize, encoder_rows: usize) !CT {
+    return decoderForwardOutputWithPositions(true, cb, allocator, config, ids, encoder_hidden, mask, batch, rows, encoder_rows, positions);
+}
+
 fn decoderForwardOutput(
     comptime resident: bool,
     cb: *const ComputeBackend,
@@ -455,9 +465,25 @@ fn decoderForwardOutput(
     dec_seq: usize,
     enc_seq: usize,
 ) !ForwardOutput(resident) {
+    return decoderForwardOutputWithPositions(resident, cb, allocator, config, decoder_input_ids, encoder_hidden, encoder_mask, batch, dec_seq, enc_seq, null);
+}
+
+fn decoderForwardOutputWithPositions(
+    comptime resident: bool,
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    decoder_input_ids: []const i64,
+    encoder_hidden: CT,
+    encoder_mask: []const i64,
+    batch: usize,
+    dec_seq: usize,
+    enc_seq: usize,
+    supplied_positions: ?[]const i64,
+) !ForwardOutput(resident) {
     const d_model = config.d_model;
     const dec_total = try std.math.mul(usize, batch, dec_seq);
-    if (batch == 0 or dec_seq == 0 or dec_seq > config.max_target_positions or dec_total > 2048) return error.SequenceTooLong;
+    if (batch == 0 or dec_seq == 0 or dec_seq > config.max_target_positions) return error.SequenceTooLong;
 
     // 1. Token embeddings
     const embed_w = try cb.getWeight("model.decoder.embed_tokens.weight");
@@ -467,10 +493,11 @@ fn decoderForwardOutput(
     defer if (hidden_live) cb.free(hidden);
 
     // 2. Learned position embeddings
-    var pos_ids_buf: [2048]i64 = undefined;
-    if (dec_total > 2048) return error.SequenceTooLong;
-    const pos_ids = pos_ids_buf[0..dec_total];
-    for (0..dec_total) |i| pos_ids[i] = @intCast(i % dec_seq);
+    const owned_positions = if (supplied_positions == null) try rowPositionIds(allocator, batch, dec_seq, config.max_target_positions) else null;
+    defer if (owned_positions) |values| allocator.free(values);
+    const pos_ids = supplied_positions orelse owned_positions.?;
+    if (pos_ids.len != dec_total) return error.InvalidInputShape;
+    for (pos_ids) |position| if (position < 0 or position >= config.max_target_positions) return error.InvalidInputShape;
 
     const pos_w = try cb.getWeight("model.decoder.embed_positions.weight");
     defer cb.free(pos_w);

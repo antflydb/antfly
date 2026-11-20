@@ -280,6 +280,19 @@ fn encodeMessage(alloc: Allocator, parent: *wire.Buf, field: u32, value: anytype
     try wire.writeMessage(alloc, parent, field, child.items);
 }
 
+/// CompileOptionsProto layout contract. Message-valued fields merge with the
+/// provider's typed options; precision and GEMM overrides remain independent.
+pub fn encodeEntryLayoutOptions(alloc: Allocator, program: xla.ProgramShapeProto) ![]u8 {
+    var options: wire.Buf = .empty;
+    errdefer options.deinit(alloc);
+    for (program.parameters) |shape| try encodeMessage(alloc, &options, 1, shape, encodeShapeProto);
+    var build: wire.Buf = .empty;
+    defer build.deinit(alloc);
+    try encodeMessage(alloc, &build, 2, program.result, encodeShapeProto);
+    try wire.writeMessage(alloc, &options, 3, build.items);
+    return options.toOwnedSlice(alloc);
+}
+
 fn encodeLayoutProto(alloc: Allocator, buf: *wire.Buf, value: xla.LayoutProto) !void {
     if (value.minor_to_major.len > 0) try wire.writePackedInt64s(alloc, buf, 1, value.minor_to_major);
     if (value.tail_padding_alignment_in_elements != 0) {

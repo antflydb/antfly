@@ -1135,6 +1135,7 @@ pub const TracingCompute = struct {
 
     fn causalSelfAttentionOp(ctx: *anyopaque, Q: CT, K: CT, V: CT, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
         const tc = fromCtx(ctx);
+        if (tc.resident_decoder) return gqaCausalAttentionOp(ctx, Q, K, V, attn_bias, batch, seq_len, num_heads, num_heads, head_dim);
         if (tc.require_resident_outputs) return tc.denseAttention(Q, K, V, &.{}, attn_bias, batch, seq_len, seq_len, num_heads, head_dim, true, true);
         const q_id = nodeIdFromCT(Q);
         const out_shape = tc.graph.node(q_id).output_shape;
@@ -1160,6 +1161,17 @@ pub const TracingCompute = struct {
 
     fn crossAttentionOp(ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) anyerror!CT {
         const tc = fromCtx(ctx);
+        if (tc.resident_decoder) {
+            if (batch != 1 or mask.len != enc_seq) return error.UnsupportedShape;
+            const visible = try tc.maskVisibility(mask, batch, enc_seq);
+            const id = try tc.graph.addNode(.{
+                .op = .{ .fused_cross_attention = .{ .batch = @intCast(batch), .dec_seq = @intCast(dec_seq), .enc_seq = @intCast(enc_seq), .num_heads = @intCast(num_heads), .head_dim = @intCast(head_dim) } },
+                .output_shape = tc.graph.node(nodeIdFromCT(Q)).output_shape,
+                .inputs = .{ nodeIdFromCT(Q), nodeIdFromCT(K), nodeIdFromCT(V), visible.node },
+                .num_inputs = 4,
+            });
+            return tc.makeHandle(id);
+        }
         if (tc.require_resident_outputs) return tc.denseAttention(Q, K, V, mask, null, batch, dec_seq, enc_seq, num_heads, head_dim, false, true);
         const q_id = nodeIdFromCT(Q);
         const out_shape = tc.graph.node(q_id).output_shape;

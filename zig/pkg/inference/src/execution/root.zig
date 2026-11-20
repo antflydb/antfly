@@ -167,3 +167,9 @@ test {
     _ = @import("resident_rows.zig");
     _ = @import("decoder_routes.zig");
 }
+
+test {
+    _ = @import("gemma4_native_plan.zig");
+    _ = @import("resident_decoder.zig");
+    _ = @import("decoder_checkpoint.zig");
+}

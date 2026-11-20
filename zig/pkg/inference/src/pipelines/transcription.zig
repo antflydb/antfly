@@ -44,6 +44,7 @@ const InferenceExecutionControl = @import("../execution_control.zig").InferenceE
 pub const TranscribeConfig = struct {
     vocab_size: usize = 51865,
     max_length: usize = 448,
+    pjrt_decoder_cache: ?bool = null,
     /// Per audio item, including all windows, temperature retries, timestamps
     /// and EOS. Exhaustion returns a retained prefix marked truncated.
     max_output_tokens: ?usize = null,
@@ -650,9 +651,9 @@ pub const TranscriptionPipeline = struct {
         // exact same operation as later iterations. Dynamic slots stay pending.
         whisper_prompt.appendKnownForced(dec_ids, &dec_len, forced, &forced_index, offset);
         const initial_query_rows: ?usize = if (dec_len < max_len and !(dec_len >= prompt_end and self.output_token_budget.remaining == 0)) dec_len else null;
-        var decoder_runtime = try decoder_stage.Decoder.initWithSource(allocator, self.decoder, encoder_output, enc_seq_len, enc_mask, self.config.vocab_size, self.execution_control, .{ .expected_initial_query_rows = initial_query_rows }, incremental_source);
+        var decoder_runtime = try decoder_stage.Decoder.initWithSource(allocator, self.decoder, encoder_output, enc_seq_len, enc_mask, self.config.vocab_size, self.execution_control, .{ .expected_initial_query_rows = initial_query_rows, .compiled_cache = self.config.pjrt_decoder_cache }, incremental_source);
         defer decoder_runtime.deinit();
-        timing.kv_cached = decoder_runtime.native != null;
+        timing.kv_cached = decoder_runtime.native != null or decoder_runtime.compiled != null;
         // Suppression list handed to the device token-choice kernel.
         var suppress_scratch = std.ArrayListUnmanaged(i32).empty;
         defer suppress_scratch.deinit(allocator);

@@ -2574,19 +2574,22 @@ test "prepared vendor descriptor ownership survives source retirement and every 
         const key = blas.tensorCoreKey(kind, CUDA_R_16F, CUDA_R_32F, 1, 3, 32, 16, 4096, .{}, invocation);
         // Exercise the actual descriptor builder on each failing SDK call,
         // not a mirror of its cleanup logic or an allocator-only simulation.
-        var failure: usize = 1;
-        while (true) : (failure += 1) {
-            Fake.reset(failure);
-            const result = blas.createTensorCoreDescriptors(key, invocation);
-            if (result) |plan| {
-                try std.testing.expect(failure > Fake.calls);
-                try std.testing.expectEqual(@as(usize, 5), Fake.count());
-                blas.destroyTensorCorePlan(plan);
-                try std.testing.expectEqual(@as(usize, 0), Fake.count());
-                break;
-            } else |err| {
-                try std.testing.expectEqual(error.CublasLtError, err);
-                try std.testing.expectEqual(@as(usize, 0), Fake.count());
+        for ([_]Status{ CUBLAS_STATUS_NOT_SUPPORTED, 3 }) |failure_status| {
+            var failure: usize = 1;
+            while (true) : (failure += 1) {
+                Fake.reset(failure);
+                Fake.failure_status = failure_status;
+                const result = blas.createTensorCoreDescriptors(key, invocation);
+                if (result) |plan| {
+                    try std.testing.expect(failure > Fake.calls);
+                    try std.testing.expectEqual(@as(usize, 5), Fake.count());
+                    blas.destroyTensorCorePlan(plan);
+                    try std.testing.expectEqual(@as(usize, 0), Fake.count());
+                    break;
+                } else |err| {
+                    try std.testing.expectEqual(if (failure_status == CUBLAS_STATUS_NOT_SUPPORTED) error.CublasLtUnsupported else error.CublasLtError, err);
+                    try std.testing.expectEqual(@as(usize, 0), Fake.count());
+                }
             }
         }
         Fake.reset(0);

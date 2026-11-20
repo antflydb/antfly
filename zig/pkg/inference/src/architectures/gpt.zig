@@ -1355,7 +1355,7 @@ pub fn forwardLastLogitsLastRowTensorFromEmbeddingsWithLayer0Overrides(
 ) !CT {
     const output: SharedKvPrefillOutput = if (batch == 1 and cb.kind() == .cuda and
         (getenvBool("ANTFLY_INFERENCE_CUDA_MULTIMODAL_SHARED_KV_PREFILL") or
-            @import("../execution/gemma4_native_plan.zig").selected() != null or
+            @import("../ops/cuda/cuda_compute.zig").CudaCompute.nativePrefillPolicySelected(cb) or
             (@import("../ops/cuda/cuda_compute.zig").CudaCompute.gemma4SharedKvPrefillEnabled(cb) and
                 platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_PREPARED_SHARED_KV_PREFILL", true) and
                 preparedSharedKvPrefillEligible(config, overrides, batch, seq_len, decode_context))) and !disableSharedKvDebug() and
@@ -3243,6 +3243,12 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     output: SharedKvPrefillOutput,
     final_norm: bool,
 ) anyerror!HiddenTensorResult {
+    var hidden = hidden_input;
+    var owns_hidden = true;
+    errdefer if (owns_hidden) cb.free(hidden);
+    // Ownership transfers before every fallible preparation step. Positioned
+    // absolute embeddings obey the declared context, not a historical stack size.
+    if (config.position_encoding == .absolute and seq_len > config.max_position_embeddings) return error.SequenceTooLong;
     var forward_kv: ?@import("../execution/forward_kv_reuse.zig").Scope = null;
     defer if (forward_kv) |*scope| scope.deinit();
     var complete_context = if (provided_decode_context) |context| context.* else DecodeContext{ .total_sequence_len = seq_len, .query_sequence_len = seq_len, .kv_sequence_len = seq_len };
@@ -3256,10 +3262,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     try validateDecoderForwardCleanup(cb, overrides.cleanup, decode_context);
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
-    var total = batch * query_seq_len;
-    var hidden = hidden_input;
-    var owns_hidden = true;
-    errdefer if (owns_hidden) cb.free(hidden);
+    var total = try std.math.mul(usize, batch, query_seq_len);
     try validatePackedQwenContext(config, batch, query_seq_len, decode_context);
     // Both full-row consumers (including text/MTP) and last-row media consumers
     // enter the same functional prefix owner. Its output ABI is specialized;

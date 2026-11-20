@@ -176,5 +176,6 @@ pub const getGlinerDecideMetalExecutionPolicy = implementation.getGlinerDecideMe
 pub const getGlinerMetalRuntimeStats = implementation.getGlinerMetalRuntimeStats;
 pub const cudaPleHostBytes = implementation.cudaPleHostBytes;
 pub const cudaPleHostBytesForPolicy = implementation.cudaPleHostBytesForPolicy;
-pub const createSessionFromManifestWithHostLease = implementation.createSessionFromManifestWithHostLease;
+pub const CudaLoadOptions = implementation.CudaLoadOptions;
+pub const createSessionFromManifestWithCudaOptions = implementation.createSessionFromManifestWithCudaOptions;
 pub const getGlinerDecideExecutionBatchPolicy = implementation.getGlinerDecideExecutionBatchPolicy;

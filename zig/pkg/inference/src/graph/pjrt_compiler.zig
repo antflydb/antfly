@@ -54,6 +54,7 @@ const partition_export = @import("partition_export.zig");
 pub const CompileResult = struct {
     /// Serialized HloModuleProto bytes.
     hlo_bytes: []u8,
+    entry_layout_options: ?[]u8 = null,
     /// Full input bindings, ordered to match HLO parameters.
     input_bindings: []InputBinding,
     /// External input node IDs, ordered to match HLO parameters.
@@ -71,6 +72,7 @@ pub const CompileResult = struct {
 
     pub fn deinit(self: *CompileResult) void {
         self.allocator.free(self.hlo_bytes);
+        if (self.entry_layout_options) |bytes| self.allocator.free(bytes);
         self.allocator.free(self.input_bindings);
         self.allocator.free(self.input_node_ids);
         self.allocator.free(self.output_node_ids);
@@ -86,6 +88,8 @@ pub const InputBinding = union(enum) {
 };
 
 pub const CompileOptions = struct {
+    /// Stable CUDA decode reductions; activations and affine math remain F32.
+    wide_single_row_norm: bool = false,
     precision: @import("../execution/precision.zig").Policy = .f32,
     /// Request-private fixed-capacity state. Position is a runtime scalar;
     /// no sequence-length-specialized decode executables or host KV readbacks.
@@ -174,6 +178,21 @@ pub fn compilePartitionWithOptions(
     var max_reducer_comp = max_reducer.build();
     max_reducer_comp.id = max_reducer_comp_id;
 
+    const wide_reducer_id: hlo.Id = 3_000_000;
+    var wide_add = hlo.Builder.init(allocator, "wide_norm_sum");
+    defer wide_add.deinit();
+    var wide_reducer: ?hlo.Computation = null;
+    if (options.wide_single_row_norm) {
+        wide_add.next_id = wide_reducer_id + 1;
+        wide_add.base_id = wide_add.next_id;
+        const wide_left = try wide_add.parameter(0, hlo.Shape.scalar(.f64), "lhs");
+        const wide_right = try wide_add.parameter(1, hlo.Shape.scalar(.f64), "rhs");
+        _ = try wide_add.add(wide_left, wide_right);
+        wide_reducer = wide_add.build();
+        wide_reducer.?.id = wide_reducer_id;
+    }
+    var needs_wide_norm = false;
+
     var b = hlo.Builder.init(allocator, "main");
     if (options.precision == .bf16) {
         b.matrix_operand_type = .bf16;
@@ -192,6 +211,40 @@ pub fn compilePartitionWithOptions(
 
     var next_param: u32 = 0;
 
+    const ordinary_outputs = try computeOutputsWithOptions(allocator, graph, &part_set, part.node_ids, options);
+    defer allocator.free(ordinary_outputs);
+    // On resident decode, immutable cross K/V are boundary operands. Stop
+    // reachability there before emitting/uploading their encoder ancestors.
+    const prune_cross_state = cross: {
+        if (options.resident_capacity == 0 or options.resident_initial) break :cross false;
+        for (part.node_ids) |id| if (graph.node(id).op == .fused_cross_attention) break :cross true;
+        break :cross false;
+    };
+    const needed = if (prune_cross_state) try allocator.alloc(bool, count) else null;
+    defer if (needed) |reachable| allocator.free(reachable);
+    if (needed) |reachable| {
+        @memset(reachable, false);
+        var pending: std.ArrayListUnmanaged(NodeId) = .empty;
+        defer pending.deinit(allocator);
+        for (ordinary_outputs) |output| {
+            if (!reachable[output]) {
+                reachable[output] = true;
+                try pending.append(allocator, output);
+            }
+        }
+        while (pending.pop()) |id| {
+            const node = graph.node(id);
+            for (node.getInputs(), 0..) |input, edge| {
+                if (input == null_node or (node.op == .fused_cross_attention and (edge == 1 or edge == 2))) continue;
+                if (input >= count) return error.UnsupportedShape;
+                if (!reachable[input]) {
+                    reachable[input] = true;
+                    try pending.append(allocator, input);
+                }
+            }
+        }
+    }
+
     // ── 1. Create HLO parameters for external inputs ────────────
 
     var input_bindings_list = std.ArrayListUnmanaged(InputBinding).empty;
@@ -202,6 +255,7 @@ pub fn compilePartitionWithOptions(
     defer semantic_past_inputs.deinit(allocator);
 
     for (part.external_inputs) |ext_in| {
+        if (needed) |reachable| if (!reachable[ext_in.node_id]) continue;
         const n = graph.node(ext_in.node_id);
         if (try emitEmbeddingIdsInputBinding(
             allocator,
@@ -298,6 +352,7 @@ pub fn compilePartitionWithOptions(
     const log_lowering_errors = @import("antfly_platform").env.getenvBool("TERMITE_PJRT_EXEC_DEBUG");
     for (part.node_ids) |node_id| {
         const nid: usize = @intCast(node_id);
+        if (needed) |reachable| if (!reachable[nid]) continue;
         const n = graph.node(node_id);
         errdefer if (log_lowering_errors) std.log.warn("PJRT HLO lowering failed: node={d} op={s} shape={any}", .{ node_id, @tagName(n.op), n.output_shape.dims[0..n.output_shape.rank()] });
         const ins = n.getInputs();
@@ -453,7 +508,10 @@ pub fn compilePartitionWithOptions(
                 const x = try getHloId(node_map, ins[0]);
                 const gamma = try getHloId(node_map, ins[1]);
                 const beta = try getHloId(node_map, ins[2]);
-                node_map[nid] = try emitLayerNorm(&b, x, gamma, beta, attrs.eps, &reducer_comp);
+                const norm_elements = n.output_shape.numElements() orelse return error.UnsupportedShape;
+                const wide = if (options.wide_single_row_norm and norm_elements == attrs.dim) &wide_reducer.? else null;
+                node_map[nid] = try emitLayerNorm(&b, x, gamma, beta, attrs.eps, &reducer_comp, wide);
+                needs_wide_norm = needs_wide_norm or wide != null;
                 needs_reducer = true;
             },
 
@@ -559,6 +617,19 @@ pub fn compilePartitionWithOptions(
                 );
             },
 
+            .fused_cross_attention => |attrs| {
+                if (resident.capacity == 0 or attrs.batch != 1 or ins.len != 4) return error.UnsupportedResidentDecode;
+                try resident.queryRows(attrs.dec_seq);
+                const shape = hlo.Shape.init(.f32, &.{ attrs.enc_seq, @as(i64, attrs.num_heads) * attrs.head_dim });
+                const key = if (options.resident_initial) try getHloId(node_map, ins[1]) else try resident.input(allocator, &b, &input_bindings_list, &next_param, ins[1], shape);
+                const value = if (options.resident_initial) try getHloId(node_map, ins[2]) else try resident.input(allocator, &b, &input_bindings_list, &next_param, ins[2], shape);
+                try resident.output(allocator, ins[1], key);
+                try resident.output(allocator, ins[2], value);
+                node_map[nid] = try emitResidentCrossAttention(&b, n, try getHloId(node_map, ins[0]), key, value, try getHloId(node_map, ins[3]), attrs, &reducer_comp, &max_reducer_comp, options.precision == .bf16);
+                needs_reducer = true;
+                needs_max_reducer = true;
+            },
+
             .fused_gqa_causal_attention => |attrs| {
                 const q = try getHloId(node_map, ins[0]);
                 const k = try getHloId(node_map, ins[1]);
@@ -643,8 +714,6 @@ pub fn compilePartitionWithOptions(
 
     // ── 3. Determine partition outputs ──────────────────────────
 
-    const ordinary_outputs = try computeOutputsWithOptions(allocator, graph, &part_set, part.node_ids, options);
-    defer allocator.free(ordinary_outputs);
     const output_node_ids = try allocator.alloc(NodeId, ordinary_outputs.len + resident.outputs.items.len);
     errdefer allocator.free(output_node_ids);
     @memcpy(output_node_ids[0..ordinary_outputs.len], ordinary_outputs);
@@ -667,8 +736,11 @@ pub fn compilePartitionWithOptions(
     defer aux_list.deinit(allocator);
     if (needs_reducer) try aux_list.append(allocator, reducer_comp);
     if (needs_max_reducer) try aux_list.append(allocator, max_reducer_comp);
+    if (needs_wide_norm) try aux_list.append(allocator, wide_reducer.?);
     for (recurrent_programs.items) |program| try aux_list.appendSlice(allocator, &program.computations());
     const module = hlo.Module.initWithAux("partition", comp, aux_list.items);
+    const entry_layout_options = if (resident.capacity != 0) try module.serializeEntryLayoutOptions(allocator) else null;
+    errdefer if (entry_layout_options) |bytes| allocator.free(bytes);
     const hlo_bytes = try module.serialize(allocator);
     errdefer allocator.free(hlo_bytes);
     const input_bindings = try input_bindings_list.toOwnedSlice(allocator);
@@ -691,6 +763,7 @@ pub fn compilePartitionWithOptions(
 
     return .{
         .hlo_bytes = hlo_bytes,
+        .entry_layout_options = entry_layout_options,
         .input_bindings = input_bindings,
         .input_node_ids = input_node_ids,
         .output_node_ids = output_node_ids,
@@ -701,6 +774,34 @@ pub fn compilePartitionWithOptions(
         .resident_query_rows = resident.rows,
         .resident_dynamic_rows = resident.valid_rows != null,
     };
+}
+
+/// Fixed immutable cross banks share the existing head layout and reduction
+/// programs. Visibility remains dynamic, including masked NaNs and empty rows.
+fn emitResidentCrossAttention(b: *hlo.Builder, node: *const Node, q: hlo.Id, k: hlo.Id, v: hlo.Id, visibility: hlo.Id, attrs: ml.graph.node.CrossAttentionAttrs, add: *const hlo.Computation, maximum: *const hlo.Computation, bf16: bool) !hlo.Id {
+    const heads: i64 = attrs.num_heads;
+    const rows: i64 = attrs.dec_seq;
+    const keys: i64 = attrs.enc_seq;
+    const dim: i64 = attrs.head_dim;
+    const qh = try reshapeAttentionInputToHeads(b, q, rows, heads, dim);
+    const kh = try reshapeAttentionInputToHeads(b, k, keys, heads, dim);
+    var vh = try reshapeAttentionInputToHeads(b, v, keys, heads, dim);
+    const scores_shape = hlo.Shape.init(.f32, &.{ heads, rows, keys });
+    var scores = try b.dot(qh, try b.transpose(kh, &.{ 0, 2, 1 }, hlo.Shape.init(.f32, &.{ heads, dim, keys })), scores_shape, .{ .lhs_contracting_dimensions = &.{2}, .rhs_contracting_dimensions = &.{1}, .lhs_batch_dimensions = &.{0}, .rhs_batch_dimensions = &.{0} });
+    scores = try b.multiply(scores, try b.constantScalarF32(1 / @sqrt(@as(f32, @floatFromInt(dim)))));
+    const mask = try b.reshape(visibility, hlo.Shape.init(.pred, &.{keys}));
+    const visible = try b.broadcast(mask, &.{2}, hlo.Shape.init(.pred, scores_shape.dimensions));
+    scores = try b.select(visible, scores, try b.broadcast(try b.constantScalarF32(-std.math.inf(f32)), &.{}, scores_shape));
+    const value_shape = hlo.Shape.init(.f32, &.{ heads, keys, dim });
+    vh = try b.select(try b.broadcast(mask, &.{1}, hlo.Shape.init(.pred, value_shape.dimensions)), vh, try b.broadcast(try b.constantScalarF32(0), &.{}, value_shape));
+    const reduced = hlo.Shape.init(.f32, &.{ heads, rows });
+    const max_value = try b.maximum(try b.reduce(scores, try b.constantScalarF32(-std.math.inf(f32)), &.{2}, reduced, maximum.id), try b.constantScalarF32(-std.math.floatMax(f32)));
+    const exp = try b.exponential(try b.subtract(scores, try b.broadcast(max_value, &.{ 0, 1 }, scores_shape)));
+    const sums = try b.maximum(try b.reduce(exp, try b.constantScalarF32(0), &.{2}, reduced, add.id), try b.constantScalarF32(1));
+    var probabilities = try b.divide(exp, try b.broadcast(sums, &.{ 0, 1 }, scores_shape));
+    if (bf16) probabilities = try roundBf16(b, probabilities, true);
+    const attended = try b.dot(probabilities, vh, hlo.Shape.init(.f32, &.{ heads, rows, dim }), .{ .lhs_contracting_dimensions = &.{2}, .rhs_contracting_dimensions = &.{1}, .lhs_batch_dimensions = &.{0}, .rhs_batch_dimensions = &.{0} });
+    return b.reshape(try b.transpose(attended, &.{ 1, 0, 2 }, hlo.Shape.init(.f32, &.{ rows, heads, dim })), graphShapeToHlo(node));
 }
 
 const ResidentLowering = struct {
@@ -749,7 +850,7 @@ fn residentRange(a: Allocator, b: *hlo.Builder, count: i64) !hlo.Id {
     return b.constantS32(hlo.Shape.init(.s32, &.{count}), values);
 }
 
-fn emitResidentMask(a: Allocator, b: *hlo.Builder, heads: i64, rows: i64, keys: i64, window: u32, position: hlo.Id, visibility: ?[]const u8) !hlo.Id {
+fn emitResidentVisibility(a: Allocator, b: *hlo.Builder, heads: i64, rows: i64, keys: i64, window: u32, position: hlo.Id, visibility: ?[]const u8) !hlo.Id {
     const grid = hlo.Shape.init(.s32, &.{ rows, keys });
     const query = try b.broadcast(try b.add(try residentRange(a, b, rows), try b.convertType(position, .s32)), &.{0}, grid);
     const key = try b.broadcast(try residentRange(a, b, keys), &.{1}, grid);
@@ -768,9 +869,7 @@ fn emitResidentMask(a: Allocator, b: *hlo.Builder, heads: i64, rows: i64, keys: 
         const span = try b.broadcast(try b.constantS32(hlo.Shape.scalar(.s32), &.{@intCast(window - 1)}), &.{}, grid);
         allowed = try b.logicalAnd(allowed, try b.compare(key, try b.subtract(query, span), "GE"));
     }
-    const floats = hlo.Shape.init(.f32, &.{ rows, keys });
-    const mask = try b.select(allowed, try b.broadcast(try b.constantScalarF32(0), &.{}, floats), try b.broadcast(try b.constantScalarF32(-1e9), &.{}, floats));
-    return b.broadcast(mask, &.{ 1, 2 }, hlo.Shape.init(.f32, &.{ heads, rows, keys }));
+    return b.broadcast(allowed, &.{ 1, 2 }, hlo.Shape.init(.pred, &.{ heads, rows, keys }));
 }
 
 fn roundBf16(b: *hlo.Builder, id: hlo.Id, enabled: bool) !hlo.Id {
@@ -858,28 +957,33 @@ fn emitRmsNorm(b: *hlo.Builder, x: hlo.Id, gamma: hlo.Id, eps: f32, reducer: *co
 }
 
 /// Layer norm: (x - mean) * rsqrt(var + eps) * gamma + beta
-fn emitLayerNorm(b: *hlo.Builder, x: hlo.Id, gamma: hlo.Id, beta: hlo.Id, eps: f32, reducer: *const hlo.Computation) !hlo.Id {
-    const x_shape = b.getInst(x).shape;
+fn emitLayerNorm(b: *hlo.Builder, x: hlo.Id, gamma: hlo.Id, beta: hlo.Id, eps: f32, reducer: *const hlo.Computation, wide: ?*const hlo.Computation) !hlo.Id {
+    const input = if (wide != null) try b.convertType(x, .f64) else x;
+    const x_shape = b.getInst(input).shape;
+    const reduction = wide orelse reducer;
     const rank = x_shape.dimensions.len;
     const last_dim_size = x_shape.dimensions[rank - 1];
-    const dim_size_f = try b.constantScalarF32(@floatFromInt(last_dim_size));
-    const eps_const = try b.constantScalarF32(eps);
+    const size = try b.constantScalarF32(@floatFromInt(last_dim_size));
+    const dim_size_f = if (wide != null) try b.convertType(size, .f64) else size;
+    const epsilon = try b.constantScalarF32(eps);
+    const eps_const = if (wide != null) try b.convertType(epsilon, .f64) else epsilon;
 
     const reduced_shape = reducedShape(x_shape, rank);
-    const zero = try b.constantScalarF32(0.0);
+    const zero_f32 = try b.constantScalarF32(0.0);
+    const zero = if (wide != null) try b.convertType(zero_f32, .f64) else zero_f32;
     const reduce_dims: []const i64 = &.{@as(i64, @intCast(rank - 1))};
 
     // mean(x)
-    const sum_x = try b.reduce(x, zero, reduce_dims, reduced_shape, reducer.id);
+    const sum_x = try b.reduce(input, zero, reduce_dims, reduced_shape, reduction.id);
     const mean_x = try b.divide(sum_x, dim_size_f);
     const mean_bc = try b.broadcast(mean_x, broadcastDimsExceptLast(rank), x_shape);
 
     // x - mean
-    const centered = try b.subtract(x, mean_bc);
+    const centered = try b.subtract(input, mean_bc);
 
     // var = mean((x - mean)^2)
     const centered_sq = try b.multiply(centered, centered);
-    const sum_sq = try b.reduce(centered_sq, zero, reduce_dims, reduced_shape, reducer.id);
+    const sum_sq = try b.reduce(centered_sq, zero, reduce_dims, reduced_shape, reduction.id);
     const var_x = try b.divide(sum_sq, dim_size_f);
 
     // rsqrt(var + eps)
@@ -889,7 +993,8 @@ fn emitLayerNorm(b: *hlo.Builder, x: hlo.Id, gamma: hlo.Id, beta: hlo.Id, eps: f
 
     // (x - mean) * rsqrt(var + eps) * gamma + beta
     const normed = try b.multiply(centered, inv_std_bc);
-    const scaled = try b.multiply(normed, gamma);
+    const published = if (wide != null) try b.convertType(normed, .f32) else normed;
+    const scaled = try b.multiply(published, gamma);
     return b.add(scaled, beta);
 }
 
@@ -1544,7 +1649,10 @@ fn emitStaticGqaAttention(
     const scale = try b.constantScalarF32(1.0 / @sqrt(@as(f32, @floatFromInt(attrs.head_dim))));
     scores = try b.multiply(scores, scale);
     if (runtime_position) |position| {
-        scores = try b.add(scores, try emitResidentMask(allocator, b, num_heads, q_len, kv_len, attrs.sliding_window orelse 0, position, visibility));
+        // Padding is absent from the softmax domain, independently of score
+        // magnitude. A finite additive sentinel can outrank valid logits.
+        const allowed = try emitResidentVisibility(allocator, b, num_heads, q_len, kv_len, attrs.sliding_window orelse 0, position, visibility);
+        scores = try b.select(allowed, scores, try b.broadcast(try b.constantScalarF32(-std.math.inf(f32)), &.{}, b.getInst(scores).shape));
     } else if (past_k == null or (attrs.sliding_window orelse 0) != 0) {
         scores = try b.add(scores, try emitCausalMask(allocator, b, num_heads, q_len, kv_len, attrs.sliding_window orelse 0));
     }
@@ -2331,4 +2439,98 @@ test "PJRT compiler keeps uniform activation constants compact" {
     var compiled = try compilePartition(a, &graph, &partition, &backend);
     defer compiled.deinit();
     try std.testing.expect(compiled.hlo_bytes.len < 4096);
+}
+
+test "PJRT resident causal mask excludes padding below finite score sentinels" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = GraphBuilder.init(&graph);
+    const shape = Shape.init(.f32, &.{ 1, 2 });
+    const q = try builder.parameter("q", shape);
+    const k = try builder.parameter("k", shape);
+    const v = try builder.parameter("v", shape);
+    const attention = try graph.addNode(.{
+        .op = .{ .fused_gqa_causal_attention = .{ .batch = 1, .seq_len = 1, .num_heads = 1, .num_kv_heads = 1, .head_dim = 2 } },
+        .output_shape = shape,
+        .inputs = .{ q, k, v, null_node },
+        .num_inputs = 3,
+    });
+    try graph.markOutput(attention);
+    const external = [_]partition_mod.ExternalInput{ .{ .node_id = q, .source_partition = 0 }, .{ .node_id = k, .source_partition = 0 }, .{ .node_id = v, .source_partition = 0 } };
+    const part = Partition{ .backend = .pjrt, .node_ids = &.{attention}, .external_inputs = &external };
+    const fake: ComputeBackend = undefined;
+    var result = try compilePartitionWithOptions(a, &graph, &part, &fake, .{ .resident_capacity = 4 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 6), result.input_bindings.len);
+    var client = pjrt.pjrt.Client.initFromEnv(a) catch |err| switch (err) {
+        error.PjrtPluginNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer client.deinit();
+    var executable = try client.compileWithEntryLayouts(result.hlo_bytes, result.output_shapes.len, client.device, result.entry_layout_options.?, a);
+    defer executable.deinit();
+    var query = try client.bufferFromHostFloat32(&.{ 1, 1 }, &.{ 1, 2 });
+    defer query.deinit();
+    var key = try client.bufferFromHostFloat32(&.{ -2e9, -2e9 }, &.{ 1, 2 });
+    defer key.deinit();
+    var value = try client.bufferFromHostFloat32(&.{ 3, 7 }, &.{ 1, 2 });
+    defer value.deinit();
+    var position = try client.bufferFromHostFloat32(&.{1}, &.{});
+    defer position.deinit();
+    var past_key = try client.bufferFromHostFloat32(&.{ -2e9, -2e9, 0, 0, 0, 0, 0, 0 }, &.{ 4, 2 });
+    defer past_key.deinit();
+    var past_value = try client.bufferFromHostFloat32(&.{ 3, 7, 0, 0, 0, 0, 0, 0 }, &.{ 4, 2 });
+    defer past_value.deinit();
+    const outputs = try executable.execute(&.{ query, key, value, position, past_key, past_value }, a);
+    defer a.free(outputs);
+    defer for (outputs) |*output| output.deinit();
+    const actual = try outputs[0].toFloat32WithShape(a, &.{ 1, 2 });
+    defer a.free(actual);
+    try std.testing.expectApproxEqAbs(@as(f32, 3), actual[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 7), actual[1], 1e-6);
+}
+
+test "PJRT stable single query normalization preserves small variance at large offsets" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = GraphBuilder.init(&graph);
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ 1, 4 }));
+    const gamma = try builder.parameter("gamma", Shape.init(.f32, &.{4}));
+    const beta = try builder.parameter("beta", Shape.init(.f32, &.{4}));
+    const norm = try graph.addNode(.{ .op = .{ .fused_layer_norm = .{ .dim = 4, .eps = 1e-5 } }, .output_shape = Shape.init(.f32, &.{ 1, 4 }), .inputs = .{ x, gamma, beta, null_node }, .num_inputs = 3 });
+    try graph.markOutput(norm);
+    const external = [_]partition_mod.ExternalInput{ .{ .node_id = x, .source_partition = 0 }, .{ .node_id = gamma, .source_partition = 0 }, .{ .node_id = beta, .source_partition = 0 } };
+    const part = Partition{ .backend = .pjrt, .node_ids = &.{norm}, .external_inputs = &external };
+    const fake: ComputeBackend = undefined;
+    var result = try compilePartitionWithOptions(a, &graph, &part, &fake, .{ .wide_single_row_norm = true });
+    defer result.deinit();
+    var client = pjrt.pjrt.Client.initFromEnv(a) catch |err| switch (err) {
+        error.PjrtPluginNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer client.deinit();
+    var executable = try client.compile(result.hlo_bytes, 1);
+    defer executable.deinit();
+    const values = [_]f32{ 65536, 65536.0078125, 65536.015625, 65536.0234375 };
+    var input = try client.bufferFromHostFloat32(&values, &.{ 1, 4 });
+    defer input.deinit();
+    var scale = try client.bufferFromHostFloat32(&.{ 1, 1, 1, 1 }, &.{4});
+    defer scale.deinit();
+    var bias = try client.bufferFromHostFloat32(&.{ 0, 0, 0, 0 }, &.{4});
+    defer bias.deinit();
+    const outputs = try executable.execute(&.{ input, scale, bias }, a);
+    defer a.free(outputs);
+    defer for (outputs) |*output| output.deinit();
+    const actual = try outputs[0].toFloat32WithShape(a, &.{ 1, 4 });
+    defer a.free(actual);
+    var mean: f64 = 0;
+    for (values) |value| mean += value;
+    mean /= values.len;
+    var variance: f64 = 0;
+    for (values) |value| variance += (@as(f64, value) - mean) * (@as(f64, value) - mean);
+    variance /= values.len;
+    const inverse = 1 / @sqrt(variance + @as(f64, @as(f32, 1e-5)));
+    for (values, actual) |value, got| try std.testing.expectApproxEqAbs(@as(f32, @floatCast((@as(f64, value) - mean) * inverse)), got, 1e-6);
 }

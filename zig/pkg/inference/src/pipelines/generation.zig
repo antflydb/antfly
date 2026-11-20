@@ -355,9 +355,9 @@ pub fn nativeGenerationPrefillChunkCeiling(
     configured_ceiling: usize,
 ) usize {
     const ceiling = @max(configured_ceiling, 1);
-    if (backend == .cuda and @import("../execution/gemma4_native_plan.zig").selected() != null) {
-        if (@import("../execution/gemma4_native_plan.zig").Geometry.resolve(config)) |geometry|
-            return @min(ceiling, geometry.prefillQueryLimit());
+    if (backend == .cuda) {
+        if (@import("../execution/gemma4_native_plan.zig").Plan.resolve(config)) |plan|
+            return @min(ceiling, plan.geometry.prefillQueryLimit());
     }
     if (backend == .metal and
         config.family == .gemma and
@@ -4972,8 +4972,8 @@ pub const NativeGenerationPipeline = struct {
                     decoder_routes.metalPreparedEmbeddingChunkRows(self.gpt_config, 0) orelse 0
                 else if (comptime build_options.enable_cuda) bounded: {
                     if (self.cb.kind() == .cuda) {
-                        if (@import("../execution/gemma4_native_plan.zig").Plan.resolve(self.gpt_config)) |plan|
-                            break :bounded plan.geometry.prefillChunkRows(seq_len, 0);
+                        if (@import("../ops/cuda/cuda_compute.zig").CudaCompute.nativePrefillChunkRows(&self.cb, seq_len, 0)) |rows|
+                            break :bounded rows;
                     }
                     break :bounded 0;
                 } else 0,
@@ -13719,14 +13719,15 @@ test "prepared embeddings prefill releases its rows once when the generic forwar
     var model: PreparedEmbeddingsTestModel = undefined;
     model.init(allocator);
     defer model.deinit(allocator);
-    // Absolute positions cap the query rows at 2048 before any weight is
-    // touched, after the forward has already taken ownership.
+    // The declared absolute context is checked before weights are touched,
+    // after the forward has already taken ownership.
     var pipeline = model.pipeline(allocator, .{
         .family = .llama,
         .hidden_size = 4,
         .vocab_size = 6,
         .num_hidden_layers = 0,
         .position_encoding = .absolute,
+        .max_position_embeddings = 2048,
     });
     const rows: usize = 2049;
     const input = try preparedEmbeddingsTestRows(&pipeline.cb, allocator, rows, 4);

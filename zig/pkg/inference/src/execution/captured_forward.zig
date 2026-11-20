@@ -407,6 +407,16 @@ pub const Cache = struct {
         for (inputs) |input| {
             for (entry.program.bindings) |binding| {
                 if (binding.kind != .input or !std.mem.eql(u8, binding.name, input.tensor.name) or binding.node_id == @import("ml").graph.null_node) continue;
+                // Immutable cross-KV decode has no runtime encoder operand.
+                // Avoid even the host import/copy for graph inputs removed by
+                // the compiled ABI; request state supplies those values instead.
+                const required = for (entry.resident.?.input_bindings) |operand| {
+                    switch (operand) {
+                        .graph_node, .embedding_ids => |id| if (id == binding.node_id) break true,
+                        .semantic_past_graph_node => {},
+                    }
+                } else false;
+                if (!required) continue;
                 values[binding.node_id] = try provider.import(provider.context, &frame.backend, &input.tensor, allocator);
             }
         }

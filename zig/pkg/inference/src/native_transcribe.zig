@@ -108,6 +108,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             decoder_session,
             hf_tok.tokenizer(),
             .{
+                .pjrt_decoder_cache = opts.pjrt.decoder_cache,
                 .max_length = dec_config.max_length,
                 .decoder_start_token_id = dec_config.decoder_start_token_id,
                 .eos_token_id = dec_config.eos_token_id,
@@ -159,6 +160,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         decoder_session,
         model.getTokenizer(),
         .{
+            .pjrt_decoder_cache = opts.pjrt.decoder_cache,
             .vocab_size = whisper_cfg.vocab_size,
             .max_length = @intCast(whisper_cfg.max_target_positions),
             .decoder_start_token_id = whisper_cfg.decoder_start_token_id,

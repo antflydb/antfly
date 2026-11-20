@@ -1077,3 +1077,102 @@ test "model program resident requests isolate concurrent state and refund failur
     }
     try std.testing.expectEqualDeep(baseline, accounting.snapshot());
 }
+
+test "model program real Whisper resident full-window banks and first decode match full prefix" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const model = platform.env.getenv("ANTFLY_WHISPER_MODEL") orelse return error.SkipZigTest;
+    if (!platform.env.getenvBool("ANTFLY_WHISPER_PJRT_QUALIFICATION")) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const session = try factory.createPjrtSessionWithOptions(a, model, try DecoderQualification.options(.f32));
+    defer session.close();
+    const cfg = session.model_contract.encoder_decoder_config orelse return error.WrongModelArchitecture;
+    const rows = cfg.max_source_positions;
+    const values = try a.alloc(f32, rows * cfg.d_model);
+    defer a.free(values);
+    for (values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 31)) - 15)) / 16;
+    var hidden = try Tensor.initFloat32(a, "encoder_hidden_states", &.{ 1, @intCast(rows), cfg.d_model }, values);
+    defer hidden.deinit();
+    const mask = try a.alloc(i64, rows);
+    defer a.free(mask);
+    for ([_]i64{ 0, 1 }) |visibility| {
+        @memset(mask, visibility);
+        var attention = try Tensor.initInt64(a, "encoder_attention_mask", &.{ 1, @intCast(rows) }, mask);
+        defer attention.deinit();
+        var decoder = (try DecoderQualification.Decoder.initEncoderDecoder(a, session, rows, true, DecoderQualification.control)).?;
+        defer decoder.deinit();
+        // Distinct token and position values prevent accidental runtime-input alias
+        // binding from hiding behind the tiny fixture's identity token sequence.
+        const original_banks = try a.alloc([]f32, cfg.decoder_layers * 4);
+        @memset(original_banks, &.{});
+        defer {
+            for (original_banks) |bank| a.free(bank);
+            a.free(original_banks);
+        }
+        const tokens = [_]i64{ cfg.decoder_start_token_id, cfg.bos_token_id, cfg.eos_token_id, cfg.decoder_start_token_id };
+        for ([_]usize{ 3, 4 }) |length| {
+            const actual = try decoder.encoderDecoderText(tokens[0..length], hidden, mask, a, DecoderQualification.control);
+            defer a.free(actual);
+            {
+                const state = decoder.resident.?;
+                for (state.buffers, 0..) |*buffer, index| {
+                    const self_attention = index % 4 < 2;
+                    const shape = [_]i64{ @intCast(if (self_attention) cfg.max_target_positions else rows), cfg.d_model };
+                    const bank = try buffer.toFloat32WithShape(a, &shape);
+                    defer a.free(bank);
+                    if (length == 3) {
+                        original_banks[index] = try a.dupe(f32, bank);
+                    } else {
+                        const preserved = if (self_attention) 3 * cfg.d_model else bank.len;
+                        if (!std.mem.eql(f32, original_banks[index][0..preserved], bank[0..preserved])) {
+                            std.debug.print("Whisper immutable cache prefix changed: bank={d} rows={d}\n", .{ index, length });
+                            return error.ImmutableResidentCachePrefixChanged;
+                        }
+                    }
+                    for (bank, 0..) |value, offset| {
+                        if (!std.math.isFinite(value)) std.debug.print("non-finite Whisper bank={d} offset={d}\n", .{ index, offset });
+                        try std.testing.expect(std.math.isFinite(value));
+                        if (self_attention and offset >= length * cfg.d_model) try std.testing.expectEqual(@as(f32, 0), value);
+                    }
+                }
+            }
+            if (length == 4) {
+                var fresh = (try DecoderQualification.Decoder.initEncoderDecoder(a, session, rows, true, DecoderQualification.control)).?;
+                defer fresh.deinit();
+                const fresh_logits = try fresh.encoderDecoderText(tokens[0..length], hidden, mask, a, DecoderQualification.control);
+                defer a.free(fresh_logits);
+                var native_backend = try factory.getComputeBackend(session, a);
+                defer native_backend.deinit();
+                const native_encoder = try native_backend.fromFloat32Shape(values, &.{ 1, @intCast(rows), @intCast(cfg.d_model) });
+                defer native_backend.free(native_encoder);
+                const native_logits = try @import("../architectures/whisper.zig").decoderForward(&native_backend, a, cfg.*, tokens[0..length], native_encoder, mask, 1, length, rows);
+                defer a.free(native_logits);
+                for (native_logits[native_logits.len - cfg.vocab_size ..], actual, fresh_logits) |reference, cached, initial| {
+                    try std.testing.expectApproxEqAbs(reference, cached, 1e-4);
+                    try std.testing.expectApproxEqAbs(reference, initial, 1e-4);
+                }
+                for (decoder.resident.?.buffers, fresh.resident.?.buffers, 0..) |*updated, *initial, index| {
+                    const self_attention = index % 4 < 2;
+                    const shape = [_]i64{ @intCast(if (self_attention) cfg.max_target_positions else rows), cfg.d_model };
+                    const left = try updated.toFloat32WithShape(a, &shape);
+                    defer a.free(left);
+                    const right = try initial.toFloat32WithShape(a, &shape);
+                    defer a.free(right);
+                    const active = if (self_attention) length * cfg.d_model else left.len;
+                    for (left[0..active], right[0..active], 0..) |cached, expected, offset| {
+                        if (@abs(cached - expected) > 1e-4) {
+                            std.debug.print("Whisper cache projection mismatch bank={d} row={d} cached={d} expected={d}\n", .{ index, offset / cfg.d_model, cached, expected });
+                            return error.ResidentProjectionMismatch;
+                        }
+                    }
+                }
+            }
+            var ids = try Tensor.initInt64(a, "decoder_input_ids", &.{ 1, @intCast(length) }, tokens[0..length]);
+            defer ids.deinit();
+            const expected = try session.runWithControl(&.{ ids, hidden, attention }, a, DecoderQualification.control);
+            defer a.free(expected);
+            defer for (expected) |*output| output.deinit();
+            const logits = expected[0].asFloat32();
+            for (logits[logits.len - cfg.vocab_size ..], actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-4);
+        }
+    }
+}

@@ -27,8 +27,7 @@ pub const Options = struct {
     pub fn validateTask(self: Options, task: Task) !void {
         if (self.task_controls.batch and task != .extraction) return error.UnsupportedPjrtTaskOption;
         if (self.task_controls.media and task != .generation) return error.UnsupportedPjrtTaskOption;
-        if (self.task_controls.cache and task != .generation and
-            !(task == .transcription and self.decoder_cache == false)) return error.UnsupportedPjrtTaskOption;
+        if (self.task_controls.cache and task != .generation and task != .transcription) return error.UnsupportedPjrtTaskOption;
     }
 
     pub fn validateTaskPlacement(self: Options, pjrt_selected: bool) !void {
@@ -138,7 +137,7 @@ test "task PJRT controls are honored or explicitly rejected" {
     var options = Options{};
     try std.testing.expect(try options.parse("--pjrt-decoder-cache", "true"));
     try options.validateTask(.generation);
-    try std.testing.expectError(error.UnsupportedPjrtTaskOption, options.validateTask(.transcription));
+    try options.validateTask(.transcription);
     try std.testing.expectError(error.UnsupportedPjrtTaskOption, options.validateTask(.extraction));
     try std.testing.expect(try options.parse("--pjrt-decoder-cache", "false"));
     try options.validateTask(.transcription);

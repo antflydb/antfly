@@ -1012,7 +1012,7 @@ pub const Runtime = struct {
         // Graph and pinned-temporary state belongs to the live request. Never
         // reset it or accidentally capture pointers to short-lived shadow KV.
         const replay = platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY") orelse "off";
-        if (!std.mem.eql(u8, replay, "off") or cudaReplayLastLogitsEnabled() or
+        if (self.context.backend.debugCudaGraphReplayRequested() or !std.mem.eql(u8, replay, "off") or cudaReplayLastLogitsEnabled() or
             (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") orelse 0) != 0 or
             (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD") orelse 0) != 0 or
             platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN"))
@@ -1275,4 +1275,26 @@ test "checkpoint shadow CUDA owners retain independent positions without retaini
     try std.testing.expectEqual(@as(usize, 3), second.state.?.total_tokens);
     try std.testing.expect(!first.storage.?.storage.config.store_cpu_bytes);
     try std.testing.expect(first.storage.?.storage.config.sliding_window_size == null);
+}
+
+test "checkpoint shadow queries reject typed automatic replay before reading source KV" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const Probe = struct {
+        fn kind(_: *anyopaque) ops.BackendKind {
+            return .cuda;
+        }
+        fn requested(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var marker: u8 = 0;
+    var table = @import("../ops/native_compute.zig").vtable_impl;
+    table.backendKind = Probe.kind;
+    table.regions.replay.requested = Probe.requested;
+    const backend = ops.ComputeBackend{ .ptr = &marker, .vtable = &table };
+    const config = gpt_mod.Config{ .family = .gemma, .ple_hidden_size = 256 };
+    var executor = Runtime{ .context = .{ .allocator = std.testing.allocator, .io = std.testing.io, .backend = &backend, .model = &config, .kv_dtype = .f16, .identity = null } };
+    // No KV/allocator callback is permitted before the replay exclusion.
+    var source: NativeDecodeState = undefined;
+    try std.testing.expectError(error.UnsupportedCompactionQueryReplay, executor.collectAttentionMatchQueries(&.{ 1, 2 }, &source, .{}));
 }

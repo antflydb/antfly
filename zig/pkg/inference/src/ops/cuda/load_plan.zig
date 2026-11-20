@@ -64,7 +64,7 @@ pub fn residencyPolicyFromEnv() ResidencyPolicy {
         // Reserve the existing conservative upper bound before model
         // geometry is available. Actual donor allocation is selective.
         .retain_q4_0_bf16_mirror = retainQ4_0Bf16Mirror() or
-            @import("../../execution/gemma4_native_plan.zig").selected() == .bf16_donors,
+            @import("../../execution/gemma4_native_plan.zig").explicitSelection() == .bf16_donors,
     };
 }
 

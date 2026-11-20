@@ -24279,6 +24279,7 @@ pub const Node = struct {
                 self.tokenizer,
                 .{
                     .max_length = self.decoder_config.max_length,
+                    .pjrt_decoder_cache = self.node.config.pjrt_decoder_cache,
                     .max_output_tokens = (try resolvedInferenceExecutorContract(self.node, "transcribe", &self.manifest.?)).batch.max_output_tokens_per_item,
                     .decoder_start_token_id = self.decoder_config.decoder_start_token_id,
                     .vocab_size = self.decoder_config.vocab_size,
@@ -56249,7 +56250,10 @@ test "native media Node dispatcher transfers serial credit and releases physical
         fn close(_: *anyopaque) void {}
         fn run(raw: *anyopaque, inputs: []const Tensor, alloc: std.mem.Allocator) ![]Tensor {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            const scratch = try alloc.alloc(u8, 128 * 1024);
+            // Declare 128 KiB of physical scratch, including this allocator
+            // header, rather than silently rounding a 128 KiB payload upward.
+            const bookkeeping = try @import("../backends/admitted_allocator.zig").AdmittedAllocator.allocationHostBytes(0, .@"1");
+            const scratch = try alloc.alloc(u8, 128 * 1024 - bookkeeping);
             defer alloc.free(scratch);
             @memset(scratch, 42);
             const out = try alloc.alloc(Tensor, 1);
@@ -56269,7 +56273,8 @@ test "native media Node dispatcher transfers serial credit and releases physical
         var fake = Fake{ .batched = mode == 1, .kv = mode == 2, .factor = 2 };
         var controller = runtime.tier.memory.AdmissionController{};
         var gate: std.atomic.Mutex = .unlocked;
-        const session = Session{ .ptr = &fake, .vtable = &.{ .run = Fake.run, .runWithControl = Fake.controlled, .inputInfo = Fake.info, .outputInfo = Fake.outputInfo, .runGeometry = Fake.geometry, .backend = Fake.backend, .close = Fake.close, .independentBatchRows = Fake.independent }, .execution_gate = &gate, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .scratch_limit_bytes = 192 * 1024 }, .static_workspace_bytes = 128 * 1024, .check_live_memory = false } };
+        var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+        const session = Session{ .ptr = &fake, .vtable = &.{ .run = Fake.run, .runWithControl = Fake.controlled, .inputInfo = Fake.info, .outputInfo = Fake.outputInfo, .runGeometry = Fake.geometry, .backend = Fake.backend, .close = Fake.close, .independentBatchRows = Fake.independent }, .execution_gate = &gate, .cohort_scheduler = &scheduler, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .scratch_limit_bytes = 192 * 1024 }, .static_workspace_bytes = 128 * 1024, .check_live_memory = false } };
         var encoder_session = session;
         encoder_session.ptr = &encoder;
         var workspace = @import("../backends/admitted_allocator.zig").AdmittedAllocator{ .backing = a, .session = encoder_session, .trim_on_free = true };

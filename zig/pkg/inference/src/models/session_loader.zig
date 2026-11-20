@@ -59,6 +59,25 @@ pub const Host = struct {
     protect_close_fn: *const fn (*anyopaque, backends.BackendRuntime) anyerror!?backends.Session.CloseProtection,
     attach_admission_fn: *const fn (*anyopaque, *backends.Session, backends.BackendRuntime, runtime.tier.memory.AdmissionAmounts, ?*const manifest_mod.ModelManifest) anyerror!void,
 };
+/// Try optional acceleration before construction. Denial retries the original
+/// artifact once, with a typed construction policy matching the winning lease.
+/// No numerical submission, environment mutation or budget widening occurs.
+fn reserveLoadPlan(host: Host, path: []const u8, backend: backends.BackendRuntime, limits: runtime.tier.memory.Limits, plan: *load_plan.ModelLoadAdmissionPlan, allow_automatic: *bool, failure: ?*runtime.tier.memory.AdmissionFailure) !Reservation {
+    var capture = runtime.tier.memory.AdmissionFailure.Capture.init(failure);
+    const optional = plan.optional_cuda_peak_weight_bytes != 0 or plan.optional_cuda_resident_weight_bytes != 0;
+    const reservation = host.reserve_fn(host.context, path, backend, limits, plan.*, host.required_residency, capture.sink()) catch |err| {
+        if (!optional or (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable and err != error.MemoryBudgetExceeded)) {
+            capture.publish(err);
+            return err;
+        }
+        plan.* = plan.withoutOptionalCudaMirrors();
+        allow_automatic.* = false;
+        return host.reserve_fn(host.context, path, backend, limits, plan.*, host.required_residency, failure);
+    };
+    allow_automatic.* = optional;
+    return reservation;
+}
+
 pub const ManagedSession = struct {
     session: backends.Session,
     resource_lease: ?runtime.tier.memory.AdmissionLease = null,
@@ -326,7 +345,10 @@ fn loadPreferredWithArtifactsImpl(
         defer if (resource_lease) |*lease| lease.release();
         var host_weight_lease: ?runtime.tier.memory.AdmissionLease = null;
         defer if (host_weight_lease) |*lease| lease.release();
-        backend_session_manager.cuda_host_weight_lease = &host_weight_lease;
+        backend_session_manager.cuda_load_options.host_lease = &host_weight_lease;
+        // Raw constructors retain their existing caller-owned resource contract.
+        // Managed/checked loads install only the policy their admission permits.
+        backend_session_manager.cuda_load_options.allow_automatic_plan = !managed_admission and host.preflight == null;
         var mapped_host_bytes: usize = 0;
         var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
         var admission_limits = runtime.tier.memory.Limits{};
@@ -349,12 +371,10 @@ fn loadPreferredWithArtifactsImpl(
                 source_session_manager.a4b_inference_request,
                 laya_packed,
             );
-            const admission_plan = admission_result catch |err| {
+            var admission_plan = admission_result catch |err| {
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
-            resident_amounts = admission_plan.resident;
-            serving_floor = admission_plan.serving_floor;
             admission_limits = host.limits_fn(
                 host.context,
                 source,
@@ -365,10 +385,12 @@ fn loadPreferredWithArtifactsImpl(
                 continue;
             };
             if (control) |active| try active.check();
-            const reservation = host.reserve_fn(host.context, model_dir, backend_runtime, admission_limits, admission_plan, host.required_residency, if (control) |active| active.admission_failure else null) catch |err| {
+            const reservation = reserveLoadPlan(host, model_dir, backend_runtime, admission_limits, &admission_plan, &backend_session_manager.cuda_load_options.allow_automatic_plan, if (control) |active| active.admission_failure else null) catch |err| {
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
+            resident_amounts = admission_plan.resident;
+            serving_floor = admission_plan.serving_floor;
             resource_lease = reservation.lease;
             host_weight_lease = reservation.host_lease;
             mapped_host_bytes = if (host_weight_lease) |held| held.amounts.host_weight_bytes else 0;
@@ -528,7 +550,8 @@ fn loadComponentImpl(
         defer if (resource_lease) |*lease| lease.release();
         var host_weight_lease: ?runtime.tier.memory.AdmissionLease = null;
         defer if (host_weight_lease) |*lease| lease.release();
-        session_manager.cuda_host_weight_lease = &host_weight_lease;
+        session_manager.cuda_load_options.host_lease = &host_weight_lease;
+        session_manager.cuda_load_options.allow_automatic_plan = !host.admission_enabled;
         var mapped_host_bytes: usize = 0;
         var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
         var admission_limits = runtime.tier.memory.Limits{};
@@ -552,11 +575,10 @@ fn loadComponentImpl(
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
-            const admission_plan = (if (source.kind == .onnx) base_plan else load_plan.withNativeAuxiliaryAdmission(source.manifest.?.*, backend, base_plan)) catch |err| {
+            var admission_plan = (if (source.kind == .onnx) base_plan else load_plan.withNativeAuxiliaryAdmission(source.manifest.?.*, backend, base_plan)) catch |err| {
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
-            resident_amounts = admission_plan.resident;
             admission_limits = host.limits_fn(
                 host.context,
                 source,
@@ -566,10 +588,11 @@ fn loadComponentImpl(
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
-            const reservation = host.reserve_fn(host.context, model_path, backend_runtime, admission_limits, admission_plan, host.required_residency, if (control) |active| active.admission_failure else null) catch |err| {
+            const reservation = reserveLoadPlan(host, model_path, backend_runtime, admission_limits, &admission_plan, &session_manager.cuda_load_options.allow_automatic_plan, if (control) |active| active.admission_failure else null) catch |err| {
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
+            resident_amounts = admission_plan.resident;
             resource_lease = reservation.lease;
             host_weight_lease = reservation.host_lease;
             mapped_host_bytes = if (host_weight_lease) |held| held.amounts.host_weight_bytes else 0;
@@ -996,4 +1019,71 @@ pub fn validateSessionConstruction(control: ?InferenceExecutionControl, backend_
         try active.check();
         try active.validateUninterruptible(backend_runtime.loadInterruption());
     }
+}
+
+test "prepared optional CUDA mirrors retry mandatory admission before construction" {
+    const Memory = runtime.tier.memory;
+    const Probe = struct {
+        controller: Memory.AdmissionController = .{},
+        calls: usize = 0,
+        fail: bool = false,
+        fn unhealthy(_: *anyopaque, _: []const u8, _: backends.BackendType) bool {
+            unreachable;
+        }
+        fn limits(_: *anyopaque, _: ModelSource, _: backends.BackendRuntime, _: Memory.Limits) !Memory.Limits {
+            unreachable;
+        }
+        fn reserve(raw: *anyopaque, _: []const u8, _: backends.BackendRuntime, cap: Memory.Limits, plan: load_plan.ModelLoadAdmissionPlan, _: Memory.Residency, failure: ?*Memory.AdmissionFailure) !Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.fail) return error.Cancelled;
+            if (try plan.peak.firstLimitExceeded(cap)) |denial| {
+                if (failure) |sink| sink.record(denial);
+                return error.ResourceLimitExceeded;
+            }
+            return .{ .lease = try self.controller.tryAcquire(.gpu, cap, plan.peak, false), .resident = plan.resident, .serving_floor = plan.serving_floor };
+        }
+        fn protect(_: *anyopaque, _: backends.BackendRuntime) !?backends.Session.CloseProtection {
+            unreachable;
+        }
+        fn attach(_: *anyopaque, _: *backends.Session, _: backends.BackendRuntime, _: Memory.AdmissionAmounts, _: ?*const manifest_mod.ModelManifest) !void {
+            unreachable;
+        }
+        fn host(self: *@This()) Host {
+            return .{ .context = self, .admission_enabled = true, .unhealthy_fn = unhealthy, .limits_fn = limits, .reserve_fn = reserve, .protect_close_fn = protect, .attach_admission_fn = attach };
+        }
+    };
+    const original = load_plan.ModelLoadAdmissionPlan{
+        .peak = .{ .backend_weight_bytes = 600 },
+        .resident = .{ .backend_weight_bytes = 500 },
+        .optional_cuda_peak_weight_bytes = 375,
+        .optional_cuda_resident_weight_bytes = 300,
+    };
+    for ([_]usize{ 700, 300, 200 }) |cap| {
+        var probe: Probe = .{};
+        var plan = original;
+        var automatic = false;
+        var failure: Memory.AdmissionFailure = .{};
+        const result = reserveLoadPlan(probe.host(), "never-opened.gguf", .{ .backend = .cuda }, .{ .backend_limit_bytes = cap }, &plan, &automatic, &failure);
+        if (cap == 200) {
+            try std.testing.expectError(error.ResourceLimitExceeded, result);
+            try std.testing.expect(failure.snapshot() != null);
+            try std.testing.expectEqual(@as(usize, 2), probe.calls);
+        } else {
+            var reservation = try result;
+            try std.testing.expectEqual(cap == 700, automatic);
+            try std.testing.expectEqual(@as(usize, if (automatic) 1 else 2), probe.calls);
+            try std.testing.expectEqual(@as(usize, if (automatic) 600 else 225), probe.controller.snapshot().backend_weight_bytes);
+            try std.testing.expectEqual(@as(usize, if (automatic) 500 else 200), reservation.resident.backend_weight_bytes);
+            try std.testing.expect(failure.snapshot() == null);
+            reservation.lease.release();
+        }
+        try std.testing.expectEqual(@as(usize, 0), probe.controller.snapshot().backendTotalBytes());
+    }
+    var probe = Probe{ .fail = true };
+    var plan = original;
+    var automatic = false;
+    try std.testing.expectError(error.Cancelled, reserveLoadPlan(probe.host(), "never-opened.gguf", .{ .backend = .cuda }, .{}, &plan, &automatic, null));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(original.peak.backend_weight_bytes, plan.peak.backend_weight_bytes);
 }
