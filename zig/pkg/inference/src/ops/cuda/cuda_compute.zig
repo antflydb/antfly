@@ -4198,6 +4198,8 @@ pub const CudaCompute = struct {
     gemma4_chunked_upload: bool = false,
     gemma4_temp_lru: bool = false,
     gemma4_projector_cache_enabled: bool = false,
+    gemma4_projector_lossless_f16: bool = false,
+    gemma4_projector_residual: bool = false,
     gemma4_projector_weights: std.StringHashMapUnmanaged(*CudaTensor) = .empty,
     gemma4_projector_weight_bytes: usize = 0,
     gemma4_projector_weight_count: usize = 0,
@@ -4674,28 +4676,15 @@ pub const CudaCompute = struct {
         self.embedding_gemma2_weights_validated = true;
     }
 
-    /// Resize a borrowed RGB8 device tensor without staging frame pixels on the host.
-    pub fn preprocessEmbeddingGemma2ResidentRgb(self: *CudaCompute, rgb: CT, width: u32, height: u32, target_width: u32, target_height: u32) !CT {
+    /// Resize a borrowed RGB8 device tensor into the consuming projector's patch layout.
+    pub fn preprocessResidentRgb(self: *CudaCompute, rgb: CT, width: u32, height: u32, target_width: u32, target_height: u32, format: embedding_gemma2_cuda.PatchFormat) !CT {
         const tensor = tensorFromCt(rgb);
-        if (tensor.dtype != .u8 or tensor.buffer.len < @as(usize, width) * height * 3) return error.InvalidShape;
-        return (try preprocessEmbeddingGemma2Patches(self, &.{}, tensor.buffer, width, height, @as(usize, width) * 3, target_width, target_height, null)) orelse error.UnsupportedVideoBackend;
+        if (tensor.dtype != .u8 or !std.mem.eql(i64, tensor.shape, &.{ height, width, 3 })) return error.InvalidShape;
+        return (try preprocessRgbPatches(self, &.{}, tensor.buffer, width, height, @as(usize, width) * 3, target_width, target_height, null, format)) orelse error.UnsupportedVideoBackend;
     }
 
-    /// Gemma 4's upstream video processor uses bicubic RGB8 resize, then [0, 1]
-    /// rescaling and the GGUF convolution's planar patch layout.
-    pub fn preprocessGemma4ResidentRgb(self: *CudaCompute, rgb: CT, width: u32, height: u32, target_width: u32, target_height: u32) !CT {
-        if (self.capability_profile != .gemma4) return error.InvalidShape;
-        const cb = self.computeBackend();
-        const centered = try self.preprocessEmbeddingGemma2ResidentRgb(rgb, width, height, target_width, target_height);
-        defer cb.free(centered);
-        const scaled = (try cb.multiplyScalar(centered, 0.5)) orelse return error.UnsupportedVideoBackend;
-        defer cb.free(scaled);
-        const pixels = (try cb.addScalar(scaled, 0.5)) orelse return error.UnsupportedVideoBackend;
-        defer cb.free(pixels);
-        const rows: i64 = @as(i64, target_width / 16) * (target_height / 16);
-        const planar = try cb.primTranspose(pixels, &.{ 0, 2, 1 }, &.{ rows, 256, 3 });
-        defer cb.free(planar);
-        return cb.primReshape(planar, &.{ rows, 768 });
+    pub fn preprocessEmbeddingGemma2ResidentRgb(self: *CudaCompute, rgb: CT, width: u32, height: u32, target_width: u32, target_height: u32) !CT {
+        return self.preprocessResidentRgb(rgb, width, height, target_width, target_height, .pixel_rgb_centered);
     }
 
     pub fn createEmbeddingGemma2Tensor(self: *CudaCompute, shape: []const i64, dtype: tensor_mod.DType) !CT {
@@ -6071,6 +6060,8 @@ pub const CudaCompute = struct {
         self.gemma4_chunked_upload = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_CHUNKED_UPLOAD", true);
         self.gemma4_temp_lru = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_TEMP_LRU", true);
         self.gemma4_projector_cache_enabled = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_CACHE", true);
+        self.gemma4_projector_lossless_f16 = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_LOSSLESS_F16", false);
+        self.gemma4_projector_residual = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL", false);
         self.gemma4_raw_q4_prefill = qualified and cudaTensorCoreQuantRequested() and
             self.kernels.linear_gemma4_q4_0_bf16_raw != null and
             platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_RAW_Q4_PREFILL", self.gemma4_e4b_sm89_qualified);
@@ -7301,21 +7292,15 @@ pub const CudaCompute = struct {
         var scan = c_file.MmapRegion.SequentialRead.begin(tensor.mmap_source_bytes, tensor.data);
         defer scan.deinit();
         try copyFromHostTracked(self, device, tensor.data);
+        // The upload and in-place conversion share one stream and one allocation.
+        // Keep the mapped source alive through the final fence, including errors.
+        errdefer self.ctx.synchronize() catch {};
+        const lossless_f16 = self.gemma4_projector_lossless_f16 and !self.resident_training_cache and tensor.dtype == .bf16 and
+            @import("projector_precision.zig").bf16TensorFitsF16(tensor.data) and
+            try self.kernels.convertBf16ToF16InPlace(&self.ctx, device, count);
         try synchronizeAndDrainDeferredDeviceFrees(self);
-        var stored_dtype = tensor.dtype;
-        const lossless_f16 = self.gemma4_e4b_sm89_qualified and !self.resident_training_cache and
-            tensor.dtype == .bf16 and
-            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_LOSSLESS_F16", false) and
-            @import("projector_precision.zig").bf16TensorFitsF16(tensor.data);
-        if (lossless_f16) {
-            var widened = try allocDeviceBuffer(self, try checkedMul(count, @sizeOf(f32)));
-            defer releaseDeviceBuffer(self, &widened);
-            try self.scalar_clamp_kernel.widen16Bit(&self.ctx, device.ptr, widened.ptr, count, true);
-            try self.kernels.launchF32ToF16(&self.ctx, device, widened, count);
-            try synchronizeAndDrainDeferredDeviceFrees(self);
-            stored_dtype = .f16;
-            self.stats.gemma4_projector_f16_weight_count += 1;
-        }
+        const stored_dtype = if (lossless_f16) .f16 else tensor.dtype;
+        if (lossless_f16) self.stats.gemma4_projector_f16_weight_count += 1;
         // All source reads, including exact-conversion eligibility, are done.
         c_file.MmapRegion.adviseBytesDontNeed(scan.bytes);
         const result = try createTensorWithDType(self, device, shape, count, stored_dtype);
@@ -12504,6 +12489,13 @@ fn tryCublasLtF16Linear(
     return true;
 }
 
+fn allocProjectorScratch(self: *CudaCompute, bytes: usize) !?buffer_mod.DeviceBuffer {
+    return allocDeviceBuffer(self, bytes) catch |err| switch (err) {
+        error.CudaMemoryLimitExceeded, error.ResourceLimitExceeded => null,
+        else => return err,
+    };
+}
+
 // Retain the activation's rounding residual when multiplying immutable
 // 16-bit projector weights. Each tensor-core product accumulates into F32.
 // Three BF16 terms recover approximately the original activation precision;
@@ -12527,13 +12519,13 @@ fn tryCublasLtProjectorResidualLinear(
     const terms = if (bf16) platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL_TERMS") orelse 3 else 2;
     if (terms != 2 and terms != 3) return error.InvalidShape;
     const count = try checkedMul(rows, in_dim);
-    var residual = try allocDeviceBuffer(self, try checkedMul(count, 4));
+    var residual = (try allocProjectorScratch(self, try checkedMul(count, 4))) orelse return false;
     defer releaseDeviceBuffer(self, &residual);
-    var rounded = try allocDeviceBuffer(self, try checkedMul(count, 4));
+    var rounded = (try allocProjectorScratch(self, try checkedMul(count, 4))) orelse return false;
     defer releaseDeviceBuffer(self, &rounded);
-    var low = try allocDeviceBuffer(self, try checkedMul(count, 2));
+    var low = (try allocProjectorScratch(self, try checkedMul(count, 2))) orelse return false;
     defer releaseDeviceBuffer(self, &low);
-    var correction = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, out_dim), 4));
+    var correction = (try allocProjectorScratch(self, try checkedMul(try checkedMul(rows, out_dim), 4))) orelse return false;
     defer releaseDeviceBuffer(self, &correction);
     try self.scalar_clamp_kernel.widen16Bit(&self.ctx, high.ptr, rounded.ptr, count, bf16);
     try self.kernels.launchElementwiseF32(&self.ctx, residual, input.buffer, rounded, count, .subtract);
@@ -20744,9 +20736,8 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
         // The QAT checkpoint stores this projection in F16 already. Decode
         // widens each weight exactly while retaining F32 inputs, accumulation,
         // and the original reduction order. Only prefill rounds activations.
-        if (!primitive_training and self.gemma4_e4b_sm89_qualified and weight_tensor.gemma4_projector_weight and
-            !weight_tensor.gemma4_projector_f16_weight and
-            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL", false))
+        if (!primitive_training and self.gemma4_projector_residual and weight_tensor.gemma4_projector_weight and
+            !weight_tensor.gemma4_projector_f16_weight)
         {
             if (try tryCublasLtProjectorResidualLinear(self, device, input_tensor, weight_tensor.buffer, rows, in_dim, out_dim, false)) {
                 self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
@@ -21010,9 +21001,7 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
             else => return error.UnsupportedTensorType,
         }
     } else if (isBf16Weight(weight_tensor)) {
-        if (!primitive_training and self.gemma4_e4b_sm89_qualified and weight_tensor.gemma4_projector_weight and
-            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL", false))
-        {
+        if (!primitive_training and self.gemma4_projector_residual and weight_tensor.gemma4_projector_weight) {
             if (try tryCublasLtProjectorResidualLinear(self, device, input_tensor, weight_tensor.buffer, rows, in_dim, out_dim, true)) {
                 self.dispatch_stats.note(self.allocator, .linear_no_bias, .bf16, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
             } else {
@@ -25442,7 +25431,7 @@ fn preprocessEmbeddingGemma2ImagePatchesIntoOp(ctx: *anyopaque, destination_ct: 
     if (offset > destination.elem_count or count > destination.elem_count - offset) return error.InvalidShape;
     const output: buffer_mod.DeviceBuffer = .{ .ptr = destination.buffer.ptr + offset * 4, .len = count * 4 };
     invalidateRmsQ8Mirror(destination);
-    const result = (try preprocessEmbeddingGemma2Patches(self, rgb, null, width, height, stride, target_width, target_height, output)) orelse return false;
+    const result = (try preprocessRgbPatches(self, rgb, null, width, height, stride, target_width, target_height, output, .pixel_rgb_centered)) orelse return false;
     freeTensor(self, result);
     self.embedding_gemma2_patch_rows_written += rows;
     return true;
@@ -25450,10 +25439,10 @@ fn preprocessEmbeddingGemma2ImagePatchesIntoOp(ctx: *anyopaque, destination_ct: 
 
 fn preprocessEmbeddingGemma2ImagePatchesOp(ctx: *anyopaque, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    return preprocessEmbeddingGemma2Patches(self, rgb, null, width, height, stride, target_width, target_height, null);
+    return preprocessRgbPatches(self, rgb, null, width, height, stride, target_width, target_height, null, .pixel_rgb_centered);
 }
 
-fn preprocessEmbeddingGemma2Patches(self: *CudaCompute, rgb: []const u8, resident: ?buffer_mod.DeviceBuffer, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32, destination: ?buffer_mod.DeviceBuffer) !?CT {
+fn preprocessRgbPatches(self: *CudaCompute, rgb: []const u8, resident: ?buffer_mod.DeviceBuffer, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32, destination: ?buffer_mod.DeviceBuffer, format: embedding_gemma2_cuda.PatchFormat) !?CT {
     if ((self.capability_profile != .embedding_gemma2 and !(self.capability_profile == .gemma4 and resident != null)) or self.ctx.info.compute_major < 8) return null;
     if (width == 0 or height == 0 or target_width == 0 or target_height == 0 or target_width % 16 != 0 or target_height % 16 != 0) return error.InvalidShape;
     const row_bytes = try checkedMul(width, 3);
@@ -25474,7 +25463,7 @@ fn preprocessEmbeddingGemma2Patches(self: *CudaCompute, rgb: []const u8, residen
     const cached = self.embedding_gemma2_resize.plan(self.allocator, &self.ctx, .{ .width = width, .height = height, .target_width = target_width, .target_height = target_height, .resident = resident != null }) catch |err| {
         if (!embeddingGemma2ResizeCachePressure(err)) return err;
         try self.embedding_gemma2_resize.clear(&self.ctx);
-        return preprocessEmbeddingGemma2PatchesUncached(self, rgb, resident, width, height, stride, target_width, target_height, destination);
+        return preprocessRgbPatchesUncached(self, rgb, resident, width, height, stride, target_width, target_height, destination, format);
     };
     if (self.embedding_gemma2_resize.misses != resize_misses) self.stats.h2d_bytes += cached.bytes;
     const module = try self.embeddingGemma2Module();
@@ -25485,7 +25474,7 @@ fn preprocessEmbeddingGemma2Patches(self: *CudaCompute, rgb: []const u8, residen
         self.embedding_gemma2_resize.uploadSource(&self.ctx, owned_source, rgb[0..source_bytes]) catch |err| {
             if (!embeddingGemma2ResizeCachePressure(err)) return err;
             try self.embedding_gemma2_resize.clear(&self.ctx);
-            return preprocessEmbeddingGemma2PatchesUncached(self, rgb, resident, width, height, stride, target_width, target_height, destination);
+            return preprocessRgbPatchesUncached(self, rgb, resident, width, height, stride, target_width, target_height, destination, format);
         };
         self.stats.h2d_bytes += source_bytes;
         break :staged owned_source;
@@ -25505,7 +25494,7 @@ fn preprocessEmbeddingGemma2Patches(self: *CudaCompute, rgb: []const u8, residen
     errdefer if (destination == null) releaseDeviceBuffer(self, &output);
     errdefer self.ctx.synchronize() catch {};
     try module.launchPillowHorizontal(&self.ctx, horizontal, source, x_starts, x_offsets, x_weights, width, height, target_width, @intCast(stride), cached.x.precision_bits);
-    try module.launchPillowVerticalPatches(&self.ctx, output, horizontal, y_starts, y_offsets, y_weights, height, target_width, target_height, cached.y.precision_bits);
+    try module.launchPillowVerticalPatches(&self.ctx, output, horizontal, y_starts, y_offsets, y_weights, height, target_width, target_height, cached.y.precision_bits, format);
     // Coefficients and pinned uploads are model-owned; temporary device
     // buffers return to the stream-ordered pool without a success barrier.
     try image.work_control.check();
@@ -25522,7 +25511,7 @@ fn embeddingGemma2ResizeCachePressure(err: anyerror) bool {
 }
 
 // Optional retention must never make an otherwise admissible request fail.
-fn preprocessEmbeddingGemma2PatchesUncached(self: *CudaCompute, rgb: []const u8, resident: ?buffer_mod.DeviceBuffer, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32, destination: ?buffer_mod.DeviceBuffer) !?CT {
+fn preprocessRgbPatchesUncached(self: *CudaCompute, rgb: []const u8, resident: ?buffer_mod.DeviceBuffer, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32, destination: ?buffer_mod.DeviceBuffer, format: embedding_gemma2_cuda.PatchFormat) !?CT {
     if ((self.capability_profile != .embedding_gemma2 and !(self.capability_profile == .gemma4 and resident != null)) or self.ctx.info.compute_major < 8) return null;
     if (width == 0 or height == 0 or target_width == 0 or target_height == 0 or target_width % 16 != 0 or target_height % 16 != 0) return error.InvalidShape;
     const row_bytes = try checkedMul(width, 3);
@@ -25580,7 +25569,7 @@ fn preprocessEmbeddingGemma2PatchesUncached(self: *CudaCompute, rgb: []const u8,
     errdefer if (destination == null) releaseDeviceBuffer(self, &output);
     errdefer self.ctx.synchronize() catch {};
     try module.launchPillowHorizontal(&self.ctx, horizontal, source, x_starts, x_offsets, x_weights, width, height, target_width, @intCast(stride), x.precision_bits);
-    try module.launchPillowVerticalPatches(&self.ctx, output, horizontal, y_starts, y_offsets, y_weights, height, target_width, target_height, y.precision_bits);
+    try module.launchPillowVerticalPatches(&self.ctx, output, horizontal, y_starts, y_offsets, y_weights, height, target_width, target_height, y.precision_bits, format);
     // The source and coefficient staging belong to this call; drain their
     // use before returning the independently owned patch tensor.
     try self.ctx.synchronize();
@@ -33479,9 +33468,9 @@ test "embeddinggemma2 CUDA cached resize is bitwise equal for fresh host and res
             for (&pixels, 0..) |*pixel, i| pixel.* = @truncate(i * 17 + iteration * 31);
             if (resident) try source.copyFromHost(&compute.ctx, &pixels);
             const device: ?buffer_mod.DeviceBuffer = if (resident) source else null;
-            const expected = (try preprocessEmbeddingGemma2PatchesUncached(&compute, &pixels, device, width, height, stride, 32, 48, null)).?;
+            const expected = (try preprocessRgbPatchesUncached(&compute, &pixels, device, width, height, stride, 32, 48, null, .pixel_rgb_centered)).?;
             defer cb.free(expected);
-            const actual = (try preprocessEmbeddingGemma2Patches(&compute, &pixels, device, width, height, stride, 32, 48, null)).?;
+            const actual = (try preprocessRgbPatches(&compute, &pixels, device, width, height, stride, 32, 48, null, .pixel_rgb_centered)).?;
             defer cb.free(actual);
             const x = try cb.toFloat32(expected, a);
             defer a.free(x);
@@ -39717,6 +39706,47 @@ test "Gemma4 CUDA temporary LRU bounds bytes and entries while preserving live t
     defer a.free(actual);
     try std.testing.expectEqualSlices(f32, &values, actual);
 }
+test "Gemma4 CUDA projector fits the weight-only budget and falls back under residual scratch pressure" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.initWithKernelJitForProfile(a, .{}, .gemma4);
+    defer compute.deinit();
+    compute.gemma4_projector_lossless_f16 = true;
+    compute.gemma4_projector_residual = true;
+    const cb = compute.computeBackend();
+    const budget = &compute.ctx.device_allocations;
+    const initial = budget.snapshot();
+    var bits = [_]u16{ 0x3f80, 0xbf00, 0x3380, 0x8000 };
+    const source = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(&bits), .dtype = .bf16, .shape = &.{ 2, 2 }, .name = "projector", .allocator = a, .owns_data = false, .owns_shape = false };
+    try budget.setLimit(initial.live + source.data.len);
+    const converted = try compute.uploadProjectorWeight(&source);
+    defer cb.free(converted);
+    try std.testing.expect(tensorFromCt(converted).gemma4_projector_f16_weight);
+    var actual: [4]u16 = undefined;
+    try tensorFromCt(converted).buffer.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
+    try compute.ctx.synchronize();
+    try std.testing.expectEqualSlices(u16, &.{ 0x3c00, 0xb800, 1, 0x8000 }, &actual);
+
+    try budget.setLimit(initial.limit);
+    // One non-representable BF16 element keeps this matrix on its BF16 path.
+    bits = .{ 0x3f80, 0x4000, 0x0001, 0xbf80 };
+    const weight = try compute.uploadProjectorWeight(&source);
+    defer cb.free(weight);
+    try std.testing.expectEqual(tensor_mod.DType.bf16, tensorFromCt(weight).dtype);
+    const input = try cb.fromFloat32Shape(&.{ 2, 3 }, &.{ 1, 2 });
+    defer cb.free(input);
+    // Pre-stage high so the allocation refusal occurs inside the residual path.
+    _ = (try stageBf16ActivationForCublasLt(&compute, tensorFromCt(input), 1, 2)) orelse return error.SkipZigTest;
+    try budget.setLimit(budget.snapshot().live + 2 * @sizeOf(f32));
+    const before = compute.stats.bf16_scalar_linear_calls;
+    const result = try cb.linearNoBias(input, weight, 1, 2, 2);
+    defer cb.free(result);
+    try std.testing.expectEqual(before + 1, compute.stats.bf16_scalar_linear_calls);
+    const values = try cb.toFloat32(result, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 8, -3 }, values);
+}
+
 test "Gemma4 CUDA projector cache preserves compact dtype and independent admission through borrowers" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;

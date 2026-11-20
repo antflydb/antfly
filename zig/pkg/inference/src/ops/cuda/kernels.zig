@@ -2307,6 +2307,7 @@ pub const KernelModule = struct {
     copy_u8: driver_mod.CUfunction = null,
     f32_to_bf16: driver_mod.CUfunction = null,
     f32_to_f16: driver_mod.CUfunction = null,
+    bf16_to_f16_in_place: driver_mod.CUfunction = null,
     f32_to_i32: driver_mod.CUfunction = null,
     round_f32: driver_mod.CUfunction = null,
     dequant_q4_0_bf16: driver_mod.CUfunction = null,
@@ -4021,6 +4022,7 @@ pub const KernelModule = struct {
             .copy_u8 = copy_u8,
             .f32_to_bf16 = f32_to_bf16,
             .f32_to_f16 = f32_to_f16,
+            .bf16_to_f16_in_place = loadOptionalFunction(ctx, module, "termite_bf16_to_f16_in_place"),
             .f32_to_i32 = f32_to_i32,
             .round_f32 = round_f32,
             .dequant_q4_0_bf16 = dequant_q4_0_bf16,
@@ -4490,6 +4492,7 @@ pub const KernelModule = struct {
             self.fill_f32 = null;
             self.f32_to_bf16 = null;
             self.f32_to_f16 = null;
+            self.bf16_to_f16_in_place = null;
             self.f32_to_i32 = null;
             self.round_f32 = null;
             self.dequant_q4_0_bf16 = null;
@@ -5501,6 +5504,18 @@ pub const KernelModule = struct {
             @ptrCast(&count_u32),
         };
         try launch1d(function, ctx, count, &params);
+    }
+
+    pub fn convertBf16ToF16InPlace(self: *KernelModule, ctx: *context_mod.CudaContext, data: buffer_mod.DeviceBuffer, count: usize) driver_mod.Error!bool {
+        const function = self.bf16_to_f16_in_place orelse return false;
+        try checkRawBytes(data, try checkedTensorElements(count, @sizeOf(u16)));
+        if (count != 0) {
+            var ptr = data.ptr;
+            var n = try toU32(count);
+            var params = [_]?*anyopaque{ @ptrCast(&ptr), @ptrCast(&n) };
+            try launch1d(function, ctx, count, &params);
+        }
+        return true;
     }
 
     pub fn launchF32ToI32(

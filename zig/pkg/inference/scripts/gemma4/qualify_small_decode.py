@@ -241,6 +241,8 @@ def main():
                 )
                 gpu.launch(old, old_parameters, outdim // oldcols, threads)
                 expected = gpu.read(dst, outdim, np.float32)
+                # Every unwritten lane must differ, even for all-zero reference output.
+                gpu.upload(dst, np.bitwise_not(expected.view(np.uint32)))
                 gpu.launch(new, new_parameters, outdim // newcols, threads)
                 identical(
                     gpu.read(dst, outdim, np.float32), expected, f"{kind}/{trial}"

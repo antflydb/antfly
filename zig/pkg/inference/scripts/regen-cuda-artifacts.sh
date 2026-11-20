@@ -283,6 +283,7 @@ required_symbols=(
   termite_copy_u8
   termite_f32_to_bf16
   termite_f32_to_f16
+  termite_bf16_to_f16_in_place
   termite_f32_to_i32
   termite_round_f32
   termite_primitive_transpose_2d_f32

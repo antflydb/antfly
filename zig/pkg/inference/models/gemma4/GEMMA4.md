@@ -20,6 +20,17 @@ unmodified Transformers (cosine >= 0.9999, relative L2 <= 0.02, identical
 argmax), and all 585 reference decisions through EOS or the output budget
 matched. These gates apply to the explicit profile, not bare process defaults.
 
+On CUDA devices with compute capability 8.0 or newer, 16×16 video patches
+with zero mean and unit standard deviation use the same bicubic RGB8 resize
+for NVDEC and portable decoding. Set `ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC=0`
+to select bilinear video resizing on both routes. The image resize setting
+applies to still images. The CUDA resize writes one matrix row per patch,
+with channel-major pixels for the GGUF projector.
+
+Eligible BF16 projector weights convert to F16 in their existing device
+allocation. When residual GEMM scratch exceeds the device memory budget,
+the projector uses the tiled kernel with F32 activations.
+
 Three rotated comparison rounds put the seven text/image/audio cases within
 1.9% of llama.cpp median latency; video was 15.4% faster. Image and 1-second
 audio remained 1.3% and 1.9% slower. The native core measurement excludes HTTP

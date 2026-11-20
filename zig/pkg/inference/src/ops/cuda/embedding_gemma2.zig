@@ -19,6 +19,13 @@ const driver = @import("driver.zig");
 const Context = @import("context.zig").CudaContext;
 const Buffer = @import("buffer.zig").DeviceBuffer;
 
+/// Physical order and value range of a [patches, 768] RGB16x16 matrix.
+pub const PatchFormat = enum(u32) {
+    pixel_rgb_centered = 0,
+    channel_planar_centered = 1,
+    channel_planar_unit = 2,
+};
+
 pub const Attention = struct {
     batch: u32,
     seq: u32,
@@ -285,7 +292,7 @@ pub const Module = struct {
         try self.launch1d(ctx, self.pillow_horizontal, &args, @intCast(count));
     }
 
-    pub fn launchPillowVerticalPatches(self: *Module, ctx: *Context, out: Buffer, horizontal: Buffer, starts: Buffer, offsets: Buffer, weights: Buffer, source_height: u32, target_width: u32, target_height: u32, precision_bits: u32) !void {
+    pub fn launchPillowVerticalPatches(self: *Module, ctx: *Context, out: Buffer, horizontal: Buffer, starts: Buffer, offsets: Buffer, weights: Buffer, source_height: u32, target_width: u32, target_height: u32, precision_bits: u32, format: PatchFormat) !void {
         if (source_height == 0 or target_width == 0 or target_height == 0 or target_width % 16 != 0 or target_height % 16 != 0 or precision_bits == 0 or precision_bits > 31 or weights.len % @sizeOf(i32) != 0) return error.InvalidEmbeddingGemma2Shape;
         const count = try std.math.mul(usize, try std.math.mul(usize, target_width, target_height), 3);
         if (count > std.math.maxInt(u32)) return error.InvalidEmbeddingGemma2Shape;
@@ -303,7 +310,8 @@ pub const Module = struct {
         var h = target_height;
         var patch: u32 = 16;
         var bits = precision_bits;
-        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&hp), @ptrCast(&sp), @ptrCast(&fp), @ptrCast(&wp), @ptrCast(&w), @ptrCast(&h), @ptrCast(&patch), @ptrCast(&bits) };
+        var format_id: u32 = @backingInt(format);
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&hp), @ptrCast(&sp), @ptrCast(&fp), @ptrCast(&wp), @ptrCast(&w), @ptrCast(&h), @ptrCast(&patch), @ptrCast(&bits), @ptrCast(&format_id) };
         try self.launch1d(ctx, self.pillow_vertical_patches, &args, @intCast(count));
     }
 

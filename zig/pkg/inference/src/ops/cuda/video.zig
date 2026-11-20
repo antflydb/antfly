@@ -770,6 +770,7 @@ test "gemma4 video RGB matches independent PyAV BT601 fixture and preserves fall
         const tensor: *cuda.CudaTensor = @ptrCast(@alignCast(rgb));
         var actual: [width * height * 3]u8 = undefined;
         try tensor.buffer.copyToHost(&compute.ctx, &actual);
+        try compute.ctx.synchronize();
         const raster = frame.rasterSize();
         for (0..raster[1]) |y| for (0..raster[0]) |x| {
             const source_x = switch (rotation) {
@@ -805,6 +806,7 @@ test "gemma4 video RGB matches independent PyAV BT601 fixture and preserves fall
             const tensor: *cuda.CudaTensor = @ptrCast(@alignCast(value));
             try tensor.buffer.copyToHost(&compute.ctx, &bytes[i]);
         }
+        try compute.ctx.synchronize();
         try std.testing.expectEqualSlices(u8, &bytes[0], &bytes[1]);
         try std.testing.expectEqualSlices(u8, &bytes[0], &bytes[2]);
     }
@@ -1424,6 +1426,7 @@ test "embeddinggemma2 video CUDA RGB and bicubic patches match the CPU torchvisi
             const before = cb.trainingRuntimeStats();
             const resident_rgb = try preprocess.rgb8(&compute, .{ .device = buffer.ptr, .pitch = pitch, .width = width, .height = height, .timestamp_us = 0, .matrix = matrix, .full_range = full });
             defer cb.free(resident_rgb);
+            try std.testing.expectError(error.InvalidShape, compute.preprocessResidentRgb(resident_rgb, height, width, size[0], size[1], .pixel_rgb_centered));
             const output = try compute.preprocessEmbeddingGemma2ResidentRgb(resident_rgb, width, height, size[0], size[1]);
             defer cb.free(output);
             const after = cb.trainingRuntimeStats();
@@ -1436,18 +1439,22 @@ test "embeddinggemma2 video CUDA RGB and bicubic patches match the CPU torchvisi
                 try std.testing.expectEqual(expected, actual[index]);
             };
             compute.capability_profile = .gemma4;
-            const gemma_before = cb.trainingRuntimeStats();
-            const gemma = try compute.preprocessGemma4ResidentRgb(resident_rgb, width, height, size[0], size[1]);
-            defer cb.free(gemma);
-            compute.capability_profile = .embedding_gemma2;
-            try std.testing.expectEqual(gemma_before.d2h_bytes, cb.trainingRuntimeStats().d2h_bytes);
-            const gemma_actual = try cb.toFloat32(gemma, a);
-            defer a.free(gemma_actual);
-            for (0..size[1] / 16) |gy| for (0..size[0] / 16) |gx| for (0..16) |py| for (0..16) |px| for (0..3) |c| {
-                const index = ((gy * (size[0] / 16) + gx) * 3 + c) * 256 + py * 16 + px;
-                const expected = reference[c * size[0] * size[1] + (gy * 16 + py) * size[0] + gx * 16 + px];
-                try std.testing.expectApproxEqAbs(expected, gemma_actual[index], 1e-7);
-            };
+            defer compute.capability_profile = .embedding_gemma2;
+            inline for (.{ .channel_planar_unit, .channel_planar_centered }) |format| {
+                const gemma_before = cb.trainingRuntimeStats();
+                const launches = compute.ctx.stats.kernel_launches;
+                const gemma = try compute.preprocessResidentRgb(resident_rgb, width, height, size[0], size[1], format);
+                defer cb.free(gemma);
+                try std.testing.expectEqual(launches + 2, compute.ctx.stats.kernel_launches);
+                try std.testing.expectEqual(gemma_before.d2h_bytes, cb.trainingRuntimeStats().d2h_bytes);
+                const gemma_actual = try cb.toFloat32(gemma, a);
+                defer a.free(gemma_actual);
+                for (0..size[1] / 16) |gy| for (0..size[0] / 16) |gx| for (0..16) |py| for (0..16) |px| for (0..3) |c| {
+                    const index = ((gy * (size[0] / 16) + gx) * 3 + c) * 256 + py * 16 + px;
+                    const unit = reference[c * size[0] * size[1] + (gy * 16 + py) * size[0] + gx * 16 + px];
+                    try std.testing.expectEqual(if (format == .channel_planar_unit) unit else 2 * (unit - 0.5), gemma_actual[index]);
+                };
+            }
         }
     };
 }

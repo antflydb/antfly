@@ -50,15 +50,18 @@ extern "C" __global__ void termite_embedding_gemma2_pillow_vertical_patches_f32(
     float* out, const unsigned char* horizontal,
     const unsigned long long* starts, const unsigned long long* offsets,
     const int* weights, unsigned int target_width, unsigned int target_height,
-    unsigned int patch_size, unsigned int precision_bits) {
+    unsigned int patch_size, unsigned int precision_bits, unsigned int format) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t count = (size_t)target_width * target_height * 3;
     if (i >= count) return;
     const unsigned int patch_dim = patch_size * patch_size * 3;
     const size_t patch = i / patch_dim;
     const unsigned int within = i % patch_dim;
-    const unsigned int channel = within % 3;
-    const unsigned int pixel = within / 3;
+    // PatchFormat in embedding_gemma2.zig selects [patch,pixel,channel]
+    // or the GGUF convolution's [patch,channel,pixel] matrix directly.
+    const unsigned int area = patch_size * patch_size;
+    const unsigned int channel = format == 0 ? within % 3 : within / area;
+    const unsigned int pixel = format == 0 ? within / 3 : within % area;
     const unsigned int grid_x = target_width / patch_size;
     const unsigned int x = (patch % grid_x) * patch_size + pixel % patch_size;
     const unsigned int y = (patch / grid_x) * patch_size + pixel / patch_size;
@@ -72,7 +75,7 @@ extern "C" __global__ void termite_embedding_gemma2_pillow_vertical_patches_f32(
     value >>= precision_bits;
     const float sample = (float)(value < 0 ? 0 : value > 255 ? 255 : value);
     const float rescaled = __fmul_rn(sample, 1.0f / 255.0f);
-    out[i] = __fmul_rn(2.0f, __fsub_rn(rescaled, 0.5f));
+    out[i] = format == 2 ? rescaled : __fmul_rn(2.0f, __fsub_rn(rescaled, 0.5f));
 }
 
 // Gemma4/EmbeddingGemma2 audio local attention. Q/K/V/relative inputs and

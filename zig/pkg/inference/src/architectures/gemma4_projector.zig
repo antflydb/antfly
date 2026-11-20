@@ -240,6 +240,18 @@ pub const ProjectedVideo = struct {
     }
 };
 
+/// Both decoders resize displayed RGB with this video-specific policy.
+fn videoResample(cb: *const ComputeBackend, cfg: Config) image.Resample {
+    if (comptime !@import("build_options").enable_cuda) return .bilinear;
+    if (cb.kind() != .cuda or cfg.patch_size != 16 or
+        !std.mem.eql(f32, &cfg.image_mean, &.{ 0, 0, 0 }) or
+        !std.mem.eql(f32, &cfg.image_std, &.{ 1, 1, 1 })) return .bilinear;
+    const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    if (compute.ctx.info.compute_major >= 8 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC", true))
+        return .torchvision_bicubic;
+    return .bilinear;
+}
+
 /// Decode one bounded MP4 clip and project each selected frame directly from
 /// CUDA memory. Only timestamp/count metadata is retained on the host.
 pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, bytes: []const u8, grow_automatic_scratch: bool) !ProjectedVideo {
@@ -266,6 +278,7 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
         weights: *ProjectorWeights,
         cfg: Config,
         preprocess: *video.Preprocessor,
+        resample: image.Resample,
         output: ?CT = null,
         tokens: [video.max_frames]usize = undefined,
         timestamps: [video.max_frames]i64 = undefined,
@@ -280,18 +293,18 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
             const display = try frame.displaySize();
             const g = targetGeometry(self.cfg, display[0], display[1]);
             const gpu_compute: *cuda.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
-            const patches = if (gpu_compute.ctx.info.compute_major >= 8 and self.cfg.patch_size == 16 and
-                std.mem.eql(f32, &self.cfg.image_mean, &.{ 0, 0, 0 }) and
-                std.mem.eql(f32, &self.cfg.image_std, &.{ 1, 1, 1 }) and
-                platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC", true))
-            bicubic: {
+            const projected = if (self.resample == .torchvision_bicubic) bicubic: {
                 const raster = frame.rasterSize();
                 const rgb = try self.preprocess.rgb8Gemma4(gpu_compute, frame);
                 defer self.cb.free(rgb);
-                break :bicubic try gpu_compute.preprocessGemma4ResidentRgb(rgb, raster[0], raster[1], @intCast(g.width), @intCast(g.height));
-            } else try self.preprocess.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
-            defer self.cb.free(patches);
-            const projected = try encodeResidentPatches(self.cb, self.allocator, self.weights, self.cfg, patches, g);
+                const patches = try gpu_compute.preprocessResidentRgb(rgb, raster[0], raster[1], @intCast(g.width), @intCast(g.height), if (self.cfg.direct_unified) .channel_planar_unit else .channel_planar_centered);
+                defer self.cb.free(patches);
+                break :bicubic try encodeResidentProjectionInput(self.cb, self.allocator, self.weights, self.cfg, patches, g);
+            } else bilinear: {
+                const patches = try self.preprocess.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
+                defer self.cb.free(patches);
+                break :bilinear try encodeResidentPatches(self.cb, self.allocator, self.weights, self.cfg, patches, g);
+            };
             defer self.cb.free(projected.embeddings);
             if (self.output == null) self.output = (try self.cb.allocUninitF32Shape(&.{ @intCast(video.max_frames * 70), @intCast(self.cfg.text_hidden) })) orelse return error.UnsupportedVideoBackend;
             if (!try self.cb.copyRows2D(self.allocator, self.output.?, self.rows, projected.embeddings, 0, projected.tokens, self.cfg.text_hidden)) return error.UnsupportedVideoBackend;
@@ -301,7 +314,7 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
             self.rows += projected.tokens;
         }
     };
-    var state = State{ .cb = cb, .allocator = allocator, .weights = &weights, .cfg = cfg, .preprocess = &preprocessor };
+    var state = State{ .cb = cb, .allocator = allocator, .weights = &weights, .cfg = cfg, .preprocess = &preprocessor, .resample = videoResample(cb, cfg) };
     defer if (state.output) |out| cb.free(out);
     const stats = try video.decodeMp4(allocator, &compute.ctx, bytes, .{ .context = &state, .consume = State.consume, .check = State.check });
     const embeddings = try ownVideoRows(cb, allocator, state.output.?, state.rows, cfg.text_hidden);
@@ -319,6 +332,7 @@ pub const PortableVideoFrames = struct {
     allocator: std.mem.Allocator,
     weights: ProjectorWeights,
     cfg: Config,
+    resample: image.Resample,
     prepared: []?PreparedImage,
 
     pub fn init(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, frames: usize) !PortableVideoFrames {
@@ -326,7 +340,7 @@ pub const PortableVideoFrames = struct {
         cfg.max_image_tokens = 70;
         const prepared = try allocator.alloc(?PreparedImage, frames);
         @memset(prepared, null);
-        return .{ .allocator = allocator, .weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector), .cfg = cfg, .prepared = prepared };
+        return .{ .allocator = allocator, .weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector), .cfg = cfg, .resample = videoResample(cb, cfg), .prepared = prepared };
     }
     pub fn deinit(self: *PortableVideoFrames) void {
         for (self.prepared) |item| if (item) |value| value.deinit();
@@ -337,7 +351,7 @@ pub const PortableVideoFrames = struct {
     /// non-square pixels without an intermediate stretched raster.
     pub fn prepare(self: *PortableVideoFrames, slot: usize, frame: image.ImageU8, presentation_width: u32, presentation_height: u32) !void {
         if (slot >= self.prepared.len or self.prepared[slot] != null) return error.InvalidVideoFrame;
-        self.prepared[slot] = try prepareImageViewAtGeometry(self.allocator, &self.weights, self.cfg, frame, portableFrameGeometry(self.cfg, frame, presentation_width, presentation_height));
+        self.prepared[slot] = try prepareImageViewAtGeometry(self.allocator, &self.weights, self.cfg, frame, portableFrameGeometry(self.cfg, frame, presentation_width, presentation_height), self.resample);
     }
     /// Consumes `timestamps_us`. A repeated selection is delivered once, so its
     /// later slots stay empty and leave the prompt rather than repeat a frame.
@@ -538,20 +552,27 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
 }
 
 fn encodeResidentPatches(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, patches: CT, g: Geometry) !ResidentImage {
+    if (cfg.direct_unified) return encodeResidentProjectionInput(cb, a, store, cfg, patches, g);
+    const doubled = (try cb.multiplyScalar(patches, 2)) orelse return error.UnsupportedVideoBackend;
+    defer cb.free(doubled);
+    const centered = (try cb.addScalar(doubled, -1)) orelse return error.UnsupportedVideoBackend;
+    defer cb.free(centered);
+    return encodeResidentProjectionInput(cb, a, store, cfg, centered, g);
+}
+
+/// Rows are patches in channel-major order. The vision tower consumes centered
+/// RGB, while the unified projector applies its own layer norm to processor pixels.
+fn encodeResidentProjectionInput(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, patches: CT, g: Geometry) !ResidentImage {
     const dim = cfg.patch_size * cfg.patch_size * 3;
     if (cfg.direct_unified) {
         const normalized = try layerNormVisionTensor(cb, a, store, patches, g.tokenCount(), dim, "v.patch_norm.1");
         defer cb.free(normalized);
         return encodeUnifiedPatchesResident(cb, a, store, cfg, normalized, g, 1);
     }
-    const doubled = (try cb.multiplyScalar(patches, 2)) orelse return error.UnsupportedVideoBackend;
-    defer cb.free(doubled);
-    const centered = (try cb.addScalar(doubled, -1)) orelse return error.UnsupportedVideoBackend;
-    defer cb.free(centered);
     const weight = try store.cachedWeightCt("v.patch_embd.weight");
     const matrix = try cb.reshape2D(a, weight, cfg.vision_hidden, dim, cfg.vision_hidden, dim);
     defer cb.free(matrix);
-    const hidden = try cb.linearNoBias(centered, matrix, g.grid_x * g.grid_y, dim, cfg.vision_hidden);
+    const hidden = try cb.linearNoBias(patches, matrix, g.grid_x * g.grid_y, dim, cfg.vision_hidden);
     return encodeVisionHiddenResident(cb, a, store, cfg, hidden, g, 1);
 }
 
@@ -2717,10 +2738,12 @@ pub const PreparedImage = struct {
 };
 
 fn prepareImageView(allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, decoded: image.ImageU8) !PreparedImage {
-    return prepareImageViewAtGeometry(allocator, store, cfg, decoded, targetGeometry(cfg, decoded.width, decoded.height));
+    const resample: image.Resample = if (store.gguf == null or (store.cb.kind() == .cuda and cfg.patch_size == 16 and !cfg.direct_unified and
+        platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_IMAGE_BICUBIC", false))) .torchvision_bicubic else .bilinear;
+    return prepareImageViewAtGeometry(allocator, store, cfg, decoded, targetGeometry(cfg, decoded.width, decoded.height), resample);
 }
 
-fn prepareImageViewAtGeometry(allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, decoded: image.ImageU8, geometry: Geometry) !PreparedImage {
+fn prepareImageViewAtGeometry(allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, decoded: image.ImageU8, geometry: Geometry, resample: image.Resample) !PreparedImage {
     try decoded.validate();
     if (store.cb.kind() == .metal and store.gguf == null and cfg.embedding_gemma2_f32_attention) return .{ .allocator = allocator, .pixels = &.{}, .geometry = geometry, .source = decoded, .source_owned = false };
     const pixel_values = try image.preprocessImageViewRectScaledWithResample(
@@ -2731,14 +2754,7 @@ fn prepareImageViewAtGeometry(allocator: std.mem.Allocator, store: *ProjectorWei
         cfg.image_mean,
         cfg.image_std,
         1.0 / 255.0,
-        // The upstream Gemma 4 image processor resizes RGB8 with antialiased
-        // bicubic interpolation, just like its video processor. Retain the old
-        // GGUF route for other backends/geometries and explicit rollback.
-        if (store.gguf == null or (store.cb.kind() == .cuda and cfg.patch_size == 16 and !cfg.direct_unified and
-            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_IMAGE_BICUBIC", false)))
-            .torchvision_bicubic
-        else
-            .bilinear,
+        resample,
     );
     return .{ .allocator = allocator, .pixels = pixel_values, .geometry = geometry };
 }
@@ -7470,7 +7486,7 @@ test "Gemma4 CUDA mapped F32 projector linear preserves orientation and repeated
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/projector.gguf", .{tmp.sub_path});
     defer a.free(path);
-    try writeVideoTestProjector(a, path, false);
+    try writeVideoTestProjector(a, path, false, 2);
     const absolute = try compat.cwd().realPathFileAlloc(compat.io(), path, a);
     defer a.free(absolute);
     const projector = try ProjectorStore.open(a, absolute);
@@ -7495,8 +7511,9 @@ test "Gemma4 CUDA mapped F32 projector linear preserves orientation and repeated
     }
 }
 
-fn writeVideoTestProjector(a: std.mem.Allocator, path: []const u8, unified: bool) !void {
+fn writeVideoTestProjector(a: std.mem.Allocator, path: []const u8, unified: bool, patch: u32) !void {
     const writer = @import("../gguf/writer.zig");
+    const patch_dim = @as(u64, patch) * patch * 3;
     const metadata = [_]gguf_format.MetadataEntry{
         .{ .key = "general.architecture", .value = .{ .string = "clip" } },
         .{ .key = "clip.vision.projector_type", .value = .{ .string = if (unified) "gemma4uv" else "gemma4v" } },
@@ -7505,17 +7522,17 @@ fn writeVideoTestProjector(a: std.mem.Allocator, path: []const u8, unified: bool
         .{ .key = "clip.vision.feed_forward_length", .value = .{ .u32 = 32 } },
         .{ .key = "clip.vision.block_count", .value = .{ .u32 = if (unified) 0 else 1 } },
         .{ .key = "clip.vision.attention.head_count", .value = .{ .u32 = 2 } },
-        .{ .key = "clip.vision.image_size", .value = .{ .u32 = 12 } },
-        .{ .key = "clip.vision.patch_size", .value = .{ .u32 = 2 } },
+        .{ .key = "clip.vision.image_size", .value = .{ .u32 = patch * 6 } },
+        .{ .key = "clip.vision.patch_size", .value = .{ .u32 = patch } },
         .{ .key = "clip.vision.projector_scale_factor", .value = .{ .u32 = 1 } },
     };
     const tensors = [_]writer.TensorSpec{
-        .{ .name = "v.patch_embd.weight", .dimensions = if (unified) &.{ 12, 16 } else &.{ 2, 2, 3, 16 }, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "v.patch_embd.weight", .dimensions = if (unified) &.{ patch_dim, 16 } else &.{ patch, patch, 3, 16 }, .tensor_type = .{ .known = .F32 } },
         .{ .name = "v.position_embd.weight", .dimensions = &.{ 16, 6, 2 }, .tensor_type = .{ .known = .F32 } },
         .{ .name = "mm.input_projection.weight", .dimensions = &.{ 16, 8 }, .tensor_type = .{ .known = .F32 } },
         .{ .name = "v.patch_embd.bias", .dimensions = &.{16}, .tensor_type = .{ .known = .F32 } },
-        .{ .name = "v.patch_norm.1.weight", .dimensions = &.{12}, .tensor_type = .{ .known = .F32 } },
-        .{ .name = "v.patch_norm.1.bias", .dimensions = &.{12}, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "v.patch_norm.1.weight", .dimensions = &.{patch_dim}, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "v.patch_norm.1.bias", .dimensions = &.{patch_dim}, .tensor_type = .{ .known = .F32 } },
         .{ .name = "v.patch_norm.2.weight", .dimensions = &.{16}, .tensor_type = .{ .known = .F32 } },
         .{ .name = "v.patch_norm.2.bias", .dimensions = &.{16}, .tensor_type = .{ .known = .F32 } },
         .{ .name = "v.patch_norm.3.weight", .dimensions = &.{16}, .tensor_type = .{ .known = .F32 } },
@@ -7569,6 +7586,53 @@ fn writeVideoTestProjector(a: std.mem.Allocator, path: []const u8, unified: bool
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = bytes.items });
 }
 
+test "gemma4 video CUDA and portable preparation share the video resize policy" {
+    if (comptime !@import("build_options").enable_cuda or @import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const cuda = @import("../ops/cuda/cuda_compute.zig");
+    const a = std.testing.allocator;
+    var compute = try cuda.CudaCompute.initWithKernelJitForProfile(a, .{}, .gemma4);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/video.gguf", .{tmp.sub_path});
+    defer a.free(path);
+    try writeVideoTestProjector(a, path, false, 16);
+    const compat = @import("../io/compat.zig");
+    const absolute = try compat.cwd().realPathFileAlloc(compat.io(), path, a);
+    defer a.free(absolute);
+    const projector = try ProjectorStore.open(a, absolute);
+    defer projector.close();
+
+    var frames = try PortableVideoFrames.init(&cb, a, projector, 1);
+    defer frames.deinit();
+    const rgb = @embedFile("../testdata/video/gemma4-rgb601.rgb");
+    const view = image.ImageU8{ .data = rgb, .width = 32, .height = 16, .format = .rgb8 };
+    try frames.prepare(0, view, 32, 16);
+    const frame = frames.prepared[0].?;
+    const w: u32 = @intCast(frame.geometry.width);
+    const h: u32 = @intCast(frame.geometry.height);
+    const expected_policy: image.Resample = if (compute.ctx.info.compute_major >= 8 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC", true)) .torchvision_bicubic else .bilinear;
+    const reference = try image.preprocessImageViewRectScaledWithResample(a, view, w, h, frames.cfg.image_mean, frames.cfg.image_std, 1.0 / 255.0, expected_policy);
+    defer a.free(reference);
+    try std.testing.expectEqualSlices(f32, reference, frame.pixels);
+    if (expected_policy == .bilinear) return;
+
+    const resident = try compute.createEmbeddingGemma2Tensor(&.{ 16, 32, 3 }, .u8);
+    defer cb.free(resident);
+    const tensor: *cuda.CudaTensor = @ptrCast(@alignCast(resident));
+    try tensor.buffer.copyFromHost(&compute.ctx, rgb);
+    const patches = try compute.preprocessResidentRgb(resident, 32, 16, w, h, .channel_planar_centered);
+    defer cb.free(patches);
+    const actual = try cb.toFloat32(patches, a);
+    defer a.free(actual);
+    for (0..h) |y| for (0..w) |x| for (0..3) |c| {
+        const patch = (y / 16) * (w / 16) + x / 16;
+        const pixel = (y % 16) * 16 + x % 16;
+        try std.testing.expectEqual(2 * frame.pixels[(c * h + y) * w + x] - 1, actual[(patch * 3 + c) * 256 + pixel]);
+    };
+}
+
 test "gemma4 video CUDA projects resident frames and matches native patch projection" {
     if (comptime !@import("build_options").enable_cuda or @import("builtin").os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -7588,7 +7652,7 @@ test "gemma4 video CUDA projects resident frames and matches native patch projec
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/video.gguf", .{tmp.sub_path});
     defer a.free(path);
     for ([_]bool{ false, true }) |unified| {
-        try writeVideoTestProjector(a, path, unified);
+        try writeVideoTestProjector(a, path, unified, 2);
         const absolute = try compat.cwd().realPathFileAlloc(compat.io(), path, a);
         defer a.free(absolute);
         const projector = try ProjectorStore.open(a, absolute);
@@ -9743,7 +9807,7 @@ test "Gemma4 CUDA projector request caches share weights only within one store i
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/projector.gguf", .{tmp.sub_path});
     defer a.free(path);
-    try writeVideoTestProjector(a, path, false);
+    try writeVideoTestProjector(a, path, false, 2);
     const absolute = try compat.cwd().realPathFileAlloc(compat.io(), path, a);
     defer a.free(absolute);
     const first = try ProjectorStore.open(a, absolute);

@@ -196,6 +196,13 @@ extern "C" __global__ void termite_f32_to_f16(
     dst[idx] = __half_as_ushort(value);
 }
 
+// Eligibility is checked on the mapped BF16 weights before upload. Each
+// thread owns one 16-bit element, so the conversion requires no scratch.
+extern "C" __global__ void termite_bf16_to_f16_in_place(unsigned short* data, unsigned int count) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) data[i] = __half_as_ushort(__float2half_rn(__uint_as_float((unsigned int)data[i] << 16)));
+}
+
 extern "C" __global__ void termite_f32_to_i32(
     int* dst,
     const float* input,
