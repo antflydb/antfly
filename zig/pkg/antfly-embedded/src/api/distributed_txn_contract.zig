@@ -15,6 +15,7 @@
 
 //! Data-only transaction envelope used by the runtime callback boundary.
 
+const std = @import("std");
 const db_types = @import("../storage/db/types.zig");
 
 /// A pre-decision participant may be tried at another replica only when the
@@ -57,6 +58,7 @@ pub const TxnStatusRequest = struct {
 };
 
 pub const TableCommitRequest = struct {
+    bound_catalog_incarnation: ?[16]u8 = null,
     commit_requires: ?db_types.CommitRequires = null,
     /// Coordinator planning context, retained until cascade expansion finishes.
     /// A participant's explicit prerequisite always overrides this default.
@@ -84,6 +86,9 @@ pub const TableCommitRequest = struct {
     relational_activation: ?@import("../storage/db/relational_integrity_activation_contract.zig").Command = null,
     relational_retirement: ?@import("../storage/db/relational_integrity_retirement_contract.zig").Command = null,
     relational_index_maintenance: ?@import("../storage/db/relational_index_maintenance_contract.zig").Command = null,
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "bound_catalog_incarnation") and self.bound_catalog_incarnation == null;
+    }
 };
 
 pub const CommitConflict = struct {

@@ -20382,8 +20382,14 @@ pub const DB = struct {
         // Projection borrows the caller's immutable schema and primary snapshot.
         const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
         defer alloc.free(store_key);
+        var page: ?[]u8 = null;
+        defer if (page) |bytes| alloc.free(bytes);
         const raw = primary orelse (probe.getLeased(store_key) catch |err| switch (err) {
-            error.NotFound => return null,
+            error.NotFound => virtual: {
+                if (opts.include_primary_digest) return null;
+                page = try virtualPdfPageUnit(self, alloc, probe, store_key);
+                break :virtual page orelse return null;
+            },
             else => return err,
         });
         var privacy_arena = std.heap.ArenaAllocator.init(alloc);
@@ -45666,12 +45672,12 @@ pub const DB = struct {
         if (req.dense_queries.len > 0) {
             for (req.dense_queries) |named| {
                 if (self.core.denseIndex(named.index_name)) |entry| {
-                    if (entry.chunk_name != null) return true;
+                    if (entry.memberBacked()) return true;
                 }
             }
         } else if (req.dense != null) {
             if (self.core.denseIndex(req.index_name)) |entry| {
-                if (entry.chunk_name != null) return true;
+                if (entry.memberBacked()) return true;
             }
         }
 
@@ -47282,7 +47288,7 @@ pub const DB = struct {
         // query and instead carries it through to applyStoredSearchPatternFilters'
         // parent-aware matcher, same as the full-text arm (issue #931/#957).
         const chunk_backed_for_filter = if (self.core.denseIndex(req.index_name)) |entry|
-            entry.chunk_name != null
+            entry.memberBacked()
         else
             false;
         const member_mode_for_filter = req.return_mode == .member or req.return_mode == .chunk;
@@ -47441,7 +47447,7 @@ pub const DB = struct {
         // through to applyStoredSearchPatternFilters' parent-aware matcher
         // instead of applying it natively (issue #931/#957).
         const chunk_backed_for_filter = if (self.core.denseIndex(identity_prefix_filter.req.index_name)) |entry|
-            entry.chunk_name != null
+            entry.memberBacked()
         else
             false;
         const member_mode_for_filter = identity_prefix_filter.req.return_mode == .member or identity_prefix_filter.req.return_mode == .chunk;
@@ -48389,7 +48395,7 @@ pub const DB = struct {
         try self.enforcePortableRuntimeGate();
         if (ttlDurationNs(self) != 0) return declineDenseSnapshot("ttl");
         const entry = (try denseIndexCallback(self, req.index_name)) orelse return error.IndexNotFound;
-        if (entry.chunk_name != null or entry.embedding_names.len != 0) return declineDenseSnapshot("result_shape");
+        if (entry.memberBacked() or entry.embedding_names.len != 0) return declineDenseSnapshot("result_shape");
         const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
         const summary = self.core.identity_visibility.summary orelse return declineDenseSnapshot("identity_summary");
         if (!doc_identity.allVisibleFromSummary(summary, snapshot_req.identity_read_generation)) return declineDenseSnapshot("visibility");
@@ -48821,7 +48827,7 @@ pub const DB = struct {
         // identity stays unchanged so text/vector fusion merges the same member.
         inline for (.{ self.core.index_manager.denseIndex(req.index_name), self.core.index_manager.sparseIndex(req.index_name) }) |selected| {
             if (selected) |entry| {
-                if (chunk_backed and entry.embedding_names.len == 0 and entry.chunk_name != null)
+                if (chunk_backed and entry.embedding_names.len == 0)
                     presence.embedding_presence_name = entry.embedding_name orelse entry.config.name;
             }
         }
@@ -50977,7 +50983,10 @@ pub const DB = struct {
         defer alloc.free(store_key);
         var txn = try self.core.store.beginProbeTxn();
         defer txn.abort();
-        const raw = (try @import("artifact_chunk_generation.zig").readMember(alloc, &txn, store_key)) orelse return null;
+        const member = try @import("artifact_chunk_generation.zig").readMember(alloc, &txn, store_key);
+        const page = if (member == null) try virtualPdfPageUnit(self, alloc, &txn, store_key) else null;
+        defer if (page) |bytes| alloc.free(bytes);
+        const raw = member orelse page orelse return null;
         var privacy_arena = std.heap.ArenaAllocator.init(alloc);
         defer privacy_arena.deinit();
         const privacy = @import("privacy_read.zig");
@@ -51318,6 +51327,82 @@ fn scalarSearchAsset(self: *DB, key: []const u8) bool {
     return entry.content_type.len == 0 or std.mem.eql(u8, entry.content_type, "text/plain");
 }
 
+// A PDF page is stored as a generated vector under its logical unit key.
+// Read only the primary-owned artifact header, including for external payloads.
+fn virtualPdfPageUnit(self: *DB, alloc: Allocator, txn: *docstore_mod.DocStore.Txn, key: []const u8) !?[]u8 {
+    var values: [1]?[]const u8 = .{null};
+    try hydrateVirtualPdfPageUnits(self, alloc, txn, &.{key}, &values);
+    return if (values[0]) |page| @constCast(page) else null;
+}
+
+// Resolve one output per still-missing page per round. Read only physical headers,
+// keeping the configured output precedence and a single catalog cut for the batch.
+fn hydrateVirtualPdfPageUnits(self: *DB, output: Allocator, txn: *docstore_mod.DocStore.Txn, keys: []const []const u8, values: []?[]const u8) !void {
+    const Candidate = struct { index: usize, unit: []const u8, number: u32, outputs: []const []const u8 };
+    const Probe = struct {
+        candidate: Candidate,
+        key: []const u8,
+        fn less(_: void, a: @This(), b: @This()) bool {
+            return std.mem.lessThan(u8, a.key, b.key);
+        }
+    };
+    var snapshot: ?index_manager_mod.IndexManager.WritePlanSnapshotView = null;
+    defer if (snapshot) |*pinned| pinned.release();
+    var batch = std.heap.ArenaAllocator.init(output);
+    defer batch.deinit();
+    var wave = std.heap.ArenaAllocator.init(output);
+    defer wave.deinit();
+    var offset: usize = 0;
+    while (offset < keys.len) {
+        const end = @min(offset + 128, keys.len);
+        _ = batch.reset(.retain_capacity);
+        var candidates: [128]Candidate = undefined;
+        var count: usize = 0;
+        for (offset..end) |i| {
+            if (values[i] != null or !internal_keys.isDocumentUnitArtifactRecordKey(keys[i])) continue;
+            const ref = (try artifact_ids.decodeArtifactRefAlloc(batch.allocator(), keys[i])) orelse continue;
+            const unit = ref.unit_id orelse continue;
+            if (!std.mem.startsWith(u8, unit, "page:")) continue;
+            const number = std.fmt.parseUnsigned(u32, unit[5..], 10) catch continue;
+            if (number == 0) continue;
+            if (snapshot == null) snapshot = try self.core.index_manager.acquireWritePlanSnapshot();
+            const names = snapshot.?.plan().pdf_page_outputs.get(ref.name) orelse continue;
+            if (names.items.len == 0) continue;
+            candidates[count] = .{ .index = i, .unit = unit, .number = number, .outputs = names.items };
+            count += 1;
+        }
+        while (count != 0) {
+            _ = wave.reset(.retain_capacity);
+            var probes: [128]Probe = undefined;
+            var physical: [128][]const u8 = undefined;
+            var headers: [128]?[]const u8 = undefined;
+            for (candidates[0..count], probes[0..count]) |item, *probe| probe.* = .{ .candidate = item, .key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(wave.allocator(), keys[item.index], item.outputs[0]) };
+            if (!std.sort.isSorted(Probe, probes[0..count], {}, Probe.less)) std.mem.sort(Probe, probes[0..count], {}, Probe.less);
+            for (probes[0..count], physical[0..count]) |probe, *key| key.* = probe.key;
+            try txn.getManySortedPhysical(physical[0..count], headers[0..count]);
+            const received = count;
+            count = 0;
+            for (probes[0..received], headers[0..received]) |probe, header| {
+                var item = probe.candidate;
+                if (header) |bytes| {
+                    const meta = try @import("../artifact_payload.zig").Metadata.decode(bytes);
+                    if (meta.sourceHash()) |source| {
+                        const fingerprint = try std.fmt.allocPrint(wave.allocator(), "{s}:{x:0>16}", .{ item.outputs[0], source });
+                        values[item.index] = try std.json.Stringify.valueAlloc(output, .{ .unit_id = item.unit, .unit_type = "page", .provenance = .{ .page_number = item.number }, ._artifact_unit_fingerprint = fingerprint }, .{});
+                        continue;
+                    }
+                }
+                item.outputs = item.outputs[1..];
+                if (item.outputs.len != 0) {
+                    candidates[count] = item;
+                    count += 1;
+                }
+            }
+        }
+        offset = end;
+    }
+}
+
 fn materializeSearchStoredValue(self: *DB, alloc: Allocator, key: []const u8, raw: []const u8) ![]u8 {
     if (scalarSearchAsset(self, key)) return try std.json.Stringify.valueAlloc(alloc, .{ .@"$" = raw }, .{});
     return try self.core.index_manager.materializeStoredValueAlloc(alloc, key, raw);
@@ -51613,6 +51698,9 @@ fn loadStoredSearchDocumentsMany(
     defer privacy_arena.deinit();
     const privacy = @import("privacy_read.zig");
     const policy = try privacy.capture(self, privacy_arena.allocator());
+    var virtual_pages = std.heap.ArenaAllocator.init(alloc);
+    defer virtual_pages.deinit();
+    try hydrateVirtualPdfPageUnits(self, virtual_pages.allocator(), &txn, read_keys, read_values);
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse continue;
         if (policy != null and policy.?.prepared.policy.mode != .monitor) {
@@ -54511,7 +54599,7 @@ fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
         // Named vector members resolve their public hit id to the source
         // document/chunk, which may be shared by several embeddings. The
         // artifact reference retains the member's authoritative stored key.
-        const key = if (embedding_presence_name != null and internal_keys.isChunkArtifactRecordKey(hit.id))
+        const key = if (embedding_presence_name != null and (internal_keys.isChunkArtifactRecordKey(hit.id) or internal_keys.isDocumentUnitArtifactRecordKey(hit.id)))
             try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, hit.id, embedding_presence_name.?)
         else if (hit.artifact_ref) |artifact_ref|
             try artifact_ids.internalKeyForArtifactRefAlloc(scratch, artifact_ref)
@@ -63983,7 +64071,7 @@ const denseIndexIsArtifactBacked = local_mutation.denseIndexIsArtifactBacked;
 /// at most one vector per source document use the current incarnation's
 /// outcome tuple even when vectors live in artifacts.
 fn densePublicationTargetUsesArtifactCounter(entry: anytype) bool {
-    return entry.external or entry.chunk_name != null or entry.embedding_names.len > 1;
+    return entry.external or entry.memberBacked() or entry.embedding_names.len > 1;
 }
 
 fn denseCoverageMatchesTarget(active_count: u64, expected_count: u64) bool {
@@ -138043,7 +138131,7 @@ test "db dense lsm cache profile benchmark" {
     for (0..reps) |_| {
         const total_start = monotonicTimeNs();
         const profiled_entry = dense_entry;
-        const chunk_backed = profiled_entry.chunk_name != null;
+        const chunk_backed = profiled_entry.memberBacked();
         const group_chunk_parents = db_query_search.shouldGroupChunkParents(req, chunk_backed);
         const effective_k: u32 = if (group_chunk_parents)
             @intCast(profiled_entry.index.metadata.active_count)
@@ -155659,6 +155747,33 @@ test "source semantic media input rejects PDF ancestry on nonempty sources and p
         try std.testing.expectEqual(@TypeOf(request.input_kind).materialized_chunks, request.input_kind);
     };
     try std.testing.expectEqual(@as(usize, 1), dense_requests);
+}
+
+test "source semantic media input PDF cardinality changes require removing dense consumers" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/pages.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try @import("../lite/backend.zig").Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var opts = OpenOptions{ .start_index_workers = false, .start_optional_runtime_workers = false };
+    try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+    var db = try DB.open(a, path, opts);
+    defer db.close();
+    var config = types.EnrichmentConfig{ .name = "visual", .kind = .embedding, .field = "url", .expected_dims = 3 };
+    try db.addEnrichment(config);
+    const index = types.IndexConfig{ .name = "images", .kind = .dense_vector, .config_json = "{\"field\":\"v\",\"dims\":3,\"embedding_name\":\"visual\"}" };
+    try db.addIndex(index);
+    config.embedding_input = .pdf_page_images;
+    try std.testing.expectError(error.EnrichmentInUse, db.upsertEnrichment(config));
+    try std.testing.expect(try db.deleteIndex("images"));
+    while (try db.advanceGeneratedArtifactCleanupPage("images") != .idle) {}
+    _ = try db.upsertEnrichment(config);
+    try db.addIndex(index);
+    config.embedding_input = .text;
+    try std.testing.expectError(error.EnrichmentInUse, db.upsertEnrichment(config));
+    try std.testing.expect(db.core.index_manager.denseIndex("images").?.memberBacked());
 }
 
 test "source semantic media input PDF producers cannot be bound to sparse consumers" {

@@ -62,15 +62,43 @@ pub fn validate(alloc: std.mem.Allocator, child_json: []const u8, parent_name: [
     const owned = arena.allocator();
     var child = try schema.parseValidatedTableSchema(alloc, child_json);
     defer child.deinit(alloc);
+    const targets = try ChildTargets.init(owned, child, try child.relationalForeignKeyDefinitions(owned));
+    try targets.validateParent(alloc, parent_name, parent_json);
+}
+
+/// Borrows the parsed child, with grouped declarations and layout owned by the caller's arena.
+pub const ChildTargets = struct {
+    layout: native.TableSchema,
+    groups: std.StringHashMapUnmanaged(std.ArrayList(relational.ForeignKey)) = .empty,
+
+    pub fn init(arena: std.mem.Allocator, child: schema.ParsedTableSchema, fks: []const relational.ForeignKey) !ChildTargets {
+        if (child.storage_mode != .relational) return error.ForeignKeyTargetNotUnique;
+        var result: ChildTargets = .{ .layout = try schema.deriveRelationalCheckLayout(arena, child) };
+        for (fks) |fk| {
+            const group = try result.groups.getOrPut(arena, fk.parent_table);
+            if (!group.found_existing) group.value_ptr.* = .empty;
+            try group.value_ptr.append(arena, fk);
+        }
+        return result;
+    }
+
+    pub fn validateParent(self: ChildTargets, alloc: std.mem.Allocator, parent_name: []const u8, parent_json: []const u8) !void {
+        const constraints = self.groups.get(parent_name) orelse std.ArrayList(relational.ForeignKey).empty;
+        try validateGroup(alloc, self.layout, constraints.items, parent_json);
+    }
+};
+
+fn validateGroup(alloc: std.mem.Allocator, child_layout: native.TableSchema, constraints: []const relational.ForeignKey, parent_json: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = arena.allocator();
     var parent = try schema.parseValidatedTableSchema(alloc, parent_json);
     defer parent.deinit(alloc);
-    if (child.storage_mode != .relational or parent.storage_mode != .relational)
+    if (parent.storage_mode != .relational)
         return error.ForeignKeyTargetNotUnique;
-    const child_layout = try schema.deriveRelationalCheckLayout(owned, child);
     const parent_layout = try schema.deriveRelationalCheckLayout(owned, parent);
     const uniques = try parent.relationalUniqueDefinitions(owned);
-    for (try child.relationalForeignKeyDefinitions(owned)) |fk| {
-        if (!std.mem.eql(u8, fk.parent_table, parent_name)) continue;
+    for (constraints) |fk| {
         _ = try resolveUnique(uniques, fk.parent_columns);
         if (fk.match == .partial) try @import("relational_witness_indexes.zig").requireCoverage(parent, fk.parent_columns);
         if (fk.child_columns.len == 0 or fk.child_columns.len != fk.parent_columns.len)

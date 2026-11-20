@@ -15,6 +15,16 @@
 
 //! Atomic, binary-safe session changes carried by metadata Raft.
 const std = @import("std");
+pub const session_prefix = "\x00\x00__api_txn_sessions__:";
+pub const bound_session_header = "{\"session_format\":2,";
+fn frameVersion(changes: []const Change) u8 {
+    for (changes) |change| {
+        if (!std.mem.startsWith(u8, change.key, session_prefix)) continue;
+        if (change.value) |value| if (std.mem.startsWith(u8, value, bound_session_header)) return 2;
+    }
+    return 1;
+}
+
 pub const max_bytes = 32 << 20;
 pub const max_operations = 4096;
 pub const Change = struct { key: []const u8, expected: ?[]const u8, value: ?[]const u8 };
@@ -40,7 +50,7 @@ pub fn encode(a: std.mem.Allocator, record: Record) ![]u8 {
     if (record.changes.len > max_operations) return error.TransactionTooLarge;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
-    try out.append(a, 1);
+    try out.append(a, frameVersion(record.changes));
     try appendInt(&out, a, u64, record.scan_epoch orelse std.math.maxInt(u64));
     try appendInt(&out, a, u32, @intCast(record.changes.len));
     for (record.changes) |change| {
@@ -74,7 +84,8 @@ const Decoder = struct {
 pub fn decode(a: std.mem.Allocator, bytes: []const u8) !Record {
     if (bytes.len > max_bytes) return error.TransactionTooLarge;
     var reader: Decoder = .{ .bytes = bytes };
-    if (try reader.int(u8) != 1) return error.InvalidTransactionSessionRecord;
+    const version = try reader.int(u8);
+    if (version != 1 and version != 2) return error.InvalidTransactionSessionRecord;
     const epoch = try reader.int(u64);
     const count = try reader.int(u32);
     if (count > max_operations) return error.TransactionTooLarge;
@@ -86,7 +97,7 @@ pub fn decode(a: std.mem.Allocator, bytes: []const u8) !Record {
         for (changes[0..i]) |previous| if (std.mem.eql(u8, key, previous.key)) return error.InvalidTransactionSessionRecord;
         change.* = .{ .key = key, .expected = try reader.slice(), .value = try reader.slice() };
     }
-    if (reader.pos != bytes.len) return error.InvalidTransactionSessionRecord;
+    if (version != frameVersion(changes) or reader.pos != bytes.len) return error.InvalidTransactionSessionRecord;
     return .{ .changes = changes, .scan_epoch = if (epoch == std.math.maxInt(u64)) null else epoch };
 }
 pub fn apply(txn: anytype, a: std.mem.Allocator, group: u64, bytes: []const u8) !bool {

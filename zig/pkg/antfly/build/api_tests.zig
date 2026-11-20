@@ -2340,7 +2340,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     hosted_initial_fk_test_mod.addImport("usermgr_storage", hosted_fk_usermgr_storage);
     const hosted_initial_fk_tests = b.addTest(.{
         .root_module = hosted_initial_fk_test_mod,
-        .filters = &.{ "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations", "mounted initial MATCH PARTIAL publication enforces constraints across restart", "hosted initial FK real services and facade retain all required capabilities" },
+        .filters = &.{ "FK plan batches", "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations", "mounted initial MATCH PARTIAL publication enforces constraints across restart", "hosted initial FK real services and facade retain all required capabilities" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-initial-fk-test", "Run mounted hosted initial-FK owner publication regression")
@@ -2371,7 +2371,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "antfly-hosted-initial-fk-recovery",
         .max_rss = @import("runtime_memory.zig").testCompileMaxRss("antfly-hosted-initial-fk-recovery", b.graph.host.result, target.result, optimize, 0),
         .root_module = hosted_initial_fk_test_mod,
-        .filters = &.{ "mounted initial", "hosted initial FK real services and facade retain all required capabilities", "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations" },
+        .filters = &.{ "mounted initial", "hosted initial FK real services and facade retain all required capabilities", "FK plan batches", "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const hosted_fk_drop_test_mod = b.createModule(.{
