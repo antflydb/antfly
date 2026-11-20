@@ -217,9 +217,11 @@ and causes the worker to submit an upgrade. Duplicate current activations retain
 the existing epoch and do not invalidate in-flight work.
 
 Remote embedding catalogs advertise `model_revision_pinning` when their executor
-supports an immutable generation fence. Native runtimes require a verified managed
-publication for this guarantee. Local model directories without a receipt keep
-serving unversioned requests. Managed calls carry the generation in
+supports an immutable generation fence. Native runtimes scope pins to a checksummed
+managed publication and a compatible execution recipe. A cold catalog reads
+the declared hashes, and the runtime verifies the bytes before acknowledging
+the revision. Local directories and legacy receipts without complete checksums
+serve unversioned requests. Managed calls carry the generation in
 `model_revision`; flat, sparse, and grouped HTTP execution check every acquired
 model before dispatch, including recovery attempts. Successful JSON and numeric
 responses acknowledge the generation in `X-Antfly-Model-Revision`. Clients verify

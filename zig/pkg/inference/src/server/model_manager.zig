@@ -2965,38 +2965,87 @@ fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []con
         owned = if (standalone) null else try managed_receipt.loadValidated(a, io, receipt_root);
         break :blk if (owned) |*validated| validated else null;
     };
-    if (receipt) |validated| {
-        const artifacts = try a.dupe(managed_receipt.ValidatedArtifact, validated.artifacts);
-        defer a.free(artifacts);
-        std.mem.sort(managed_receipt.ValidatedArtifact, artifacts, {}, struct {
-            fn less(_: void, left: managed_receipt.ValidatedArtifact, right: managed_receipt.ValidatedArtifact) bool {
-                return std.mem.lessThan(u8, left.path, right.path);
-            }
-        }.less);
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        for (artifacts) |artifact| {
-            try control.check();
-            var decoded: [32]u8 = undefined;
-            const verified_digest = if (published) |source| try source.verifiedFileDigest(artifact.path) else null;
-            if (verified_digest) |digest| {
-                _ = std.fmt.hexToBytes(&decoded, digest) catch return error.InvalidManagedDownload;
-            } else decoded = try LegacyArtifactDigestCache.digestWithControl(io, artifact, control);
-            if (artifact.sha256) |digest| {
-                if (digest.len != 64) return error.InvalidManagedDownload;
-                var expected: [32]u8 = undefined;
-                _ = std.fmt.hexToBytes(&expected, digest) catch return error.InvalidManagedDownload;
-                if (!std.mem.eql(u8, &expected, &decoded)) return error.ChecksumMismatch;
-            }
-            hash.update(artifact.path);
-            hash.update(&.{0});
-            hash.update(&decoded);
-        }
-        var result: [32]u8 = undefined;
-        hash.final(&result);
-        try control.check();
-        return imagePreprocessingRevision(manifest, result);
+    const revision = if (receipt) |validated|
+        try receiptedModelRevision(a, io, validated, published, control, true)
+    else
+        try resolutionModelRevision(a, io, manifest, control);
+    return imagePreprocessingRevision(manifest, revision);
+}
+
+fn hasCompleteChecksums(artifacts: *const PublishedArtifacts) bool {
+    const receipt = artifacts.receipt orelse return false;
+    for (receipt.artifacts) |artifact| {
+        if (artifact.sha256 == null) return false;
     }
-    return imagePreprocessingRevision(manifest, try resolutionModelRevision(a, io, manifest, control));
+    return true;
+}
+
+fn receiptedModelRevision(
+    a: std.mem.Allocator,
+    io: std.Io,
+    receipt: *const managed_receipt.ValidatedReceipt,
+    published: ?*PublishedArtifacts,
+    control: InferenceExecutionControl,
+    comptime verify: bool,
+) ![32]u8 {
+    const artifacts = try a.dupe(managed_receipt.ValidatedArtifact, receipt.artifacts);
+    defer a.free(artifacts);
+    std.mem.sort(managed_receipt.ValidatedArtifact, artifacts, {}, struct {
+        fn less(_: void, left: managed_receipt.ValidatedArtifact, right: managed_receipt.ValidatedArtifact) bool {
+            return std.mem.lessThan(u8, left.path, right.path);
+        }
+    }.less);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (artifacts) |artifact| {
+        try control.check();
+        const digest: ?[]const u8 = if (verify)
+            if (published) |source| try source.verifiedFileDigest(artifact.path) else null
+        else
+            artifact.sha256 orelse return error.InvalidManagedDownload;
+        const decoded = if (digest) |hex| blk: {
+            var checksum: [32]u8 = undefined;
+            if (hex.len != 64) return error.InvalidManagedDownload;
+            _ = std.fmt.hexToBytes(&checksum, hex) catch return error.InvalidManagedDownload;
+            break :blk checksum;
+        } else legacy: {
+            const checksum = try LegacyArtifactDigestCache.digestWithControl(io, artifact, control);
+            if (artifact.sha256) |hex| {
+                var expected: [32]u8 = undefined;
+                if (hex.len != 64) return error.InvalidManagedDownload;
+                _ = std.fmt.hexToBytes(&expected, hex) catch return error.InvalidManagedDownload;
+                if (!std.mem.eql(u8, &expected, &checksum)) return error.ChecksumMismatch;
+            }
+            break :legacy checksum;
+        };
+        hash.update(artifact.path);
+        hash.update(&.{0});
+        hash.update(&decoded);
+    }
+    var result: [32]u8 = undefined;
+    hash.final(&result);
+    try control.check();
+    return result;
+}
+
+/// Durable indexes require a stable vector recipe in addition to model content.
+/// Gemma's qualified native and Metal recipes are compatible. Other backends
+/// retain separate identities until their embedding recipes are qualified.
+/// Bump the domain when the generic embedding recipe changes incompatibly.
+fn durableEmbeddingRevision(manifest: manifest_mod.ModelManifest, artifact_revision: [32]u8, backend: backends.BackendType) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-durable-embedding-v1\x00");
+    hash.update(&artifact_revision);
+    if (manifest.embedding_style == .embedding_gemma2) {
+        const gemma = @import("../models/embedding_gemma2_identity.zig");
+        hash.update(gemma.recipe);
+        const encoded = std.fmt.bytesToHex(hash.finalResult(), .lower);
+        const backend_identity = gemma.forBackend(encoded, backend);
+        var digest: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&digest, &backend_identity) catch unreachable;
+        return digest;
+    }
+    hash.update(@tagName(backend));
+    return hash.finalResult();
 }
 
 fn imagePreprocessingRevision(manifest: manifest_mod.ModelManifest, artifacts: [32]u8) [32]u8 {
@@ -3226,6 +3275,7 @@ pub const LoadedModel = struct {
     runtime_id: RuntimeId = 0,
     residency_mode: RuntimeResidencyMode = .backend_managed,
     chunk_planning: ?ChunkPlanningSnapshot = null,
+    durable_embedding_revision: ?[32]u8 = null,
     resolution_revision: ?[32]u8 = null,
     /// Portable checkpoint identity is bound to this loaded asset generation.
     /// Unsupported bundles keep this optional capability disabled.
@@ -10120,6 +10170,27 @@ pub const ModelManager = struct {
         return modelIdentityWithArtifacts(self.allocator, io, model_dir, manifest, &artifacts, control);
     }
 
+    /// A validated publication declares the expected content hashes. The
+    /// acquired runtime independently verifies those bytes before it may
+    /// acknowledge the revision, so catalog latency is independent of weight size.
+    pub fn declaredEmbeddingRevision(
+        self: *ModelManager,
+        model_dir: []const u8,
+        manifest: manifest_mod.ModelManifest,
+        control: InferenceExecutionControl,
+    ) !?[32]u8 {
+        if (manifest.managed_publication == null) return null;
+        const io = control.io orelse try self.componentPlanIo();
+        var lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
+        defer lease.deinit(io);
+        var artifacts = try PublishedArtifacts.init(self.allocator, io, model_dir, .{ .publication = manifest.managed_publication });
+        defer artifacts.deinit();
+        if (!hasCompleteChecksums(&artifacts)) return null;
+        const artifact_revision = try receiptedModelRevision(self.allocator, io, &artifacts.receipt.?, null, control, false);
+        const backend = plannedDurableEmbeddingBackend(self.session_manager, manifest);
+        return durableEmbeddingRevision(manifest, imagePreprocessingRevision(manifest, artifact_revision), backend orelse return null);
+    }
+
     fn loadFromDirUncached(
         self: *ModelManager,
         model_dir: []const u8,
@@ -10430,6 +10501,10 @@ pub const ModelManager = struct {
             .managed_publication = managed_publication,
             .chunk_planning = chunk_planning,
             .resolution_revision = resolution_revision,
+            .durable_embedding_revision = if (hasCompleteChecksums(&tokenizer_artifacts))
+                durableEmbeddingRevision(man, resolution_revision, session.backend())
+            else
+                null,
             .native_kv_asset_generation = native_kv_asset_generation,
             .native_kv_tokenizer_contract = if (native_kv_asset_generation != null) .{
                 .route = switch (tokenizer_type) {
@@ -17364,6 +17439,31 @@ fn embeddingPlanningBackend(manager: backends.SessionManager) backends.BackendTy
         if (backend == .cuda or backend == .metal or backend == .native) return backend;
     }
     return .native;
+}
+
+fn plannedDurableEmbeddingBackend(manager: backends.SessionManager, manifest: manifest_mod.ModelManifest) ?backends.BackendType {
+    if (manifest.embedding_style == .embedding_gemma2) {
+        const backend = embeddingPlanningBackend(manager);
+        return if (backend.available() and (backend == .cuda or backend == .metal or backend == .native)) backend else null;
+    }
+    if (manager.required_backend) |backend| return if (backend.available()) backend else null;
+    for (manager.preferred_backends) |backend| {
+        if (!backend.available()) continue;
+        if (!manager.uninterruptibleBackendsAllowed() and backend.executionInterruption() == .uninterruptible) continue;
+        if (backend == .wasm and manifest.onnx_path == null) continue;
+        return backend;
+    }
+    return null;
+}
+
+test "durable embedding revision fences backend execution recipes" {
+    const a = std.testing.allocator;
+    const manifest: manifest_mod.ModelManifest = .{ .allocator = a, .embedding_style = .embedding_gemma2 };
+    const artifacts: [32]u8 = @splat(1);
+    const native = durableEmbeddingRevision(manifest, artifacts, .native);
+    try std.testing.expectEqual(native, durableEmbeddingRevision(manifest, artifacts, .metal));
+    try std.testing.expect(!std.mem.eql(u8, &native, &durableEmbeddingRevision(manifest, artifacts, .cuda)));
+    try std.testing.expect(!std.mem.eql(u8, &native, &durableEmbeddingRevision(manifest, @splat(2), .native)));
 }
 
 test "embeddinggemma2 planning precision follows required backend before preferences" {
