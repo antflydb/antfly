@@ -50,7 +50,7 @@ pub fn decode(a: A, key: []const u8, value: []const u8) !Effect {
 /// Logical write dependencies are conflict/range reservations only. Keeping
 /// them separate from primary intents preserves the original document bytes.
 /// Decode into the request preparation arena; returned keys borrow that arena.
-pub fn sources(a: A, intents: []const txn.WriteIntent) ![]const txn.WriteIntent {
+pub fn sources(a: A, intents: []const txn.WriteIntent, include_policy_endpoints: bool) ![]const txn.WriteIntent {
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(a);
     var output: std.ArrayList(txn.WriteIntent) = .empty;
@@ -58,11 +58,15 @@ pub fn sources(a: A, intents: []const txn.WriteIntent) ![]const txn.WriteIntent 
     for (intents) |intent| {
         if (!isEffect(intent.key)) continue;
         const effect = try decode(a, intent.key, intent.value orelse return error.InvalidTxnRecord);
-        const source = switch (effect) {
-            inline else => |edge| edge.source,
-        };
-        if ((try seen.getOrPut(a, source)).found_existing) continue;
-        try output.append(a, .{ .key = source, .value = null });
+        switch (effect) {
+            inline else => |edge| {
+                const owner = edge.producingDocument();
+                if (!(try seen.getOrPut(a, owner)).found_existing)
+                    try output.append(a, .{ .key = owner, .value = null });
+                if (include_policy_endpoints and !(try seen.getOrPut(a, edge.source)).found_existing)
+                    try output.append(a, .{ .key = edge.source, .value = null });
+            },
+        }
     }
     return output.toOwnedSlice(a);
 }

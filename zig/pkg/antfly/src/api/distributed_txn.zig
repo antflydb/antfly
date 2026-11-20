@@ -1406,12 +1406,12 @@ fn executeMultiTableCommitOnce(
             try participant.deletes.append(alloc, key);
         }
         for (table.graph_writes) |edge| {
-            const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
+            const group_id = routing.resolveGroupForKey(edge.producingDocument()) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.graph_writes.append(alloc, edge);
         }
         for (table.graph_deletes) |edge| {
-            const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
+            const group_id = routing.resolveGroupForKey(edge.producingDocument()) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.graph_deletes.append(alloc, edge);
         }
@@ -5781,6 +5781,13 @@ fn consumerTests() type {
                 fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnPrepareRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(req.req.writes.len + req.req.deletes.len + req.req.predicates.len + req.req.integrity.len + req.req.range_guards.len > 0);
+                    if (req.req.graph_writes.len != 0 or req.req.graph_deletes.len != 0) {
+                        try std.testing.expectEqual(@as(u64, 7002), group_id);
+                        try std.testing.expectEqual(@as(usize, 1), req.req.graph_writes.len);
+                        try std.testing.expectEqual(@as(usize, 1), req.req.graph_deletes.len);
+                        try std.testing.expectEqualStrings("doc:z", req.req.graph_writes[0].producingDocument());
+                        try std.testing.expectEqualStrings("doc:z", req.req.graph_deletes[0].producingDocument());
+                    }
                     if (req.req.range_guards.len != 0) {
                         try std.testing.expectEqual(@as(u64, 7002), group_id);
                         try std.testing.expectEqual(@as(?u64, 9007199254740993), req.req.range_guards[0].generation);
@@ -5847,6 +5854,21 @@ fn consumerTests() type {
                         .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
                         .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
                     },
+                    .graph_writes = &.{.{
+                        .index_name = "links",
+                        .source = "doc:a",
+                        .target = "doc:z",
+                        .edge_type = "cites",
+                        .edge_id = "new",
+                        .owner_document = "doc:z",
+                    }},
+                    .graph_deletes = &.{.{
+                        .index_name = "links",
+                        .source = "doc:a",
+                        .target = "doc:z",
+                        .edge_type = "cites",
+                        .owner = "doc:z",
+                    }},
                     .predicates = &.{
                         .{ .key = "doc:a", .expected_version = 1 },
                         .{ .key = "doc:z", .expected_version = 2 },

@@ -26097,7 +26097,7 @@ pub const DB = struct {
         }
         for (effective_ops.graph_writes.items) |edge| try graph_contract.append(graph_alloc, preparation_alloc, &intents, .{ .write = edge });
         for (effective_ops.graph_deletes.items) |edge| try graph_contract.append(graph_alloc, preparation_alloc, &intents, .{ .delete = edge });
-        const graph_sources = try graph_contract.sources(graph_alloc, intents.items);
+        const graph_sources = try graph_contract.sources(graph_alloc, intents.items, false);
         var predicates = std.ArrayListUnmanaged(transactions_mod.VersionPredicate).empty;
         defer predicates.deinit(preparation_alloc);
 
@@ -26271,7 +26271,10 @@ pub const DB = struct {
         if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
         if (row_policy_principal) |principal| {
             const view = prepared_schema_view orelse return error.RowPolicyCatalogChanged;
-            try self.enforceRowPolicyIntentsLocked(view, intents.items, graph_sources, principal, graph_alloc, &predicates, preparation_alloc);
+            // Preserve authorization on the logical endpoint as well as the
+            // document that owns the durable graph contribution.
+            const policy_sources = if (graph_sources.len != 0) try graph_contract.sources(graph_alloc, intents.items, true) else graph_sources;
+            try self.enforceRowPolicyIntentsLocked(view, intents.items, policy_sources, principal, graph_alloc, &predicates, preparation_alloc);
         }
         const integrity_mod = @import("relational_integrity.zig");
         const activation_mod = @import("relational_integrity_activation.zig");
@@ -147879,11 +147882,11 @@ test "db graph endpoint cleanup transaction graph effects advance source ranges 
     try db.batch(.{ .graph_writes = &.{.{ .edge_id = "second", .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} });
 }
 
-test "db graph endpoint cleanup graph-only prepares reserve source ranges across reopen" {
+test "db graph endpoint cleanup graph-only prepares reserve producing document ranges across reopen" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("cypher-graph-only-prepare-range");
     defer directory.cleanup();
-    const edge: types.GraphEdgeWrite = .{ .edge_id = "explicit", .index_name = "g", .source = "a", .target = "b", .edge_type = "R" };
+    const edge: types.GraphEdgeWrite = .{ .edge_id = "explicit", .owner_document = "fact", .index_name = "g", .source = "a", .target = "b", .edge_type = "R" };
     const tracking = @import("../range_protection.zig");
     var writer: types.TxnId = undefined;
     var generation: u64 = undefined;
@@ -147895,7 +147898,7 @@ test "db graph endpoint cleanup graph-only prepares reserve source ranges across
         try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{}" }, .{ .key = "b", .value = "{}" } } });
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
-        generation = (try tracking.generation(&read, tracking.bucket("a"))).?;
+        generation = (try tracking.generation(&read, tracking.bucket("fact"))).?;
         writer = try db.beginTransaction(100);
         try db.writeTransaction(writer, .{ .graph_writes = &.{edge} });
     }
@@ -147903,7 +147906,7 @@ test "db graph endpoint cleanup graph-only prepares reserve source ranges across
         var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
         defer db.close();
         const reader = try db.beginTransaction(101);
-        const request: types.TransactionIntentRequest = .{ .range_guards = &.{.{ .bucket = tracking.bucket("a"), .generation = generation }} };
+        const request: types.TransactionIntentRequest = .{ .range_guards = &.{.{ .bucket = tracking.bucket("fact"), .generation = generation }} };
         try std.testing.expectError(error.IntentConflict, db.writeTransaction(reader, request));
         try db.abortTransaction(writer, 102);
         try db.writeTransaction(reader, request);
