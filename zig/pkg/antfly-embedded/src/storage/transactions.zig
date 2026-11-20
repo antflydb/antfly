@@ -2859,17 +2859,27 @@ const DagBatch = union(enum) {
     resolve: struct { id: TxnId, status: TxnStatus },
 };
 
+const dag_vote_magic = "DAGV\x01";
+const dag_vote_bytes = 32 + 32 + 32 + 8;
+
 fn stageDagPrepare(alloc: Allocator, batch: *backend_erased.Batch, id: TxnId, prepare: DagPrepare) !void {
     const key = makeSidecarKey(dag_domains_prefix, id);
     if (batch.get(&key)) |_| {
         return error.GraphConstraintAttemptConflict;
     } else |err| if (err != error.NotFound) return err;
     if (prepare.domains.len == 0 or prepare.domains.len > max_dag_domains_per_participant) return error.InvalidDagMutation;
-    var domains: [max_dag_domains_per_participant]dag.Digest = undefined;
+    var packet: [dag_vote_magic.len + max_dag_domains_per_participant * dag_vote_bytes]u8 = undefined;
+    @memcpy(packet[0..dag_vote_magic.len], dag_vote_magic);
+    var previous: ?dag.Digest = null;
     for (prepare.domains, 0..) |domain, index| {
         if (!std.mem.eql(u8, &domain.attempt.transaction, &id)) return error.GraphConstraintAttemptConflict;
-        if (index != 0 and std.mem.order(u8, &domains[index - 1], &domain.domain) != .lt) return error.InvalidDagMutation;
-        domains[index] = domain.domain;
+        if (previous) |prior| if (std.mem.order(u8, &prior, &domain.domain) != .lt) return error.InvalidDagMutation;
+        previous = domain.domain;
+        const row = packet[dag_vote_magic.len + index * dag_vote_bytes ..][0..dag_vote_bytes];
+        row[0..32].* = domain.domain;
+        row[32..64].* = domain.attempt.id;
+        row[64..96].* = domain.attempt.candidate;
+        std.mem.writeInt(u64, row[96..104], domain.revision, .big);
         const result = try dag.Storage.begin(batch, domain.domain, domain.epoch, domain.revision, domain.attempt);
         const token = switch (result) {
             .reserved => |token| token,
@@ -2877,7 +2887,7 @@ fn stageDagPrepare(alloc: Allocator, batch: *backend_erased.Batch, id: TxnId, pr
         };
         try dag.TransactionParticipant.prepare(alloc, batch, token, domain.producer_versions, domain.replacements, prepare.budget, prepare.witness);
     }
-    try batch.put(&key, std.mem.sliceAsBytes(domains[0..prepare.domains.len]));
+    try batch.put(&key, packet[0 .. dag_vote_magic.len + prepare.domains.len * dag_vote_bytes]);
 }
 
 fn stageDagResolution(alloc: Allocator, batch: *backend_erased.Batch, id: TxnId, status: TxnStatus) !void {
@@ -2886,21 +2896,31 @@ fn stageDagResolution(alloc: Allocator, batch: *backend_erased.Batch, id: TxnId,
         if (err == error.NotFound) return error.InvalidTxnRecord;
         return err;
     };
-    const digest_len = @sizeOf(dag.Digest);
-    if (raw.len == 0 or raw.len % digest_len != 0 or raw.len / digest_len > max_dag_domains_per_participant) return error.InvalidTxnRecord;
-    var domains: [max_dag_domains_per_participant]dag.Digest = undefined;
-    const ids = domains[0 .. raw.len / digest_len];
-    @memcpy(std.mem.sliceAsBytes(ids), raw);
+    const legacy = raw.len % @sizeOf(dag.Digest) == 0;
+    if (!legacy and !std.mem.startsWith(u8, raw, dag_vote_magic)) return error.InvalidTxnRecord;
+    const body = if (legacy) raw else raw[dag_vote_magic.len..];
+    const row_bytes: usize = if (legacy) @sizeOf(dag.Digest) else dag_vote_bytes;
+    if (body.len == 0 or body.len % row_bytes != 0 or body.len / row_bytes > max_dag_domains_per_participant) return error.InvalidTxnRecord;
+    // The backend may invalidate the borrowed record on another read.
+    var scratch: [max_dag_domains_per_participant * dag_vote_bytes]u8 = undefined;
+    @memcpy(scratch[0..body.len], body);
     const outcome: dag.Outcome = switch (status) {
         .committed => .accepted,
         .aborted => .aborted,
         .pending => return error.InvalidTxnRecord,
     };
-    for (ids, 0..) |domain, index| {
-        if (index != 0 and std.mem.order(u8, &ids[index - 1], &domain) != .lt) return error.InvalidTxnRecord;
+    var previous: ?dag.Digest = null;
+    for (0..body.len / row_bytes) |index| {
+        const row = scratch[index * row_bytes ..][0..row_bytes];
+        const domain = row[0..32].*;
+        if (previous) |prior| if (std.mem.order(u8, &prior, &domain) != .lt) return error.InvalidTxnRecord;
+        previous = domain;
         const state = try dag.Storage.load(batch, domain);
         const token = (try state.recoveryToken(state.owner_epoch)) orelse return error.GraphConstraintAttemptConflict;
         if (!std.mem.eql(u8, &token.attempt.transaction, &id)) return error.GraphConstraintAttemptConflict;
+        if (!legacy and (!std.mem.eql(u8, row[32..64], &token.attempt.id) or
+            !std.mem.eql(u8, row[64..96], &token.attempt.candidate) or
+            std.mem.readInt(u64, row[96..104], .big) != token.revision)) return error.GraphConstraintAttemptConflict;
         _ = try dag.TransactionParticipant.resolve(alloc, batch, domain, state.owner_epoch, token.attempt, outcome);
     }
     try batch.delete(&key);
@@ -5541,6 +5561,19 @@ test "DAG transaction prepare and resolution share the primary transaction" {
         if (revision == 0) {
             try manager.writeIntentsExtraBatch(id, intents, &.{}, extra);
             try std.testing.expectError(error.GraphConstraintAttemptConflict, manager.writeIntents(id, intents, &.{}));
+            const vote_key = makeSidecarKey(dag_domains_prefix, id);
+            var vote: [dag_vote_magic.len + dag_vote_bytes]u8 = undefined;
+            {
+                var reader = try store.beginReadTxn();
+                defer reader.abort();
+                @memcpy(&vote, try reader.get(&vote_key));
+            }
+            vote[dag_vote_magic.len + 32] ^= 1;
+            try store.putBatch(&.{.{ .key = &vote_key, .value = &vote }}, &.{});
+            try std.testing.expectError(error.GraphConstraintAttemptConflict, manager.resolveIntents(id, .committed, 200));
+            try std.testing.expect(try manager.hasIntents(id));
+            vote[dag_vote_magic.len + 32] ^= 1;
+            try store.putBatch(&.{.{ .key = &vote_key, .value = &vote }}, &.{});
             try manager.resolveIntents(id, .committed, 200);
             try manager.resolveIntents(id, .committed, 200);
             {
