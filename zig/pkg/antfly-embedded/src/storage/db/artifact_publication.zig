@@ -918,9 +918,9 @@ fn matchingGraphCycle(txn: anytype, command: Command) !?Rejected {
     if (try latestGraphCycle(txn, command)) |cycle| {
         if (std.mem.eql(u8, &command.publication_digest, &cycle.publication_digest)) return cycle;
     }
-    if (command.producer_kind != .graph or command.sources.len <= 1) return null;
+    if (command.producer_kind != .graph or command.mode != .publish) return null;
     const owners = try command.outputSources();
-    for (command.sources[1..], 1..) |source, source_index| {
+    for (command.sources, 0..) |source, source_index| {
         if (!owners.isSet(source_index)) continue;
         if (try latestGraphCycleForSource(txn, command, source)) |cycle| {
             if (std.mem.eql(u8, &command.publication_digest, &cycle.publication_digest)) return cycle;
@@ -2036,6 +2036,12 @@ test "ordered artifact inventory publication coverage is point bounded idempoten
     try stageRejection(&txn, graph, 18, .graph_cycle);
     try std.testing.expectError(error.GraphCycle, requireUnrejectedGraphCandidate(&txn, multi));
     try std.testing.expectEqual(@as(u64, 17), (try rejected(&txn, multi)).?.applied_index);
+    var second_owner_only = multi;
+    second_owner_only.mutations = multi.mutations[1..];
+    second_owner_only.publication_digest = second_owner_only.digest();
+    try stageRejection(&txn, second_owner_only, 19, .graph_cycle);
+    try std.testing.expectError(error.GraphCycle, requireUnrejectedGraphCandidate(&txn, graph));
+
     graph.publication_digest = @splat(92);
     try requireUnrejectedGraphCandidate(&txn, graph);
 }

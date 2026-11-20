@@ -196,14 +196,16 @@ fresh admission that could strand a committed participant.
 
 ## Generated candidates and inspection still required
 
-Graph publication reserves a bounded slot for the latest cycle rejection per
-producer/source. Replaying that exact candidate is rejected inside the same
-guarded write that would publish it. Transient responses and newer successful
-publications preserve the cycle record. The authority still needs to drive this
-outcome from an actual cross-shard validation decision and retain inspectable
-candidate history under the configured policy. Co-located capacity and
-authority readiness failures are recorded as retryable ordered outcomes, so
-the apply watermark advances and immutable uploads remain available.
+Graph publication records the latest terminal cycle rejection for each output
+owner and retains a separate request response slot. Replaying a retained
+candidate is rejected in the guarded write. The ordered rejection marks output
+coverage as terminally failed and preserves prior accepted bytes. A current
+artifact proof and its commit-time certificate reject outputs superseded by a
+newer cycle rejection. A later valid publication clears the coverage failure and
+provides a newer proof. Transient responses preserve the cycle record.
+Co-located capacity and authority readiness failures advance the apply watermark
+and retain immutable uploads for retry. Cross-shard validation decisions and
+configurable candidate history retention still need integration.
 
 Generated output must first enter private candidate storage, outside the current
 accepted artifact namespace. A candidate binds source revisions, producer recipe,
