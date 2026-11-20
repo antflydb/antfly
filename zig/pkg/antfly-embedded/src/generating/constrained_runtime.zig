@@ -54,6 +54,7 @@ pub const Runtime = struct {
     require_execution_lease: bool = false,
     /// Invocation-local allowance checked before each window/repair call.
     input_token_limit: ?u64 = null,
+    required_media: bool = false,
     invocation_usage: ?struct {
         ptr: *anyopaque,
         record: *const fn (*anyopaque, []const constrained.Item, constrained.Usage) void,
@@ -64,7 +65,16 @@ pub const Runtime = struct {
     } = null,
 
     pub fn capabilities(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig) !constrained.Capabilities {
-        const caps = try self.resolveCapabilities(a, cfg, null);
+        return self.planCapabilities(a, cfg, null);
+    }
+
+    pub fn capabilitiesForMedia(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig, media: bool) !constrained.Capabilities {
+        self.required_media = media;
+        return self.planCapabilities(a, cfg, .{ .items = 1, .media = media, .output_tokens = std.math.cast(usize, cfg.max_tokens) });
+    }
+
+    fn planCapabilities(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig, shape: ?remote.DiscoveryShape) !constrained.Capabilities {
+        const caps = try self.resolveCapabilities(a, cfg, shape);
         self.capability_snapshot = caps;
         self.require_execution_lease = self.require_execution_lease or cfg.capability_token != null;
         return caps;
@@ -223,7 +233,7 @@ pub const Runtime = struct {
             const messages = try constrained.evidenceMessages(a, request, system, cfg.provider == .openai);
             const shape: remote.DiscoveryShape = .{
                 .items = 1,
-                .media = remote.generationHasMedia(messages),
+                .media = self.runtime.required_media or remote.generationHasMedia(messages),
                 .output_tokens = std.math.cast(usize, cfg.max_tokens),
             };
             try self.runtime.bindExecutionLease(a, &cfg, shape);

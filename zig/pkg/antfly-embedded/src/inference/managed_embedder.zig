@@ -6601,6 +6601,34 @@ fn discoverRemoteEmbeddingLease(entry: *const ManagedEmbeddingEntry, http: *http
     return lease;
 }
 
+fn resolvePlannedRemoteEmbeddingLease(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    http: *httpx.Client,
+    headers: []const [2][]const u8,
+    placement_headers: []const [2][]const u8,
+    planned: remote_capabilities.CapabilityLease,
+) !remote_capabilities.CapabilityLease {
+    const scope = planned.scope_digest orelse return planned;
+    const shaped_scope = try remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, placement_headers);
+    if (std.mem.eql(u8, &scope, &shaped_scope)) return planned;
+    const base_scope = try remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, headers);
+    if (!std.mem.eql(u8, &scope, &base_scope)) return error.InferenceCapabilitiesStale;
+    if (planned.routing_token == null) return planned;
+
+    const revision = planned.descriptor_revision orelse return error.InferenceCapabilitiesStale;
+    var execution = try discoverRemoteEmbeddingLease(entry, http, placement_headers);
+    const discovered_revision = execution.descriptor_revision orelse return error.InferenceCapabilitiesStale;
+    if (execution.routing_token == null or !std.mem.eql(u8, revision.slice(), discovered_revision.slice())) {
+        // The caller records the generation it planned before dispatch.
+        return error.InferenceCapabilitiesStale;
+    }
+    if (entry.declared_inputs) |inputs| if (execution.capabilities) |*caps| applyDeclaredInputs(caps, inputs);
+    execution.scope_digest = shaped_scope;
+    execution.planning_only = planned.planning_only;
+    return execution;
+}
+
 fn acquireRemoteEmbeddingLease(
     entry: *const ManagedEmbeddingEntry,
     http: *httpx.Client,
@@ -6609,19 +6637,12 @@ fn acquireRemoteEmbeddingLease(
     placement_headers: []const [2][]const u8,
 ) !remote_capabilities.CapabilityLease {
     if (entry.planned_embedding_lease) |planned| {
-        if (planned.scope_digest) |scope| {
-            const actual = try remote_capabilities.scopeDigest(provider.allocator, entry.base_url, entry.model, .embed, headers);
-            if (!std.mem.eql(u8, &scope, &actual)) return error.InferenceCapabilitiesStale;
-        }
-        // Keep the coordinator's route and descriptor through every retry.
-        // Discovering another lease here could stamp its vectors with the old
-        // generation captured before execution.
-        provider.model_revision = if (planned.capabilities) |caps| caps.model_revision else null;
-        var execution = planned;
+        var execution = try resolvePlannedRemoteEmbeddingLease(provider.allocator, entry, http, headers, placement_headers, planned);
+        provider.model_revision = if (execution.capabilities) |caps| caps.model_revision else null;
         if (execution.planning_only) execution.capabilities = null;
         provider.setFramedAttachments(if (execution.capabilities) |caps| caps.framed_attachments else false);
-        if (planned.routing_token) |token| try provider.setCapabilityToken(token.slice());
-        if (planned.descriptor_revision) |revision| try provider.setCapabilityRevision(revision.slice());
+        if (execution.routing_token) |token| try provider.setCapabilityToken(token.slice());
+        if (execution.descriptor_revision) |revision| try provider.setCapabilityRevision(revision.slice());
         return execution;
     }
     const lease = try discoverRemoteEmbeddingLease(entry, http, placement_headers);
@@ -6685,7 +6706,7 @@ fn invalidateRemoteEmbeddingLease(
     };
     try cache.invalidateLease(entry.base_url, entry.model, .embed, headers, rejected);
     // A caller-owned plan may have been obtained without invocation details.
-    if (entry.planned_embedding_lease != null and headers.len > 0 and
+    if (headers.len > 0 and
         std.ascii.eqlIgnoreCase(headers[headers.len - 1][0], remote_capabilities.discovery_shape_header))
         try cache.invalidateLease(entry.base_url, entry.model, .embed, headers[0 .. headers.len - 1], rejected);
 }
@@ -7296,30 +7317,21 @@ fn embedPartItemsWithEntry(
     const capability_headers = remoteEmbeddingHeaders(entry, auth_header_owned, &capability_header_storage);
     var placement: remote_capabilities.DiscoveryHeaders = .{};
     const placement_headers = try embeddingPlacementHeaders(&placement, capability_headers, items.len, hasEmbeddingMedia(items));
-    const capability_cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
     const planned_capabilities = planned_lease.capabilities orelse return error.EmbeddingCapabilitiesUnavailable;
-    if (planned_lease.scope_digest) |scope| {
-        const current_scope = try remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, capability_headers);
-        if (!std.mem.eql(u8, &scope, &current_scope)) return error.InferenceCapabilitiesStale;
-        const lease = planned_lease;
+    const execution_lease = if (planned_lease.scope_digest != null) lease: {
+        const lease = try resolvePlannedRemoteEmbeddingLease(alloc, entry, http, capability_headers, placement_headers, planned_lease);
         const live = lease.capabilities orelse return error.InferenceCapabilitiesStale;
         try validateDensePartItemInvocation(alloc, live, if (live.framed_attachments) .segmented_framed_binary else .base64_payload, items);
+        provider.model_revision = live.model_revision;
         provider.setFramedAttachments(live.framed_attachments);
         if (lease.routing_token) |token| try provider.setCapabilityToken(token.slice());
         if (lease.descriptor_revision) |revision| try provider.setCapabilityRevision(revision.slice());
         if (live.numeric_responses_v1 and dims != 0) provider.numeric_dense_dimensions = dims;
-    } else if (planned_capabilities.numeric_responses_v1 and dims != 0) {
-        return error.InferenceCapabilitiesStale;
-    } else _ = try bindRemoteEmbeddingPartsLease(
-        alloc,
-        entry,
-        http,
-        &provider,
-        capability_headers,
-        placement_headers,
-        items,
-        true,
-    );
+        break :lease lease;
+    } else if (planned_capabilities.numeric_responses_v1 and dims != 0)
+        return error.InferenceCapabilitiesStale
+    else
+        try bindRemoteEmbeddingPartsLease(alloc, entry, http, &provider, capability_headers, placement_headers, items, true);
     const operation_deadline_ns = embeddingOperationDeadline(entry);
     try applyAntflyEmbeddingRequestControls(entry, &provider, operation_deadline_ns);
     if (provider.numeric_dense_dimensions != null) provider.setMaxResponseBytes(try numericDenseResponseLimit(items.len, dims));
@@ -7327,7 +7339,7 @@ fn embedPartItemsWithEntry(
     var result = provider.embedParts(alloc, entry.model, items) catch |err| switch (err) {
         error.EmptyResponse => return error.EmptyEmbeddingResponse,
         error.InferenceCapabilitiesStale => {
-            try capability_cache.invalidate(entry.base_url, entry.model, .embed, if (planned_lease.scope_digest != null) capability_headers else placement_headers);
+            try invalidateRemoteEmbeddingLease(entry, placement_headers, execution_lease);
             return err;
         },
         else => return err,
@@ -7829,7 +7841,7 @@ fn prepareRemoteQueryEmbedding(alloc: std.mem.Allocator, entry: *const ManagedEm
         failure = err;
         return err;
     };
-    lease.scope_digest = remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, headers) catch |err| {
+    lease.scope_digest = remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, discovery_headers) catch |err| {
         failure = err;
         return err;
     };
@@ -8790,6 +8802,8 @@ test "managed embedder owned numeric lease executes without cache residency and 
         .shared_remote_capability_cache = &cache,
     }};
     var managed = ManagedEmbedder{ .alloc = alloc, .entries = &entries };
+    var placement: remote_capabilities.DiscoveryHeaders = .{};
+    const shaped_headers = try embeddingPlacementHeaders(&placement, &.{.{ "X-Antfly-Inference-Workload-Type", "write-heavy" }}, 1, true);
     const lease = inference_work.CapabilityLease{
         .capabilities = .{
             .task = .embed,
@@ -8803,7 +8817,7 @@ test "managed embedder owned numeric lease executes without cache residency and 
         },
         .routing_token = try remote_capabilities.RoutingToken.init("owned-route"),
         .descriptor_revision = try remote_capabilities.CapabilityRevision.init("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
-        .scope_digest = try remote_capabilities.scopeDigest(alloc, url, "clipclap", .embed, &.{.{ "X-Antfly-Inference-Workload-Type", "write-heavy" }}),
+        .scope_digest = try remote_capabilities.scopeDigest(alloc, url, "clipclap", .embed, shaped_headers),
     };
     const planned = managed.denseInterface().withPartLease(lease);
     const items = [_]template_mod.ContentPart{.{ .binary = .{

@@ -361,14 +361,16 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         header_storage[header_count] = header;
         header_count += 1;
     }
-    if (capability_lease.routing_token) |*token| {
+    // An upstream embedding/transcription lease describes the boundary
+    // service, so only the direct chunk contract can authorize /chunk.
+    if (capability_task == .chunk) if (capability_lease.routing_token) |*token| {
         header_storage[header_count] = .{ remote_capabilities.capability_token_header, token.slice() };
         header_count += 1;
-    }
-    if (capability_lease.descriptor_revision) |*revision| {
+    };
+    if (capability_task == .chunk) if (capability_lease.descriptor_revision) |*revision| {
         header_storage[header_count] = .{ remote_capabilities.capability_revision_header, revision.slice() };
         header_count += 1;
-    }
+    };
     if (attachment_transport == .segmented_framed_binary) {
         header_storage[header_count] = .{ "Content-Type", httpx.attachment_envelope.content_type };
         header_count += 1;
@@ -407,7 +409,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         if (resp.status.code == 409 and stale != null and
             std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale.?, " \t"), "true"))
         {
-            try capability_cache.?.invalidateLease(endpoint, model, capability_task, discovery_headers, .{
+            if (capability_task == .chunk) try capability_cache.?.invalidateLease(endpoint, model, capability_task, discovery_headers, .{
                 .routing_token = capability_lease.routing_token,
                 .descriptor_revision = capability_lease.descriptor_revision,
             });

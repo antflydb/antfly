@@ -1400,6 +1400,11 @@ fn capabilityStaleResponse(response: httpx.Response) bool {
 }
 
 fn discoveryResponseError(response: httpx.Response) anyerror {
+    if (response.status.code == 413) {
+        if (response.headers.get("X-Antfly-Inference-Discovery-Error")) |reason| {
+            if (std.mem.eql(u8, reason, "items")) return error.InferenceDiscoveryTooManyItems;
+        }
+    }
     return discoveryStatusError(response.status.code, capabilityStaleResponse(response));
 }
 

@@ -2711,8 +2711,8 @@ pub const Runtime = struct {
         var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
         defer cfg.deinit(alloc);
         try self.routeExtractorConfig(alloc, &cfg);
-        const attachment_transport: inference_work.AttachmentTransport = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) .borrowed_binary else if (capabilities.framed_attachments) .segmented_framed_binary else .base64_payload;
-        try validateExtractorBatchCompatibility(alloc, capabilities, attachment_transport, requests);
+        const remote = cfg.provider == .antfly and cfg.resolvedUrl() != null;
+        if (!remote) try validateExtractorBatchCompatibility(alloc, capabilities, extractorAttachmentTransport(cfg), requests);
         const outputs = try alloc.alloc([]u8, requests.len);
         var outputs_owned = true;
         errdefer if (outputs_owned) {
@@ -2720,41 +2720,57 @@ pub const Runtime = struct {
             alloc.free(outputs);
         };
         for (outputs) |*output| output.* = &.{};
-        var windows: usize = 0;
+        var execution: inference_work.ExecutionReport = .{ .requested_items = requests.len };
+        var discovery_item_limit: usize = std.math.maxInt(usize);
         var start: usize = 0;
         while (start < requests.len) {
-            const end = try extractorBatchEnd(alloc, capabilities, attachment_transport, requests, start);
-            try validateExtractorInvocation(alloc, capabilities, attachment_transport, requests[start..end]);
-            const chunk_outputs = try self.tryExtractBatchChunk(alloc, requests[start..end]);
+            var active = capabilities;
+            var end = @min(start +| @min(active.batch.max_items, discovery_item_limit), requests.len);
+            if (end <= start) return error.InvalidInferenceCapabilities;
+            var shape: remote_capabilities.DiscoveryShape = .{ .items = end - start };
+            while (true) {
+                if (remote) {
+                    shape = try producerDiscoveryShape(alloc, requests[start..end]);
+                    active = (self.bindExtractorCapabilityLease(alloc, &cfg, shape) catch |err| {
+                        if (err != error.InferenceDiscoveryTooManyItems or end - start <= 1) return err;
+                        discovery_item_limit = (end - start) / 2;
+                        end = start + discovery_item_limit;
+                        continue;
+                    }) orelse return error.InvalidInferenceCapabilities;
+                }
+                if (!remote and active.batch.mode == .none) return error.BatchIncompatible;
+                const transport = extractorAttachmentTransport(cfg);
+                const fitting = try extractorBatchEnd(alloc, active, transport, requests[0..end], start);
+                if (fitting <= start) return error.InvalidInferenceCapabilities;
+                if (fitting < end and remote) {
+                    end = fitting;
+                    continue;
+                }
+                end = fitting;
+                if (remote and active.batch.mode != .none) validateExtractorBatchCompatibility(alloc, active, transport, requests[start..end]) catch |err| {
+                    return if (err == error.BatchIncompatible and start != 0) error.InferenceCapabilitiesStale else err;
+                };
+                try validateExtractorInvocation(alloc, active, transport, requests[start..end]);
+                break;
+            }
+            const chunk_outputs = try self.tryExtractBatchChunk(alloc, requests[start..end], cfg, shape);
             defer alloc.free(chunk_outputs);
             if (chunk_outputs.len != end - start) {
                 for (chunk_outputs) |output| if (output.len > 0) alloc.free(output);
                 return error.InvalidProducedBatchCardinality;
             }
             for (chunk_outputs, 0..) |output, i| outputs[start + i] = output;
-            windows += 1;
+            if (active.batch.mode == .native) {
+                execution.native_batches += 1;
+                execution.native_items += end - start;
+            } else execution.serial_items += end - start;
             start = end;
         }
-        const execution = switch (capabilities.batch.mode) {
-            .native => inference_work.ExecutionReport{
-                .requested_items = requests.len,
-                .native_batches = windows,
-                .native_items = requests.len,
-            },
-            .serial_compatibility => inference_work.ExecutionReport.serial(requests.len),
-            .none => return error.BatchIncompatible,
-        };
         outputs_owned = false;
         return try asset_producer.producedBatchFromOutputs(alloc, requests, outputs, execution);
     }
 
-    fn tryExtractBatchChunk(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
-        var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
-        defer cfg.deinit(alloc);
-        try self.routeExtractorConfig(alloc, &cfg);
-        const discovery_shape = try producerDiscoveryShape(alloc, requests);
-        _ = try self.bindExtractorCapabilityLease(alloc, &cfg, discovery_shape);
-
+    fn tryExtractBatchChunk(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request, cfg: extracting.Config, discovery_shape: remote_capabilities.DiscoveryShape) ![][]u8 {
         const inputs = try alloc.alloc(extracting.Input, requests.len);
         var inputs_filled: usize = 0;
         defer {
@@ -2957,10 +2973,11 @@ pub const Runtime = struct {
         var serial_items: usize = 0;
         var rejected_items: usize = 0;
         var fallback_items: usize = 0;
+        var discovery_item_limit: usize = std.math.maxInt(usize);
         var start: usize = 0;
         while (start < requests.len) {
             try self.execution.check(platform.time.monotonicNs());
-            var end = @min(start +| capabilities.batch.max_items, requests.len);
+            var end = @min(start +| @min(capabilities.batch.max_items, discovery_item_limit), requests.len);
             if (end <= start) return error.InvalidInferenceCapabilities;
             var placement: remote_capabilities.DiscoveryHeaders = .{};
             var discovery_headers: []const [2][]const u8 = undefined;
@@ -2973,14 +2990,19 @@ pub const Runtime = struct {
                 var shape = try producerDiscoveryShape(alloc, window);
                 shape.output_tokens = discoveryOutputTokens(cfg.max_tokens);
                 discovery_headers = try placement.withShape(auth_headers, shape);
-                capability_lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
+                capability_lease = self.capabilityCache().getOrDiscoverLeaseWithContext(
                     self.http,
                     cfg.url,
                     cfg.model,
                     .generate_batch,
                     discovery_headers,
                     self.execution.waitContext(),
-                );
+                ) catch |err| {
+                    if (err != error.InferenceDiscoveryTooManyItems or end - start <= 1) return err;
+                    discovery_item_limit = (end - start) / 2;
+                    end = start + discovery_item_limit;
+                    continue;
+                };
                 capabilities = capability_lease.capabilities orelse return error.InvalidInferenceCapabilities;
                 const fitting_end = try generatorBatchEnd(alloc, capabilities, remoteAttachmentTransport(capabilities, .base64_payload), requests[0..end], start);
                 if (fitting_end == end) break;
@@ -3470,7 +3492,7 @@ pub const Runtime = struct {
         const a = arena.allocator();
         var cfg = try parsed.generator.clone(a);
         var engine = self.constrainedRuntime();
-        const caps = try engine.capabilities(a, &cfg);
+        const caps = try engine.capabilitiesForMedia(a, &cfg, false);
         const mode = try caps.select(parsed.output, null);
         const inputs = try a.alloc([]const u8, requests.len);
         for (requests, inputs) |request, *input| {
@@ -4385,7 +4407,7 @@ pub const Runtime = struct {
         var config = parsed.value;
         try self.routeGeneratorConfig(a, &config.generator);
         var engine = self.constrainedRuntime();
-        const caps = try engine.capabilities(a, &config.generator);
+        const caps = try engine.capabilitiesForMedia(a, &config.generator, false);
         const mode = try caps.select(config.output, config.probabilities);
         config.generator.logprobs = config.probabilities == .token_logprobs;
         const texts = try a.alloc([]const u8, requests.len);
