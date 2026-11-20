@@ -383,7 +383,9 @@ pub const CublasLt = struct {
 
     pub fn openWithAllocator(allocator: ?std.mem.Allocator, ctx: *context_mod.CudaContext) Error!CublasLt {
         ctx.makeCurrent() catch return error.CublasLtUnavailable;
-        var lib = openLibrary() catch return error.CublasLtUnavailable;
+        var lib = @import("libraries.zig").openCublasLt(&.{
+            "libcublasLt.so.13", "libcublasLt.so", "libcublasLt.so.11", "libcublasLt.so.12",
+        }) catch return error.CublasLtUnavailable;
         errdefer lib.close();
         const fns = Table{
             .cublasLtCreate = lookup(&lib, @TypeOf(@as(Table, undefined).cublasLtCreate), "cublasLtCreate") catch return error.CublasLtSymbolMissing,
@@ -1481,13 +1483,6 @@ pub const CublasLt = struct {
         ctx.makeCurrent() catch return error.CublasLtError;
     }
 };
-
-fn openLibrary() !std.DynLib {
-    return std.DynLib.open("libcublasLt.so.13") catch
-        std.DynLib.open("libcublasLt.so") catch
-        std.DynLib.open("libcublasLt.so.11") catch
-        std.DynLib.open("libcublasLt.so.12");
-}
 
 // Exercise the real descriptor, discovery, submission and cache paths without
 // CUDA. Any unexpected driver/library call still fails through an undefined
