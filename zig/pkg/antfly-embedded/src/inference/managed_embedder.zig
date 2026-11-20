@@ -6694,6 +6694,32 @@ fn discoverRemoteEmbeddingLease(entry: *const ManagedEmbeddingEntry, http: *http
     return lease;
 }
 
+fn samePinnedEmbeddingOutput(prior: inference_work.InferenceCapabilities, current: inference_work.InferenceCapabilities) bool {
+    return prior.model_revision != null and prior.model_revision_pinning and current.model_revision_pinning and
+        std.meta.eql(prior.model_revision, current.model_revision) and
+        prior.output == current.output and prior.result_cardinality == current.result_cardinality and
+        std.meta.eql(prior.dense_output, current.dense_output);
+}
+
+fn validatePlannedEmbeddingPlacement(
+    pinned: bool,
+    planned: remote_capabilities.CapabilityLease,
+    execution: remote_capabilities.CapabilityLease,
+) !void {
+    const revision = planned.descriptor_revision orelse return error.InferenceCapabilitiesStale;
+    const discovered_revision = execution.descriptor_revision orelse return error.InferenceCapabilitiesStale;
+    if (execution.routing_token == null) return error.InferenceCapabilitiesStale;
+    if (pinned) {
+        const prior = planned.capabilities orelse return error.InferenceCapabilitiesStale;
+        const current = execution.capabilities orelse return error.InferenceCapabilitiesStale;
+        // The revision authenticates vector production. Placement limits and
+        // transport are validated against the lease that will be forwarded.
+        if (!samePinnedEmbeddingOutput(prior, current)) return error.InferenceCapabilitiesStale;
+    } else if (!std.mem.eql(u8, revision.slice(), discovered_revision.slice())) {
+        return error.InferenceCapabilitiesStale;
+    }
+}
+
 fn resolvePlannedRemoteEmbeddingLease(
     alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
@@ -6718,13 +6744,8 @@ fn resolvePlannedRemoteEmbeddingLease(
         if (media_items) |count| if (count <= limit) return planned;
     }
 
-    const revision = planned.descriptor_revision orelse return error.InferenceCapabilitiesStale;
     var execution = try discoverRemoteEmbeddingLease(entry, http, placement_headers);
-    const discovered_revision = execution.descriptor_revision orelse return error.InferenceCapabilitiesStale;
-    if (execution.routing_token == null or !std.mem.eql(u8, revision.slice(), discovered_revision.slice())) {
-        // The caller records the generation it planned before dispatch.
-        return error.InferenceCapabilitiesStale;
-    }
+    try validatePlannedEmbeddingPlacement(entry.required_model_revision != null, planned, execution);
     if (entry.declared_inputs) |inputs| if (execution.capabilities) |*caps| applyDeclaredInputs(caps, inputs);
     execution.scope_digest = shaped_scope;
     execution.planning_only = planned.planning_only;
@@ -7925,9 +7946,7 @@ fn sameTextWindowContract(prior: remote_capabilities.CapabilityLease, current: r
     const new_model = if (new_caps) |caps| caps.model_revision else null;
     if (!std.meta.eql(old_model, new_model)) return false;
     if (old_model != null and old_caps.?.model_revision_pinning and new_caps.?.model_revision_pinning) {
-        return old_caps.?.output == new_caps.?.output and
-            old_caps.?.result_cardinality == new_caps.?.result_cardinality and
-            std.meta.eql(old_caps.?.dense_output, new_caps.?.dense_output);
+        return samePinnedEmbeddingOutput(old_caps.?, new_caps.?);
     }
     if (prior.descriptor_revision) |expected| {
         const actual = current.descriptor_revision orelse return false;
@@ -7961,6 +7980,73 @@ test "split text windows compare pinned output identity across placement contrac
     current.capabilities = prior.capabilities;
     current.capabilities.?.model_revision_pinning = false;
     try std.testing.expect(!sameTextWindowContract(prior, current));
+}
+
+test "managed embedder pinned planned embedding accepts a different execution lease for the same output" {
+    const alloc = std.testing.allocator;
+    const App = struct {
+        fn serve(server: *httpx.TestServer) std.Io.Cancelable!void {
+            server.handleOne() catch {};
+        }
+    };
+    const io = std.testing.io;
+    var server = try httpx.TestServer.start(alloc, io, &.{.{
+        .method = .GET,
+        .path = "/ai/v1/models",
+        .max_uses = 1,
+        .respond = .{
+            .body =
+            \\{"embedders":{"model":{"inputs":["text"],"model_revision_pinning":true,"model_revision":"1111111111111111111111111111111111111111111111111111111111111111","dense_output":{"native_dimensions":3,"minimum_dimensions":3}}}}
+            ,
+            .headers = &.{
+                .{ .name = remote_capabilities.capability_token_header, .value = "execution-route" },
+                .{ .name = remote_capabilities.capability_revision_header, .value = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+            },
+        },
+    }});
+    defer server.deinit();
+    const url = server.baseUrl();
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, App.serve, .{&server});
+    var cache = remote_capabilities.Cache.init(alloc, io);
+    defer cache.deinit();
+    var http = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer http.deinit();
+    const revision: [32]u8 = @splat(0x11);
+    const entry: ManagedEmbeddingEntry = .{
+        .alloc = alloc,
+        .index_name = @constCast("semantic"),
+        .provider = .antfly,
+        .model = @constCast("model"),
+        .base_url = @constCast(url),
+        .dimensions = 3,
+        .required_model_revision = revision,
+        .io = std.testing.io,
+        .shared_remote_capability_cache = &cache,
+    };
+    var placement: remote_capabilities.DiscoveryHeaders = .{};
+    const shaped = try placement.withShape(&.{}, textWindowPlacement(2));
+    var planned: remote_capabilities.CapabilityLease = .{
+        .routing_token = try remote_capabilities.RoutingToken.init("planning-route"),
+        .descriptor_revision = try remote_capabilities.CapabilityRevision.init("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .scope_digest = try remote_capabilities.revisionScopedDigest(alloc, url, "model", .embed, &.{}, revision),
+        .capabilities = .{
+            .task = .embed,
+            .input_modalities = .{ .text = true },
+            .input_granularity = .chunk,
+            .output = .embedding,
+            .model_revision = revision,
+            .model_revision_pinning = true,
+            .dense_output = .{ .native_dimensions = 3, .minimum_dimensions = 3 },
+        },
+    };
+    const lease = try resolvePlannedRemoteEmbeddingLease(alloc, &entry, &http, &.{}, shaped, planned, null);
+    try std.testing.expectEqualStrings("execution-route", lease.routing_token.?.slice());
+    try std.testing.expectEqual(try remote_capabilities.revisionScopedDigest(alloc, url, "model", .embed, shaped, revision), lease.scope_digest.?);
+    try std.testing.expectError(error.InferenceCapabilitiesStale, validatePlannedEmbeddingPlacement(false, planned, lease));
+    planned.capabilities.?.dense_output.?.native_dimensions = 4;
+    try std.testing.expectError(error.InferenceCapabilitiesStale, resolvePlannedRemoteEmbeddingLease(alloc, &entry, &http, &.{}, shaped, planned, null));
 }
 
 fn embedSmallerTextWindows(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry, texts: []const []const u8, dims: u32, task_type: EmbeddingTaskType) ![]const []const f32 {
