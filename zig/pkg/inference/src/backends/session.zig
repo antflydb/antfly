@@ -1656,6 +1656,11 @@ pub const ModelContract = struct {
     /// wrappers retain this descriptor without rediscovering an opaque provider.
     pub const DecoderCache = struct {
         automatic: bool = false,
+        /// Qualified causal query bound; zero retains whole-prefix execution.
+        /// KV capacity and the logical context limit remain independent.
+        max_prefill_query_rows: usize = 0,
+        /// Prefer matrix reuse when the complete query peak is admitted.
+        prefer_whole_prefill: bool = false,
     };
     pub const Task = enum { generic, classifier, extractor };
     pub const Embedding = struct {

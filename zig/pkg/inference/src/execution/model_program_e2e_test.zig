@@ -71,7 +71,7 @@ test "model program real EG2 media stages preserve native image composition and 
     var source = Source{ .session = session, .cfg = factory.getEmbeddingGemma2Config(session).? };
     var reference = try Source.create(&source, a);
     defer reference.deinit();
-    var client = try @import("pjrt").pjrt.Client.initFromEnv(a);
+    var client = try @import("testing/pjrt_qualification.zig").client(a);
     defer client.deinit();
     var caches = [_]@import("captured_forward.zig").Cache{ .{}, .{} };
     defer for (&caches) |*cache| cache.deinit(a);
@@ -212,7 +212,7 @@ test "model program real EG2 PJRT public embedding outputs match native across c
     }
     var manager = @import("../backends/backends.zig").SessionManager.init(a);
     manager.required_backend = .pjrt;
-    manager.pjrt_memory_policy = .cpu;
+    try @import("testing/pjrt_qualification.zig").configure(&manager, .f32);
     manager.required_backend_invalid = false;
     manager.native_call_policy = .in_process;
     manager.preferred_backends = &.{.pjrt};
@@ -264,7 +264,7 @@ test "model program real GLiNER25 Deberta backbone PJRT outputs match native" {
             initialized += 1;
         }
     }
-    const session = try factory.createPjrtSessionWithOptions(a, model, .{ .task_override = .generic, .memory_policy = .cpu });
+    const session = try factory.createPjrtSessionWithOptions(a, model, try @import("testing/pjrt_qualification.zig").options(.f32, .generic));
     defer session.close();
     for (requests, expected, 0..) |values, want, index| {
         var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 3 }, &values);
@@ -326,7 +326,7 @@ test "model program real Whisper PJRT encoder and decoder stages match native" {
     }
     var manager = @import("../backends/backends.zig").SessionManager.init(a);
     manager.required_backend = .pjrt;
-    manager.pjrt_memory_policy = .cpu;
+    try @import("testing/pjrt_qualification.zig").configure(&manager, .f32);
     manager.required_backend_invalid = false;
     manager.native_call_policy = .in_process;
     const session = loaded: {
@@ -368,7 +368,7 @@ test "model program real EG2 public loaders preserve explicit BF16 precision" {
     defer dimensions.deinit();
     const inputs = [_]Tensor{ ids, mask, dimensions };
     const expected = reference: {
-        const session = try factory.createPjrtSessionWithOptions(a, model, .{ .precision = .bf16, .memory_policy = .cpu });
+        const session = try factory.createPjrtSessionWithOptions(a, model, try @import("testing/pjrt_qualification.zig").options(.bf16, null));
         defer session.close();
         const outputs = try session.runWithControl(&inputs, a, .{ .native_call_policy = .in_process });
         defer a.free(outputs);
@@ -410,8 +410,7 @@ test "model program real EG2 public loaders preserve explicit BF16 precision" {
     }
     var manager = @import("../backends/backends.zig").SessionManager.init(a);
     manager.required_backend = .pjrt;
-    manager.pjrt_memory_policy = .cpu;
-    manager.pjrt_precision = .bf16;
+    try @import("testing/pjrt_qualification.zig").configure(&manager, .bf16);
     manager.required_backend_invalid = false;
     manager.native_call_policy = .in_process;
     manager.preferred_backends = &.{.pjrt};
@@ -493,7 +492,7 @@ test "model program public decoder prefix keeps new embeddings and token tails d
     const a = std.testing.allocator;
     const native = try factory.createNativeSessionWithTaskOverride(a, model, .generic);
     defer native.close();
-    const compiled = try factory.createPjrtSessionWithOptions(a, model, .{ .task_override = .generic, .memory_policy = .cpu });
+    const compiled = try factory.createPjrtSessionWithOptions(a, model, try @import("testing/pjrt_qualification.zig").options(.f32, .generic));
     defer compiled.close();
     var reference = try factory.getComputeBackend(native, a);
     defer reference.deinit();
@@ -575,7 +574,7 @@ test "model program real companion image stage preserves the GGUF projector refe
     const encoded = @embedFile("../models/testdata/lightonocr3/invoice.png");
     var expected = try projector.encodeProjectedImages(&cb, a, oracle_store, &.{encoded});
     defer expected.deinit();
-    const session = try factory.createPjrtSessionWithOptions(a, model, .{ .task_override = .generic, .memory_policy = .cpu });
+    const session = try factory.createPjrtSessionWithOptions(a, model, try @import("testing/pjrt_qualification.zig").options(.f32, .generic));
     defer session.close();
     const metadata = factory.getAuxiliaryProjectorMetadata(session) orelse return error.MissingProjector;
     const prepared = try projector.prepareProjectorImage(a, metadata, encoded);
@@ -608,7 +607,7 @@ test "model program real patch image stage preserves native vision features" {
     const image = @embedFile("../models/testdata/lightonocr3/invoice.png");
     var expected = try projector.encodeProjectedImagesResident(&cb, a, config, &.{image}, limits);
     defer expected.deinit();
-    const compiled = try factory.createPjrtSessionWithOptions(a, model, .{ .task_override = .generic, .memory_policy = .cpu });
+    const compiled = try factory.createPjrtSessionWithOptions(a, model, try @import("testing/pjrt_qualification.zig").options(.f32, .generic));
     defer compiled.close();
     var actual = try @import("media_projection.zig").patchImages(compiled, a, config, &.{image}, limits, .{ .native_call_policy = .in_process });
     defer actual.deinit();
@@ -635,7 +634,7 @@ test "model program real boundary extraction executes compiled task graphs" {
     const executor = @import("../extractors/gliner_boundary_executor.zig");
     const wire = @import("../extractors/extraction_v2.zig");
     for ([_]factory.PjrtSessionOptions.Precision{ .f32, .bf16 }) |precision| {
-        const compiled = try factory.createPjrtSessionWithOptions(a, model, .{ .memory_policy = .cpu, .precision = precision });
+        const compiled = try factory.createPjrtSessionWithOptions(a, model, try @import("testing/pjrt_qualification.zig").options(precision, null));
         defer compiled.close();
         for ([_][]const u8{ "natural", "latent", "anchorless" }) |mode| {
             const request_bytes = try std.fmt.allocPrint(a,
@@ -723,7 +722,7 @@ test "model program real companion audio stage preserves the GGUF projector refe
     const clip = @embedFile("../testdata/video/codecs/aac-lc-speech-en.m4a.reference.wav");
     var expected = try projector.encodeProjectedAudio(&cb, a, oracle_store, &.{clip});
     defer expected.deinit();
-    const session = try factory.createPjrtSessionWithOptions(a, model, .{ .task_override = .generic, .memory_policy = .cpu });
+    const session = try factory.createPjrtSessionWithOptions(a, model, try @import("testing/pjrt_qualification.zig").options(.f32, .generic));
     defer session.close();
     for (0..2) |_| {
         var actual = try @import("media_projection.zig").companionAudio(session, a, &.{.{ .encoded = clip }}, .{ .native_call_policy = .in_process });
@@ -753,7 +752,7 @@ test "model program real companion video stage preserves frame projection and ti
     defer expected.deinit();
     const expected_values = try cb.toFloat32(expected.images.embeddings, a);
     defer a.free(expected_values);
-    const session = try factory.createPjrtSessionWithOptions(a, model, .{ .task_override = .generic, .memory_policy = .cpu });
+    const session = try factory.createPjrtSessionWithOptions(a, model, try @import("testing/pjrt_qualification.zig").options(.f32, .generic));
     defer session.close();
     for (0..2) |_| {
         var actual = try @import("../pipelines/gemma4_video.zig").encode(&cb, .{ .session = session }, a, oracle_store, clip);
@@ -771,7 +770,7 @@ test "model program qualified extraction binds actual PJRT profile and bounded g
     if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
     const model = platform.env.getenv("ANTFLY_PJRT_BOUNDARY_MODEL") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
-    const compiled = try factory.createPjrtSessionWithOptions(a, model, .{ .memory_policy = .cpu });
+    const compiled = try factory.createPjrtSessionWithOptions(a, model, try @import("testing/pjrt_qualification.zig").options(.f32, null));
     defer compiled.close();
     var cb = try factory.getComputeBackend(compiled, a);
     defer cb.deinit();
@@ -852,6 +851,22 @@ test "model program resident decoder matches full-prefix logits without per-toke
             }
         }
         if (precision == .f32) {
+            // Force several causal query chunks in a real provider. Cached
+            // positions and visibility must span chunks, not restart at zero.
+            var bounded = session;
+            bounded.model_contract.decoder_cache.max_prefill_query_rows = 2;
+            var one_output = (try @import("resident_decoder.zig").Decoder.initForRequest(a, session, null, .{ .limit = history.len + 1, .prompt_rows = history.len, .max_tokens = 1, .query_rows = 2 }, DecoderQualification.control)).?;
+            one_output.deinit();
+            var chunked = try @import("resident_decoder.zig").Decoder.init(a, bounded, 16, null);
+            defer chunked.deinit();
+            const chunk_reference = try DecoderQualification.reference(session, &history, a);
+            defer a.free(chunk_reference);
+            const chunk_logits = try chunked.text(&history, a, DecoderQualification.control);
+            defer a.free(chunk_logits);
+            try std.testing.expectEqual(history.len, chunked.position);
+            try std.testing.expectEqual(@as(usize, 3), chunked.prefill_steps);
+            try std.testing.expectEqual(@as(usize, 2), chunked.prefill_head_skips);
+            for (chunk_reference, chunk_logits) |want, got| try std.testing.expectApproxEqAbs(want, got, @as(f32, 0.003));
             for (3..5) |rows| {
                 const full_values = try a.alloc(f32, rows * cfg.hidden_size);
                 defer a.free(full_values);
@@ -880,14 +895,7 @@ const DecoderQualification = struct {
     const control = @import("../execution_control.zig").InferenceExecutionControl{ .native_call_policy = .in_process };
 
     fn options(precision: factory.PjrtSessionOptions.Precision) !factory.PjrtSessionOptions {
-        const gemm = if (platform.env.getenv("ANTFLY_PJRT_DECODER_GEMM")) |value| std.meta.stringToEnum(@FieldType(factory.PjrtSessionOptions, "gemm"), value) orelse return error.InvalidPjrtGemm else .provider_default;
-        const physical = platform.env.getenv("ANTFLY_PJRT_DECODER_DEVICE_BYTES") orelse return .{ .task_override = .generic, .memory_policy = .cpu, .precision = precision, .gemm = gemm };
-        const capacity = platform.env.getenv("ANTFLY_PJRT_DECODER_CAPACITY_BYTES") orelse return error.MissingPjrtCapacity;
-        return .{ .task_override = .generic, .precision = precision, .gemm = gemm, .memory_policy = .{ .cuda = .{
-            .device_bytes = try std.fmt.parseInt(usize, physical, 10),
-            .capacity_bytes = try std.fmt.parseInt(usize, capacity, 10),
-            .unified_memory = platform.env.getenvBool("ANTFLY_PJRT_DECODER_UNIFIED_MEMORY"),
-        } } };
+        return @import("testing/pjrt_qualification.zig").options(precision, .generic);
     }
 
     fn reference(session: Session, ids: []const i64, a: std.mem.Allocator) ![]f32 {
@@ -932,10 +940,16 @@ test "model program resident decoder qualifies context boundaries and longer con
     if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
     const path = platform.env.getenv("ANTFLY_PJRT_DECODER_MODEL") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
-    const f32_session = try factory.createPjrtSessionWithOptions(a, path, try DecoderQualification.options(.f32));
+    var f32_session = try factory.createPjrtSessionWithOptions(a, path, try DecoderQualification.options(.f32));
     defer f32_session.close();
-    const bf16_session = try factory.createPjrtSessionWithOptions(a, path, try DecoderQualification.options(.bf16));
+    var bf16_session = try factory.createPjrtSessionWithOptions(a, path, try DecoderQualification.options(.bf16));
     defer bf16_session.close();
+    if (platform.env.getenv("ANTFLY_PJRT_DECODER_PREFILL_ROWS")) |value| {
+        const rows = try std.fmt.parseInt(usize, value, 10);
+        if (rows == 0) return error.InvalidPrefillQueryLimit;
+        f32_session.model_contract.decoder_cache.max_prefill_query_rows = rows;
+        bf16_session.model_contract.decoder_cache.max_prefill_query_rows = rows;
+    }
     const stress = platform.env.getenvBool("ANTFLY_PJRT_DECODER_STRESS");
     const steps: usize = if (stress) 16 else 4;
     const starts = [_]usize{ 31, 63, 65, 255, 1023, 2047 };
@@ -1009,14 +1023,14 @@ test "model program resident requests isolate concurrent state and refund failur
     var denied = session;
     denied.run_admission.?.limits = .{ .host_limit_bytes = 1, .backend_limit_bytes = 1, .scratch_limit_bytes = 1 };
     try std.testing.expectError(error.ResourceLimitExceeded, DecoderQualification.Decoder.init(a, denied, 16, DecoderQualification.control));
-    try std.testing.expect((try DecoderQualification.Decoder.initForRequest(a, denied, null, 16, 8, DecoderQualification.control)) == null);
-    try std.testing.expect((try DecoderQualification.Decoder.initForRequest(a, session, null, 16, 1, DecoderQualification.control)) == null);
-    try std.testing.expect((try DecoderQualification.Decoder.initForRequest(a, unsupported, null, 16, 8, DecoderQualification.control)) == null);
-    try std.testing.expectError(error.ResourceLimitExceeded, DecoderQualification.Decoder.initForRequest(a, denied, true, 16, 8, DecoderQualification.control));
+    try std.testing.expect((try DecoderQualification.Decoder.initForRequest(a, denied, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8 }, DecoderQualification.control)) == null);
+    try std.testing.expect((try DecoderQualification.Decoder.initForRequest(a, session, null, .{ .limit = 16, .prompt_rows = 15, .max_tokens = 1 }, DecoderQualification.control)) == null);
+    try std.testing.expect((try DecoderQualification.Decoder.initForRequest(a, unsupported, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8 }, DecoderQualification.control)) == null);
+    try std.testing.expectError(error.ResourceLimitExceeded, DecoderQualification.Decoder.initForRequest(a, denied, true, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8 }, DecoderQualification.control));
     accounting.configureForcedRunDenialsForTesting(1);
-    try std.testing.expect((try DecoderQualification.Decoder.initForRequest(a, session, null, 16, 8, DecoderQualification.control)) == null);
+    try std.testing.expect((try DecoderQualification.Decoder.initForRequest(a, session, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8 }, DecoderQualification.control)) == null);
     accounting.configureForcedRunDenialsForTesting(1);
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, DecoderQualification.Decoder.initForRequest(a, session, true, 16, 8, DecoderQualification.control));
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, DecoderQualification.Decoder.initForRequest(a, session, true, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8 }, DecoderQualification.control));
     try std.testing.expectEqualDeep(baseline, accounting.snapshot());
     {
         var bounded = session;
@@ -1191,5 +1205,53 @@ test "model program real Whisper resident full-window banks and first decode mat
             const logits = expected[0].asFloat32();
             for (logits[logits.len - cfg.vocab_size ..], actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-4);
         }
+    }
+}
+
+test "model program resident decoder qualifies complete logical context with bounded queries" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    if (!platform.env.getenvBool("ANTFLY_PJRT_DECODER_FULL_WINDOW")) return error.SkipZigTest;
+    // This explicitly requested hardware qualification uses the provider's real
+    // bounded CUDA arena. It never raises a production operator memory limit.
+    if (platform.env.getenv("ANTFLY_PJRT_QUALIFICATION_DEVICE_BYTES") == null and
+        platform.env.getenv("ANTFLY_PJRT_DECODER_DEVICE_BYTES") == null) return error.FullWindowQualificationRequiresDeviceBudget;
+    const path = platform.env.getenv("ANTFLY_PJRT_DECODER_MODEL") orelse return error.MissingQualificationModel;
+    const a = std.testing.allocator;
+    const loaded = try factory.createPjrtSessionWithOptions(a, path, try DecoderQualification.options(.f32));
+    defer loaded.close();
+    const cfg = loaded.model_contract.decoder_config orelse return error.WrongModelArchitecture;
+    const maximum: usize = cfg.max_position_embeddings;
+    if (maximum < 1024) return error.QualificationContextTooSmall;
+    const tokenizer = try @import("../server/model_manager.zig").loadHuggingFaceTokenizerFromDir(a, path);
+    defer tokenizer.tokenizer().deinitTokenizer();
+    const encoded = try tokenizer.tokenizer().encode(a, "The sunlight helps plants grow. Paris is the capital of France. ");
+    defer a.free(encoded);
+    if (encoded.len == 0) return error.EmptyQualificationPrompt;
+    const history = try a.alloc(i64, maximum + 1);
+    defer a.free(history);
+    for (history, 0..) |*id, index| id.* = encoded[index % encoded.len];
+    var reference: [2]?[]f32 = .{ null, null };
+    defer for (reference) |values| if (values) |owned| a.free(owned);
+    for ([_]usize{ 512, 256 }) |chunk| {
+        var bounded = loaded;
+        bounded.model_contract.decoder_cache.max_prefill_query_rows = chunk;
+        var decoder = (try DecoderQualification.Decoder.initForRequest(a, bounded, true, .{ .limit = maximum, .prompt_rows = maximum - 1, .max_tokens = 2, .query_rows = chunk }, DecoderQualification.control)).?;
+        defer decoder.deinit();
+        for ([_]usize{ maximum - 1, maximum }, 0..) |rows, step| {
+            const actual = try decoder.text(history[0..rows], a, DecoderQualification.control);
+            defer a.free(actual);
+            try std.testing.expectEqual(rows, decoder.position);
+            try std.testing.expectEqual(rows, decoder.resident.?.position);
+            try std.testing.expectEqual(try std.math.divCeil(usize, maximum - 1, chunk), decoder.prefill_steps);
+            try std.testing.expectEqual(decoder.prefill_steps - 1, decoder.prefill_head_skips);
+            for (actual) |value| try std.testing.expect(std.math.isFinite(value));
+            if (reference[step]) |expected| {
+                for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, @as(f32, 0.003));
+                try std.testing.expectEqual(std.mem.indexOfMax(f32, expected), std.mem.indexOfMax(f32, actual));
+            } else reference[step] = try a.dupe(f32, actual);
+            std.debug.print("full context rows={d} query_bound={d} banks={d} bank_bytes={d}\n", .{ rows, chunk, decoder.resident.?.buffers.len, decoder.bank_bytes });
+        }
+        try std.testing.expectError(error.InvalidResidentDecodePosition, decoder.text(history, a, DecoderQualification.control));
+        try std.testing.expectEqual(maximum, decoder.position);
     }
 }

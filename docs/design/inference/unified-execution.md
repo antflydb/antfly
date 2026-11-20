@@ -224,18 +224,50 @@ logits reject the generation before any prior cache buffers or cursor change.
 BF16 decoder branches retain their BF16 publication boundaries while CPU and
 CUDA GPT residual streams accumulate in F32. Automatic reduced-precision
 caching requires the qualified CPU residual policy; CUDA BF16 keeps ordinary
-execution automatically. Explicit CUDA BF16 caching remains experimental: the
-Qwen context matrix misses the unchanged relative-error gate at two contexts,
-even though sampled greedy tokens match. Accuracy qualification retains its
-independent F32 reference, relative-error limit and generated-token checks.
+execution automatically. Explicit CUDA BF16 resident programs resolve the default
+GEMM policy to deterministic vendor GEMM without changing the shared client's
+policy or ordinary programs. Explicit GEMM overrides remain authoritative.
+Compact rotary coefficients are shared across heads, preserve F32 angle order,
+and use widened trigonometry before the original BF16 publication. Ordinary and
+resident causal attention share exact visibility predicates instead of finite
+mask sentinels. Together these repairs pass the sampled Qwen context matrix,
+including the frozen error limits from the two previously failing contexts.
+Accuracy qualification retains its independent F32 reference, relative-error
+limit and generated-token checks. This does not establish performance across
+models or qualify automatic CUDA BF16 selection.
 
 KV capacity remains bucketed in 64-row increments. Prefill query geometry is
 separate: prompts below 64 rows use power-of-two query buckets, bounding padded
 work below twice the logical prompt without creating an unbounded shape cache.
-Text and media prefixes use the same policy. Automatic state admission declines
+F32 causal text prefill has a 512-row query policy independently of KV capacity;
+explicit deterministic CUDA BF16 caching uses the same bound. F32 requests
+prefer the whole-prefix matrix schedule when a shape-only speculative
+lease admits its complete peak beside the charged banks. The probe creates no
+provider objects, gives no future quota credit, and releases its lease before
+execution. Quota or pressure retains bounded queries without publishing a
+speculative failure; cancellation and unexpected errors propagate. The request
+can supply a different explicit query bound through the
+existing prefill-chunk setting. Every chunk publishes its valid rows before the
+next chunk. Intermediate queries produce a checked hidden row without loading
+or executing the unused vocabulary head; only the final chunk's last-row logits
+reach sampling. The capture identity and output admission distinguish these
+variants while sharing their decoder body. Reports include the actual completed
+prefill-step and skipped-head counts. Recurrent layouts retain their
+separately qualified shape. Bidirectional media prefixes retain whole-prefix
+execution and reject an explicit chunk request rather than changing visibility.
+CPU BF16 retains its qualified whole-prefix cached route.
+
+The opt-in full-window test exercises Qwen3-0.6B's actual 40,960-token capacity
+on CUDA F32: 40,959-token prefill, the final decode step, over-window rejection
+without cursor publication, and logits/token agreement between 512- and 256-row
+query schedules. This is execution and numerical coverage, not full-window task
+accuracy or a claim about bidirectional media.
+
+Automatic state admission declines
 quota and transient-pressure denials before execution; explicit cache requests,
 cancellation and provider failures preserve their errors. Neither path replays
-submitted numerical work.
+submitted numerical work. An explicit query bound that requires resident state
+also preserves its admission error rather than silently using a larger query.
 
 Opaque serial native calls use the same prepared Source owner as dispatched
 calls. The original scratch floor, final Tensor container, owned shape arrays

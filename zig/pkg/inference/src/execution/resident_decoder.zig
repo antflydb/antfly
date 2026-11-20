@@ -38,10 +38,26 @@ pub fn select(source: Session, requested: ?bool) !bool {
 
 /// Qualification follows immutable arithmetic policy and survives session wrappers.
 pub fn profileFor(profile: anytype) DecoderCache {
-    // CUDA BF16 retains an explicit experimental route, but matching sampled
-    // tokens does not qualify its F32-relative-error contract at all contexts.
-    return .{ .automatic = profile.precision == .f32 or
-        (profile.platform == .cpu and profile.residual_storage == .f32) };
+    // CUDA BF16's deterministic resident schedule has sampled accuracy coverage.
+    // Keep automatic selection gated until model and performance qualification
+    // establishes where its fixed-bank work amortizes ordinary execution.
+    const precision = @import("precision.zig");
+    const stable_cuda = profile.platform == .cuda and profile.precision == .bf16 and profile.residual_storage == .f32 and
+        precision.residentGemm(true, profile.precision, profile.gemm) == .vendor_deterministic;
+    return .{
+        .automatic = profile.precision == .f32 or (profile.platform == .cpu and profile.residual_storage == .f32),
+        .max_prefill_query_rows = if (profile.precision == .f32 or stable_cuda) 512 else 0,
+        .prefer_whole_prefill = profile.precision == .f32,
+    };
+}
+
+/// Recurrent state keeps its existing execution shape until its multi-query
+/// publication has separate qualification. This limit is a capability hint,
+/// never permission to reinterpret a recurrent bank as ordinary KV.
+fn causalQueryLimit(source: Session) usize {
+    const cfg = source.model_contract.decoder_config orelse return 0;
+    if (cfg.qwen35_has_linear_attention) return 0;
+    return source.model_contract.decoder_cache.max_prefill_query_rows;
 }
 
 pub fn supports(cfg: Config) bool {
@@ -76,19 +92,89 @@ pub const Decoder = struct {
     bank_bytes: usize,
     resident: ?*Resident = null,
     position: usize = 0,
+    /// Successfully published causal prefill queries, excluding decode steps.
+    prefill_steps: usize = 0,
+    prefill_head_skips: usize = 0,
+    prefill_only: bool = false,
     axis_positions: bool = false,
     position_delta: i64 = 0,
     failed: bool = false,
     control: ?Control = null,
     reservation: @import("../backends/session.zig").RunPermit,
 
-    /// Decline optional caching only before provider allocation/execution. A
-    /// short request cannot amortize prefill padding, and a denied cache bank
-    /// must not prevent an otherwise admissible full-prefix PJRT request.
-    pub fn initForRequest(a: std.mem.Allocator, source: Session, requested: ?bool, limit: usize, max_tokens: usize, control: ?Control) !?Decoder {
-        if (requested == null and max_tokens <= 1) return null;
-        if (!try select(source, requested)) return null;
-        return initWithRequest(a, source, requested, limit, control);
+    pub const RequestGeometry = struct {
+        limit: usize,
+        prompt_rows: usize,
+        max_tokens: usize,
+        query_rows: usize = 0,
+    };
+
+    /// Query bounds and actual prompt rows belong to this request. They never
+    /// mutate model policy or infer a prompt length from a clipped context cap.
+    pub fn initForRequest(a: std.mem.Allocator, source: Session, requested: ?bool, request: RequestGeometry, control: ?Control) !?Decoder {
+        if (control) |active| try active.check();
+        if (request.prompt_rows == 0 or request.prompt_rows > request.limit) return error.InvalidResidentDecodePosition;
+        var bounded = source;
+        const explicit_chunks = request.query_rows != 0 and request.prompt_rows > request.query_rows;
+        if (request.query_rows != 0) {
+            const cfg = source.model_contract.decoder_config orelse return error.UnsupportedResidentDecode;
+            if (request.query_rows > cfg.max_position_embeddings) return error.InvalidPrefillQueryLimit;
+            if (explicit_chunks and cfg.qwen35_has_linear_attention) return error.UnsupportedResidentPrefillChunking;
+            bounded.model_contract.decoder_cache.max_prefill_query_rows = request.query_rows;
+        }
+        const query_bound = causalQueryLimit(bounded);
+        const needs_chunks = query_bound != 0 and request.prompt_rows > query_bound;
+        if (!try select(bounded, requested)) {
+            if (explicit_chunks) return error.UnsupportedResidentPrefillChunking;
+            return null;
+        }
+        if (requested == null and (request.max_tokens == 0 or (request.max_tokens == 1 and !needs_chunks))) return null;
+        // An explicit bound requiring state cannot fall back to a larger query.
+        // Preserve the real quota/pressure error instead of relabeling it as an
+        // unsupported feature or replaying a whole-prefix operation.
+        var decoder = (try initWithRequest(a, bounded, if (explicit_chunks) true else requested, request.limit, control)) orelse return null;
+        // Construction has funded metadata only; no provider state exists.
+        errdefer decoder.reservation.deinit();
+        if (request.query_rows == 0 and needs_chunks and bounded.model_contract.decoder_cache.prefer_whole_prefill and
+            try decoder.wholePrefillAdmitted(request.prompt_rows, control))
+        {
+            if (requested == null and request.max_tokens == 1) {
+                decoder.reservation.deinit();
+                return null;
+            }
+            decoder.source.model_contract.decoder_cache.max_prefill_query_rows = 0;
+        }
+        return decoder;
+    }
+
+    /// A shape-only speculative lease preserves the whole-prefix matrix schedule
+    /// when its complete peak fits beside the already charged banks. It creates
+    /// no provider objects, grants no future credit, and submits no numerical
+    /// work. Pressure keeps bounded queries; cancellation and real errors escape.
+    fn wholePrefillAdmitted(self: *const Decoder, prompt_rows: usize, control: ?Control) !bool {
+        if (control) |active| try active.check();
+        // An unmanaged source has no evidence that a larger query fits.
+        if (self.source.run_admission == null) return false;
+        const rows = try prefillRowsFor(prompt_rows, self.config.max_position_embeddings);
+        const stage_geometry = try @import("../architectures/frontends/decoder.zig").geometry(self.config, rows, self.capacity);
+        const staging_bytes = try std.math.add(usize, try std.math.mul(usize, rows, 2 * @sizeOf(i64)), @sizeOf(i64));
+        const admitted = self.source.withAdmissionControl(control);
+        const Memory = @import("../runtime/tier/memory.zig");
+        var capture = Memory.AdmissionFailure.Capture.init(if (admitted.run_admission) |policy| policy.failure else null);
+        var permit = admitted.withAdmissionFailure(capture.sink()).admit(.{
+            .sequence = rows,
+            .input_bytes = try std.math.add(usize, try std.math.mul(usize, rows, @sizeOf(i64)), @sizeOf(i64)),
+            .output_bytes = stage_geometry.output_bytes,
+            .workspace_bytes = stage_geometry.workspace_bytes,
+            .host_preprocess_bytes = staging_bytes,
+        }) catch |err| {
+            if (declineOptionalAdmission(null, err)) return false;
+            capture.publish(err);
+            return err;
+        };
+        defer permit.deinit();
+        if (control) |active| try active.check();
+        return true;
     }
 
     pub fn init(a: std.mem.Allocator, source: Session, limit: usize, control: ?Control) !Decoder {
@@ -198,7 +284,7 @@ pub const Decoder = struct {
             };
             if (self.position > self.limit or valid_rows > self.limit - self.position) return error.InvalidResidentDecodePosition;
             if (self.encoder_decoder_config) |cfg| return .{ .sequence = rows, .output_bytes = try std.math.mul(usize, cfg.vocab_size, @sizeOf(f32)), .workspace_bytes = try @import("stage_workspace.zig").attentionFfn(1, rows, @max(self.capacity, self.encoder_rows), cfg.d_model, cfg.decoder_attention_heads, cfg.decoder_ffn_dim) };
-            return @import("../architectures/frontends/decoder.zig").geometry(self.config, rows, self.capacity);
+            return @import("../architectures/frontends/decoder.zig").geometryForOutput(self.config, rows, self.capacity, if (self.prefill_only) .hidden else .logits);
         };
         return error.MissingInputs;
     }
@@ -214,13 +300,35 @@ pub const Decoder = struct {
         if (self.failed) return error.DecoderRequestFailed;
         if (history.len == 0 or history.len > self.limit or (self.position != 0 and history.len != self.position + 1)) return error.InvalidResidentDecodePosition;
         errdefer self.failed = true;
-        const ids = if (self.position == 0) history else history[history.len - 1 ..];
-        const rows = if (self.position == 0) try prefillRowsFor(ids.len, self.config.max_position_embeddings) else 1;
+        const initial = self.position == 0;
+        const chunk = causalQueryLimit(self.source);
+        if (initial and chunk != 0) {
+            var end = @min(chunk, history.len);
+            while (end < history.len) {
+                const intermediate = try self.appendText(history[0..end], false, a, control);
+                a.free(intermediate);
+                self.prefill_steps += 1;
+                self.prefill_head_skips += 1;
+                end += @min(chunk, history.len - end);
+            }
+        }
+        const logits = try self.appendText(history, true, a, control);
+        if (initial) self.prefill_steps += 1;
+        return logits;
+    }
+
+    /// Internal append consumes every new query row. Public text decoding still
+    /// accepts one token after prefill; only this owner schedules causal chunks.
+    fn appendText(self: *Decoder, history: []const i64, publish_logits: bool, a: std.mem.Allocator, control: ?Control) ![]f32 {
+        self.prefill_only = !publish_logits;
+        defer self.prefill_only = false;
+        const ids = history[self.position..];
+        const rows = @min(try prefillRowsFor(ids.len, self.config.max_position_embeddings), self.capacity - self.position);
         // These copies precede per-step admission, so retain their real host
         // charge until the complete synchronous invocation has finished.
         var staging_bytes = try std.math.mul(usize, rows, 2 * @sizeOf(i64));
-        if (self.axis_positions and self.position != 0) staging_bytes = try std.math.add(usize, staging_bytes, 3 * @sizeOf(i64));
-        if (self.position == 0) staging_bytes = try std.math.add(usize, staging_bytes, @sizeOf(i64));
+        if (self.axis_positions and self.position != 0) staging_bytes = try std.math.add(usize, staging_bytes, try std.math.mul(usize, rows, 6 * @sizeOf(i64)));
+        if (self.position == 0 or ids.len > 1) staging_bytes = try std.math.add(usize, staging_bytes, @sizeOf(i64));
         var staging = try self.source.withAdmissionControl(control).admitRetainedMedia(staging_bytes, 0);
         defer staging.deinit();
         const padded = if (rows != ids.len) try a.alloc(i64, rows) else null;
@@ -231,13 +339,17 @@ pub const Decoder = struct {
         }
         var input = try Tensor.initInt64(a, "input_ids", &.{ 1, @intCast(rows) }, padded orelse ids);
         defer input.deinit();
-        var logits_row: ?Tensor = if (self.position == 0) try Tensor.initInt64(a, "logits_row", &.{1}, &.{@intCast(ids.len - 1)}) else null;
+        var logits_row: ?Tensor = if (self.position == 0 or ids.len > 1) try Tensor.initInt64(a, "logits_row", &.{1}, &.{@intCast(ids.len - 1)}) else null;
         defer if (logits_row) |*tensor| tensor.deinit();
         var positions: ?Tensor = null;
         defer if (positions) |*tensor| tensor.deinit();
         if (self.axis_positions and self.position != 0) {
-            const position = try std.math.add(i64, @intCast(self.position), self.position_delta);
-            positions = try Tensor.initInt64(a, "position_ids", &.{ 3, 1 }, &.{ position, position, position });
+            const values = try a.alloc(i64, try std.math.mul(usize, rows, 3));
+            defer a.free(values);
+            for (0..3) |axis| for (0..rows) |row| {
+                values[axis * rows + row] = try std.math.add(i64, @intCast(self.position + row), self.position_delta);
+            };
+            positions = try Tensor.initInt64(a, "position_ids", &.{ 3, @intCast(rows) }, values);
         }
         var declared: [3]Tensor = undefined;
         declared[0] = input;
@@ -352,7 +464,7 @@ test "resident decoder capability rejects unsupported state layouts before execu
 }
 
 test "resident decoder automatic selection excludes unqualified reduced precision" {
-    var profile = struct { platform: enum { cpu, cuda, other }, precision: @import("precision.zig").Policy, residual_storage: @import("precision.zig").ResidualStorage = .activation }{ .platform = .cpu, .precision = .bf16 };
+    var profile = struct { platform: enum { cpu, cuda, other }, precision: @import("precision.zig").Policy, gemm: @import("precision.zig").Gemm = .provider_default, residual_storage: @import("precision.zig").ResidualStorage = .activation }{ .platform = .cpu, .precision = .bf16 };
     try std.testing.expect(!profileFor(profile).automatic);
     profile.residual_storage = .f32;
     try std.testing.expect(profileFor(profile).automatic);
@@ -361,6 +473,10 @@ test "resident decoder automatic selection excludes unqualified reduced precisio
     try std.testing.expect(!profileFor(profile).automatic);
     profile.residual_storage = .f32;
     try std.testing.expect(!profileFor(profile).automatic);
+    try std.testing.expectEqual(@as(usize, 512), profileFor(profile).max_prefill_query_rows);
+    profile.gemm = .vendor;
+    try std.testing.expectEqual(@as(usize, 0), profileFor(profile).max_prefill_query_rows);
+    profile.gemm = .provider_default;
     profile.precision = .f32;
     try std.testing.expect(profileFor(profile).automatic);
     profile.platform = .other;
@@ -389,6 +505,10 @@ test "resident encoder decoder policy preserves explicit controls actual KV admi
         }
         fn cancelled(_: ?*anyopaque) anyerror!void {
             return error.Cancelled;
+        }
+        fn cancelFunded(raw: ?*anyopaque) anyerror!void {
+            const controller: *@import("../runtime/tier/memory.zig").AdmissionController = @ptrCast(@alignCast(raw.?));
+            if (controller.snapshot().hostTotalBytes() != 0) return error.Cancelled;
         }
         const table = Session.VTable{ .run = run, .runWithControl = controlled, .backend = backend, .inputInfo = info, .outputInfo = info, .close = close, .runCachedDecoder = cached };
     };
@@ -427,10 +547,49 @@ test "resident encoder decoder policy preserves explicit controls actual KV admi
     const gpt = Config{ .position_encoding = .rope };
     source.model_contract.decoder_config = &gpt;
     domain.configureForcedRunDenialsForTesting(1);
-    try std.testing.expect((try Decoder.initForRequest(a, source, null, 16, 8, null)) == null);
+    try std.testing.expect((try Decoder.initForRequest(a, source, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8 }, null)) == null);
     domain.configureForcedRunDenialsForTesting(1);
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, Decoder.initForRequest(a, source, true, 16, 8, null));
-    try std.testing.expectError(error.Cancelled, Decoder.initForRequest(a, source, null, 16, 8, .{ .check_fn = Probe.cancelled }));
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, Decoder.initForRequest(a, source, true, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8 }, null));
+    try std.testing.expectError(error.Cancelled, Decoder.initForRequest(a, source, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8 }, .{ .check_fn = Probe.cancelled }));
+    try std.testing.expectEqual(@as(usize, 0), domain.snapshot().hostTotalBytes());
+    source.run_admission.?.limits.kv_limit_bytes = 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, Decoder.initForRequest(a, source, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8, .query_rows = 2 }, null));
+    try std.testing.expectEqual(@as(usize, 0), domain.snapshot().hostTotalBytes());
+    source.run_admission.?.limits.kv_limit_bytes = 0;
+    source.model_contract.decoder_cache.max_prefill_query_rows = 2;
+    source.model_contract.decoder_cache.prefer_whole_prefill = true;
+    var retained_header_bytes: usize = 0;
+    {
+        var selected = (try Decoder.initForRequest(a, source, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8 }, null)).?;
+        defer selected.deinit();
+        try std.testing.expectEqual(@as(usize, 0), causalQueryLimit(selected.source));
+        retained_header_bytes = domain.snapshot().host_scratch_bytes;
+    }
+    source.run_admission.?.limits.scratch_limit_bytes = retained_header_bytes + 1;
+    var speculative_failure: @import("../runtime/tier/memory.zig").AdmissionFailure = .{};
+    {
+        var selected = (try Decoder.initForRequest(a, source, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8 }, .{ .admission_failure = &speculative_failure, .native_call_policy = .in_process })).?;
+        defer selected.deinit();
+        try std.testing.expectEqual(@as(usize, 2), causalQueryLimit(selected.source));
+        try std.testing.expect(speculative_failure.snapshot() == null);
+    }
+    source.run_admission.?.limits.scratch_limit_bytes = 0;
+    {
+        var selected = (try Decoder.initForRequest(a, source, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8, .query_rows = 2 }, null)).?;
+        defer selected.deinit();
+        try std.testing.expectEqual(@as(usize, 2), causalQueryLimit(selected.source));
+    }
+    try std.testing.expectEqual(@as(usize, 0), domain.snapshot().hostTotalBytes());
+    {
+        var unmanaged = source;
+        unmanaged.run_admission = null;
+        var selected = (try Decoder.initForRequest(a, unmanaged, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8 }, null)).?;
+        defer selected.deinit();
+        try std.testing.expectEqual(@as(usize, 2), causalQueryLimit(selected.source));
+    }
+    try std.testing.expectError(error.Cancelled, Decoder.initForRequest(a, source, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8 }, .{ .ptr = &domain, .check_fn = Probe.cancelFunded }));
+    try std.testing.expectEqual(@as(usize, 0), domain.snapshot().hostTotalBytes());
+    try std.testing.expect((try Decoder.initForRequest(a, source, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 1 }, .{})) == null);
     try std.testing.expectEqual(@as(usize, 0), domain.snapshot().hostTotalBytes());
     source.model_contract.decoder_cache.automatic = false;
     try std.testing.expect((try Decoder.initEncoderDecoder(a, source, 2, null, null)) == null);

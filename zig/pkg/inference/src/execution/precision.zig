@@ -23,3 +23,19 @@ pub const Gemm = enum { provider_default, vendor, vendor_deterministic };
 
 /// Residual accumulation is independent of BF16 branch publication.
 pub const ResidualStorage = enum { activation, f32 };
+
+/// A resident BF16 CUDA boundary needs a stable vendor accumulation schedule.
+/// Preserve explicit vendor choices; provider-default stage execution remains
+/// unchanged outside resident programs. Callers report the resolved schedule.
+pub fn residentGemm(cuda: bool, precision: Policy, requested: Gemm) Gemm {
+    return if (cuda and precision == .bf16 and requested == .provider_default) .vendor_deterministic else requested;
+}
+
+test "resident GEMM resolution is local to the qualified arithmetic boundary" {
+    const std = @import("std");
+    try std.testing.expectEqual(Gemm.vendor_deterministic, residentGemm(true, .bf16, .provider_default));
+    try std.testing.expectEqual(Gemm.provider_default, residentGemm(true, .f32, .provider_default));
+    try std.testing.expectEqual(Gemm.provider_default, residentGemm(false, .bf16, .provider_default));
+    try std.testing.expectEqual(Gemm.vendor, residentGemm(true, .bf16, .vendor));
+    try std.testing.expectEqual(Gemm.vendor_deterministic, residentGemm(true, .bf16, .vendor_deterministic));
+}

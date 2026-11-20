@@ -2645,6 +2645,8 @@ pub const NativeGenerationPipeline = struct {
     session: ?backends.Session = null,
     pjrt_decoder_cache: ?bool = null,
     pjrt_decoder_cache_used: bool = false,
+    resident_prefill_steps: ?usize = null,
+    resident_prefill_head_skips: ?usize = null,
     compiled_decoder: ?*@import("../execution/resident_decoder.zig").Decoder = null,
     compiled_media_prefix: ?*@import("../execution/media_prefix.zig").Prefix = null,
     /// Optional observation-only model capability; never changes provider,
@@ -3078,6 +3080,8 @@ pub const NativeGenerationPipeline = struct {
         const previous_compiled_decoder = self.compiled_decoder;
         self.compiled_decoder = null;
         self.pjrt_decoder_cache_used = false;
+        self.resident_prefill_steps = null;
+        self.resident_prefill_head_skips = null;
         defer {
             self.compiled_decoder = previous_compiled_decoder;
             if (compiled_decoder) |*decoder| decoder.deinit();
@@ -3777,7 +3781,8 @@ pub const NativeGenerationPipeline = struct {
         }
         if (self.usesPjrtSession()) {
             const capacity = @min(try std.math.add(usize, seq_len, max_tokens), self.gpt_config.max_position_embeddings);
-            compiled_decoder = try @import("../execution/resident_decoder.zig").Decoder.initForRequest(self.allocator, self.session.?, self.pjrt_decoder_cache, capacity, max_tokens, self.execution_control);
+            if (compiled_prefix != null and config.prefill_chunk_size != 0) return error.UnsupportedCompiledMediaPrefillChunking;
+            compiled_decoder = try @import("../execution/resident_decoder.zig").Decoder.initForRequest(self.allocator, self.session.?, self.pjrt_decoder_cache, .{ .limit = capacity, .prompt_rows = seq_len, .max_tokens = max_tokens, .query_rows = config.prefill_chunk_size }, self.execution_control);
             if (compiled_decoder) |*decoder| {
                 self.compiled_decoder = decoder;
                 self.pjrt_decoder_cache_used = true;
@@ -3802,6 +3807,10 @@ pub const NativeGenerationPipeline = struct {
             try self.executePreparedMultimodalPrefill(prepared, seq_len, decode_state, capture_mtp_prefill_hidden, config)
         else
             try self.executePrefill(prefill_ids, seq_len, cached_prompt_tokens, decode_state, config, allow_prefill_greedy_token, capture_mtp_prefill_hidden);
+        if (self.compiled_decoder) |decoder| {
+            self.resident_prefill_steps = decoder.prefill_steps;
+            self.resident_prefill_head_skips = decoder.prefill_head_skips;
+        }
         if (native_work_enabled) {
             std.debug.print("native_work_prefill_complete: pipeline={d} source_tokens={d} cached_prefix={d} declared_query_tokens={d}\n", .{ @intFromPtr(self), seq_len, cached_prompt_tokens, prefill_ids.len });
         }

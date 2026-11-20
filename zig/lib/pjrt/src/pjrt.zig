@@ -699,7 +699,12 @@ pub const Client = struct {
     /// Protobuf merges the additional executable-build message with the typed
     /// replica/partition settings while retaining every precision/GEMM override.
     pub fn compileWithEntryLayouts(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, target_device: *c.PjrtDevice, layouts: []const u8, allocator: std.mem.Allocator) !LoadedExecutable {
-        const defaults: []const u8 = switch (self.compile_options.gpu_gemm) {
+        return self.compileWithEntryLayoutsAndOptions(hlo_bytes, num_outputs, target_device, layouts, self.compile_options, allocator);
+    }
+
+    /// Resolve one program's schedule without mutating a shared client's policy.
+    pub fn compileWithEntryLayoutsAndOptions(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, target_device: *c.PjrtDevice, layouts: []const u8, policy: CompileOptions, allocator: std.mem.Allocator) !LoadedExecutable {
+        const defaults: []const u8 = switch (policy.gpu_gemm) {
             .provider_default => &strict_compile_options,
             .vendor => &vendor_gemm_compile_options,
             .vendor_deterministic => &deterministic_vendor_compile_options,
@@ -1520,6 +1525,16 @@ test "compile and deserialize reject native output arity with balanced ownership
     try std.testing.expectEqual(@as(usize, 8), Fake.strict_compiles);
     try std.testing.expectEqual(@as(usize, 9), Fake.loaded_destroyed);
     try std.testing.expectEqual(@as(usize, 9), Fake.executable_destroyed);
+    client.compile_options.gpu_gemm = .provider_default;
+    for ([_]@FieldType(CompileOptions, "gpu_gemm"){ .provider_default, .vendor, .vendor_deterministic }) |policy| {
+        Fake.vendor_expected = policy != .provider_default;
+        Fake.deterministic_expected = policy == .vendor_deterministic;
+        try std.testing.expectError(error.OutputCountMismatch, client.compileWithEntryLayoutsAndOptions("hlo", 2, client.device, layouts, .{ .gpu_gemm = policy }, std.testing.allocator));
+        try std.testing.expectEqual(@FieldType(CompileOptions, "gpu_gemm").provider_default, client.compile_options.gpu_gemm);
+    }
+    try std.testing.expectEqual(@as(usize, 11), Fake.strict_compiles);
+    try std.testing.expectEqual(@as(usize, 12), Fake.loaded_destroyed);
+    try std.testing.expectEqual(@as(usize, 12), Fake.executable_destroyed);
 }
 
 test "float32 downloads use logical host bytes and reject invalid type size and shape" {

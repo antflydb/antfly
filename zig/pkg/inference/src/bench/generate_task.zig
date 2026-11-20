@@ -100,6 +100,8 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
     defer if (reference) |*value| value.deinit();
     const cached_samples = try a.alloc(u64, if (comparison) options.iterations else 0);
     defer a.free(cached_samples);
+    const Execution = struct { cached: bool, resident_prefill_steps: ?usize, resident_prefill_head_skips: ?usize };
+    var execution: [2]?Execution = .{ null, null };
     var counts: [2]usize = @splat(0);
     var cold: [2]u64 = @splat(0);
     const requests = try std.math.mul(usize, try std.math.add(usize, options.warmup, options.iterations), if (comparison) @as(usize, 2) else 1);
@@ -140,6 +142,18 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
             break :request try pipeline.generate(&messages, .{ .max_tokens = @intCast(options.generate_tokens), .temperature = 0, .enable_thinking = false, .prefill_chunk_size = options.generate_prefill_chunk_rows });
         };
         const elapsed = inference.platform.time.awakeNs(init.io) - start;
+        if (comparison) {
+            const observed = Execution{ .cached = pipeline.pjrt_decoder_cache_used, .resident_prefill_steps = pipeline.resident_prefill_steps, .resident_prefill_head_skips = pipeline.resident_prefill_head_skips };
+            if (mode == 1 and !observed.cached) {
+                result.deinit();
+                return error.GenerationComparisonCacheNotUsed;
+            }
+            if (execution[mode]) |prior| if (!std.meta.eql(prior, observed)) {
+                result.deinit();
+                return error.GenerationResetExecutionChanged;
+            };
+            execution[mode] = observed;
+        }
         if (counts[mode] == 0) cold[mode] = elapsed;
         if (counts[mode] >= options.warmup) {
             const destination = if (mode == 1) cached_samples else samples;
@@ -194,8 +208,10 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .model_chat_template = model.chat_tmpl != null,
         .runtime_capabilities = if (cache.compiled_model_runtime) |*runtime| runtime.capabilities() else null,
         .compiled_stage_shapes = factory.getPjrtSpecializationCount(model.session),
+        .resident_prefill_steps = pipeline.resident_prefill_steps,
+        .resident_prefill_head_skips = pipeline.resident_prefill_head_skips,
         .cached_shapes = cache.specializations.entries.items.len,
-        .cache_comparison = if (comparison) .{ .order = "ABBA", .same_tokens = true, .baseline_samples_ns = samples, .cached_samples_ns = cached_samples, .cached_cold_request_ns = cold[1] } else null,
+        .cache_comparison = if (comparison) .{ .order = "ABBA", .same_tokens = true, .baseline_execution = execution[0].?, .cached_execution = execution[1].?, .baseline_samples_ns = samples, .cached_samples_ns = cached_samples, .cached_cold_request_ns = cold[1] } else null,
         .cold_request_ns = cold[0],
         .samples_ns = samples,
         .stage_samples_ms = stage_samples,

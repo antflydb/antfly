@@ -46,6 +46,7 @@ pub const Prefix = struct {
         const logits = try self.runImpl(decoder, decoder.source, history, a, control);
         decoder.axis_positions = self.axis_positions != null;
         decoder.position_delta = self.position_delta;
+        decoder.prefill_steps = 1;
         return logits;
     }
 

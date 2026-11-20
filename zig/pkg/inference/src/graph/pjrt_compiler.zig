@@ -90,6 +90,8 @@ pub const InputBinding = union(enum) {
 pub const CompileOptions = struct {
     /// Stable CUDA decode reductions; activations and affine math remain F32.
     wide_single_row_norm: bool = false,
+    /// Evaluate compact rotary coefficients before their BF16 publication.
+    wide_rotary_trig: bool = false,
     precision: @import("../execution/precision.zig").Policy = .f32,
     /// Request-private fixed-capacity state. Position is a runtime scalar;
     /// no sequence-length-specialized decode executables or host KV readbacks.
@@ -605,7 +607,7 @@ pub fn compilePartitionWithOptions(
 
             .fused_rope => |attrs| {
                 if (resident.capacity != 0) {
-                    node_map[nid] = try emitResidentRope(allocator, &b, n, try getHloId(node_map, ins[0]), attrs, resident.position.?, resident.capacity, options.precision == .bf16);
+                    node_map[nid] = try emitResidentRope(allocator, &b, n, try getHloId(node_map, ins[0]), attrs, resident.position.?, resident.capacity, options.precision == .bf16, options.wide_rotary_trig);
                     continue;
                 }
                 node_map[nid] = try emitStaticRope(
@@ -850,7 +852,7 @@ fn residentRange(a: Allocator, b: *hlo.Builder, count: i64) !hlo.Id {
     return b.constantS32(hlo.Shape.init(.s32, &.{count}), values);
 }
 
-fn emitResidentVisibility(a: Allocator, b: *hlo.Builder, heads: i64, rows: i64, keys: i64, window: u32, position: hlo.Id, visibility: ?[]const u8) !hlo.Id {
+fn emitCausalVisibility(a: Allocator, b: *hlo.Builder, heads: i64, rows: i64, keys: i64, window: u32, position: hlo.Id, visibility: ?[]const u8) !hlo.Id {
     const grid = hlo.Shape.init(.s32, &.{ rows, keys });
     const query = try b.broadcast(try b.add(try residentRange(a, b, rows), try b.convertType(position, .s32)), &.{0}, grid);
     const key = try b.broadcast(try residentRange(a, b, keys), &.{1}, grid);
@@ -866,7 +868,8 @@ fn emitResidentVisibility(a: Allocator, b: *hlo.Builder, heads: i64, rows: i64, 
         allowed = try b.logicalOr(allowed, blocks);
     }
     if (window != 0) {
-        const span = try b.broadcast(try b.constantS32(hlo.Shape.scalar(.s32), &.{@intCast(window - 1)}), &.{}, grid);
+        const window_span = std.math.cast(i32, window - 1) orelse return error.UnsupportedAttentionShape;
+        const span = try b.broadcast(try b.constantS32(hlo.Shape.scalar(.s32), &.{window_span}), &.{}, grid);
         allowed = try b.logicalAnd(allowed, try b.compare(key, try b.subtract(query, span), "GE"));
     }
     return b.broadcast(allowed, &.{ 1, 2 }, hlo.Shape.init(.pred, &.{ heads, rows, keys }));
@@ -876,7 +879,7 @@ fn roundBf16(b: *hlo.Builder, id: hlo.Id, enabled: bool) !hlo.Id {
     return if (enabled) b.convertType(try b.convertType(id, .bf16), .f32) else id;
 }
 
-fn emitResidentRope(a: Allocator, b: *hlo.Builder, node: *const Node, x: hlo.Id, attrs: ml.graph.node.RopeAttrs, position: hlo.Id, capacity: usize, bf16: bool) !hlo.Id {
+fn emitResidentRope(a: Allocator, b: *hlo.Builder, node: *const Node, x: hlo.Id, attrs: ml.graph.node.RopeAttrs, position: hlo.Id, capacity: usize, bf16: bool, wide_trig: bool) !hlo.Id {
     const shape = node.output_shape;
     if (shape.rank() != 2 or shape.dims[0] != attrs.seq_len or attrs.seq_len > capacity) return error.UnsupportedResidentDecode;
     const rows: usize = @intCast(shape.dims[0]);
@@ -884,21 +887,37 @@ fn emitResidentRope(a: Allocator, b: *hlo.Builder, node: *const Node, x: hlo.Id,
     const dim: usize = attrs.head_dim;
     const rotary: usize = if (attrs.rope_dim == 0) dim else attrs.rope_dim;
     if (dim == 0 or width % dim != 0 or rotary == 0 or rotary > dim or rotary % 2 != 0) return error.UnsupportedResidentDecode;
-    const frequencies = try a.alloc(f32, width);
+    const frequencies = try a.alloc(f32, dim);
     defer a.free(frequencies);
     const active = try a.alloc(u8, width);
     defer a.free(active);
-    for (frequencies, active, 0..) |*frequency, *flag, col| {
+    for (frequencies, 0..) |*frequency, lane| {
+        const pair = if (attrs.consecutive_pairs) lane / 2 else lane % (dim / 2);
+        const enabled = pair < rotary / 2 and (if (attrs.consecutive_pairs) lane < rotary else true);
+        frequency.* = if (!enabled) 0 else 1 / std.math.pow(f32, attrs.theta, @as(f32, @floatFromInt(pair * 2)) / @as(f32, @floatFromInt(rotary)));
+    }
+    for (active, 0..) |*flag, col| {
         const lane = col % dim;
         const pair = if (attrs.consecutive_pairs) lane / 2 else lane % (dim / 2);
         flag.* = @intFromBool(pair < rotary / 2 and (if (attrs.consecutive_pairs) lane < rotary else true));
-        frequency.* = if (flag.* == 0) 0 else attrs.freq_scale / std.math.pow(f32, attrs.theta, @as(f32, @floatFromInt(pair * 2)) / @as(f32, @floatFromInt(rotary)));
     }
+    // Coefficients belong to a rotary lane, not an attention head. Sharing
+    // this compact grid also lets Q and K reuse the same trigonometry.
+    const compact = hlo.Shape.init(.f32, &.{ @intCast(rows), @intCast(dim) });
     const hs = hlo.Shape.init(.f32, &.{ @intCast(rows), @intCast(width) });
     const positions = try b.add(try b.convertType(try residentRange(a, b, @intCast(rows)), .f32), position);
-    const angles = try b.multiply(try b.broadcast(positions, &.{0}, hs), try b.broadcast(try b.constantF32(hlo.Shape.init(.f32, &.{@intCast(width)}), frequencies), &.{1}, hs));
-    const cosines = try roundBf16(b, try b.cosine(angles), bf16);
-    const sines = try roundBf16(b, try b.sine(angles), bf16);
+    const scaled = try b.multiply(positions, try b.constantScalarF32(attrs.freq_scale));
+    const angles = try b.multiply(try b.broadcast(scaled, &.{0}, compact), try b.broadcast(try b.constantF32(hlo.Shape.init(.f32, &.{@intCast(dim)}), frequencies), &.{1}, compact));
+    const trig_angles = if (wide_trig) try b.convertType(angles, .f64) else angles;
+    var cosine = try b.cosine(trig_angles);
+    var sine = try b.sine(trig_angles);
+    if (wide_trig) {
+        cosine = try b.convertType(cosine, .f32);
+        sine = try b.convertType(sine, .f32);
+    }
+    const head_shape = hlo.Shape.init(.f32, &.{ @intCast(rows), @intCast(width / dim), @intCast(dim) });
+    const cosines = try b.reshape(try b.broadcast(try roundBf16(b, cosine, bf16), &.{ 0, 2 }, head_shape), hs);
+    const sines = try b.reshape(try b.broadcast(try roundBf16(b, sine, bf16), &.{ 0, 2 }, head_shape), hs);
     const rotated = try emitRopePermutation(b, x, rows, width, dim, rotary, attrs.consecutive_pairs);
     const result = try roundBf16(b, try b.add(try roundBf16(b, try b.multiply(x, cosines), bf16), try roundBf16(b, try b.multiply(rotated, sines), bf16)), bf16);
     if (!bf16 or rotary == dim) return result;
@@ -1648,13 +1667,14 @@ fn emitStaticGqaAttention(
     });
     const scale = try b.constantScalarF32(1.0 / @sqrt(@as(f32, @floatFromInt(attrs.head_dim))));
     scores = try b.multiply(scores, scale);
-    if (runtime_position) |position| {
-        // Padding is absent from the softmax domain, independently of score
-        // magnitude. A finite additive sentinel can outrank valid logits.
-        const allowed = try emitResidentVisibility(allocator, b, num_heads, q_len, kv_len, attrs.sliding_window orelse 0, position, visibility);
+    if (runtime_position != null or past_k == null or (attrs.sliding_window orelse 0) != 0) {
+        if (kv_len < q_len) return error.UnsupportedAttentionShape;
+        // Ordinary and resident programs share exact visibility. A finite
+        // additive exclusion can outrank valid scores and needlessly changes
+        // the arithmetic graph at the cache boundary.
+        const position = runtime_position orelse try b.constantScalarF32(@floatFromInt(kv_len - q_len));
+        const allowed = try emitCausalVisibility(allocator, b, num_heads, q_len, kv_len, attrs.sliding_window orelse 0, position, visibility);
         scores = try b.select(allowed, scores, try b.broadcast(try b.constantScalarF32(-std.math.inf(f32)), &.{}, b.getInst(scores).shape));
-    } else if (past_k == null or (attrs.sliding_window orelse 0) != 0) {
-        scores = try b.add(scores, try emitCausalMask(allocator, b, num_heads, q_len, kv_len, attrs.sliding_window orelse 0));
     }
     if (bias) |bias_id| scores = try b.add(scores, bias_id);
 
@@ -1708,29 +1728,6 @@ fn repeatGqaKvHeads(b: *hlo.Builder, value: hlo.Id, seq_len: i64, num_kv_heads: 
     const grouped = try b.reshape(value, hlo.Shape.init(.f32, &.{ seq_len, num_kv_heads, 1, head_dim }));
     const expanded = try b.broadcast(grouped, &.{ 0, 1, 2, 3 }, hlo.Shape.init(.f32, &.{ seq_len, num_kv_heads, repeat_factor, head_dim }));
     return b.reshape(expanded, hlo.Shape.init(.f32, &.{ seq_len, num_heads, head_dim }));
-}
-
-fn emitCausalMask(allocator: Allocator, b: *hlo.Builder, heads: i64, rows: i64, keys: i64, window: u32) !hlo.Id {
-    if (keys < rows or rows <= 0) return error.UnsupportedShape;
-    const queries = try allocator.alloc(i32, std.math.cast(usize, rows) orelse return error.UnsupportedShape);
-    defer allocator.free(queries);
-    const columns = try allocator.alloc(i32, std.math.cast(usize, keys) orelse return error.UnsupportedShape);
-    defer allocator.free(columns);
-    for (queries, 0..) |*value, index| value.* = std.math.cast(i32, keys - rows + @as(i64, @intCast(index))) orelse return error.UnsupportedShape;
-    for (columns, 0..) |*value, index| value.* = std.math.cast(i32, index) orelse return error.UnsupportedShape;
-    const grid = hlo.Shape.init(.s32, &.{ rows, keys });
-    const query = try b.broadcast(try b.constantS32(hlo.Shape.init(.s32, &.{rows}), queries), &.{0}, grid);
-    const key = try b.broadcast(try b.constantS32(hlo.Shape.init(.s32, &.{keys}), columns), &.{1}, grid);
-    var allowed = try b.compare(query, key, "GE");
-    if (window != 0) {
-        const span: i32 = std.math.cast(i32, window - 1) orelse return error.UnsupportedShape;
-        const width = try b.broadcast(try b.constantS32(hlo.Shape.scalar(.s32), &.{span}), &.{}, grid);
-        allowed = try b.logicalAnd(allowed, try b.compare(key, try b.subtract(query, width), "GE"));
-    }
-    const floats = hlo.Shape.init(.f32, &.{ rows, keys });
-    // Keep the finite exclusion value and O(Q+K) host metadata.
-    const mask = try b.select(allowed, try b.broadcast(try b.constantScalarF32(0), &.{}, floats), try b.broadcast(try b.constantScalarF32(-1.0e9), &.{}, floats));
-    return b.broadcast(mask, &.{ 1, 2 }, hlo.Shape.init(.f32, &.{ heads, rows, keys }));
 }
 
 fn emitSoftmaxLastDim(
@@ -2533,4 +2530,100 @@ test "PJRT stable single query normalization preserves small variance at large o
     variance /= values.len;
     const inverse = 1 / @sqrt(variance + @as(f64, @as(f32, 1e-5)));
     for (values, actual) |value, got| try std.testing.expectApproxEqAbs(@as(f32, @floatCast((@as(f64, value) - mean) * inverse)), got, 1e-6);
+}
+
+test "PJRT compact resident rotary coefficients preserve BF16 host publication" {
+    const a = std.testing.allocator;
+    const Reference = struct {
+        fn bf16(value: f32) f32 {
+            const bits: u32 = @bitCast(value);
+            return @bitCast((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff0000);
+        }
+    };
+    var client = pjrt.pjrt.Client.initFromEnv(a) catch |err| switch (err) {
+        error.PjrtPluginNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer client.deinit();
+    const rows = 4;
+    const heads = 3;
+    const dim = 128;
+    const width = heads * dim;
+    for ([_]bool{ false, true }) |consecutive| {
+        var graph = Graph.init(a);
+        defer graph.deinit();
+        var builder = GraphBuilder.init(&graph);
+        const shape = Shape.init(.f32, &.{ rows, width });
+        const x = try builder.parameter("x", shape);
+        const rope = try graph.addNode(.{ .op = .{ .fused_rope = .{ .seq_len = rows, .head_dim = dim, .theta = 1000000, .freq_scale = 1, .consecutive_pairs = consecutive } }, .output_shape = shape, .inputs = .{ x, null_node, null_node, null_node }, .num_inputs = 1 });
+        try graph.markOutput(rope);
+        const external = [_]partition_mod.ExternalInput{.{ .node_id = x, .source_partition = 0 }};
+        const part = Partition{ .backend = .pjrt, .node_ids = &.{rope}, .external_inputs = &external };
+        const fake: ComputeBackend = undefined;
+        var result = try compilePartitionWithOptions(a, &graph, &part, &fake, .{ .precision = .bf16, .resident_capacity = 65536, .wide_rotary_trig = true });
+        defer result.deinit();
+        var executable = try client.compileWithEntryLayouts(result.hlo_bytes, 1, client.device, result.entry_layout_options.?, a);
+        defer executable.deinit();
+        var values: [rows * width]f32 = undefined;
+        for (&values, 0..) |*value, index| {
+            const lane = index % dim;
+            value.* = if (if (consecutive) lane % 2 == 0 else lane < dim / 2) 1 else 0;
+        }
+        var input = try client.bufferFromHostFloat32(&values, &.{ rows, width });
+        defer input.deinit();
+        for ([_]usize{ 0, 63, 65, 1023, 32765, 40956 }) |start| {
+            var position = try client.bufferFromHostFloat32(&.{@floatFromInt(start)}, &.{});
+            defer position.deinit();
+            const outputs = try executable.execute(&.{ input, position }, a);
+            defer a.free(outputs);
+            defer for (outputs) |*output| output.deinit();
+            const actual = try outputs[0].toFloat32WithShape(a, &.{ rows, width });
+            defer a.free(actual);
+            for (actual, 0..) |got, index| {
+                const lane = index % dim;
+                const pair = if (consecutive) lane / 2 else lane % (dim / 2);
+                const frequency = 1 / std.math.pow(f32, 1000000, @as(f32, @floatFromInt(2 * pair)) / dim);
+                const angle = @as(f32, @floatFromInt(start + index / width)) * frequency;
+                const want = Reference.bf16(if (if (consecutive) lane % 2 == 0 else lane < dim / 2) @cos(angle) else @sin(angle));
+                try std.testing.expectEqual(want, got);
+            }
+        }
+    }
+}
+
+test "PJRT full prefix causal mask excludes future keys below finite sentinels" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = GraphBuilder.init(&graph);
+    const shape = Shape.init(.f32, &.{ 2, 2 });
+    const q = try builder.parameter("q", shape);
+    const k = try builder.parameter("k", shape);
+    const v = try builder.parameter("v", shape);
+    const attention = try graph.addNode(.{ .op = .{ .fused_gqa_causal_attention = .{ .batch = 1, .seq_len = 2, .num_heads = 1, .num_kv_heads = 1, .head_dim = 2 } }, .output_shape = shape, .inputs = .{ q, k, v, null_node }, .num_inputs = 3 });
+    try graph.markOutput(attention);
+    const external = [_]partition_mod.ExternalInput{ .{ .node_id = q, .source_partition = 0 }, .{ .node_id = k, .source_partition = 0 }, .{ .node_id = v, .source_partition = 0 } };
+    const part = Partition{ .backend = .pjrt, .node_ids = &.{attention}, .external_inputs = &external };
+    const fake: ComputeBackend = undefined;
+    var result = try compilePartition(a, &graph, &part, &fake);
+    defer result.deinit();
+    var client = pjrt.pjrt.Client.initFromEnv(a) catch |err| switch (err) {
+        error.PjrtPluginNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer client.deinit();
+    var executable = try client.compile(result.hlo_bytes, 1);
+    defer executable.deinit();
+    var query = try client.bufferFromHostFloat32(&.{ 1, 1, 1, 1 }, &.{ 2, 2 });
+    defer query.deinit();
+    var key = try client.bufferFromHostFloat32(&.{ -2e9, -2e9, 0, 0 }, &.{ 2, 2 });
+    defer key.deinit();
+    var value = try client.bufferFromHostFloat32(&.{ 3, 7, 99, 101 }, &.{ 2, 2 });
+    defer value.deinit();
+    const outputs = try executable.execute(&.{ query, key, value }, a);
+    defer a.free(outputs);
+    defer for (outputs) |*output| output.deinit();
+    const actual = try outputs[0].toFloat32WithShape(a, &.{ 2, 2 });
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 7, 99, 101 }, actual);
 }

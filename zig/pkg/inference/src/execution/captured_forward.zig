@@ -442,13 +442,16 @@ pub const Cache = struct {
             valid_rows = @intCast(input.tensor.asInt64()[0] + 1);
             break;
         };
+        // Resolve the declared ABI before committing any request state.
+        const output_names = if (forward.output_abi) |resolve| try resolve(forward.context, inputs) else forward.output_names;
+        if (output_names.len != 1) return error.MissingProgramOutputABI;
         // Allocate the entire public result before committing request state.
         const outputs = try allocator.alloc(Tensor, 1);
         errdefer allocator.free(outputs);
         const shape = try allocator.dupe(i64, entry.resident.?.output_shapes[0]);
         errdefer allocator.free(shape);
         const data = try state.run(entry.resident.?, &frame.backend, values, rows, valid_rows, allocator, control);
-        outputs[0] = .{ .data = std.mem.sliceAsBytes(data), .dtype = .f32, .shape = shape, .name = "logits", .allocator = allocator, .owns_data = true, .owns_shape = true, .data_alignment = .of(f32) };
+        outputs[0] = .{ .data = std.mem.sliceAsBytes(data), .dtype = .f32, .shape = shape, .name = output_names[0], .allocator = allocator, .owns_data = true, .owns_shape = true, .data_alignment = .of(f32) };
         return outputs;
     }
 

@@ -409,6 +409,7 @@ pub const PjrtExecutionProfile = struct {
     platform: enum { cpu, cuda, other },
     precision: @import("precision.zig").Policy,
     gemm: @import("precision.zig").Gemm,
+    resident_gemm: @import("precision.zig").Gemm = .provider_default,
     residual_storage: @import("precision.zig").ResidualStorage = .activation,
 };
 
@@ -606,7 +607,7 @@ pub fn getPjrtExecutionProfile(session: Session) ?PjrtExecutionProfile {
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     if (self.backend_type != .pjrt) return null;
     const data = &self.backend_data.pjrt;
-    return .{ .device_kind = data.device_kind, .platform = data.platform, .precision = data.precision, .gemm = data.gemm, .residual_storage = data.residual_storage };
+    return .{ .device_kind = data.device_kind, .platform = data.platform, .precision = data.precision, .gemm = data.gemm, .resident_gemm = @import("precision.zig").residentGemm(data.platform == .cuda, data.precision, data.gemm), .residual_storage = data.residual_storage };
 }
 
 pub fn getPjrtSpecializationCount(session: Session) ?usize {
@@ -7661,7 +7662,7 @@ fn archRunCachedDecoder(ptr: *anyopaque, state: *@import("resident_decoder.zig")
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     if (self.backend_type != .pjrt or state.failed) return error.UnsupportedResidentDecode;
     var forward = switch (self.arch_config) {
-        .gpt => @import("../architectures/frontends/decoder.zig").resolve(&self.arch_config.gpt),
+        .gpt => if (state.prefill_only) @import("../architectures/frontends/decoder.zig").resolvePrefill(&self.arch_config.gpt) else @import("../architectures/frontends/decoder.zig").resolve(&self.arch_config.gpt),
         .whisper => @import("../architectures/frontends/whisper.zig").resolveCached(&self.arch_config.whisper),
         else => return error.UnsupportedResidentDecode,
     };

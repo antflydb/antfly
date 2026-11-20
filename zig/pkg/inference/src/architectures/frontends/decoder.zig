@@ -26,6 +26,10 @@ const Config = @import("../../models/gpt.zig").Config;
 /// The query width and resident key extent are distinct in cached decode.
 /// Declares public logits independently of a generic session's hidden output.
 pub fn geometry(config: Config, rows: usize, keys: usize) !@import("../../backends/session.zig").RunGeometry {
+    return geometryForOutput(config, rows, keys, .logits);
+}
+
+pub fn geometryForOutput(config: Config, rows: usize, keys: usize, output: enum { logits, hidden }) !@import("../../backends/session.zig").RunGeometry {
     if (rows == 0 or keys < rows or keys > config.max_position_embeddings) return error.InvalidInputShape;
     var width: usize = config.hidden_size;
     for (0..config.num_hidden_layers) |layer| width = @max(width, try std.math.mul(usize, config.num_attention_heads, config.effectiveHeadDimForLayer(layer)));
@@ -34,11 +38,18 @@ pub fn geometry(config: Config, rows: usize, keys: usize) !@import("../../backen
         const matrix = try std.math.mul(usize, config.qwen35_linear_num_value_heads, try std.math.mul(usize, config.qwen35_linear_key_head_dim, config.qwen35_linear_value_head_dim));
         workspace = try std.math.add(usize, workspace, try std.math.mul(usize, matrix, 2 * @sizeOf(f32)));
     }
-    return .{ .sequence = rows, .output_bytes = try std.math.add(usize, try std.math.mul(usize, config.vocab_size, @sizeOf(f32)), 2 * @sizeOf(i64)), .workspace_bytes = workspace };
+    const columns = if (output == .logits) config.vocab_size else config.hidden_size;
+    return .{ .sequence = rows, .output_bytes = try std.math.add(usize, try std.math.mul(usize, columns, @sizeOf(f32)), 2 * @sizeOf(i64)), .workspace_bytes = workspace };
 }
 
 pub fn resolve(config: *Config) capture.Forward {
     return .{ .context = config, .fingerprint = 7, .output_names = &.{"logits"}, .validate = validate, .run = run };
+}
+
+/// Intermediate causal queries publish state and a checked hidden row, without
+/// loading or executing a vocabulary head whose logits cannot be sampled.
+pub fn resolvePrefill(config: *Config) capture.Forward {
+    return .{ .context = config, .fingerprint = 0x70726566696c6c, .output_names = &.{"prefill_hidden"}, .validate = validate, .run = runPrefill };
 }
 
 const Inputs = struct {
@@ -101,6 +112,14 @@ fn validate(raw: *anyopaque, inputs: []const capture.Input) !void {
 }
 
 fn run(raw: *anyopaque, cb: *const ops.ComputeBackend, a: std.mem.Allocator, declared: []const capture.Input) ![]capture.Output {
+    return runWithOutput(raw, cb, a, declared, true);
+}
+
+fn runPrefill(raw: *anyopaque, cb: *const ops.ComputeBackend, a: std.mem.Allocator, declared: []const capture.Input) ![]capture.Output {
+    return runWithOutput(raw, cb, a, declared, false);
+}
+
+fn runWithOutput(raw: *anyopaque, cb: *const ops.ComputeBackend, a: std.mem.Allocator, declared: []const capture.Input, publish_logits: bool) ![]capture.Output {
     const config: *Config = @ptrCast(@alignCast(raw));
     const input = try parse(config.*, declared);
     const rows: usize = @intCast(input.ids.shape[1]);
@@ -138,10 +157,14 @@ fn run(raw: *anyopaque, cb: *const ops.ComputeBackend, a: std.mem.Allocator, dec
     const indices = if (input.logits_row) |row| (try cb.fromConstantBytes(row.data, .i64, row.shape)) orelse return error.UnsupportedPrimitiveOp else null;
     defer if (indices) |value| cb.free(value);
     hidden_owned = false; // the ordinary decoder consumes its input rows
-    const logits = if (indices) |index| selected: {
+    const logits = if (indices != null or !publish_logits) selected: {
         const result = try gpt.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(cb, a, config.*, hidden, .{}, 1, rows, &context, ple);
         defer cb.free(result.hidden);
-        const selected_hidden = try cb.primGather(result.hidden, index, 0, &.{ @intCast(rows), @intCast(width) });
+        const selected_hidden = if (indices) |index|
+            try cb.primGather(result.hidden, index, 0, &.{ @intCast(rows), @intCast(width) })
+        else
+            try cb.sliceRows2D(a, result.hidden, rows - 1, 1, width);
+        if (!publish_logits) break :selected selected_hidden;
         defer cb.free(selected_hidden);
         const lm_weight = try gpt.getLmHeadWeight(cb, config.*);
         defer cb.free(lm_weight);
@@ -150,7 +173,7 @@ fn run(raw: *anyopaque, cb: *const ops.ComputeBackend, a: std.mem.Allocator, dec
     errdefer cb.free(logits);
     const transform = gpt.finalLogitTransform(config.*);
     const outputs = try a.alloc(capture.Output, 1);
-    outputs[0] = .{ .name = "logits", .value = logits, .float32_transform = .{ .scale = transform.scale, .softcap = transform.softcap } };
+    outputs[0] = .{ .name = if (publish_logits) "logits" else "prefill_hidden", .value = logits, .float32_transform = if (publish_logits) .{ .scale = transform.scale, .softcap = transform.softcap } else null };
     return outputs;
 }
 
@@ -160,6 +183,8 @@ test "resident decoder geometry protects the vocabulary row and resident key ext
     const cached = try geometry(cfg, 1, 512);
     try std.testing.expectEqual(@as(usize, 65536 * @sizeOf(f32) + 2 * @sizeOf(i64)), cached.output_bytes);
     try std.testing.expectEqual(short.output_bytes, cached.output_bytes);
+    const prefill = try geometryForOutput(cfg, 512, 512, .hidden);
+    try std.testing.expectEqual(@as(usize, 64 * @sizeOf(f32) + 2 * @sizeOf(i64)), prefill.output_bytes);
     try std.testing.expect(cached.workspace_bytes > short.workspace_bytes);
     try std.testing.expectEqual(@as(usize, 512 * 64 * 6 * @sizeOf(f32)), cached.workspace_bytes);
     try std.testing.expectError(error.InvalidInputShape, geometry(cfg, 2, 1));
