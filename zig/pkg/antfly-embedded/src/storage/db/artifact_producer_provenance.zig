@@ -1738,10 +1738,10 @@ test "ordered artifact inventory document proof pages seek binary ranges and rej
 test "ordered artifact inventory provenance shares receipts and reclaims superseded proof" {
     const Fake = struct {
         values: std.StringHashMap([]u8),
-        fn get(self: *@This(), name: []const u8) anyerror![]const u8 {
+        pub fn get(self: *@This(), name: []const u8) anyerror![]const u8 {
             return self.values.get(name) orelse error.NotFound;
         }
-        fn put(self: *@This(), name: []const u8, value: []const u8) !void {
+        pub fn put(self: *@This(), name: []const u8, value: []const u8) !void {
             const owned_value = try std.testing.allocator.dupe(u8, value);
             errdefer std.testing.allocator.free(owned_value);
             const entry = try self.values.getOrPut(name);
@@ -1789,6 +1789,14 @@ test "ordered artifact inventory provenance shares receipts and reclaims superse
     const prepared_raw = try txn.get(&prepared_reference);
     const certificate: ArtifactCertificate = .{ .reference = prepared_reference, .value = prepared_raw[0 .. 32 + publication.Position.encoded_len].* };
     try certificate.requireCurrent(&txn);
+    var graph = command;
+    graph.producer_kind = .graph;
+    var graph_certificate = certificate;
+    graph_certificate.graph_output = publication.GraphOutputFence.init(graph, sources[0], position);
+    try graph_certificate.requireCurrent(&txn);
+    try publication.stageRejection(&txn, graph, 2, .graph_cycle);
+    try std.testing.expectError(error.EnrichmentSourceChanged, graph_certificate.requireCurrent(&txn));
+    try std.testing.expectEqualSlices(u8, &certificate.value, try txn.get(&prepared_reference));
     try txn.put("unrelated", "write");
     try certificate.requireCurrent(&txn);
     var changed_position = certificate.value;
