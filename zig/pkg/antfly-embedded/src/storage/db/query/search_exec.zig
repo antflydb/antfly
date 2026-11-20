@@ -11120,29 +11120,33 @@ const IndexedPredicateEvaluator = struct {
                 else => return err,
             };
             defer matches.deinit();
-            try entry.shared.lockDeletionSharedWithControl(self.control);
-            defer entry.shared.unlockDeletionShared();
-            if (entry.shared.deleted) |deleted| matches.andNotWith(&deleted);
+            var deleted = deleted: {
+                try entry.shared.lockDeletionSharedWithControl(self.control);
+                defer entry.shared.unlockDeletionShared();
+                break :deleted if (entry.shared.deleted) |*mask| try mask.cloneExact(self.alloc) else null;
+            };
+            defer if (deleted) |*mask| mask.deinit();
+
+            if (deleted) |*mask| matches.andNotWith(mask);
             var hits = matches.iterator();
             while (hits.next()) |doc| {
                 try self.control.check();
                 try matched_docs.add(base + doc);
             }
             if (!capture_coverage) continue;
-            if (physical != null) {
-                if (entry.shared.deleted) |deleted| pending.andNotWith(&deleted);
+            if (physical == null) {
+                if (deleted) |*mask| {
+                    var live_ranges = mask.absentRanges(0, entry.reader.doc_count);
+                    while (live_ranges.next()) |range| {
+                        try self.control.check();
+                        try covered_docs.addRange(base + range.start, base + range.end);
+                    }
+                } else try covered_docs.addRange(base, offset);
+            } else {
+                if (deleted) |*mask| pending.andNotWith(mask);
                 var candidates = pending.iterator();
                 while (candidates.next()) |doc| {
                     try self.control.check();
-                    try covered_docs.add(base + doc);
-                }
-            } else if (entry.shared.deleted == null) {
-                try covered_docs.addRange(base, offset);
-            } else {
-                for (0..entry.reader.doc_count) |local| {
-                    if (local % 256 == 0) try self.control.check();
-                    const doc: u32 = @intCast(local);
-                    if (entry.shared.deleted) |deleted| if (deleted.contains(doc)) continue;
                     try covered_docs.add(base + doc);
                 }
             }
@@ -22123,9 +22127,17 @@ fn countNativeSortCursor(
         snapshot: *index_mod.IndexSnapshot,
         control: QueryExecutionControl,
         projection: index_mod.IndexSnapshot.SortOrdinalBatchProjection = .{},
-        items: [256]MatchAllCandidate = undefined,
+        items: []MatchAllCandidate,
+        expanded: bool = false,
+        attempted_expansion: bool = false,
         len: usize = 0,
         count: usize = 0,
+
+        fn deinit(self: *@This()) void {
+            self.clear();
+            self.projection.deinit(self.alloc);
+            if (self.expanded) self.alloc.free(self.items);
+        }
 
         fn clear(self: *@This()) void {
             for (self.items[0..self.len]) |*candidate| candidate.deinit(self.alloc);
@@ -22136,7 +22148,17 @@ fn countNativeSortCursor(
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.items[self.len] = candidate.take();
             self.len += 1;
-            if (self.len == self.items.len) try self.flush();
+            if (self.len == self.items.len) {
+                try self.flush();
+                if (self.projection.spill_disabled and !self.attempted_expansion) {
+                    self.attempted_expansion = true;
+                    // Amortize scans whose navigation could not be admitted.
+                    if (self.alloc.alloc(MatchAllCandidate, 4096)) |items| {
+                        self.items = items;
+                        self.expanded = true;
+                    } else |_| {}
+                }
+            }
         }
 
         fn flush(self: *@This()) !void {
@@ -22182,16 +22204,17 @@ fn countNativeSortCursor(
     try validateSortPageOptions(req);
     try validateMatchAllSortDoesNotUseScore(req);
     try validateSortExecutionPlanForRuntime(req, plan, .{ .ctx = null, .require_native = plan.require_native, .load = loadTextDocValueSortValue });
+    var small_batch: [256]MatchAllCandidate = undefined;
     var batch = Batch{
         .alloc = alloc,
         .req = req,
         .plan = plan,
         .snapshot = snapshot,
         .control = control,
+        .items = &small_batch,
         .projection = .{ .remaining_scan_rows = @max(sortedSegmentScanBudget(), @as(u64, snapshot.filterPhysicalDocCount()) * 2) },
     };
-    defer batch.clear();
-    defer batch.projection.deinit(alloc);
+    defer batch.deinit();
     const stream = executor.collect_candidates_stream orelse return rejectSortCandidateStreamUnavailable(plan);
     const profiling = req.profile or shouldLogBenchQueryProfile();
     const started = if (profiling) platform_time.monotonicNs() else 0;

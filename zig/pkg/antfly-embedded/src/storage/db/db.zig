@@ -49208,8 +49208,13 @@ pub const DB = struct {
                         if (ttl_mod.isExpired(ts, duration, now)) continue;
                     };
                     if (!try sourcePresent(alloc, &txn, id)) continue;
+                    const identity = if (ordinal) |known| PreparedIdentity{ .visible = known } else try self.resolvePreparedIdentity(alloc, &txn, id, null);
+                    switch (identity) {
+                        .invisible => continue,
+                        .unmapped => {},
+                        .visible => |value| resolved[i] = value,
+                    }
                     present[i] = true;
-                    resolved[i] = if (ordinal) |known| known else try self.resolvePreparedOrdinal(alloc, &txn, id);
                 }
             }
             for (keys, resolved[0..keys.len], present[0..keys.len]) |id, ordinal, is_present| {
@@ -49266,10 +49271,11 @@ pub const DB = struct {
                         const temp = source_batch.arena.allocator();
                         const mapped = try doc_identity.lookupOrdinalsTxnAlloc(temp, &txn, keys);
                         for (keys, mapped, 0..) |id, forward, i| {
-                            const ordinal = forward orelse try doc_identity.lookupLiveOrdinalTxn(temp, &txn, id) orelse continue;
-                            const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse continue;
-                            visible[i] = if (owner.req.identity_read_generation) |generation| state.isVisibleAt(generation) else state.isLive();
-                            if (visible[i]) ordinals[i] = ordinal;
+                            switch (try owner.resolvePreparedIdentity(temp, &txn, id, @as(??doc_set.DocOrdinal, forward))) {
+                                .invisible => visible[i] = false,
+                                .unmapped => {},
+                                .visible => |ordinal| ordinals[i] = ordinal,
+                            }
                         }
                     }
                     const timestamps = if (source_batch.ttl_duration == 0) null else try loadDocumentTimestampsManyWithIdentityShape(owner.db, source_batch.arena.allocator(), keys, true);
@@ -49417,12 +49423,16 @@ pub const DB = struct {
         }
 
         fn sourcePresent(alloc: Allocator, txn: *docstore_mod.DocStore.Txn, id: []const u8) !bool {
-            const primary_key = try internal_keys.documentKeyAlloc(alloc, id);
-            defer alloc.free(primary_key);
-            if (try txn.contains(primary_key)) return true;
-            const relational_key = try internal_keys.relationalRowKeyAlloc(alloc, id);
-            defer alloc.free(relational_key);
-            return txn.contains(relational_key);
+            var buffer: [256]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+            var scratch: std.heap.BufferFirstAllocator = .init(&buffer, alloc);
+            const key_alloc = scratch.allocator();
+            const key = try internal_keys.documentKeyAlloc(key_alloc, id);
+            defer key_alloc.free(key);
+            const kind = &key[key.len - 1];
+            // Private group source anchors are outside the public population.
+            if (kind.* == internal_keys.primary_kind and try txn.contains(key)) return true;
+            kind.* = internal_keys.relational_row_kind;
+            return txn.contains(key);
         }
 
         fn visitId(self: *@This(), id: []const u8, unique: bool) !docstore_mod.DocStore.ScanAction {
@@ -49435,14 +49445,32 @@ pub const DB = struct {
                 defer txn.abort();
                 if (!try sourcePresent(self.alloc, &txn, id)) return .@"continue";
                 if (known_ordinal) |value| break :identity value;
-                break :identity try self.resolvePreparedOrdinal(self.alloc, &txn, id);
+                switch (try self.resolvePreparedIdentity(self.alloc, &txn, id, null)) {
+                    .invisible => return .@"continue",
+                    .unmapped => break :identity null,
+                    .visible => |value| break :identity value,
+                }
             };
             return self.visitor(self.visitor_ctx, id, ordinal, unique, false);
         }
-        fn resolvePreparedOrdinal(self: *@This(), alloc: Allocator, txn: *docstore_mod.DocStore.Txn, id: []const u8) !?doc_set.DocOrdinal {
-            const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, txn, id)) orelse return null;
-            const state = (try doc_identity.lookupStateTxn(txn, ordinal)) orelse return null;
-            return if (if (self.req.identity_read_generation) |at| state.isVisibleAt(at) else state.isLive()) ordinal else null;
+        const PreparedIdentity = union(enum) {
+            unmapped,
+            invisible,
+            visible: doc_set.DocOrdinal,
+        };
+
+        fn resolvePreparedIdentity(
+            self: *@This(),
+            alloc: Allocator,
+            txn: *docstore_mod.DocStore.Txn,
+            id: []const u8,
+            preloaded_forward: ??doc_set.DocOrdinal,
+        ) !PreparedIdentity {
+            const forward = if (preloaded_forward) |value| value else try doc_identity.lookupOrdinalTxn(alloc, txn, id);
+            const ordinal = forward orelse try doc_identity.lookupLiveOrdinalTxn(alloc, txn, id) orelse return .unmapped;
+            const state = (try doc_identity.lookupStateTxn(txn, ordinal)) orelse return .unmapped;
+            const visible = if (self.req.identity_read_generation) |at| state.isVisibleAt(at) else state.isLive();
+            return if (visible) .{ .visible = ordinal } else .invisible;
         }
     };
 
@@ -157853,6 +157881,38 @@ test "optional numeric range keeps mixed primary matches for native field sortin
             try write.delete(&state_key);
             try write.commit();
         }
+        // The missing state is a valid compatibility key. The mapped row
+        // exists physically but was created after this read generation.
+        const VisitHistorical = struct {
+            fn visit(raw: ?*anyopaque, id: []const u8, ordinal: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
+                const visited: *usize = @ptrCast(@alignCast(raw.?));
+                try std.testing.expectEqualStrings("legacy", id);
+                try std.testing.expectEqual(@as(?doc_set.DocOrdinal, null), ordinal);
+                visited.* += 1;
+                return .@"continue";
+            }
+        };
+        const key_options = db_query_search.MatchAllCandidateCollectOptions{ .constraints = &.{
+            .positive_filter = true,
+            .legacy_filter = .{ .doc_keys = &.{ "legacy", "mapped" } },
+        } };
+        var visited: usize = 0;
+        var historical = DB.PrimaryMatchAllIdentityScan{
+            .db = &db,
+            .req = .{ .identity_read_generation = 0 },
+            .alloc = a,
+            .visitor_ctx = &visited,
+            .visitor = VisitHistorical.visit,
+        };
+        try std.testing.expect(try historical.scanSmallOrderedScope(key_options));
+        try std.testing.expectEqual(@as(usize, 1), visited);
+        var started = false;
+        try std.testing.expect(try historical.scanLargeOrderedScopeWithSpill(key_options, &started));
+        try std.testing.expect(started);
+        try std.testing.expectEqual(@as(usize, 2), visited);
+        try historical.scanSourcePopulation(key_options);
+        try std.testing.expectEqual(@as(usize, 3), visited);
+
         var mixed_scope = doc_set.ResolvedDocFilter{ .include = try doc_set.fromOrdinalsAlloc(a, &.{mapped_ordinal}) };
         defer mixed_scope.deinit(a);
         mixed_scope.legacy_include = try doc_set.cloneDocKeysAlloc(a, &.{"legacy"});

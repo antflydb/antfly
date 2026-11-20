@@ -63,7 +63,7 @@ pub fn admitSearchSpill(alloc: Allocator, io: std.Io, context: *anyopaque, check
 
 pub fn searchSpillUnavailable(err: anyerror) bool {
     return switch (err) {
-        error.SqlProgramLimitExceeded, error.NoSpaceLeft, error.DiskQuota, error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem, error.FileNotFound, error.InputOutput, error.SystemResources, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => true,
+        error.SqlProgramLimitExceeded, error.NoSpaceLeft, error.FileTooBig, error.DiskQuota, error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem, error.FileNotFound, error.InputOutput, error.SystemResources, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => true,
         else => false,
     };
 }
