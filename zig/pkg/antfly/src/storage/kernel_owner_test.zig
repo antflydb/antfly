@@ -3945,6 +3945,22 @@ test "opaque metadata session reads retain binary values and survive raft snapsh
     var current = try store.openSessionRead(a, group);
     defer current.abort();
     try std.testing.expectEqualStrings("\x80committed", try current.get(key));
+    {
+        var reader = try store.openSessionRead(a, group);
+        var ranged = reader.openReadScope(a) catch |err| {
+            reader.abort();
+            return err;
+        };
+        reader.abort();
+        defer ranged.close();
+        try std.testing.expectEqualStrings("commit", try ranged.getRange(key, 1, 6));
+        try std.testing.expectError(error.EndOfStream, ranged.getRange(key, 8, 8));
+        try std.testing.expectError(error.EndOfStream, ranged.getRange(key, 20, 0));
+        try std.testing.expectError(error.InvalidArgument, ranged.getRange("outside-session-namespace", 0, 1));
+        var old = try retained.openReadScope(a);
+        defer old.close();
+        try std.testing.expectEqualStrings("\x00", try old.getRange(key, 1, 1));
+    }
     var cursor = try current.openCursor();
     {
         defer cursor.close();

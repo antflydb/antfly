@@ -2792,12 +2792,11 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
         defer if (scope) |*s| s.close();
         const value = if (scope) |*s| blk: {
             if (request.length > 32 << 20) return .invalid_argument;
-            if (s.supportsRange()) break :blk s.getRange(key, request.offset, request.length) catch |err| switch (err) {
-                error.EndOfStream => return .ok,
-                else => return storageOwnerStatusFromError(err),
-            };
+            if (s.getRange(key, request.offset, request.length)) |bytes| {
+                break :blk bytes;
+            } else |err| if (err != error.Unsupported) return storageOwnerStatusFromError(err);
             const full = read.txn.get(key) catch |err| return storageOwnerStatusFromError(err);
-            if (request.offset > full.len or request.length > full.len - request.offset) return .ok;
+            if (request.offset > full.len or request.length > full.len - request.offset) return .end_of_stream;
             break :blk full[@intCast(request.offset)..][0..request.length];
         } else read.txn.get(key) catch |err| return storageOwnerStatusFromError(err);
         if (value.len > 32 << 20) return .invalid_argument;

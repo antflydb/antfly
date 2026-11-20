@@ -62,7 +62,7 @@ const Read = struct {
         pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
             if (length > 32 << 20) return error.TransactionTooLarge;
             const value = try self.read.readValue(self.arena.allocator(), .{ .operation = .get_range, .key = .fromSlice(key), .offset = offset, .length = @intCast(length) });
-            if (value.len != length) return error.EndOfStream;
+            if (value.len != length) return error.StorageKernelFailure;
             return value;
         }
         pub fn close(self: *@This()) void {
