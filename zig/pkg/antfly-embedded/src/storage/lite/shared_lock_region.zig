@@ -2465,6 +2465,20 @@ pub const Region = struct {
         return self.readLogStateChecked() orelse .{ .checkpoint_sequence = 0, .durable_sequence = 0, .durable_offset = 0 };
     }
 
+    /// The published fields read one at a time, outside the seqlock: no
+    /// consistent tuple, but usable as a bound while a publication is torn
+    /// or in progress. Each field then holds either its previous or its new
+    /// value, and every durable sequence ever published was durable when it
+    /// was published.
+    pub fn readLogStateRaw(self: *const Region) LogState {
+        const hdr = self.header();
+        return .{
+            .checkpoint_sequence = hdr.log_checkpoint_sequence.load(.seq_cst),
+            .durable_sequence = hdr.log_durable_sequence.load(.seq_cst),
+            .durable_offset = hdr.log_durable_offset.load(.seq_cst),
+        };
+    }
+
     /// `readLogState`, or null when the publication is torn (a publisher
     /// died mid-publish): a writer must then treat peer progress as unknown
     /// rather than as none.

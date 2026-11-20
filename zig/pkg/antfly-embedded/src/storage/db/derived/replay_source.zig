@@ -672,7 +672,10 @@ fn primaryStoreForEachMatchingRecord(
         StopReplayChunk.StopReplayChunk => return callback_ctx.stats,
         else => return err,
     };
-    if (replay_stats.matched_entries == 0) {
+    // A batch that ran out of scan budget before any match still made
+    // progress: report where it stopped instead of rescanning the same
+    // window through the fallback.
+    if (replay_stats.matched_entries == 0 and !replay_stats.scan_budget_exhausted) {
         return try primaryStoreForEachMatchingRecordFallbackAll(
             store,
             from_sequence,

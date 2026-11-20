@@ -279,6 +279,9 @@ pub const ReplayLaneIterationStats = struct {
     last_sequence: u64 = 0,
     scan_batches: usize = 0,
     fallback_used: bool = false,
+    /// The batch stopped at its scan budget rather than at its match limit
+    /// or the end of the lane: more entries follow `last_sequence`.
+    scan_budget_exhausted: bool = false,
 };
 
 test "default backend capabilities assume ordered single-writer snapshots" {

@@ -35,6 +35,7 @@ const replay_chunks = @import("db/derived/replay_chunks.zig");
 const apply_state = @import("db/derived/apply_state.zig");
 const replay_reference = @import("db/derived/replay_reference.zig");
 const internal_keys = @import("internal_keys.zig");
+const replay_journal_format = @import("replay_journal_format.zig");
 const retained_effects = @import("retained_effects.zig");
 const artifact_payload = @import("artifact_payload.zig");
 const lsm_backend = @import("lsm_backend.zig");
@@ -205,16 +206,36 @@ fn storeJournalCreditLedger(txn: anytype, ledger: internal_keys.JournalCreditLed
     try txn.put(internal_keys.journal_credit_ledger_key[0..], raw[0..]);
 }
 
-/// WS5: Antfly is unreleased, so this build never speaks the pre-ledger v1
-/// replay layout. An already-initialized journal without a current version
-/// marker is refused outright rather than silently reinterpreted.
-fn requireCurrentReplayJournalFormat(txn: anytype) !void {
-    const raw = txn.get(internal_keys.replay_journal_format_version_key[0..]) catch |err| switch (err) {
-        error.NotFound => return error.UnsupportedReplayJournalFormat,
-        else => return err,
+/// The credit ledger a scan of every lane entry reproduces: what the base
+/// revision's journal is charged when it is upgraded in place.
+fn scanReplayJournalLedger(txn: anytype) !internal_keys.JournalCreditLedger {
+    var ledger: internal_keys.JournalCreditLedger = .{};
+    const kinds = [_]u8{internal_keys.replay_all_kind} ++ comptime blk: {
+        var ordinals: [replay_hints.len]u8 = undefined;
+        for (replay_hints, 0..) |hint, i| ordinals[i] = replayHintOrdinal(hint);
+        break :blk ordinals;
     };
-    const version = internal_keys.decodeReplayJournalFormatVersion(raw) orelse return error.UnsupportedReplayJournalFormat;
-    if (version != internal_keys.replay_journal_format_v2) return error.UnsupportedReplayJournalFormat;
+    for (kinds) |kind| {
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const lower = internal_keys.replayRangeLower(kind, 0);
+        const upper = internal_keys.replayRangeUpper(kind);
+        cursor.setUpperBound(&upper);
+        var entry = try cursor.seekAtOrAfter(&lower);
+        while (entry) |current| : (entry = try cursor.next()) {
+            // Bounded by key as well: not every cursor honors the upper bound.
+            if (current.key.len < 2 or current.key[0] != internal_keys.replay_namespace or current.key[1] != kind) break;
+            if (current.key.len != internal_keys.replay_key_len) continue;
+            ledger = ledger.charged(replay_journal_format.entryCharge(current.key.len, current.value.len), 1);
+        }
+    }
+    return ledger;
+}
+
+/// Brings a journal the base revision initialized up to the current format
+/// in `txn`; see `replay_journal_format`.
+fn upgradeLegacyReplayJournal(txn: anytype) !void {
+    try replay_journal_format.upgrade(txn, try scanReplayJournalLedger(txn));
 }
 
 fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []const u8) !void {
@@ -223,6 +244,16 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     // already published cut: replay consumers may have passed it. Consensus
     // duplicate detection happens before opening this mutation transaction.
     if (sequence == std.math.maxInt(u64)) return error.InvalidBatchRequest;
+    // A journal the base revision initialized is upgraded in this append's
+    // own transaction (open normally already did it), before its
+    // `next_sequence` is read from the current key; a fresh one is stamped.
+    const journal_state = try replay_journal_format.state(txn);
+    if (journal_state == .legacy) try upgradeLegacyReplayJournal(txn);
+    const already_initialized = journal_state != .absent;
+    if (!already_initialized) {
+        const version_raw = internal_keys.encodeReplayJournalFormatVersion(internal_keys.replay_journal_format_v2);
+        try txn.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
+    }
     const previous = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
@@ -237,22 +268,6 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
         if (raw.len != 8) return error.CorruptReplayMetadata;
         previous_fixed = raw[0..8].*;
         if (sequence < std.mem.readInt(u64, raw[0..8], .little)) return error.InvalidBatchRequest;
-    }
-
-    // WS5: refuse a pre-ledger journal on the very first real append it
-    // sees, and stamp a fresh journal with the current version so later
-    // appends and retirement transactions can tell the layout apart from an
-    // old one. Low-level tests that hand-construct replay state never call
-    // this function, so they are unaffected either way.
-    const already_initialized = (txn.get(internal_keys.replay_meta_init_key[0..]) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    }) != null;
-    if (already_initialized) {
-        try requireCurrentReplayJournalFormat(txn);
-    } else {
-        const version_raw = internal_keys.encodeReplayJournalFormatVersion(internal_keys.replay_journal_format_v2);
-        try txn.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
     }
 
     // WS5: this append is charged against the journal credit ledger in the
@@ -358,6 +373,8 @@ pub const ReplayIterationStats = struct {
     hint_filter_skips: usize = 0,
     scan_batches: usize = 0,
     fallback_used: bool = false,
+    /// See `backend_types.ReplayLaneIterationStats.scan_budget_exhausted`.
+    scan_budget_exhausted: bool = false,
 };
 
 // ============================================================================
@@ -1547,8 +1564,9 @@ pub const DocStore = struct {
             .wal_enabled = !opts.read_only,
         });
         errdefer backend.close();
-        const runtime_store = try backend.backend.runtimeStore(alloc, .{});
-        return .{
+        var runtime_store = try backend.backend.runtimeStore(alloc, .{});
+        errdefer runtime_store.deinit();
+        var opened: DocStore = .{
             .alloc = alloc,
             .runtime_store = runtime_store,
             .owns_runtime_store = true,
@@ -1556,17 +1574,49 @@ pub const DocStore = struct {
             .replay_index_state = .init(replay_index_unknown),
             .next_replay_sequence_cached = .init(0),
         };
+        if (!opts.read_only) try opened.upgradeLegacyReplayJournalAtOpen();
+        return opened;
     }
 
     pub fn openRuntime(alloc: Allocator, store: anytype) !DocStore {
-        const runtime_store = try initRuntimeStore(alloc, store);
-        return .{
+        var runtime_store = try initRuntimeStore(alloc, store);
+        // A store handed over by value stays the caller's to release when the
+        // open fails; only a wrapper made here is released here.
+        errdefer if (runtime_store.owned and @TypeOf(store) != backend_erased.Store) runtime_store.store.deinit();
+        var opened: DocStore = .{
             .alloc = alloc,
             .runtime_store = runtime_store.store,
             .owns_runtime_store = runtime_store.owned,
             .owned_lsm_backend = null,
             .replay_index_state = .init(replay_index_unknown),
             .next_replay_sequence_cached = .init(0),
+        };
+        try opened.upgradeLegacyReplayJournalAtOpen();
+        return opened;
+    }
+
+    /// Upgrades a journal the base revision initialized before this store
+    /// serves anything: its next append, and every reader of
+    /// `next_sequence`, expect the current layout. A read-only store cannot
+    /// upgrade and is left as it is. An unknown format fails the open.
+    fn upgradeLegacyReplayJournalAtOpen(self: *DocStore) !void {
+        {
+            var probe = try self.beginProbeTxn();
+            defer probe.abort();
+            if (try replay_journal_format.state(&probe) != .legacy) return;
+        }
+        var batch = self.beginWriteBatch() catch |err| switch (err) {
+            error.ReadOnly => return,
+            else => return err,
+        };
+        errdefer batch.abort();
+        try upgradeLegacyReplayJournal(batch.asTxn());
+        batch.commit() catch |err| switch (err) {
+            error.ReadOnly => {
+                batch.abort();
+                return;
+            },
+            else => return err,
         };
     }
 
@@ -3293,6 +3343,7 @@ pub const DocStore = struct {
             .last_sequence = lane_stats.last_sequence,
             .scan_batches = lane_stats.scan_batches,
             .fallback_used = lane_stats.fallback_used,
+            .scan_budget_exhausted = lane_stats.scan_budget_exhausted,
         };
     }
 
@@ -7309,4 +7360,73 @@ test "docstore scoped owned batches pin one generation and release external payl
     try std.testing.expectEqual(@as(u64, 128), after.get_many_sorted_calls - before.get_many_sorted_calls);
     try std.testing.expectEqual(@as(u64, 384), after.get_many_sorted_keys - before.get_many_sorted_keys);
     try std.testing.expect(budget.live < baseline + 64 * 1024);
+}
+
+fn writeLegacyReplayJournal(store: *DocStore) !void {
+    // The base revision's layout: no format marker, no credit ledger,
+    // `next_sequence` under its old key, and a per-hint lane copy.
+    var batch = try store.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(internal_keys.replay_meta_init_key[0..], "");
+    var next_raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &next_raw, 2, .little);
+    try batch.put(replay_journal_format.legacy_next_sequence_key[0..], next_raw[0..]);
+    const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    try batch.put(all_key[0..], "replay:1");
+    const lane_key = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 1);
+    try batch.put(lane_key[0..], "replay:1");
+    try batch.commit();
+}
+
+test "docstore upgrades a base-revision replay journal when it opens" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try writeLegacyReplayJournal(&store);
+    }
+
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try std.testing.expectEqual(@as(u64, 1), store.lastReplaySequence(0));
+    {
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.NotFound, txn.get(replay_journal_format.legacy_next_sequence_key[0..]));
+        const version = internal_keys.decodeReplayJournalFormatVersion(try txn.get(internal_keys.replay_journal_format_version_key[0..]));
+        try std.testing.expectEqual(@as(?u32, internal_keys.replay_journal_format_v2), version);
+        const ledger = internal_keys.JournalCreditLedger.decode(try txn.get(internal_keys.journal_credit_ledger_key[0..])) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u64, 2), ledger.records);
+        try std.testing.expectEqual(@as(u64, 2 * (internal_keys.replay_key_len + "replay:1".len)), ledger.bytes);
+    }
+
+    // The next journal-producing mutation succeeds.
+    try store.putBatchWithReplay(null, &.{
+        .{ .key = "doc:a", .value = "A" },
+    }, &.{}, .{
+        .sequence = 2,
+        .payload = "replay:2",
+    });
+    try std.testing.expectEqual(@as(u64, 2), store.lastReplaySequence(0));
+}
+
+test "docstore refuses an unknown replay journal format when it opens" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(internal_keys.replay_meta_init_key[0..], "");
+        const version_raw = internal_keys.encodeReplayJournalFormatVersion(7);
+        try batch.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
+        try batch.commit();
+    }
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    try std.testing.expectError(error.UnsupportedReplayJournalFormat, DocStore.openRuntime(alloc, &runtime));
 }
