@@ -7002,7 +7002,7 @@ pub const Store = struct {
     pub fn nextReplaySequence(self: *Store, fallback_next: u64) u64 {
         var read = self.beginRead() catch return fallback_next;
         defer read.abort();
-        const raw = read.get(internal_keys.replay_meta_next_sequence_key[0..]) catch return fallback_next;
+        const raw = replay_journal_format.getNextSequence(&read) catch return fallback_next;
         if (raw.len != 8) return fallback_next;
         return std.mem.readInt(u64, raw[0..8], .little);
     }
@@ -7198,7 +7198,7 @@ const RuntimeStore = struct {
     pub fn nextReplaySequence(self: *RuntimeStore, fallback_next: u64) u64 {
         var read = self.beginRead() catch return fallback_next;
         defer read.abort();
-        const raw = read.get(internal_keys.replay_meta_next_sequence_key[0..]) catch return fallback_next;
+        const raw = replay_journal_format.getNextSequence(&read) catch return fallback_next;
         if (raw.len != 8) return fallback_next;
         return std.mem.readInt(u64, raw[0..8], .little);
     }
@@ -9211,6 +9211,9 @@ fn scanReplayJournalLedger(txn: *Txn) !internal_keys.JournalCreditLedger {
     for (kinds) |kind| {
         var cursor = try txn.openCursor();
         defer cursor.close();
+        // Lengths only, as retirement measures them: never materialize a
+        // retained payload (or its external value pages) just to count it.
+        cursor.setLengthOnly();
         const lower = internal_keys.replayRangeLower(kind, 0);
         const upper = internal_keys.replayRangeUpper(kind);
         cursor.setUpperBound(&upper);
@@ -9221,7 +9224,7 @@ fn scanReplayJournalLedger(txn: *Txn) !internal_keys.JournalCreditLedger {
         while (true) {
             if (entry.key.len < 2 or entry.key[0] != internal_keys.replay_namespace or entry.key[1] != kind) break;
             if (entry.key.len == internal_keys.replay_key_len) {
-                ledger = ledger.charged(replay_journal_format.entryCharge(entry.key.len, entry.value.len), 1);
+                ledger = ledger.charged(replay_journal_format.entryCharge(entry.key.len, cursor.lastValueLen()), 1);
             }
             entry = cursor.next() catch |err| switch (err) {
                 error.NotFound => break,

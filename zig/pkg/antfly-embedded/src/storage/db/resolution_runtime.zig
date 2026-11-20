@@ -2942,6 +2942,7 @@ pub const ResolutionRuntime = struct {
         // acknowledged by an earlier empty scan.
         const target = self.target_sequence.load(.acquire);
         const applied = self.applied_sequence.load(.acquire);
+        var scan: replay_source_mod.MatchingRecordStats = .{};
         if (self.pending_replay_record == null) {
             const Capture = struct {
                 fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
@@ -2953,10 +2954,20 @@ pub const ResolutionRuntime = struct {
                     runtime.pending_replay_record = .{ .sequence = sequence, .raw = raw, .decoded = decoded };
                 }
             };
-            _ = try self.replay_source.forEachMatchingRecord(self.alloc, applied, .resolution, 1, self, Capture.consume);
+            scan = try self.replay_source.forEachMatchingRecord(self.alloc, applied, .resolution, 1, self, Capture.consume);
         }
         const record = if (self.pending_replay_record) |*value| value else {
             if (self.replay_progress != null) return error.InvalidResolutionReplayCursor;
+            // A scan that stopped at its entry cap examined only a prefix:
+            // advance through what it verified holds no resolution work, not
+            // to the target.
+            if (scan.scan_budget_exhausted) {
+                if (scan.last_sequence > applied) {
+                    try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, scan.last_sequence);
+                    self.applied_sequence.store(scan.last_sequence, .release);
+                }
+                return;
+            }
             try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
             self.applied_sequence.store(target, .release);
             return;

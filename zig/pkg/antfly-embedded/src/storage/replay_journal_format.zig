@@ -47,6 +47,23 @@ pub fn state(txn: anytype) !State {
     return .current;
 }
 
+/// The stored `next_sequence` bytes. A journal still in the base layout (a
+/// read-only open never upgrades it) keeps them under the legacy key; read
+/// there only while the format marker is absent, so a populated database
+/// never reports an empty journal.
+pub fn getNextSequence(txn: anytype) ![]const u8 {
+    return txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
+        error.NotFound => {
+            _ = txn.get(internal_keys.replay_journal_format_version_key[0..]) catch |marker_err| switch (marker_err) {
+                error.NotFound => return txn.get(legacy_next_sequence_key[0..]),
+                else => return marker_err,
+            };
+            return error.NotFound;
+        },
+        else => return err,
+    };
+}
+
 /// What the credit ledger charges for one lane entry.
 pub fn entryCharge(key_len: usize, value_len: usize) u64 {
     return @as(u64, key_len) + value_len;

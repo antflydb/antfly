@@ -99,6 +99,11 @@ pub const MatchingRecordStats = struct {
     hint_filter_skips: usize = 0,
     scan_batches: usize = 0,
     last_sequence: u64 = 0,
+    /// The batch stopped at its scanned-entry cap, not at the end of the
+    /// journal: `last_sequence` is the last record scanned, and records
+    /// after it are unexamined. An empty batch with this set proves nothing
+    /// about the rest of the journal.
+    scan_budget_exhausted: bool = false,
 
     pub fn add(self: *MatchingRecordStats, other: MatchingRecordStats) void {
         self.matched_entries += other.matched_entries;
@@ -106,6 +111,7 @@ pub const MatchingRecordStats = struct {
         self.hint_filter_skips += other.hint_filter_skips;
         self.scan_batches += other.scan_batches;
         self.last_sequence = @max(self.last_sequence, other.last_sequence);
+        self.scan_budget_exhausted = self.scan_budget_exhausted or other.scan_budget_exhausted;
     }
 };
 
@@ -434,7 +440,10 @@ fn primaryStoreMatchingCursorForEachNext(
             stats.last_sequence = sequence;
             cursor.next_sequence = sequence;
             cursor.entry = try cursor.cursor.?.next();
-            if (stats.scanned_entries >= max_scanned_entries) return stats;
+            if (stats.scanned_entries >= max_scanned_entries) {
+                stats.scan_budget_exhausted = cursor.entry != null;
+                return stats;
+            }
             continue;
         }
 
@@ -508,6 +517,9 @@ fn primaryStoreForEachMatchingRecordFallbackAll(
     callback_ctx.stats.hint_filter_skips += replay_stats.hint_filter_skips;
     callback_ctx.stats.scan_batches = @max(callback_ctx.stats.scan_batches, replay_stats.scan_batches);
     callback_ctx.stats.last_sequence = @max(callback_ctx.stats.last_sequence, replay_stats.last_sequence);
+    // The raw lane stops after `max_scanned_entries` entries whether or not
+    // more follow; treat reaching the cap as unexamined remainder.
+    callback_ctx.stats.scan_budget_exhausted = max_scanned_entries != 0 and replay_stats.scanned_entries >= max_scanned_entries;
     return callback_ctx.stats;
 }
 
@@ -690,6 +702,7 @@ fn primaryStoreForEachMatchingRecord(
     callback_ctx.stats.hint_filter_skips += replay_stats.hint_filter_skips;
     callback_ctx.stats.scan_batches = @max(callback_ctx.stats.scan_batches, replay_stats.scan_batches);
     callback_ctx.stats.last_sequence = @max(callback_ctx.stats.last_sequence, replay_stats.last_sequence);
+    callback_ctx.stats.scan_budget_exhausted = replay_stats.scan_budget_exhausted;
     return callback_ctx.stats;
 }
 
@@ -1475,14 +1488,76 @@ test "replay source primary fallback cursor is bounded across unrelated rows" {
     try std.testing.expectEqual(primary_store_fallback_scan_budget_min, first_stats.scanned_entries);
     try std.testing.expectEqual(@as(usize, primary_store_fallback_scan_budget_min), first_stats.hint_filter_skips);
     try std.testing.expectEqual(@as(u64, primary_store_fallback_scan_budget_min), first_stats.last_sequence);
+    try std.testing.expect(first_stats.scan_budget_exhausted);
 
     var second = Context{};
     const second_stats = try cursor.forEachNext(1, &second, Context.consume);
+    try std.testing.expect(!second_stats.scan_budget_exhausted);
     try std.testing.expectEqual(@as(usize, 1), second.calls);
     try std.testing.expectEqual(@as(u64, primary_store_fallback_scan_budget_min + 1), second.last_sequence);
     try std.testing.expectEqual(@as(usize, 1), second_stats.matched_entries);
     try std.testing.expectEqual(@as(usize, 1), second_stats.scanned_entries);
     try std.testing.expectEqual(@as(u64, primary_store_fallback_scan_budget_min + 1), second_stats.last_sequence);
+}
+
+// A one-match scan capped by scanned work before its first match must say so:
+// a caller treating the empty batch as "reached the end" would skip the
+// record past the cap.
+test "replay source primary fallback reports an empty batch capped by scanned work" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    var batch = try store.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(internal_keys.replay_meta_init_key[0..], "");
+    var sequence: u64 = 1;
+    while (sequence <= primary_store_fallback_scan_budget_min) : (sequence += 1) {
+        const payload = try change_journal_mod.encodeRecord(alloc, .{
+            .sequence = sequence,
+            .changed_doc_keys = &.{"doc:ft"},
+            .target_hints = &.{.full_text},
+        });
+        defer alloc.free(payload);
+        const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+        try batch.put(key[0..], payload);
+    }
+    const resolution_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = sequence,
+        .changed_doc_keys = &.{"doc:resolution"},
+        .target_hints = &.{.resolution},
+    });
+    defer alloc.free(resolution_payload);
+    const resolution_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+    try batch.put(resolution_key[0..], resolution_payload);
+    try batch.commit();
+
+    const Context = struct {
+        calls: usize = 0,
+        last_sequence: u64 = 0,
+
+        fn consume(ptr: *anyopaque, sequence_value: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_sequence = sequence_value;
+        }
+    };
+    const source = Source.fromPrimaryStore(&store, null, null);
+    var first = Context{};
+    const first_stats = try source.forEachMatchingRecord(alloc, 0, .resolution, 1, &first, Context.consume);
+    try std.testing.expectEqual(@as(usize, 0), first.calls);
+    try std.testing.expect(first_stats.scan_budget_exhausted);
+    try std.testing.expectEqual(@as(u64, primary_store_fallback_scan_budget_min), first_stats.last_sequence);
+
+    var second = Context{};
+    const second_stats = try source.forEachMatchingRecord(alloc, first_stats.last_sequence, .resolution, 1, &second, Context.consume);
+    try std.testing.expectEqual(@as(usize, 1), second.calls);
+    try std.testing.expectEqual(sequence, second.last_sequence);
+    try std.testing.expect(!second_stats.scan_budget_exhausted);
 }
 
 test "replay source primary cursor resumes after stop chunk progress" {
