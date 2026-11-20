@@ -4093,6 +4093,7 @@ const ambiguous_model_error_hint = "Run `antfly inference list` and specify an e
 const RequestWorkTestCounters = struct {
     model_resolution_attempts: usize = 0,
     model_load_attempts: usize = 0,
+    scoped_execution_manifest_loads: usize = 0,
     media_fetch_attempts: usize = 0,
     batch_materialized_items: usize = 0,
     batch_peak_materialized_items: usize = 0,
@@ -27034,35 +27035,38 @@ pub const Node = struct {
                         return modelArtifactsChangingResponse(ctx);
                     break :blk &scope.artifacts;
                 } else null;
-                var manifest = (if (scoped_artifacts) |artifacts|
-                    manifest_mod.loadFromPublishedArtifacts(ctx.allocator, path, artifacts, false)
-                else
-                    self.loadBoundManifest(ctx.allocator, path, false, control)) catch |err| {
-                    if (replica_probe and isPinnedCatalogArtifactFailure(err)) return embeddingArtifactFailureResponse(ctx);
-                    return modelLoadFailureResponse(ctx, err);
-                };
-                defer manifest.deinit();
-                var dense_output = manifest.denseEmbeddingOutput();
-                var durable_revision: ?[32]u8 = null;
                 var cached_model = if (scoped_artifacts) |artifacts|
                     self.model_manager.acquireLoadedModelFromInstallation(path, artifacts.installation.?)
                 else
                     self.model_manager.acquireLoadedModelWithControl(path, control) catch |err| return modelLoadFailureResponse(ctx, err);
                 defer if (cached_model) |*handle| handle.releaseObservation();
+                var cold_manifest: ?manifest_mod.ModelManifest = if (cached_model == null) cold: {
+                    if (comptime builtin.is_test) request_work_test_counters.scoped_execution_manifest_loads += 1;
+                    break :cold (if (scoped_artifacts) |artifacts|
+                        manifest_mod.loadFromPublishedArtifacts(ctx.allocator, path, artifacts, false)
+                    else
+                        self.loadBoundManifest(ctx.allocator, path, false, control)) catch |err| {
+                        if (replica_probe and isPinnedCatalogArtifactFailure(err)) return embeddingArtifactFailureResponse(ctx);
+                        return modelLoadFailureResponse(ctx, err);
+                    };
+                } else null;
+                defer if (cold_manifest) |*manifest| manifest.deinit();
+                const manifest = if (cached_model) |*handle| &handle.get().manifest else &cold_manifest.?;
+                const dense_output = manifest.denseEmbeddingOutput();
+                var durable_revision: ?[32]u8 = null;
                 const declared = if (embedding and manifest.managed_publication != null and (cached_model == null or include_revisions or requested_revision != null))
                     (if (scoped_artifacts) |artifacts|
-                        self.model_manager.declaredEmbeddingRevisionsFromArtifacts(path, manifest, control, artifacts)
+                        self.model_manager.declaredEmbeddingRevisionsFromArtifacts(path, manifest.*, control, artifacts)
                     else
-                        self.model_manager.declaredEmbeddingRevisions(path, manifest, control)) catch |err| {
+                        self.model_manager.declaredEmbeddingRevisions(path, manifest.*, control)) catch |err| {
                         if (err == error.ChecksumMismatch or err == error.InvalidManagedDownload or err == error.ModelArtifactNotPublished) return embeddingArtifactFailureResponse(ctx);
                         return modelLoadFailureResponse(ctx, err);
                     }
                 else
                     model_manager_mod.ModelManager.EmbeddingRevisions{};
                 var revision: ?[32]u8 = if (cached_model) |*handle| loaded: {
-                    // Geometry and revision must describe the same serving generation.
+                    // The held runtime supplies both geometry and revision.
                     const serving = handle.get();
-                    dense_output = serving.manifest.denseEmbeddingOutput();
                     if (embedding) {
                         durable_revision = serving.durable_embedding_revision;
                         if (serving.managed_publication != null) {
@@ -27075,13 +27079,13 @@ pub const Node = struct {
                     }
                     if (serving.resolution_revision) |loaded_revision| break :loaded loaded_revision;
                     if (embedding) return error.InvalidEmbeddingIdentity;
-                    break :loaded self.model_manager.modelIdentityForManifestWithControl(path, manifest, control) catch |err| return modelLoadFailureResponse(ctx, err);
+                    break :loaded self.model_manager.modelIdentityForManifestWithControl(path, manifest.*, control) catch |err| return modelLoadFailureResponse(ctx, err);
                 } else cold: {
                     if (embedding and manifest.managed_publication != null) {
                         if (declared.len > 0) durable_revision = declared.revisions[0];
                         break :cold durable_revision;
                     }
-                    break :cold self.model_manager.modelIdentityForManifestWithControl(path, manifest, control) catch |err| return modelLoadFailureResponse(ctx, err);
+                    break :cold self.model_manager.modelIdentityForManifestWithControl(path, manifest.*, control) catch |err| return modelLoadFailureResponse(ctx, err);
                 };
                 const catalog_allocator = catalog.arena.allocator();
                 if (embedding and include_revisions) {
@@ -51372,6 +51376,34 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     var repaired = try node.listModels(&repaired_context);
     defer repaired.deinit();
     try std.testing.expectEqual(@as(u16, 200), repaired.status.code);
+
+    // A held, matching runtime supplies execution geometry and the durable
+    // revision without reparsing its tokenizer or extending its idle lifetime.
+    {
+        var resident: model_manager_mod.LoadedModel = undefined;
+        resident.managed_publication = publication;
+        resident.managed_installation = try managed.installationForPublication(a, io, managed_path, publication.?);
+        resident.manifest = managed_manifest;
+        resident.active_handles = 0;
+        resident.retired = false;
+        resident.last_used_ns = 17;
+        var revision: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&revision, published.object.get("model_revision").?.string);
+        resident.durable_embedding_revision = revision;
+        try node.model_manager.loaded.put(a, managed_path, &resident);
+        defer _ = node.model_manager.loaded.remove(managed_path);
+        const previous_loads = request_work_test_counters.scoped_execution_manifest_loads;
+        var resident_request = try httpx.Request.init(a, .GET, "/ai/v1/models?model=acme%2Fother&task=embed&model_revision_candidates=1");
+        defer resident_request.deinit();
+        var resident_ctx = httpx.Context.init(a, io, &resident_request);
+        defer resident_ctx.deinit();
+        var resident_response = try node.listModels(&resident_ctx);
+        defer resident_response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resident_response.status.code);
+        try std.testing.expectEqual(previous_loads, request_work_test_counters.scoped_execution_manifest_loads);
+        try std.testing.expectEqual(@as(usize, 0), resident.active_handles);
+        try std.testing.expectEqual(@as(u64, 17), resident.last_used_ns);
+    }
 
     for ([_]?[]const u8{ weights[0..1], null }) |contents| {
         if (contents) |data| {

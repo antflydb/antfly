@@ -3699,6 +3699,7 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
             };
         },
         .create_restore_job_with_staging => |record| {
+            required = @max(required, try metadata_topology_protocol.pinnedEmbeddingDecoderVersion(a, record.plan_json, true));
             const guard = @import("restore_staging.zig").PlanGuard.read(a, record.plan_json) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return metadata_topology_protocol.current_version,
@@ -3805,6 +3806,9 @@ test "index alias and pinned embedding metadata changes enforce their own decode
     const pin_envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .topology = .{ .create = .{ .table = pinned } } }, .{});
     defer std.testing.allocator.free(pin_envelope);
     try std.testing.expectEqual(pin_floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = pin_envelope }));
+    const plan = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .targets = .{.{ .table = pinned }} });
+    defer std.testing.allocator.free(plan);
+    try std.testing.expectEqual(pin_floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .create_restore_job_with_staging = .{ .key = "job", .value = "{}", .plan_json = plan } }));
 }
 
 test "relation mutation admission gates bound transaction sessions independently of ordinary sessions" {
