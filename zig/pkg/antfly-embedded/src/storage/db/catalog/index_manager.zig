@@ -34942,10 +34942,16 @@ pub const IndexManager = struct {
             }
             if (!matched_member) if (try self.lookupDenseVectorIdForDocKeyTxn(&mappings, name, key)) |id| try ids.put(alloc, id, {});
         }
+        try control.check();
         const result = try alloc.alloc(u64, ids.count());
+        errdefer alloc.free(result);
         var iter = ids.keyIterator();
-        for (result) |*id| id.* = iter.next().?.*;
+        for (result, 0..) |*id, i| {
+            if (i % 256 == 0) try control.check();
+            id.* = iter.next().?.*;
+        }
         std.mem.sort(u64, result, {}, std.sort.asc(u64));
+        try control.check();
         return result;
     }
 
@@ -42006,11 +42012,12 @@ test "dense index unions multiple embedding artifact sources without overwriting
 
     const CancelProjection = struct {
         checks: usize = 0,
+        cancel_at: usize = 3,
 
         fn check(raw: *const anyopaque) bool {
             const state: *@This() = @ptrCast(@alignCast(@constCast(raw)));
             state.checks += 1;
-            return state.checks == 3;
+            return state.checks == state.cancel_at;
         }
     };
     var cancellation: CancelProjection = .{};
@@ -42021,8 +42028,20 @@ test "dense index unions multiple embedding artifact sources without overwriting
         &.{doc_key},
         .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = CancelProjection.check } },
     ));
-    const parent_vectors = try manager.lookupDenseVectorIdsForParentKeysAlloc(alloc, &store, "document_vectors", &.{doc_key});
+    cancellation = .{ .cancel_at = std.math.maxInt(usize) };
+    const control: @import("../../../search/query.zig").ExecutionControl = .{
+        .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = CancelProjection.check },
+    };
+    const parent_vectors = try manager.lookupDenseVectorIdsForParentKeysControlledAlloc(alloc, &store, "document_vectors", &.{doc_key}, control);
     defer alloc.free(parent_vectors);
+    cancellation = .{ .cancel_at = cancellation.checks };
+    try std.testing.expectError(error.Canceled, manager.lookupDenseVectorIdsForParentKeysControlledAlloc(
+        alloc,
+        &store,
+        "document_vectors",
+        &.{doc_key},
+        control,
+    ));
     try std.testing.expectEqual(@as(usize, 2), parent_vectors.len);
     try std.testing.expect(containsU64(parent_vectors, deterministicDenseVectorId(title_artifact)));
     try std.testing.expect(containsU64(parent_vectors, deterministicDenseVectorId(body_artifact)));

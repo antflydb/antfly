@@ -11201,11 +11201,17 @@ const IndexedPredicateEvaluator = struct {
         return bytes;
     }
 
+    fn collectKeyRangeEvidence(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap) !RangeEvidence {
+        var physical = try self.collectPhysicalProbeScope(scope);
+        defer physical.deinit();
+        return self.collectRangeEvidence(query, &physical, true);
+    }
+
     fn rangeEvidence(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap) !RangeEvidence {
         if (self.key_domain != null) {
             const memo = self.probe_input orelse return RangeEvidence.init(self.alloc);
             if (memo.range_projection_disabled) return RangeEvidence.init(self.alloc);
-            var physical = self.collectPhysicalProbeScope(scope) catch |err| switch (err) {
+            return self.collectKeyRangeEvidence(query, scope) catch |err| switch (err) {
                 error.OutOfMemory => {
                     memo.deinit(self.alloc);
                     memo.* = .{ .range_projection_disabled = true };
@@ -11213,8 +11219,6 @@ const IndexedPredicateEvaluator = struct {
                 },
                 else => return err,
             };
-            defer physical.deinit();
-            return self.collectRangeEvidence(query, &physical, true);
         }
         const cache = &self.snapshot.graph_predicates;
         const coverage_key = try std.fmt.allocPrint(self.scratch, "range-field:{s}:{s}", .{ self.presence_cache_prefix orelse self.cache_prefix, query.numeric_range.field });
@@ -12370,6 +12374,60 @@ test "optional numeric range releases a published frontier when candidate alloca
         .probe_input = &memo,
     };
     failing.fail_index = failing.alloc_index;
+    var evidence = try evaluator.rangeEvidence(.{ .numeric_range = .{ .field = "rank" } }, &domain);
+    defer evidence.covered.deinit();
+    defer evidence.matches.deinit();
+    try std.testing.expectEqual(@as(usize, 0), evidence.covered.cardinality());
+    try std.testing.expectEqual(@as(usize, 0), memo.batches.items.len);
+    try std.testing.expect(memo.range_projection_disabled);
+}
+
+test "optional numeric range releases a published frontier when evidence allocation fails" {
+    const backing = std.testing.allocator;
+    var segment = segment_mod.SegmentWriter.init(backing);
+    defer segment.deinit();
+    try segment.addStoredDoc("one", "{}");
+    var witnesses = [_]segment_mod.NumericRangeWitness{.{ .field = "rank", .coverage = .empty }};
+    try segment.addNumericRangeWitnesses(&witnesses);
+    const bytes = try segment.build();
+    defer backing.free(bytes);
+    var writer = try index_mod.IndexWriter.init(backing);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const snapshot = writer.acquireSnapshot();
+    defer snapshot.release();
+
+    var failing: std.testing.FailingAllocator = .init(backing, .{});
+    const alloc = failing.allocator();
+    var memo: IndexedPredicateEvaluator.FrontierProbeInput = .{ .covered = roaring.RoaringBitmap.init(alloc) };
+    defer memo.deinit(alloc);
+    var map: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    try map.put(alloc, 0, 1);
+    const pairs = try alloc.dupe(u64, &.{@as(u64, 1) << 32});
+    try memo.appendBatch(alloc, .{ .pairs = pairs, .ordinals = map }, .{});
+    try memo.covered.?.add(1);
+    var domain = roaring.RoaringBitmap.init(backing);
+    defer domain.deinit();
+    try domain.add(1);
+    const key_domain: std.StringHashMapUnmanaged(u32) = .empty;
+    const evaluator: IndexedPredicateEvaluator = .{
+        .snapshot = snapshot,
+        .analysis = .{},
+        .schema = null,
+        .executor = undefined,
+        .control = .{},
+        .alloc = alloc,
+        .scratch = alloc,
+        .cache_prefix = "",
+        .frontier = .empty,
+        .key_domain = &key_domain,
+        .probe_input = &memo,
+    };
+    const before = failing.alloc_index;
+    var physical = try evaluator.collectPhysicalProbeScope(&domain);
+    physical.deinit();
+    const projection_allocations = failing.alloc_index - before;
+    failing.fail_index = failing.alloc_index + projection_allocations;
     var evidence = try evaluator.rangeEvidence(.{ .numeric_range = .{ .field = "rank" } }, &domain);
     defer evidence.covered.deinit();
     defer evidence.matches.deinit();
