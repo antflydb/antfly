@@ -33373,15 +33373,14 @@ fn appendGeneratedSourceGuard(
     try window.source_guards.append(runtime.alloc, .{ .key = owned_key, .expected_digest = expected_digest, .document_key = owned_doc_key, .source_sequence = source_sequence });
 }
 
-fn appendEmbeddingSourceGuard(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, source_key: []const u8, digest: ?[32]u8) !void {
+fn captureEmbeddingSourceGuard(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, source_key: []const u8, digest: ?[32]u8) !GeneratedSourceGuard {
     var plan = try runtime.index_manager.acquireWritePlanSnapshot();
     defer plan.release();
     if (!plan.plan().generated_definitions.contains(producer_input.definitionDigest(request))) return error.EnrichmentSourceChanged;
     var read = try runtime.store.beginProbe();
     defer read.abort();
     const catalog_digest = try plan.plan().publicationCatalogDigest(&read);
-    const name = try runtime.alloc.dupe(u8, requestEmbeddingName(request));
-    errdefer runtime.alloc.free(name);
+    const name = requestEmbeddingName(request);
     const guard = GeneratedSourceGuard{ .key = source_key, .expected_digest = digest, .document_key = request.doc_key, .source_sequence = request.sequence, .embedding = .{ .name = name, .generation = request.reprocess_generation, .catalog_digest = catalog_digest } };
     // The writer repeats these checks. Checking here also avoids queuing a
     // known-obsolete request's cleanup or coverage into a shared window.
@@ -33391,8 +33390,19 @@ fn appendEmbeddingSourceGuard(runtime: *EnrichmentRuntime, window: *GeneratedRep
     var source_only = guard;
     source_only.embedding = null;
     try validateGeneratedSourceRecord(runtime.alloc, &read, source_only);
-    try appendGeneratedSourceGuard(runtime, window, source_key, digest, request.doc_key, request.sequence);
-    window.source_guards.items[window.source_guards.items.len - 1].embedding = guard.embedding;
+    return guard;
+}
+
+fn appendCapturedEmbeddingGuard(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, guard: GeneratedSourceGuard) !void {
+    var embedding = guard.embedding.?;
+    embedding.name = try runtime.alloc.dupe(u8, embedding.name);
+    errdefer runtime.alloc.free(embedding.name);
+    try appendGeneratedSourceGuard(runtime, window, guard.key, guard.expected_digest, guard.document_key, guard.source_sequence);
+    window.source_guards.items[window.source_guards.items.len - 1].embedding = embedding;
+}
+
+fn appendEmbeddingSourceGuard(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, source_key: []const u8, digest: ?[32]u8) !void {
+    try appendCapturedEmbeddingGuard(runtime, window, try captureEmbeddingSourceGuard(runtime, request, source_key, digest));
 }
 
 fn currentRecordDigest(runtime: *EnrichmentRuntime, key: []const u8) !?[32]u8 {
@@ -34173,8 +34183,14 @@ fn processPdfPageImageEmbeddingWithAllocator(
     };
     defer metadata_alloc.free(raw);
     errdefer if (runtime.retry_scheduler) |scheduler| scheduler.rememberSource(runtime, requestFailureFingerprint(request), sourceRecordDigest(raw));
+    const publication = PdfPublication{
+        .runtime = runtime,
+        .window = window,
+        .guard = try captureEmbeddingSourceGuard(runtime, request, doc_store_key, sourceRecordDigest(raw)),
+        .capacity = @max(4, generatedReplayWindowItems()),
+    };
     const source_url = try extractSourceText(metadata_alloc, runtime.config, raw, request) orelse {
-        try retirePdfPageEmbeddings(runtime, metadata_alloc, window, request, consumer_indexes, doc_store_key, sourceRecordDigest(raw));
+        try retirePdfPageEmbeddings(publication, metadata_alloc, request, consumer_indexes);
         return;
     };
     defer metadata_alloc.free(source_url);
@@ -34263,7 +34279,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
     coordinator.beginOperation(runtime.config.sync_wait_timeout_ms);
     const page_count = try coordinator.session.pageCount();
     if (page_count == 0) {
-        try retirePdfPageEmbeddings(runtime, metadata_alloc, window, request, consumer_indexes, doc_store_key, sourceRecordDigest(raw));
+        try retirePdfPageEmbeddings(publication, metadata_alloc, request, consumer_indexes);
         return;
     }
 
@@ -34584,7 +34600,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
     // transferred through lease-fenced bounded publication windows. A
     // superseded worker therefore cannot delete stages written by its
     // replacement.
-    var obsolete_stage_keys = try collectObsoletePdfPageEmbeddingStageKeys(
+    const obsolete_stage_keys = try collectObsoletePdfPageEmbeddingStageKeys(
         runtime,
         metadata_alloc,
         request.doc_key,
@@ -34600,47 +34616,81 @@ fn processPdfPageImageEmbeddingWithAllocator(
     // remaining stages without rebuilding completed vectors.
     try embedding_lease_guard.check();
     try publishPdfPageEmbeddingBatches(
-        runtime,
+        publication,
         metadata_alloc,
-        window,
         desired_page_keys.items,
         base_embeddings.items,
         consumer_indexes,
         promotion_page_keys.items,
         staged_page_keys.items,
         embedding_name,
-        &stale.artifact_delete_keys,
-        &obsolete_stage_keys,
+        stale.artifact_delete_keys,
+        obsolete_stage_keys,
         request,
     );
-    stale.artifact_delete_keys = &.{};
 }
 
-// A terminal empty input retires each previously published page. Each bounded
-// commit checks the same document and producer generation, including retries.
-fn retirePdfPageEmbeddings(runtime: *EnrichmentRuntime, alloc: Allocator, window: *GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, consumers: []const []const u8, source_key: []const u8, digest: [32]u8) !void {
+// Each transaction repeats the input witness captured before rendering. The
+// minimum window fits one guard and an atomic document-retirement notification.
+const PdfPublication = struct {
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    guard: GeneratedSourceGuard,
+    capacity: usize,
+
+    fn reserve(self: @This(), cost: usize) !void {
+        if (cost >= self.capacity) return error.GeneratedReplayWindowTooLarge;
+        if (self.capacity -| self.window.itemCount() < cost) try self.flush();
+        if (self.window.source_guards.items.len == 0)
+            try appendCapturedEmbeddingGuard(self.runtime, self.window, self.guard);
+    }
+
+    fn flush(self: @This()) !void {
+        try flushGeneratedReplayWindow(self.runtime, self.window);
+    }
+
+    fn deletes(self: @This(), keys: []const []const u8, replay: bool) !void {
+        for (keys) |key| {
+            try self.reserve(if (replay) 2 else 1);
+            if (replay) {
+                try appendOwnedPdfPageDelete(self.runtime, self.window, key);
+            } else {
+                try self.window.artifact_delete_keys.ensureUnusedCapacity(self.runtime.alloc, 1);
+                self.window.artifact_delete_keys.appendAssumeCapacity(try self.runtime.alloc.dupe(u8, key));
+            }
+        }
+    }
+
+    fn finish(self: @This(), request: enrichment_types.GeneratedEnrichmentRequest, consumers: []const []const u8, outcome: CoverageOutcome) !void {
+        for (consumers) |name| {
+            try self.reserve(1);
+            try queueDerivedCoverageOutcomeForIndex(self.runtime, self.window, name, request, outcome);
+        }
+        try self.flush();
+    }
+};
+
+fn retirePdfPageEmbeddings(publication: PdfPublication, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, consumers: []const []const u8) !void {
+    const runtime = publication.runtime;
+    try publication.flush();
+    updateIndexPublishing(runtime, consumers, true);
+    defer updateIndexPublishing(runtime, consumers, false);
     var stale = try deleteStalePageEmbeddingArtifactsWithLimit(runtime, alloc, request.doc_key, requestArtifactName(request), requestEmbeddingName(request), &.{}, generated_pdf_absolute_max_document_pages);
     defer stale.deinit(alloc);
-    if (!window.isEmpty()) try flushGeneratedReplayWindow(runtime, window);
-    const capacity = generatedReplayWindowItems();
-    // The last commit includes a source guard, the document retirement and
-    // its replay notifications, and one terminal outcome per consumer.
-    const terminal_items = 3 + consumers.len;
-    if (1 + terminal_items > capacity) return error.GeneratedReplayWindowTooLarge;
-    try appendEmbeddingSourceGuard(runtime, window, request, source_key, digest);
-    for (stale.artifact_delete_keys) |key| {
-        if (window.itemCount() + 2 > capacity) {
-            try flushGeneratedReplayWindow(runtime, window);
-            try appendEmbeddingSourceGuard(runtime, window, request, source_key, digest);
-        }
-        try appendOwnedPdfPageDelete(runtime, window, key);
+    try publication.deletes(stale.artifact_delete_keys, true);
+
+    const root = try internal_keys.pdfPageEmbeddingStageRootPrefixAlloc(alloc, request.doc_key, requestArtifactName(request), requestEmbeddingName(request));
+    defer alloc.free(root);
+    while (true) {
+        var page = try backend_scan.scanPrefixKeysPage(alloc, &runtime.store, root, generated_pdf_stage_cleanup_page_keys);
+        defer page.deinit(alloc);
+        try publication.deletes(page.keys, false);
+        if (!page.has_more) break;
+        try publication.flush();
     }
-    if (window.itemCount() + terminal_items > capacity) {
-        try flushGeneratedReplayWindow(runtime, window);
-        try appendEmbeddingSourceGuard(runtime, window, request, source_key, digest);
-    }
-    try markDerivedCoverageSkipped(runtime, window, request, consumers);
-    try flushGeneratedReplayWindow(runtime, window);
+    try publication.reserve(3);
+    try markDerivedCoverageSkipped(runtime, publication.window, request, &.{});
+    try publication.finish(request, consumers, .skipped);
 }
 
 fn appendOwnedPdfPageDelete(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, key: []const u8) !void {
@@ -34671,38 +34721,6 @@ fn appendPdfPageEmbeddingPromotion(
     });
 }
 
-fn flushOwnedPdfArtifactDeletesBounded(
-    runtime: *EnrichmentRuntime,
-    owned_alloc: Allocator,
-    window: *GeneratedReplayWindow,
-    owned_keys: *[][]u8,
-    max_window_items: usize,
-    replay_deletes: bool,
-) !void {
-    if (owned_keys.*.len == 0) return;
-    const cost: usize = if (replay_deletes) 2 else 1;
-    if (max_window_items < cost) return error.GeneratedReplayWindowTooLarge;
-    var next: usize = 0;
-    while (next < owned_keys.*.len) {
-        if (max_window_items -| window.itemCount() < cost) try flushGeneratedReplayWindow(runtime, window);
-        const available = (max_window_items - window.itemCount()) / cost;
-        const end = @min(owned_keys.*.len, next + available);
-        try window.artifact_delete_keys.ensureUnusedCapacity(runtime.alloc, end - next);
-        for (owned_keys.*[next..end]) |*key| {
-            if (replay_deletes) {
-                try appendOwnedPdfPageDelete(runtime, window, key.*);
-            } else {
-                window.artifact_delete_keys.appendAssumeCapacity(try runtime.alloc.dupe(u8, key.*));
-            }
-            owned_alloc.free(key.*);
-            key.* = &.{};
-        }
-        next = end;
-    }
-    if (owned_keys.*.len > 0) owned_alloc.free(owned_keys.*);
-    owned_keys.* = &.{};
-}
-
 fn appendPdfPageEmbeddingConsumer(
     runtime: *EnrichmentRuntime,
     window: *GeneratedReplayWindow,
@@ -34718,9 +34736,7 @@ fn appendPdfPageEmbeddingConsumer(
     const owned_artifact_key = if (base.artifact_key) |key| try runtime.alloc.dupe(u8, key) else null;
     errdefer if (owned_artifact_key) |key| runtime.alloc.free(key);
 
-    // Reserve before transferring ownership. The caller marks the complete
-    // consumer set once per replay window instead of repeating activity-map
-    // scans and notifications for every page/index pair.
+    // Reserve before transferring ownership of the page/index mapping.
     try window.dense_embeddings.ensureUnusedCapacity(runtime.alloc, 1);
     window.dense_embeddings.appendAssumeCapacity(.{
         .index_name = owned_index_name,
@@ -34732,23 +34748,28 @@ fn appendPdfPageEmbeddingConsumer(
 }
 
 fn publishPdfPageEmbeddingBatches(
-    runtime: *EnrichmentRuntime,
+    publication: PdfPublication,
     metadata_alloc: Allocator,
-    window: *GeneratedReplayWindow,
     desired_page_keys: []const []const u8,
     base_embeddings: []const derived_types.DerivedDenseEmbeddingWrite,
     consumer_indexes: []const []const u8,
     promotion_page_keys: []const []const u8,
     staged_page_keys: []const []const u8,
     embedding_name: []const u8,
-    stale_artifact_keys: *[][]u8,
-    obsolete_stage_keys: *[][]u8,
+    stale_artifact_keys: []const []const u8,
+    obsolete_stage_keys: []const []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !void {
+    const runtime = publication.runtime;
+    const window = publication.window;
     if (base_embeddings.len != desired_page_keys.len or
         staged_page_keys.len != promotion_page_keys.len)
         return error.InvalidPdfPageEmbeddingStage;
-    if (!window.isEmpty()) try flushGeneratedReplayWindow(runtime, window);
+    try publication.flush();
+    // This call drains every owned window before returning. Keep one activity
+    // lease over the entire publication, even when one page spans windows.
+    updateIndexPublishing(runtime, consumer_indexes, true);
+    defer updateIndexPublishing(runtime, consumer_indexes, false);
 
     var desired_page_key_set = try borrowedRuntimeKeySet(metadata_alloc, desired_page_keys);
     defer desired_page_key_set.deinit(metadata_alloc);
@@ -34765,44 +34786,24 @@ fn publishPdfPageEmbeddingBatches(
         entry.value_ptr.* = stage_key;
     }
 
-    const max_window_items = generatedReplayWindowItems();
-    // Reserve enough room for final coverage in the last fenced derived
-    // commit. Keeping at least one page/index or cleanup mutation in that
-    // window prevents a long publication from ending in an unfenced
-    // coverage-only transition after its lease has expired.
-    if (consumer_indexes.len >= max_window_items)
-        return error.GeneratedReplayWindowTooLarge;
-    const derived_window_items = max_window_items - consumer_indexes.len;
     for (desired_page_keys, 0..) |page_key, page_index| {
         const base_embedding = &base_embeddings[page_index];
         if (!std.mem.eql(u8, base_embedding.doc_key, page_key))
             return error.InvalidPdfPageEmbeddingStage;
         const stage_key = stage_by_page.get(page_key);
-        const page_items = std.math.add(
-            usize,
-            consumer_indexes.len,
-            @intFromBool(stage_key != null),
-        ) catch return error.GeneratedReplayWindowTooLarge;
-        if (page_items > derived_window_items) return error.GeneratedReplayWindowTooLarge;
-        if (page_items > derived_window_items -| window.itemCount())
-            try flushGeneratedReplayWindow(runtime, window);
-        if (consumer_indexes.len > 0 and window.publishing_indexes.items.len == 0)
-            try markWindowPublishing(runtime, window, consumer_indexes);
         if (stage_key) |key| {
+            try publication.reserve(1);
             try appendPdfPageEmbeddingPromotion(runtime, window, page_key, key, embedding_name);
         }
 
         for (consumer_indexes) |index_name| {
+            try publication.reserve(1);
             try appendPdfPageEmbeddingConsumer(runtime, window, base_embedding, index_name);
         }
     }
-    try flushOwnedPdfArtifactDeletesBounded(runtime, metadata_alloc, window, stale_artifact_keys, derived_window_items, true);
-    try flushOwnedPdfArtifactDeletesBounded(runtime, metadata_alloc, window, obsolete_stage_keys, derived_window_items, false);
-
-    for (consumer_indexes) |index_name| {
-        try queueDerivedCoverageOutcomeForIndex(runtime, window, index_name, request, .produced);
-    }
-    try flushGeneratedReplayWindow(runtime, window);
+    try publication.deletes(stale_artifact_keys, true);
+    try publication.deletes(obsolete_stage_keys, false);
+    try publication.finish(request, consumer_indexes, .produced);
 }
 
 fn pdfPageEmbeddingStageKeyAlloc(
@@ -51588,6 +51589,73 @@ test "sparse publication bounds both row count and nonzero output bytes" {
     rows[0].indices = try a.alloc(u32, 600 * 1024);
     defer a.free(rows[0].indices);
     try std.testing.expectEqual(@as(usize, 1), sparsePublicationBatchEnd(&rows, 0));
+}
+
+test "PDF page publication fences stale windows and drains abandoned attempts" {
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/pdf-publication.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try @import("../../lite/backend.zig").Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var opts = db_mod.OpenOptions{ .start_index_workers = false, .start_optional_runtimes = false };
+    try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+    var db = try db_mod.DB.open(a, path, opts);
+    defer db.close();
+    try db.addEnrichment(.{ .name = "visual", .kind = .embedding, .field = "url", .expected_dims = 3, .embedding_input = .pdf_page_images });
+    try db.addIndex(.{ .name = "images", .kind = .dense_vector, .config_json = "{\"field\":\"v\",\"dims\":3,\"embedding_name\":\"visual\"}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"url\":\"previous\"}" }}, .sync_level = .write });
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    var request = for (plan.plan().generated_templates) |candidate| {
+        if (candidate.embedding_input == .pdf_page_images) break candidate;
+    } else return error.TestUnexpectedResult;
+    request.doc_key = "doc";
+    const source = try documentSourceStoreKeyAlloc(runtime, "doc");
+    defer runtime.alloc.free(source);
+    var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
+    defer window.deinit();
+    var publication = PdfPublication{
+        .runtime = runtime,
+        .window = &window,
+        .guard = try captureEmbeddingSourceGuard(runtime, request, source, try currentRecordDigest(runtime, source)),
+        .capacity = 4,
+    };
+    const last = try pdfPageEmbeddingStageKeyAlloc(a, "doc", requestArtifactName(request), requestEmbeddingName(request), "old", "last");
+    defer a.free(last);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .sync_level = .write });
+    try db.core.store.put(last, "newer");
+    try publication.deletes(&.{last}, false);
+    try std.testing.expectError(error.EnrichmentSourceChanged, publication.flush());
+    const preserved = try db.core.store.get(a, last);
+    defer a.free(preserved);
+    try std.testing.expectEqualStrings("newer", preserved);
+
+    // More than a scan page of residue, including two different attempts.
+    {
+        var writer = try db.core.store.beginWriteTxn();
+        errdefer writer.abort();
+        for (0..generated_pdf_stage_cleanup_page_keys) |i| {
+            var id: [32]u8 = undefined;
+            const stage = try pdfPageEmbeddingStageKeyAlloc(a, "doc", requestArtifactName(request), requestEmbeddingName(request), "crash", try std.fmt.bufPrint(&id, "page:{d:0>6}", .{i + 1}));
+            defer a.free(stage);
+            try writer.put(stage, "private");
+        }
+        try writer.commit();
+    }
+    publication.guard = try captureEmbeddingSourceGuard(runtime, request, source, try currentRecordDigest(runtime, source));
+    publication.capacity = generated_pdf_stage_cleanup_page_keys;
+    try retirePdfPageEmbeddings(publication, a, request, &.{});
+    const root = try internal_keys.pdfPageEmbeddingStageRootPrefixAlloc(a, "doc", requestArtifactName(request), requestEmbeddingName(request));
+    defer a.free(root);
+    var residue = try backend_scan.scanPrefixKeysPage(a, &runtime.store, root, 1);
+    defer residue.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), residue.keys.len);
 }
 
 test "sparse cleanup guards fence empty sources epochs definitions and source resurrection" {

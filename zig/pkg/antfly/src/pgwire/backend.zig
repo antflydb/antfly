@@ -114,6 +114,7 @@ pub const DescriptionStamp = struct {
     /// Null when the binder consulted no catalog objects.
     catalog: ?CatalogStamp = null,
     authority: u64,
+    reusable: bool = true,
 };
 
 pub const Description = struct {

@@ -207,6 +207,7 @@ def test_published_pdf_page_image_hits(embeddinggemma2_model_available):
                 "type": "embeddings",
                 "dimension": 768,
                 "embedding_name": "visual",
+                "field": "url",
                 "embedder": {
                     "provider": "antfly",
                     "model": harness.EMBEDDINGGEMMA2_MODEL,
@@ -222,6 +223,15 @@ def test_published_pdf_page_image_hits(embeddinggemma2_model_available):
                 ],
             },
         )
+        api(
+            "POST",
+            "/indexes/image_sources",
+            {
+                "type": "embeddings",
+                "dimension": 768,
+                "sources": [{"artifact": "visual"}],
+            },
+        )
         cardinality_change = requests.put(
             root + "/artifacts/visual/enrichment",
             json={
@@ -233,6 +243,18 @@ def test_published_pdf_page_image_hits(embeddinggemma2_model_available):
             timeout=30,
         )
         assert cardinality_change.status_code == 409, cardinality_change.text
+
+        indexes = ("images", "image_sources")
+
+        def published(expected):
+            for index in indexes:
+                status = api("GET", "/indexes/" + index)["status"]
+                if (
+                    not status.get("publication", {}).get("complete")
+                    or status.get("searchable_vectors", 0) != expected
+                ):
+                    return False
+            return True
 
         fixtures = Path(__file__).resolve().parents[2] / "lib/pdf/testdata"
         for filename, pages in (
@@ -251,16 +273,11 @@ def test_published_pdf_page_image_hits(embeddinggemma2_model_available):
                 },
             )
 
-            def published():
-                status = api("GET", "/indexes/images")["status"]
-                return (
-                    status.get("publication", {}).get("complete")
-                    and status.get("searchable_vectors") == pages
-                )
-
-            assert wait_until(published, timeout_s=180, interval_s=0.25), (
-                server.debug_logs()
-            )
+            assert wait_until(
+                lambda expected=pages: published(expected),
+                timeout_s=180,
+                interval_s=0.25,
+            ), server.debug_logs()
             page_ids = {f"page:{page:06d}" for page in range(1, pages + 1)}
             for extra in (
                 {},
@@ -308,20 +325,34 @@ def test_published_pdf_page_image_hits(embeddinggemma2_model_available):
                         hits[0]["hierarchy"]["matched_artifact"]["unit_id"] in page_ids
                     )
 
+            for index in indexes:
+                grouped = api(
+                    "POST",
+                    "/query",
+                    {
+                        "indexes": [index],
+                        "embeddings": {index: [1.0] + [0.0] * 767},
+                        "limit": pages,
+                        "fields": ["unit_id", "provenance.page_number"],
+                        "hierarchy": {"group_by": {"level": "unit"}},
+                    },
+                )["responses"][0]
+                assert grouped["status"] == 200, grouped
+                documents = [hit["_source"] for hit in grouped["hits"]["hits"]]
+                assert {row["unit_id"] for row in documents} == page_ids, grouped
+                assert {row["provenance"]["page_number"] for row in documents} == set(
+                    range(1, pages + 1)
+                )
+
         api(
             "POST",
             "/batch",
             {"inserts": {"one": {"filename": "no-url"}}, "sync_level": "write"},
         )
 
-        def retired():
-            status = api("GET", "/indexes/images")["status"]
-            return (
-                status.get("publication", {}).get("complete")
-                and status.get("searchable_vectors", 0) == 0
-            )
-
-        assert wait_until(retired, timeout_s=90, interval_s=0.25), server.debug_logs()
+        assert wait_until(lambda: published(0), timeout_s=90, interval_s=0.25), (
+            server.debug_logs()
+        )
         for extra in ({}, {"hierarchy": {}}):
             result = api(
                 "POST",

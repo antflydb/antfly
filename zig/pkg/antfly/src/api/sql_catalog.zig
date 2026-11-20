@@ -101,7 +101,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         }
         const publication_id = try alloc.alloc(u8, 32);
         errdefer alloc.free(publication_id);
-        const publication = server.beginBoundFkGenerationPublication(alloc, context, identity, before.*, updated, if (expected) |obj| if (obj.parent_id) |id| .{ .constraint = ddl.schema_change.?.add_foreign_key.name, .id = id } else null else null) catch |err| switch (err) {
+        const publication = server.beginBoundFkGenerationPublication(alloc, context, identity, before.*, updated, if (expected) |obj| obj.fk_parent else null) catch |err| switch (err) {
             error.MetadataMutationOutcomeUnknown => return error.SqlMutationOutcomeUnknown,
             else => return err,
         };
@@ -454,7 +454,7 @@ fn resolveIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authent
 
 fn indexGuard(a: std.mem.Allocator, result: IndexResolution, creating: bool) !DdlGuard {
     const admission = result.admission orelse return DdlGuard.index(a, null, null);
-    const birth = if (!creating and admission.guard.owner.kind == .index) blk: {
+    const birth = if (creating) admission.guard.owner.schema_version else if (admission.guard.owner.kind == .index) blk: {
         const definition = admission.table.query_definition orelse return error.InvalidSqlBackendResponse;
         break :blk try tables.indexBirthVersion(a, definition.schema_json, admission.guard.target.name);
     } else null;
@@ -622,7 +622,7 @@ pub fn bindsExisting(statement: ast.Statement) bool {
 fn pinsSchemaVersion(statement: ast.Statement) bool {
     if (statement != .catalog_ddl) return false;
     return switch (statement.catalog_ddl.schema_change orelse return false) {
-        .drop_column, .drop_constraint, .validate_constraint, .drop_default, .set_default => true,
+        .add_column, .add_foreign_key, .add_unique, .add_check, .drop_column, .drop_constraint, .validate_constraint, .drop_default, .set_default => true,
         else => false,
     };
 }
@@ -688,6 +688,11 @@ fn tablespaceId(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authent
     return (state.find(.tablespace, 0, name) orelse return error.InvalidSqlBackendResponse).id;
 }
 
+fn foreignKeyParent(name: []const u8, id: u64, definition: ?domain.ResolvedTable) !DdlGuard.ForeignKeyParent {
+    const version = if (definition) |table| try tables.schemaVersion((table.query_definition orelse return error.InvalidSqlBackendResponse).schema_json) else 0;
+    return .{ .constraint = name, .id = id, .schema_version = version };
+}
+
 pub fn describeGuard(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, statement: ast.Statement, path: ?*const SearchPath) !DdlGuard {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -705,8 +710,8 @@ pub fn describeGuard(server: *server_mod.ApiHttpServer, identity: ?server_mod.Au
         }
         const parents = try a.alloc(DdlGuard.ForeignKeyParent, names.items.len);
         if (parents.len != 0) {
-            const cut = try resolveTables(server, identity, context, a, create.table.database orelse database, create.table.namespace orelse namespace, names.items, null, false, null);
-            for (parents, constraints.items, cut.objects) |*parent, constraint, object| parent.* = .{ .constraint = constraint, .id = object.id };
+            const cut = try resolveTables(server, identity, context, a, create.table.database orelse database, create.table.namespace orelse namespace, names.items, null, true, null);
+            for (parents, constraints.items, cut.objects, cut.definitions) |*parent, constraint, object, definition| parent.* = try foreignKeyParent(constraint, object.id, definition);
         }
         return DdlGuard.encode(alloc, .{ .fk_parents = parents, .tablespace_id = try tablespaceId(server, identity, context, a, create.tablespace) });
     }
@@ -765,8 +770,8 @@ pub fn describeGuard(server: *server_mod.ApiHttpServer, identity: ?server_mod.Au
         const ddl = statement.catalog_ddl;
         objects.tablespace_id = try tablespaceId(server, identity, context, a, ddl.tablespace);
         if (ddl.schema_change) |change| if (change == .add_foreign_key) {
-            const parent = try resolveTables(server, identity, context, a, ddl.name.database orelse database, cut.objects[0].namespace, &.{.{ .table = change.add_foreign_key.parent }}, null, false, cut.revision);
-            objects.parent_id = parent.objects[0].id;
+            const parent = try resolveTables(server, identity, context, a, ddl.name.database orelse database, cut.objects[0].namespace, &.{.{ .table = change.add_foreign_key.parent }}, null, true, cut.revision);
+            objects.fk_parent = try foreignKeyParent(change.add_foreign_key.name, parent.objects[0].id, parent.definitions[0]);
         };
     }
     return DdlGuard.encode(alloc, objects);

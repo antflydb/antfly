@@ -207,6 +207,19 @@ def exercise_bound_portals(server, password):
             None,
         )
 
+        for name, statement in (
+            ("index_rebind", "CREATE INDEX scratch_idx ON portal_target (scratch)"),
+            (
+                "check_rebind",
+                "ALTER TABLE portal_target ADD CONSTRAINT scratch_check CHECK (scratch >= 0)",
+            ),
+        ):
+            parse(name, statement)
+            bind(name)
+            migrator.execute("ALTER TABLE portal_target DROP COLUMN scratch")
+            migrator.execute("ALTER TABLE portal_target ADD COLUMN scratch BIGINT")
+            execute(b"C40001")
+
         constraint = (
             "ALTER TABLE portal_target ADD CONSTRAINT nonnegative CHECK (n >= 0)"
         )

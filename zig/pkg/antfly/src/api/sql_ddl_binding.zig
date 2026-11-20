@@ -34,30 +34,30 @@ pub const Guard = struct {
 
     pub const Table = struct { namespace: []const u8, id: u64 };
     pub const Policy = struct { id: u64, generation: u64 };
-    pub const ForeignKeyParent = struct { constraint: []const u8, id: u64 };
+    pub const ForeignKeyParent = struct { constraint: []const u8, id: u64, schema_version: u32 };
     pub const Objects = struct {
         fk_parents: []const ForeignKeyParent = &.{},
         tables: []const Table = &.{},
         resource_id: ?u64 = null,
         schema_version: ?u32 = null,
         policy: ?Policy = null,
-        parent_id: ?u64 = null,
+        fk_parent: ?ForeignKeyParent = null,
         tablespace_id: ?u64 = null,
 
         // Admission checks the plan's exact parent and catalog revisions. Match
         // by constraint so even a swap between two existing parents is fenced.
         pub fn validateCreatePlan(self: Objects, a: std.mem.Allocator, plan: anytype) !void {
             if (self.tablespace_id) |id| if (id != plan.tablespace_id) return error.CatalogGenerationChanged;
-            var expected: std.StringHashMapUnmanaged(u64) = .empty;
+            var expected: std.StringHashMapUnmanaged(ForeignKeyParent) = .empty;
             defer expected.deinit(a);
             for (self.fk_parents) |parent| {
                 const entry = try expected.getOrPut(a, parent.constraint);
                 if (entry.found_existing) return error.InvalidSqlSyntax;
-                entry.value_ptr.* = parent.id;
+                entry.value_ptr.* = parent;
             }
             for (plan.parents) |parent| for (parent.transitions) |transition| {
                 const binding = expected.fetchRemove(transition.constraint_name) orelse return error.CatalogGenerationChanged;
-                if (binding.value != parent.table.table_id) return error.CatalogGenerationChanged;
+                if (binding.value.id != parent.table.table_id or binding.value.schema_version != try @import("tables.zig").schemaVersion(parent.table.schema_json)) return error.CatalogGenerationChanged;
             };
             if (expected.count() != 0) return error.CatalogGenerationChanged;
         }

@@ -20382,8 +20382,14 @@ pub const DB = struct {
         // Projection borrows the caller's immutable schema and primary snapshot.
         const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
         defer alloc.free(store_key);
+        var page: ?[]u8 = null;
+        defer if (page) |bytes| alloc.free(bytes);
         const raw = primary orelse (probe.getLeased(store_key) catch |err| switch (err) {
-            error.NotFound => return null,
+            error.NotFound => virtual: {
+                if (opts.include_primary_digest) return null;
+                page = try virtualPdfPageUnit(self, alloc, probe, store_key);
+                break :virtual page orelse return null;
+            },
             else => return err,
         });
         var privacy_arena = std.heap.ArenaAllocator.init(alloc);
@@ -49911,7 +49917,10 @@ pub const DB = struct {
         defer alloc.free(store_key);
         var txn = try self.core.store.beginProbeTxn();
         defer txn.abort();
-        const raw = (try @import("artifact_chunk_generation.zig").readMember(alloc, &txn, store_key)) orelse return null;
+        const member = try @import("artifact_chunk_generation.zig").readMember(alloc, &txn, store_key);
+        const page = if (member == null) try virtualPdfPageUnit(self, alloc, &txn, store_key) else null;
+        defer if (page) |bytes| alloc.free(bytes);
+        const raw = member orelse page orelse return null;
         var privacy_arena = std.heap.ArenaAllocator.init(alloc);
         defer privacy_arena.deinit();
         const privacy = @import("privacy_read.zig");
@@ -50252,6 +50261,39 @@ fn scalarSearchAsset(self: *DB, key: []const u8) bool {
     return entry.content_type.len == 0 or std.mem.eql(u8, entry.content_type, "text/plain");
 }
 
+// A PDF page is stored as a generated vector under its logical unit key.
+// Read only the primary-owned artifact header, including for external payloads.
+fn virtualPdfPageUnit(self: *DB, alloc: Allocator, txn: *docstore_mod.DocStore.Txn, key: []const u8) !?[]u8 {
+    if (!internal_keys.isDocumentUnitArtifactRecordKey(key)) return null;
+    var ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, key)) orelse return null;
+    defer ref.deinit(alloc);
+    const unit = ref.unit_id orelse return null;
+    if (!std.mem.startsWith(u8, unit, "page:")) return null;
+    const number = std.fmt.parseUnsigned(u32, unit[5..], 10) catch return null;
+    if (number == 0) return null;
+    var snapshot = try self.core.index_manager.acquireWritePlanSnapshot();
+    defer snapshot.release();
+    const outputs = snapshot.plan().pdf_page_outputs.get(ref.name) orelse return null;
+    for (outputs.items) |output| {
+        const vector = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, key, output);
+        defer alloc.free(vector);
+        const meta = txn.getArtifactMetadata(vector) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        const source = meta.sourceHash() orelse continue;
+        const fingerprint = try std.fmt.allocPrint(alloc, "{s}:{x:0>16}", .{ output, source });
+        defer alloc.free(fingerprint);
+        return try std.json.Stringify.valueAlloc(alloc, .{
+            .unit_id = unit,
+            .unit_type = "page",
+            .provenance = .{ .page_number = number },
+            ._artifact_unit_fingerprint = fingerprint,
+        }, .{});
+    }
+    return null;
+}
+
 fn materializeSearchStoredValue(self: *DB, alloc: Allocator, key: []const u8, raw: []const u8) ![]u8 {
     if (scalarSearchAsset(self, key)) return try std.json.Stringify.valueAlloc(alloc, .{ .@"$" = raw }, .{});
     return try self.core.index_manager.materializeStoredValueAlloc(alloc, key, raw);
@@ -50548,7 +50590,9 @@ fn loadStoredSearchDocumentsMany(
     const privacy = @import("privacy_read.zig");
     const policy = try privacy.capture(self, privacy_arena.allocator());
     for (pending.items, 0..) |item, i| {
-        const value = read_values[i] orelse continue;
+        const page = if (read_values[i] == null) try virtualPdfPageUnit(self, alloc, &txn, item.store_key) else null;
+        defer if (page) |bytes| alloc.free(bytes);
+        const value = read_values[i] orelse page orelse continue;
         if (policy != null and policy.?.prepared.policy.mode != .monitor) {
             var row_backing = inference_work.ReclaimingInvocationAllocator.init(alloc);
             var row_arena = std.heap.ArenaAllocator.init(row_backing.allocator());

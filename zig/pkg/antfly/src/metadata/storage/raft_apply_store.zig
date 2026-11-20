@@ -5828,7 +5828,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "16";
+const derived_catalog_index_version = "17";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -13062,6 +13062,7 @@ pub const RaftApplyStore = struct {
         if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
         var parsed = try std.json.parseFromSlice(sql_policies.Command, self.alloc, bytes, .{});
         defer parsed.deinit();
+        _ = try self.ensureDerivedCatalogIndexesTxn(txn, group_id);
         const previous = try system_catalog_storage.readMeta(self.alloc, txn, group_id);
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});

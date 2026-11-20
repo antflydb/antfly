@@ -23,6 +23,7 @@ const Mock = struct {
     cached_rename: bool = false,
     probe_change_at: ?usize = null,
     replace_incarnation: bool = false,
+    replace_before_setting_execute: bool = false,
     probes: usize = 0,
     catalog_revision: u64 = 1,
     cached_shape_change: bool = false,
@@ -236,8 +237,9 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.describes += 1;
         try request.check();
-        if (self.probe_change_at != null) return .{
-            .stamp = .{ .catalog = .{ .catalog_revision = self.catalog_revision, .relation_epoch = .{ .incarnation = @splat(if (self.replace_incarnation) @intCast(self.catalog_revision) else 1), .revision = self.catalog_revision } }, .authority = 1 },
+        if (self.replace_before_setting_execute and self.describes == 3) self.catalog_revision += 1;
+        if (self.probe_change_at != null or self.replace_before_setting_execute) return .{
+            .stamp = .{ .catalog = .{ .catalog_revision = self.catalog_revision, .relation_epoch = .{ .incarnation = @splat(if (self.replace_incarnation) @intCast(self.catalog_revision) else 1), .revision = self.catalog_revision } }, .authority = 1, .reusable = !self.replace_before_setting_execute },
             .binding_guard = if (self.replace_incarnation or self.catalog_revision == 1) "original table" else "replacement table",
             .columns = &.{},
         };
@@ -2731,6 +2733,24 @@ test "pgwire producer capacity rejects execution before backend and preserves ro
     try std.testing.expectEqual(@as(usize, 1), mock.executions);
     try std.testing.expect(!session.completion.unknown);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "54000") != null);
+}
+
+test "pgwire setting-dependent portal retains its catalog incarnation across fresh descriptions" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "stmt", "UPDATE t SET n = current_setting('app.value')", false);
+    try bind(&input.writer, "bound", "stmt", null);
+    try execute(&input.writer, "bound", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock = Mock{ .replace_before_setting_execute = true, .replace_incarnation = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 3), mock.describes);
+    try std.testing.expectEqual(@as(usize, 0), mock.probes);
+    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "40001") != null);
 }
 
 test "pgwire warm descriptions survive prepared close and bound writes reject a replacement before execution" {

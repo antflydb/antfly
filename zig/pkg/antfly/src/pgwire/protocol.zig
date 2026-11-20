@@ -456,7 +456,8 @@ pub const Session = struct {
 
     fn descriptionCurrent(self: *Session, alloc: std.mem.Allocator, statement: []const u8, description: backend.Description) !bool {
         const check = self.source.vtable.description_current orelse return false;
-        if (description.stamp == null) return false;
+        const stamp = description.stamp orelse return false;
+        if (!stamp.reusable) return false;
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);

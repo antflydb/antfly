@@ -6223,6 +6223,14 @@ pub const IndexManager = struct {
     /// Fully-owned extraction inputs for one immutable catalog generation.
     /// Foreground preparation never borrows live index entries after this is
     /// built, so catalog publication is independent of batch size.
+    const PdfPageOutputs = std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8));
+
+    fn deinitPdfPageOutputs(outputs: *PdfPageOutputs, alloc: Allocator) void {
+        var lists = outputs.valueIterator();
+        while (lists.next()) |list| list.deinit(alloc);
+        outputs.deinit(alloc);
+    }
+
     pub const WritePlanSnapshot = struct {
         alloc: Allocator,
         generation: u64,
@@ -6245,6 +6253,8 @@ pub const IndexManager = struct {
         /// Per-row planning only substitutes the document identity and removes
         /// consumers already satisfied by explicit/direct vectors.
         generated_templates: []enrichment_types.GeneratedEnrichmentRequest,
+        // Keys and output names borrow the immutable producer templates.
+        pdf_page_outputs: PdfPageOutputs = .empty,
         /// Constant-time publication membership, compiled once per catalog.
         generated_definitions: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
         /// Catalog-wide completion requirements include projections and
@@ -6266,6 +6276,7 @@ pub const IndexManager = struct {
             if (self.group_sources) |*plan| plan.deinit();
             if (self.completion_plan) |*plan| plan.deinit();
             if (self.artifact_catalogs) |*catalogs| catalogs.deinit(self.alloc);
+            deinitPdfPageOutputs(&self.pdf_page_outputs, self.alloc);
             self.generated_definitions.deinit(self.alloc);
             for (self.text_fields) |field| self.alloc.free(field);
             if (self.text_fields.len != 0) self.alloc.free(self.text_fields);
@@ -6884,7 +6895,24 @@ pub const IndexManager = struct {
         }
         var generated_definitions: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
         errdefer generated_definitions.deinit(alloc);
-        for (generated_templates) |template| try generated_definitions.put(alloc, @import("../artifact_producer_input.zig").definitionDigest(template), {});
+        var pdf_page_outputs: PdfPageOutputs = .empty;
+        errdefer deinitPdfPageOutputs(&pdf_page_outputs, alloc);
+        for (generated_templates) |template| {
+            try generated_definitions.put(alloc, @import("../artifact_producer_input.zig").definitionDigest(template), {});
+            if (template.kind != .dense_embedding or template.embedding_input != .pdf_page_images) continue;
+            const names = try pdf_page_outputs.getOrPut(alloc, enrichment_types.requestArtifactName(template));
+            if (!names.found_existing) names.value_ptr.* = .empty;
+            const name = enrichment_types.requestEmbeddingName(template);
+            for (names.value_ptr.items) |known| {
+                if (std.mem.eql(u8, known, name)) break;
+            } else try names.value_ptr.append(alloc, name);
+        }
+        var page_outputs = pdf_page_outputs.valueIterator();
+        while (page_outputs.next()) |names| std.mem.sort([]const u8, names.items, {}, struct {
+            fn less(_: void, lhs: []const u8, rhs: []const u8) bool {
+                return std.mem.lessThan(u8, lhs, rhs);
+            }
+        }.less);
         var result: WritePlanSnapshot = .{
             .alloc = alloc,
             .generation = self.writePlanGeneration(),
@@ -6902,6 +6930,7 @@ pub const IndexManager = struct {
             .graph_fields = graph_fields,
             .generated_templates = generated_templates,
             .generated_definitions = generated_definitions,
+            .pdf_page_outputs = pdf_page_outputs,
             .group_sources = group_sources,
             .completion_plan = completion_plan,
             .chunk_dependents = chunk_dependents,
@@ -18893,8 +18922,8 @@ pub const IndexManager = struct {
     }
 
     fn embeddingSourceSupportsUnitGrouping(self: *const IndexManager, embedding_cfg: *const enrichment_catalog.EnrichmentConfig) bool {
-        return embedding_cfg.source_artifact_name.len > 0 and
-            self.artifactSourceSupportsUnitGrouping(embedding_cfg.source_artifact_name);
+        return embedding_cfg.embedding_input == .pdf_page_images or (embedding_cfg.source_artifact_name.len > 0 and
+            self.artifactSourceSupportsUnitGrouping(embedding_cfg.source_artifact_name));
     }
 
     fn textSourcesSupportUnitGrouping(
@@ -24624,6 +24653,8 @@ pub const IndexManager = struct {
                     .embedding_names = try cloneOwnedStrings(self.alloc, dense_cfg.embedding_names),
                     .supports_unit_grouping = if (dense_cfg.embedding_names.len > 0)
                         multi_source_supports_unit_grouping
+                    else if (dense_generator) |generator|
+                        generator.embedding_input == .pdf_page_images
                     else if (referenced_embedding) |embedding_cfg|
                         self.embeddingSourceSupportsUnitGrouping(embedding_cfg)
                     else
@@ -31013,7 +31044,10 @@ pub const IndexManager = struct {
         index_name: []const u8,
         pending: []const PendingDenseVectorMapping,
     ) !void {
-        const cache_updates = try self.collectDenseOrdinalVectorCacheUpdatesTxn(self.alloc, txn, pending);
+        const cache_updates = if (!entry.memberBacked() and entry.embedding_names.len == 0)
+            try self.collectDenseOrdinalVectorCacheUpdatesTxn(self.alloc, txn, pending)
+        else
+            &.{};
         defer self.alloc.free(cache_updates);
         self.commitDenseVectorMappingsTxn(txn, index_name, pending) catch |err| {
             self.rollbackPendingDenseVectors(entry, pending);
@@ -31070,7 +31104,6 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         updates: []const DenseOrdinalVectorCacheUpdate,
     ) !void {
-        if (entry.chunk_name != null or entry.embedding_names.len > 0) return;
         for (updates) |update| {
             try entry.ordinal_vector_ids.put(self.alloc, update.ordinal, update.vector_id);
             try entry.vector_ordinals.put(self.alloc, update.vector_id, update.ordinal);
@@ -31091,7 +31124,7 @@ pub const IndexManager = struct {
         pending: []const PendingDenseVectorMapping,
     ) !void {
         _ = index_name;
-        if (entry.chunk_name != null or entry.embedding_names.len > 0 or pending.len == 0) return;
+        if (entry.memberBacked() or entry.embedding_names.len > 0 or pending.len == 0) return;
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginRead();

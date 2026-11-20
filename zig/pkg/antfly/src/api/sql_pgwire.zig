@@ -1042,7 +1042,7 @@ const Job = struct {
             const parameter_types = try self.alloc.alloc(wire.Type, description.binding.parameter_types.len);
             for (parameter_types, description.binding.parameter_types) |*out, kind| out.* = if (kind) |value| try wireType(value) else .unknown;
             self.description = .{
-                .stamp = if (compiled.uses_current_setting or (probe.sampled and probe.catalog == null)) null else .{ .catalog = probe.catalog, .authority = authority_revision },
+                .stamp = if (probe.sampled and probe.catalog == null) null else .{ .catalog = probe.catalog, .authority = authority_revision, .reusable = !compiled.uses_current_setting },
                 .columns = columns,
                 .parameter_types = parameter_types,
                 .parameter_descriptors = try self.alloc.dupe(wire.Parameter, description.binding.parameter_descriptors),
