@@ -157466,6 +157466,42 @@ test "optional numeric range keeps mixed primary matches for native field sortin
             try std.testing.expectEqual(@as(usize, 0), rejected.hits.len);
             try std.testing.expectEqual(@as(u32, 0), rejected.total_hits);
         }
+
+        // This row still has a text ordinal and source bytes, but the primary
+        // state lookup cannot vouch for the ordinal. Its key remains authoritative.
+        const state_key = internal_keys.identityOrdinalStateKey(legacy_ordinal);
+        const old_state = state: {
+            var read = try db.core.store.beginProbeTxn();
+            defer read.abort();
+            break :state try a.dupe(u8, try read.get(&state_key));
+        };
+        defer a.free(old_state);
+        {
+            var write = try db.core.store.beginWriteTxn();
+            errdefer write.abort();
+            try write.delete(&state_key);
+            try write.commit();
+        }
+        var mixed_scope = doc_set.ResolvedDocFilter{ .include = try doc_set.fromOrdinalsAlloc(a, &.{mapped_ordinal}) };
+        defer mixed_scope.deinit(a);
+        mixed_scope.legacy_include = try doc_set.cloneDocKeysAlloc(a, &.{"legacy"});
+        var mixed_page = try db_query_search.searchMatchAll(a, .{
+            .index_name = "ft",
+            .limit = 2,
+            .include_stored = false,
+            .resolved_doc_filter = &mixed_scope,
+            .exclude_doc_ids = &.{"missing"},
+            .order_by = &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } },
+        }, db.matchAllExecutor());
+        defer mixed_page.deinit();
+        try std.testing.expectEqual(@as(usize, 2), mixed_page.hits.len);
+        try std.testing.expectEqualStrings("legacy", mixed_page.hits[1].id);
+        {
+            var write = try db.core.store.beginWriteTxn();
+            errdefer write.abort();
+            try write.put(&state_key, old_state);
+            try write.commit();
+        }
     }
     const forward = try internal_keys.identityDocToOrdinalKeyAlloc(a, "legacy");
     defer a.free(forward);

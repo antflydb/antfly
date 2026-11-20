@@ -1426,6 +1426,34 @@ const PatternParentMemo = struct {
     }
 };
 
+// One memo per result pass. All operands use the same read generation,
+// and the hit IDs and resolved parent keys outlive the memo.
+const PatternOrdinalMemo = struct {
+    sets: std.StringHashMapUnmanaged(doc_set.ResolvedDocSet) = .empty,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        var values = self.sets.valueIterator();
+        while (values.next()) |value| value.deinit(alloc);
+        self.sets.deinit(alloc);
+    }
+
+    fn get(
+        self: *@This(),
+        alloc: Allocator,
+        executor: StoredPatternFilterExecutor,
+        key: []const u8,
+        generation: ?u64,
+    ) !?*const doc_set.ResolvedDocSet {
+        const resolve = executor.resolve_doc_ids_to_doc_set orelse return null;
+        if (self.sets.getPtr(key)) |set| return set;
+        var set = try resolve(executor.ctx, alloc, &.{key}, generation);
+        errdefer set.deinit(alloc);
+        const slot = try self.sets.getOrPut(alloc, key);
+        slot.value_ptr.* = set;
+        return slot.value_ptr;
+    }
+};
+
 fn resolvePatternDocIdsAlloc(
     alloc: Allocator,
     set: *const doc_set.ResolvedDocSet,
@@ -1434,13 +1462,14 @@ fn resolvePatternDocIdsAlloc(
     generation: ?u64,
     executor: StoredPatternFilterExecutor,
     parents: ?*PatternParentMemo,
+    ordinal_memo: *PatternOrdinalMemo,
     control: @import("../../../search/query.zig").ExecutionControl,
 ) !ResolvedPatternDocIds {
     return switch (set.*) {
         .all => .{ .all = true },
         .none => .{ .active = true },
         .doc_keys => |keys| .{ .ids = keys, .active = true },
-        .ordinals, .ordinal_bitmap => try resolvePatternOrdinalHitsAlloc(alloc, set, legacy, hits, generation, executor, parents, control),
+        .ordinals, .ordinal_bitmap => try resolvePatternOrdinalHitsAlloc(alloc, set, legacy, hits, generation, executor, parents, ordinal_memo, control),
     };
 }
 
@@ -1452,6 +1481,7 @@ fn resolvePatternOrdinalHitsAlloc(
     generation: ?u64,
     executor: StoredPatternFilterExecutor,
     parents: ?*PatternParentMemo,
+    ordinal_memo: *PatternOrdinalMemo,
     control: @import("../../../search/query.zig").ExecutionControl,
 ) !ResolvedPatternDocIds {
     if (allHitsHaveDocOrdinals(hits)) return .{ .borrowed_ordinal_set = set, .active = true };
@@ -1471,11 +1501,9 @@ fn resolvePatternOrdinalHitsAlloc(
         const parent = if (parents) |memo| try memo.get(alloc, executor, hit) else null;
         const key = parent orelse hit.id;
         if (legacy.contains(key)) continue;
-        if (executor.resolve_doc_ids_to_doc_set) |resolve| {
-            var hit_set = try resolve(executor.ctx, alloc, &.{key}, generation);
-            defer hit_set.deinit(alloc);
-            if (hit_set == .none) continue;
-            if (hit_set == .ordinals) {
+        if (try ordinal_memo.get(alloc, executor, key, generation)) |hit_set| {
+            if (hit_set.* == .none) continue;
+            if (hit_set.* == .ordinals) {
                 for (hit_set.ordinals) |ordinal| {
                     if (!set.containsOrdinal(ordinal)) continue;
                     try appendPatternMatch(alloc, &matched, hit.id);
@@ -1636,6 +1664,8 @@ pub fn applyStoredSearchPatternFilters(
 
     var parents: PatternParentMemo = .{};
     defer parents.deinit(alloc);
+    var ordinals: PatternOrdinalMemo = .{};
+    defer ordinals.deinit(alloc);
 
     const control = @import("../../../search/query.zig").ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
     var include_keys: std.StringHashMapUnmanaged(void) = .empty;
@@ -1701,7 +1731,7 @@ pub fn applyStoredSearchPatternFilters(
                 var resolved = if (cheap and !key_only)
                     ResolvedPatternDocIds{ .borrowed_ordinal_set = operand, .active = true }
                 else
-                    try resolvePatternDocIdsAlloc(alloc, operand, gate.legacy, candidates[0..candidate_len], req.identity_read_generation, executor, if (gate.shared and parent_aware) &parents else null, control);
+                    try resolvePatternDocIdsAlloc(alloc, operand, gate.legacy, candidates[0..candidate_len], req.identity_read_generation, executor, if (gate.shared and parent_aware) &parents else null, &ordinals, control);
                 defer resolved.deinit(alloc);
                 var surviving: usize = 0;
                 for (candidates[0..candidate_len], indexes[0..candidate_len]) |hit, index| {
@@ -2554,11 +2584,14 @@ test "applyStoredSearchPatternFilters skips stored loads for doc_id-only filters
 test "optional numeric range result membership keeps exceptional keys without reverse projection" {
     const alloc = std.testing.allocator;
     const Harness = struct {
+        calls: usize = 0,
         fn failReverse(_: ?*anyopaque, _: Allocator, _: *const doc_set.ResolvedDocSet, _: ?u64) anyerror!?[]const []const u8 {
             return error.UnexpectedReverseProjection;
         }
 
-        fn resolve(_: ?*anyopaque, a: Allocator, keys: []const []const u8, _: ?u64) anyerror!doc_set.ResolvedDocSet {
+        fn resolve(ctx: ?*anyopaque, a: Allocator, keys: []const []const u8, _: ?u64) anyerror!doc_set.ResolvedDocSet {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
             try std.testing.expectEqualSlices(u8, "recoverable", keys[0]);
             return try doc_set.fromOrdinalsAlloc(a, &.{7});
         }
@@ -2574,15 +2607,22 @@ test "optional numeric range result membership keeps exceptional keys without re
     };
     var membership = try patternLegacyMembershipAlloc(alloc, &legacy, .{});
     defer membership.deinit(alloc);
-    var resolved = try resolvePatternDocIdsAlloc(alloc, &primary, &membership, hits, null, .{
-        .ctx = null,
+    var memo: PatternOrdinalMemo = .{};
+    defer memo.deinit(alloc);
+    var harness: Harness = .{};
+    const executor: StoredPatternFilterExecutor = .{
+        .ctx = &harness,
         .load_stored = TestStoredLoader.loadStored,
         .resolve_doc_set_doc_ids = Harness.failReverse,
         .resolve_doc_ids_to_doc_set = Harness.resolve,
-    }, null, .{});
-    defer resolved.deinit(alloc);
-    try std.testing.expect(resolvedPatternContainsHit(resolved, hits[1]));
-    try std.testing.expect(resolvedPatternContainsHit(resolved, hits[2]));
+    };
+    for (0..2) |_| {
+        var resolved = try resolvePatternDocIdsAlloc(alloc, &primary, &membership, hits, null, executor, null, &memo, .{});
+        defer resolved.deinit(alloc);
+        try std.testing.expect(resolvedPatternContainsHit(resolved, hits[1]));
+        try std.testing.expect(resolvedPatternContainsHit(resolved, hits[2]));
+    }
+    try std.testing.expectEqual(@as(usize, 1), harness.calls);
 }
 
 test "optional numeric range skips reverse exclusions for rejected hits" {

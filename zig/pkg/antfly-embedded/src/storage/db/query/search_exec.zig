@@ -2815,7 +2815,7 @@ fn deriveNativeDocIdConstraintsAlloc(
 
     if (active_executor.text_snapshot_for_doc_num_projection) |snapshot| {
         const control = query_mod.ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
-        _ = try mergeLegacyResidualTextDocNumsAlloc(alloc, snapshot, &out, control, if (active_executor.text_project_parent_keys) .text_parent_doc_num else .text_doc_num, null);
+        try mergeLegacyResidualTextDocNumsAlloc(alloc, snapshot, &out, control, active_executor.text_project_parent_keys);
     }
 
     if (active_executor.apply_live_all_docs and !out.positive_filter) {
@@ -2949,13 +2949,12 @@ fn mergeLegacyResidualTextDocNumsAlloc(
     snapshot: *const index_mod.IndexSnapshot,
     out: *NativeDocIdConstraints,
     control: query_mod.ExecutionControl,
-    space: enum { text_doc_num, text_parent_doc_num, primary_ordinal },
-    exceptional_doc_nums: ?*std.StringHashMapUnmanaged(u32),
-) !bool {
+    parent_keys: bool,
+) !void {
     const includes = if (out.legacy_filter == .doc_keys) out.legacy_filter.doc_keys else &.{};
     const excludes = if (out.legacy_exclude == .doc_keys) out.legacy_exclude.doc_keys else &.{};
-    if (includes.len == 0 and excludes.len == 0) return true;
-    if (space == .text_parent_doc_num) {
+    if (includes.len == 0 and excludes.len == 0) return;
+    if (parent_keys) {
         const added = try textDocNumsForParentKeysAlloc(alloc, snapshot, includes, control);
         defer alloc.free(added);
         const removed = try textDocNumsForParentKeysAlloc(alloc, snapshot, excludes, control);
@@ -2965,7 +2964,7 @@ fn mergeLegacyResidualTextDocNumsAlloc(
         for (added) |doc| if (!containsSortedU32(removed, doc)) try surviving.append(alloc, doc);
         try mergeResidualDocNumsAlloc(alloc, &out.filter_doc_nums, &out.filter_doc_nums_owned, surviving.items);
         try mergeResidualDocNumsAlloc(alloc, &out.exclude_doc_nums, &out.exclude_doc_nums_owned, removed);
-        return true;
+        return;
     }
     var slots: std.StringHashMapUnmanaged(u32) = .empty;
     defer slots.deinit(alloc);
@@ -2995,40 +2994,19 @@ fn mergeLegacyResidualTextDocNumsAlloc(
     defer added.deinit(alloc);
     var removed = std.ArrayListUnmanaged(u32).empty;
     defer removed.deinit(alloc);
-    var complete = true;
     var matches = documents.ordinals.iterator();
     while (matches.next()) |match| {
         try control.check();
-        const number = switch (space) {
-            .text_doc_num, .text_parent_doc_num => match.key_ptr.*,
-            .primary_ordinal => (try snapshot.docOrdinal(match.key_ptr.*)) orelse {
-                complete = false;
-                continue;
-            },
-        };
-        if (excluded.isSet(match.value_ptr.*)) try removed.append(alloc, number);
-        // When projecting into ordinal space, address inclusion and
-        // exclusion independently so aliasing cannot erase an inclusion.
-        if (space == .primary_ordinal or !excluded.isSet(match.value_ptr.*)) {
-            if (included.isSet(match.value_ptr.*)) try added.append(alloc, number);
+        const doc_num = match.key_ptr.*;
+        const slot = match.value_ptr.*;
+        if (excluded.isSet(slot)) {
+            try removed.append(alloc, doc_num);
+        } else if (included.isSet(slot)) {
+            try added.append(alloc, doc_num);
         }
     }
-    if (!complete) {
-        if (exceptional_doc_nums) |map| {
-            matches = documents.ordinals.iterator();
-            while (matches.next()) |match| {
-                try control.check();
-                if (!included.isSet(match.value_ptr.*) or excluded.isSet(match.value_ptr.*)) continue;
-                try map.put(alloc, frontier.get(match.value_ptr.*).?, match.key_ptr.*);
-            }
-        }
-        // Keep key membership authoritative when at least one match has no ordinal.
-        return false;
-    }
-    // An excluded key needs no positive candidate even if it matched both.
     try mergeResidualDocNumsAlloc(alloc, &out.filter_doc_nums, &out.filter_doc_nums_owned, added.items);
     try mergeResidualDocNumsAlloc(alloc, &out.exclude_doc_nums, &out.exclude_doc_nums_owned, removed.items);
-    return true;
 }
 
 fn mergeResidualDocNumsAlloc(alloc: Allocator, doc_nums: *[]const u32, owned: *bool, added: []const u32) !void {
@@ -21962,6 +21940,38 @@ fn buildCompleteOrPartialTextDocIdMapAlloc(
     return allow_missing or !saw_live_doc or ordinal_to_text_doc_id.count() > 0;
 }
 
+fn projectSortKeyDocNumsAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    filter_keys: []const []const u8,
+    legacy_keys: []const []const u8,
+    out: *std.StringHashMapUnmanaged(u32),
+    control: QueryExecutionControl,
+) !void {
+    var frontier: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+    defer frontier.deinit(alloc);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(alloc);
+    for ([_][]const []const u8{ filter_keys, legacy_keys }) |keys| {
+        for (keys) |key| {
+            try control.check();
+            const slot = try seen.getOrPut(alloc, key);
+            if (slot.found_existing) continue;
+            try frontier.put(alloc, std.math.cast(u32, frontier.count()) orelse return error.InvalidData, key);
+        }
+    }
+    if (frontier.count() == 0) return;
+    var matches = try snapshot.collectGraphKeyFrontierDocNumsAlloc(alloc, frontier, control);
+    defer matches.deinit();
+    var docs = matches.ordinals.iterator();
+    while (docs.next()) |doc| {
+        try control.check();
+        const key = frontier.get(doc.value_ptr.*).?;
+        const slot = try out.getOrPut(alloc, key);
+        if (!slot.found_existing or slot.value_ptr.* < doc.key_ptr.*) slot.value_ptr.* = doc.key_ptr.*;
+    }
+}
+
 fn resolveTextSortOrdinalScope(
     alloc: Allocator,
     scope_alloc: Allocator,
@@ -21977,6 +21987,8 @@ fn resolveTextSortOrdinalScope(
     var keys: std.ArrayListUnmanaged([]const u8) = .empty;
     var stale: std.AutoHashMapUnmanaged(u32, void) = .empty;
     defer stale.deinit(alloc);
+    var frontier: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+    defer frontier.deinit(alloc);
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     var offset: usize = 0;
@@ -21996,26 +22008,18 @@ fn resolveTextSortOrdinalScope(
         if (len == 0) continue;
         var resolved: [256]?[]const u8 = undefined;
         try resolve(executor.ctx, temp, batch[0..len], req.identity_read_generation, resolved[0..len]);
-        var frontier: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
         for (batch[0..len], resolved[0..len]) |ordinal, value| {
             const key = value orelse {
                 try stale.put(alloc, ordinal, {});
                 _ = map.remove(ordinal);
                 continue;
             };
-            try keys.append(scope_alloc, try scope_alloc.dupe(u8, key));
-            if (!map.contains(ordinal)) try frontier.put(temp, ordinal, key);
-        }
-        if (frontier.count() == 0) continue;
-        var matches = try snapshot.collectGraphKeyFrontierDocNumsAlloc(temp, frontier, control);
-        defer matches.deinit();
-        var docs = matches.ordinals.iterator();
-        while (docs.next()) |doc| {
-            try control.check();
-            const slot = try map.getOrPut(alloc, doc.value_ptr.*);
-            if (!slot.found_existing or slot.value_ptr.* < doc.key_ptr.*) slot.value_ptr.* = doc.key_ptr.*;
+            const owned = try scope_alloc.dupe(u8, key);
+            try keys.append(scope_alloc, owned);
+            if (!map.contains(ordinal)) try frontier.put(alloc, ordinal, owned);
         }
     }
+    try appendSortOrdinalProjection(alloc, snapshot, frontier, map, control);
     if (stale.count() != 0) {
         const replacement = try alloc.alloc(u32, constraints.filter_doc_nums.len - stale.count());
         var len: usize = 0;
@@ -22053,6 +22057,11 @@ fn repairTextSortOrdinalProjection(
     control: QueryExecutionControl,
 ) !void {
     const resolve = executor.resolve_doc_set_doc_ids orelse return;
+    var key_arena = std.heap.ArenaAllocator.init(alloc);
+    defer key_arena.deinit();
+    const key_alloc = key_arena.allocator();
+    var frontier: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+    defer frontier.deinit(alloc);
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     var offset: usize = 0;
@@ -22071,17 +22080,28 @@ fn repairTextSortOrdinalProjection(
         }
         if (len == 0) continue;
         const set = doc_set.ResolvedDocSet{ .ordinals = missing[0..len] };
-        const keys = (try resolve(executor.ctx, batch_alloc, &set, req.identity_read_generation)) orelse return;
+        const keys = (try resolve(executor.ctx, batch_alloc, &set, req.identity_read_generation)) orelse break;
         if (keys.len != len) return error.InvalidDocIdentity;
-        var frontier: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
-        for (missing[0..len], keys) |ordinal, key| try frontier.put(batch_alloc, ordinal, key);
-        var matches = try snapshot.collectGraphKeyFrontierDocNumsAlloc(batch_alloc, frontier, control);
-        defer matches.deinit();
-        var docs = matches.ordinals.iterator();
-        while (docs.next()) |doc| {
-            const slot = try map.getOrPut(alloc, doc.value_ptr.*);
-            if (!slot.found_existing or slot.value_ptr.* < doc.key_ptr.*) slot.value_ptr.* = doc.key_ptr.*;
-        }
+        for (missing[0..len], keys) |ordinal, key| try frontier.put(alloc, ordinal, try key_alloc.dupe(u8, key));
+    }
+    try appendSortOrdinalProjection(alloc, snapshot, frontier, map, control);
+}
+
+fn appendSortOrdinalProjection(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    frontier: std.AutoHashMapUnmanaged(u32, []const u8),
+    map: *std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
+    control: QueryExecutionControl,
+) !void {
+    if (frontier.count() == 0) return;
+    var matches = try snapshot.collectGraphKeyFrontierDocNumsAlloc(alloc, frontier, control);
+    defer matches.deinit();
+    var docs = matches.ordinals.iterator();
+    while (docs.next()) |doc| {
+        try control.check();
+        const slot = try map.getOrPut(alloc, doc.value_ptr.*);
+        if (!slot.found_existing or slot.value_ptr.* < doc.key_ptr.*) slot.value_ptr.* = doc.key_ptr.*;
     }
 }
 
@@ -22705,53 +22725,6 @@ pub fn searchMatchAll(
         return out;
     }
 
-    var exceptional_sort_doc_nums: std.StringHashMapUnmanaged(u32) = .empty;
-    defer exceptional_sort_doc_nums.deinit(alloc);
-    var mixed_sort_snapshot: ?*index_mod.IndexSnapshot = null;
-    defer if (mixed_sort_snapshot) |snapshot| snapshot.release();
-    if (!compact_primary and (native_constraints.legacy_filter != .none or native_constraints.legacy_exclude != .none)) {
-        const entry = (try executor.text_index_entry(executor.ctx, exec_req.index_name)) orelse return error.UnsupportedQueryRequest;
-        const snapshot = entry.persistent.acquireSnapshot();
-        mixed_sort_snapshot = snapshot;
-        const control = QueryExecutionControl{ .cancellation = exec_req.cancellation, .deadline_ns = exec_req.execution_deadline_ns };
-        if (try mergeLegacyResidualTextDocNumsAlloc(alloc, snapshot, &native_constraints, control, .primary_ordinal, &exceptional_sort_doc_nums)) {
-            native_constraints.legacy_filter.deinit(alloc);
-            native_constraints.legacy_exclude.deinit(alloc);
-        }
-    }
-
-    if (exec_req.order_by.len > 0 and
-        (planned_sort.kind == .sorted_segment_seek or planned_sort.kind == .native_doc_values_top_n) and
-        (native_constraints.filter_doc_ids.len > 0 or native_constraints.exclude_doc_ids.len > 0))
-    {
-        const text_entry = (try executor.text_index_entry(executor.ctx, exec_req.index_name)) orelse {
-            logNativeSortPlanRejection(
-                "*",
-                nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
-                "text_index_entry_unavailable",
-            );
-            return error.UnsupportedQueryRequest;
-        };
-        const snapshot = mixed_sort_snapshot orelse text_entry.persistent.acquireSnapshot();
-        if (mixed_sort_snapshot == null) mixed_sort_snapshot = snapshot;
-        if (native_constraints.filter_doc_ids.len != 0) {
-            var frontier: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
-            defer frontier.deinit(alloc);
-            const control = QueryExecutionControl{ .cancellation = exec_req.cancellation, .deadline_ns = exec_req.execution_deadline_ns };
-            for (native_constraints.filter_doc_ids, 0..) |key, i| {
-                try control.check();
-                try frontier.put(alloc, std.math.cast(u32, i) orelse return error.InvalidData, key);
-            }
-            var docs = try snapshot.collectGraphKeyFrontierDocNumsAlloc(alloc, frontier, control);
-            defer docs.deinit();
-            var matches = docs.ordinals.iterator();
-            while (matches.next()) |match| {
-                try control.check();
-                try exceptional_sort_doc_nums.put(alloc, frontier.get(match.value_ptr.*).?, match.key_ptr.*);
-            }
-        }
-    }
-
     if (exec_req.order_by.len > 0 and planned_sort.kind == .sorted_segment_seek and !unresolved_stored_filters) {
         const text_entry = (try executor.text_index_entry(executor.ctx, exec_req.index_name)) orelse {
             logNativeSortPlanRejection(
@@ -22761,8 +22734,8 @@ pub fn searchMatchAll(
             );
             return error.UnsupportedQueryRequest;
         };
-        const sort_snapshot = mixed_sort_snapshot orelse text_entry.persistent.acquireSnapshot();
-        defer if (mixed_sort_snapshot == null) sort_snapshot.release();
+        const sort_snapshot = text_entry.persistent.acquireSnapshot();
+        defer sort_snapshot.release();
         if (sortedSegmentSelectiveFilterDocValuesDecision(postprocess_req, &native_constraints, sort_snapshot)) |cost_decision| {
             applySortCostModelDecision(&planned_sort, cost_decision);
             if (cost_decision.prefer_doc_values) {
@@ -22830,35 +22803,36 @@ pub fn searchMatchAll(
         };
         var ordinal_to_text_doc_id = std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32).empty;
         defer ordinal_to_text_doc_id.deinit(alloc);
-        const sort_snapshot = mixed_sort_snapshot orelse text_entry.persistent.acquireSnapshot();
-        defer if (mixed_sort_snapshot == null) sort_snapshot.release();
+        const sort_snapshot = text_entry.persistent.acquireSnapshot();
+        defer sort_snapshot.release();
         const has_legacy = native_constraints.legacy_filter != .none or native_constraints.legacy_exclude != .none or
             native_constraints.filter_doc_ids.len != 0 or native_constraints.exclude_doc_ids.len != 0;
         const control = QueryExecutionControl{ .cancellation = exec_req.cancellation, .deadline_ns = exec_req.execution_deadline_ns };
         try normalizeNativeDocNumConstraintsAlloc(alloc, &native_constraints);
         const only_ordinals = if (native_constraints.positive_filter) native_constraints.filter_doc_nums else &.{};
         const had_ordinal_scope = only_ordinals.len != 0;
-        const key_only = native_constraints.filter_doc_ids.len != 0 and !had_ordinal_scope;
-        if (!key_only and !(try buildCompleteOrPartialTextDocIdMapAlloc(alloc, sort_snapshot, &ordinal_to_text_doc_id, true, only_ordinals, control))) {
-            logNativeSortPlanRejection(
-                "*",
-                nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
-                "doc_ordinal_projection_unavailable",
-            );
-            return error.UnsupportedQueryRequest;
+        const legacy_keys = if (native_constraints.legacy_filter == .doc_keys) native_constraints.legacy_filter.doc_keys else &.{};
+        const filter_keys = native_constraints.filter_doc_ids;
+        const finite_count = @max(only_ordinals.len, filter_keys.len) +| legacy_keys.len;
+        // Use the stream's admission limit for oversized finite scopes.
+        // Its visibility and key predicates can admit fewer rows than the seed.
+        const defer_projection = postprocess_req.limit != 0 and native_constraints.positive_filter and
+            finite_count > exact_sort_budget;
+        if (!defer_projection and (had_ordinal_scope or !native_constraints.positive_filter)) {
+            _ = try buildCompleteOrPartialTextDocIdMapAlloc(alloc, sort_snapshot, &ordinal_to_text_doc_id, true, only_ordinals, control);
         }
         var exact_keys_arena = std.heap.ArenaAllocator.init(alloc);
         defer exact_keys_arena.deinit();
         const exact_key_alloc = exact_keys_arena.allocator();
         var resolved_exact_keys: ?[]const []const u8 = null;
-        if (only_ordinals.len != 0 and (ordinal_to_text_doc_id.count() != only_ordinals.len or
+        if (!defer_projection and had_ordinal_scope and (ordinal_to_text_doc_id.count() != only_ordinals.len or
             (has_legacy and native_constraints.filter_doc_ids.len == 0)))
         {
             resolved_exact_keys = try resolveTextSortOrdinalScope(alloc, exact_key_alloc, exec_req, executor, sort_snapshot, &native_constraints, &ordinal_to_text_doc_id, has_legacy and native_constraints.filter_doc_ids.len == 0, control);
             if (resolved_exact_keys == null and ordinal_to_text_doc_id.count() != only_ordinals.len)
                 try repairTextSortOrdinalProjection(alloc, exec_req, executor, sort_snapshot, only_ordinals, &ordinal_to_text_doc_id, control);
         }
-        if (!has_legacy and ordinal_to_text_doc_id.count() == native_constraints.filter_doc_nums.len and
+        if (!defer_projection and !has_legacy and ordinal_to_text_doc_id.count() == native_constraints.filter_doc_nums.len and
             had_ordinal_scope and native_constraints.filter_doc_ids.len == 0)
         {
             return try sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
@@ -22870,6 +22844,22 @@ pub fn searchMatchAll(
                 planned_sort,
                 &ordinal_to_text_doc_id,
             );
+        }
+        var exceptional_sort_doc_nums: std.StringHashMapUnmanaged(u32) = .empty;
+        defer exceptional_sort_doc_nums.deinit(alloc);
+        var admitted: ?MatchAllCandidates = null;
+        defer if (admitted) |*candidates| candidates.deinit(alloc);
+        if (defer_projection) {
+            admitted = try executor.collect_candidates(executor.ctx, alloc, postprocess_req, .{
+                .candidate_limit = exact_sort_budget,
+                .constraints = &native_constraints,
+            });
+            const keys = try alloc.alloc([]const u8, admitted.?.items.len);
+            defer alloc.free(keys);
+            for (admitted.?.items, keys) |candidate, *key| key.* = candidate.id;
+            try projectSortKeyDocNumsAlloc(alloc, sort_snapshot, keys, &.{}, &exceptional_sort_doc_nums, control);
+        } else {
+            try projectSortKeyDocNumsAlloc(alloc, sort_snapshot, filter_keys, legacy_keys, &exceptional_sort_doc_nums, control);
         }
         var native_sort_ctx = TextDocValueSortContext{
             .snapshot = sort_snapshot,
@@ -22886,17 +22876,20 @@ pub fn searchMatchAll(
         };
         const exact_keys = if (native_constraints.filter_doc_ids.len != 0)
             null
-        else if (resolved_exact_keys) |keys| keys else if (only_ordinals.len != 0) blk: {
+        else if (resolved_exact_keys) |keys| keys else if (had_ordinal_scope and !defer_projection) blk: {
             const resolve = executor.resolve_doc_set_doc_ids orelse break :blk null;
             const set = doc_set.ResolvedDocSet{ .ordinals = only_ordinals };
             const mapped = (try resolve(executor.ctx, exact_key_alloc, &set, exec_req.identity_read_generation)) orelse break :blk null;
             const exceptional = if (native_constraints.legacy_filter == .doc_keys) native_constraints.legacy_filter.doc_keys else &.{};
             break :blk try std.mem.concat(exact_key_alloc, []const u8, &.{ mapped, exceptional });
-        } else null;
-        var out = try sortAndPageMatchAllCandidateStreamAlloc(alloc, postprocess_req, executor, .{
-            .constraints = &native_constraints,
-            .exact_primary_keys = exact_keys,
-        }, planned_sort, native_sort_loader);
+        } else if (!had_ordinal_scope and native_constraints.positive_filter) legacy_keys else null;
+        var out = if (admitted) |*candidates|
+            try sortAndPageMatchAllCandidatesAlloc(alloc, postprocess_req, candidates, executor.ctx, executor.load_stored, planned_sort, native_sort_loader)
+        else
+            try sortAndPageMatchAllCandidateStreamAlloc(alloc, postprocess_req, executor, .{
+                .constraints = &native_constraints,
+                .exact_primary_keys = exact_keys,
+            }, planned_sort, native_sort_loader);
         errdefer out.deinit();
         if (postprocess_req.include_stored) {
             const source_profile = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, out.hits);
