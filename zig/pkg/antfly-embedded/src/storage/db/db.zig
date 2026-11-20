@@ -48940,7 +48940,8 @@ pub const DB = struct {
                 try self.scanExactScope(options);
                 return;
             }
-            if (options.require_complete_primary_population) {
+            if (options.require_complete_primary_population and !options.hasCompletePrimaryKeyScope()) {
+                if (try self.scanSmallOrderedScope(options)) return;
                 try self.scanSourcePopulation(options);
                 return;
             }
@@ -48974,12 +48975,17 @@ pub const DB = struct {
             defer if (range_upper) |key| alloc.free(key);
             var exceptional: std.ArrayListUnmanaged([]const u8) = .empty;
             defer exceptional.deinit(alloc);
-            for (options.exceptionalPrimaryKeys()) |id| {
-                try db_query_search.checkSearchRequestDeadline(self.req);
-                if (!owner_range.contains(id)) continue;
-                if (options.primary_key_start_after) |start| if (!std.mem.lessThan(u8, start, id)) continue;
-                if (options.primary_key_stop_before) |stop| if (!std.mem.lessThan(u8, id, stop)) continue;
-                try exceptional.append(alloc, id);
+            const exceptional_keys = options.exceptionalPrimaryKeys();
+            const residual = if (options.hasCompletePrimaryKeyScope() and options.constraints != null and
+                options.constraints.?.legacy_filter == .doc_keys) options.constraints.?.legacy_filter.doc_keys else &.{};
+            for ([_][]const []const u8{ exceptional_keys, residual }) |keys| {
+                for (keys) |id| {
+                    try db_query_search.checkSearchRequestDeadline(self.req);
+                    if (!owner_range.contains(id)) continue;
+                    if (options.primary_key_start_after) |start| if (!std.mem.lessThan(u8, start, id)) continue;
+                    if (options.primary_key_stop_before) |stop| if (!std.mem.lessThan(u8, id, stop)) continue;
+                    try exceptional.append(alloc, id);
+                }
             }
             std.mem.sort([]const u8, exceptional.items, {}, struct {
                 fn less(_: void, left: []const u8, right: []const u8) bool {
@@ -49017,6 +49023,69 @@ pub const DB = struct {
             defer txn.abort();
             try self.db.core.store.scanReadTxnWithContext(&txn, lower, upper, .{ .reverse = options.primary_key_reverse }, self, visit);
             if (!self.stopped) _ = try self.drainExceptionalBefore(null);
+        }
+
+        fn scanSmallOrderedScope(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !bool {
+            const constraints = options.constraints orelse return false;
+            if (!constraints.positive_filter) return false;
+            const legacy = if (constraints.legacy_filter == .doc_keys) constraints.legacy_filter.doc_keys else &.{};
+            const direct_keys = if (constraints.primary_include_compact and constraints.primary_include == .doc_keys)
+                constraints.primary_include.doc_keys
+            else
+                &.{};
+            const limit = 256;
+            var ordinal_buffer: [limit]doc_set.DocOrdinal = undefined;
+            const ordinals: []const doc_set.DocOrdinal = if (constraints.primary_include_compact) switch (constraints.primary_include) {
+                .none, .doc_keys => &.{},
+                .ordinals => |values| values,
+                .ordinal_bitmap => |*bitmap| blk: {
+                    if (bitmap.cardinality() +| legacy.len > limit) return false;
+                    var iterator = bitmap.iterator();
+                    var len: usize = 0;
+                    while (iterator.next()) |ordinal| : (len += 1) ordinal_buffer[len] = ordinal;
+                    break :blk ordinal_buffer[0..len];
+                },
+                .all => return false,
+            } else constraints.filter_doc_nums;
+            if (ordinals.len +| legacy.len +| direct_keys.len > limit) return false;
+            var scratch = std.heap.ArenaAllocator.init(self.alloc);
+            defer scratch.deinit();
+            const temp = scratch.allocator();
+            var resolved: [limit]?[]const u8 = undefined;
+            resolvePrimaryOrdinalKeysCallback(self.db, temp, ordinals, self.req.identity_read_generation, resolved[0..ordinals.len]) catch |err| switch (err) {
+                error.InvalidDocIdentity => return false,
+                else => return err,
+            };
+            const Candidate = struct {
+                id: []const u8,
+                ordinal: ?doc_set.DocOrdinal = null,
+
+                fn less(reverse: bool, left: @This(), right: @This()) bool {
+                    const order = std.mem.order(u8, left.id, right.id);
+                    if (order == .eq) return left.ordinal != null and right.ordinal == null;
+                    return order == if (reverse) std.math.Order.gt else .lt;
+                }
+            };
+            var keys: std.ArrayListUnmanaged(Candidate) = .empty;
+            for (legacy) |id| try keys.append(temp, .{ .id = id });
+            for (direct_keys) |id| try keys.append(temp, .{ .id = id });
+            for (ordinals, resolved[0..ordinals.len]) |ordinal, key| {
+                if (key) |id| try keys.append(temp, .{ .id = id, .ordinal = ordinal });
+            }
+            std.mem.sort(Candidate, keys.items, options.primary_key_reverse, Candidate.less);
+            const owner_range = self.db.core.byteRange();
+            var last: ?[]const u8 = null;
+            for (keys.items) |candidate| {
+                const id = candidate.id;
+                try db_query_search.checkSearchRequestDeadline(self.req);
+                if (last) |prior| if (std.mem.eql(u8, prior, id)) continue;
+                last = id;
+                if (!owner_range.contains(id)) continue;
+                if (options.primary_key_start_after) |after| if (!std.mem.lessThan(u8, after, id)) continue;
+                if (options.primary_key_stop_before) |before| if (!std.mem.lessThan(u8, id, before)) continue;
+                if (try self.visitIdWithOrdinal(id, candidate.ordinal, true) == .stop) return true;
+            }
+            return true;
         }
 
         fn scanSourcePopulation(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !void {
@@ -49067,6 +49136,10 @@ pub const DB = struct {
                             return .stop;
                         }
                     }
+                    // A full batch that did not fill the page encountered
+                    // rejected rows. Amortize subsequent identity probes.
+                    if (source_batch.len == source_batch.batch_size)
+                        source_batch.batch_size = @min(source_batch.keys.len, source_batch.batch_size * 2);
                     source_batch.len = 0;
                     _ = source_batch.arena.reset(.retain_capacity);
                     return .@"continue";
@@ -49205,10 +49278,15 @@ pub const DB = struct {
         }
 
         fn visitId(self: *@This(), id: []const u8, unique: bool) !docstore_mod.DocStore.ScanAction {
+            return self.visitIdWithOrdinal(id, null, unique);
+        }
+
+        fn visitIdWithOrdinal(self: *@This(), id: []const u8, known_ordinal: ?doc_set.DocOrdinal, unique: bool) !docstore_mod.DocStore.ScanAction {
             const ordinal = identity: {
                 var txn = try self.db.core.store.beginProbeTxn();
                 defer txn.abort();
                 if (!try sourcePresent(self.alloc, &txn, id)) return .@"continue";
+                if (known_ordinal) |value| break :identity value;
                 const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, &txn, id)) orelse break :identity null;
                 const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse break :identity null;
                 if (!(if (self.req.identity_read_generation) |at| state.isVisibleAt(at) else state.isLive())) break :identity null;
@@ -157654,6 +157732,40 @@ test "optional numeric range keeps mixed primary matches for native field sortin
         }, unordered_executor);
         defer unordered.deinit();
         try std.testing.expectEqual(@as(u32, 2), unordered.total_hits);
+
+        const mapped_live_key = try internal_keys.identityLiveDocToOrdinalKeyAlloc(a, "mapped");
+        defer a.free(mapped_live_key);
+        const mapped_live_value = value: {
+            var txn = try db.core.store.beginProbeTxn();
+            defer txn.abort();
+            break :value try a.dupe(u8, try txn.get(mapped_live_key));
+        };
+        defer a.free(mapped_live_value);
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.delete(mapped_live_key);
+            try txn.commit();
+        }
+        var mapped_scope = doc_set.ResolvedDocFilter{ .include = try doc_set.fromOrdinalsAlloc(a, &.{mapped_ordinal}) };
+        defer mapped_scope.deinit(a);
+        for ([_][]const types.SortField{ &.{}, &.{.{ .field = "_id" }} }) |order| {
+            var scoped = try db_query_search.searchMatchAll(a, .{
+                .limit = 1,
+                .include_stored = false,
+                .resolved_doc_filter = &mapped_scope,
+                .order_by = order,
+            }, unordered_executor);
+            defer scoped.deinit();
+            try std.testing.expectEqual(@as(usize, 1), scoped.hits.len);
+            try std.testing.expectEqualStrings("mapped", scoped.hits[0].id);
+        }
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(mapped_live_key, mapped_live_value);
+            try txn.commit();
+        }
 
         const StopAfterOne = struct {
             fn visit(raw: ?*anyopaque, _: []const u8, _: ?doc_set.DocOrdinal, _: bool) !docstore_mod.DocStore.ScanAction {

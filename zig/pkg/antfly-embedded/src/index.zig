@@ -2495,15 +2495,16 @@ pub const IndexSnapshot = struct {
     }
 
     pub fn collectGraphKeyFrontierDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl) !GraphFrontierDocs {
-        return try self.collectKeyDocNumsAlloc(alloc, frontier, control, false, false);
+        return try self.collectKeyDocNumsAlloc(alloc, frontier, control, false, null);
     }
 
-    pub fn collectSortKeyFrontierDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl) !GraphFrontierDocs {
-        return self.collectKeyDocNumsAlloc(alloc, frontier, control, false, true);
+    pub fn collectSortKeyFrontierDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl, projection: *SortOrdinalBatchProjection) !GraphFrontierDocs {
+        projection.key_batches +|= 1;
+        return self.collectKeyDocNumsAlloc(alloc, frontier, control, false, projection);
     }
 
     pub fn collectParentKeyDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl) !GraphFrontierDocs {
-        return try self.collectKeyDocNumsAlloc(alloc, frontier, control, true, false);
+        return try self.collectKeyDocNumsAlloc(alloc, frontier, control, true, null);
     }
 
     fn storedProjectionKey(alloc: Allocator, key: []const u8, match_parent: bool) ![]const u8 {
@@ -2536,7 +2537,7 @@ pub const IndexSnapshot = struct {
         scratch: *segment_mod.SegmentReadScratch,
         match_parent: bool,
         control: query_mod.ExecutionControl,
-        require_managed_build: bool,
+        sort_projection: ?*SortOrdinalBatchProjection,
     ) !?*StoredKeyDirectory {
         const shared = segment.shared;
         const mode = @intFromBool(match_parent);
@@ -2561,9 +2562,13 @@ pub const IndexSnapshot = struct {
                 shared.stored_key_directory_lock.unlock();
                 return directory;
             }
-            if (require_managed_build and manager == null) {
-                shared.stored_key_directory_lock.unlock();
-                return null;
+            if (sort_projection) |projection| {
+                // A single batch is cheaper as a bounded scan on a cold
+                // segment. Only recurring lookups can amortize the sort.
+                if (projection.key_batches < 2 or manager == null) {
+                    shared.stored_key_directory_lock.unlock();
+                    return null;
+                }
             }
             if (flight_slot.*) |active| {
                 _ = active.refs.fetchAdd(1, .monotonic);
@@ -2620,7 +2625,7 @@ pub const IndexSnapshot = struct {
             if (io) |runtime| flight.ready.set(runtime);
             flight.release(shared.allocator);
         }
-        directory_out = buildStoredKeyDirectory(segment, scratch, match_parent, manager, room, control) catch |err| {
+        directory_out = buildStoredKeyDirectory(segment, scratch, match_parent, manager, room, control, sort_projection) catch |err| {
             failure = err;
             return err;
         };
@@ -2634,6 +2639,7 @@ pub const IndexSnapshot = struct {
         manager: ?*resource_manager_mod.ResourceManager,
         room: usize,
         control: query_mod.ExecutionControl,
+        sort_projection: ?*SortOrdinalBatchProjection,
     ) !?*StoredKeyDirectory {
         var reservation: ?resource_manager_mod.Reservation = if (manager) |owner|
             owner.reserveWithoutReclaim(.graph_predicate_cache, room + @sizeOf(StoredKeyDirectory)) catch return null
@@ -2646,6 +2652,7 @@ pub const IndexSnapshot = struct {
         const alloc = segment.shared.allocator;
         const entries = alloc.alloc(StoredKeyDirectory.Entry, segment.reader.doc_count) catch return null;
         defer if (!published) alloc.free(entries);
+        if (sort_projection) |projection| try projection.chargeScan(segment.reader.doc_count);
         var used: usize = 0;
         for (0..segment.reader.doc_count) |i| {
             if (i % 256 == 0) try control.check();
@@ -2671,7 +2678,8 @@ pub const IndexSnapshot = struct {
         return directory;
     }
 
-    fn collectKeyDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl, match_parent: bool, prefer_directory: bool) !GraphFrontierDocs {
+    fn collectKeyDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl, match_parent: bool, sort_projection: ?*SortOrdinalBatchProjection) !GraphFrontierDocs {
+        const prefer_directory = sort_projection != null;
         var docs = GraphFrontierDocs.init(alloc);
         errdefer docs.deinit();
         if (frontier.count() == 0) return docs;
@@ -2696,7 +2704,7 @@ pub const IndexSnapshot = struct {
                 .newest_by_key = if (prefer_directory) &newest_by_key else null,
             };
             if (prefer_directory or frontier.count() *| 8 < segment.reader.doc_count) {
-                if (try self.storedKeyDirectory(lease.entry, &scratch, match_parent, control, prefer_directory)) |directory| {
+                if (try self.storedKeyDirectory(lease.entry, &scratch, match_parent, control, sort_projection)) |directory| {
                     defer directory.release();
                     var wanted = frontier.iterator();
                     while (wanted.next()) |entry| {
@@ -2728,6 +2736,7 @@ pub const IndexSnapshot = struct {
                     try keys.put(alloc, entry.value_ptr.*, entry.key_ptr.*);
                 }
             }
+            if (sort_projection) |projection| try projection.chargeScan(segment.reader.doc_count);
             for (0..segment.reader.doc_count) |i| {
                 if (i % 256 == 0) try control.check();
                 const doc: u32 = @intCast(i);
@@ -2791,9 +2800,19 @@ pub const IndexSnapshot = struct {
     /// Request-local fallback for cursor counts. Seek modern sidecars and
     /// read each legacy ordinal sidecar at most once across all batches.
     pub const SortOrdinalBatchProjection = struct {
+        const fallback_ordinal_limit = 4096;
+        remaining_scan_rows: u64 = 0,
+        key_batches: u64 = 0,
+        attempted_navigation: bool = false,
+        navigation: ?*GraphOrdinalNavigation = null,
         fallback: std.AutoHashMapUnmanaged(u32, u32) = .empty,
         scanned: std.DynamicBitSetUnmanaged = .{},
         bounds: []?segment_mod.InverseDocOrdinalReader.OrdinalBounds = &.{},
+
+        fn chargeScan(self: *@This(), rows: u32) !void {
+            if (rows > self.remaining_scan_rows) return error.QueryCandidateBudgetExceeded;
+            self.remaining_scan_rows -= rows;
+        }
 
         fn firstAtLeast(values: []const u32, target: u64) usize {
             var low: usize = 0;
@@ -2806,6 +2825,7 @@ pub const IndexSnapshot = struct {
         }
 
         pub fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.navigation) |navigation| navigation.release();
             self.fallback.deinit(alloc);
             self.scanned.deinit(alloc);
             alloc.free(self.bounds);
@@ -2814,13 +2834,17 @@ pub const IndexSnapshot = struct {
         pub fn project(
             self: *@This(),
             alloc: Allocator,
-            snapshot: *const IndexSnapshot,
+            snapshot: *IndexSnapshot,
             ordinals: []const u32,
             control: query_mod.ExecutionControl,
         ) !GraphFrontierDocs {
             var out = GraphFrontierDocs.init(alloc);
             errdefer out.deinit();
             if (ordinals.len == 0) return out;
+            if (self.navigation) |navigation| {
+                try addNavigation(snapshot, alloc, navigation, ordinals, control, &out);
+                return out;
+            }
             if (self.scanned.capacity() == 0) {
                 self.scanned = try .initEmpty(alloc, snapshot.segments.len);
                 self.bounds = try alloc.alloc(?segment_mod.InverseDocOrdinalReader.OrdinalBounds, snapshot.segments.len);
@@ -2850,6 +2874,19 @@ pub const IndexSnapshot = struct {
                     while (matches.next()) |match| try out.add(match.key_ptr.*, match.value_ptr.*);
                     continue;
                 }
+                const retain_segment = segment.reader.doc_count <= fallback_ordinal_limit -| self.fallback.count();
+                if (!retain_segment and !self.attempted_navigation) {
+                    self.attempted_navigation = true;
+                    self.navigation = snapshot.graphOrdinalNavigation(control) catch |err| switch (err) {
+                        error.OutOfMemory, error.InvalidSegment, error.CrcMismatch => null,
+                        else => return err,
+                    };
+                    if (self.navigation) |navigation| {
+                        try addNavigation(snapshot, alloc, navigation, ordinals, control, &out);
+                        return out;
+                    }
+                }
+                try self.chargeScan(segment.reader.doc_count);
                 try lease.entry.shared.lockDeletionSharedWithControl(control);
                 defer lease.entry.shared.unlockDeletionShared();
                 var cursor = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
@@ -2858,16 +2895,35 @@ pub const IndexSnapshot = struct {
                     const local: u32 = @intCast(doc);
                     if (lease.entry.shared.deleted) |deleted| if (deleted.contains(local)) continue;
                     const ordinal = (try cursor.get(local)) orelse continue;
-                    const slot = try self.fallback.getOrPut(alloc, ordinal);
                     const global = offset + local;
-                    if (!slot.found_existing or slot.value_ptr.* < global) slot.value_ptr.* = global;
+                    if (retain_segment) {
+                        const slot = try self.fallback.getOrPut(alloc, ordinal);
+                        if (!slot.found_existing or slot.value_ptr.* < global) slot.value_ptr.* = global;
+                    } else {
+                        const i_ordinal = firstAtLeast(sorted, ordinal);
+                        if (i_ordinal < sorted.len and sorted[i_ordinal] == ordinal) try out.add(global, ordinal);
+                    }
                 }
-                self.scanned.set(i);
+                if (retain_segment) self.scanned.set(i);
             }
             for (ordinals) |ordinal| {
                 if (self.fallback.get(ordinal)) |doc| try out.add(doc, ordinal);
             }
             return out;
+        }
+
+        fn addNavigation(
+            snapshot: *const IndexSnapshot,
+            alloc: Allocator,
+            navigation: *const GraphOrdinalNavigation,
+            ordinals: []const u32,
+            control: query_mod.ExecutionControl,
+            out: *GraphFrontierDocs,
+        ) !void {
+            var frontier: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer frontier.deinit(alloc);
+            for (ordinals) |ordinal| try frontier.put(alloc, ordinal, {});
+            try snapshot.addGraphNavigationFrontier(navigation, frontier, control, out);
         }
 
         fn seekBounded(
