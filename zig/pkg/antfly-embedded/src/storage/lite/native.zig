@@ -7417,6 +7417,9 @@ pub const NativeFile = struct {
     /// record exists): null until first looked up, then kept current by the
     /// shrink and its resume (`redoReservationReleasePending`).
     redo_reservation_release_pending: ?bool = null,
+    /// Test-only: this handle behaves as if no shared lock region were
+    /// usable (a read-only or uncooperative filesystem).
+    test_region_unusable: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     /// Test-only: fail the writer-authority resync's durability barrier.
     test_fail_redo_resync_sync: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
     /// Test-only: fail the fold's log erase after its first zero block.
@@ -8057,6 +8060,10 @@ pub const NativeFile = struct {
         }
     };
 
+    /// The most record payload bytes a later opener copies while scanning to
+    /// catch the shared overlay up without rereading the log.
+    const cold_catch_up_stage_limit: usize = 8 * 1024 * 1024;
+
     /// How long a cold open waits for a sidecar-only writer to publish the
     /// watermark of a region nothing has published to yet.
     const cold_publish_wait_polls: u32 = 100;
@@ -8353,35 +8360,74 @@ pub const NativeFile = struct {
                 // the overlay lock, and nothing is when the overlay is current,
                 // so this open never stalls overlay readers for a full scan.
                 const have_through = @max(existing_overlay.appliedThrough(), existing_overlay.decodedThrough());
+                // Copies of the records the overlay lacks, kept during the one
+                // unlocked read so installing them never rereads the log.
+                // Bounded: past `cold_catch_up_stage_limit` (or on an
+                // allocation failure) the rest is replayed from the log
+                // under the lock instead.
                 const Visit = struct {
                     meta: *MetaCtx,
                     have_through: u64,
-                    first_missing: ?u64 = null,
+                    allocator: Allocator,
+                    staged: std.ArrayListUnmanaged(struct { sequence: u64, payload: []u8 }) = .empty,
+                    staged_bytes: usize = 0,
+                    overflow_offset: ?u64 = null,
                     fn onRecord(ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
                         const visit: *@This() = @ptrCast(@alignCast(ptr.?));
                         try MetaCtx.onRecord(visit.meta, record);
-                        if (visit.first_missing == null and record.commit_sequence > visit.have_through) visit.first_missing = record.offset;
+                        if (record.commit_sequence <= visit.have_through or visit.overflow_offset != null) return;
+                        if (visit.staged_bytes + record.payload.len > cold_catch_up_stage_limit) {
+                            visit.overflow_offset = record.offset;
+                            return;
+                        }
+                        visit.staged.ensureUnusedCapacity(visit.allocator, 1) catch {
+                            visit.overflow_offset = record.offset;
+                            return;
+                        };
+                        const copy = visit.allocator.dupe(u8, record.payload) catch {
+                            visit.overflow_offset = record.offset;
+                            return;
+                        };
+                        visit.staged.appendAssumeCapacity(.{ .sequence = record.commit_sequence, .payload = copy });
+                        visit.staged_bytes += copy.len;
+                    }
+                    fn deinit(visit: *@This()) void {
+                        for (visit.staged.items) |item| visit.allocator.free(item.payload);
+                        visit.staged.deinit(visit.allocator);
                     }
                 };
-                var visit: Visit = .{ .meta = &meta_ctx, .have_through = have_through };
+                var visit: Visit = .{ .meta = &meta_ctx, .have_through = have_through, .allocator = allocator };
+                defer visit.deinit();
                 meta_outcome = try redo_log.replayBounded(allocator, self.file, io, self.header.redo_log_offset + fold_start, self.header.redo_log_capacity - fold_start, folded_through, ceiling, scan_check.covered, Visit.onRecord, &visit);
                 meta_outcome.valid_bytes += fold_start;
-                if (visit.first_missing) |missing_offset| {
+                if (visit.staged.items.len != 0 or visit.overflow_offset != null) {
                     const Install = struct {
                         file: *NativeFile,
                         io: std.Io,
-                        start_offset: u64,
+                        visit: *Visit,
+                        fold_start: u64,
                         floor: u64,
                         ceiling: u64,
                         covered: u64,
-                        outcome: redo_log.ReplayOutcome = undefined,
+                        decoded: u64 = 0,
                         fn run(ctx: *@This(), overlay: *redo_overlay.SharedRedoOverlay) anyerror!void {
-                            ctx.outcome = try replayIntoSharedOverlayFrom(ctx.file, ctx.io, overlay, ctx.start_offset, ctx.floor, ctx.ceiling, ctx.covered);
+                            var through = @max(ctx.floor, overlay.appliedThrough(), overlay.decodedThrough());
+                            for (ctx.visit.staged.items) |item| {
+                                if (item.sequence <= through) continue;
+                                try applyRedoRecordToOverlay(overlay, item.sequence, item.payload);
+                                overlay.noteDecoded(item.sequence);
+                                through = item.sequence;
+                                ctx.decoded += 1;
+                            }
+                            if (ctx.visit.overflow_offset) |offset| {
+                                const outcome = try replayIntoSharedOverlayFrom(ctx.file, ctx.io, overlay, ctx.fold_start + offset, through, ctx.ceiling, ctx.covered);
+                                ctx.decoded += outcome.valid_count;
+                            } else if (ctx.decoded != 0) _ = overlay.replay_epoch.fetchAdd(1, .acq_rel);
                         }
                     };
-                    var install: Install = .{ .file = self, .io = io, .start_offset = fold_start + missing_offset, .floor = @max(folded_through, have_through), .ceiling = ceiling, .covered = scan_check.covered };
+                    var install: Install = .{ .file = self, .io = io, .visit = &visit, .fold_start = fold_start, .floor = @max(folded_through, have_through), .ceiling = ceiling, .covered = scan_check.covered };
                     try inode_lock.withRedoOverlayLock(entry, io, &install, Install.run);
-                    if (install.outcome.valid_count != 0) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
+                    if (install.decoded != 0) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
                 }
                 overlay_caught_up = true;
             } else {
@@ -10249,12 +10295,28 @@ pub const NativeFile = struct {
             redo.tail_source = .own;
             self.publishRedoLogState();
         }
-        const region = (self.regionForInode() catch null) orelse return;
-        const torn = region.readLogStateChecked() == null;
+        // Without a usable region there is no publication to check against,
+        // but an unknown tail must still be rebuilt from the log before an
+        // append: nothing below needs the region except that check.
+        const region = self.regionForInode() catch null;
+        const torn = if (region) |r| r.readLogStateChecked() == null else false;
         if (torn) redo.tail_source = .unknown;
         if (redo.tail_source == .own) return;
         const io = self.runtimeIo();
         const entry = self.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
+        // Another handle may have shrunk or moved the log (a shrink whose
+        // smaller header landed while its fold boundary stayed put): append
+        // only inside the geometry the disk header names now.
+        {
+            var geometry_bytes: [header_size]u8 = undefined;
+            try readHeaderExactAt(self.file, io, &geometry_bytes);
+            const geometry = try decodeHeader(&geometry_bytes);
+            if (geometry.redo_log_offset != self.header.redo_log_offset or geometry.redo_log_capacity != self.header.redo_log_capacity) {
+                self.header.redo_log_offset = geometry.redo_log_offset;
+                self.header.redo_log_capacity = geometry.redo_log_capacity;
+                self.rebindRedoWriterToHeader();
+            }
+        }
         // What the checkpoint already covers without a log record: the fold
         // boundary, and on a rebuild the on-disk slot's own commits (a
         // ledger-only or bare-slot publication logs nothing).
@@ -10284,8 +10346,10 @@ pub const NativeFile = struct {
         // One validated pass decodes the suffix straight into the shared
         // overlay. Nothing reads it yet: no instance's read mark passes its
         // sequences until this writer advances `durable_sequence` after the
-        // barrier below. A retry after a failed barrier skips what this pass
-        // already decoded (`SharedRedoOverlay.decodedThrough`).
+        // barrier below. The scan itself counts every record past this
+        // writer's position (so a retry after a failed barrier still finds
+        // the suffix and syncs it); only the decode skips what an earlier
+        // attempt already decoded (`SharedRedoOverlay.decodedThrough`).
         const Scan = struct {
             file: *NativeFile,
             io: std.Io,
@@ -10294,21 +10358,40 @@ pub const NativeFile = struct {
             unlogged_through: u64,
             outcome: redo_log.ReplayOutcome = undefined,
             fn run(ctx: *@This(), overlay: *redo_overlay.SharedRedoOverlay) anyerror!void {
-                ctx.outcome = try replayIntoSharedOverlayFrom(ctx.file, ctx.io, overlay, ctx.start_offset, ctx.floor, null, ctx.unlogged_through);
+                const Visit = struct {
+                    overlay: *redo_overlay.SharedRedoOverlay,
+                    have_through: u64,
+                    decoded: u64 = 0,
+                    fn onRecord(ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
+                        const visit: *@This() = @ptrCast(@alignCast(ptr.?));
+                        if (record.commit_sequence <= visit.have_through) return;
+                        try applyRedoRecordToOverlay(visit.overlay, record.commit_sequence, record.payload);
+                        visit.overlay.noteDecoded(record.commit_sequence);
+                        visit.decoded += 1;
+                    }
+                };
+                var visit: Visit = .{ .overlay = overlay, .have_through = @max(overlay.appliedThrough(), overlay.decodedThrough()) };
+                const file = ctx.file;
+                if (ctx.start_offset > file.header.redo_log_capacity) return error.NativeRedoLogCorrupt;
+                ctx.outcome = try redo_log.replayBounded(file.allocator, file.file, ctx.io, file.header.redo_log_offset + ctx.start_offset, file.header.redo_log_capacity - ctx.start_offset, ctx.floor, null, ctx.unlogged_through, Visit.onRecord, &visit);
+                ctx.outcome.valid_bytes += ctx.start_offset;
+                if (visit.decoded != 0) _ = overlay.replay_epoch.fetchAdd(1, .acq_rel);
             }
         };
         var scan_ctx: Scan = .{ .file = self, .io = io, .start_offset = start_offset, .floor = floor, .unlogged_through = covered };
         try inode_lock.withRedoOverlayLock(entry, io, &scan_ctx, Scan.run);
         const scan = scan_ctx.outcome;
-        const published = region.readLogStateChecked();
+        const published = if (region) |r| r.readLogStateChecked() else null;
         if (scan.stop_reason == .corrupt_record) {
             if (!try discardTornRedoAppend(self.file, io, self.header.redo_log_offset, capacity, scan, covered, published)) return error.NativeRedoLogCorrupt;
         }
         // Whatever stopped the scan (zeros, a short read, corruption), the
         // log must still hold everything the watermark promised as durable.
         // A torn watermark's raw fields each hold a value once published.
-        const promised = published orelse region.readLogStateRaw();
-        if (@max(scan.last_sequence orelse 0, covered) < promised.durable_sequence) return error.NativeRedoLogCorrupt;
+        const promised: ?shared_lock_region.Region.LogState = if (region) |r| (published orelse r.readLogStateRaw()) else null;
+        if (promised) |state| {
+            if (@max(scan.last_sequence orelse 0, covered) < state.durable_sequence) return error.NativeRedoLogCorrupt;
+        }
 
         const found = scan.valid_count != 0 or (!probe and scan.valid_bytes != redo.writer.tail);
         if ((found or torn) and !self.no_sync) {
@@ -10333,7 +10416,7 @@ pub const NativeFile = struct {
         }
         redo.tail_source = .own;
         redo.tail_fold_boundary = redo.checkpoint_sequence;
-        redo.log_reset_generation = @max(redo.log_reset_generation, (published orelse region.readLogStateRaw()).reset_generation);
+        if (promised) |state| redo.log_reset_generation = @max(redo.log_reset_generation, state.reset_generation);
         redo.tail_reset_generation = redo.log_reset_generation;
         if (found or torn) self.publishRedoLogState();
     }
@@ -11239,6 +11322,7 @@ pub const NativeFile = struct {
     /// `OutOfMemory`) propagates instead of being swallowed into a
     /// fallback that would likely fail the same way.
     pub fn regionForInode(self: *NativeFile) !?*shared_lock_region.Region {
+        if (builtin.is_test and self.test_region_unusable) return null;
         const entry = self.inode_lock_ref.load(.acquire) orelse return null;
         return inode_lock.ensureRegion(entry, self.runtime()) catch |err| {
             if (inode_lock.isRegionUnusable(err)) return null;
@@ -39316,4 +39400,84 @@ test "lite redo log a reset retry keeps a record another writer appended unseen 
     try expectRedoDocument(&reopened, "alpha", "one");
     try expectRedoDocument(&reopened, "beta", "two");
     try expectRedoDocument(&reopened, "gamma", "three");
+}
+
+// Without a usable region the resync used to return before rebuilding a tail
+// it had just found stale (a successor reset the log and appended), so the
+// next append went out from the old cursor. It must rebuild from the log.
+test "lite redo log a region-less reset retry rebuilds the tail before appending" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-reset-retry-regionless.aflite");
+    defer a.free(path);
+    {
+        var first = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        defer first.close();
+        try first.beginTransaction();
+        try first.putDocument("alpha", "one");
+        try first.commitTransaction();
+        first.test_fail_redo_log_erase = error.TestInjectedFailure;
+        try std.testing.expectError(error.TestInjectedFailure, first.checkpointRedoLog());
+        {
+            var second = try NativeFile.openWithIo(a, io, path, .{ .externally_locked = true });
+            defer second.close();
+            try second.beginTransaction();
+            try second.putDocument("beta", "two");
+            try second.commitTransaction();
+        }
+        first.test_region_unusable = true;
+        try first.beginTransaction();
+        try std.testing.expect(first.redo.?.pending_log_reset == null);
+        try std.testing.expectEqual(RedoTailSource.own, first.redo.?.tail_source);
+        try first.putDocument("gamma", "three");
+        try first.commitTransaction();
+    }
+    var reopened = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reopened.close();
+    try expectRedoDocument(&reopened, "alpha", "one");
+    try expectRedoDocument(&reopened, "beta", "two");
+    try expectRedoDocument(&reopened, "gamma", "three");
+}
+
+// A takeover whose resync barrier fails leaves the suffix decoded into the
+// overlay. The retry must still find it in the log and run the barrier,
+// rather than treat the decoded records as already applied.
+test "lite redo log a failed takeover barrier is retried even after the suffix was decoded" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-resync-decoded-retry.aflite");
+    defer a.free(path);
+    var beta_sequence: u64 = 0;
+    {
+        var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        defer writer.close();
+        try writer.beginTransaction();
+        try writer.putDocument("alpha", "one");
+        try writer.commitTransaction();
+        const region = (try writer.regionForInode()).?;
+        const published = region.readLogStateChecked().?;
+        try writer.beginTransaction();
+        try writer.putDocument("beta", "two");
+        try writer.commitTransaction();
+        beta_sequence = writer.redo.?.durable_sequence;
+        region.resetLogStateForTest();
+        region.publishLogState(published);
+    }
+    var writer = try NativeFile.openWithIo(a, io, path, .{});
+    defer writer.close();
+    writer.test_fail_redo_resync_sync = error.TestInjectedFailure;
+    try std.testing.expectError(error.TestInjectedFailure, writer.beginTransaction());
+    try writer.beginTransaction();
+    try std.testing.expectEqual(RedoTailSource.own, writer.redo.?.tail_source);
+    // The retried barrier ran and published the recovered suffix.
+    try std.testing.expect(writer.redo.?.durable_sequence >= beta_sequence);
+    try std.testing.expect((try writer.regionForInode()).?.readLogStateChecked().?.durable_sequence >= beta_sequence);
+    try writer.putDocument("gamma", "three");
+    try writer.commitTransaction();
+    try expectRedoDocument(&writer, "beta", "two");
+    try expectRedoDocument(&writer, "gamma", "three");
 }
