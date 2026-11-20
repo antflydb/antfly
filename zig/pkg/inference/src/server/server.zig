@@ -26540,14 +26540,121 @@ pub const Node = struct {
         };
     }
 
+    fn validateChunkOutputManifest(self: *Node, kind: lib_chunker.outputs.Kind, manifest: *const manifest_mod.ModelManifest) !?@import("../models/media_classifier_profile.zig").Profile {
+        if (kind == .transcribe) {
+            const contract = try resolvedInferenceExecutorContract(self, "transcribe", manifest);
+            try validateInferenceExecutorInvocation(contract, .{ .has_audio = true, .item_count = 1, .media_parts_per_item = 1 });
+            return null;
+        }
+        std.debug.assert(kind == .classify);
+        const profile = manifest.media_classifier orelse return error.UnsupportedMediaClassifier;
+        try profile.validate();
+        if (manifest.model_type != .classifier or !manifest.hasCapability("classification") or !manifest.hasTask("classify") or manifest.id2label == null) return error.UnsupportedMediaClassifier;
+        return profile;
+    }
+
+    const catalog_publication = @import("../registry/catalog_publication.zig");
+
+    fn chunkCatalogResponse(self: *Node, ctx: *httpx.Context, observed: catalog_publication.Generation, failure: ?[]const u8) !httpx.Response {
+        catalog_publication.require(ctx.allocator, ctx.io, self.config.models_dir, observed) catch |err| return modelLoadFailureResponse(ctx, err);
+        if (observed.kind != .legacy) {
+            const hex = std.fmt.bytesToHex(observed.digest, .lower);
+            try ctx.setHeader("X-Antfly-Catalog-Publication", try ctx.allocator.dupe(u8, &hex));
+        }
+        if (failure) |code| return ctx.status(404).json(.{ .@"error" = code });
+        try ctx.setHeader("X-Antfly-Inference-Chunk-Boundary-Available", "true");
+        return ctx.status(204).text("");
+    }
+
     pub fn listModels(self: *Node, ctx: *httpx.Context) !httpx.Response {
         try ctx.setHeader("X-Antfly-Generation-Placement-Version", "1");
-        const catalog_publication = @import("../registry/catalog_publication.zig");
         const catalog_generation = catalog_publication.read(ctx.allocator, ctx.io, self.config.models_dir) catch |err| return requestModelResolutionError(ctx, err);
+        if (ctx.header("X-Antfly-Inference-Chunk-Requirements")) |requirements| {
+            if (requirements.len > 128 * 1024) return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+            const parsed = std.json.parseFromSlice([]const []const u8, ctx.allocator, requirements, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" }),
+            };
+            defer parsed.deinit();
+            if (parsed.value.len == 0 or parsed.value.len > 34) return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+            for (parsed.value) |requirement| {
+                const colon = std.mem.indexOfScalar(u8, requirement, ':') orelse return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                const selector = requirement[0..colon];
+                const at = std.mem.indexOfScalar(u8, selector, '@') orelse selector.len;
+                const task = selector[0..at];
+                const pin = if (at == selector.len) null else selector[at + 1 ..];
+                if (pin) |expected| {
+                    if (expected.len != 64) return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                    for (expected) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f'))
+                        return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                }
+                const name = requirement[colon + 1 ..];
+                if (name.len == 0 or name.len > 4096) return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                if (std.mem.eql(u8, task, "diarize")) {
+                    const path = self.resolveChunkSpeakerPath(ctx.allocator, name) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => return self.chunkCatalogResponse(ctx, catalog_generation, "SpeakerModelUnavailable"),
+                    };
+                    defer ctx.allocator.free(path);
+                    if (pin) |expected| {
+                        const identity = self.chunkSpeakerRevision(path, ctx.io, self.bindExecutionControl(ctx.io, .{})) catch |err| return requestModelResolutionError(ctx, err);
+                        if (!std.mem.eql(u8, expected, &identity)) return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkModelIdentityMismatch");
+                    }
+                } else {
+                    const kind: lib_chunker.outputs.Kind = if (std.mem.eql(u8, task, "embed")) .embedding else if (std.mem.eql(u8, task, "transcribe")) .transcribe else if (std.mem.eql(u8, task, "classify")) .classify else return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                    const category = switch (kind) {
+                        .embedding => "embedders",
+                        .transcribe => "transcribers",
+                        .classify => "classifiers",
+                        .diarize => unreachable,
+                    };
+                    const selected = self.resolveRequestModelSelection(ctx.allocator, ctx.io, name, category) catch |err| {
+                        if (requestModelResolutionErrorKind(err) == .missing)
+                            return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkOutputModelUnavailable");
+                        return requestModelResolutionError(ctx, err);
+                    };
+                    defer ctx.allocator.free(selected.path);
+                    const control = selected.bind(self.bindExecutionControl(ctx.io, .{}));
+                    if (kind == .embedding) {
+                        if (pin) |expected| {
+                            const identity = self.model_manager.chunkPlanningIdentityForDiscovery(selected.path, ctx.io, control) catch |err| return requestModelResolutionError(ctx, err);
+                            if (!std.mem.eql(u8, expected, &identity)) return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkModelIdentityMismatch");
+                        }
+                    } else {
+                        var manifest = self.loadBoundManifest(ctx.allocator, selected.path, false, control) catch |err| return requestModelResolutionError(ctx, err);
+                        defer manifest.deinit();
+                        _ = self.validateChunkOutputManifest(kind, &manifest) catch |err| {
+                            if (err == error.OutOfMemory or isModelPublicationError(err)) return requestModelResolutionError(ctx, err);
+                            return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkOutputModelUnsupported");
+                        };
+                        if (pin) |expected| {
+                            const identity = std.fmt.bytesToHex(self.model_manager.modelIdentityForManifest(selected.path, manifest) catch |err| return requestModelResolutionError(ctx, err), .lower);
+                            if (!std.mem.eql(u8, expected, &identity)) return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkModelIdentityMismatch");
+                        }
+                    }
+                }
+            }
+            try ctx.setHeader("X-Antfly-Inference-Chunk-Boundary-Available", "true");
+            if (std.mem.eql(u8, ctx.query("chunk_boundary_probe") orelse "", "1"))
+                return self.chunkCatalogResponse(ctx, catalog_generation, null);
+        } else if (ctx.header("X-Antfly-Inference-Chunk-Boundary")) |boundary| {
+            if (std.mem.startsWith(u8, boundary, "diarize:")) {
+                const name = boundary["diarize:".len..];
+                const path = self.resolveChunkSpeakerPath(ctx.allocator, name) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return self.chunkCatalogResponse(ctx, catalog_generation, "SpeakerModelUnavailable"),
+                };
+                ctx.allocator.free(path);
+                try ctx.setHeader("X-Antfly-Inference-Chunk-Boundary-Available", "true");
+                if (std.mem.eql(u8, ctx.query("chunk_boundary_probe") orelse "", "1"))
+                    return self.chunkCatalogResponse(ctx, catalog_generation, null);
+            }
+        }
         const model = try ctx.queryDecoded("model");
         const task = ctx.query("task");
         const scoped_embedding = if (task != null and std.mem.eql(u8, task.?, "embed")) model else null;
-        const json_body = self.listModelsJsonAllocScoped(ctx.allocator, ctx.io, scoped_embedding) catch |err| {
+        const publication = if (catalog_generation.kind == .legacy) null else std.fmt.bytesToHex(catalog_generation.digest, .lower);
+        const json_body = self.listModelsJsonAllocScoped(ctx.allocator, ctx.io, scoped_embedding, if (publication) |*hex| hex else null) catch |err| {
             if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
             return err;
         };
@@ -26607,10 +26714,10 @@ pub const Node = struct {
     /// (e.g. the antfly server's /connections endpoint) can list the embedded
     /// node's models without going through HTTP. Caller owns the result.
     pub fn listModelsJsonAlloc(self: *Node, a: std.mem.Allocator, io: std.Io) ![]u8 {
-        return self.listModelsJsonAllocScoped(a, io, null);
+        return self.listModelsJsonAllocScoped(a, io, null, null);
     }
 
-    fn listModelsJsonAllocScoped(self: *Node, a: std.mem.Allocator, io: std.Io, scoped_embedding: ?[]const u8) ![]u8 {
+    fn listModelsJsonAllocScoped(self: *Node, a: std.mem.Allocator, io: std.Io, scoped_embedding: ?[]const u8, publication: ?[]const u8) ![]u8 {
         var buf = std.ArrayListUnmanaged(u8).empty;
         defer buf.deinit(a);
         var body = std.ArrayListUnmanaged(u8).empty;
@@ -26970,7 +27077,13 @@ pub const Node = struct {
 
             try body.append(a, '}');
         }
-        try buf.appendSlice(a, "{\"object\":\"list\",\"data\":[");
+        try buf.append(a, '{');
+        if (publication) |token| {
+            try buf.appendSlice(a, "\"catalog_publication\":");
+            try jsonEncodeString(&buf, a, token);
+            try buf.append(a, ',');
+        }
+        try buf.appendSlice(a, "\"object\":\"list\",\"data\":[");
         try buf.appendSlice(a, openai_data.items);
         try buf.appendSlice(a, if (build_options.allow_downloads) "],\"allow_downloads\":true," else "],\"allow_downloads\":false,");
         try buf.appendSlice(a, "\"backends\":{");
@@ -30493,7 +30606,7 @@ fn appendResolvedInferenceCapabilities(
     try buf.appendSlice(allocator, ",\"generation_token_logprobs_v1\":");
     try buf.appendSlice(allocator, if (executor_kind == .native_generation) "true" else "false");
     try buf.appendSlice(allocator, ",\"model_aware_chunking_v1\":");
-    try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed")) "true" else "false");
+    try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed") or std.mem.eql(u8, resolved_task, "chunk")) "true" else "false");
     try buf.appendSlice(allocator, ",\"numeric_responses_v1\":");
     try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed") or std.mem.eql(u8, resolved_task, "rerank")) "true" else "false");
     // `/rerank` accepts `documents` (strings or content parts). Older servers
@@ -49759,13 +49872,7 @@ const MediaOutputExecution = struct {
         } else {
             var manifest = try self.node.loadBoundManifest(a, path, false, selected_control);
             defer manifest.deinit();
-            if (target.kind == .transcribe) {
-                const contract = try resolvedInferenceExecutorContract(self.node, "transcribe", &manifest);
-                try validateInferenceExecutorInvocation(contract, .{ .has_audio = true, .item_count = 1, .media_parts_per_item = 1 });
-            } else {
-                const profile = manifest.media_classifier orelse return error.UnsupportedMediaClassifier;
-                try profile.validate();
-                if (manifest.model_type != .classifier or !manifest.hasCapability("classification") or !manifest.hasTask("classify") or manifest.id2label == null) return error.UnsupportedMediaClassifier;
+            if (try self.node.validateChunkOutputManifest(target.kind, &manifest)) |profile| {
                 classifier_profile = profile;
                 max_audio_ns = profile.max_audio_ns;
                 uses_audio = profile.input == .waveform;

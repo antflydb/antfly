@@ -11948,13 +11948,13 @@ const SharedPdfWindowScheduler = struct {
         const source_url = try extractSourceText(self.runtime.alloc, self.runtime.config, raw, request) orelse return;
         defer self.runtime.alloc.free(source_url);
         consumer.source_identity = PreparedDocumentSourceCache.sourceIdentity(source_url);
-        const execution_lease = try embedder.resolvePartLease(self.runtime.alloc, requestEmbeddingName(request));
+        const policy = try enrichment_types.parseExecutionPolicyJson(self.runtime.alloc, request.execution_json);
+        const execution_lease = try embedder.resolveMediaPartLease(self.runtime.alloc, requestEmbeddingName(request), @min(policy.batch_items orelse generated_ocr_default_batch_max_items, generated_ocr_absolute_batch_max_items));
         const caps = execution_lease.capabilities.?;
         consumer.execution_lease = execution_lease;
         const raster = embedder.supportsRasterItems() and caps.borrowed_rasters;
         if (!caps.supports(.{ .image = true }) or (!raster and !caps.acceptsMimeType("image/png")) or caps.result_cardinality != .one_per_item)
             return error.UnsupportedEmbeddingProvider;
-        const policy = try enrichment_types.parseExecutionPolicyJson(self.runtime.alloc, request.execution_json);
         consumer.max_items = @min(@min(policy.batch_items orelse caps.batch.preferred_items, caps.batch.max_items), generated_ocr_absolute_batch_max_items);
         consumer.max_items = try embedder.withPartLease(execution_lease).partBatchLimit(requestEmbeddingName(request), request.expected_dims, consumer.max_items);
         if (consumer.max_items == 0)
@@ -34199,7 +34199,8 @@ fn processPdfPageImageEmbeddingWithAllocator(
     if (!dense_embedder.supportsPartItems() and !dense_embedder.supportsRasterItems())
         return error.UnsupportedEmbeddingProvider;
     const embedding_name = requestEmbeddingName(request);
-    const execution_lease = try dense_embedder.resolvePartLease(metadata_alloc, embedding_name);
+    const policy = try enrichment_types.parseExecutionPolicyJson(metadata_alloc, request.execution_json);
+    const execution_lease = try dense_embedder.resolveMediaPartLease(metadata_alloc, embedding_name, @min(policy.batch_items orelse generated_ocr_default_batch_max_items, generated_ocr_absolute_batch_max_items));
     const capabilities = execution_lease.capabilities.?;
     const use_borrowed_rasters = dense_embedder.supportsRasterItems() and capabilities.borrowed_rasters;
     if (!capabilities.supports(.{ .image = true }) or
@@ -34208,7 +34209,6 @@ fn processPdfPageImageEmbeddingWithAllocator(
     {
         return error.UnsupportedEmbeddingProvider;
     }
-    const policy = try enrichment_types.parseExecutionPolicyJson(metadata_alloc, request.execution_json);
     const capability_items = @max(@as(usize, 1), capabilities.batch.max_items);
     const default_items = @max(@as(usize, 1), capabilities.batch.preferred_items);
     const batch_items = try dense_embedder.withPartLease(execution_lease).partBatchLimit(embedding_name, request.expected_dims, @min(@min(policy.batch_items orelse default_items, capability_items), generated_ocr_absolute_batch_max_items));

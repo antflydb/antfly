@@ -27302,6 +27302,10 @@ pub const IndexManager = struct {
         // estimate is cached across snapshots; the task allocator still caps
         // real live bytes, including publication and oversized values.
         bytes = try std.math.add(u64, bytes, try seg.typedMergeWorkingSetBytes());
+        // An inverse ordinal directory sorts one pair per live output row.
+        if (layout.doc_ordinals_bytes != 0) {
+            bytes = try std.math.add(u64, bytes, @as(u64, seg.reader.doc_count) * @sizeOf(u64));
+        }
         bytes = try std.math.add(u64, bytes, if (native_scratch) @as(u64, 16 * 1024) else try std.math.mul(u64, layout.doc_ordinals_bytes, 2));
         return bytes;
     }
@@ -28900,6 +28904,7 @@ pub const IndexManager = struct {
                 var projection_doc_limit: usize = 0;
                 var projected_build_bytes: u64 = 0;
                 var projected_segment_bytes: u64 = 0;
+                var projected_witness_bytes: u64 = 0;
                 while (source_end < source_docs_with_ordinals.len) {
                     const projection_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
                     const previous_projection_docs = builder.text_docs.items.len;
@@ -28920,7 +28925,8 @@ pub const IndexManager = struct {
                     const doc_build_bytes = try introducer_mod.estimateTextDocumentBuildMemoryBytes(projection_alloc, projected_doc);
                     const doc_segment_bytes = introducer_mod.estimateTextDocumentSegmentBytes(projected_doc);
                     const next_build_bytes = projected_build_bytes +| doc_build_bytes;
-                    const next_segment_bytes = projected_segment_bytes +| doc_segment_bytes;
+                    const next_witness_bytes = @max(projected_witness_bytes, projected_doc.numericWitnessSegmentBytes());
+                    const next_segment_bytes = projected_segment_bytes +| doc_segment_bytes +| (next_witness_bytes - projected_witness_bytes);
                     if (previous_projection_docs > 0 and (next_build_bytes > target_build_memory_bytes or next_segment_bytes > target_segment_bytes)) {
                         projection_doc_limit = previous_projection_docs;
                         next_source_start = source_end - 1;
@@ -28929,6 +28935,7 @@ pub const IndexManager = struct {
 
                     projected_build_bytes = next_build_bytes;
                     projected_segment_bytes = next_segment_bytes;
+                    projected_witness_bytes = next_witness_bytes;
                     projection_doc_limit = builder.text_docs.items.len;
                     next_source_start = source_end;
                     if (projection_doc_limit >= max_text_projection_docs_per_segment_build) break;
@@ -29692,168 +29699,245 @@ pub const IndexManager = struct {
         index_name: []const u8,
         ordinals: []const doc_identity.DocOrdinal,
     ) ![]const u32 {
-        const bench_profile = getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
-        const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        const runtime_store_ns: u64 = 0;
-        var primary_txn_ns: u64 = 0;
-        var sparse_txn_ns: u64 = 0;
-        var doc_id_ns: u64 = 0;
-        var doc_num_ns: u64 = 0;
-        const entry = self.findSparseIndexEntry(index_name) orelse return error.IndexNotFound;
+        const set = @import("../doc_set.zig").ResolvedDocSet{ .ordinals = ordinals };
+        return try self.lookupSparseDocNumsForOrdinalSetAlloc(alloc, store, index_name, &set, .{});
+    }
 
-        const sparse_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+    pub fn lookupSparseDocNumsForOrdinalSetAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        set: *const @import("../doc_set.zig").ResolvedDocSet,
+        control: @import("../../../search/query.zig").ExecutionControl,
+    ) ![]const u32 {
+        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedQueryRequest;
+        const entry = self.findSparseIndexEntry(index_name) orelse return error.IndexNotFound;
+        try control.check();
         var sparse_txn = try entry.index.beginReadTxn();
         defer sparse_txn.abort();
-        if (bench_profile) sparse_txn_ns = platform_time.monotonicNs() - sparse_txn_start_ns;
+        const direct = entry.chunk_name == null and entry.embedding_names.len == 0;
+        var primary_txn = try store.beginReadTxn();
+        defer primary_txn.abort();
 
-        if (entry.chunk_name == null and entry.embedding_names.len == 0) {
-            var fast_lookup = try entry.index.docNumsForOrdinalDocNumsAlloc(alloc, &sparse_txn, ordinals);
-            defer fast_lookup.deinit(alloc);
-            if (fast_lookup.missing_ordinals.len == 0) {
-                const out = try alloc.dupe(u32, fast_lookup.doc_nums);
-                if (bench_profile) {
-                    std.log.info(
-                        "antfly_bench_sparse_ordinal_projection total_us={d} runtime_store_us={d} primary_txn_us={d} sparse_txn_us={d} doc_id_us={d} doc_num_us={d} ordinals={d} doc_nums={d}",
-                        .{
-                            (platform_time.monotonicNs() - total_start_ns) / 1000,
-                            runtime_store_ns / 1000,
-                            primary_txn_ns / 1000,
-                            sparse_txn_ns / 1000,
-                            doc_id_ns / 1000,
-                            doc_num_ns / 1000,
-                            ordinals.len,
-                            out.len,
-                        },
-                    );
-                }
-                return out;
-            }
-
-            const primary_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            var txn = try store.beginProbeTxn();
-            defer txn.abort();
-            if (bench_profile) primary_txn_ns = platform_time.monotonicNs() - primary_txn_start_ns;
-            const doc_id_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const parent_doc_ids = try lookupSparseProjectionDocIdsForOrdinalsAlloc(alloc, &txn, fast_lookup.missing_ordinals);
-            defer alloc.free(parent_doc_ids);
-            if (bench_profile) doc_id_ns = platform_time.monotonicNs() - doc_id_start_ns;
-            const doc_num_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const fallback_doc_nums = try entry.index.docNumsForDocIdsAlloc(alloc, &sparse_txn, parent_doc_ids);
-            defer alloc.free(fallback_doc_nums);
-            var out = std.ArrayListUnmanaged(u32).empty;
-            errdefer out.deinit(alloc);
-            try out.appendSlice(alloc, fast_lookup.doc_nums);
-            try out.appendSlice(alloc, fallback_doc_nums);
-            const out_slice = try out.toOwnedSlice(alloc);
-            if (bench_profile) {
-                doc_num_ns = platform_time.monotonicNs() - doc_num_start_ns;
-                std.log.info(
-                    "antfly_bench_sparse_ordinal_projection total_us={d} runtime_store_us={d} primary_txn_us={d} sparse_txn_us={d} doc_id_us={d} doc_num_us={d} ordinals={d} doc_nums={d}",
-                    .{
-                        (platform_time.monotonicNs() - total_start_ns) / 1000,
-                        runtime_store_ns / 1000,
-                        primary_txn_ns / 1000,
-                        sparse_txn_ns / 1000,
-                        doc_id_ns / 1000,
-                        doc_num_ns / 1000,
-                        ordinals.len,
-                        out_slice.len,
-                    },
-                );
-            }
-            return out_slice;
+        var out: std.ArrayListUnmanaged(u32) = .empty;
+        errdefer out.deinit(alloc);
+        var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen.deinit(alloc);
+        var miss_budget: ?resource_manager_mod.BudgetedAllocator = if (resource_manager_mod.BudgetedAllocator.fromAllocator(alloc) == null)
+            if (self.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.init(manager, .lsm_read_working_set, alloc, 1) else null
+        else
+            null;
+        defer if (miss_budget) |*budget| budget.deinit();
+        const miss_alloc = if (miss_budget) |*budget| budget.allocator() else alloc;
+        var misses: std.StringHashMapUnmanaged(void) = .empty;
+        defer {
+            var keys = misses.keyIterator();
+            while (keys.next()) |key| miss_alloc.free(key.*);
+            misses.deinit(miss_alloc);
         }
+        const locator_complete = try sparse_mod.SparseIndex.projectionHasCompleteLocatorMap(&sparse_txn);
+        var ordinal_iter = if (set.* == .ordinal_bitmap) set.ordinal_bitmap.iterator() else null;
+        var offset: usize = 0;
+        while (true) {
+            try control.check();
+            var ordinals: [256]doc_identity.DocOrdinal = undefined;
+            var len: usize = 0;
+            if (ordinal_iter) |*it| {
+                while (len < ordinals.len) : (len += 1) ordinals[len] = it.next() orelse break;
+            } else {
+                switch (set.*) {
+                    .ordinals => |entries| {
+                        len = @min(entries.len - offset, ordinals.len);
+                        @memcpy(ordinals[0..len], entries[offset..][0..len]);
+                        offset += len;
+                        ordinal_core.sort(doc_identity.DocOrdinal, ordinals[0..len]);
+                    },
+                    .none => {},
+                    else => return error.InvalidArgument,
+                }
+            }
+            if (len == 0) break;
 
-        const primary_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        var txn = try store.beginReadTxn();
-        defer txn.abort();
-        if (bench_profile) primary_txn_ns = platform_time.monotonicNs() - primary_txn_start_ns;
+            const OrdinalKey = @TypeOf(internal_keys.identityOrdinalToDocKey(0));
+            var storage: [ordinals.len]OrdinalKey = undefined;
+            var keys: [ordinals.len][]const u8 = undefined;
+            var values: [ordinals.len]?[]u8 = @splat(null);
+            var key_count: usize = 0;
+            for (ordinals[0..len], 0..) |ordinal, i| {
+                if (i != 0 and ordinals[i - 1] == ordinal) continue;
+                storage[key_count] = internal_keys.identityOrdinalToDocKey(ordinal);
+                keys[key_count] = &storage[key_count];
+                key_count += 1;
+            }
+            var key_arena = std.heap.ArenaAllocator.init(alloc);
+            defer key_arena.deinit();
+            try primary_txn.getManySortedOwnedScoped(key_arena.allocator(), keys[0..key_count], values[0..key_count]);
+            if (direct) {
+                var present: usize = 0;
+                for (values[0..key_count]) |value| if (value) |key| {
+                    keys[present] = key;
+                    present += 1;
+                };
+                const physical = try entry.index.docNumsForDocIdsDeferredAlloc(alloc, &sparse_txn, keys[0..present], .{ .keys = &misses, .allocator = miss_alloc }, control);
+                defer alloc.free(physical);
+                for (physical) |doc_num| {
+                    const entry_num = try seen.getOrPut(alloc, doc_num);
+                    if (!entry_num.found_existing) try out.append(alloc, doc_num);
+                }
+            } else {
+                for (values[0..key_count]) |maybe_key| {
+                    try control.check();
+                    if (maybe_key) |key| try appendSparseParentProjectionDocNums(alloc, entry, &primary_txn, &sparse_txn, key, &seen, &out, &misses, miss_alloc, locator_complete, control);
+                }
+            }
+        }
+        try entry.index.appendUnmappedDocNums(alloc, &sparse_txn, &misses, miss_alloc, &seen, &out, control);
+        return try out.toOwnedSlice(alloc);
+    }
 
+    pub fn lookupSparseDocNumsForParentKeysAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        keys: []const []const u8,
+    ) ![]const u32 {
+        return try self.lookupSparseDocNumsForParentKeysControlledAlloc(alloc, store, index_name, keys, .{});
+    }
+
+    pub fn lookupSparseDocNumsForParentKeysControlledAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        keys: []const []const u8,
+        control: @import("../../../search/query.zig").ExecutionControl,
+    ) ![]const u32 {
+        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedQueryRequest;
+        const entry = self.findSparseIndexEntry(index_name) orelse return error.IndexNotFound;
+        var sparse_txn = try entry.index.beginReadTxn();
+        defer sparse_txn.abort();
+        if (entry.chunk_name == null and entry.embedding_names.len == 0)
+            return try entry.index.docNumsForDocIdsDeferredAlloc(alloc, &sparse_txn, keys, null, control);
+
+        var primary_txn = try store.beginReadTxn();
+        defer primary_txn.abort();
         var out = std.ArrayListUnmanaged(u32).empty;
         errdefer out.deinit(alloc);
         var seen = std.AutoHashMapUnmanaged(u32, void).empty;
         defer seen.deinit(alloc);
-        for (ordinals) |ordinal| {
-            const parent_doc_id = (try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal)) orelse continue;
-            defer self.alloc.free(parent_doc_id);
-            if (entry.embedding_names.len == 0) {
-                var chunks = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, &txn, parent_doc_id, entry.chunk_name.?);
-                defer chunks.close();
-                while (try chunks.next()) |row| {
-                    if (!internal_keys.matchesChunkArtifactName(row.key, entry.chunk_name.?)) continue;
-                    try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, row.key, &seen, &out);
-                }
-                continue;
-            }
-            const prefix = try internal_keys.documentExactPrefixAlloc(self.alloc, parent_doc_id);
-            defer self.alloc.free(prefix);
-            var cursor = try txn.openPhysicalCursorAdapter();
-            defer cursor.close();
-            var item = try cursor.seekAtOrAfter(prefix);
-            while (item) |row| : (item = try cursor.next()) {
-                if (!std.mem.startsWith(u8, row.key, prefix)) break;
-                var matches_source = false;
-                for (entry.embedding_names) |embedding_name| {
-                    if ((internal_keys.isEmbeddingArtifactKey(row.key) and internal_keys.matchesEmbeddingArtifactName(row.key, embedding_name)) or
-                        (internal_keys.isDerivedEmbeddingArtifactKey(row.key) and internal_keys.matchesDerivedEmbeddingArtifactName(row.key, embedding_name)))
-                    {
-                        matches_source = true;
+        var miss_budget: ?resource_manager_mod.BudgetedAllocator = if (resource_manager_mod.BudgetedAllocator.fromAllocator(alloc) == null)
+            if (self.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.init(manager, .lsm_read_working_set, alloc, 1) else null
+        else
+            null;
+        defer if (miss_budget) |*budget| budget.deinit();
+        const miss_alloc = if (miss_budget) |*budget| budget.allocator() else alloc;
+        var misses: std.StringHashMapUnmanaged(void) = .empty;
+        defer {
+            var remaining = misses.keyIterator();
+            while (remaining.next()) |key| miss_alloc.free(key.*);
+            misses.deinit(miss_alloc);
+        }
+        const locator_complete = try sparse_mod.SparseIndex.projectionHasCompleteLocatorMap(&sparse_txn);
+        for (keys) |key| {
+            try control.check();
+            if (internal_keys.isChunkArtifactRecordKey(key)) {
+                if (entry.chunk_name) |name| {
+                    if (!internal_keys.matchesChunkArtifactName(key, name)) continue;
+                    const parent = (try internal_keys.decodeDocumentComponentAlloc(alloc, key)) orelse continue;
+                    defer alloc.free(parent);
+                    var chunks = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, &primary_txn, parent, name);
+                    defer chunks.close();
+                    while (try chunks.next()) |row| {
+                        try control.check();
+                        const order = std.mem.order(u8, row.key, key);
+                        if (order == .lt) continue;
+                        if (order == .eq) try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, key, &seen, &out, &misses, miss_alloc, locator_complete, control);
                         break;
                     }
                 }
-                if (!matches_source) continue;
-                try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, row.key, &seen, &out);
+                continue;
             }
+            if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
+                if (sparseEmbeddingSourceMatches(entry, key) and try primary_txn.contains(key))
+                    try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, key, &seen, &out, &misses, miss_alloc, locator_complete, control);
+                continue;
+            }
+            try appendSparseParentProjectionDocNums(alloc, entry, &primary_txn, &sparse_txn, key, &seen, &out, &misses, miss_alloc, locator_complete, control);
         }
+        try entry.index.appendUnmappedDocNums(alloc, &sparse_txn, &misses, miss_alloc, &seen, &out, control);
         return try out.toOwnedSlice(alloc);
     }
 
-    fn appendSparseProjectionDocNum(alloc: Allocator, entry: *SparseIndex, txn: anytype, key: []const u8, seen: *std.AutoHashMapUnmanaged(u32, void), out: *std.ArrayListUnmanaged(u32)) !void {
-        // Reuse the query's sparse snapshot, rather than opening one per member
-        // and potentially mixing mappings from different index generations.
-        const doc_num = (entry.index.docNumForDocIdTxn(txn, key) catch |err| switch (err) {
-            error.DocNumOverflow => return,
-            else => return err,
-        }) orelse return;
-        const gop = try seen.getOrPut(alloc, doc_num);
-        if (!gop.found_existing) try out.append(alloc, doc_num);
+    fn appendSparseParentProjectionDocNums(
+        alloc: Allocator,
+        entry: *SparseIndex,
+        primary_txn: *docstore_mod.DocStore.Txn,
+        sparse_txn: anytype,
+        parent_doc_id: []const u8,
+        seen: *std.AutoHashMapUnmanaged(u32, void),
+        out: *std.ArrayListUnmanaged(u32),
+        misses: *std.StringHashMapUnmanaged(void),
+        miss_alloc: Allocator,
+        locator_complete: bool,
+        control: @import("../../../search/query.zig").ExecutionControl,
+    ) !void {
+        if (entry.embedding_names.len == 0) {
+            var chunks = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, primary_txn, parent_doc_id, entry.chunk_name.?);
+            defer chunks.close();
+            while (try chunks.next()) |row| {
+                try control.check();
+                if (!internal_keys.matchesChunkArtifactName(row.key, entry.chunk_name.?)) continue;
+                try appendSparseProjectionDocNum(alloc, entry, sparse_txn, row.key, seen, out, misses, miss_alloc, locator_complete, control);
+            }
+            return;
+        }
+        const prefix = try internal_keys.documentExactPrefixAlloc(alloc, parent_doc_id);
+        defer alloc.free(prefix);
+        var cursor = try primary_txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        var item = try cursor.seekAtOrAfter(prefix);
+        while (item) |row| : (item = try cursor.next()) {
+            try control.check();
+            if (!std.mem.startsWith(u8, row.key, prefix)) break;
+            if (!sparseEmbeddingSourceMatches(entry, row.key)) continue;
+            try appendSparseProjectionDocNum(alloc, entry, sparse_txn, row.key, seen, out, misses, miss_alloc, locator_complete, control);
+        }
     }
 
-    fn lookupSparseProjectionDocIdsForOrdinalsAlloc(alloc: Allocator, txn: anytype, ordinals: []const doc_identity.DocOrdinal) ![]const []const u8 {
-        if (ordinals.len == 0) return try alloc.alloc([]const u8, 0);
-
-        const sorted_ordinals = try alloc.dupe(doc_identity.DocOrdinal, ordinals);
-        defer alloc.free(sorted_ordinals);
-        ordinal_core.sort(doc_identity.DocOrdinal, sorted_ordinals);
-
-        const IdentityOrdinalKey = @TypeOf(internal_keys.identityOrdinalToDocKey(0));
-        var key_storage = try alloc.alloc(IdentityOrdinalKey, sorted_ordinals.len);
-        defer alloc.free(key_storage);
-        var keys = try alloc.alloc([]const u8, sorted_ordinals.len);
-        defer alloc.free(keys);
-        var values = try alloc.alloc(?[]const u8, sorted_ordinals.len);
-        defer alloc.free(values);
-
-        var key_count: usize = 0;
-        var previous: ?doc_identity.DocOrdinal = null;
-        for (sorted_ordinals) |ordinal| {
-            if (previous != null and previous.? == ordinal) continue;
-            key_storage[key_count] = internal_keys.identityOrdinalToDocKey(ordinal);
-            keys[key_count] = key_storage[key_count][0..];
-            values[key_count] = null;
-            key_count += 1;
-            previous = ordinal;
+    fn sparseEmbeddingSourceMatches(entry: *const SparseIndex, key: []const u8) bool {
+        for (entry.embedding_names) |name| {
+            if ((internal_keys.isEmbeddingArtifactKey(key) and internal_keys.matchesEmbeddingArtifactName(key, name)) or
+                (internal_keys.isDerivedEmbeddingArtifactKey(key) and internal_keys.matchesDerivedEmbeddingArtifactName(key, name))) return true;
         }
+        return false;
+    }
 
-        try txn.getManySorted(keys[0..key_count], values[0..key_count]);
-
-        var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer doc_ids.deinit(alloc);
-        try doc_ids.ensureTotalCapacity(alloc, key_count);
-        for (values[0..key_count]) |maybe_raw| {
-            if (maybe_raw) |raw| doc_ids.appendAssumeCapacity(raw);
+    fn appendSparseProjectionDocNum(
+        alloc: Allocator,
+        entry: *SparseIndex,
+        txn: anytype,
+        key: []const u8,
+        seen: *std.AutoHashMapUnmanaged(u32, void),
+        out: *std.ArrayListUnmanaged(u32),
+        misses: *std.StringHashMapUnmanaged(void),
+        miss_alloc: Allocator,
+        locator_complete: bool,
+        control: @import("../../../search/query.zig").ExecutionControl,
+    ) !void {
+        try control.check();
+        switch (entry.index.lookupProjectionDocNum(alloc, txn, key, locator_complete) catch |err| switch (err) {
+            error.DocNumOverflow => return,
+            else => return err,
+        }) {
+            .absent => {},
+            .needs_scan => try sparse_mod.SparseIndex.deferProjectionKey(miss_alloc, misses, key),
+            .found => |doc_num| {
+                const slot = try seen.getOrPut(alloc, doc_num);
+                if (!slot.found_existing) try out.append(alloc, doc_num);
+            },
         }
-        return try doc_ids.toOwnedSlice(alloc);
     }
 
     fn deleteGraphDocsEntry(_: *IndexManager, entry: *GraphIndex, keys: []const []const u8) !void {
@@ -34860,6 +34944,58 @@ pub const IndexManager = struct {
             else => return err,
         };
         return try self.alloc.dupe(u8, raw);
+    }
+
+    pub fn lookupDenseVectorIdsForParentKeysAlloc(self: *IndexManager, alloc: Allocator, store: *docstore_mod.DocStore, name: []const u8, keys: []const []const u8) ![]u64 {
+        const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        var runtime = try initRuntimeStore(self.alloc, store);
+        defer runtime.deinit();
+        var mappings = try runtime.store.beginRead();
+        defer mappings.abort();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer ids.deinit(alloc);
+        for (keys) |key| {
+            var matched_member = false;
+            if (!internal_keys.isInternalUserKey(key)) {
+                if (entry.embedding_names.len != 0) {
+                    const prefix = try internal_keys.documentExactPrefixAlloc(alloc, key);
+                    defer alloc.free(prefix);
+                    var cursor = try read.openPhysicalCursorAdapter();
+                    defer cursor.close();
+                    var item = try cursor.seekAtOrAfter(prefix);
+                    while (item) |row| : (item = try cursor.next()) {
+                        if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                        for (entry.embedding_names) |embedding| {
+                            if (!((internal_keys.isEmbeddingArtifactKey(row.key) and internal_keys.matchesEmbeddingArtifactName(row.key, embedding)) or
+                                (internal_keys.isDerivedEmbeddingArtifactKey(row.key) and internal_keys.matchesDerivedEmbeddingArtifactName(row.key, embedding)))) continue;
+                            if (try self.lookupDenseVectorIdForDocKeyTxn(&mappings, name, row.key)) |id| {
+                                try ids.put(alloc, id, {});
+                                matched_member = true;
+                            }
+                            break;
+                        }
+                    }
+                } else if (entry.chunk_name) |chunk| {
+                    var cursor = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, &read, key, chunk);
+                    defer cursor.close();
+                    while (try cursor.next()) |row| {
+                        if (!internal_keys.matchesChunkArtifactName(row.key, chunk)) continue;
+                        if (try self.lookupDenseVectorIdForDocKeyTxn(&mappings, name, row.key)) |id| {
+                            try ids.put(alloc, id, {});
+                            matched_member = true;
+                        }
+                    }
+                }
+            }
+            if (!matched_member) if (try self.lookupDenseVectorIdForDocKeyTxn(&mappings, name, key)) |id| try ids.put(alloc, id, {});
+        }
+        const result = try alloc.alloc(u64, ids.count());
+        var iter = ids.keyIterator();
+        for (result) |*id| id.* = iter.next().?.*;
+        std.mem.sort(u64, result, {}, std.sort.asc(u64));
+        return result;
     }
 
     pub fn lookupDenseVectorIdsForOrdinalsAlloc(
@@ -41915,6 +42051,12 @@ test "dense index unions multiple embedding artifact sources without overwriting
     // Exercise the generic dispatch path used by enrichment batching. It must
     // preserve artifact identity exactly like the named maintenance API.
     try manager.applyDenseEmbeddingWrites(&store, &writes);
+
+    const parent_vectors = try manager.lookupDenseVectorIdsForParentKeysAlloc(alloc, &store, "document_vectors", &.{doc_key});
+    defer alloc.free(parent_vectors);
+    try std.testing.expectEqual(@as(usize, 2), parent_vectors.len);
+    try std.testing.expect(containsU64(parent_vectors, deterministicDenseVectorId(title_artifact)));
+    try std.testing.expect(containsU64(parent_vectors, deterministicDenseVectorId(body_artifact)));
 
     try std.testing.expect(!entry.supports_unit_grouping);
     try std.testing.expectEqual(@as(u64, 2), entry.index.stats().active_count);
