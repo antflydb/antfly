@@ -144216,6 +144216,11 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             const by_key = try owner.core.index_manager.lookupSparseDocNumsForParentKeysAlloc(a, owner.core.store, "chunk_sparse", &.{ "doc\x00", "doc\x00", "absent" });
             defer a.free(by_key);
             try std.testing.expectEqualSlices(u32, &expected, by_key);
+            const exact_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(a, "doc\x00", "chunks", "z", 0);
+            defer a.free(exact_key);
+            const exact = try owner.core.index_manager.lookupSparseDocNumsForParentKeysAlloc(a, owner.core.store, "chunk_sparse", &.{exact_key});
+            defer a.free(exact);
+            try std.testing.expectEqualSlices(u32, expected[1..], exact);
             var read = try owner.core.store.beginReadTxn();
             defer read.abort();
             var binary = try @import("artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(a, &read, "doc\x00", "fresh\x00");
@@ -157371,6 +157376,33 @@ test "optional numeric range keeps mixed primary matches for native field sortin
         .{ .key = "legacy", .value = "{\"body\":\"beacon\",\"rank\":1}" },
         .{ .key = "mapped", .value = "{\"body\":\"beacon\",\"rank\":2}" },
     } });
+    const text = db.core.index_manager.textIndex("ft").?;
+    {
+        const legacy_ordinal = ordinal: {
+            var read = try db.core.store.beginProbeTxn();
+            defer read.abort();
+            break :ordinal (try doc_identity.lookupOrdinalTxn(a, &read, "legacy")).?;
+        };
+        const deleted = try text.deleteByIdsTracked(&.{ "legacy", "mapped" });
+        defer text.freeDeleteInfos(deleted);
+        const mixed = (try mapper.buildTextSegmentFromDocuments(a, &.{
+            .{ .key = "legacy", .doc_ordinal = legacy_ordinal, .value = "{\"body\":\"beacon\",\"rank\":1}" },
+            .{ .key = "mapped", .value = "{\"body\":\"beacon\",\"rank\":2}" },
+        }, .{}, schema)).?;
+        defer a.free(mixed);
+        try text.indexSegment(mixed);
+        try std.testing.expect(try text.snapshot().hasDocOrdinalCoverage());
+        var sorted = try db_query_search.searchMatchAll(a, .{
+            .index_name = "ft",
+            .limit = 2,
+            .filter_doc_ids = &.{"mapped"},
+            .include_stored = false,
+            .order_by = &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } },
+        }, db.matchAllExecutor());
+        defer sorted.deinit();
+        try std.testing.expectEqual(@as(usize, 1), sorted.hits.len);
+        try std.testing.expectEqualStrings("mapped", sorted.hits[0].id);
+    }
     const forward = try internal_keys.identityDocToOrdinalKeyAlloc(a, "legacy");
     defer a.free(forward);
     const live = try internal_keys.identityLiveDocToOrdinalKeyAlloc(a, "legacy");
@@ -157382,7 +157414,6 @@ test "optional numeric range keeps mixed primary matches for native field sortin
         try txn.delete(live);
         try txn.commit();
     }
-    const text = db.core.index_manager.textIndex("ft").?;
     for ([_]bool{ false, true }) |replace_segment| {
         if (replace_segment) {
             const deletions = try text.deleteByIdsTracked(&.{"legacy"});

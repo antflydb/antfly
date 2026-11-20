@@ -5790,6 +5790,17 @@ pub const SparseIndex = struct {
     }
 
     pub fn docNumsForDocIdsAlloc(self: *SparseIndex, alloc: Allocator, txn: anytype, doc_ids: []const []const u8) ![]const u32 {
+        return try self.docNumsForDocIdsDeferredAlloc(alloc, txn, doc_ids, null, .{});
+    }
+
+    pub fn docNumsForDocIdsDeferredAlloc(
+        self: *SparseIndex,
+        alloc: Allocator,
+        txn: anytype,
+        doc_ids: []const []const u8,
+        deferred_keys: ?*std.StringHashMapUnmanaged(void),
+        control: @import("../search/query.zig").ExecutionControl,
+    ) ![]const u32 {
         if (doc_ids.len == 0) return &.{};
         const complete = try completeLocatorMap(txn);
         var wanted = std.StringHashMapUnmanaged(void).empty;
@@ -5800,6 +5811,7 @@ pub const SparseIndex = struct {
         defer seen.deinit(alloc);
 
         for (doc_ids) |doc_id| {
+            try control.check();
             const gop = try wanted.getOrPut(alloc, doc_id);
             if (gop.found_existing) continue;
             var key_buf: [256]u8 = undefined;
@@ -5827,6 +5839,31 @@ pub const SparseIndex = struct {
         }
         if (wanted.count() == 0) return try out.toOwnedSlice(alloc);
 
+        if (deferred_keys) |deferred| {
+            var missing = wanted.keyIterator();
+            while (missing.next()) |key| {
+                try control.check();
+                if (deferred.contains(key.*)) continue;
+                const copy = try alloc.dupe(u8, key.*);
+                errdefer alloc.free(copy);
+                try deferred.put(alloc, copy, {});
+            }
+        } else {
+            try self.appendUnmappedDocNums(alloc, txn, &wanted, &seen, &out, control);
+        }
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn appendUnmappedDocNums(
+        self: *SparseIndex,
+        alloc: Allocator,
+        txn: anytype,
+        wanted: *std.StringHashMapUnmanaged(void),
+        seen: *std.AutoHashMapUnmanaged(u32, void),
+        out: *std.ArrayListUnmanaged(u32),
+        control: @import("../search/query.zig").ExecutionControl,
+    ) !void {
+        if (wanted.count() == 0) return;
         const LookupContext = struct {
             alloc: Allocator,
             index: *SparseIndex,
@@ -5834,8 +5871,10 @@ pub const SparseIndex = struct {
             wanted: *std.StringHashMapUnmanaged(void),
             seen: *std.AutoHashMapUnmanaged(u32, void),
             out: *std.ArrayListUnmanaged(u32),
+            control: @import("../search/query.zig").ExecutionControl,
 
             fn visit(ctx: *@This(), entry: DocMapLookup) !bool {
+                try ctx.control.check();
                 if (!ctx.wanted.contains(entry.doc_id) or try ctx.index.docNumDeletedChecked(ctx.txn, entry.doc_num)) return false;
                 if (entry.doc_num <= std.math.maxInt(u32)) {
                     const doc_num: u32 = @intCast(entry.doc_num);
@@ -5847,24 +5886,26 @@ pub const SparseIndex = struct {
             }
         };
 
+        var remaining = try wanted.clone(alloc);
+        defer remaining.deinit(alloc);
         var cur = try txn.openCursor();
         defer cur.close();
         var maybe_entry = try cur.seekAtOrAfter(taggedPrefix(key_docmap_segment));
         while (maybe_entry) |entry| {
+            try control.check();
             if (entry.key.len == 0 or entry.key[0] != key_docmap_segment) break;
             var ctx = LookupContext{
                 .alloc = alloc,
                 .index = self,
                 .txn = txn,
-                .wanted = &wanted,
-                .seen = &seen,
-                .out = &out,
+                .wanted = &remaining,
+                .seen = seen,
+                .out = out,
+                .control = control,
             };
             if (try forEachCurrentDocMapEntry(txn, entry.key, entry.value, &ctx, LookupContext.visit)) break;
             maybe_entry = try cur.next();
         }
-
-        return try out.toOwnedSlice(alloc);
     }
 
     pub fn docNumsForOrdinalDocNumsAlloc(self: *SparseIndex, alloc: Allocator, txn: anytype, ordinals: []const u32) !OrdinalDocNumLookup {

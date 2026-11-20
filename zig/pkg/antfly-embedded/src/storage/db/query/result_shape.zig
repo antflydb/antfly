@@ -1501,40 +1501,6 @@ fn appendPatternMatch(alloc: Allocator, matched: *std.ArrayListUnmanaged([]const
     try matched.append(alloc, id);
 }
 
-fn resolvePatternDocIdsFromPublicIdsAlloc(
-    alloc: Allocator,
-    ids: []const []const u8,
-    hits: []const types.SearchHit,
-    generation: ?u64,
-    executor: StoredPatternFilterExecutor,
-    control: @import("../../../search/query.zig").ExecutionControl,
-) !ResolvedPatternDocIds {
-    if (ids.len == 0) return .{ .active = true };
-    const resolve = executor.resolve_doc_ids_to_doc_set orelse return .{ .ids = ids, .active = true };
-    var resolved = try resolve(executor.ctx, alloc, ids, generation);
-    errdefer resolved.deinit(alloc);
-    switch (resolved) {
-        .all => {
-            resolved.deinit(alloc);
-            return .{ .all = true };
-        },
-        .none => {
-            resolved.deinit(alloc);
-            return .{ .active = true };
-        },
-        .doc_keys => |keys| {
-            return .{ .ids = keys, .active = true, .ordinal_set = resolved };
-        },
-        .ordinals, .ordinal_bitmap => {
-            const no_legacy: std.StringHashMapUnmanaged(void) = .empty;
-            var matched = try resolvePatternOrdinalHitsAlloc(alloc, &resolved, &no_legacy, hits, generation, executor, false, control);
-            matched.borrowed_ordinal_set = null;
-            matched.ordinal_set = resolved;
-            return matched;
-        },
-    }
-}
-
 fn allHitsHaveDocOrdinals(hits: []const types.SearchHit) bool {
     for (hits) |hit| {
         if (hit.doc_ordinal == null) return false;
@@ -1646,29 +1612,92 @@ pub fn applyStoredSearchPatternFilters(
         exclude_keys = try patternLegacyMembershipAlloc(alloc, &filter.legacy_exclude, control);
     }
 
-    var resolved_include = if (resolved_filter) |filter|
-        try resolvePatternDocIdsAlloc(alloc, &filter.include, &include_keys, result.hits, req.identity_read_generation, executor, parent_aware, control)
-    else
-        ResolvedPatternDocIds{};
-    defer resolved_include.deinit(alloc);
-
-    var resolved_exclude = if (resolved_filter) |filter|
-        try resolvePatternDocIdsAlloc(alloc, &filter.exclude, &exclude_keys, result.hits, req.identity_read_generation, executor, parent_aware, control)
-    else
-        ResolvedPatternDocIds{};
-    defer resolved_exclude.deinit(alloc);
-
-    var native_include = if (has_positive_doc_ids)
-        try resolvePatternDocIdsFromPublicIdsAlloc(alloc, req.filter_doc_ids, result.hits, req.identity_read_generation, executor, control)
-    else
-        ResolvedPatternDocIds{};
-    defer native_include.deinit(alloc);
-
-    var native_exclude = if (req.exclude_doc_ids.len > 0)
-        try resolvePatternDocIdsFromPublicIdsAlloc(alloc, req.exclude_doc_ids, result.hits, req.identity_read_generation, executor, control)
-    else
-        ResolvedPatternDocIds{};
-    defer native_exclude.deinit(alloc);
+    const keep_hits = try alloc.alloc(bool, result.hits.len);
+    defer alloc.free(keep_hits);
+    @memset(keep_hits, true);
+    if (has_native_doc_ids or resolved_filter != null) {
+        const candidates = try alloc.dupe(types.SearchHit, result.hits);
+        defer alloc.free(candidates);
+        const indexes = try alloc.alloc(usize, candidates.len);
+        defer alloc.free(indexes);
+        for (indexes, 0..) |*index, i| index.* = i;
+        var candidate_len = candidates.len;
+        if ((has_positive_doc_ids and req.filter_doc_ids.len == 0) or
+            (if (resolved_filter) |filter| filter.exclude == .all or (filter.include == .none and include_keys.count() == 0) else false))
+        {
+            @memset(keep_hits, false);
+            candidate_len = 0;
+        }
+        var owned_explicit_include: ?doc_set.ResolvedDocSet = null;
+        defer if (owned_explicit_include) |*set| set.deinit(alloc);
+        var owned_explicit_exclude: ?doc_set.ResolvedDocSet = null;
+        defer if (owned_explicit_exclude) |*set| set.deinit(alloc);
+        const raw_explicit_include = doc_set.ResolvedDocSet{ .doc_keys = req.filter_doc_ids };
+        const raw_explicit_exclude = doc_set.ResolvedDocSet{ .doc_keys = req.exclude_doc_ids };
+        if (candidate_len != 0) {
+            if (executor.resolve_doc_ids_to_doc_set) |resolve| {
+                if (has_positive_doc_ids) owned_explicit_include = try resolve(executor.ctx, alloc, req.filter_doc_ids, req.identity_read_generation);
+                if (req.exclude_doc_ids.len != 0) owned_explicit_exclude = try resolve(executor.ctx, alloc, req.exclude_doc_ids, req.identity_read_generation);
+            }
+        }
+        const no_legacy: std.StringHashMapUnmanaged(void) = .empty;
+        const Gate = struct {
+            operand: ?*const doc_set.ResolvedDocSet,
+            legacy: *const std.StringHashMapUnmanaged(void),
+            shared: bool = false,
+            exclude: bool = false,
+        };
+        const gates = [_]Gate{
+            .{ .operand = if (resolved_filter) |filter| &filter.include else null, .legacy = &include_keys, .shared = true },
+            .{ .operand = if (has_positive_doc_ids) if (owned_explicit_include) |*set| set else &raw_explicit_include else null, .legacy = &no_legacy },
+            .{ .operand = if (resolved_filter) |filter| &filter.exclude else null, .legacy = &exclude_keys, .shared = true, .exclude = true },
+            .{ .operand = if (req.exclude_doc_ids.len != 0) if (owned_explicit_exclude) |*set| set else &raw_explicit_exclude else null, .legacy = &no_legacy, .exclude = true },
+        };
+        // First apply key-only gates and ordinal gates to hits whose ordinal
+        // is already known. Only surviving unresolved hits need rebuilding.
+        for ([_]bool{ true, false }) |cheap| {
+            for (gates) |gate| {
+                if (candidate_len == 0) break;
+                const operand = gate.operand orelse continue;
+                const key_only = operand.* != .ordinals and operand.* != .ordinal_bitmap;
+                if (!cheap and key_only) continue;
+                var resolved = if (cheap and !key_only)
+                    ResolvedPatternDocIds{ .borrowed_ordinal_set = operand, .active = true }
+                else
+                    try resolvePatternDocIdsAlloc(alloc, operand, gate.legacy, candidates[0..candidate_len], req.identity_read_generation, executor, gate.shared and parent_aware, control);
+                defer resolved.deinit(alloc);
+                var surviving: usize = 0;
+                for (candidates[0..candidate_len], indexes[0..candidate_len]) |hit, index| {
+                    try control.check();
+                    if (!key_only and (cheap == (hit.doc_ordinal == null))) {
+                        candidates[surviving] = hit;
+                        indexes[surviving] = index;
+                        surviving += 1;
+                        continue;
+                    }
+                    const parent = if (gate.shared and parent_aware) executor.resolve_parent_id.?(executor.ctx, alloc, hit) catch |err| switch (err) {
+                        error.InvalidChunkArtifact, error.StoredDocMissing => null,
+                        else => return err,
+                    } else null;
+                    defer if (parent) |key| alloc.free(key);
+                    const match_id = parent orelse hit.id;
+                    const matches = resolved.all or if (gate.shared)
+                        gate.legacy.contains(match_id) or
+                            resolvedPatternContainsSharedHit(resolved, hit, match_id)
+                    else
+                        resolvedPatternContainsHit(resolved, hit);
+                    if (matches == gate.exclude) {
+                        keep_hits[index] = false;
+                        continue;
+                    }
+                    candidates[surviving] = hit;
+                    indexes[surviving] = index;
+                    surviving += 1;
+                }
+                candidate_len = surviving;
+            }
+        }
+    }
 
     var filter_query = if (req.filter_query_json.len > 0)
         try std.json.parseFromSlice(std.json.Value, alloc, req.filter_query_json, .{ .parse_numbers = false })
@@ -1731,6 +1760,7 @@ pub fn applyStoredSearchPatternFilters(
     var missing_indices = std.ArrayListUnmanaged(usize).empty;
     defer missing_indices.deinit(alloc);
     for (result.hits, 0..) |hit, i| {
+        if (!keep_hits[i]) continue;
         if (needs_stored and !parent_aware and hit.stored_data == null) try missing_indices.append(alloc, i);
     }
 
@@ -1760,11 +1790,10 @@ pub fn applyStoredSearchPatternFilters(
     // Decide first and commit second. Every fallible parse/load/match happens
     // while the caller still owns an untouched result, so errors preserve the
     // input. The commit phase only moves or destroys already-owned hits.
-    const keep_hits = try alloc.alloc(bool, result.hits.len);
-    defer alloc.free(keep_hits);
     var loaded_missing_index: usize = 0;
     var kept_len: usize = 0;
     for (result.hits, 0..) |hit, i| {
+        if (!keep_hits[i]) continue;
         _ = arena_state.reset(.retain_capacity);
         const hit_alloc = arena_state.allocator();
         const batch_loaded_stored = if (needs_stored and hit.stored_data == null and loaded_many != null) blk: {
@@ -1826,23 +1855,6 @@ pub fn applyStoredSearchPatternFilters(
         const match_id: []const u8 = resolved_match_parent_id orelse hit.id;
 
         var keep = true;
-        if (has_positive_doc_ids) {
-            keep = resolvedPatternContainsHit(native_include, hit);
-        }
-        const legacy_include = include_keys.contains(match_id);
-        const legacy_exclude = exclude_keys.contains(match_id);
-        if (keep and resolved_include.active) {
-            keep = legacy_include or resolvedPatternContainsSharedHit(resolved_include, hit, match_id);
-        }
-        if (keep and req.exclude_doc_ids.len > 0) {
-            keep = !resolvedPatternContainsHit(native_exclude, hit);
-        }
-        if (keep and (resolved_exclude.all or legacy_exclude)) {
-            keep = false;
-        }
-        if (keep and resolved_exclude.active) {
-            keep = !resolvedPatternContainsSharedHit(resolved_exclude, hit, match_id);
-        }
         if (keep and compiled_filter != null) {
             const compiled = compiled_filter.?;
             keep = if (filter_needs_stored and exact_numbers)
@@ -2533,6 +2545,35 @@ test "optional numeric range result membership keeps exceptional keys without re
     defer resolved.deinit(alloc);
     try std.testing.expect(resolvedPatternContainsHit(resolved, hits[1]));
     try std.testing.expect(resolvedPatternContainsHit(resolved, hits[2]));
+}
+
+test "optional numeric range skips reverse exclusions for rejected hits" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        fn failReverse(_: ?*anyopaque, _: Allocator, _: *const doc_set.ResolvedDocSet, _: ?u64) anyerror!?[]const []const u8 {
+            return error.UnexpectedReverseProjection;
+        }
+    };
+    var filter = doc_set.ResolvedDocFilter{ .include = try doc_set.cloneDocKeysAlloc(alloc, &.{"allowed"}) };
+    defer filter.deinit(alloc);
+    filter.exclude = try doc_set.fromOrdinalsAlloc(alloc, &.{9});
+    var raw = types.SearchResult{ .alloc = alloc, .hits = &.{}, .total_hits = 1 };
+    errdefer raw.deinit();
+    const key = try alloc.dupe(u8, "rejected");
+    const hits = alloc.alloc(types.SearchHit, 1) catch |err| {
+        alloc.free(key);
+        return err;
+    };
+    hits[0] = .{ .id = key };
+    raw.hits = hits;
+    var result = try applyStoredSearchPatternFilters(alloc, .{ .resolved_doc_filter = &filter }, raw, .{
+        .ctx = null,
+        .load_stored = TestStoredLoader.loadStored,
+        .resolve_doc_set_doc_ids = Harness.failReverse,
+    });
+    defer result.deinit();
+    raw.hits = &.{};
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
 }
 
 test "applyStoredSearchPatternFilters applies native doc id constraints without stored loads" {

@@ -224,6 +224,7 @@ pub const SegmentShared = struct {
     residency_mutex: std.atomic.Mutex = .unlocked,
     stored_key_directory_lock: std.atomic.Mutex = .unlocked,
     stored_key_directories: [2]?*StoredKeyDirectory = @splat(null),
+    stored_key_directory_building: [2]bool = @splat(false),
     stored_key_directory_manager: ?*resource_manager_mod.ResourceManager = null,
     stored_key_directory_reclaimer: u64 = 0,
     // One process-level accounting owner per physical mapping. The manager
@@ -2513,22 +2514,56 @@ pub const IndexSnapshot = struct {
         control: query_mod.ExecutionControl,
     ) !?*StoredKeyDirectory {
         const shared = segment.shared;
-        const slot = &shared.stored_key_directories[@intFromBool(match_parent)];
-        if (!shared.stored_key_directory_lock.tryLock()) return null;
-        defer shared.stored_key_directory_lock.unlock();
-        if (slot.*) |directory| {
-            _ = directory.refs.fetchAdd(1, .monotonic);
-            return directory;
-        }
-
+        const mode = @intFromBool(match_parent);
+        const slot = &shared.stored_key_directories[mode];
+        const building = &shared.stored_key_directory_building[mode];
         const room = @as(usize, segment.reader.doc_count) * @sizeOf(StoredKeyDirectory.Entry);
         const manager = self.graph_predicates.manager.load(.acquire);
-        if (manager) |owner| {
-            if (shared.stored_key_directory_reclaimer == 0) {
-                shared.stored_key_directory_reclaimer = owner.registerReclaimer(.graph_predicate_cache, shared, reclaimStoredKeyDirectories) catch return null;
-                shared.stored_key_directory_manager = owner;
+        if (manager == null and room > 16 * 1024 * 1024) return null;
+
+        var waited_for_builder = false;
+        while (true) {
+            try control.check();
+            if (!shared.stored_key_directory_lock.tryLock()) {
+                spinOrYield();
+                continue;
             }
-        } else if (room > 16 * 1024 * 1024) return null;
+            if (slot.*) |directory| {
+                _ = directory.refs.fetchAdd(1, .monotonic);
+                shared.stored_key_directory_lock.unlock();
+                return directory;
+            }
+            if (building.*) {
+                waited_for_builder = true;
+                shared.stored_key_directory_lock.unlock();
+                spinOrYield();
+                continue;
+            }
+            if (waited_for_builder) {
+                shared.stored_key_directory_lock.unlock();
+                return null;
+            }
+            if (manager) |owner| {
+                if (shared.stored_key_directory_reclaimer == 0) {
+                    shared.stored_key_directory_reclaimer = owner.registerReclaimer(.graph_predicate_cache, shared, reclaimStoredKeyDirectories) catch {
+                        shared.stored_key_directory_lock.unlock();
+                        return null;
+                    };
+                    shared.stored_key_directory_manager = owner;
+                }
+            }
+            building.* = true;
+            shared.stored_key_directory_lock.unlock();
+            break;
+        }
+        var directory_out: ?*StoredKeyDirectory = null;
+        defer {
+            while (!shared.stored_key_directory_lock.tryLock()) spinOrYield();
+            slot.* = directory_out;
+            building.* = false;
+            shared.stored_key_directory_lock.unlock();
+        }
+
         var reservation: ?resource_manager_mod.Reservation = if (manager) |owner|
             owner.reserveWithoutReclaim(.graph_predicate_cache, room + @sizeOf(StoredKeyDirectory)) catch return null
         else
@@ -2561,7 +2596,7 @@ pub const IndexSnapshot = struct {
         try control.check();
         const directory = alloc.create(StoredKeyDirectory) catch return null;
         directory.* = .{ .entries = entries, .reservation = reservation, .alloc = alloc };
-        slot.* = directory;
+        directory_out = directory;
         published = true;
         return directory;
     }
