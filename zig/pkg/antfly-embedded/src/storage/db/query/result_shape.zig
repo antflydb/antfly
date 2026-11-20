@@ -1362,6 +1362,7 @@ fn containsDocId(doc_ids: []const []const u8, expected: []const u8) bool {
 const ResolvedPatternDocIds = struct {
     ids: []const []const u8 = &.{},
     ordinal_set: ?doc_set.ResolvedDocSet = null,
+    borrowed_ordinal_set: ?*const doc_set.ResolvedDocSet = null,
     active: bool = false,
     all: bool = false,
     owned: bool = false,
@@ -1381,24 +1382,74 @@ fn freeResolvedDocIds(alloc: Allocator, ids: []const []const u8) void {
 fn resolvePatternDocIdsAlloc(
     alloc: Allocator,
     set: *const doc_set.ResolvedDocSet,
+    legacy: *const doc_set.ResolvedDocSet,
     hits: []const types.SearchHit,
     generation: ?u64,
     executor: StoredPatternFilterExecutor,
+    parent_aware: bool,
 ) !ResolvedPatternDocIds {
     return switch (set.*) {
         .all => .{ .all = true },
         .none => .{ .active = true },
         .doc_keys => |keys| .{ .ids = keys, .active = true },
-        .ordinals, .ordinal_bitmap => blk: {
-            if (allHitsHaveDocOrdinals(hits)) break :blk .{
-                .ordinal_set = try doc_set.cloneAlloc(alloc, set),
-                .active = true,
-            };
-            const resolve = executor.resolve_doc_set_doc_ids orelse return error.UnsupportedQueryRequest;
-            const ids = (try resolve(executor.ctx, alloc, set, generation)) orelse return error.UnsupportedQueryRequest;
-            break :blk .{ .ids = ids, .active = true, .owned = true };
-        },
+        .ordinals, .ordinal_bitmap => try resolvePatternOrdinalHitsAlloc(alloc, set, legacy, hits, generation, executor, parent_aware),
     };
+}
+
+fn resolvePatternOrdinalHitsAlloc(
+    alloc: Allocator,
+    set: *const doc_set.ResolvedDocSet,
+    legacy: *const doc_set.ResolvedDocSet,
+    hits: []const types.SearchHit,
+    generation: ?u64,
+    executor: StoredPatternFilterExecutor,
+    parent_aware: bool,
+) !ResolvedPatternDocIds {
+    var matched = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (matched.items) |id| alloc.free(id);
+        matched.deinit(alloc);
+    }
+    var projected: ?[]const []const u8 = null;
+    defer if (projected) |ids| freeResolvedDocIds(alloc, ids);
+    for (hits) |hit| {
+        if (hit.doc_ordinal != null) continue;
+        const parent = if (parent_aware) executor.resolve_parent_id.?(executor.ctx, alloc, hit) catch |err| switch (err) {
+            error.InvalidChunkArtifact, error.StoredDocMissing => null,
+            else => return err,
+        } else null;
+        defer if (parent) |id| alloc.free(id);
+        const key = parent orelse hit.id;
+        if (legacy.* == .doc_keys and containsDocId(legacy.doc_keys, key)) continue;
+
+        const matches = blk: {
+            if (executor.resolve_doc_ids_to_doc_set) |resolve| {
+                var hit_set = try resolve(executor.ctx, alloc, &.{key}, generation);
+                defer hit_set.deinit(alloc);
+                switch (hit_set) {
+                    .none => break :blk false,
+                    .ordinals => {
+                        for (hit_set.ordinals) |ordinal| if (set.containsOrdinal(ordinal)) break :blk true;
+                        break :blk false;
+                    },
+                    else => {},
+                }
+            }
+            // Old rows may have only reverse identity entries. Keep the
+            // compatibility projection for hits that still need that lookup.
+            if (projected == null) {
+                const project = executor.resolve_doc_set_doc_ids orelse return error.UnsupportedQueryRequest;
+                projected = (try project(executor.ctx, alloc, set, generation)) orelse return error.UnsupportedQueryRequest;
+            }
+            break :blk containsDocId(projected.?, key);
+        };
+        if (matches) {
+            const id = try alloc.dupe(u8, hit.id);
+            errdefer alloc.free(id);
+            try matched.append(alloc, id);
+        }
+    }
+    return .{ .borrowed_ordinal_set = set, .ids = try matched.toOwnedSlice(alloc), .active = true, .owned = true };
 }
 
 fn resolvePatternDocIdsFromPublicIdsAlloc(
@@ -1448,11 +1499,14 @@ fn allHitsHaveDocOrdinals(hits: []const types.SearchHit) bool {
 }
 
 fn resolvedPatternContainsHit(resolved: ResolvedPatternDocIds, hit: types.SearchHit) bool {
+    if (resolved.borrowed_ordinal_set) |set| {
+        return if (hit.doc_ordinal) |ordinal| set.containsOrdinal(ordinal) else containsDocId(resolved.ids, hit.id);
+    }
     if (resolved.ordinal_set) |*set| {
         return switch (set.*) {
             .doc_keys => containsDocId(resolved.ids, hit.id),
             .ordinals, .ordinal_bitmap => blk: {
-                const ordinal = hit.doc_ordinal orelse return false;
+                const ordinal = hit.doc_ordinal orelse return containsDocId(resolved.ids, hit.id);
                 break :blk set.containsOrdinal(ordinal);
             },
             .all => true,
@@ -1528,14 +1582,17 @@ pub fn applyStoredSearchPatternFilters(
     const resolved_filter = resolvedDocFilterFromRequest(req);
     if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0 and !has_native_doc_ids and resolved_filter == null) return result;
 
+    const member_mode = req.return_mode == .member or req.return_mode == .chunk;
+    const parent_aware = member_mode and executor.resolve_parent_id != null and executor.load_parent_stored != null;
+
     var resolved_include = if (resolved_filter) |filter|
-        try resolvePatternDocIdsAlloc(alloc, &filter.include, result.hits, req.identity_read_generation, executor)
+        try resolvePatternDocIdsAlloc(alloc, &filter.include, &filter.legacy_include, result.hits, req.identity_read_generation, executor, parent_aware)
     else
         ResolvedPatternDocIds{};
     defer resolved_include.deinit(alloc);
 
     var resolved_exclude = if (resolved_filter) |filter|
-        try resolvePatternDocIdsAlloc(alloc, &filter.exclude, result.hits, req.identity_read_generation, executor)
+        try resolvePatternDocIdsAlloc(alloc, &filter.exclude, &filter.legacy_exclude, result.hits, req.identity_read_generation, executor, parent_aware)
     else
         ResolvedPatternDocIds{};
     defer resolved_exclude.deinit(alloc);
@@ -1594,12 +1651,6 @@ pub fn applyStoredSearchPatternFilters(
     const exact_numbers = (if (compiled_filter) |compiled| compiled.hasStandardRange() else false) or
         (if (compiled_exclusion) |compiled| compiled.hasStandardRange() else false);
 
-    // Member/chunk-mode hits are a separate full-text/vector document from
-    // their parent row: their own stored payload never carries the parent's
-    // fields. When the caller wired parent resolution, match against the
-    // resolved parent row instead of the hit's own stored data (issue #931).
-    const member_mode = req.return_mode == .member or req.return_mode == .chunk;
-    const parent_aware = member_mode and executor.resolve_parent_id != null and executor.load_parent_stored != null;
     // load_parent_stored projects the parent row through the RESPONSE
     // request's own field selection (`req.fields`/`req.include_all_fields`).
     // A predicate field the caller didn't ask back in the response (e.g.
@@ -2389,6 +2440,38 @@ test "applyStoredSearchPatternFilters skips stored loads for doc_id-only filters
     try std.testing.expectEqual(@as(usize, 0), loader.many_calls);
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+test "optional numeric range result membership keeps exceptional keys without reverse projection" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        fn failReverse(_: ?*anyopaque, _: Allocator, _: *const doc_set.ResolvedDocSet, _: ?u64) anyerror!?[]const []const u8 {
+            return error.UnexpectedReverseProjection;
+        }
+
+        fn resolve(_: ?*anyopaque, a: Allocator, keys: []const []const u8, _: ?u64) anyerror!doc_set.ResolvedDocSet {
+            try std.testing.expectEqualSlices(u8, "recoverable", keys[0]);
+            return try doc_set.fromOrdinalsAlloc(a, &.{7});
+        }
+    };
+    var primary = try doc_set.fromOrdinalsAlloc(alloc, &.{ 4, 7 });
+    defer primary.deinit(alloc);
+    var legacy = try doc_set.cloneDocKeysAlloc(alloc, &.{"legacy"});
+    defer legacy.deinit(alloc);
+    const hits: []const types.SearchHit = &.{
+        .{ .id = @constCast("legacy") },
+        .{ .id = @constCast("recoverable") },
+        .{ .id = @constCast("mapped"), .doc_ordinal = 4 },
+    };
+    var resolved = try resolvePatternDocIdsAlloc(alloc, &primary, &legacy, hits, null, .{
+        .ctx = null,
+        .load_stored = TestStoredLoader.loadStored,
+        .resolve_doc_set_doc_ids = Harness.failReverse,
+        .resolve_doc_ids_to_doc_set = Harness.resolve,
+    }, false);
+    defer resolved.deinit(alloc);
+    try std.testing.expect(resolvedPatternContainsHit(resolved, hits[1]));
+    try std.testing.expect(resolvedPatternContainsHit(resolved, hits[2]));
 }
 
 test "applyStoredSearchPatternFilters applies native doc id constraints without stored loads" {

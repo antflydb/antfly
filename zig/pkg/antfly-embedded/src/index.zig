@@ -2447,6 +2447,15 @@ pub const IndexSnapshot = struct {
     }
 
     pub fn collectGraphKeyFrontierDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl) !GraphFrontierDocs {
+        return try self.collectKeyDocNumsAlloc(alloc, frontier, control, false);
+    }
+
+    pub fn collectParentKeyDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl) !GraphFrontierDocs {
+        return try self.collectKeyDocNumsAlloc(alloc, frontier, control, true);
+    }
+
+    fn collectKeyDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl, match_parent: bool) !GraphFrontierDocs {
+        const internal_keys = @import("storage/internal_keys.zig");
         var docs = GraphFrontierDocs.init(alloc);
         errdefer docs.deinit();
         var keys: std.StringHashMapUnmanaged(u32) = .empty;
@@ -2471,7 +2480,11 @@ pub const IndexSnapshot = struct {
                 const doc: u32 = @intCast(i);
                 scratch.reset();
                 const key = (try lease.entry.reader.storedIdScoped(scratch.allocator(), doc)) orelse continue;
-                if (keys.get(key)) |slot| try live.add(offset + doc, slot);
+                const match_key = if (match_parent and (internal_keys.isChunkArtifactRecordKey(key) or internal_keys.isAssetArtifactKey(key) or internal_keys.isDocumentUnitArtifactRecordKey(key)))
+                    (try internal_keys.decodeDocumentComponentAlloc(scratch.allocator(), key)) orelse continue
+                else
+                    key;
+                if (keys.get(match_key)) |slot| try live.add(offset + doc, slot);
             }
         }
         return docs;

@@ -29708,36 +29708,73 @@ pub const IndexManager = struct {
         for (ordinals) |ordinal| {
             const parent_doc_id = (try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal)) orelse continue;
             defer self.alloc.free(parent_doc_id);
-            if (entry.embedding_names.len == 0) {
-                var chunks = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, &txn, parent_doc_id, entry.chunk_name.?);
-                defer chunks.close();
-                while (try chunks.next()) |row| {
-                    if (!internal_keys.matchesChunkArtifactName(row.key, entry.chunk_name.?)) continue;
-                    try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, row.key, &seen, &out);
-                }
-                continue;
-            }
-            const prefix = try internal_keys.documentExactPrefixAlloc(self.alloc, parent_doc_id);
-            defer self.alloc.free(prefix);
-            var cursor = try txn.openPhysicalCursorAdapter();
-            defer cursor.close();
-            var item = try cursor.seekAtOrAfter(prefix);
-            while (item) |row| : (item = try cursor.next()) {
-                if (!std.mem.startsWith(u8, row.key, prefix)) break;
-                var matches_source = false;
-                for (entry.embedding_names) |embedding_name| {
-                    if ((internal_keys.isEmbeddingArtifactKey(row.key) and internal_keys.matchesEmbeddingArtifactName(row.key, embedding_name)) or
-                        (internal_keys.isDerivedEmbeddingArtifactKey(row.key) and internal_keys.matchesDerivedEmbeddingArtifactName(row.key, embedding_name)))
-                    {
-                        matches_source = true;
-                        break;
-                    }
-                }
-                if (!matches_source) continue;
-                try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, row.key, &seen, &out);
-            }
+            try appendSparseParentProjectionDocNums(alloc, entry, &txn, &sparse_txn, parent_doc_id, &seen, &out);
         }
         return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn lookupSparseDocNumsForParentKeysAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        keys: []const []const u8,
+    ) ![]const u32 {
+        const entry = self.findSparseIndexEntry(index_name) orelse return error.IndexNotFound;
+        var sparse_txn = try entry.index.beginReadTxn();
+        defer sparse_txn.abort();
+        if (entry.chunk_name == null and entry.embedding_names.len == 0)
+            return try entry.index.docNumsForDocIdsAlloc(alloc, &sparse_txn, keys);
+
+        var primary_txn = try store.beginReadTxn();
+        defer primary_txn.abort();
+        var out = std.ArrayListUnmanaged(u32).empty;
+        errdefer out.deinit(alloc);
+        var seen = std.AutoHashMapUnmanaged(u32, void).empty;
+        defer seen.deinit(alloc);
+        for (keys) |key| {
+            try appendSparseParentProjectionDocNums(alloc, entry, &primary_txn, &sparse_txn, key, &seen, &out);
+        }
+        return try out.toOwnedSlice(alloc);
+    }
+
+    fn appendSparseParentProjectionDocNums(
+        alloc: Allocator,
+        entry: *SparseIndex,
+        primary_txn: *docstore_mod.DocStore.Txn,
+        sparse_txn: anytype,
+        parent_doc_id: []const u8,
+        seen: *std.AutoHashMapUnmanaged(u32, void),
+        out: *std.ArrayListUnmanaged(u32),
+    ) !void {
+        if (entry.embedding_names.len == 0) {
+            var chunks = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, primary_txn, parent_doc_id, entry.chunk_name.?);
+            defer chunks.close();
+            while (try chunks.next()) |row| {
+                if (!internal_keys.matchesChunkArtifactName(row.key, entry.chunk_name.?)) continue;
+                try appendSparseProjectionDocNum(alloc, entry, sparse_txn, row.key, seen, out);
+            }
+            return;
+        }
+        const prefix = try internal_keys.documentExactPrefixAlloc(alloc, parent_doc_id);
+        defer alloc.free(prefix);
+        var cursor = try primary_txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        var item = try cursor.seekAtOrAfter(prefix);
+        while (item) |row| : (item = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, prefix)) break;
+            var matches_source = false;
+            for (entry.embedding_names) |embedding_name| {
+                if ((internal_keys.isEmbeddingArtifactKey(row.key) and internal_keys.matchesEmbeddingArtifactName(row.key, embedding_name)) or
+                    (internal_keys.isDerivedEmbeddingArtifactKey(row.key) and internal_keys.matchesDerivedEmbeddingArtifactName(row.key, embedding_name)))
+                {
+                    matches_source = true;
+                    break;
+                }
+            }
+            if (!matches_source) continue;
+            try appendSparseProjectionDocNum(alloc, entry, sparse_txn, row.key, seen, out);
+        }
     }
 
     fn appendSparseProjectionDocNum(alloc: Allocator, entry: *SparseIndex, txn: anytype, key: []const u8, seen: *std.AutoHashMapUnmanaged(u32, void), out: *std.ArrayListUnmanaged(u32)) !void {

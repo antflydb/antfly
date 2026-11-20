@@ -47533,6 +47533,7 @@ pub const DB = struct {
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .lookup_doc_nums_for_ordinals = sparseDocNumsForOrdinalsCallback,
+            .lookup_doc_nums_for_parent_keys = sparseDocNumsForParentKeysCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
             .lookup_doc_ordinals = lookupLiveDocOrdinalsNoLockCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
@@ -48743,6 +48744,16 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         try self.failIfIndexQuarantined(index_name);
         return self.core.sparseIndex(index_name);
+    }
+
+    fn sparseDocNumsForParentKeysCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        index_name: []const u8,
+        keys: []const []const u8,
+    ) anyerror![]const u32 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.core.index_manager.lookupSparseDocNumsForParentKeysAlloc(alloc, self.core.store, index_name, keys);
     }
 
     fn sparseDocNumsForOrdinalsCallback(
@@ -144185,6 +144196,9 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             // The retired unit still has a live sparse posting. Filtering must
             // follow logical output membership, not the physical artifact tail.
             try std.testing.expectEqualSlices(u32, &expected, nums);
+            const by_key = try owner.core.index_manager.lookupSparseDocNumsForParentKeysAlloc(a, owner.core.store, "chunk_sparse", &.{ "doc\x00", "doc\x00", "absent" });
+            defer a.free(by_key);
+            try std.testing.expectEqualSlices(u32, &expected, by_key);
             var read = try owner.core.store.beginReadTxn();
             defer read.abort();
             var binary = try @import("artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(a, &read, "doc\x00", "fresh\x00");
@@ -157326,14 +157340,15 @@ test "optional numeric range keeps mixed primary matches for native field sortin
     defer directory.cleanup();
     var db = try DB.open(a, directory.path(), .{});
     defer db.close();
-    try db.setSchema(.{
+    const schema: schema_mod.TableSchema = .{
         .default_type = "doc",
         .full_text_documents = &.{.{ .name = "doc", .fields = &.{
             .{ .path = "body", .emitted_name = "body", .analyzer = "standard" },
         } }},
         .exact_fields = &.{.{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .numeric, .doc_values = true, .sortable = true } }},
         .index_sort = &.{ .{ .field = "rank" }, .{ .field = "_id" } },
-    });
+    };
+    try db.setSchema(schema);
     try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
     try db.batch(.{ .sync_level = .full_index, .writes = &.{
         .{ .key = "legacy", .value = "{\"body\":\"beacon\",\"rank\":1}" },
@@ -157350,17 +157365,31 @@ test "optional numeric range keeps mixed primary matches for native field sortin
         try txn.delete(live);
         try txn.commit();
     }
-    var sorted = try db_query_search.searchMatchAll(a, .{
-        .index_name = "ft",
-        .limit = 2,
-        .include_stored = false,
-        .filter_query_json = "{\"range\":{\"rank\":{\"gte\":1}}}",
-        .order_by = &.{ .{ .field = "rank" }, .{ .field = "_id" } },
-    }, db.matchAllExecutor());
-    defer sorted.deinit();
-    try std.testing.expectEqual(@as(usize, 2), sorted.hits.len);
-    try std.testing.expectEqualStrings("legacy", sorted.hits[0].id);
-    try std.testing.expectEqualStrings("mapped", sorted.hits[1].id);
+    const text = db.core.index_manager.textIndex("ft").?;
+    for ([_]bool{ false, true }) |replace_segment| {
+        if (replace_segment) {
+            const deletions = try text.deleteByIdsTracked(&.{"legacy"});
+            defer text.freeDeleteInfos(deletions);
+            try std.testing.expect(deletions.len != 0);
+            const legacy = (try mapper.buildTextSegmentFromDocuments(a, &.{
+                .{ .key = "legacy", .value = "{\"body\":\"beacon\",\"rank\":1}" },
+            }, .{}, schema)).?;
+            defer a.free(legacy);
+            try text.indexSegment(legacy);
+            try std.testing.expect(!(try text.snapshot().hasDocOrdinalCoverage()));
+        }
+        var sorted = try db_query_search.searchMatchAll(a, .{
+            .index_name = "ft",
+            .limit = 2,
+            .include_stored = false,
+            .filter_query_json = "{\"range\":{\"rank\":{\"gte\":1}}}",
+            .order_by = &.{ .{ .field = "rank" }, .{ .field = "_id" } },
+        }, db.matchAllExecutor());
+        defer sorted.deinit();
+        try std.testing.expectEqual(@as(usize, 2), sorted.hits.len);
+        try std.testing.expectEqualStrings("legacy", sorted.hits[0].id);
+        try std.testing.expectEqualStrings("mapped", sorted.hits[1].id);
+    }
 }
 
 test "optional numeric range graph admission preserves legacy indexed predicates" {
