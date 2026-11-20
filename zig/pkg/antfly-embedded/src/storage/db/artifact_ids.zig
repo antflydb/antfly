@@ -678,7 +678,7 @@ test "artifact public id round trips document unit chunk derived embedding refs"
     try expectArtifactRefEqual(artifact_ref, decoded_internal);
 }
 
-test "PDF page embedding member round trips through its public and stored keys" {
+test "source semantic media input PDF page embedding member round trips through its public and stored keys" {
     const a = std.testing.allocator;
     const base = try internal_keys.documentUnitArtifactKeyAlloc(a, "source/a", "pages", "page:000001");
     defer a.free(base);

@@ -23,6 +23,7 @@ uv run --no-project --with requests --with pytest --with 'psycopg[binary]==3.3.6
 
 import argparse
 import os
+import secrets
 import subprocess
 import sys
 from pathlib import Path
@@ -224,7 +225,7 @@ def exercise_bound_portals(server, password):
             "ALTER TABLE portal_target ADD CONSTRAINT bound_fk FOREIGN KEY (id) REFERENCES fk_destination(id)",
         )
         bind("fk")
-        migrator.execute("DROP TABLE fk_destination")
+        migrator.execute("ALTER TABLE fk_destination RENAME TO fk_original")
         migrator.execute("CREATE TABLE fk_destination (id TEXT PRIMARY KEY)")
         execute(b"C40001")
 
@@ -317,18 +318,6 @@ def exercise_cached_search_path(server, password):
             assert sql.fetchone() == ("a", value)
             assert conn.execute(query, prepare=True).fetchone() == ("a", value)
 
-        sql.execute("CREATE TABLE path_second.only_here (n BIGINT)")
-        sql.execute("SET search_path TO path_first, path_second")
-        conn.execute("ALTER TABLE only_here ADD COLUMN k TEXT", prepare=True)
-        sql.execute("SELECT k FROM path_second.only_here")
-        conn.execute("DROP TABLE IF EXISTS only_here", prepare=True)
-        try:
-            sql.execute("SELECT k FROM path_second.only_here")
-        except psycopg.errors.UndefinedTable:
-            pass
-        else:
-            raise AssertionError("DROP TABLE skipped the second search_path entry")
-
         sql.execute("SET search_path TO path_renamed")
         for execute in (
             lambda: sql.execute("EXECUTE path_plan"),
@@ -340,6 +329,18 @@ def exercise_cached_search_path(server, password):
                 assert exc.sqlstate == "0A000", exc
             else:
                 raise AssertionError("cached result accepted a changed column label")
+
+        sql.execute("CREATE TABLE path_second.only_here (n BIGINT)")
+        sql.execute("SET search_path TO path_first, path_second")
+        conn.execute("ALTER TABLE only_here ADD COLUMN k TEXT", prepare=True)
+        sql.execute("SELECT k FROM path_second.only_here")
+        conn.execute("DROP TABLE IF EXISTS only_here", prepare=True)
+        try:
+            sql.execute("SELECT k FROM path_second.only_here")
+        except psycopg.errors.UndefinedTable:
+            pass
+        else:
+            raise AssertionError("DROP TABLE skipped the second search_path entry")
     print(
         "SQL and wire statements follow search_path and preserve column labels: PASS",
         flush=True,
@@ -416,6 +417,9 @@ def main():
         ) as conn:
             conn.execute(next(startup_ddl))
 
+    # Policy definitions use the standalone owner's signed install authority.
+    os.environ["ANTFLY_TRUSTED_PRINCIPAL_SECRET"] = secrets.token_urlsafe(32)
+    os.environ["ANTFLY_TRUSTED_PRINCIPAL_ISSUER"] = "pgwire-driver-conformance"
     server = StandaloneAntflyServer(
         str(args.binary.resolve()),
         "127.0.0.1",

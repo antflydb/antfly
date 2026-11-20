@@ -222,50 +222,59 @@ def test_published_pdf_page_image_hits(embeddinggemma2_model_available):
                 ],
             },
         )
-        pdf = (
-            Path(__file__).resolve().parents[2]
-            / "lib/pdf/testdata/simple_text_fixture.pdf"
-        )
-        url = (
-            "data:application/pdf;base64," + base64.b64encode(pdf.read_bytes()).decode()
-        )
-        api("POST", "/batch", {"inserts": {"one": {"url": url}}, "sync_level": "write"})
-
-        def published():
-            status = api("GET", "/indexes/images")["status"]
-            return (
-                status.get("publication", {}).get("complete")
-                and status.get("searchable_vectors") == 1
+        fixtures = Path(__file__).resolve().parents[2] / "lib/pdf/testdata"
+        for filename, pages in (
+            ("simple_text_fixture.pdf", 1),
+            ("two_page_text_fixture.pdf", 2),
+        ):
+            pdf = (fixtures / filename).read_bytes()
+            url = "data:application/pdf;base64," + base64.b64encode(pdf).decode()
+            api(
+                "POST",
+                "/batch",
+                {"inserts": {"one": {"url": url}}, "sync_level": "write"},
             )
 
-        assert wait_until(published, timeout_s=180, interval_s=0.25), (
-            server.debug_logs()
-        )
-        for extra in ({}, {"hierarchy": {}}):
-            result = api(
-                "POST",
-                "/query",
-                {
-                    "indexes": ["images"],
-                    "semantic_search": "brass lantern",
-                    "fields": [],
-                    "limit": 1,
-                    "profile": True,
-                    **extra,
-                },
-            )["responses"][0]
-            assert result["status"] == 200, result
-            assert result["profile"]["dense_search"]["raw_hit_count"] == 1
-            hits = result["hits"]["hits"]
-            assert len(hits) == 1, result
-            hit = hits[0]
-            hierarchy = hit["hierarchy"]
-            ref = hierarchy["artifact" if extra else "matched_artifact"]
-            if extra:
-                assert hierarchy["parent_doc_key"] == "one", hit
-            assert ref["unit_id"] == "page:000001", hit
-            if not extra:
-                assert hit["_id"] == "one", hit
+            def published():
+                status = api("GET", "/indexes/images")["status"]
+                return (
+                    status.get("publication", {}).get("complete")
+                    and status.get("searchable_vectors") == pages
+                )
+
+            assert wait_until(published, timeout_s=180, interval_s=0.25), (
+                server.debug_logs()
+            )
+            page_ids = {f"page:{page:06d}" for page in range(1, pages + 1)}
+            for extra in ({}, {"hierarchy": {}}):
+                result = api(
+                    "POST",
+                    "/query",
+                    {
+                        "indexes": ["images"],
+                        "semantic_search": "brass lantern",
+                        "fields": [],
+                        "limit": pages,
+                        "profile": True,
+                        **extra,
+                    },
+                )["responses"][0]
+                assert result["status"] == 200, result
+                assert result["profile"]["dense_search"]["raw_hit_count"] == pages
+                hits = result["hits"]["hits"]
+                if extra:
+                    assert len(hits) == pages, result
+                    assert {hit["hierarchy"]["parent_doc_key"] for hit in hits} == {
+                        "one"
+                    }
+                    assert {
+                        hit["hierarchy"]["artifact"]["unit_id"] for hit in hits
+                    } == page_ids
+                else:
+                    assert [hit["_id"] for hit in hits] == ["one"], result
+                    assert (
+                        hits[0]["hierarchy"]["matched_artifact"]["unit_id"] in page_ids
+                    )
         failed = False
     finally:
         server.stop(test_failed=failed)
