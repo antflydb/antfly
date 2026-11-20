@@ -26887,7 +26887,7 @@ pub const Node = struct {
                             return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkOutputModelUnsupported");
                         };
                         if (pin) |expected| {
-                            const identity = std.fmt.bytesToHex(self.model_manager.modelIdentityForManifestWithControl(selected.path, manifest, ctx.io, control) catch |err| return requestModelResolutionError(ctx, err), .lower);
+                            const identity = std.fmt.bytesToHex(self.model_manager.modelIdentityForManifestWithControl(selected.path, manifest, control) catch |err| return requestModelResolutionError(ctx, err), .lower);
                             if (!std.mem.eql(u8, expected, &identity)) return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkModelIdentityMismatch");
                         }
                     }
@@ -26911,7 +26911,7 @@ pub const Node = struct {
         }
         const model = try ctx.queryDecoded("model");
         const task = ctx.query("task");
-        const scope: ?CatalogListingScope = if (model) |name| scope: {
+        const listing_scope: ?CatalogListingScope = if (model) |name| scope: {
             const operation = task orelse break :scope null;
             if (std.mem.eql(u8, operation, "embed")) break :scope .{ .name = name, .category = "embedders" };
             if (std.mem.eql(u8, operation, "generate")) break :scope .{ .name = name, .category = "generators" };
@@ -26920,7 +26920,7 @@ pub const Node = struct {
         const publication = if (catalog_generation.kind == .legacy) null else std.fmt.bytesToHex(catalog_generation.digest, .lower);
         var scoped_publication: ?ScopedCatalogPublication = null;
         defer if (scoped_publication) |*captured| captured.deinit();
-        const json_body = self.listModelsJsonAllocScoped(ctx.allocator, ctx.io, scope, if (publication) |*hex| hex else null, &scoped_publication, catalog_control) catch |err| {
+        const json_body = self.listModelsJsonAllocScoped(ctx.allocator, ctx.io, listing_scope, if (publication) |*hex| hex else null, &scoped_publication, catalog_control) catch |err| {
             if (err == error.Timeout or err == error.Canceled or err == error.Cancelled) return inferenceFailureResponse(ctx, err);
             if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
             return err;
