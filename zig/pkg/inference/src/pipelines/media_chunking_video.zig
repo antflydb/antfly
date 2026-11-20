@@ -138,18 +138,21 @@ pub const Owner = struct {
     pub fn init(a: std.mem.Allocator, reader: *media.mp4.Reader, pool: *media.admission.Pool, limits: @import("media_chunk_limits.zig").Limits) !Owner {
         return initPlanned(a, reader, pool, limits, null);
     }
-    pub fn initPlanned(a: std.mem.Allocator, reader: *media.mp4.Reader, pool: *media.admission.Pool, limits: @import("media_chunk_limits.zig").Limits, headers: ?[]const []u8) !Owner {
+    pub fn initPlanned(a: std.mem.Allocator, reader: *media.mp4.Reader, pool: *media.admission.Pool, limits: @import("media_chunk_limits.zig").Limits, transport: ?*video.transport_seek.Index) !Owner {
         if (reader.packets.len == 0) return error.EmptyVideo;
         if (reader.packets.len > limits.max_index_packets) return error.ResourceLimitExceeded;
         if (reader.input.identity.len == 0) return error.InvalidVideoReaderSelection;
         var planning = video.h264_pictures.Options.forTrack(reader.packets.len);
         planning.decode.max_dependency_packets = limits.max_dependency_packets;
+        const headers = if (transport) |ts| ts.planningHeaders() else null;
         const registry = if (headers) |source| try video.h264_dynamic.Session.initWithHeaders(a, reader, planning.decode, source) else if (reader.track.requiresAvcRegistry()) try video.h264_dynamic.Session.initPlanning(a, reader, planning.decode) else null;
         errdefer if (registry) |owner| owner.deinit();
         var logical: ?video.h264_pictures.Index = null;
         errdefer if (logical) |*index| index.deinit();
         if (try video.packet_sampling.needsLogicalIndex(a, reader.track))
             logical = try video.h264_pictures.planning(a, reader, planning, registry);
+        if (registry) |session| session.releasePlanningHeaders();
+        if (transport) |ts| ts.releaseHeaders();
         const count = if (logical) |index| index.pictures.len else reader.packets.len;
         var metadata_bytes = try video.sampling.Timeline.storageBytes(count);
         if ((reader.track.codec == .avc and registry == null) or reader.track.codec == .hevc) metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, reader.packets.len, @sizeOf(usize)));

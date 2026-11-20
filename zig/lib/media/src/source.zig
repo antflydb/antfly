@@ -91,12 +91,16 @@ pub const Source = struct {
         };
     }
     pub fn read(self: *Source, offset: u64, size: usize) !Lease {
+        return self.readControlled(offset, size, .{});
+    }
+    pub fn readControlled(self: *Source, offset: u64, size: usize, caller: Control) !Lease {
         const owner = self.physical orelse self;
         const io = std.Io.Threaded.global_single_threaded.io();
         owner.mutex.lockUncancelable(io);
         defer owner.mutex.unlock(io);
         const controls = ReadControl{ .source = owner.control, .worker = self.control };
-        const control = controls.control();
+        const combined = ReadControl{ .source = controls.control(), .worker = caller };
+        const control = combined.control();
         try control.check();
         if (offset > self.length() or size > self.length() - offset) return error.UnexpectedEndOfSource;
         if (!self.canRead(size) or (owner != self and !owner.canRead(size))) return error.ResourceLimitExceeded;

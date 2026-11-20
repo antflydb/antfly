@@ -161,65 +161,126 @@ fn constrainedRanges(a: std.mem.Allocator, map: Mapping, first: usize, last: usi
     if (calls <= budget.max_reads) return ranges.toOwnedSlice(a);
     ranges.clearRetainingCapacity();
 
-    // For competing gaps retain only nondominated (calls, overhead) choices.
-    // Trace through completed prefixes so a later cheap join can displace an
-    // earlier expensive one. Gaps at least one read wide always split a group.
-    const Choice = struct { calls: u64, extra: u64, first: usize, parent: usize };
-    const frontiers = try a.alloc(std.ArrayList(Choice), spans.items.len + 1);
-    defer a.free(frontiers);
-    @memset(frontiers, .empty);
-    defer for (frontiers) |*frontier| frontier.deinit(a);
-    try frontiers[0].append(a, .{ .calls = 0, .extra = 0, .first = 0, .parent = 0 });
-    var remaining = payload;
-    for (spans.items, 1..) |span, stop| {
-        try control.check();
-        remaining -= span.size();
-        const suffix_calls = std.math.divCeil(u64, remaining, capacity) catch unreachable;
-        const frontier = &frontiers[stop];
-        var i = stop;
-        var bytes: u64 = 0;
-        while (i > 0) {
-            i -= 1;
-            const part = spans.items[i];
-            bytes += part.size();
-            const width = span.end - part.start;
-            const extra = width - bytes;
-            const reads = std.math.divCeil(u64, width, capacity) catch unreachable;
-            if (extra > slack or reads + suffix_calls > budget.max_reads) break;
-            if (i % 256 == 0) try control.check();
-            for (frontiers[i].items, 0..) |prefix, parent| {
-                const cost = prefix.extra + extra;
-                const count = prefix.calls + reads;
-                if (cost > slack or count + suffix_calls > budget.max_reads) continue;
-                for (frontier.items) |other| {
-                    if (other.calls <= count and other.extra <= cost) break;
-                } else {
-                    var k = frontier.items.len;
-                    while (k != 0) {
-                        k -= 1;
-                        const other = frontier.items[k];
-                        if (count <= other.calls and cost <= other.extra) _ = frontier.swapRemove(k);
-                    }
-                    try frontier.append(a, .{ .calls = count, .extra = cost, .first = i, .parent = parent });
-                }
-            }
-            if (i > 0 and part.start - spans.items[i - 1].end >= capacity) break;
+    return exactRanges(a, spans.items, capacity, budget, payload, control);
+}
+
+const OpenRanges = struct {
+    const Tree = std.Treap(i128, std.math.order);
+    const Opening = struct {
+        node: Tree.Node = undefined,
+        byte_offset: i128,
+        first: usize,
+        parent: usize,
+        fn from(node: *Tree.Node) *Opening {
+            return @alignCast(@fieldParentPtr("node", node));
+        }
+    };
+
+    tree: Tree = .{},
+    allocator: std.mem.Allocator,
+
+    fn floor(self: *OpenRanges, key: i128) ?*Opening {
+        var node = self.tree.root;
+        var best: ?*Opening = null;
+        while (node) |n| {
+            if (n.key <= key) best = Opening.from(n);
+            node = n.children[@intFromBool(n.key < key)];
+            if (n.key == key) break;
+        }
+        return best;
+    }
+    fn remove(self: *OpenRanges, node: *Tree.Node) void {
+        var entry = self.tree.getEntryForExisting(node);
+        entry.set(null);
+        self.allocator.destroy(Opening.from(node));
+    }
+    fn insert(self: *OpenRanges, key: i128, cost: i128, first: usize, parent: usize) !void {
+        if (self.floor(key)) |prev| {
+            if (prev.byte_offset <= cost) return;
+            if (prev.node.key == key) self.remove(&prev.node);
+        }
+        const current = try self.allocator.create(Opening);
+        current.* = .{ .byte_offset = cost, .first = first, .parent = parent };
+        var entry = self.tree.getEntryFor(key);
+        entry.set(&current.node);
+        while (current.node.next()) |next| {
+            if (Opening.from(next).byte_offset < cost) break;
+            self.remove(next);
         }
     }
-    var stop = spans.items.len;
-    if (frontiers[stop].items.len == 0) return error.ResourceLimitExceeded;
-    var chosen: usize = 0;
-    for (frontiers[stop].items, 0..) |choice, i| {
-        if (choice.calls < frontiers[stop].items[chosen].calls) chosen = i;
+};
+
+/// For a group starting at B after k calls and b bytes, ending at E costs
+/// ceil((k*C-B+E)/C) calls and b-B+E bytes. These two offsets order openings
+/// independently of E. Keep only nondominated openings in that order. One
+/// predecessor lookup finds the cheapest route under a call ceiling, then jump
+/// directly to the next smaller feasible call count. There is no scan of past
+/// spans. S feasible prefix trade-offs take O(S log S) expected time and O(S)
+/// space. The reverse coverage bound excludes calls needed by the suffix.
+fn exactRanges(a: std.mem.Allocator, spans: []const WireSpan, capacity: usize, budget: media.source.Limits, payload: u64, control: media.source.Control) ![]WireSpan {
+    const suffix = try a.alloc(u64, spans.len + 1);
+    defer a.free(suffix);
+    suffix[spans.len] = 0;
+    var boundary: u64 = spans[spans.len - 1].end;
+    var i = spans.len;
+    while (i > 0) {
+        i -= 1;
+        if (i % 256 == 0) try control.check();
+        const span = spans[i];
+        const end = @min(boundary, span.end);
+        const calls = try std.math.divCeil(u64, end -| span.start, capacity);
+        suffix[i] = suffix[i + 1] + calls;
+        if (calls != 0) boundary = end -| (calls *| capacity);
     }
-    while (stop != 0) {
-        const choice = frontiers[stop].items[chosen];
-        try ranges.append(a, .{ .start = spans.items[choice.first].start, .end = spans.items[stop - 1].end });
-        stop = choice.first;
-        chosen = choice.parent;
+    const State = struct { calls: u64, bytes: u64, first: usize, parent: usize };
+    const Trace = struct { first: usize, parent: usize };
+    var states: std.ArrayList(State) = .empty;
+    defer states.deinit(a);
+    var trace: std.ArrayList(Trace) = .empty;
+    defer trace.deinit(a);
+    var openings = OpenRanges{ .allocator = a };
+    defer while (openings.tree.root) |node| openings.remove(node);
+    const root = std.math.maxInt(usize);
+    try openings.insert(-@as(i128, spans[0].start), -@as(i128, spans[0].start), 0, root);
+    var remaining = payload;
+    for (spans, 1..) |span, stop| {
+        try control.check();
+        remaining -= span.size();
+        if (suffix[stop] > budget.max_reads) continue;
+        var ceiling: u64 = budget.max_reads - suffix[stop];
+        states.clearRetainingCapacity();
+        while (ceiling > 0) {
+            if (states.items.len % 256 == 0) try control.check();
+            const best = openings.floor(@as(i128, ceiling) * capacity - span.end) orelse break;
+            const bytes: u64 = @intCast(best.byte_offset + span.end);
+            if (bytes > budget.max_total_bytes - remaining) break;
+            const calls: u64 = @intCast(@divFloor(best.node.key + span.end - 1, capacity) + 1);
+            if (stop == spans.len) {
+                var ranges: std.ArrayList(WireSpan) = .empty;
+                errdefer ranges.deinit(a);
+                var start = best.first;
+                var end = stop;
+                var parent = best.parent;
+                while (true) {
+                    try ranges.append(a, .{ .start = spans[start].start, .end = spans[end - 1].end });
+                    if (parent == root) break;
+                    end = start;
+                    start = trace.items[parent].first;
+                    parent = trace.items[parent].parent;
+                }
+                std.mem.reverse(WireSpan, ranges.items);
+                return ranges.toOwnedSlice(a);
+            }
+            try states.append(a, .{ .calls = calls, .bytes = bytes, .first = best.first, .parent = best.parent });
+            ceiling = calls - 1;
+        }
+        for (states.items) |state| {
+            const parent = trace.items.len;
+            try trace.append(a, .{ .first = state.first, .parent = state.parent });
+            try openings.insert(@as(i128, state.calls) * capacity - spans[stop].start, @as(i128, state.bytes) - spans[stop].start, stop, parent);
+        }
     }
-    std.mem.reverse(WireSpan, ranges.items);
-    return ranges.toOwnedSlice(a);
+    return error.ResourceLimitExceeded;
 }
 
 /// Bound for one request. Every underlying read retains the provider's source
@@ -333,7 +394,7 @@ pub const View = struct {
                         break :physical @intCast(@min(wire_end - wire, capacity));
                     };
                     if (count == 0) return error.ResourceLimitExceeded;
-                    lease = try self.wire.read(wire, count);
+                    lease = try self.wire.readControlled(wire, count, control);
                     wire_start = wire;
                 }
                 const offset: usize = @intCast(wire - wire_start);
@@ -366,8 +427,21 @@ pub const Index = struct {
     }
 
     pub fn buildForReader(self: *Index, a: std.mem.Allocator, wire: *media.source.Source, options: avc.Options, capture_headers: bool) !void {
+        var retry_without_cache = false;
+        self.buildAttempt(a, wire, options, capture_headers, &retry_without_cache) catch |err| {
+            // A demux or source buffer can encounter shared pressure outside
+            // the index callbacks. Drop the cache before retrying that scan.
+            if (!retry_without_cache or (err != error.SharedAdmissionExceeded and err != error.OutOfMemory)) return err;
+            try self.buildAttempt(a, wire, options, false, &retry_without_cache);
+        };
+    }
+
+    fn buildAttempt(self: *Index, a: std.mem.Allocator, wire: *media.source.Source, options: avc.Options, capture_headers: bool, retry_without_cache: *bool) !void {
         self.* = .{ .capture_headers = capture_headers, .memory = .{ .backing = a, .limit = options.index.max_index_bytes, .reservation = if (wire.admission_pool) |pool| try pool.acquire(.{}) else .{} } };
-        errdefer self.deinit();
+        errdefer {
+            retry_without_cache.* = self.capture_headers and (self.headers.capacity != 0 or self.current_header.capacity != 0);
+            self.deinit();
+        }
         var units = try avc.Stream.initIndex(a, wire.identity, options, .{ .context = self, .track = recordTrack, .nal = recordNal, .packet = recordPacket });
         defer if (!units.ended) units.deinit();
         var consumer = units.consumer();
@@ -376,6 +450,23 @@ pub const Index = struct {
         avc.scanSource(a, wire, options, &units, consumer) catch |err|
             return if (err == error.OutOfMemory) self.memory.denied orelse err else err;
         if (self.track == null or self.packet_end != self.length or self.runs.items.len == 0) return error.InvalidVideoIndex;
+    }
+    /// Header prefixes save a second pass over the wire. They may be evicted
+    /// as a unit at any point before a consumer borrows them.
+    pub fn planningHeaders(self: *const Index) ?[]const []u8 {
+        return if (self.capture_headers and self.headers.items.len == self.packets.items.len) self.headers.items else null;
+    }
+    fn reclaim(self: *Index) bool {
+        if (!self.capture_headers) return false;
+        self.releaseHeaders();
+        return true;
+    }
+    fn appendRequired(self: *Index, list: anytype, value: anytype) !void {
+        const a = self.memory.allocator();
+        list.append(a, value) catch |err| {
+            if (!self.reclaim()) return err;
+            try list.append(a, value);
+        };
     }
     fn recordRun(raw: *anyopaque, elementary: usize, wire: usize, len: usize) !void {
         const self: *Index = @ptrCast(@alignCast(raw));
@@ -387,26 +478,33 @@ pub const Index = struct {
                 return;
             }
         } else if (elementary != 0) return error.InvalidVideoIndex;
-        try self.runs.append(self.memory.allocator(), .{ .wire = wire, .elementary = elementary, .len = len });
+        try self.appendRequired(&self.runs, Run{ .wire = wire, .elementary = elementary, .len = len });
     }
     fn recordNal(raw: *anyopaque, elementary: usize, nal: []const u8) !void {
         const self: *Index = @ptrCast(@alignCast(raw));
         const len = nal.len;
-        const a = self.memory.allocator();
-        if (self.capture_headers) {
-            const retained = try @import("h264_prefix.zig").retainedSize(nal[0], len);
-            var prefix: [4]u8 = undefined;
-            std.mem.writeInt(u32, &prefix, @intCast(retained), .big);
-            try self.current_header.appendSlice(a, &prefix);
-            try self.current_header.appendSlice(a, nal[0..retained]);
-        }
-        try self.nals.append(self.memory.allocator(), .{ .logical = self.length, .elementary = elementary, .size = @intCast(len) });
+        if (self.capture_headers) self.cacheNal(nal) catch |err| {
+            if (err != error.OutOfMemory or !self.reclaim()) return err;
+        };
+        try self.appendRequired(&self.nals, Nal{ .logical = self.length, .elementary = elementary, .size = @intCast(len) });
         self.length = try std.math.add(u64, self.length, 4 + len);
+    }
+    fn cacheNal(self: *Index, nal: []const u8) !void {
+        const len = nal.len;
+        const a = self.memory.allocator();
+        const retained = try @import("h264_prefix.zig").retainedSize(nal[0], len);
+        var prefix: [4]u8 = undefined;
+        std.mem.writeInt(u32, &prefix, @intCast(retained), .big);
+        try self.current_header.appendSlice(a, &prefix);
+        try self.current_header.appendSlice(a, nal[0..retained]);
     }
     fn recordTrack(raw: *anyopaque, track: media.mp4.Track) !void {
         const self: *Index = @ptrCast(@alignCast(raw));
         var owned = track;
-        owned.avcc = try self.memory.allocator().dupe(u8, track.avcc);
+        owned.avcc = self.memory.allocator().dupe(u8, track.avcc) catch |err| retry: {
+            if (!self.reclaim()) return err;
+            break :retry try self.memory.allocator().dupe(u8, track.avcc);
+        };
         self.track = owned;
     }
     fn recordPacket(raw: *anyopaque, original: media.mp4.Packet) !void {
@@ -415,13 +513,18 @@ pub const Index = struct {
         packet.offset = self.packet_end;
         self.packet_end += packet.size;
         if (self.packet_end != self.length) return error.InvalidVideoIndex;
+        try self.appendRequired(&self.packets, packet);
+        if (self.capture_headers) self.cachePacket() catch |err| {
+            if (!self.reclaim()) return err;
+        };
+    }
+    fn cachePacket(self: *Index) !void {
         const a = self.memory.allocator();
-        try self.packets.append(a, packet);
-        if (!self.capture_headers) return;
         try self.headers.ensureUnusedCapacity(a, 1);
         self.headers.appendAssumeCapacity(try self.current_header.toOwnedSlice(a));
     }
     pub fn releaseHeaders(self: *Index) void {
+        self.capture_headers = false;
         const a = self.memory.allocator();
         for (self.headers.items) |bytes| a.free(bytes);
         self.headers.deinit(a);
@@ -588,6 +691,23 @@ test "seekable transport constrained range plans match all partitions of small m
             if (calls <= limit) optimum = @min(optimum, bytes);
         }
         const map = Mapping{ .runs = &runs, .nals = &.{.{ .logical = 0, .elementary = 0, .size = @intCast(es) }}, .len = es + 4 };
+        var spans: [runs.len]WireSpan = undefined;
+        for (&spans, runs) |*span, run| span.* = .{ .start = run.wire, .end = run.wire + run.len };
+        const exact = exactRanges(a, &spans, capacity, .{ .max_reads = limit, .max_total_bytes = budget }, es, .{});
+        if (optimum > budget) {
+            try std.testing.expectError(error.ResourceLimitExceeded, exact);
+        } else {
+            const schedule = try exact;
+            defer a.free(schedule);
+            var bytes: u64 = 0;
+            var calls: u64 = 0;
+            for (schedule) |range| {
+                bytes += range.size();
+                calls += try std.math.divCeil(u64, range.size(), capacity);
+            }
+            try std.testing.expectEqual(optimum, bytes);
+            try std.testing.expect(calls <= limit);
+        }
         const result = constrainedRanges(a, map, 0, 0, 4, es + 4, capacity, .{ .max_reads = limit, .max_total_bytes = budget }, .{});
         if (optimum > budget) {
             try std.testing.expectError(error.ResourceLimitExceeded, result);
@@ -608,4 +728,64 @@ test "seekable transport constrained range plans match all partitions of small m
             }
         }
     }
+}
+
+test "seekable transport exact planner handles thousands of competing multiplex gaps" {
+    const a = std.testing.allocator;
+    var spans: [4096]WireSpan = undefined;
+    var pos: u64 = 0;
+    for (&spans, 0..) |*span, i| {
+        span.* = .{ .start = pos, .end = pos + 4 };
+        pos += if (i % 2 == 0) 6 else 61;
+    }
+    const result = try exactRanges(a, &spans, 16, .{ .max_reads = spans.len / 2, .max_total_bytes = spans.len * 5 }, spans.len * 4, .{});
+    defer a.free(result);
+    try std.testing.expectEqual(spans.len / 2, result.len);
+    for (result) |range| try std.testing.expectEqual(10, range.size());
+}
+
+test "seekable transport evicts optional headers when required mapping growth needs their allowance" {
+    // Force moving growth so both builds have the same required peak
+    // regardless of the backing allocator's placement of optional headers.
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    const a = backing.allocator();
+    const bytes = @embedFile("../testdata/transport/closed.ts");
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = std.math.maxInt(usize) } };
+    var wire = media.source.Source{ .allocator = a, .admission_pool = &pool, .identity = "header-pressure", .storage = .{ .borrowed = bytes } };
+    var baseline: Index = undefined;
+    try baseline.buildForReader(a, &wire, .{}, false);
+    defer baseline.deinit();
+    const cap: usize = @intCast(pool.high_water.host_bytes);
+    var cached: Index = undefined;
+    try cached.build(a, &wire, .{ .index = .{ .max_index_bytes = cap } });
+    defer cached.deinit();
+    try std.testing.expect(cached.planningHeaders() == null);
+    try std.testing.expectEqualSlices(Nal, baseline.nals.items, cached.nals.items);
+    try std.testing.expectEqualSlices(Run, baseline.runs.items, cached.runs.items);
+}
+
+test "seekable transport forwards worker cancellation inside a physical read" {
+    const Provider = struct {
+        entered: bool = false,
+        fn read(raw: *anyopaque, _: u64, out: []u8, control: media.source.Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.entered = true;
+            try control.check();
+            @memset(out, 0);
+            return out.len;
+        }
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            if (self.entered) return error.Cancelled;
+        }
+    };
+    var provider = Provider{};
+    var wire = media.source.Source{ .allocator = std.testing.allocator, .identity = "cancel", .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = 1 } } };
+    var transport = View{ .wire = &wire, .map = .{ .len = 5, .nals = &.{.{ .logical = 0, .elementary = 0, .size = 1 }}, .runs = &.{.{ .elementary = 0, .wire = 0, .len = 1 }} } };
+    var src = transport.source("cancel", .{});
+    var worker = src.view(std.testing.allocator, null, .{ .context = &provider, .check_fn = Provider.check });
+    try std.testing.expectError(error.Cancelled, worker.read(4, 1));
+    try std.testing.expect(provider.entered);
+    try std.testing.expectEqual(0, wire.total_bytes);
+    try std.testing.expectEqual(0, wire.retained_bytes);
 }

@@ -227,7 +227,7 @@ test "embeddinggemma2 video HEVC AV1 and AVC NVDEC pixels match independent FFmp
     }
 }
 
-pub const EmbeddingInspection = struct { width: u32, height: u32, frames: usize, codec: media.mp4.Codec = .avc, display_width: u32 = 0, display_height: u32 = 0 };
+pub const EmbeddingInspection = struct { width: u32, height: u32, frames: usize, selection: DisplayPlan = .{}, codec: media.mp4.Codec = .avc, display_width: u32 = 0, display_height: u32 = 0 };
 
 test "embeddinggemma2 video container preflight shares six second sampling and cancellation" {
     const bytes = @embedFile("../../testdata/video/closed.mp4");
@@ -258,10 +258,10 @@ pub fn inspectEmbedding(allocator: std.mem.Allocator, bytes: []const u8, control
     try validateTrack(reader.track);
     const normalized = try normalizeDecoderTrack(allocator, &reader);
     defer if (normalized) |config| allocator.free(config);
-    const sampler = try embeddingSamplerForReader(&reader);
+    const selection = try embeddingSelection(allocator, &reader);
     const frame = Frame{ .device = 0, .pitch = 0, .width = reader.track.width, .height = reader.track.height, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = try quarterTurns(reader.track.display_matrix), .sar = try displayAspect(allocator, reader.track) };
     const display = try frame.displaySize();
-    return .{ .width = reader.track.width, .height = reader.track.height, .frames = sampler.length, .codec = reader.track.codec, .display_width = display[0], .display_height = display[1] };
+    return .{ .width = reader.track.width, .height = reader.track.height, .frames = selection.pictures.len, .selection = selection, .codec = reader.track.codec, .display_width = display[0], .display_height = display[1] };
 }
 
 fn normalizeDecoderTrack(allocator: std.mem.Allocator, reader: *media.mp4.Reader) !?[]u8 {
@@ -341,77 +341,70 @@ fn quarterTurns(matrix: [9]i32) !u32 {
     return error.UnsupportedVideoFormat;
 }
 
-fn embeddingSamplerForReader(reader: *const media.mp4.Reader) !EmbeddingSampler {
-    const track = reader.track;
-    try validateDecodeSpan(track, reader.packets);
-    var frames: usize = 0;
-    var first: i64 = std.math.maxInt(i64);
-    var last: i64 = std.math.minInt(i64);
-    var tail: u32 = 0;
-    for (reader.packets, 0..) |packet, i| {
-        if (i % 256 == 0) try reader.input.control.check();
-        if (!track.edit.contains(packet.pts)) continue;
-        frames += 1;
-        first = @min(first, packet.pts);
-        if (packet.pts >= last) {
-            last = packet.pts;
-            tail = packet.duration;
+fn embeddingSelection(a: std.mem.Allocator, reader: *media.mp4.Reader) !DisplayPlan {
+    try validateDecodeSpan(reader.track, reader.packets);
+    if (reader.track.codec != .av1) return referenceSelection(a, reader, reader.packets);
+    const counts = packet_sampling.av1OutputCounts(a, reader) catch |err| switch (err) {
+        error.UnsupportedVideoProfile, error.InvalidVideoData => return error.UnsupportedVideoFormat,
+        else => return err,
+    };
+    defer a.free(counts);
+    var total: usize = 0;
+    for (counts) |count| {
+        if (count > nvdec_max_samples - total) return error.ResourceLimitExceeded;
+        total += count;
+    }
+    const Picture = struct { pts: i64, duration: u32, first_packet: usize, output: usize };
+    const pictures = try a.alloc(Picture, total);
+    defer a.free(pictures);
+    var next: usize = 0;
+    for (reader.packets, counts, 0..) |packet, count, id| {
+        for (0..count) |output| {
+            pictures[next] = .{ .pts = packet.pts, .duration = packet.duration, .first_packet = id, .output = output };
+            next += 1;
         }
     }
-    if (frames == 0) return error.EmptyVideo;
-    const duration: i128 = track.edit.source_duration orelse (@as(i128, last) + tail - first);
-    return EmbeddingSampler.fromClock(frames, duration, track.timescale, track.edit);
+    return referenceSelection(a, reader, pictures);
 }
 
-/// EmbeddingGemma2: floor(duration * 1 FPS) samples, capped uniformly to 32.
-/// Frame indices use the container's average frame rate, as the upstream processor does.
-pub const EmbeddingSampler = struct {
-    indices: [32]usize = undefined,
-    length: usize = 0,
-    next: usize = 0,
-    frame: usize = 0,
-    repetitions: usize = 1,
-    edit: media.timeline.Edit = .{},
-    timescale: u32 = std.time.us_per_s,
-    last_pts: ?i64 = null,
-
-    pub fn init(frame_count: usize, duration_us: i64, presentation_end_us: i64) !EmbeddingSampler {
-        if (presentation_end_us <= 0) return error.EmptyVideo;
-        return fromClock(frame_count, duration_us, std.time.us_per_s, .{ .source_duration = presentation_end_us });
+fn referenceSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, pictures: anytype) !DisplayPlan {
+    const track = reader.track;
+    const ids = try @import("antfly_video").sampling.referencePictures(a, pictures, track.timescale, track.edit, reader.input.control);
+    defer a.free(ids);
+    var selection = DisplayPlan{ .pictures = .{ .len = ids.len } };
+    for (ids, 0..) |id, i| {
+        const pic = pictures[id];
+        selection.pictures.packet_ids[i] = if (@hasField(@TypeOf(pic), "first_packet")) pic.first_packet else id;
+        if (@hasField(@TypeOf(pic), "output")) selection.outputs[i] = pic.output;
+        const pts = if (track.edit.source_duration != null) @max(pic.pts, track.edit.source_start) else pic.pts;
+        selection.pictures.timestamps_us[i] = try timestampUs(pts, track.timescale);
     }
-    fn fromClock(frames: usize, ticks: i128, scale: u32, edit: media.timeline.Edit) !EmbeddingSampler {
-        if (frames == 0 or ticks <= 0) return error.EmptyVideo;
-        if (ticks * std.time.us_per_s > @as(i128, max_duration_us) * scale) return error.VideoDurationExceeded;
-        var self = EmbeddingSampler{ .edit = edit, .timescale = scale };
-        var fixed = std.heap.FixedBufferAllocator.init(std.mem.asBytes(&self.indices));
-        const selected = try @import("antfly_video").sampling.referenceOrdinals(fixed.allocator(), frames, ticks, scale);
-        self.length = selected.len;
-        return self;
-    }
-    pub fn select(self: *EmbeddingSampler, pts: i64) !bool {
-        if (self.last_pts) |last| if (pts < last) return error.NonMonotonicVideoPresentation;
-        self.last_pts = pts;
-        if (!self.edit.contains(pts)) return false;
-        const index = self.frame;
-        self.frame += 1;
-        if (self.next == self.length or index != self.indices[self.next]) return false;
-        self.repetitions = 0;
-        while (self.next < self.length and self.indices[self.next] == index) : (self.next += 1) self.repetitions += 1;
-        return true;
-    }
-};
+    return selection;
+}
 
 /// NVDEC returns the packet tag supplied to the parser, including across
 /// B-frame reordering. Matching packet identity preserves tied or sub-us PTS.
+pub const DisplayPlan = struct {
+    pictures: packet_sampling.Gemma4Plan = .{},
+    outputs: [32]usize = @splat(0),
+};
 const SelectedPackets = struct {
-    plan: packet_sampling.Gemma4Plan,
+    plan: DisplayPlan,
+    output: usize = 0,
+    repetitions: usize = 0,
     next: usize = 0,
     timestamp_us: i64 = 0,
 
     fn select(self: *SelectedPackets, tag: i64) !bool {
-        if (self.next == self.plan.len or tag != self.plan.packet_ids[self.next]) return false;
-        self.timestamp_us = self.plan.timestamps_us[self.next];
-        self.next += 1;
+        if (self.next == self.plan.pictures.len or tag != self.plan.pictures.packet_ids[self.next]) return false;
+        const ordinal = self.output;
+        self.output += 1;
+        if (ordinal != self.plan.outputs[self.next]) return false;
+        self.timestamp_us = self.plan.pictures.timestamps_us[self.next];
+        const start = self.next;
+        while (self.next < self.plan.pictures.len and tag == self.plan.pictures.packet_ids[self.next] and self.plan.outputs[self.next] == ordinal) self.next += 1;
+        self.repetitions = self.next - start;
+        if (self.next == self.plan.pictures.len or tag != self.plan.pictures.packet_ids[self.next]) self.output = 0;
         return true;
     }
 };
@@ -435,7 +428,7 @@ test "Gemma4 packet selection spans a 45-second edit and identifies tied PTS by 
     const selection = try packet_sampling.gemma4Pictures(&reader, reader.packets, source.control);
     const ids = selection.ids();
     try std.testing.expectEqual(@as(usize, 32), ids.len);
-    var plan = SelectedPackets{ .plan = selection };
+    var plan = SelectedPackets{ .plan = .{ .pictures = selection } };
     try std.testing.expect(!try plan.select(47));
     try std.testing.expect(!try plan.select(46)); // same PTS as selected packet 45
     for (ids, 0..) |id, index| {
@@ -451,7 +444,6 @@ const DecodeState = struct {
     ctx: *context.CudaContext,
     consumer: Consumer,
     sampler: Sampler = .{},
-    embedding_sampler: ?EmbeddingSampler = null,
     selected_packets: ?SelectedPackets = null,
     avc_packet_count: ?usize = null,
     displayed_packets: std.StaticBitSet(nvdec_max_samples) = .empty,
@@ -466,7 +458,6 @@ const DecodeState = struct {
             self.displayed_packets.set(id);
         }
         if (self.selected_packets) |*plan| return plan.select(tag);
-        if (self.embedding_sampler) |*sampler| return sampler.select(tag);
         return self.sampler.select(tag);
     }
 
@@ -489,13 +480,9 @@ const DecodeState = struct {
                 return -1;
             }) 1 else 0;
         }
-        const displayed_us = if (self.embedding_sampler) |sampler| timestampUs(pts, sampler.timescale) catch |err| {
-            self.failure = err;
-            return -1;
-        } else pts;
-        const repetitions = if (self.embedding_sampler) |sampler| sampler.repetitions else 1;
+        const repetitions = if (self.selected_packets) |selection| selection.repetitions else 1;
         for (0..if (self.consumer.coalesce_repetitions) @as(usize, 1) else repetitions) |_| {
-            self.consumer.consume(self.consumer.context, .{ .device = device, .pitch = pitch, .width = width, .height = height, .planned_frames = if (self.selected_packets) |*selection| selection.plan.len else 0, .timestamp_us = if (self.selected_packets) |*plan| plan.timestamp_us else displayed_us, .matrix = matrix, .full_range = full_range, .rotation = self.rotation, .sar = self.sar, .high_depth = @intFromBool(bit_depth == 10), .tone = if (transfer == 16) 1 else if (transfer == 18) 2 else 0, .repetitions = if (self.consumer.coalesce_repetitions) repetitions else 1 }) catch |err| {
+            self.consumer.consume(self.consumer.context, .{ .device = device, .pitch = pitch, .width = width, .height = height, .planned_frames = if (self.selected_packets) |*selection| selection.plan.pictures.len else 0, .timestamp_us = if (self.selected_packets) |*plan| plan.timestamp_us else pts, .matrix = matrix, .full_range = full_range, .rotation = self.rotation, .sar = self.sar, .high_depth = @intFromBool(bit_depth == 10), .tone = if (transfer == 16) 1 else if (transfer == 18) 2 else 0, .repetitions = if (self.consumer.coalesce_repetitions) repetitions else 1 }) catch |err| {
                 self.failure = err;
                 break;
             };
@@ -532,6 +519,16 @@ pub fn decodeMp4(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes:
 }
 
 pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes: []const u8, consumer: Consumer, sampling: Sampling) !Stats {
+    return decodeWithPlan(allocator, ctx, bytes, consumer, sampling, null);
+}
+
+/// Decode the same immutable MP4 bytes whose headers produced the admitted plan.
+pub fn decodeInspectedEmbedding(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes: []const u8, consumer: Consumer, plan: DisplayPlan) !Stats {
+    if (plan.pictures.len == 0 or plan.pictures.len > plan.outputs.len) return error.InvalidSamplingMetadata;
+    return decodeWithPlan(allocator, ctx, bytes, consumer, .embedding_gemma2, plan);
+}
+
+fn decodeWithPlan(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes: []const u8, consumer: Consumer, sampling: Sampling, selection: ?DisplayPlan) !Stats {
     if (!build_options.enable_cuda or builtin.os.tag != .linux) return error.UnsupportedVideoBackend;
     if (bytes.len > 256 * 1024 * 1024) return error.VideoInputTooLarge;
     ctx.video_cache_budget.failure = null;
@@ -556,14 +553,15 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     // before allocating surfaces. Sample the progressive access-unit timeline.
     // Validate the one-picture-per-sample contract against the display callbacks.
     if (sampling == .gemma4) {
-        state.selected_packets = .{ .plan = if (track.codec == .av1) packet_sampling.gemma4Av1Packets(allocator, &reader) catch |err| switch (err) {
+        state.selected_packets = .{ .plan = .{ .pictures = if (track.codec == .av1) packet_sampling.gemma4Av1Packets(allocator, &reader) catch |err| switch (err) {
             error.UnsupportedVideoProfile, error.InvalidVideoData => return error.UnsupportedVideoFormat,
             else => return err,
-        } else try packet_sampling.gemma4Pictures(&reader, reader.packets, source.control) };
+        } else try packet_sampling.gemma4Pictures(&reader, reader.packets, source.control) } };
         if (track.codec == .avc) state.avc_packet_count = reader.packets.len;
     }
     if (sampling == .embedding_gemma2) {
-        state.embedding_sampler = try embeddingSamplerForReader(&reader);
+        state.selected_packets = .{ .plan = selection orelse try embeddingSelection(allocator, &reader) };
+        if (track.codec == .avc) state.avc_packet_count = reader.packets.len;
     }
     const codec: c_int = switch (track.codec) {
         .avc => 4,
@@ -604,7 +602,7 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
             try annexPacket(allocator, &annex, lease.bytes, track.nal_length_bytes);
             break :converted annex.items;
         };
-        const pts = if (state.selected_packets != null) @as(i64, @intCast(index)) else if (state.embedding_sampler != null) packet.pts else try timestampUs(packet.pts, track.timescale);
+        const pts = if (state.selected_packets != null) @as(i64, @intCast(index)) else try timestampUs(packet.pts, track.timescale);
         const result = antfly_nvdec_packet(decoder.?, payload.ptr, @intCast(payload.len), pts, 0);
         if (state.failure) |err| return err;
         try state.checkStatus(result);
@@ -613,10 +611,9 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     const result = antfly_nvdec_packet(decoder.?, null, 0, 0, 1);
     if (state.failure) |err| return err;
     try state.checkStatus(result);
-    if (state.selected_packets) |plan| if (plan.next != plan.plan.len) return error.VideoDecodeFailed;
+    if (state.selected_packets) |plan| if (plan.next != plan.plan.pictures.len) return error.VideoDecodeFailed;
     if (state.avc_packet_count) |count| if (state.stats.decoded_frames != count) return error.UnsupportedVideoFormat;
     if (state.stats.selected_frames == 0) return error.EmptyVideo;
-    if (state.embedding_sampler) |sampler| if (sampler.next != sampler.length) return error.VideoDecodeFailed;
     succeeded = true;
     return state.stats;
 }
@@ -1530,43 +1527,28 @@ test "video PTX matches its checked source" {
 }
 
 test "embeddinggemma2 video sampling matches fractional FPS and uniformly caps the entire clip" {
-    var short = try EmbeddingSampler.init(1, 300_000, 300_000);
-    try std.testing.expectEqualSlices(usize, &.{0}, short.indices[0..short.length]);
-    try std.testing.expect(!try short.select(-1));
-    try std.testing.expect(try short.select(0));
-    const fractional = try EmbeddingSampler.init(180, 6_006_000, 6_006_000);
-    try std.testing.expectEqualSlices(usize, &.{ 0, 29, 59, 89, 119, 149 }, fractional.indices[0..fractional.length]);
-    const capped = try EmbeddingSampler.init(1800, 60_000_000, 60_000_000);
-    try std.testing.expectEqual(@as(usize, 32), capped.length);
-    try std.testing.expectEqual(@as(usize, 1770), capped.indices[31]);
-    var low_rate = try EmbeddingSampler.init(2, 4_000_000, 4_000_000);
-    try std.testing.expect(try low_rate.select(0));
-    try std.testing.expectEqual(@as(usize, 2), low_rate.repetitions);
-    try std.testing.expect(try low_rate.select(2_000_000));
-    try std.testing.expectEqual(@as(usize, 4), low_rate.next);
-    try std.testing.expectError(error.NonMonotonicVideoPresentation, low_rate.select(1));
-    try std.testing.expectError(error.VideoDurationExceeded, EmbeddingSampler.init(1801, 60_000_001, 60_000_001));
-    try std.testing.expectError(error.EmptyVideo, EmbeddingSampler.init(0, 1, 1));
+    const a = std.testing.allocator;
+    const ordinals = @import("antfly_video").sampling.referenceOrdinals;
+    const fractional = try ordinals(a, 180, 6_006_000, 1_000_000);
+    defer a.free(fractional);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 29, 59, 89, 119, 149 }, fractional);
+    const capped = try ordinals(a, 1800, 60_000_000, 1_000_000);
+    defer a.free(capped);
+    try std.testing.expectEqual(@as(usize, 32), capped.len);
+    try std.testing.expectEqual(@as(usize, 1770), capped[31]);
 }
 
-test "embeddinggemma2 sampling excludes a leading empty edit from content duration" {
-    // Equivalent to the parsed timeline of a 60-frame, 10 FPS clip preceded
-    // by a two-second empty edit. PyAV reports duration=6s and start_time=2s;
-    // the pinned processor therefore selects [0, 10, 20, 30, 40, 50].
-    const track = media.mp4.Track{
-        .id = 1,
-        .timescale = 10_240,
-        .width = 160,
-        .height = 96,
-        .avcc = &.{},
-        .nal_length_bytes = 4,
-        .display_matrix = @splat(0),
-        .edit = .{ .source_start = 20_480, .source_duration = 61_440 },
-    };
-    var sampler = try EmbeddingSampler.fromClock(60, track.edit.source_duration.?, track.timescale, track.edit);
-    try std.testing.expect(!try sampler.select(track.edit.source_start - 1));
-    try std.testing.expect(try sampler.select(track.edit.source_start));
-    try std.testing.expectEqualSlices(usize, &.{ 0, 10, 20, 30, 40, 50 }, sampler.indices[0..sampler.length]);
+test "EmbeddingGemma2 resolves repeated slots and separate outputs from one AV1 packet" {
+    var s = SelectedPackets{ .plan = .{ .pictures = .{ .len = 4 } } };
+    @memcpy(s.plan.pictures.packet_ids[0..4], &[_]usize{ 2, 2, 2, 4 });
+    @memcpy(s.plan.outputs[0..4], &[_]usize{ 1, 1, 2, 0 });
+    @memset(s.plan.pictures.timestamps_us[0..4], 0);
+    try std.testing.expect(!try s.select(2));
+    try std.testing.expect(try s.select(2));
+    try std.testing.expectEqual(2, s.repetitions);
+    try std.testing.expect(try s.select(2));
+    try std.testing.expect(try s.select(4));
+    try std.testing.expectEqual(4, s.next);
 }
 
 test "embeddinggemma2 video CUDA RGB and bicubic patches match the CPU torchvision path" {
@@ -1686,9 +1668,7 @@ test "embeddinggemma2 video staging fences coalesce repeats and drain consumer e
     var state = DecodeState{ .ctx = &ctx, .consumer = .{ .context = &consumer, .consume = Mock.State.consume, .surface_ready = Mock.State.surfaceReady, .coalesce_repetitions = true } };
     // Three model slots can refer to one coded picture. One staging/vision
     // call carries all repeats while retaining three logical sample slots.
-    var sampler = try EmbeddingSampler.init(1, 1_000_000, 1_000_000);
-    sampler.repetitions = 3;
-    state.embedding_sampler = sampler;
+    state.selected_packets = .{ .plan = .{ .pictures = .{ .len = 3 } }, .repetitions = 3 };
     try std.testing.expectEqual(@as(c_int, 1), DecodeState.callback(&state, 1, 256, 160, 96, 0, 2, 0, 8, 2));
     try std.testing.expectEqual(@as(usize, 1), consumer.calls);
     try std.testing.expectEqual(@as(usize, 3), consumer.copies);
@@ -1770,9 +1750,39 @@ test "embeddinggemma2 video sampler applies both edit endpoints in source ticks"
     var packets: [3]media.mp4.Packet = @splat(reader.packets[0]);
     for (&packets, [_]i64{ 0, 1, 2_000_001 }) |*packet, pts| packet.pts = pts;
     view.packets = &packets;
-    var sampler = try embeddingSamplerForReader(&view);
-    try std.testing.expect(!try sampler.select(0));
-    try std.testing.expect(try sampler.select(1));
-    try std.testing.expect(!try sampler.select(2_000_001));
-    try std.testing.expectEqual(@as(usize, 1), sampler.frame);
+    packets[0].duration = 1; // Ends exactly where the edit starts.
+    var selection = try embeddingSelection(a, &view);
+    try std.testing.expectEqualSlices(usize, &.{1}, selection.pictures.ids());
+    var cursor = SelectedPackets{ .plan = selection };
+    try std.testing.expect(!try cursor.select(0));
+    try std.testing.expect(try cursor.select(1));
+    try std.testing.expect(!try cursor.select(2));
+    view.packets = packets[0..1];
+    packets[0].duration = 2_000_002;
+    selection = try embeddingSelection(a, &view);
+    try std.testing.expectEqualSlices(usize, &.{0}, selection.pictures.ids());
+}
+
+test "embeddinggemma2 video AV1 selection excludes non-displaying samples from the reference clock" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../../testdata/video/codecs/av1.mp4");
+    const data = try std.mem.concat(a, u8, &.{ bytes, &.{ 0x12, 0x00 } });
+    defer a.free(data);
+    var source = media.source.Source{ .allocator = a, .identity = "visible-av1", .storage = .{ .borrowed = bytes } };
+    var reader = try media.mp4.Reader.init(a, &source, mp4Limits(true));
+    defer reader.deinit();
+    const expected = try embeddingSelection(a, &reader);
+    const packets = try a.alloc(media.mp4.Packet, reader.packets.len + 1);
+    defer a.free(packets);
+    @memcpy(packets[0..1], reader.packets[0..1]);
+    @memcpy(packets[2..], reader.packets[1..]);
+    packets[1] = packets[0];
+    packets[1].offset = bytes.len;
+    packets[1].size = 2;
+    source.storage = .{ .borrowed = data };
+    var adjusted = reader;
+    adjusted.packets = packets;
+    const actual = try embeddingSelection(a, &adjusted);
+    try std.testing.expectEqualSlices(i64, expected.pictures.timestamps(), actual.pictures.timestamps());
+    for (expected.pictures.ids(), actual.pictures.ids()) |before, after| try std.testing.expectEqual(before + @intFromBool(before > 0), after);
 }

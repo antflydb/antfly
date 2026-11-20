@@ -2186,7 +2186,7 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
     const before = MediaTransferSnapshot.init(cb);
     defer observeResidentTransfers(cb, before, options);
     const started = mediaNow();
-    var projected = projector.encodeEmbeddingGemma2VideoResident(cb, a, bytes, options.max_tokens) catch |err| {
+    var projected = projector.encodeEmbeddingGemma2VideoResident(cb, a, bytes, options.max_tokens, inspected.selection) catch |err| {
         std.log.warn("embeddinggemma2 CUDA video failed phase=decode_projection error={s}", .{@errorName(err)});
         return videoInputError(err);
     };
@@ -2244,13 +2244,12 @@ fn cudaVideoRequest(clip: @import("../ops/cuda/video.zig").EmbeddingInspection, 
     const pixels = @as(usize, clip.width) * clip.height;
     const patches = @as(usize, g.width / 16) * (g.height / 16);
     // Retain the qualified CUDA media arena allowance. Add owned RGB/patch
-    // staging, pending and concatenated vision inputs, and both accumulation
-    // and compact projection buffers. NVDEC surfaces have their own cache
+    // staging, pending and concatenated vision inputs, and projected batch and accumulated output rows. NVDEC surfaces have their own cache
     // reservation, acquired from the same controller by reserveDecoder.
     const media_workspace = 384 * 1024 * 1024 + pixels * 3 +
         @as(usize, g.width) * g.height * 3 * @sizeOf(f32) +
         @min(clip.frames, 4) * patches * 768 * @sizeOf(f32) * 2 +
-        2 * 32 * 140 * 512 * @sizeOf(f32);
+        (clip.frames + @min(clip.frames, 4)) * g.tokens * 512 * @sizeOf(f32);
     return .{ .batch = 1, .sequence = sequence, .input_bytes = input_bytes, .backend_input_bytes = sequence * 512 * @sizeOf(f32), .host_preprocess_bytes = 128 * 1024 * 1024, .workspace_planned = true, .workspace_bytes = @max(media_workspace, try cudaEncoderWorkspace(sequence, 1)), .output_bytes = options.dimensions * @sizeOf(f32) };
 }
 

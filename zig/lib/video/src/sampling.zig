@@ -64,17 +64,31 @@ pub fn referencePictures(a: std.mem.Allocator, pictures: anytype, scale: u32, ed
     const order = try a.alloc(usize, pictures.len);
     defer a.free(order);
     var count: usize = 0;
+    var previous: ?usize = null;
+    var starts_at_edit = false;
     for (pictures, 0..) |picture, id| {
         if (id % 256 == 0) try control.check();
-        if (!edit.contains(picture.pts)) continue;
+        if (picture.pts == edit.source_start) starts_at_edit = true;
+        if (!edit.contains(picture.pts)) {
+            if (picture.pts < edit.source_start and (previous == null or picture.pts > pictures[previous.?].pts)) previous = id;
+            const duration: ?u64 = picture.duration;
+            if (picture.pts >= edit.source_start or duration == null or @as(i128, picture.pts) + duration.? <= edit.source_start) continue;
+        }
         order[count] = id;
         count += 1;
+    }
+    if (previous) |id| {
+        const duration: ?u64 = pictures[id].duration;
+        if (duration == null and !starts_at_edit) {
+            order[count] = id;
+            count += 1;
+        }
     }
     if (count == 0) return error.EmptyVideo;
     const Less = struct {
         fn less(items: @TypeOf(pictures), l: usize, r: usize) bool {
             if (items[l].pts != items[r].pts) return items[l].pts < items[r].pts;
-            if (@hasField(@TypeOf(items[l]), "first_packet")) return items[l].first_packet < items[r].first_packet;
+            if (@hasField(@TypeOf(items[l]), "first_packet") and items[l].first_packet != items[r].first_packet) return items[l].first_packet < items[r].first_packet;
             return l < r;
         }
     };
@@ -174,6 +188,7 @@ pub const Timeline = struct {
     base: usize,
     first: i64,
     last: i128,
+    edited: bool,
     pub fn storageBytes(count: usize) !usize {
         const base = try std.math.ceilPowerOfTwo(usize, @max(@as(usize, 1), count));
         return std.math.add(usize, try std.math.mul(usize, count, @sizeOf(Entry)), try std.math.mul(usize, base, 2 * @sizeOf(i128)));
@@ -247,7 +262,7 @@ pub const Timeline = struct {
             node -= 1;
             maxima[node] = @max(maxima[node * 2], maxima[node * 2 + 1]);
         }
-        return .{ .allocator = a, .entries = entries, .maxima = maxima, .base = base, .first = if (stop != null) edit.source_start else bounds.first, .last = stop orelse bounds.end(null) };
+        return .{ .allocator = a, .entries = entries, .maxima = maxima, .base = base, .edited = stop != null, .first = if (stop != null) edit.source_start else bounds.first, .last = stop orelse bounds.end(null) };
     }
     pub fn deinit(self: *Timeline) void {
         self.allocator.free(self.entries);
@@ -265,16 +280,25 @@ pub const Timeline = struct {
         const origin: i128 = if (relative) self.first else 0;
         const inferred = @divFloor((self.last - origin) * 1_000_000_000 + timescale - 1, timescale);
         const end: i128 = policy.end_ns orelse (std.math.cast(i64, inferred) orelse return error.TimestampOverflow);
-        if (end <= policy.start_ns) return error.EmptyVideoWindow;
-        const candidates: u128 = @intCast(@divFloor(end - policy.start_ns + policy.step_ns - 1, policy.step_ns));
+        const start_ticks = @as(i128, policy.start_ns) * timescale;
+        const stop_ticks = end * timescale;
+        const begin = if (self.edited) @max(start_ticks, (@as(i128, self.first) - origin) * std.time.ns_per_s) else start_ticks;
+        const stop = if (self.edited) @min(stop_ticks, (self.last - origin) * std.time.ns_per_s) else stop_ticks;
+        if (stop <= begin) return error.EmptyVideoWindow;
+        // Preserve the request's cadence and include a held edit boundary once.
+        // Apply the uniform cap only after discarding out-of-edit targets.
+        const step_ticks = @as(i128, policy.step_ns) * timescale;
+        const first_slot: u128 = @intCast(@divFloor(begin - start_ticks, step_ticks));
+        const after_last: u128 = @intCast(@divFloor(stop - start_ticks - 1, step_ticks) + 1);
+        const candidates = after_last - first_slot;
         const count: usize = @intCast(@min(candidates, policy.max_frames));
         var output: std.ArrayList(usize) = .empty;
         errdefer output.deinit(a);
         for (0..count) |i| {
             try control.check();
             const ordinal: u128 = if (policy.overflow == .uniform and count > 1 and candidates > count) @as(u128, i) * (candidates - 1) / (count - 1) else i;
-            const target_ns: i128 = policy.start_ns + @as(i128, @intCast(ordinal * policy.step_ns));
-            const target = origin * 1_000_000_000 + target_ns * timescale;
+            const requested = start_ticks + @as(i128, @intCast(first_slot + ordinal)) * step_ticks;
+            const target = origin * std.time.ns_per_s + @max(begin, requested);
             var lo: usize = 0;
             var hi = self.entries.len;
             while (lo < hi) {
@@ -282,7 +306,7 @@ pub const Timeline = struct {
                 if (@as(i128, self.entries[mid].pts) * 1_000_000_000 <= target) lo = mid + 1 else hi = mid;
             }
             var chosen: ?usize = null;
-            if (policy.hold) chosen = self.active(1, 0, self.base, lo, @divFloor(target, 1_000_000_000));
+            if (policy.hold or (self.edited and target == @as(i128, self.first) * std.time.ns_per_s)) chosen = self.active(1, 0, self.base, lo, @divFloor(target, 1_000_000_000));
             if (chosen == null) {
                 lo = 0;
                 hi = self.entries.len;
@@ -567,6 +591,12 @@ test "source timestamp sampling preserves edit origin and visible logical IDs" {
     defer timeline.deinit();
     try std.testing.expectEqual(@as(i64, 10), timeline.first);
     try std.testing.expectEqual(@as(i128, 25), timeline.last);
+    for ([_]bool{ true, false }) |hold| {
+        try std.testing.expectError(error.EmptyVideoWindow, timeline.select(a, 1, .{ .start_ns = 0, .end_ns = 5 * std.time.ns_per_s, .hold = hold }, .{}, false));
+        const crossed = try timeline.select(a, 1, .{ .start_ns = 9 * std.time.ns_per_s, .end_ns = 11 * std.time.ns_per_s, .hold = hold }, .{}, false);
+        defer a.free(crossed);
+        try std.testing.expectEqualSlices(usize, &.{0}, crossed);
+    }
     const ids = try timeline.select(a, 10, .{ .step_ns = std.time.ns_per_s, .hold = true }, .{}, true);
     defer a.free(ids);
     try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, ids);

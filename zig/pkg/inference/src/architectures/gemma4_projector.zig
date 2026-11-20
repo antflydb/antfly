@@ -457,18 +457,8 @@ fn sumUsize(values: []const usize) usize {
     return total;
 }
 
-/// CUDA row slices borrow their source allocation. Return an owned compact
-/// tensor before the decode accumulator leaves scope; later token lookup can
-/// otherwise reuse that allocation and overwrite the projected frame rows.
-fn ownVideoRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, source: CT, rows: usize, width: usize) !CT {
-    const output = (try cb.allocUninitF32Shape(&.{ @intCast(rows), @intCast(width) })) orelse return error.UnsupportedVideoBackend;
-    errdefer cb.free(output);
-    if (!try cb.copyRows2D(allocator, output, 0, source, 0, rows, width)) return error.UnsupportedVideoBackend;
-    return output;
-}
-
 /// Native video uses 140 soft tokens per frame and a single joint encoder input.
-pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8, max_tokens: usize) !ProjectedVideo {
+pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8, max_tokens: usize, selection: @import("../ops/cuda/video.zig").DisplayPlan) !ProjectedVideo {
     if (comptime !@import("build_options").enable_cuda or @import("builtin").os.tag != .linux) return error.UnsupportedVideoBackend;
     if (cb.kind() != .cuda or !cb.supportsCopyRows2D() or cb.vtable.sliceRows2D == null) return error.UnsupportedVideoBackend;
     const video = @import("../ops/cuda/video.zig");
@@ -493,6 +483,7 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
         timestamps: [video.max_frames]i64 = undefined,
         count: usize = 0,
         rows: usize = 0,
+        planned_frames: usize,
         scheduled: usize = 0,
         scheduled_rows: usize = 0,
         pending: [4]Pending = undefined,
@@ -527,11 +518,18 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
             if (count == 1) self.pending[0].hidden = null;
             owned = false;
             const projected = try encodeVisionHiddenResident(self.cb, self.allocator, self.weights, self.cfg, input, g, count);
-            defer self.cb.free(projected.embeddings);
-            if (self.output == null) self.output = (try self.cb.allocUninitF32Shape(&.{ @intCast(32 * 140), @intCast(self.cfg.text_hidden) })) orelse return error.UnsupportedVideoBackend;
+            var transferred = false;
+            defer if (!transferred) self.cb.free(projected.embeddings);
+            if (projected.tokens != g.tokenCount()) return error.InvalidVideoGeometry;
+            // A full batch already owns the exact result tensor.
+            const direct = self.count == 0 and count == self.planned_frames;
+            if (direct) {
+                self.output = projected.embeddings;
+                transferred = true;
+            } else if (self.output == null) self.output = (try self.cb.allocUninitF32Shape(&.{ @intCast(self.planned_frames * projected.tokens), @intCast(self.cfg.text_hidden) })) orelse return error.UnsupportedVideoBackend;
             for (self.pending[0..count], 0..) |slot, i| {
                 for (0..slot.repetitions) |_| {
-                    if (!try self.cb.copyRows2D(self.allocator, self.output.?, self.rows, projected.embeddings, i * projected.tokens, projected.tokens, self.cfg.text_hidden)) return error.UnsupportedVideoBackend;
+                    if (!direct and !try self.cb.copyRows2D(self.allocator, self.output.?, self.rows, projected.embeddings, i * projected.tokens, projected.tokens, self.cfg.text_hidden)) return error.UnsupportedVideoBackend;
                     self.tokens[self.count] = projected.tokens;
                     self.timestamps[self.count] = slot.timestamp;
                     self.count += 1;
@@ -549,8 +547,8 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
             const raster = frame.rasterSize();
             const g = targetGeometry(self.cfg, display[0], display[1]);
             const repeated_rows = std.math.mul(usize, frame.repetitions, g.tokenCount()) catch return error.EmbeddingInputTooLong;
-            if (frame.repetitions == 0 or frame.repetitions > 32 - self.scheduled or self.scheduled_rows + repeated_rows + (self.scheduled + frame.repetitions) * 2 + 2 > self.max_tokens) return error.EmbeddingInputTooLong;
-            if (self.geometry) |previous| if (embeddingGemma2GeometryKey(previous) != embeddingGemma2GeometryKey(g)) try self.flush();
+            if (frame.repetitions == 0 or frame.repetitions > self.planned_frames - self.scheduled or self.scheduled_rows + repeated_rows + (self.scheduled + frame.repetitions) * 2 + 2 > self.max_tokens) return error.EmbeddingInputTooLong;
+            if (self.geometry) |previous| if (embeddingGemma2GeometryKey(previous) != embeddingGemma2GeometryKey(g)) return error.UnsupportedVideoFormat;
             self.geometry = g;
             const c: *cuda.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
             const rgb = try self.preprocess.rgb8(c, frame);
@@ -572,15 +570,17 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
     };
     const staging_event = try compute.ctx.createStreamEvent();
     defer _ = compute.ctx.driver.fns.cuEventDestroy(staging_event);
-    var state = State{ .cb = cb, .allocator = allocator, .weights = &weights, .cfg = cfg, .preprocess = &preprocessor, .max_tokens = max_tokens, .staging_event = staging_event, .capacity = if (compute.embedding_gemma2_policy.image_batch) 4 else 1 };
+    var state = State{ .cb = cb, .allocator = allocator, .weights = &weights, .cfg = cfg, .preprocess = &preprocessor, .max_tokens = max_tokens, .planned_frames = selection.pictures.len, .staging_event = staging_event, .capacity = if (compute.embedding_gemma2_policy.image_batch) 4 else 1 };
     defer {
         for (state.pending[0..state.pending_count]) |slot| if (slot.hidden) |tensor| cb.free(tensor);
         if (state.output) |out| cb.free(out);
     }
     errdefer compute.ctx.synchronize() catch {};
-    const stats = try video.decodeMp4Sampled(allocator, &compute.ctx, bytes, .{ .context = &state, .consume = State.consume, .check = State.check, .surface_ready = State.ready, .coalesce_repetitions = true }, .embedding_gemma2);
+    const stats = try video.decodeInspectedEmbedding(allocator, &compute.ctx, bytes, .{ .context = &state, .consume = State.consume, .check = State.check, .surface_ready = State.ready, .coalesce_repetitions = true }, selection);
     try state.flush();
-    const embeddings = try ownVideoRows(cb, allocator, state.output.?, state.rows, cfg.text_hidden);
+    if (state.count != selection.pictures.len) return error.VideoDecodeFailed;
+    const embeddings = state.output.?;
+    state.output = null;
     errdefer cb.free(embeddings);
     const counts = try allocator.dupe(usize, state.tokens[0..state.count]);
     errdefer allocator.free(counts);
@@ -8031,28 +8031,6 @@ test "gemma4 deferred CUDA raster preparation owns RGB rows and drains allocatio
     };
     try Runner.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
-}
-
-test "gemma4 video compact rows survive accumulator reuse on CUDA" {
-    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
-    const a = std.testing.allocator;
-    const cuda = @import("../ops/cuda/cuda_compute.zig");
-    var compute = try cuda.CudaCompute.init(a);
-    defer compute.deinit();
-    const cb = compute.computeBackend();
-    const values = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    const source = try cb.fromFloat32Shape(&values, &.{ 4, 2 });
-    defer cb.free(source);
-    const output = try ownVideoRows(&cb, a, source, 3, 2);
-    defer cb.free(output);
-    const zeros = try cb.fromFloat32Shape(&(@as([8]f32, @splat(0))), &.{ 4, 2 });
-    defer cb.free(zeros);
-    // Deterministically reproduce allocator reuse by overwriting the backing
-    // allocation; a borrowed slice would now return zeros.
-    try std.testing.expect(try cb.copyRows2D(a, source, 0, zeros, 0, 4, 2));
-    const actual = try cb.toFloat32(output, a);
-    defer a.free(actual);
-    try std.testing.expectEqualSlices(f32, values[0..6], actual);
 }
 
 fn singleGeometry(g: Geometry) Geometry {

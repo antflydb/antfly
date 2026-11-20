@@ -920,9 +920,13 @@ pub const Runner = struct {
             var view = video.transport_seek.View{ .map = index.mapping(), .wire = source };
             var normalized = view.source(&self.summary.identity.source, .{ .max_total_bytes = std.math.maxInt(u64), .max_reads = std.math.maxInt(usize) });
             var reader = media.mp4.Reader{ .allocator = self.allocator, .input = &normalized, .metadata = .{ .source = null, .bytes = &.{} }, .packets = index.packets.items, .track = index.track.?, .limits = limits };
-            var owner = try @import("media_chunking_video.zig").Owner.initPlanned(self.allocator, &reader, &self.pool, self.request.limits, index.headers.items);
+            const Owner = @import("media_chunking_video.zig").Owner;
+            var owner = Owner.initPlanned(self.allocator, &reader, &self.pool, self.request.limits, &index) catch |err| retry: {
+                if ((err != error.SharedAdmissionExceeded and err != error.OutOfMemory) or index.planningHeaders() == null) return err;
+                index.releaseHeaders();
+                break :retry try Owner.init(self.allocator, &reader, &self.pool, self.request.limits);
+            };
             defer owner.deinit();
-            index.releaseHeaders();
             owner.transport = view.map;
             if (identity) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission|
                 cache.rememberPlanned(std.heap.smp_allocator, key, .{ .mp4 = reader }, admission, .{ .mp4 = &owner });
@@ -1113,11 +1117,6 @@ pub const Runner = struct {
                     slot.shape = (try cursor.next()) orelse break;
                     known[index] = true;
                 }
-                if (self.ordinal < self.summary.start_ordinal) {
-                    self.ordinal = try std.math.add(u64, self.ordinal, 1);
-                    known[index] = false;
-                    continue;
-                }
                 if (slot.failure) |err| return err;
                 if (!slot.initialized) self.prepareVideoSlot(source, slot) catch |err| {
                     if (count == 0 or !@import("embedding_gemma2.zig").videoSpeculationPressure(err)) return err;
@@ -1217,6 +1216,9 @@ pub const Runner = struct {
         const source = VideoSource{ .bytes = bytes, .reader = reader, .origin = origin, .timescale = timescale, .owner = owner, .webm = webm };
         const end = std.math.cast(i64, duration) orelse return error.TimestampOverflow;
         var cursor = planning.Temporal{ .kind = .video, .end_ns = end, .policy = self.request.policy, .model = self.executor.model, .picture_tokens = 142 };
+        try self.control.check();
+        try cursor.seekVideo(self.summary.start_ordinal -| self.ordinal);
+        self.ordinal += cursor.ordinal;
         const selective = if (self.request.outputs) |config| (try config.boundary()).skip_windows.len != 0 else false;
         if (self.request.execute and !selective and self.executor.embed_video_batch != null) return self.videoBatches(source, &cursor);
         var slots = [_]VideoSlot{ .{}, .{} };
@@ -1224,11 +1226,6 @@ pub const Runner = struct {
         var active: usize = 0;
         slots[0].shape = (try cursor.next()) orelse return;
         while (true) {
-            if (self.ordinal < self.summary.start_ordinal) {
-                self.ordinal = try std.math.add(u64, self.ordinal, 1);
-                slots[active].shape = (try cursor.next()) orelse break;
-                continue;
-            }
             if (self.request.max_chunks != 0 and self.summary.emitted >= self.request.max_chunks) {
                 self.stopped = true;
                 break;

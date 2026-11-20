@@ -39,29 +39,38 @@ pub fn gemma4Pictures(reader: *const media.mp4.Reader, pictures: anytype, contro
 /// NVDEC returns source packet tags. Only samples producing a visible output
 /// participate in its clock, matching the portable logical picture index.
 pub fn gemma4Av1Packets(a: std.mem.Allocator, reader: *media.mp4.Reader) !Gemma4Plan {
+    const counts = try av1OutputCounts(a, reader);
+    defer a.free(counts);
+    var visible = try std.DynamicBitSetUnmanaged.initEmpty(a, reader.packets.len);
+    defer visible.deinit(a);
+    for (counts, 0..) |count, i| switch (count) {
+        0 => {},
+        1 => visible.set(i),
+        else => return error.UnsupportedVideoFormat,
+    };
+    return planPictures(reader.track.timescale, reader.track.edit, reader.packets, null, visible, reader.input.control);
+}
+
+pub fn av1OutputCounts(a: std.mem.Allocator, reader: *media.mp4.Reader) ![]usize {
     const headers = try @import("codecs/av1_headers.zig").Session.create(a, .{ .max_pixels = 4096 * 4096, .all_layers = false, .control = reader.input.control });
     defer headers.deinit();
     try headers.configuration(reader.track.codec_config);
-    var visible = try std.DynamicBitSetUnmanaged.initEmpty(a, reader.packets.len);
-    defer visible.deinit(a);
+    const counts = try a.alloc(usize, reader.packets.len);
+    errdefer a.free(counts);
     const Display = struct {
         fn accept(raw: *anyopaque, _: @import("codecs/vp9_header.zig").Geometry) !void {
-            const seen: *bool = @ptrCast(@alignCast(raw));
-            // Several outputs sharing a parser timestamp cannot be independently
-            // identified by NVDEC. Route these to the logical decoder up front.
-            if (seen.*) return error.UnsupportedVideoFormat;
-            seen.* = true;
+            const count: *usize = @ptrCast(@alignCast(raw));
+            count.* += 1;
         }
     };
-    for (0..reader.packets.len) |i| {
+    for (counts, 0..) |*count, i| {
         var lease = try reader.readPacket(i);
         defer lease.deinit();
-        var seen = false;
-        try headers.walk(lease.bytes, &seen, Display.accept);
-        if (seen) visible.set(i);
+        count.* = 0;
+        try headers.walk(lease.bytes, count, Display.accept);
     }
     try headers.finish();
-    return planPictures(reader.track.timescale, reader.track.edit, reader.packets, null, visible, reader.input.control);
+    return counts;
 }
 
 /// Select visible AV1 output ordinals in the original MP4 clock. Codec replay

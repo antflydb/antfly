@@ -113,7 +113,7 @@ const ParameterOverlay = struct {
         const boundary = self.original.length();
         if (offset < boundary) {
             const count: usize = @intCast(@min(destination.len, boundary - offset));
-            var lease = try self.original.read(offset, count);
+            var lease = try self.original.readControlled(offset, count, control);
             defer lease.deinit();
             @memcpy(destination[0..count], lease.bytes);
             return count;
@@ -134,7 +134,7 @@ const ParameterOverlay = struct {
         const payload_offset = relative - entry.prefix.len;
         if (payload_offset >= entry.packet.size) return error.UnexpectedEndOfSource;
         const count: usize = @intCast(@min(destination.len, entry.packet.size - payload_offset));
-        var lease = try self.original.read(entry.packet.offset + payload_offset, count);
+        var lease = try self.original.readControlled(entry.packet.offset + payload_offset, count, control);
         defer lease.deinit();
         @memcpy(destination[0..count], lease.bytes);
         return count;

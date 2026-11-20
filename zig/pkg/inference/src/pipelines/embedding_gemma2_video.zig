@@ -242,18 +242,24 @@ pub const Inspection = struct {
                 self.packet_input = opened.?.packets;
                 self.reader = self.packet_input.?.reader;
             }
-            self.configurations = try parameterSession(a, &self.reader, configuration.sampling == .gemma4 and configuration.selection == null, if (self.packet_input) |input| if (input.transport) |ts| ts.index.headers.items else null else null);
-            if (configuration.sampling == .gemma4) {
-                self.gemma4_plan = if (configuration.selection) |selection| selection.gemma4_plan orelse return error.InvalidVideoReaderSelection else try video.packet_sampling.gemma4PortablePlan(a, &self.reader, self.configurations);
-            }
-            self.selected = if (self.gemma4_plan != null and configuration.selection == null)
-                try a.dupe(usize, self.gemma4_plan.?.ids())
-            else
-                try selectReader(a, &self.reader, configuration.sampling, self.source.control, configuration.selection, self.configurations);
-            if (self.packet_input) |input| if (input.transport) |ts| {
-                if (self.configurations) |registry| registry.releasePlanningHeaders();
-                ts.index.releaseHeaders();
+            const ts = if (self.packet_input) |input| input.transport else null;
+            const cache_headers = configuration.sampling == .gemma4 and configuration.selection == null;
+            const headers = if (ts) |transport| transport.index.planningHeaders() else null;
+            self.configurations = parameterSession(a, &self.reader, cache_headers, headers) catch |err| retry: {
+                if ((err != error.SharedAdmissionExceeded and !(err == error.OutOfMemory and self.bounded.denied)) or headers == null) return err;
+                ts.?.index.releaseHeaders();
+                break :retry try parameterSession(a, &self.reader, false, null);
             };
+            self.selectPackets(a, configuration) catch |err| {
+                if ((err != error.SharedAdmissionExceeded and !(err == error.OutOfMemory and self.bounded.denied)) or ts == null or ts.?.index.planningHeaders() == null) return err;
+                if (self.configurations) |registry| registry.releasePlanningHeaders();
+                ts.?.index.releaseHeaders();
+                try self.selectPackets(a, configuration);
+            };
+            if (ts) |transport| {
+                if (self.configurations) |registry| registry.releasePlanningHeaders();
+                transport.index.releaseHeaders();
+            }
             self.plan = try inspectSelectedPacketPlan(a, &self.reader, control, true, self.selected.?, self.configurations);
             if (self.reader.track.codec == .avc and self.configurations == null) {
                 const cfg = try video.h264.configParse(a, self.reader.track.avcc);
@@ -262,6 +268,15 @@ pub const Inspection = struct {
             }
         }
         return self;
+    }
+    fn selectPackets(self: *Inspection, a: std.mem.Allocator, configuration: Configuration) !void {
+        if (configuration.sampling == .gemma4) {
+            self.gemma4_plan = if (configuration.selection) |selection| selection.gemma4_plan orelse return error.InvalidVideoReaderSelection else try video.packet_sampling.gemma4PortablePlan(a, &self.reader, self.configurations);
+        }
+        self.selected = if (self.gemma4_plan != null and configuration.selection == null)
+            try a.dupe(usize, self.gemma4_plan.?.ids())
+        else
+            try selectReader(a, &self.reader, configuration.sampling, self.source.control, configuration.selection, self.configurations);
     }
     fn deinit(self: *Inspection) void {
         const a = self.bounded.allocator();
@@ -429,9 +444,17 @@ pub const ReaderSelection = struct {
     binding: [32]u8,
     immutable: bool = false,
     reservation: media.admission.Token = .{},
+    fn selectionPeakBytes(count: usize, edit: media.timeline.Edit, sampling: Sampling) !usize {
+        const scratch = switch (sampling) {
+            .gemma4 => 0,
+            .reference => try std.math.mul(usize, count, @sizeOf(usize)),
+            .timestamps, .source_timestamps => try std.math.add(usize, try std.math.mul(usize, count, @sizeOf(video.sampling.TimedPicture)), if (edit.source_duration != null) try video.sampling.Timeline.storageBytes(count) else 0),
+        };
+        return std.math.add(usize, scratch, 128 * @sizeOf(usize) + 32 * @sizeOf(CacheKey));
+    }
     pub fn init(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, logical: *const video.h264_pictures.Index, pool: ?*media.admission.Pool, control: media.source.Control) !ReaderSelection {
         if ((reader.track.codec != .avc and reader.track.codec != .mjpeg) or logical.packet_count != reader.packets.len or logical.timescale != reader.track.timescale or logical.pictures.len > 8192) return error.InvalidVideoReaderSelection;
-        const bound = try std.math.add(usize, try std.math.mul(usize, logical.pictures.len, @sizeOf(video.sampling.TimedPicture)), 128 * @sizeOf(usize) + 32 * @sizeOf(CacheKey));
+        const bound = try selectionPeakBytes(logical.pictures.len, reader.track.edit, sampling);
         var reservation = if (pool) |shared| try shared.acquire(.{ .host_bytes = bound }) else media.admission.Token{};
         errdefer reservation.deinit();
         const binding = try readerBinding(reader, sampling, control);
@@ -450,7 +473,7 @@ pub const ReaderSelection = struct {
     /// reuse projections without reading or hashing coded dependencies again.
     pub fn initImmutable(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, logical: *const video.h264_pictures.Index, pool: ?*media.admission.Pool, control: media.source.Control, source_binding: [32]u8, packet_base: usize) !ReaderSelection {
         if (logical.packet_count != reader.packets.len or logical.timescale != reader.track.timescale) return error.InvalidVideoReaderSelection;
-        const bound = try std.math.add(usize, try std.math.mul(usize, logical.pictures.len, @sizeOf(video.sampling.TimedPicture)), 128 * @sizeOf(usize) + 32 * @sizeOf(CacheKey));
+        const bound = try selectionPeakBytes(logical.pictures.len, reader.track.edit, sampling);
         var reservation = if (pool) |shared| try shared.acquire(.{ .host_bytes = bound }) else media.admission.Token{};
         errdefer reservation.deinit();
         const plan = if (sampling == .gemma4) try video.packet_sampling.gemma4Pictures(reader, logical.pictures, control) else null;
@@ -4344,10 +4367,15 @@ test "embeddinggemma2 video Apple continuation drains windows while preserving n
         var batch = try video.apple.decodeTo(a, &reader, &.{index}, .{ .require_hardware = false }, .{ .context = &expected, .accept = Oracle.accept });
         defer batch.deinit();
         var actual = Oracle{};
+        const reads = source.reads;
         total += try decoder.decodeTo(&.{index}, .{ .context = &actual, .accept = Oracle.accept });
+        try std.testing.expect(source.reads > reads);
         try std.testing.expectEqualSlices(u8, &expected.hash, &actual.hash);
     }
     try std.testing.expectEqual(@min(reader.packets.len, 8), total);
+    source.limits.max_reads = source.reads;
+    var blocked = Oracle{};
+    try std.testing.expectError(error.ResourceLimitExceeded, decoder.decodeTo(&.{8}, .{ .context = &blocked, .accept = Oracle.accept }));
 }
 
 test "embeddinggemma2 video retained WebM preparation matches independent windows" {
