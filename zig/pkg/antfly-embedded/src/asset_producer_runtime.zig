@@ -194,6 +194,21 @@ test "reader split windows share rounded geometry envelopes" {
     try std.testing.expectEqual(rounded, rounded.roundedUp());
 }
 
+test "reader split windows share lower bound checks for mixed media" {
+    const lease: remote_capabilities.CapabilityLease = .{ .capabilities = .{
+        .task = .read,
+        .input_modalities = .{ .image = true },
+        .input_granularity = .page,
+        .output = .read_result,
+        .batch = .{ .max_decoded_pixels = 100 },
+    } };
+    const inline_lower_bound: remote_capabilities.DiscoveryMediaGeometry = .{
+        .batch = .{ .pixels = 140 },
+        .first = .{ .pixels = 140 },
+    };
+    try std.testing.expectError(error.InferenceDiscoveryTooManyItems, Runtime.validateReaderPlacementGeometry(lease, inline_lower_bound, 2));
+}
+
 test "reader execution report preserves mixed native and fallback completion" {
     var report = inference_work.ExecutionReport{};
     try mergeReaderExecution(&report, .{
@@ -4058,28 +4073,38 @@ pub const Runtime = struct {
         var complete = request.images.len != 0;
         const geometry = try readerMediaGeometry(alloc, request, &complete);
         measured.* = geometry;
-        if (!complete) {
-            return cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, headers.*, wait);
-        }
-
         const shaped = headers.*;
-        const rounded = geometry.roundedUp();
-        headers.* = try placement.withMediaGeometry(shaped, rounded);
-        const candidate = cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, headers.*, wait) catch |err| switch (err) {
-            error.InferenceDiscoveryTooManyItems, error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilityDiscoveryRejected => {
-                if (std.meta.eql(geometry, rounded)) return err;
-                headers.* = try placement.withMediaGeometry(shaped, geometry);
-                return cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, headers.*, wait);
-            },
-            else => return err,
-        };
-        if (candidate.capabilities) |caps| {
-            if (!geometry.fits(caps)) {
-                const first = remote_capabilities.DiscoveryMediaGeometry{ .batch = geometry.first };
-                if (first.fits(caps) and request.images.len > 1) return error.InferenceDiscoveryTooManyItems;
-            }
+        if (complete) {
+            const rounded = geometry.roundedUp();
+            const has_rounding = !std.meta.eql(geometry, rounded);
+            headers.* = try placement.withMediaGeometry(shaped, rounded);
+            if (has_rounding) headers.* = try placement.withRoundedMediaMarker(headers.*);
+            const candidate: ?remote_capabilities.CapabilityLease = cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, headers.*, wait) catch |err| switch (err) {
+                error.InferenceDiscoveryRequiresExactGeometry, error.InferenceDiscoveryTooManyItems, error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilityDiscoveryRejected => exact: {
+                    if (has_rounding) {
+                        headers.* = try placement.withMediaGeometry(shaped, geometry);
+                        break :exact cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, headers.*, wait) catch |exact_err| switch (exact_err) {
+                            error.RemoteCapabilityDiscoveryTransient => null,
+                            else => return exact_err,
+                        };
+                    }
+                    if (err != error.RemoteCapabilityDiscoveryTransient) return err;
+                    break :exact null;
+                },
+                else => return err,
+            };
+            if (candidate) |lease| return try validateReaderPlacementGeometry(lease, geometry, request.images.len);
         }
-        return candidate;
+        headers.* = shaped;
+        const fallback = try cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, shaped, wait);
+        return validateReaderPlacementGeometry(fallback, geometry, request.images.len);
+    }
+
+    fn validateReaderPlacementGeometry(lease: remote_capabilities.CapabilityLease, geometry: remote_capabilities.DiscoveryMediaGeometry, items: usize) !remote_capabilities.CapabilityLease {
+        if (lease.capabilities) |caps| {
+            if (items > 1 and !geometry.fits(caps)) return error.InferenceDiscoveryTooManyItems;
+        }
+        return lease;
     }
 
     fn readImagesWithConfig(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.Request) ![]readers.Result {

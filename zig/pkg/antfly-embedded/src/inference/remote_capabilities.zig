@@ -114,6 +114,7 @@ pub const DiscoveryMediaGeometry = struct {
 };
 
 pub const discovery_media_header = "X-Antfly-Inference-Discovery-Media";
+pub const discovery_rounded_media_header = "X-Antfly-Inference-Discovery-Media-Rounded";
 
 /// Stack-owned headers for discovery. Pass the original selectors to execution.
 pub const DiscoveryHeaders = struct {
@@ -133,6 +134,11 @@ pub const DiscoveryHeaders = struct {
         const first = geometry.first;
         self.entries[shaped.len] = .{ discovery_media_header, try std.fmt.bufPrint(&self.media_value, "{d}:{d}:{d}:{d}:{d}:{d}", .{ batch.encoded, batch.framed, batch.pixels, first.encoded, first.framed, first.pixels }) };
         return self.entries[0 .. shaped.len + 1];
+    }
+    pub fn withRoundedMediaMarker(self: *DiscoveryHeaders, geometry: []const [2][]const u8) ![]const [2][]const u8 {
+        if (geometry.len >= self.entries.len or geometry.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
+        self.entries[geometry.len] = .{ discovery_rounded_media_header, "true" };
+        return self.entries[0 .. geometry.len + 1];
     }
 };
 
@@ -1508,6 +1514,7 @@ fn discoveryResponseError(response: httpx.Response) anyerror {
     if (response.status.code == 413) {
         if (response.headers.get("X-Antfly-Inference-Discovery-Error")) |reason| {
             if (std.mem.eql(u8, reason, "items")) return error.InferenceDiscoveryTooManyItems;
+            if (std.mem.eql(u8, reason, "geometry")) return error.InferenceDiscoveryRequiresExactGeometry;
         }
     }
     return discoveryStatusError(response.status.code, capabilityStaleResponse(response));
@@ -1779,6 +1786,7 @@ fn discoverWithContextOnce(
         .follow_redirects = false,
         .headers = headers,
         .timeout_ms = timeout_ms,
+        .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
         .cancellation = httpx.CancellationToken.fromCallback(
             context.cancellation.ptr,
             context.cancellation.is_cancelled_fn,

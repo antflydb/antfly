@@ -26567,6 +26567,10 @@ pub const Node = struct {
     }
 
     pub fn listModels(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        ctx.application_deadline_ns = @import("inference_deadline.zig").establish(ctx.application_deadline_ns, ctx.request.headers.iterator(), platform.time.monotonicNs()) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_INFERENCE_TIMEOUT", .retryable = false });
+        const catalog_control = httpInferenceExecutionControl(self, ctx);
+        catalog_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         try ctx.setHeader("X-Antfly-Generation-Placement-Version", "1");
         const catalog_generation = catalog_publication.read(ctx.allocator, ctx.io, self.config.models_dir) catch |err| return requestModelResolutionError(ctx, err);
         if (ctx.header("X-Antfly-Inference-Chunk-Requirements")) |requirements| {
@@ -26597,7 +26601,7 @@ pub const Node = struct {
                     };
                     defer ctx.allocator.free(path);
                     if (pin) |expected| {
-                        const identity = self.chunkSpeakerRevision(path, ctx.io, self.bindExecutionControl(ctx.io, .{})) catch |err| return requestModelResolutionError(ctx, err);
+                        const identity = self.chunkSpeakerRevision(path, ctx.io, catalog_control) catch |err| return requestModelResolutionError(ctx, err);
                         if (!std.mem.eql(u8, expected, &identity)) return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkModelIdentityMismatch");
                     }
                 } else {
@@ -26614,7 +26618,7 @@ pub const Node = struct {
                         return requestModelResolutionError(ctx, err);
                     };
                     defer ctx.allocator.free(selected.path);
-                    const control = selected.bind(self.bindExecutionControl(ctx.io, .{}));
+                    const control = selected.bind(catalog_control);
                     if (kind == .embedding) {
                         if (pin) |expected| {
                             const identity = self.model_manager.chunkPlanningIdentityForDiscovery(selected.path, ctx.io, control) catch |err| return requestModelResolutionError(ctx, err);
@@ -26628,7 +26632,7 @@ pub const Node = struct {
                             return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkOutputModelUnsupported");
                         };
                         if (pin) |expected| {
-                            const identity = std.fmt.bytesToHex(self.model_manager.modelIdentityForManifest(selected.path, manifest) catch |err| return requestModelResolutionError(ctx, err), .lower);
+                            const identity = std.fmt.bytesToHex(self.model_manager.modelIdentityForManifestWithControl(selected.path, manifest, ctx.io, control) catch |err| return requestModelResolutionError(ctx, err), .lower);
                             if (!std.mem.eql(u8, expected, &identity)) return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkModelIdentityMismatch");
                         }
                     }

@@ -10073,6 +10073,10 @@ pub const ModelManager = struct {
         return identity;
     }
 
+    pub fn modelIdentityForManifestWithControl(self: *ModelManager, model_dir: []const u8, manifest: manifest_mod.ModelManifest, io: std.Io, control: InferenceExecutionControl) ![32]u8 {
+        return modelIdentityWithArtifacts(self.allocator, io, model_dir, manifest, null, control);
+    }
+
     pub fn modelIdentityForManifest(self: *ModelManager, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
         return modelIdentity(self.allocator, try self.componentPlanIo(), model_dir, manifest);
     }
