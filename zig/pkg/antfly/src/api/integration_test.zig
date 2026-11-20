@@ -2960,16 +2960,21 @@ test "public api standalone-like integration backs up drops and restores a table
     );
     defer query_resp.deinit(std.testing.allocator);
 
-    const backup_body =
-        \\{"backup_id":"standalone-like-roundtrip-snap","location":"file:///","connection":"test-backups"}
-    ;
+    const backup_location = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{backup_root_absolute});
+    defer std.testing.allocator.free(backup_location);
+    const transfer_body = try std.json.Stringify.valueAlloc(std.testing.allocator, .{
+        .backup_id = "standalone-like-roundtrip-snap",
+        .location = backup_location,
+        .connection = "test-backups",
+    }, .{});
+    defer std.testing.allocator.free(transfer_body);
     const backup_uri = try raft_routes.Routes.join(std.testing.allocator, base_uri, "/db/v1/tables/docs/backup");
     defer std.testing.allocator.free(backup_uri);
     var backup_resp = try executor.executor().execute(std.testing.allocator, .{
         .method = .POST,
         .uri = backup_uri,
         .content_type = "application/json",
-        .body = backup_body,
+        .body = transfer_body,
     });
     defer backup_resp.deinit(std.testing.allocator);
     if (backup_resp.status != 201) {
@@ -3009,16 +3014,13 @@ test "public api standalone-like integration backs up drops and restores a table
     const lifecycle_reads_after_drop = data_server.remoteMetadataLifecycleLinearizableReadsForTest();
     try std.testing.expect(lifecycle_reads_after_drop > lifecycle_reads_before_drop);
 
-    const restore_body =
-        \\{"backup_id":"standalone-like-roundtrip-snap","location":"file:///","connection":"test-backups"}
-    ;
     const restore_uri = try raft_routes.Routes.join(std.testing.allocator, base_uri, "/db/v1/tables/docs/restore");
     defer std.testing.allocator.free(restore_uri);
     var restore_resp = try executor.executor().execute(std.testing.allocator, .{
         .method = .POST,
         .uri = restore_uri,
         .content_type = "application/json",
-        .body = restore_body,
+        .body = transfer_body,
     });
     defer restore_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), restore_resp.status);

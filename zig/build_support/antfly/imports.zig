@@ -428,6 +428,7 @@ pub const AntflyRootImports = struct {
         @import("../embedded/source_owner.zig").registerStorageIndependent(mod);
         mod.addImport("antfly_platform", self.platform);
         mod.addImport("antfly_cancellation", self.cancellation);
+        mod.addImport("antfly_inference_execution_context", self.inference_execution_context);
         mod.addImport("antfly_template_content", implementation.template_content);
         mod.addImport("antfly_runtime_fs", self.runtime_fs);
         // Extraction clients carry the caller's request deadline/cancellation.
@@ -531,6 +532,11 @@ pub const AntflyRootImports = struct {
                 self.filesystem_capacity_source_file,
                 self.platform_target,
             );
+            // The platform module already provides the anchor on Linux even
+            // when it was configured without libc.
+            if (self.platform_target.result.os.tag != .linux) {
+                platform_build.addNativeFdCacheSource(mod, self.filesystem_capacity_source_file, self.platform_target);
+            }
         }
         mod.link_libc = link_libc;
     }

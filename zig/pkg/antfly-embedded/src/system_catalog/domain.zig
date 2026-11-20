@@ -325,14 +325,19 @@ pub const Mutation = struct {
     location_json: []const u8 = "null",
     source_json: []const u8 = "null",
     expected_graph_revision: ?u64 = null,
+    /// Bound destructive SQL DDL. Zero attests absence for IF EXISTS.
+    expected_resource_id: ?u64 = null,
+    expected_incarnation: ?[16]u8 = null,
+    expected_parent_id: ?u64 = null,
+    expected_tablespace_id: ?u64 = null,
     /// Populated only by native table admission, never accepted from public JSON.
     table_id: u64 = 0,
     storage_name: []const u8 = "",
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "expected_graph_revision")) {
-                if (self.expected_graph_revision) |revision| {
+            if (comptime std.mem.eql(u8, name, "expected_incarnation") or std.mem.eql(u8, name, "expected_graph_revision") or std.mem.eql(u8, name, "expected_resource_id") or std.mem.eql(u8, name, "expected_parent_id") or std.mem.eql(u8, name, "expected_tablespace_id")) {
+                if (@field(self, name)) |revision| {
                     try jw.objectField(name);
                     try jw.write(revision);
                 }
@@ -342,6 +347,20 @@ pub const Mutation = struct {
             }
         }
         try jw.endObject();
+    }
+};
+
+pub const PolicyRead = struct {
+    table_id: u64,
+    name: []const u8,
+    id: ?u64 = null,
+
+    pub fn select(self: @This(), state: State) State {
+        const records = for (state.policies, 0..) |record, i| {
+            if (record.table_id == self.table_id and std.ascii.eqlIgnoreCase(record.name, self.name) and (self.id == null or self.id.? == record.id))
+                break state.policies[i..][0..1];
+        } else state.policies[0..0];
+        return .{ .revision = state.revision, .next_id = state.next_id, .policies = records };
     }
 };
 
@@ -620,7 +639,7 @@ pub const MutableState = struct {
     }
 
     pub fn clonePolicies(alloc: std.mem.Allocator, records: []const @import("policies.zig").Record) !OwnedPolicies {
-        if (records.len > 1024) return error.RowPolicyLimitExceeded;
+        if (records.len > @import("policies.zig").max_stored_definitions) return error.RowPolicyLimitExceeded;
         const bytes = try std.json.Stringify.valueAlloc(alloc, records, .{});
         defer alloc.free(bytes);
         var owned = try std.json.parseFromSlice([]const @import("policies.zig").Record, alloc, bytes, .{ .allocate = .alloc_always });
@@ -869,12 +888,22 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
         .namespace => ((try reader.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id,
         .table => (try reader.namespaceFor(request.database, request.namespace)).id,
     };
+    if (request.expected_parent_id) |expected| {
+        if (request.action != .create or (request.kind != .table and request.kind != .namespace)) return error.InvalidCatalogMutation;
+        if (parent_id != expected) return error.CatalogGenerationChanged;
+    }
     var found = try reader.lookup(request.kind, parent_id, request.name);
     if (found == null and request.kind == .table and parent_id == default_namespace_id and request.action != .create) {
         if (try reader.physicalByName(request.name)) |table| if (try reader.byId(.table, table.id) == null) {
             found = .{ .kind = .table, .id = table.id, .parent_id = default_namespace_id, .name = table.name, .storage_name = table.name };
         };
     }
+    if (request.expected_resource_id) |expected| {
+        if (request.action == .create) return error.InvalidCatalogMutation;
+        if ((if (found) |resource| resource.id else 0) != expected) return error.CatalogGenerationChanged;
+    }
+    if (request.expected_tablespace_id != null and (request.tablespace == null or
+        (request.action != .create and (request.action != .set_tablespace or request.expected_resource_id == null)))) return error.InvalidCatalogMutation;
     var upserts = std.ArrayListUnmanaged(Resource).empty;
     defer upserts.deinit(alloc);
     var removes = std.ArrayListUnmanaged(Resource).empty;
@@ -893,7 +922,11 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                 if (existing.graph_revision != request.expected_graph_revision.?) return error.CatalogGenerationChanged;
             }
             if (request.new_name != null) return error.InvalidCatalogMutation;
-            const binding = if (request.tablespace) |name| ((try reader.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound).id else 0;
+            const binding = if (request.tablespace) |name| blk: {
+                const space = try reader.lookup(.tablespace, 0, name);
+                if (request.expected_tablespace_id) |id| if ((if (space) |destination| destination.id else 0) != id) return error.CatalogGenerationChanged;
+                break :blk (space orelse return error.TablespaceNotFound).id;
+            } else 0;
             if (request.kind == .tablespace and binding != 0) return error.InvalidCatalogMutation;
             var resource: Resource = if (replacing) found.? else .{ .native_service = request.native_service, .kind = request.kind, .id = next_id, .parent_id = parent_id, .name = request.name, .tablespace_id = binding, .placement_policy = request.placement_policy, .location_json = request.location_json, .source_json = request.source_json };
             if (replacing) {
@@ -970,7 +1003,11 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
             if (request.action == .set_tablespace) {
                 if (existing.kind == .tablespace or request.new_name != null) return error.InvalidCatalogMutation;
                 var updated = existing;
-                updated.tablespace_id = if (request.tablespace) |name| ((try reader.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound).id else 0;
+                updated.tablespace_id = if (request.tablespace) |name| blk: {
+                    const destination = try reader.lookup(.tablespace, 0, name);
+                    if (request.expected_tablespace_id) |id| if ((if (destination) |space| space.id else 0) != id) return error.CatalogGenerationChanged;
+                    break :blk (destination orelse return error.TablespaceNotFound).id;
+                } else 0;
                 try upserts.append(alloc, updated);
             } else {
                 if ((existing.kind == .database and existing.id == default_database_id) or (existing.kind == .namespace and existing.id == default_namespace_id)) return error.ProtectedCatalogResource;
@@ -1169,11 +1206,27 @@ pub const RelationMutationGuard = struct {
     owner: @import("relation_names.zig").Owner,
     incarnation: [16]u8,
 
+    /// Check the logical table binding directly; schema-owned index names
+    /// continue to require their published registry claim.
+    qualified_table: bool = false,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (!std.mem.eql(u8, name, "qualified_table") or self.qualified_table) {
+                try jw.objectField(name);
+                try jw.write(@field(self, name));
+            }
+        }
+        try jw.endObject();
+    }
+
     pub fn validate(self: @This()) !void {
         try self.target.validate();
         try (Target{ .database = self.target.database, .namespace = self.target.namespace, .table = self.logical_table }).validate();
         try self.owner.validate();
-        if (self.owner.phase != .active or std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidCatalogMutation;
+        if (self.qualified_table and (self.owner.kind != .table or !std.mem.eql(u8, self.target.name, self.logical_table))) return error.InvalidCatalogMutation;
+        if (self.owner.phase != .active or (!self.qualified_table and std.mem.allEqual(u8, &self.incarnation, 0))) return error.InvalidCatalogMutation;
     }
 
     pub fn deinitOwned(self: *@This(), alloc: std.mem.Allocator) void {
@@ -1192,16 +1245,47 @@ pub const RelationMutationGuard = struct {
         errdefer alloc.free(namespace);
         const name = try alloc.dupe(u8, self.target.name);
         errdefer alloc.free(name);
-        return .{ .target = .{ .database = database, .namespace = namespace, .name = name }, .logical_table = try alloc.dupe(u8, self.logical_table), .owner = self.owner, .incarnation = self.incarnation };
+        return .{ .target = .{ .database = database, .namespace = namespace, .name = name }, .logical_table = try alloc.dupe(u8, self.logical_table), .owner = self.owner, .incarnation = self.incarnation, .qualified_table = self.qualified_table };
     }
 };
 
+/// Identity observed by the SQL binder. A null target denotes a named graph.
+pub const CursorBinding = struct {
+    target: ?Target = null,
+    physical: []const u8,
+    id: u64,
+    version: u64,
+};
+
+pub const CursorPolicies = struct {
+    digest: [32]u8,
+    protected: bool,
+
+    pub fn observe(hash: *std.crypto.hash.Blake3, protected: *bool, binding: CursorBinding, stamp: ?@import("policies.zig").PublicationStamp) !void {
+        var encoded: [16]u8 = @splat(0);
+        if (stamp) |value| {
+            if (value.table_id != binding.id or value.schema_version != binding.version) return error.RowPolicyCatalogChanged;
+            if (try value.servingAuthority()) |serving| {
+                std.mem.writeInt(u64, encoded[0..8], serving.generation, .little);
+                std.mem.writeInt(u64, encoded[8..16], serving.catalog_epoch, .little);
+                protected.* = true;
+            }
+        }
+        hash.update(&encoded);
+    }
+};
+pub const CursorCatalogCut = struct { revision: u64, epoch: @import("relation_reconciliation.zig").Epoch };
 pub const ResolveMany = struct {
+    cursor_catalog_cut: ?CursorCatalogCut = null,
+    cursor_bindings: []const CursorBinding = &.{},
     targets: []const Target = &.{},
     /// Internal reverse lookup for dependency authorization and schema output.
     /// Captured with forward bindings in the same immutable catalog read.
     storage_names: []const []const u8 = &.{},
     include_query_definitions: bool = false,
+    /// Request the tracked physical relation source cut alongside the logical
+    /// revision. A missing epoch cannot validate a cached binding.
+    include_source_epoch: bool = false,
     expected_revision: ?u64 = null,
     relations: []const RelationTarget = &.{},
     /// Name allocation may use an authoritative metadata cut without a
@@ -1210,7 +1294,11 @@ pub const ResolveMany = struct {
     expected_relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        if (self.relations.len != 0 or self.expected_relation_epoch != null) {
+        if (self.cursor_bindings.len != 0) {
+            try jw.write(.{ .cursor_bindings = self.cursor_bindings, .cursor_catalog_cut = self.cursor_catalog_cut, .include_source_epoch = true, .expected_revision = self.expected_revision });
+        } else if (self.include_source_epoch) {
+            try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .include_source_epoch = true, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch });
+        } else if (self.relations.len != 0 or self.expected_relation_epoch != null) {
             try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch });
         } else {
             // Keep ordinary table resolution compatible with strict old peers.
@@ -1220,9 +1308,12 @@ pub const ResolveMany = struct {
 };
 
 pub const ResolvedMany = struct {
+    cursor_policies: ?CursorPolicies = null,
     revision: u64,
     tables: []const ?ResolvedTable,
     logical_names: []const ?[]const u8 = &.{},
+    /// Source observation for descriptor invalidation, independent of publication.
+    source_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
     /// Null means the receiver did not attest authoritative relation resolution.
     /// A missing field from an older peer must never prove name absence.
     relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
@@ -1231,7 +1322,11 @@ pub const ResolvedMany = struct {
     relation_names_only: bool = false,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        if (self.relation_epoch != null or self.relations.len != 0) {
+        if (self.cursor_policies != null) {
+            try jw.write(.{ .revision = self.revision, .tables = self.tables, .source_epoch = self.source_epoch, .cursor_policies = self.cursor_policies });
+        } else if (self.source_epoch != null) {
+            try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .source_epoch = self.source_epoch, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only });
+        } else if (self.relation_epoch != null or self.relations.len != 0) {
             try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only });
         } else {
             try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names });

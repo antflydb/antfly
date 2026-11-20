@@ -88,6 +88,10 @@ extern "C" __global__ void video_patches(const unsigned char *input, float *outp
     float py=(float(dy)+0.5f)*float(raster_height)/float(out_height)-0.5f;
     float sx, sy;
     coded_position(px, py, width, height, rotation, &sx, &sy);
+    // Half-pixel coordinates can lie outside the raster when upscaling.
+    // Clamp before forming interpolation weights, matching the CPU image path.
+    sx=fminf(float(width)-1.0f,fmaxf(0.0f,sx));
+    sy=fminf(float(height)-1.0f,fmaxf(0.0f,sy));
     unsigned x0=(unsigned)fmaxf(0.0f,floorf(sx)), y0=(unsigned)fmaxf(0.0f,floorf(sy)), x1=min(x0+1,width-1), y1=min(y0+1,height-1);
     float fx=sx-x0, fy=sy-y0;
     float a=rgb(input,pitch,height,x0,y0,c,matrix,full,high,tone), b=rgb(input,pitch,height,x1,y0,c,matrix,full,high,tone);
@@ -108,4 +112,27 @@ extern "C" __global__ void video_rgb8(const unsigned char *input, unsigned char 
     float sx, sy;
     coded_position(float(pixel % raster_width), float(pixel / raster_width), width, height, rotation, &sx, &sy);
     output[i] = (unsigned char)rgb(input, pitch, height, (unsigned)sx, (unsigned)sy, i % 3, matrix, full, high, tone);
+}
+
+// SDR limited-range BT.601 RGB8 boundary used by the upstream PyAV processor.
+// Keep each signed product's arithmetic shift before summation: combining the
+// float matrix and rounding once introduces a positive RGB bias. Coefficients
+// are the standard conversion matrix rounded to Q13, with three fractional
+// input bits. See FFmpeg libswscale/yuv2rgb.c and x86/yuv_2_rgb.asm.
+// The caller admits only eight-bit, limited-range BT.601 without tone mapping.
+extern "C" __global__ void video_rgb8_swscale601(const unsigned char *input, unsigned char *output,
+    unsigned pitch, unsigned width, unsigned height, unsigned matrix, unsigned full,
+    unsigned rotation, unsigned high, unsigned tone) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width * height * 3) return;
+    unsigned pixel = i / 3, raster_width = rotation & 1 ? height : width;
+    float sx, sy;
+    coded_position(float(pixel % raster_width), float(pixel / raster_width), width, height, rotation, &sx, &sy);
+    unsigned x = (unsigned)sx, y = (unsigned)sy;
+    const unsigned char *uv = input + pitch * height + (y / 2) * pitch + (x / 2) * 2;
+    int yy = ((int(input[y * pitch + x]) * 8 - 128) * 9539) >> 16;
+    int u = int(uv[0]) * 8 - 1024, v = int(uv[1]) * 8 - 1024;
+    int value = i % 3 == 0 ? yy + ((v * 13075) >> 16) : i % 3 == 2 ? yy + ((u * 16525) >> 16) :
+        yy + ((u * -3209) >> 16) + ((v * -6660) >> 16);
+    output[i] = (unsigned char)min(255, max(0, value));
 }

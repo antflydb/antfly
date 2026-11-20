@@ -2130,6 +2130,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.graphAuthority(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .catalog_policy_definition => |input| {
+                    const value = handle.store.policyDefinitionRead(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .catalog_read => |input| {
                     const value = handle.store.systemCatalogRead(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -2289,6 +2293,10 @@ pub fn metadataApplyStoreProjection(
                     };
                     break :blk metadataProjectionJson(alloc, out_json, result);
                 },
+                .policy_create_has_capacity => {
+                    const available = handle.store.policyCreateHasCapacity(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, available);
+                },
                 .require_policy_index_mutation_allowed => |input| {
                     handle.store.requirePolicyIndexMutationAllowed(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, true);
@@ -2441,6 +2449,20 @@ pub fn metadataApplyStoreProjection(
                 .timeout
             else
                 storageOwnerStatusFromError(err);
+            defer handle.store.freeTables(alloc, value.tables);
+            defer handle.store.freeRanges(alloc, value.ranges);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .catalog_table_projection => blk: {
+            const value = handle.store.captureCatalogTableProjection(
+                alloc,
+                request.group_id,
+                request.key.slice(),
+                if (request.arg0 == 0) null else request.arg0,
+            ) catch |err| break :blk if (err == error.CatalogRoutingSnapshotTimeout)
+                .timeout
+            else
+                metadataProjectionStatusFromError(err);
             defer handle.store.freeTables(alloc, value.tables);
             defer handle.store.freeRanges(alloc, value.ranges);
             break :blk metadataProjectionJson(alloc, out_json, value);
@@ -2689,7 +2711,10 @@ pub fn metadataApplyStoreProjection(
             break :blk .ok;
         },
         .restore_job_value => blk: {
-            const value = handle.store.getRestoreJobValue(alloc, request.group_id, request.key.slice()) catch |err|
+            const value = (if (request.arg0 == 1)
+                handle.store.getRestoreJobRecord(alloc, request.group_id, request.key.slice())
+            else
+                handle.store.getRestoreJobValue(alloc, request.group_id, request.key.slice())) catch |err|
                 break :blk storageOwnerStatusFromError(err);
             defer if (value) |bytes| alloc.free(bytes);
             break :blk metadataProjectionJson(alloc, out_json, value);
@@ -5569,7 +5594,7 @@ pub fn storageOwnerQueryJson(
 ) callconv(.c) kernel_owner_abi.Status {
     out_response.* = .{};
     out_failure.* = .{};
-    if (request.control.version != kernel_owner_abi.query_abi_version)
+    if (request.control.version != kernel_owner_abi.query_request_version)
         return localOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
     const handle = asHandle(owner) orelse
         return localOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);

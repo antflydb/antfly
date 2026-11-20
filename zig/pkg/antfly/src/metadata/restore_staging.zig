@@ -74,6 +74,30 @@ test "graph retirement digest matches production index config extraction for exp
     }
 }
 pub const ProvisioningProjection = @import("restore_provisioning_contract.zig").ProvisioningProjection;
+
+/// Only plans carrying the new range witness need the v2 data reader. Empty
+/// witnesses preserve both the historical plan digest and v1 placement.
+pub fn admissionReaderGroups(alloc: std.mem.Allocator, projection: ProvisioningProjection) ![]u64 {
+    var groups: std.ArrayList(u64) = .empty;
+    errdefer groups.deinit(alloc);
+    for (projection.jobs_json) |bytes| {
+        const job = try std.json.parseFromSlice(Job, alloc, bytes, .{});
+        defer job.deinit();
+        var required = false;
+        for (job.value.plan.targets) |target| {
+            for (target.ranges) |range| required = required or !std.mem.allEqual(u8, &range.restore_admission_fingerprint, 0);
+            if (target.replace) |old| for (old.ranges) |range| {
+                required = required or !std.mem.allEqual(u8, &range.restore_admission_fingerprint, 0);
+            };
+        }
+        for (job.value.plan.external_fk_parents) |parent| for (parent.ranges) |range| {
+            required = required or !std.mem.allEqual(u8, &range.restore_admission_fingerprint, 0);
+        };
+        if (required) for (job.value.plan.targets) |target| for (target.ranges) |range| try groups.append(alloc, range.group_id);
+    }
+    return groups.toOwnedSlice(alloc);
+}
+
 pub const ProvisioningRequest = struct { node_id: u64 };
 
 pub fn scopeProvisioningForNode(alloc: std.mem.Allocator, projection: ProvisioningProjection, node_id: u64, placements: []const @import("../raft/reconciler.zig").PlacementIntent) !ProvisioningProjection {
@@ -382,14 +406,27 @@ pub fn prepareEmptyGenerationHandoffMappingsAlloc(alloc: std.mem.Allocator, targ
     }
 }
 
+/// Read the admission guard without materializing the staged owner manifests.
+pub const PlanGuard = struct {
+    expected_incarnation: ?[32]u8 = null,
+
+    pub fn read(alloc: std.mem.Allocator, bytes: []const u8) !PlanGuard {
+        var header = try std.json.parseFromSlice(PlanGuard, alloc, bytes, .{ .ignore_unknown_fields = true });
+        defer header.deinit();
+        return header.value;
+    }
+};
+
 pub const Plan = struct {
     pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
         // Preserve the canonical digest of in-flight plans created before
         // external parents became an optional part of the envelope.
+        if (std.mem.eql(u8, name, "expected_incarnation")) return self.expected_incarnation == null;
         return std.mem.eql(u8, name, "external_fk_parents") and self.external_fk_parents.len == 0;
     }
 
     id: Id,
+    expected_incarnation: ?[32]u8 = null,
     /// Authenticated server-issued aggregate manifest identity, not an
     /// independent set of user-selected table snapshot timestamps.
     cohort_digest: Digest,

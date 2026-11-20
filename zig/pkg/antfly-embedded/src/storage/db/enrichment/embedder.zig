@@ -137,6 +137,7 @@ pub const DenseEmbedder = struct {
     /// Descriptor and route authority cannot be replaced independently.
     part_lease: ?inference_work.CapabilityLease = null,
     resolve_part_lease_fn: ?*const fn (*anyopaque, Allocator, []const u8, ?RequestContext) anyerror!inference_work.CapabilityLease = null,
+    resolve_media_part_lease_fn: ?*const fn (*anyopaque, Allocator, []const u8, ?RequestContext, usize) anyerror!inference_work.CapabilityLease = null,
     part_batch_limit_fn: ?*const fn (*anyopaque, []const u8, u32, inference_work.CapabilityLease, usize) anyerror!usize = null,
     capabilities_with_context_fn: ?*const fn (*anyopaque, Allocator, []const u8, RequestContext) anyerror!inference_work.InferenceCapabilities = null,
     dense_embed_part_items_planned_fn: ?*const fn (*anyopaque, Allocator, []const u8, []const template_mod.ContentPart, u32, ?RequestContext, inference_work.CapabilityLease) anyerror![]const []const f32 = null,
@@ -400,6 +401,17 @@ pub const DenseEmbedder = struct {
         if (self.part_request_context) |context| try context.check();
         if (self.resolve_part_lease_fn != null) return self.resolveProviderLease(alloc, name);
         return .{ .capabilities = try self.capabilities(alloc, name) };
+    }
+
+    pub fn resolveMediaPartLease(self: DenseEmbedder, alloc: Allocator, name: []const u8, items: usize) !inference_work.CapabilityLease {
+        const resolve = self.resolve_media_part_lease_fn orelse return self.resolvePartLease(alloc, name);
+        if (self.part_request_context) |context| try context.check();
+        const lease = try resolve(self.ptr, alloc, name, self.part_request_context, items);
+        if (self.part_request_context) |context| try context.check();
+        const caps = lease.capabilities orelse return error.EmbeddingCapabilitiesUnavailable;
+        try caps.validate();
+        if (caps.task != .embed) return error.InvalidInferenceCapabilities;
+        return lease;
     }
 
     // Shared callback boundary for discovery and metadata-only capability

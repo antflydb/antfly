@@ -43,6 +43,37 @@ pub const Parsed = struct {
         };
     }
 
+    /// Decode only a leading placement sample. The execution decoder still
+    /// validates the entire payload and its canonical padding.
+    pub fn decodePrefix(self: Parsed, buffer: []u8) ![]const u8 {
+        switch (self.encoding) {
+            .base64 => {
+                const encoded = self.payload[0..@min(self.payload.len, buffer.len / 3 * 4)];
+                const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
+                const decoded = buffer[0..decoded_len];
+                try std.base64.standard.Decoder.decode(decoded, encoded);
+                return decoded;
+            },
+            .percent => {
+                var src: usize = 0;
+                var dst: usize = 0;
+                while (src < self.payload.len and dst < buffer.len) : (dst += 1) {
+                    if (self.payload[src] == '%') {
+                        if (self.payload.len - src < 3) return error.InvalidDataUri;
+                        const hi = hexValue(self.payload[src + 1]) orelse return error.InvalidDataUri;
+                        const lo = hexValue(self.payload[src + 2]) orelse return error.InvalidDataUri;
+                        buffer[dst] = (hi << 4) | lo;
+                        src += 3;
+                    } else {
+                        buffer[dst] = self.payload[src];
+                        src += 1;
+                    }
+                }
+                return buffer[0..dst];
+            },
+        }
+    }
+
     pub fn effectiveMediaTypeEssence(self: Parsed) []const u8 {
         return if (self.has_explicit_media_type) self.media_type_essence else "text/plain";
     }

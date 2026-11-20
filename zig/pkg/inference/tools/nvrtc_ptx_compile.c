@@ -131,12 +131,13 @@ static void print_log(struct Nvrtc *nvrtc, nvrtcProgram program) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3 || argc > 4) {
-        fprintf(stderr, "usage: %s input.cu output.ptx [compute_XX]\n", argv[0]);
+    if (argc < 3 || argc > 5 || (argc == 5 && (strcmp(argv[4], "--precise") != 0 || strcmp(argv[3], "--precise") == 0))) {
+        fprintf(stderr, "usage: %s input.cu output.ptx [compute_XX] [--precise]\n", argv[0]);
         return 2;
     }
 
-    const char *arch = argc == 4 ? argv[3] : "compute_75";
+    const int precise = argc == 5 || (argc == 4 && strcmp(argv[3], "--precise") == 0);
+    const char *arch = argc >= 4 && strcmp(argv[3], "--precise") != 0 ? argv[3] : "compute_75";
     char arch_option[64];
     snprintf(arch_option, sizeof(arch_option), "--gpu-architecture=%s", arch);
 
@@ -155,7 +156,7 @@ int main(int argc, char **argv) {
     const char *options[] = {
         arch_option,
         "--std=c++14",
-        "--use_fast_math",
+        precise ? "--fmad=false" : "--use_fast_math",
         "--device-as-default-execution-space",
     };
     result = nvrtc.compileProgram(program, (int)(sizeof(options) / sizeof(options[0])), options);

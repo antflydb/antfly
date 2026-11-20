@@ -195,6 +195,9 @@ pub const TableBackupManifest = struct {
     backup_id: []const u8,
     table_name: []const u8,
     table_id: u64 = 0,
+    /// Private destination admission witness. Repository readers clear this;
+    /// only the restore coordinator may attach it to an internal publication.
+    restore_admission_fingerprint: ?[32]u8 = null,
     description: []const u8,
     schema_json: []const u8,
     read_schema_json: []const u8,

@@ -360,6 +360,11 @@ components:
           format: uint64
           minimum: 0
           description: Optional safe-read boundary. Defaults to applied_lsn.
+        restore_job_format:
+          type: integer
+          format: uint32
+          description: Highest restore job format the standby can recover.
+
     StandbyStatusUpdateResponse:
       allOf:
         - $ref: "#/components/schemas/StandbyReplicationSlotResponse"

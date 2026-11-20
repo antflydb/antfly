@@ -140,6 +140,8 @@ pub const LocalQueryExecutionOptions = extern struct {
     /// Presentation only; never used for storage lookup or authorization.
     /// Borrowed through this synchronous call and response serialization.
     response_table_name: BorrowedBytes = .{},
+    /// Coordinator monotonic timestamp for same-process response timing.
+    public_query_started_ns: u64 = 0,
 };
 
 /// Private capability format, independently versioned from public query JSON
@@ -184,8 +186,9 @@ pub const CheckedDbBorrow = extern struct {
 /// capability and cancellation token are opaque borrows valid only for this
 /// synchronous call. No posting, candidate, stored document, or index handle
 /// crosses the compiled boundary.
+pub const query_request_version = abi_version + 1;
 pub const LocalQueryRequest = extern struct {
-    version: u32 = abi_version,
+    version: u32 = query_request_version,
     dialect: LocalQueryDialect = .internal,
     kind: LocalQueryKind = .search,
     has_execution_deadline: u8 = 0,
@@ -247,7 +250,7 @@ pub const ControlledJsonOperationRequest = extern struct {
 };
 
 pub const QueryOperationRequest = extern struct {
-    control: ControlledJsonOperationRequest = .{},
+    control: ControlledJsonOperationRequest = .{ .version = query_request_version },
     execution_options: LocalQueryExecutionOptions = .{},
 };
 

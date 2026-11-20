@@ -433,6 +433,19 @@ pub const RaftApplyStore = struct {
     pub fn graphAuthority(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/server_call.zig").GraphAuthority) !@import("../system_catalog/server_call.zig").GraphAuthorityResult {
         return self.catalogProjection(@import("../system_catalog/server_call.zig").GraphAuthorityResult, alloc, group_id, .{ .catalog_graph_authority = request });
     }
+    pub fn policyCreateHasCapacity(self: *RaftApplyStore, group_id: u64) !bool {
+        return self.catalogProjection(bool, self.alloc, group_id, .policy_create_has_capacity);
+    }
+
+    pub fn requireMetadataIncarnation(self: *RaftApplyStore, group: u64, expected: ?[32]u8) !void {
+        const incarnation = expected orelse return;
+        const actual = (try self.getMetadataIncarnation(group)) orelse return error.CatalogGenerationChanged;
+        if (!std.mem.eql(u8, &incarnation, &actual)) return error.CatalogGenerationChanged;
+    }
+
+    pub fn policyDefinitionRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.PolicyRead) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_policy_definition = request });
+    }
     pub fn systemCatalogRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Read) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_read = request });
     }
@@ -770,6 +783,19 @@ pub const RaftApplyStore = struct {
         };
     }
 
+    pub fn captureCatalogTableProjection(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8, deadline_ns: ?u64) !CatalogProjectionSnapshot {
+        return self.projectionWithAllocator(CatalogProjectionSnapshot, alloc, .{
+            .kind = .catalog_table_projection,
+            .group_id = group_id,
+            .arg0 = deadline_ns orelse 0,
+            .key = .fromSlice(name),
+        }) catch |err| switch (err) {
+            error.InvalidArgument => error.InvalidDerivedCatalogIndex,
+            error.Timeout => error.CatalogRoutingSnapshotTimeout,
+            else => err,
+        };
+    }
+
     pub fn captureCatalogCursor(self: *RaftApplyStore, group_id: u64) !CatalogCursor {
         return try self.projection(CatalogCursor, .{
             .kind = .catalog_cursor,
@@ -1056,6 +1082,12 @@ pub const RaftApplyStore = struct {
         defer abi.antfly_storage_owner_buffer_destroy(&response);
         if (response.len == 0) return null;
         return try alloc.dupe(u8, response.slice());
+    }
+
+    pub fn getRestoreJobRecord(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
+        // arg0 selects the compact row for checkpoint acknowledgement without
+        // transporting or hashing the immutable inputs again.
+        return try self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .restore_job_value, .group_id = group_id, .key = .fromSlice(logical_key), .arg0 = 1 });
     }
 
     pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {

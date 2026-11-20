@@ -22,7 +22,7 @@ const identity = @import("kernel_error_identity");
 pub fn execute(request: *const abi.LocalQueryRequest, out_response: *abi.QueryOwnedResponse, out_failure: *abi.FailureIdentity) callconv(.c) abi.Status {
     out_response.* = .{};
     out_failure.* = .{};
-    if (request.version != abi.abi_version) return fail(error.InvalidAbiVersion, out_failure);
+    if (request.version != abi.query_request_version) return fail(error.InvalidAbiVersion, out_failure);
     request.execution.validate() catch |err| return fail(err, out_failure);
     const callback = request.execution.execute_fn.?;
     return callback(request.execution.context, request, out_response, out_failure);

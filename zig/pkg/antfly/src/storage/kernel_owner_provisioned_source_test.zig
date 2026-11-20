@@ -1703,7 +1703,9 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
     try std.testing.expect(lease_capture.count > lease_count_before_reopen);
 
-    const restore_source_location = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root});
+    const restore_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root});
+    defer alloc.free(restore_uri);
+    const restore_source_location = try @import("antfly_local_sources").api_local_backups.restorePublicationIdentityAlloc(alloc, 17, "00000000000000000000000000001234", restore_uri);
     defer alloc.free(restore_source_location);
     const PublicationHook = struct {
         publish_count: usize = 0,
@@ -1876,12 +1878,19 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         var reconcile_plan = restore_plan;
         reconcile_plan.reconcile_only = true;
         reconcile_plan.replace_existing = false;
+        // The receipt on the published generation is sufficient even when
+        // the original archive root can no longer be opened.
+        reconcile_plan.backup_root = "missing-repository-after-publication";
         try std.testing.expect((try write_source.source().restoreTable(
             alloc,
             "articles",
             reconcile_plan,
         )) != null);
         try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
+        const other_publication = try @import("antfly_local_sources").api_local_backups.restorePublicationIdentityAlloc(alloc, 18, "00000000000000000000000000001234", restore_uri);
+        defer alloc.free(other_publication);
+        reconcile_plan.source_location = other_publication;
+        try std.testing.expectError(error.RestoreIdentityMismatch, write_source.source().restoreTable(alloc, "articles", reconcile_plan));
     }
 
     concurrent_maintenance.stop.store(true, .release);

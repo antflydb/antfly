@@ -3072,7 +3072,7 @@ test "lite mapped artifacts and spilled writers obey process descriptor pressure
     var pool = storage_io.NativeStoragePool.init(a);
     defer pool.deinit();
     const stats = pool.snapshotStats();
-    var occupying = try native_storage.acquireFdPermits(stats.fd_admission_capacity - stats.fd_persistent_reserve);
+    var occupying = try native_storage.acquireFdPermits(stats.fd_admission_capacity - stats.fd_persistent_reserve - stats.fd_mapping_reserve);
     defer occupying.release();
     try std.testing.expectError(error.StorageDescriptorPressure, storage.mapImmutableArtifact(a, "/mapped"));
     var writer = try storage.beginAtomicWrite(a, "/spilled");

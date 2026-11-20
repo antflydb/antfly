@@ -1667,7 +1667,7 @@ pub fn applySchemaUpdateRecord(
     schema_json: []const u8,
 ) !metadata_table_manager.TableRecord {
     try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, table.indexes_json, "");
-    return applySchemaRecord(alloc, table, schema_json, false, false, null);
+    return applySchemaRecord(alloc, table, schema_json, false, false, null, .lineage_v1);
 }
 
 /// Recompute an already prepared schema update without minting a second index
@@ -1679,22 +1679,32 @@ pub fn applySchemaUpdateRecordWithIncarnation(
     schema_json: []const u8,
     incarnation: u64,
 ) !metadata_table_manager.TableRecord {
+    return reconstructSchemaUpdateRecord(alloc, table, schema_json, incarnation, .lineage_v1);
+}
+
+pub fn reconstructSchemaUpdateRecord(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    schema_json: []const u8,
+    incarnation: u64,
+    format: SchemaRecordFormat,
+) !metadata_table_manager.TableRecord {
     try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, table.indexes_json, "");
     if (!@import("antfly_local_sources").storage_coverage_identity.isValid(incarnation)) return error.InvalidIndexConfig;
-    return applySchemaRecord(alloc, table, schema_json, false, false, incarnation);
+    return applySchemaRecord(alloc, table, schema_json, false, false, incarnation, format);
 }
 
 /// Only the fresh-generation rewrite reservation may use this constructor.
 /// It does not publish the schema or permit changing existing stored rows.
 pub fn prepareSchemaRewriteRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8) !metadata_table_manager.TableRecord {
-    return applySchemaRecord(alloc, table, schema_json, true, false, null);
+    return applySchemaRecord(alloc, table, schema_json, true, false, null, .lineage_v1);
 }
 
 /// Construct the immutable candidate for a coordinated FK generation plan.
 /// This does not publish the table: metadata's dedicated fenced state machine
 /// is the only consumer allowed to commit the returned record.
 pub fn prepareForeignKeyPublicationRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8) !metadata_table_manager.TableRecord {
-    return applySchemaRecord(alloc, table, schema_json, false, true, null);
+    return applySchemaRecord(alloc, table, schema_json, false, true, null, .lineage_v1);
 }
 
 /// Recompute the only index-catalog delta a generation publication may carry.
@@ -1729,7 +1739,9 @@ pub fn foreignKeyPublicationIndexesValid(alloc: std.mem.Allocator, table_name: [
     return std.mem.eql(u8, expected, after_indexes_json);
 }
 
-fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool, fk_publication: bool, pinned_incarnation: ?u64) !metadata_table_manager.TableRecord {
+pub const SchemaRecordFormat = enum { legacy, lineage_v1 };
+
+fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool, fk_publication: bool, pinned_incarnation: ?u64, format: SchemaRecordFormat) !metadata_table_manager.TableRecord {
     try @import("antfly_local_sources").schema_relational_index_namespace.validate(alloc, schema_json, table.indexes_json);
     const current_version = try schemaVersion(table.schema_json);
     const schema_changed = !try schemasSemanticallyEqual(alloc, table.schema_json, schema_json);
@@ -1748,7 +1760,7 @@ fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_mana
     var updated = try metadata_table_manager.cloneTable(alloc, table.*);
     errdefer metadata_table_manager.freeTable(alloc, updated);
 
-    const normalized_schema_json = try normalizeSchemaVersion(alloc, schema_json, next_version);
+    const normalized_schema_json = try normalizeSchemaRecord(alloc, schema_json, next_version, table.schema_json, format);
     var normalized_schema_json_owned = true;
     errdefer if (normalized_schema_json_owned) alloc.free(normalized_schema_json);
     // schemasSemanticallyEqual derives both runtime schemas, so the candidate
@@ -1769,7 +1781,7 @@ fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_mana
 
     if (table.read_schema_json.len == 0) {
         const normalized_read_schema_json = if (table.schema_json.len > 0)
-            try normalizeSchemaVersion(alloc, table.schema_json, current_version)
+            try normalizeSchemaRecord(alloc, table.schema_json, current_version, null, format)
         else
             try normalizeSchemaVersion(alloc, "{}", 0);
         alloc.free(updated.read_schema_json);
@@ -3772,16 +3784,19 @@ fn queryNeedsPrimaryTextIndex(req: db_mod.types.SearchRequest) bool {
 }
 
 pub fn schemaVersion(schema_json: []const u8) !u32 {
-    if (schema_json.len == 0) return 0;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, schema_json, .{});
-    defer parsed.deinit();
+    return schemaVersionAlloc(std.heap.page_allocator, schema_json);
+}
 
-    const root = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidSchemaUpdateRequest,
+pub fn schemaVersionAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !u32 {
+    if (schema_json.len == 0) return 0;
+    // Skip schema bodies and index definitions when only the version is needed.
+    const Header = struct { version: std.json.Value = .{ .integer = 0 } };
+    var parsed = std.json.parseFromSlice(Header, alloc, schema_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.UnexpectedToken => return error.InvalidSchemaUpdateRequest,
+        else => return err,
     };
-    const version_value = root.get("version") orelse return 0;
-    return switch (version_value) {
+    defer parsed.deinit();
+    return switch (parsed.value.version) {
         .integer => |value| std.math.cast(u32, value) orelse error.InvalidSchemaUpdateRequest,
         else => error.InvalidSchemaUpdateRequest,
     };
@@ -3984,15 +3999,166 @@ fn appendCanonicalSchemaJson(
 }
 
 pub fn normalizeSchemaVersion(alloc: std.mem.Allocator, schema_json: []const u8, version: u32) ![]u8 {
+    return normalizeSchemaWithPredecessor(alloc, schema_json, version, null);
+}
+
+// Birth versions are metadata-owned. Legacy writers can copy unknown schema
+// fields, so accept the map only at the exact version at which it was stamped.
+const IndexLifetimes = struct {
+    version: u32,
+    births: std.json.ArrayHashMap(u32),
+};
+const index_lifetimes_field = "x-antfly-index-lifetimes";
+
+/// These fields describe catalog object history and never change row semantics.
+pub fn removeBindingHistory(root: *std.json.ObjectMap) void {
+    _ = root.orderedRemove(index_lifetimes_field);
+    _ = root.orderedRemove("x-antfly-column-lineage");
+}
+const IndexLifetimesProjection = struct {
+    version: u32 = 0,
+    @"x-antfly-index-lifetimes": ?IndexLifetimes = null,
+    fn birth(self: @This(), name: []const u8) u32 {
+        if (self.@"x-antfly-index-lifetimes") |stamp| {
+            if (stamp.version == self.version) if (stamp.births.map.get(name)) |v| {
+                if (v <= self.version) return v;
+            };
+        }
+        return self.version;
+    }
+};
+
+pub fn indexBirthVersion(alloc: std.mem.Allocator, schema: []const u8, name: []const u8) !u32 {
+    var projection = std.json.parseFromSlice(IndexLifetimesProjection, alloc, schema, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return schemaVersion(schema),
+    };
+    defer projection.deinit();
+    return projection.value.birth(name);
+}
+
+// Only a surviving relational row shape carries continuity across versions.
+fn rowProperties(root: std.json.ObjectMap) ?std.json.ObjectMap {
+    const mode = root.get("storage_mode") orelse return null;
+    if (mode != .string or !std.mem.eql(u8, mode.string, "relational")) return null;
+    const name = root.get("default_type") orelse return null;
+    const definitions = root.get("document_schemas") orelse return null;
+    if (name != .string or definitions != .object) return null;
+    const row = definitions.object.get(name.string) orelse return null;
+    if (row != .object) return null;
+    const schema = row.object.get("schema") orelse return null;
+    if (schema != .object) return null;
+    const properties = schema.object.get("properties") orelse return null;
+    return if (properties == .object) properties.object else null;
+}
+
+fn stampColumnLineage(a: std.mem.Allocator, root: *std.json.ObjectMap, old: std.json.ObjectMap, version: u32) !void {
+    const prior = old.get("version") orelse std.json.Value{ .integer = 0 };
+    const prior_version = switch (prior) {
+        .integer => |v| std.math.cast(u32, v) orelse return,
+        .number_string => |v| std.fmt.parseInt(u32, v, 10) catch return,
+        else => return,
+    };
+    if (prior_version > version) return;
+    // Equal versions already passed whole-schema semantic equality in
+    // applySchemaRecord. Optional defaults can have different JSON spellings.
+    if (prior_version < version) {
+        const before = rowProperties(old) orelse return;
+        const after = rowProperties(root.*) orelse return;
+        if (!json_helpers.jsonValuesEqual(old.get("default_type").?, root.get("default_type").?)) return;
+        var it = before.iterator();
+        while (it.next()) |entry| {
+            const current = after.get(entry.key_ptr.*) orelse return;
+            if (!json_helpers.jsonValuesEqual(entry.value_ptr.*, current)) return;
+        }
+    }
+    const start = schema_mod.columnLineage(old, prior_version);
+    // A no-op carries forward only a lineage the predecessor actually had.
+    if (start == version) return;
+    var stamp: std.json.ObjectMap = .empty;
+    try stamp.put(a, "version", .{ .integer = version });
+    try stamp.put(a, "start", .{ .integer = start });
+    try root.put(a, "x-antfly-column-lineage", .{ .object = stamp });
+}
+
+fn stampSchemaLifetimes(a: std.mem.Allocator, root: *std.json.ObjectMap, previous: []const u8, version: u32) !void {
+    if (rowProperties(root.*) == null and root.get("relational_indexes") == null) return;
+    const source = if (previous.len == 0) "{}" else previous;
+    const old = std.json.parseFromSliceLeaky(std.json.Value, a, source, .{ .parse_numbers = false }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    if (old != .object) return;
+    try stampColumnLineage(a, root, old.object, version);
+    const indexes = root.get("relational_indexes") orelse return;
+    if (indexes != .array or indexes.array.items.len == 0) return;
+    const projection = std.json.parseFromSliceLeaky(IndexLifetimesProjection, a, source, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    var definitions: std.StringHashMapUnmanaged(std.json.Value) = .empty;
+    if (old.object.get("relational_indexes")) |prior| if (prior == .array) {
+        for (prior.array.items) |item| {
+            if (item != .object) continue;
+            const name = item.object.get("name") orelse continue;
+            if (name == .string) try definitions.put(a, name.string, item);
+        }
+    };
+    var births: std.json.ObjectMap = .empty;
+    for (indexes.array.items) |item| {
+        if (item != .object) return error.InvalidSchemaUpdateRequest;
+        const key = item.object.get("name") orelse return error.InvalidSchemaUpdateRequest;
+        if (key != .string) return error.InvalidSchemaUpdateRequest;
+        const name = key.string;
+        const prior = definitions.get(name) orelse continue;
+        if (json_helpers.jsonValuesEqual(prior, item)) {
+            try births.put(a, name, .{ .integer = projection.birth(name) });
+        }
+    }
+    if (births.count() == 0) return;
+    var stamp: std.json.ObjectMap = .empty;
+    try stamp.put(a, "version", .{ .integer = version });
+    try stamp.put(a, "births", .{ .object = births });
+    try root.put(a, index_lifetimes_field, .{ .object = stamp });
+}
+
+test "SQL index DDL birth survives compatible updates and resets after removal or replacement" {
+    const a = std.testing.allocator;
+    const legacy =
+        \\{"version":4,"relational_indexes":[{"name":"ix","keys":[{"column":"x"}]}]}
+    ;
+    const forged =
+        \\{"relational_indexes":[{"keys":[{"column":"x"}],"name":"ix"}],"x-antfly-index-lifetimes":{"version":5,"births":{"ix":1}}}
+    ;
+    const compatible = try normalizeSchemaWithPredecessor(a, forged, 5, legacy);
+    defer a.free(compatible);
+    try std.testing.expectEqual(@as(u32, 4), try indexBirthVersion(a, compatible, "ix"));
+    const replaced = try normalizeSchemaWithPredecessor(a,
+        \\{"relational_indexes":[{"name":"ix","keys":[{"column":"y"}]}]}
+    , 6, compatible);
+    defer a.free(replaced);
+    try std.testing.expectEqual(@as(u32, 6), try indexBirthVersion(a, replaced, "ix"));
+    const recreated = try normalizeSchemaWithPredecessor(a, forged, 7, "{}");
+    defer a.free(recreated);
+    try std.testing.expectEqual(@as(u32, 7), try indexBirthVersion(a, recreated, "ix"));
+}
+
+fn normalizeSchemaWithPredecessor(alloc: std.mem.Allocator, schema_json: []const u8, version: u32, predecessor: ?[]const u8) ![]u8 {
+    return normalizeSchemaRecord(alloc, schema_json, version, predecessor, .lineage_v1);
+}
+
+fn normalizeSchemaRecord(alloc: std.mem.Allocator, schema_json: []const u8, version: u32, predecessor: ?[]const u8, format: SchemaRecordFormat) ![]u8 {
     const source = if (schema_json.len > 0) schema_json else "{}";
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{ .parse_numbers = false });
     defer parsed.deinit();
     try @import("relational_expression_contract.zig").canonicalizeSchemaValue(parsed.arena.allocator(), &parsed.value);
 
-    const root = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidSchemaUpdateRequest,
-    };
+    if (parsed.value != .object) return error.InvalidSchemaUpdateRequest;
+    const root = &parsed.value.object;
+    if (format == .lineage_v1) {
+        removeBindingHistory(root);
+        if (predecessor) |old| try stampSchemaLifetimes(parsed.arena.allocator(), root, old, version);
+    }
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);

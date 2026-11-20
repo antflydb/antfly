@@ -445,6 +445,7 @@ pub const StreamingWriter = struct {
 pub const Reader = struct {
     data: []const u8,
     index_offset: usize,
+    index_crc: Crc32,
     entry_count: usize,
 
     pub fn init(data: []const u8) !Reader {
@@ -465,10 +466,13 @@ pub const Reader = struct {
             entry_count_u64,
             index_entry_size,
         ) catch return error.CorruptedPostingSegment;
-        if (readU32(footer[16..20]) != Crc32.hash(index_region.slice(data))) return error.PostingSegmentChecksumMismatch;
+        var index_crc = Crc32.init();
+        index_crc.update(index_region.slice(data));
+        if (readU32(footer[16..20]) != index_crc.final()) return error.PostingSegmentChecksumMismatch;
         const reader: Reader = .{
             .data = data,
             .index_offset = index_region.offset,
+            .index_crc = index_crc,
             .entry_count = entry_count,
         };
         try reader.validateIndex();
@@ -516,7 +520,9 @@ pub const Reader = struct {
     /// opaque payload pages. `init` has already checked their shape and the
     /// index carries a checksum for every payload value.
     pub fn admissionChecksum(self: Reader) u32 {
-        return Crc32.hash(self.data[self.index_offset..]);
+        var crc = self.index_crc;
+        crc.update(self.data[self.data.len - footer_size ..]);
+        return crc.final();
     }
 
     pub fn deltas(self: Reader, posting_id: PostingId) DeltaIterator {
@@ -638,16 +644,28 @@ pub const VerifiedReader = struct {
     alloc: Allocator,
     reader: Reader,
     verification: []Verification,
+    owns_verification: bool = true,
 
     pub fn init(alloc: Allocator, data: []const u8) !VerifiedReader {
-        const reader = try Reader.init(data);
+        return initFromReader(alloc, try Reader.init(data));
+    }
+
+    /// The caller retains the immutable bytes backing the validated reader.
+    pub fn initFromReader(alloc: Allocator, reader: Reader) !VerifiedReader {
         const verification = try alloc.alloc(Verification, reader.entry_count);
         for (verification) |*state| state.* = Verification.init(unknown);
         return .{ .alloc = alloc, .reader = reader, .verification = verification };
     }
 
+    /// The owner must outlive every borrowed reader.
+    pub fn borrow(self: VerifiedReader) VerifiedReader {
+        var borrowed = self;
+        borrowed.owns_verification = false;
+        return borrowed;
+    }
+
     pub fn deinit(self: *VerifiedReader) void {
-        self.alloc.free(self.verification);
+        if (self.owns_verification) self.alloc.free(self.verification);
         self.* = undefined;
     }
 

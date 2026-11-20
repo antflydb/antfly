@@ -155,6 +155,7 @@ pub fn provisioningFingerprint(
         hasher.update(std.mem.asBytes(&range.restore_native_manifest_size_bytes));
         hashBytes(&hasher, range.restore_native_manifest_sha256);
         hasher.update(&range.completed_restore_fingerprint);
+        hasher.update(&range.restore_admission_fingerprint);
         hasher.update(std.mem.asBytes(&table.table_id));
         hashBytes(&hasher, table.name);
         if (table.storage.dense_embeddings != .primary_lsm) hashBytes(&hasher, @tagName(table.storage.dense_embeddings));

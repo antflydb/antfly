@@ -130,6 +130,7 @@ pub const StandbyStatusUpdateRequest = struct {
     received_lsn: u64,
     applied_lsn: u64,
     safe_read_lsn: ?u64 = null,
+    restore_job_format: u32 = 0,
 };
 
 pub const StandbyStatusUpdateResponse = struct {
@@ -310,6 +311,7 @@ pub fn standbyStatusUpdate(
         request.applied_lsn,
         request.safe_read_lsn orelse request.applied_lsn,
     );
+    primary.slots.observeRestoreJobFormat(request.slot_name, request.restore_job_format);
     const slot = primary.slot(request.slot_name) orelse return error.SlotNotFound;
     return .{
         .slot_name = slot.name,
