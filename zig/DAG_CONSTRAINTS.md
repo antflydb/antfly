@@ -96,7 +96,9 @@ The hosted job driver advances through acquisition, per-domain scanning,
 publication, and cleanup. The authority stores job progress through an
 ordered compare-and-set operation. Cycle rejection is recorded before the
 cleanup step can release fences. The initial job update also stores the immutable plan, so a worker can
-recover a known attempt from its authority route and identifier. The authority indexes unfinished attempts in the same ordered writer as
+recover a known attempt from its authority route and identifier. Admission
+checks that every domain covers each authoritative source root once and
+that its source selectors and destination DAG declarations agree. The authority indexes unfinished attempts in the same ordered writer as
 job progress. Hosted workers can discover them by advancing a bounded
 attempt-ID cursor. The hosted maintenance sweep resumes one discovered
 attempt per authority visit and advances past retrying jobs. Recovery

@@ -187,19 +187,40 @@ pub fn planDagActivationPublication(
         !std.mem.eql(u8, &command.namespace, &manifest.authority_namespace))
         return error.InvalidArtifactCatalogCommand;
 
-    var remaining: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    var remaining: std.AutoHashMapUnmanaged([32]u8, []const @import("dag_activation_contract.zig").ScanRoot) = .empty;
     defer remaining.deinit(alloc);
-    for (manifest.domains) |domain| try remaining.put(alloc, domain.id, {});
+    for (manifest.domains) |domain| try remaining.put(alloc, domain.id, domain.roots);
     const activations = try alloc.alloc(DagActivation, targets.len);
     for (targets, activations) |target, *activation| {
         var entries = try @import("artifact_catalog_view.zig").Iterator.init(command.catalogs.indexes);
-        const generation = while (try entries.next()) |entry| {
-            if (entry.kind == 3 and std.mem.eql(u8, entry.name, target.index_name)) break entry.generation;
+        const declaration = while (try entries.next()) |entry| {
+            if (entry.kind == 3 and std.mem.eql(u8, entry.name, target.index_name)) break entry;
         } else return error.InvalidArtifactCatalogCommand;
+        const config = try std.json.parseFromSlice(struct {
+            edge_types: []const struct { name: []const u8, topology: ?[]const u8 = null },
+        }, alloc, declaration.config, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidArtifactCatalogCommand,
+        };
+        defer config.deinit();
+        var dag_types: usize = 0;
+        for (config.value.edge_types) |edge| {
+            if (std.mem.eql(u8, edge.topology orelse "", "dag")) dag_types += 1;
+        }
+        if (dag_types != target.edge_types.len) return error.InvalidArtifactCatalogCommand;
         const proofs = try alloc.alloc(@import("artifact_publication.zig").LocalDagBinding.Activation, target.edge_types.len);
-        for (target.edge_types, proofs) |edge_type, *proof| {
-            const id = try @import("../../graph/dag_authority.zig").domain(target.table_identity, generation, target.index_name, edge_type);
-            if (!remaining.remove(id)) return error.InvalidArtifactCatalogCommand;
+        for (target.edge_types, proofs, 0..) |edge_type, *proof, index| {
+            if (index != 0 and std.mem.order(u8, target.edge_types[index - 1], edge_type) != .lt)
+                return error.InvalidArtifactCatalogCommand;
+            for (config.value.edge_types) |edge| {
+                if (std.mem.eql(u8, edge.name, edge_type) and std.mem.eql(u8, edge.topology orelse "", "dag")) break;
+            } else return error.InvalidArtifactCatalogCommand;
+            const id = try @import("../../graph/dag_authority.zig").domain(target.table_identity, declaration.generation, target.index_name, edge_type);
+            const source = remaining.fetchRemove(id) orelse return error.InvalidArtifactCatalogCommand;
+            for (source.value) |root| {
+                if (!std.mem.eql(u8, root.index_name, target.index_name) or !std.mem.eql(u8, root.edge_type, edge_type))
+                    return error.InvalidArtifactCatalogCommand;
+            }
             const cursor = try manifest.terminalCursor(id);
             proof.* = .{
                 .edge_type = edge_type,

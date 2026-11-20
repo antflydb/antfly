@@ -12455,9 +12455,26 @@ pub const DataServer = struct {
         action: enum { acquire, release },
         cancellation: antfly.db.types.CancellationToken,
     ) !void {
+        try cancellation.check();
+        const ordered = try planDagActivationRoutes(alloc, manifest, authority_route, source_routes);
+        defer alloc.free(ordered);
+        for (0..ordered.len) |index| {
+            const route = ordered[if (action == .acquire) index else ordered.len - 1 - index];
+            try cancellation.check();
+            try localRaftBatchGroupRoutedWithCancellation(self, alloc, route.fence, table_name, .{
+                .dag_source_fence = .{ .namespace = route.namespace, .action = if (action == .acquire) .acquire else .release, .fence = manifest.fence },
+            }, cancellation);
+        }
+    }
+
+    fn planDagActivationRoutes(
+        alloc: std.mem.Allocator,
+        manifest: DagEffects.ScanManifest,
+        authority_route: DagActivationRoute,
+        source_routes: []const DagActivationRoute,
+    ) ![]DagActivationRoute {
         if (!std.mem.eql(u8, &manifest.authority_namespace, &authority_route.namespace))
             return error.GraphConstraintRevisionChanged;
-        try cancellation.check();
         const SourceRoute = struct { route: DagActivationRoute, selected: bool = false };
         var routes: std.AutoHashMapUnmanaged([24]u8, SourceRoute) = .empty;
         defer routes.deinit(alloc);
@@ -12475,7 +12492,7 @@ pub const DataServer = struct {
         }
         // Resolve the entire ordered scan footprint before changing a root.
         var ordered: std.ArrayList(DagActivationRoute) = .empty;
-        defer ordered.deinit(alloc);
+        errdefer ordered.deinit(alloc);
         try authority_route.validate();
         try ordered.append(alloc, authority_route);
         for (manifest.domains) |domain| {
@@ -12487,13 +12504,7 @@ pub const DataServer = struct {
                 source.selected = true;
             }
         }
-        for (0..ordered.items.len) |index| {
-            const route = ordered.items[if (action == .acquire) index else ordered.items.len - 1 - index];
-            try cancellation.check();
-            try localRaftBatchGroupRoutedWithCancellation(self, alloc, route.fence, table_name, .{
-                .dag_source_fence = .{ .namespace = route.namespace, .action = if (action == .acquire) .acquire else .release, .fence = manifest.fence },
-            }, cancellation);
-        }
+        return ordered.toOwnedSlice(alloc);
     }
 
     fn readDagActivationControl(
@@ -12732,6 +12743,40 @@ pub const DataServer = struct {
             .mode = @as(enum { dag_activation_job_status }, .dag_activation_job_status),
             .dag_job = .{ .namespace = route.namespace, .attempt = manifest.fence.activation },
         });
+        if (current == null) {
+            const scratch = arena.allocator();
+            _ = try planDagActivationRoutes(scratch, manifest, route, source_routes);
+            _ = try DagInventory.planDagActivationPublication(scratch, manifest, catalog, targets, progress.owner_epoch);
+            const source_catalog = self.write_source.catalog;
+            const deadline = source_catalog.budget(null).nowNs() +| 5 * std.time.ns_per_s;
+            var footprint = try @import("../api/table_catalog.zig").routedSpanSnapshotUntil(scratch, source_catalog, table_name, "", "", source_catalog.deadlineFrom(.{ .deadline_ns = deadline }));
+            defer footprint.deinit(scratch);
+            if (footprint.table_id != route.fence.table_id or footprint.topology_epoch != route.fence.topology_epoch or
+                footprint.catalog_revision != route.fence.catalog_revision or footprint.metadata_group_id != route.fence.metadata_group_id or
+                !std.meta.eql(footprint.metadata_incarnation, route.fence.metadata_incarnation))
+                return error.TopologyChanged;
+            var namespaces: std.AutoHashMapUnmanaged([24]u8, usize) = .empty;
+            defer namespaces.deinit(scratch);
+            for (footprint.routes, 0..) |group, index| {
+                var identity: [24]u8 = undefined;
+                std.mem.writeInt(u64, identity[0..8], group.identity_namespace.table_id, .big);
+                std.mem.writeInt(u64, identity[8..16], group.identity_namespace.shard_id, .big);
+                std.mem.writeInt(u64, identity[16..24], group.identity_namespace.range_id, .big);
+                const slot = try namespaces.getOrPut(scratch, identity);
+                if (slot.found_existing) return error.TopologyChanged;
+                slot.value_ptr.* = index;
+            }
+            const visited = try scratch.alloc(bool, footprint.routes.len);
+            for (manifest.domains) |domain| {
+                if (domain.roots.len != namespaces.count()) return error.TopologyChanged;
+                @memset(visited, false);
+                for (domain.roots) |root| {
+                    const slot = namespaces.get(root.namespace) orelse return error.TopologyChanged;
+                    if (visited[slot]) return error.TopologyChanged;
+                    visited[slot] = true;
+                }
+            }
+        }
         const next = if (current) |previous|
             try previous.advance(manifest, catalog.binding.digest, catalog.binding.epoch, Port{
                 .server = self,
