@@ -49321,14 +49321,18 @@ pub const DB = struct {
                         defer txn.abort();
                         const temp = source_batch.arena.allocator();
                         const mapped: ?[]?doc_set.DocOrdinal = doc_identity.lookupOrdinalsTxnAlloc(temp, &txn, keys) catch |err| fallback: {
-                            if (source_batch.prefix != null or err != error.InvalidDocIdentity) return source_batch.rejectSpeculativeBatch(err);
+                            if (source_batch.prefix != null or !recoverableSourceIdentityError(err)) return source_batch.rejectSpeculativeBatch(err);
                             break :fallback null;
                         };
+                        var failures: [256]?anyerror = @splat(null);
+                        var failed = false;
                         for (keys, 0..) |id, i| {
                             const forward: ??doc_set.DocOrdinal = if (mapped) |values| @as(??doc_set.DocOrdinal, values[i]) else null;
-                            const identity = owner.resolvePreparedIdentity(temp, &txn, id, forward) catch |err| recovery: {
-                                if (source_batch.prefix != null or err != error.InvalidDocIdentity) return source_batch.rejectSpeculativeBatch(err);
-                                break :recovery try owner.recoverScopedSourceIdentity(source_batch.options, temp, &txn, id);
+                            const identity = owner.resolvePreparedIdentity(temp, &txn, id, forward) catch |err| {
+                                if (source_batch.prefix != null or !recoverableSourceIdentityError(err)) return source_batch.rejectSpeculativeBatch(err);
+                                failures[i] = err;
+                                failed = true;
+                                continue;
                             };
                             switch (identity) {
                                 .invisible => visible[i] = false,
@@ -49336,6 +49340,14 @@ pub const DB = struct {
                                 .visible => |ordinal| ordinals[i] = ordinal,
                             }
                         }
+                        if (failed) try owner.recoverScopedSourceBatch(
+                            source_batch.options,
+                            temp,
+                            keys,
+                            failures[0..keys.len],
+                            visible[0..keys.len],
+                            ordinals[0..keys.len],
+                        );
                     }
                     const timestamps = if (source_batch.ttl_duration == 0) null else try loadDocumentTimestampsManyWithIdentityShape(owner.db, source_batch.arena.allocator(), keys, true);
                     for (keys, ordinals[0..keys.len], visible[0..keys.len], 0..) |id, ordinal, include, i| {
@@ -49362,7 +49374,7 @@ pub const DB = struct {
                 }
 
                 fn rejectSpeculativeBatch(source_batch: *@This(), err: anyerror) !docstore_mod.DocStore.ScanAction {
-                    if (source_batch.prefix == null or (err != error.InvalidDocIdentity and err != error.StorageReadTemporarilyUnavailable)) return err;
+                    if (source_batch.prefix == null or !recoverableSourceIdentityError(err)) return err;
                     source_batch.exhausted_budget = true;
                     source_batch.len = 0;
                     return .stop;
@@ -49400,52 +49412,104 @@ pub const DB = struct {
             return self.stopped or !source_batch.exhausted_budget;
         }
 
-        /// A failed forward lookup cannot prove that a row outside a finite
-        /// scope is relevant. Recover through the requested reverse keys only
-        /// on the corruption path. Ordinary source scans still fail closed.
-        fn recoverScopedSourceIdentity(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions, alloc: Allocator, txn: *docstore_mod.DocStore.Txn, id: []const u8) !PreparedIdentity {
-            const constraints = options.constraints orelse return error.InvalidDocIdentity;
-            if (!constraints.positive_filter) return error.InvalidDocIdentity;
+        fn recoverableSourceIdentityError(err: anyerror) bool {
+            return err == error.InvalidDocIdentity or err == error.StorageReadTemporarilyUnavailable;
+        }
+
+        /// Resolve the finite ordinal scope once for all failed keys in a
+        /// source batch. No candidate is delivered until membership is known.
+        fn recoverScopedSourceBatch(
+            self: *@This(),
+            options: db_query_search.MatchAllCandidateCollectOptions,
+            alloc: Allocator,
+            keys: []const []const u8,
+            failures: []const ?anyerror,
+            visible: []bool,
+            ordinals: []?doc_set.DocOrdinal,
+        ) !void {
+            const original_error = for (failures) |failure| {
+                if (failure) |err| break err;
+            } else unreachable;
+            const constraints = options.constraints orelse return original_error;
+            if (!constraints.positive_filter) return original_error;
             const set = if (constraints.primary_include_compact) constraints.primary_include else doc_set.ResolvedDocSet{ .ordinals = constraints.filter_doc_nums };
-            if (set == .all or sourceScopeContainsKey(&set, id) or sourceScopeContainsKey(&constraints.legacy_filter, id))
-                return error.InvalidDocIdentity;
+            if (set == .all) return original_error;
+
+            var pending: std.StringHashMapUnmanaged(usize) = .empty;
+            defer pending.deinit(alloc);
+            for (keys, failures, 0..) |key, failure, i| {
+                if (failure == null) continue;
+                try pending.put(alloc, key, i);
+                visible[i] = false;
+            }
+
             var bitmap = if (set == .ordinal_bitmap) set.ordinal_bitmap.iterator() else null;
             const numbers = if (set == .ordinals) set.ordinals else &.{};
             var offset: usize = 0;
-            if (bitmap == null and numbers.len == 0) return .invisible;
-            var read = try self.db.core.store.beginReadTxn();
-            defer read.abort();
-            var scope = try read.openReadScope(alloc);
-            defer scope.close();
-            var probes: usize = 0;
-            while (true) {
-                const ordinal = if (bitmap) |*it| it.next() orelse break else next: {
-                    if (offset == numbers.len) break;
-                    const value = numbers[offset];
-                    offset += 1;
-                    break :next value;
-                };
+            var incomplete_scope = false;
+            var read: ?docstore_mod.DocStore.Txn = null;
+            defer if (read) |*txn| txn.abort();
+            while (pending.count() != 0) {
                 try db_query_search.checkSearchRequestDeadline(self.req);
-                if (probes == 64) {
-                    try scope.reset();
-                    probes = 0;
+                var ordinal_page: [256]doc_set.DocOrdinal = undefined;
+                var len: usize = 0;
+                while (len < ordinal_page.len) : (len += 1) {
+                    if (bitmap) |*it| {
+                        ordinal_page[len] = it.next() orelse break;
+                    } else {
+                        if (offset == numbers.len) break;
+                        ordinal_page[len] = numbers[offset];
+                        offset += 1;
+                    }
                 }
-                probes += 1;
-                const encoded = internal_keys.identityOrdinalToDocKey(ordinal);
-                const key = scope.get(&encoded) catch |err| switch (err) {
-                    error.NotFound => continue,
-                    else => return err,
-                };
-                if (std.mem.eql(u8, id, key))
-                    return self.resolvePreparedIdentity(alloc, txn, id, @as(??doc_set.DocOrdinal, @as(?doc_set.DocOrdinal, ordinal)));
+                if (len == 0) break;
+                std.mem.sort(doc_set.DocOrdinal, ordinal_page[0..len], {}, std.sort.asc(doc_set.DocOrdinal));
+                if (read == null) read = try self.db.core.store.beginReadTxn();
+                var scope = try read.?.openReadScope(self.alloc);
+                defer scope.close();
+                var encoded: [ordinal_page.len]@TypeOf(internal_keys.identityOrdinalToDocKey(0)) = undefined;
+                var reverse_keys: [ordinal_page.len][]const u8 = undefined;
+                for (ordinal_page[0..len], 0..) |ordinal, i| {
+                    encoded[i] = internal_keys.identityOrdinalToDocKey(ordinal);
+                    reverse_keys[i] = &encoded[i];
+                }
+                var resolved: [ordinal_page.len]?[]const u8 = undefined;
+                try scope.getManySorted(reverse_keys[0..len], resolved[0..len]);
+                for (ordinal_page[0..len], resolved[0..len]) |ordinal, key| {
+                    try db_query_search.checkSearchRequestDeadline(self.req);
+                    const match = if (key) |id| pending.getEntry(id) orelse continue else null;
+                    const state = (try doc_identity.lookupStateTxn(&scope, ordinal)) orelse continue;
+                    if (!(if (self.req.identity_read_generation) |at| state.isVisibleAt(at) else state.isLive())) continue;
+                    if (match) |entry| {
+                        ordinals[entry.value_ptr.*] = ordinal;
+                        visible[entry.value_ptr.*] = true;
+                        _ = pending.remove(entry.key_ptr.*);
+                    } else if (key == null) {
+                        incomplete_scope = true;
+                    }
+                }
             }
-            return .invisible;
-        }
-
-        fn sourceScopeContainsKey(set: *const doc_set.ResolvedDocSet, id: []const u8) bool {
-            if (set.* != .doc_keys) return false;
-            for (set.doc_keys) |key| if (std.mem.eql(u8, key, id)) return true;
-            return false;
+            var unresolved_error: ?anyerror = null;
+            if (incomplete_scope) {
+                var unresolved = pending.valueIterator();
+                while (unresolved.next()) |slot| {
+                    const failure = failures[slot.*].?;
+                    if (failure == error.StorageReadTemporarilyUnavailable) return failure;
+                    unresolved_error = failure;
+                }
+            } else if (pending.count() != 0) {
+                for ([_]doc_set.ResolvedDocSet{ set, constraints.legacy_filter }) |key_set| {
+                    if (key_set != .doc_keys) continue;
+                    for (key_set.doc_keys) |key| {
+                        try db_query_search.checkSearchRequestDeadline(self.req);
+                        const slot = pending.get(key) orelse continue;
+                        const failure = failures[slot].?;
+                        if (failure == error.StorageReadTemporarilyUnavailable) return failure;
+                        unresolved_error = failure;
+                    }
+                }
+            }
+            if (unresolved_error) |err| return err;
         }
 
         fn scanExactScope(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !void {
@@ -157953,6 +158017,49 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
             try txn.put(key, "malformed");
         }
         try txn.commit();
+    }
+
+    // Exercise batch recovery with mixed error classes and overlapping
+    // legacy and ordinal membership. An absent live reverse key is ambiguous.
+    {
+        const scan_req: types.SearchRequest = .{ .identity_read_generation = generation };
+        var scan = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = scan_req, .alloc = a };
+        const options: db_query_search.MatchAllCandidateCollectOptions = .{
+            .constraints = &.{
+                .positive_filter = true,
+                .filter_doc_nums = &endpoints,
+                .legacy_filter = .{ .doc_keys = &.{writes[1].key} },
+            },
+        };
+        const failed_keys = [_][]const u8{ writes[1].key, writes[2].key, writes[3].key, writes[78].key };
+        const failures = [_]?anyerror{ error.InvalidDocIdentity, error.InvalidDocIdentity, error.StorageReadTemporarilyUnavailable, error.StorageReadTemporarilyUnavailable };
+        var visible = [_]bool{ true, true, true, true };
+        var resolved: [4]?doc_set.DocOrdinal = @splat(null);
+        try scan.recoverScopedSourceBatch(options, a, &failed_keys, &failures, &visible, &resolved);
+        try std.testing.expectEqual([4]bool{ true, false, false, true }, visible);
+        try std.testing.expectEqual([4]?doc_set.DocOrdinal{ endpoints[0], null, null, endpoints[1] }, resolved);
+
+        const missing_key = internal_keys.identityOrdinalToDocKey(endpoints[0]);
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.delete(&missing_key);
+            try txn.commit();
+        }
+        try std.testing.expectError(error.StorageReadTemporarilyUnavailable, scan.recoverScopedSourceBatch(
+            options,
+            a,
+            &.{writes[2].key},
+            &.{error.StorageReadTemporarilyUnavailable},
+            visible[0..1],
+            resolved[0..1],
+        ));
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(&missing_key, writes[1].key);
+            try txn.commit();
+        }
     }
 
     const Record = struct {
