@@ -35,6 +35,129 @@ const capability_cache_max_entries: usize = 64;
 const capability_cache_max_flights: usize = 16;
 const capability_discovery_timeout_ns: u64 = 30 * std.time.ns_per_s;
 const capability_activation_timeout_ns: u64 = 5 * 60 * std.time.ns_per_s;
+pub const discovery_shape_header = "X-Antfly-Inference-Discovery-Shape";
+
+/// Placement-only facts available before encoding an execution payload.
+/// The proxy derives the authoritative budget from the body at execution.
+pub const DiscoveryShape = struct {
+    items: usize,
+    media: bool = false,
+    modalities: work.Modalities = .{},
+    output_tokens: ?usize = null,
+    candidates: ?usize = null,
+
+    pub fn formatHeader(self: DiscoveryShape, buf: *[64]u8) ![]const u8 {
+        if (self.items == 0) return error.InvalidInferenceDiscoveryShape;
+        const mask: u8 = @bitCast(self.modalities);
+        // Version 1 can carry unknown media without accidentally claiming a
+        // text-only invocation. Use version 4 when exact text or a candidate
+        // limit must also survive the wire.
+        if (self.media and mask & ~@as(u8, 1) == 0 and (mask != 0 or self.candidates != null)) {
+            var stream: std.Io.Writer = .fixed(buf);
+            try stream.print("4:{d}:{d}:", .{ self.items, mask });
+            if (self.output_tokens) |tokens| try stream.print("{d}", .{tokens}) else try stream.writeByte('-');
+            try stream.writeByte(':');
+            if (self.candidates) |count| try stream.print("{d}", .{count}) else try stream.writeByte('-');
+            return stream.buffered();
+        }
+        if (self.candidates) |count| {
+            if (self.output_tokens) |tokens| return std.fmt.bufPrint(buf, "3:{d}:{d}:{d}:{d}", .{ self.items, mask, tokens, count });
+            return std.fmt.bufPrint(buf, "3:{d}:{d}:-:{d}", .{ self.items, mask, count });
+        }
+        if (mask != 0) {
+            if (self.output_tokens) |tokens|
+                return std.fmt.bufPrint(buf, "2:{d}:{d}:{d}", .{ self.items, mask, tokens });
+            return std.fmt.bufPrint(buf, "2:{d}:{d}:-", .{ self.items, mask });
+        }
+        if (self.output_tokens) |tokens| {
+            return std.fmt.bufPrint(buf, "1:{d}:{d}:{d}", .{ self.items, @intFromBool(self.media), tokens });
+        }
+        return std.fmt.bufPrint(buf, "1:{d}:{d}:-", .{ self.items, @intFromBool(self.media) });
+    }
+};
+
+pub const DiscoveryMediaCost = struct {
+    encoded: usize = 0,
+    framed: usize = 0,
+    pixels: u64 = 0,
+};
+
+pub const DiscoveryMediaGeometry = struct {
+    batch: DiscoveryMediaCost = .{},
+    first: DiscoveryMediaCost = .{},
+
+    pub fn fits(self: DiscoveryMediaGeometry, caps: work.InferenceCapabilities) bool {
+        const bytes = if (caps.framed_attachments) self.batch.framed else self.batch.encoded;
+        if (caps.batch.max_encoded_media_bytes) |limit| if (bytes > limit) return false;
+        if (caps.batch.max_decoded_pixels) |limit| if (self.batch.pixels > limit) return false;
+        return true;
+    }
+};
+
+pub const discovery_media_header = "X-Antfly-Inference-Discovery-Media";
+
+/// Stack-owned headers for discovery. Pass the original selectors to execution.
+pub const DiscoveryHeaders = struct {
+    entries: [16][2][]const u8 = undefined,
+    value: [64]u8 = undefined,
+    media_value: [125]u8 = undefined,
+
+    pub fn withShape(self: *DiscoveryHeaders, base: []const [2][]const u8, shape: DiscoveryShape) ![]const [2][]const u8 {
+        if (base.len >= self.entries.len) return error.TooManyInferenceHeaders;
+        @memcpy(self.entries[0..base.len], base);
+        self.entries[base.len] = .{ discovery_shape_header, try shape.formatHeader(&self.value) };
+        return self.entries[0 .. base.len + 1];
+    }
+    pub fn withMediaGeometry(self: *DiscoveryHeaders, shaped: []const [2][]const u8, geometry: DiscoveryMediaGeometry) ![]const [2][]const u8 {
+        if (shaped.len >= self.entries.len or shaped.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
+        const batch = geometry.batch;
+        const first = geometry.first;
+        self.entries[shaped.len] = .{ discovery_media_header, try std.fmt.bufPrint(&self.media_value, "{d}:{d}:{d}:{d}:{d}:{d}", .{ batch.encoded, batch.framed, batch.pixels, first.encoded, first.framed, first.pixels }) };
+        return self.entries[0 .. shaped.len + 1];
+    }
+};
+
+/// Read only the data URI header. Full validation belongs to invocation
+/// admission, which already has to check sizes and encoding.
+pub fn inlineDiscoveryMime(uri: []const u8) ?[]const u8 {
+    if (!std.ascii.startsWithIgnoreCase(uri, "data:")) return null;
+    const body = uri["data:".len..];
+    const header = body[0..@min(body.len, 256)];
+    const end = std.mem.indexOfAny(u8, header, ";,") orelse return null;
+    return if (end == 0) null else body[0..end];
+}
+
+pub fn generationModalities(messages: anytype) work.Modalities {
+    var mask: u8 = 0;
+    for (messages) |message| {
+        const content = message.content orelse continue;
+        if (content == .text) {
+            mask |= 1;
+            continue;
+        }
+        for (content.parts) |part| {
+            const modalities: work.Modalities = switch (part) {
+                .text => .{ .text = true },
+                .image_url => .{ .image = true },
+                .media => |media| work.modalityForMimeType(if (media.mime_type.len != 0) media.mime_type else inlineDiscoveryMime(media.url orelse media.data) orelse "") orelse .{},
+            };
+            mask |= @bitCast(modalities);
+        }
+    }
+    return @bitCast(mask);
+}
+
+pub fn generationHasMedia(messages: anytype) bool {
+    for (messages) |message| {
+        if (message.content) |content| {
+            if (content == .parts) {
+                for (content.parts) |part| if (part != .text) return true;
+            }
+        }
+    }
+    return false;
+}
+
 pub const parent_request_id_header = "X-Antfly-Parent-Request-ID";
 pub const model_activation_header = "X-Antfly-Model-Activation";
 const capability_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;
@@ -1386,6 +1509,16 @@ fn capabilityStaleResponse(response: httpx.Response) bool {
 }
 
 fn discoveryResponseError(response: httpx.Response) anyerror {
+    if (response.status.code == 404) {
+        if (response.headers.get(capability_selector_rejected_header)) |value| {
+            if (std.ascii.eqlIgnoreCase(value, "true")) return error.RemoteCapabilityDiscoveryRejected;
+        }
+    }
+    if (response.status.code == 413) {
+        if (response.headers.get("X-Antfly-Inference-Discovery-Error")) |reason| {
+            if (std.mem.eql(u8, reason, "items")) return error.InferenceDiscoveryTooManyItems;
+        }
+    }
     return discoveryStatusError(response.status.code, capabilityStaleResponse(response));
 }
 
@@ -1416,6 +1549,54 @@ pub fn discover(
     };
 }
 
+// An older Colony rejects only the shape version with this diagnostic.
+// Keep authority and route selectors identical on the conservative retry.
+fn legacyMediaDiscoveryHeaders(response: httpx.Response, headers: []const [2][]const u8, storage: *DiscoveryHeaders) !?[]const [2][]const u8 {
+    if (response.status.code != 400 or !std.mem.eql(u8, std.mem.trim(u8, response.body orelse "", " \t\r\n"), "invalid inference discovery shape or missing model selector")) return null;
+    if (headers.len > storage.entries.len) return null;
+    for (headers, 0..) |header, index| {
+        if (!std.ascii.eqlIgnoreCase(header[0], discovery_shape_header)) continue;
+        var fields = std.mem.splitScalar(u8, header[1], ':');
+        if (!std.mem.eql(u8, fields.next() orelse return null, "4")) return null;
+        const items = fields.next() orelse return null;
+        _ = fields.next() orelse return null;
+        const tokens = fields.next() orelse return null;
+        // Versions 1–3 cannot represent both unknown media and candidates.
+        if (!std.mem.eql(u8, fields.next() orelse return null, "-") or fields.next() != null) return null;
+        @memcpy(storage.entries[0..headers.len], headers);
+        storage.entries[index][1] = try std.fmt.bufPrint(&storage.value, "1:{s}:1:{s}", .{ items, tokens });
+        return storage.entries[0..headers.len];
+    }
+    return null;
+}
+
+fn validateLegacyMediaDescriptor(capabilities: ?work.InferenceCapabilities, headers: []const [2][]const u8) !void {
+    const caps = capabilities orelse return;
+    for (headers) |header| {
+        if (!std.ascii.eqlIgnoreCase(header[0], discovery_shape_header)) continue;
+        var fields = std.mem.splitScalar(u8, header[1], ':');
+        if (!std.mem.eql(u8, fields.next() orelse return error.InvalidInferenceDiscoveryShape, "4")) return error.InvalidInferenceDiscoveryShape;
+        _ = fields.next() orelse return error.InvalidInferenceDiscoveryShape;
+        const mask = std.fmt.parseInt(u8, fields.next() orelse return error.InvalidInferenceDiscoveryShape, 10) catch return error.InvalidInferenceDiscoveryShape;
+        const supported: u8 = @bitCast(caps.input_modalities);
+        if (supported & mask != mask or supported & ~@as(u8, 1) == 0)
+            return error.RemoteCapabilityDiscoveryTransient;
+        return;
+    }
+    return error.InvalidInferenceDiscoveryShape;
+}
+
+test "remote Antfly legacy media discovery still requires the original modalities" {
+    const a = std.testing.allocator;
+    const headers = &.{.{ discovery_shape_header, "4:1:1:0:-" }};
+    const image_only = try parseModelCapabilities(a, "{\"embedders\":{\"model\":{\"inputs\":[\"image\"]}}}", "model", .embed);
+    try std.testing.expect(image_only != null);
+    try std.testing.expectError(error.RemoteCapabilityDiscoveryTransient, validateLegacyMediaDescriptor(image_only, headers));
+    const multimodal = try parseModelCapabilities(a, "{\"embedders\":{\"model\":{\"inputs\":[\"text\",\"audio\"]}}}", "model", .embed);
+    try std.testing.expect(multimodal != null);
+    try validateLegacyMediaDescriptor(multimodal, headers);
+}
+
 fn discoverOnce(
     alloc: std.mem.Allocator,
     http: *httpx.Client,
@@ -1435,8 +1616,20 @@ fn discoverOnce(
         return error.RemoteCapabilityDiscoveryTransient;
     };
     defer response.deinit();
+    var fallback: DiscoveryHeaders = .{};
+    const legacy_headers = try legacyMediaDiscoveryHeaders(response, headers, &fallback);
+    if (legacy_headers) |legacy| {
+        const retry = http.get(url, .{ .follow_redirects = false, .headers = legacy, .max_response_size = capability_catalog_response_bytes }) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return error.RemoteCapabilityDiscoveryTransient;
+        };
+        response.deinit();
+        response = retry;
+    }
     if (!response.ok()) return discoveryResponseError(response);
-    return try parseModelCapabilities(alloc, response.body orelse return error.InvalidInferenceCapabilities, model, operation.task());
+    const caps = try parseModelCapabilities(alloc, response.body orelse return error.InvalidInferenceCapabilities, model, operation.task());
+    if (legacy_headers != null) try validateLegacyMediaDescriptor(caps, headers);
+    return caps;
 }
 
 fn discoverWithContext(
@@ -1603,7 +1796,7 @@ fn discoverWithContextOnce(
         null;
     defer if (revision_url) |value| alloc.free(value);
     const url = revision_url orelse scoped_url;
-    var response = http.get(url, .{
+    var options: httpx.RequestOptions = .{
         .follow_redirects = false,
         .headers = headers,
         .timeout_ms = timeout_ms,
@@ -1612,12 +1805,31 @@ fn discoverWithContextOnce(
             context.cancellation.is_cancelled_fn,
         ),
         .max_response_size = capability_catalog_response_bytes,
-    }) catch |err| {
+    };
+    var response = http.get(url, options) catch |err| {
         try context.check(monotonicNowNs(io));
         if (err == error.OutOfMemory) return err;
         return error.RemoteCapabilityDiscoveryTransient;
     };
     defer response.deinit();
+    var fallback: DiscoveryHeaders = .{};
+    var effective_headers = headers;
+    const legacy_headers = try legacyMediaDiscoveryHeaders(response, headers, &fallback);
+    if (legacy_headers) |legacy| {
+        const retry_now = monotonicNowNs(io);
+        try context.check(retry_now);
+        if (retry_now >= effective_deadline) return error.Timeout;
+        options.headers = legacy;
+        options.timeout_ms = @max(1, (effective_deadline - retry_now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
+        const retry = http.get(url, options) catch |err| {
+            try context.check(monotonicNowNs(io));
+            if (err == error.OutOfMemory) return err;
+            return error.RemoteCapabilityDiscoveryTransient;
+        };
+        response.deinit();
+        response = retry;
+        effective_headers = legacy;
+    }
     const activation_advertised = if (response.headers.get(model_activation_header)) |value|
         std.ascii.eqlIgnoreCase(value, if (required_revision == null) "supported" else "revision-wake")
     else
@@ -1630,7 +1842,7 @@ fn discoverWithContextOnce(
         if (required_revision != null and failure == error.RemoteCapabilityDiscoveryUnsupported) return error.RemoteCapabilityDiscoveryRejected;
         if (failure == error.RemoteCapabilityDiscoveryTransient) recordDiscoveryRetryHint(alloc, io, response, context);
         if (allow_activation and activation_advertised and response.status.code == 503 and
-            try loadMissingModelInstance(alloc, io, http, inference_url, model, operation, headers, context))
+            try loadMissingModelInstance(alloc, io, http, inference_url, model, operation, effective_headers, context))
             return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, headers, context, false);
         if (!allow_activation and !context.passive_refresh and failure == error.RemoteCapabilityDiscoveryUnsupported)
             return error.RemoteCapabilitySelectorAbsent;
@@ -1638,6 +1850,7 @@ fn discoverWithContextOnce(
     }
     const body = response.body orelse return error.InvalidInferenceCapabilities;
     const capabilities = try parseModelCapabilities(alloc, body, model, operation.task());
+    if (legacy_headers != null) try validateLegacyMediaDescriptor(capabilities, headers);
     if (required_revision) |revision| {
         const descriptor = capabilities orelse return error.RemoteCapabilitySelectorAbsent;
         if (!descriptor.model_revision_pinning) return error.RemoteCapabilityDiscoveryRejected;
@@ -1659,7 +1872,7 @@ fn discoverWithContextOnce(
             try catalogListsExternalEmbedding(alloc, body, model))
             return .{ .value = null, .routing_token = null, .descriptor_revision = null };
         if (allow_activation and activation_advertised) {
-            const loaded = loadMissingModelInstance(alloc, io, http, inference_url, model, operation, headers, context) catch |err| {
+            const loaded = loadMissingModelInstance(alloc, io, http, inference_url, model, operation, effective_headers, context) catch |err| {
                 // Discovery already disproved the previous descriptor.
                 if (err == error.RemoteCapabilityDiscoveryTransient) return error.RemoteCapabilitySelectorAbsent;
                 return err;
@@ -2831,4 +3044,55 @@ test "revision-scoped embedding discovery cools down revision mismatches and rej
         }
         try group.await(io);
     }
+}
+
+test "remote capability discovery forwards placement shape and separates cached leases" {
+    const Fixture = struct {
+        fn expectBatch(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("1:2:1:0", req.header(discovery_shape_header).?);
+            try std.testing.expectEqualStrings("write-heavy", req.header("X-Antfly-Inference-Workload-Type").?);
+        }
+        fn serve(server: *httpx.TestServer) !void {
+            try server.handleOne();
+        }
+    };
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = httpx.TestServer.start(allocator, io, &.{.{
+        .path = "/ai/v1/models",
+        .assert_request = Fixture.expectBatch,
+        .respond = .{ .body = "{\"embedders\":{\"model\":{\"inputs\":[\"image\"]}}}" },
+    }}) catch |err| switch (err) {
+        error.Unexpected => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    var http = httpx.Client.init(allocator, io);
+    defer http.deinit();
+    var cache = Cache.init(allocator, io);
+    defer cache.deinit();
+    var single_value: [64]u8 = undefined;
+    var batch_value: [64]u8 = undefined;
+    const single = try (DiscoveryShape{ .items = 1, .output_tokens = 0 }).formatHeader(&single_value);
+    const batch = try (DiscoveryShape{ .items = 2, .media = true, .output_tokens = 0 }).formatHeader(&batch_value);
+    const small_headers: []const [2][]const u8 = &.{
+        .{ "X-Antfly-Inference-Workload-Type", "write-heavy" },
+        .{ discovery_shape_header, single },
+    };
+    const batch_headers: []const [2][]const u8 = &.{
+        small_headers[0],
+        .{ discovery_shape_header, batch },
+    };
+    const key = try capabilityCacheKeyAlloc(allocator, server.baseUrl(), "model", .embed, small_headers);
+    defer allocator.free(key);
+    try cache.admitLocked(key, null, null, null, monotonicNowNs(io));
+    var handler = try io.concurrent(Fixture.serve, .{&server});
+    defer handler.cancel(io) catch {};
+    const lease = try cache.getOrDiscoverLease(&http, server.baseUrl(), "model", .embed, batch_headers);
+    try handler.await(io);
+    try std.testing.expect(lease.capabilities.?.input_modalities.image);
+    const small = try cache.getOrDiscoverLease(&http, server.baseUrl(), "model", .embed, small_headers);
+    try std.testing.expect(small.capabilities == null);
 }
