@@ -780,7 +780,16 @@ pub const TxnManager = struct {
         var record = try self.loadTransactionRecord(txn_id);
         if (record.status != .pending) return TxnError.DecisionConflict;
         const first_prepare = record.prepared_known and !record.prepared and record.intent_revision == 0;
-        if (record.dag_prepared or (!first_prepare and extra_batch.dag_prepare != null)) return error.GraphConstraintAttemptConflict;
+        if (record.dag_prepared) {
+            const replay = extra_batch.dag_prepare orelse return error.GraphConstraintAttemptConflict;
+            if (intents.len != 0 or predicates.len != 0 or extra_batch.graph_sources.len != 0 or
+                extra_batch.index_span_digests.len != 0 or extra_batch.prepared_enrichments_json != null or
+                try self.hasIntents(txn_id)) return error.GraphConstraintAttemptConflict;
+            return self.applyBatchWithParticipant(extra_batch.writes, extra_batch.deletes, null, null, null, .{
+                .repeat_vote = .{ .id = txn_id, .payload = replay },
+            });
+        }
+        if (!first_prepare and extra_batch.dag_prepare != null) return error.GraphConstraintAttemptConflict;
         record.dag_prepared = extra_batch.dag_prepare != null;
         if (!first_prepare and extra_batch.prepared_enrichments_json == null) {
             if (try self.loadPreparedEnrichments(self.alloc, txn_id)) |packet| {
@@ -2820,6 +2829,7 @@ pub const TxnManager = struct {
                     return error.GraphConstraintNotReady;
                 if (prepare.payload) |payload| try stageDagPrepare(self.alloc, &batch, prepare.id, payload);
             },
+            .repeat_vote => |repeat| try requireSameDagVote(&batch, repeat.id, repeat.payload),
             .resolve => |resolve| try stageDagResolution(self.alloc, &batch, resolve.id, resolve.status),
         };
         try batch.commit();
@@ -2856,6 +2866,7 @@ pub fn isDagAuthorityKey(key: []const u8) bool {
 const max_dag_domains_per_participant = 64;
 const DagBatch = union(enum) {
     prepare: struct { id: TxnId, payload: ?DagPrepare, changes_sources: bool },
+    repeat_vote: struct { id: TxnId, payload: DagPrepare },
     resolve: struct { id: TxnId, status: TxnStatus },
 };
 
@@ -2888,6 +2899,25 @@ fn stageDagPrepare(alloc: Allocator, batch: *backend_erased.Batch, id: TxnId, pr
         try dag.TransactionParticipant.prepare(alloc, batch, token, domain.producer_versions, domain.replacements, prepare.budget, prepare.witness);
     }
     try batch.put(&key, packet[0 .. dag_vote_magic.len + prepare.domains.len * dag_vote_bytes]);
+}
+
+// Retry a lost authority-only prepare acknowledgement without reserving or
+// validating the graph again. The ordered receipt shares this same writer.
+fn requireSameDagVote(batch: *backend_erased.Batch, id: TxnId, prepare: DagPrepare) !void {
+    if (prepare.domains.len == 0 or prepare.domains.len > max_dag_domains_per_participant) return error.InvalidDagMutation;
+    const raw = batch.get(&makeSidecarKey(dag_domains_prefix, id)) catch |err| if (err == error.NotFound) return error.InvalidTxnRecord else return err;
+    if (raw.len != dag_vote_magic.len + prepare.domains.len * dag_vote_bytes or
+        !std.mem.startsWith(u8, raw, dag_vote_magic)) return error.GraphConstraintAttemptConflict;
+    for (prepare.domains, 0..) |domain, index| {
+        const row = raw[dag_vote_magic.len + index * dag_vote_bytes ..][0..dag_vote_bytes];
+        if (!std.mem.eql(u8, row[0..32], &domain.domain) or
+            !std.mem.eql(u8, row[32..64], &domain.attempt.id) or
+            !std.mem.eql(u8, row[64..96], &domain.attempt.candidate) or
+            !std.mem.eql(u8, &domain.attempt.transaction, &id) or
+            std.mem.readInt(u64, row[96..104], .big) != domain.revision) return error.GraphConstraintAttemptConflict;
+        const candidate = dag.Contributions.candidate(domain.producer_versions, domain.replacements);
+        if (!std.mem.eql(u8, &candidate, &domain.attempt.candidate)) return error.GraphConstraintAttemptConflict;
+    }
 }
 
 fn stageDagResolution(alloc: Allocator, batch: *backend_erased.Batch, id: TxnId, status: TxnStatus) !void {
@@ -5613,7 +5643,7 @@ test "DAG transaction prepare and resolution share the primary transaction" {
         .candidate = dag.Contributions.candidate(versions, &.{}),
     };
     try manager.initTransaction(id, 100);
-    try manager.writeIntentsExtraBatch(id, &.{}, &.{}, .{ .dag_prepare = .{
+    const extra: MutationExtraBatch = .{ .dag_prepare = .{
         .domains = &.{.{
             .domain = domain,
             .epoch = 1,
@@ -5624,7 +5654,15 @@ test "DAG transaction prepare and resolution share the primary transaction" {
         }},
         .budget = &budget,
         .witness = &witness,
-    } });
+    } };
+    try manager.writeIntentsExtraBatch(id, &.{}, &.{}, extra);
+    try manager.writeIntentsExtraBatch(id, &.{}, &.{}, extra);
+    var changed = extra.dag_prepare.?.domains[0];
+    changed.producer_versions[0] ^= 1;
+    var altered = extra;
+    altered.dag_prepare.?.domains = &.{changed};
+    try std.testing.expectError(error.GraphConstraintAttemptConflict, manager.writeIntentsExtraBatch(id, &.{}, &.{}, altered));
+
     const stats = try manager.recoverTransactions(std.math.maxInt(u64), 200);
     try std.testing.expectEqual(@as(usize, 1), stats.kept_recent_pending);
     var reader = try store.beginReadTxn();
