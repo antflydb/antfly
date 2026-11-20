@@ -6071,6 +6071,34 @@ pub const Store = struct {
         try self.checkpointRedoLogAdmitted();
     }
 
+    /// Folds and shrinks a redo log reservation the storage budget no longer
+    /// covers (§9.7f). True only if the reservation shrank, so a write the
+    /// budget rejected is worth retrying.
+    pub fn reclaimOversizedRedoReservation(self: *Store) !bool {
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, .allocator_service);
+        defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
+        return try self.reclaimOversizedRedoReservationAdmitted();
+    }
+
+    /// `reclaimOversizedRedoReservation` for a caller already inside this
+    /// store's writer admission. The eligibility check reads the resolved
+    /// writer's file under its mutex, never this store's local snapshot.
+    fn reclaimOversizedRedoReservationAdmitted(self: *Store) anyerror!bool {
+        if (self.forwardedWriter()) |writer| {
+            const shrank = try writer.reclaimOversizedRedoReservation();
+            self.adoptWriterTip(writer);
+            return shrank;
+        }
+        lockStoreExclusive(self);
+        defer self.mutex.unlock();
+        if (self.maintenance_running or self.generation_workspace_active or self.multi_commit_sequence_active or self.file.change_capture != null) return error.FileBusy;
+        if (self.file.redo == null) return false;
+        const before = self.file.header.redo_log_capacity;
+        if (native.NativeFile.redoLogCapacityForBudget(self.file.redo_log_budget_bytes) >= before) return false;
+        try self.file.checkpointRedoLog();
+        return self.file.header.redo_log_capacity < before;
+    }
+
     /// `checkpointRedoLog` for a caller already inside this store's writer
     /// admission: resolves the writer and takes the store mutex.
     fn checkpointRedoLogAdmitted(self: *Store) anyerror!void {
@@ -6617,18 +6645,17 @@ pub const Store = struct {
             // existing "budget correctly rejects this write" test's own
             // behavior is unaffected: for those, this condition is
             // false and the original error returns unchanged).
-            if (err == error.LiteStorageBudgetExceeded and self.file.redo != null and
-                native.NativeFile.redoLogCapacityForBudget(self.file.redo_log_budget_bytes) < self.file.header.redo_log_capacity)
-            {
+            if (err == error.LiteStorageBudgetExceeded) {
                 // The group that rejected this write has finished: its
                 // admission and the store mutex no longer cover this retry.
-                // Fold through the serialized path, as any other fold does
-                // (writer resolution included for a forwarded request).
-                const folded = if (forwarded_admission != null) self.checkpointRedoLogAdmitted() else self.checkpointRedoLog();
-                if (folded) |_| {
+                // Decide and fold under the resolved writer's admission and
+                // mutex (writer resolution included for a forwarded
+                // request), and retry only if the reservation shrank.
+                const shrank = (if (forwarded_admission != null) self.reclaimOversizedRedoReservationAdmitted() else self.reclaimOversizedRedoReservation()) catch false;
+                if (shrank) {
                     const retry_ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
                     return retry_ticket.wait();
-                } else |_| {}
+                }
             }
             return err;
         };

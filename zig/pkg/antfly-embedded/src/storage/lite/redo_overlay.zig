@@ -287,6 +287,10 @@ pub const SharedRedoOverlay = struct {
     /// next append (`NativeFile.refreshIfWriterBaseStale`), so no record
     /// below it is ever missing. An opener replays the log past it.
     applied_through: std.atomic.Value(u64) = .init(0),
+    /// A log position this process has verified and applied, so a later
+    /// opener replays only the log past it: see `noteVerifiedLog`. Under
+    /// `mutex`.
+    verified_log: ?VerifiedLog = null,
     /// Bumped whenever a replay adds another process's records. Every
     /// instance sharing this overlay reads them, so it is part of each
     /// instance's `NativeFile.adoptionEpoch`.
@@ -562,6 +566,45 @@ pub const SharedRedoOverlay = struct {
     /// enum). Takes ownership of `value` (already caller-allocated with
     /// the same allocator this overlay uses throughout); duplicates `key`
     /// only the first time it's seen for this root.
+    /// A record boundary in the log, the last record before it, and that
+    /// record's encoded compact checkpoint, valid while the log's fold
+    /// boundary is `fold_boundary` (a fold that resets the log moves it).
+    pub const VerifiedLog = struct {
+        fold_boundary: u64,
+        offset: u64,
+        sequence: u64,
+        compact: [compact_checkpoint_size]u8,
+    };
+
+    /// `native.CompactCheckpoint.encoded_size`.
+    pub const compact_checkpoint_size: usize = 48 + 8 * 8;
+
+    /// Records a verified log position. Later positions under the same fold
+    /// boundary replace earlier ones; a new boundary replaces any.
+    pub fn noteVerifiedLog(self: *SharedRedoOverlay, io: std.Io, position: VerifiedLog) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.verified_log) |current| {
+            if (current.fold_boundary == position.fold_boundary and current.offset >= position.offset) return;
+        }
+        self.verified_log = position;
+    }
+
+    /// Drops the verified position (its records were rolled back).
+    pub fn forgetVerifiedLog(self: *SharedRedoOverlay, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.verified_log = null;
+    }
+
+    /// The verified position, if it belongs to `fold_boundary`'s log.
+    pub fn verifiedLog(self: *SharedRedoOverlay, io: std.Io, fold_boundary: u64) ?VerifiedLog {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const position = self.verified_log orelse return null;
+        return if (position.fold_boundary == fold_boundary) position else null;
+    }
+
     pub fn noteApplied(self: *SharedRedoOverlay, sequence: u64) void {
         _ = self.applied_through.fetchMax(sequence, .acq_rel);
     }
