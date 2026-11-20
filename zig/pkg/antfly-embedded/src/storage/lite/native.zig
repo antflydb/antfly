@@ -5129,6 +5129,8 @@ pub const PathWriterLock = struct {
     /// comment); every constructor today still takes the real sidecar
     /// `flock`, so this is populated whenever `region` is too.
     file: ?std.Io.File,
+    /// `file` is an exclusive sidecar lock recorded in `own_sidecar_locks`.
+    registered_sidecar: bool = false,
     /// Admission owns this scope. Closing/yielding the kernel lease drops all
     /// idle anchors; escaped readers retain independent marker references.
     reader_registration_batch: ?ReaderCoordinator.RegistrationBatch = null,
@@ -5234,7 +5236,10 @@ pub const PathWriterLock = struct {
         }
         if (self.reader_registration_batch) |batch| batch.end();
         const io = self.borrowed_io orelse self.io_impl.io();
-        if (self.file) |f| f.close(io);
+        if (self.file) |f| {
+            if (self.registered_sidecar) noteOwnSidecarLock(io, f, .remove);
+            f.close(io);
+        }
         // The hold ends when the descriptor (and its flock) is released, so
         // it covers reader-marker cleanup done under the lock, as handoffs do.
         self.endHold();
@@ -9879,26 +9884,17 @@ pub const NativeFile = struct {
         return self.writer_lock_file != null or (self.externally_locked and !self.read_only);
     }
 
-    /// Counts this handle's sidecar writer lock on its inode entry
-    /// (`inode_lock.Entry.writer_authorities`). Only a held lock counts: an
-    /// externally locked handle holds the lease only between its caller's
-    /// lease acquisitions, so it says nothing about who holds it now.
+    /// Records this handle's sidecar writer lock in `own_sidecar_locks`.
     fn noteWriterAuthority(self: *NativeFile, change: enum { add, remove }) void {
-        if (self.writer_lock_file == null) return;
-        const entry = self.inode_lock_ref.load(.acquire) orelse return;
-        switch (change) {
-            .add => _ = entry.writer_authorities.fetchAdd(1, .acq_rel),
-            .remove => _ = entry.writer_authorities.fetchSub(1, .acq_rel),
-        }
+        const file = self.writer_lock_file orelse return;
+        noteOwnSidecarLock(self.runtime(), file, switch (change) {
+            .add => .add,
+            .remove => .remove,
+        });
     }
 
-    /// Whether another process may hold the sidecar writer lock. A probe
-    /// alone cannot tell this process's own lock from another's: a handle
-    /// here with writer authority means no other process holds it.
+    /// Whether another process holds the sidecar writer lock.
     fn foreignSidecarWriterHeld(self: *NativeFile, io: std.Io) bool {
-        if (self.inode_lock_ref.load(.acquire)) |entry| {
-            if (entry.writer_authorities.load(.acquire) != 0) return false;
-        }
         return sidecarWriterHeld(self.allocator, io, self.path);
     }
 
@@ -21880,13 +21876,8 @@ pub const NativeFile = struct {
         // which one an in-flight one releases against.
         const self_entry = self.inode_lock_ref.load(.acquire);
         const prepared_entry = prepared.inode_lock_ref.load(.acquire);
-        // Writer authority counts follow the handles to their new entries.
-        self.noteWriterAuthority(.remove);
-        prepared.noteWriterAuthority(.remove);
         self.inode_lock_ref.store(prepared_entry, .release);
         prepared.inode_lock_ref.store(self_entry, .release);
-        self.noteWriterAuthority(.add);
-        prepared.noteWriterAuthority(.add);
         // Tell the entry now reachable at `self.path` that its path
         // moved: a lazy fd reopen inside it (`ensureFd`, only reached if
         // `entry.fd` had gone back to `null`) must use the name the file
@@ -22458,7 +22449,8 @@ pub fn waitPathLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, wr
         .mode = if (writer) .read_write else .read_only,
     });
     const held = try @import("path_lock_wait.zig").lockUntil(file, io, if (writer) .exclusive else .shared, deadline_ns);
-    return .{ .io_impl = undefined, .borrowed_io = io, .file = held };
+    if (writer) noteOwnSidecarLock(io, held, .add);
+    return .{ .io_impl = undefined, .borrowed_io = io, .file = held, .registered_sidecar = writer };
 }
 
 /// FIFO cross-process writer admission. Fairness order is decided by
@@ -22729,7 +22721,8 @@ fn sidecarWriterLockUntil(allocator: Allocator, io: std.Io, wait_io: std.Io, pat
     var backoff_ns: i96 = 50 * std.time.ns_per_us;
     while (true) {
         if (acquireWriterLock(allocator, io, path)) |held| {
-            return .{ .io_impl = undefined, .borrowed_io = io, .file = held.file };
+            noteOwnSidecarLock(io, held.file, .add);
+            return .{ .io_impl = undefined, .borrowed_io = io, .file = held.file, .registered_sidecar = true };
         } else |err| if (err != error.WouldBlock and err != error.FileBusy) return err;
         if (deadline_ns - std.Io.Clock.awake.now(io).nanoseconds <= 0) return error.FileBusy;
         if (region_wait and !cache_attempted) {
@@ -22979,13 +22972,49 @@ fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !LockFi
 fn sidecarWriterHeld(allocator: Allocator, io: std.Io, path: []const u8) bool {
     const lock_path = writerLockPathAlloc(allocator, io, path) catch return true;
     defer allocator.free(lock_path);
-    const probe = std.Io.Dir.cwd().openFile(io, lock_path, .{
-        .mode = .read_only,
-        .lock = .exclusive,
-        .lock_nonblocking = true,
-    }) catch |err| return err != error.FileNotFound;
-    probe.close(io);
-    return false;
+    const probe = std.Io.Dir.cwd().openFile(io, lock_path, .{ .mode = .read_only }) catch |err| return err != error.FileNotFound;
+    defer probe.close(io);
+    // This process's own lock: a flock probe on another descriptor cannot
+    // tell it from another process's.
+    if (ownSidecarLockHeld(io, probe)) return false;
+    // A shared probe conflicts only with an exclusive (writer) holder, not
+    // with readers holding the sidecar shared.
+    const free = probe.tryLock(io, .shared) catch return true;
+    if (free) probe.unlock(io);
+    return !free;
+}
+
+/// Sidecar writer locks this process holds, by the lock file's inode.
+const own_sidecar_locks = struct {
+    var mutex: std.Io.Mutex = .init;
+    var held: std.AutoHashMapUnmanaged(std.Io.File.INode, u32) = .empty;
+};
+
+/// Records (or drops) one exclusive sidecar lock this process holds on
+/// `file`. Best effort: an unrecorded lock only makes a cold reader here
+/// wait for a publication as it would for another process's writer.
+fn noteOwnSidecarLock(io: std.Io, file: std.Io.File, change: enum { add, remove }) void {
+    const stat = file.stat(io) catch return;
+    own_sidecar_locks.mutex.lockUncancelable(io);
+    defer own_sidecar_locks.mutex.unlock(io);
+    switch (change) {
+        .add => {
+            const slot = own_sidecar_locks.held.getOrPut(std.heap.page_allocator, stat.inode) catch return;
+            if (!slot.found_existing) slot.value_ptr.* = 0;
+            slot.value_ptr.* += 1;
+        },
+        .remove => if (own_sidecar_locks.held.getPtr(stat.inode)) |count| {
+            count.* -= 1;
+            if (count.* == 0) _ = own_sidecar_locks.held.remove(stat.inode);
+        },
+    }
+}
+
+fn ownSidecarLockHeld(io: std.Io, file: std.Io.File) bool {
+    const stat = file.stat(io) catch return false;
+    own_sidecar_locks.mutex.lockUncancelable(io);
+    defer own_sidecar_locks.mutex.unlock(io);
+    return own_sidecar_locks.held.contains(stat.inode);
 }
 
 fn writerLockPathAlloc(allocator: Allocator, io: std.Io, path: []const u8) ![]u8 {
