@@ -73,8 +73,8 @@ pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: option
     if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
     if (reader.packets.len == 0) return error.EmptyVideo;
     if (reader.packets.len > options.max_packets or options.max_pictures == 0) return error.ResourceLimitExceeded;
-    const cfg0 = try h264.configParse(a, reader.track.avcc);
-    defer cfg0.groups.deinit(a);
+    const cfg0 = if (registry == null) try h264.configParse(a, reader.track.avcc) else null;
+    defer if (cfg0) |cfg| cfg.groups.deinit(a);
     const capacity = @min(reader.packets.len, options.max_pictures);
     // Exact row storage plus a conservative hash-table/transient allocation
     // allowance; no pixel/decode reservation is needed for this phase.
@@ -131,7 +131,7 @@ pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: option
                 const id = owner.packet_configs[packet_index];
                 if (id >= owner.entries.items.len) return error.MalformedVideoConfig;
                 break :blk owner.entries.items[id].config;
-            } else cfg0;
+            } else cfg0.?;
             const h = try header(nal, cfg);
             if (h.redundant != 0) continue;
             const lane: usize = @as(usize, h.plane) * 2 + h.parity;

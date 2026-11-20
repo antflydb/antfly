@@ -123,6 +123,23 @@ pub fn preprocessDecodedRectScaledWithResample(
     rescale_factor: f32,
     resample: Resample,
 ) ![]f32 {
+    var cache = PillowResizeCache{};
+    defer cache.deinit();
+    return preprocessWithResizeCache(allocator, img, target_width, target_height, mean, std_dev, rescale_factor, resample, &cache);
+}
+
+/// Reuse the two filter axes and horizontal scanlines across a sequence of images.
+pub fn preprocessWithResizeCache(
+    allocator: std.mem.Allocator,
+    img: ImageU8,
+    target_width: u32,
+    target_height: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    rescale_factor: f32,
+    resample: Resample,
+    cache: *PillowResizeCache,
+) ![]f32 {
     try img.validate();
 
     const tw: usize = target_width;
@@ -133,17 +150,7 @@ pub fn preprocessDecodedRectScaledWithResample(
     const result = try allocator.alloc(f32, result_len);
     errdefer allocator.free(result);
 
-    try preprocessDecodedRectScaledWithResampleInto(
-        allocator,
-        img,
-        result,
-        target_width,
-        target_height,
-        mean,
-        std_dev,
-        rescale_factor,
-        resample,
-    );
+    try preprocessRectInto(allocator, img, result, target_width, target_height, mean, std_dev, rescale_factor, resample, cache);
     return result;
 }
 
@@ -157,6 +164,23 @@ pub fn preprocessDecodedRectScaledWithResampleInto(
     std_dev: [3]f32,
     rescale_factor: f32,
     resample: Resample,
+) !void {
+    var cache = PillowResizeCache{};
+    defer cache.deinit();
+    return preprocessRectInto(allocator, img, result, target_width, target_height, mean, std_dev, rescale_factor, resample, &cache);
+}
+
+fn preprocessRectInto(
+    allocator: std.mem.Allocator,
+    img: ImageU8,
+    result: []f32,
+    target_width: u32,
+    target_height: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    rescale_factor: f32,
+    resample: Resample,
+    cache: *PillowResizeCache,
 ) !void {
     try img.validate();
     var resolved_img = img;
@@ -194,6 +218,7 @@ pub fn preprocessDecodedRectScaledWithResampleInto(
             std_dev,
             rescale_factor,
             resample,
+            cache,
         );
         return;
     }
@@ -816,9 +841,47 @@ fn pillowHorizontalRow(img: ImageU8, axis: BicubicAxis, horizontal: []u8, target
     }
 }
 
-/// Pillow resizes 8-bit images in two passes, materializing an 8-bit
-/// horizontal intermediate before the vertical pass. Preserving that
-/// quantization boundary is required for Transformers pixel parity.
+/// Owned by one sequential producer. Each frame rewrites the scratch rows.
+/// One geometry is retained, including the intermediate 8-bit rounding boundary.
+pub const PillowResizeCache = struct {
+    plan: ?Plan = null,
+
+    const Key = struct { width: usize, height: usize, target_width: usize, target_height: usize, resample: Resample };
+    const Plan = struct {
+        key: Key,
+        x: BicubicAxis,
+        y: BicubicAxis,
+        horizontal: []u8,
+        row_mask: usize,
+        vector_safe: bool,
+    };
+
+    pub fn deinit(self: *PillowResizeCache) void {
+        if (self.plan) |*p| {
+            p.x.allocator.free(p.horizontal);
+            p.x.deinit();
+            p.y.deinit();
+            self.plan = null;
+        }
+    }
+
+    fn get(self: *PillowResizeCache, allocator: std.mem.Allocator, key: Key) !*const Plan {
+        if (self.plan) |*p| if (std.meta.eql(p.key, key)) return p;
+        self.deinit();
+        var x = try buildPillowAxis(allocator, key.width, key.target_width, key.resample);
+        errdefer x.deinit();
+        var y = try buildPillowAxis(allocator, key.height, key.target_height, key.resample);
+        errdefer y.deinit();
+        var max_rows: usize = 1;
+        for (0..key.target_height) |i| max_rows = @max(max_rows, y.offsets[i + 1] - y.offsets[i]);
+        const rows = try std.math.ceilPowerOfTwo(usize, max_rows);
+        const row_bytes = try std.math.mul(usize, key.target_width, 3);
+        const horizontal = try allocator.alloc(u8, try std.math.mul(usize, rows, row_bytes));
+        self.plan = .{ .key = key, .x = x, .y = y, .horizontal = horizontal, .row_mask = rows - 1, .vector_safe = pillowHorizontalVectorSafe(x, key.target_width, true) };
+        return &self.plan.?;
+    }
+};
+
 fn preprocessDecodedRectPillowBicubic(
     allocator: std.mem.Allocator,
     img: ImageU8,
@@ -829,20 +892,15 @@ fn preprocessDecodedRectPillowBicubic(
     std_dev: [3]f32,
     rescale_factor: f32,
     resample: Resample,
+    cache: *PillowResizeCache,
 ) !void {
-    var horizontal_axis = try buildPillowAxis(allocator, img.width, target_width, resample);
-    defer horizontal_axis.deinit();
-    var vertical_axis = try buildPillowAxis(allocator, img.height, target_height, resample);
-    defer vertical_axis.deinit();
-
-    var max_rows: usize = 1;
-    for (0..target_height) |y| max_rows = @max(max_rows, vertical_axis.offsets[y + 1] - vertical_axis.offsets[y]);
-    const ring_rows = try std.math.ceilPowerOfTwo(usize, max_rows);
-    const row_mask = ring_rows - 1;
-    const row_bytes = try std.math.mul(usize, target_width, 3);
-    const horizontal = try allocator.alloc(u8, try std.math.mul(usize, ring_rows, row_bytes));
-    defer allocator.free(horizontal);
-    const horizontal_vector_safe = pillowHorizontalVectorSafe(horizontal_axis, target_width, true);
+    const plan = try cache.get(allocator, .{ .width = img.width, .height = img.height, .target_width = target_width, .target_height = target_height, .resample = resample });
+    const horizontal_axis = plan.x;
+    const vertical_axis = plan.y;
+    const horizontal = plan.horizontal;
+    const row_mask = plan.row_mask;
+    const row_bytes = target_width * 3;
+    const horizontal_vector_safe = plan.vector_safe;
     var computed_through: usize = 0;
 
     const Vec = @Vector(8, i32);

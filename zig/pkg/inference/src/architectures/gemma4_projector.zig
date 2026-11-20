@@ -308,9 +308,18 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
                 defer self.cb.free(patches);
                 break :bilinear try encodeResidentPatches(self.cb, self.allocator, self.weights, self.cfg, patches, g);
             };
-            defer self.cb.free(projected.embeddings);
-            if (self.output == null) self.output = (try self.cb.allocUninitF32Shape(&.{ @intCast(max_frames * 70), @intCast(self.cfg.text_hidden) })) orelse return error.UnsupportedVideoBackend;
-            if (!try self.cb.copyRows2D(self.allocator, self.output.?, self.rows, projected.embeddings, 0, projected.tokens, self.cfg.text_hidden)) return error.UnsupportedVideoBackend;
+            // NVDEC validates stable displayed geometry across sequence changes.
+            var transferred = false;
+            defer if (!transferred) self.cb.free(projected.embeddings);
+            if (frame.planned_frames == 0 or frame.planned_frames > max_frames or self.count >= frame.planned_frames or
+                (self.count != 0 and projected.tokens != self.tokens[0])) return error.UnsupportedVideoFormat;
+            if (frame.planned_frames == 1) {
+                self.output = projected.embeddings;
+                transferred = true;
+            } else {
+                if (self.output == null) self.output = (try self.cb.allocUninitF32Shape(&.{ @intCast(frame.planned_frames * projected.tokens), @intCast(self.cfg.text_hidden) })) orelse return error.UnsupportedVideoBackend;
+                if (!try self.cb.copyRows2D(self.allocator, self.output.?, self.rows, projected.embeddings, 0, projected.tokens, self.cfg.text_hidden)) return error.UnsupportedVideoBackend;
+            }
             self.tokens[self.count] = projected.tokens;
             self.timestamps[self.count] = frame.timestamp_us;
             self.count += 1;
@@ -320,7 +329,8 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
     var state = State{ .cb = cb, .allocator = allocator, .weights = &weights, .cfg = cfg, .preprocess = &preprocessor, .resample = videoResample(cb, cfg) };
     defer if (state.output) |out| cb.free(out);
     const stats = try video.decodeMp4Sampled(allocator, &compute.ctx, bytes, .{ .context = &state, .consume = State.consume, .check = State.check }, .gemma4);
-    const embeddings = try ownVideoRows(cb, allocator, state.output.?, state.rows, cfg.text_hidden);
+    const embeddings = state.output.?;
+    state.output = null;
     errdefer cb.free(embeddings);
     const counts = try allocator.dupe(usize, state.tokens[0..state.count]);
     errdefer allocator.free(counts);
@@ -337,6 +347,7 @@ pub const PortableVideoFrames = struct {
     cfg: Config,
     resample: image.Resample,
     prepared: []?PreparedImage,
+    resize: antfly_image.processing.PillowResizeCache = .{},
 
     pub fn init(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, frames: usize) !PortableVideoFrames {
         var cfg = try parseConfig(&projector.gguf.parsed);
@@ -346,6 +357,7 @@ pub const PortableVideoFrames = struct {
         return .{ .allocator = allocator, .weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector), .cfg = cfg, .resample = videoResample(cb, cfg), .prepared = prepared };
     }
     pub fn deinit(self: *PortableVideoFrames) void {
+        self.resize.deinit();
         for (self.prepared) |item| if (item) |value| value.deinit();
         self.allocator.free(self.prepared);
         self.weights.deinit();
@@ -354,25 +366,30 @@ pub const PortableVideoFrames = struct {
     /// non-square pixels without an intermediate stretched raster.
     pub fn prepare(self: *PortableVideoFrames, slot: usize, frame: image.ImageU8, presentation_width: u32, presentation_height: u32) !void {
         if (slot >= self.prepared.len or self.prepared[slot] != null) return error.InvalidVideoFrame;
-        self.prepared[slot] = try prepareImageViewAtGeometry(self.allocator, &self.weights, self.cfg, frame, portableFrameGeometry(self.cfg, frame, presentation_width, presentation_height), self.resample);
+        const g = portableFrameGeometry(self.cfg, frame, presentation_width, presentation_height);
+        const pixels = try antfly_image.processing.preprocessWithResizeCache(self.allocator, frame, @intCast(g.width), @intCast(g.height), self.cfg.image_mean, self.cfg.image_std, 1.0 / 255.0, self.resample, &self.resize);
+        self.prepared[slot] = .{ .allocator = self.allocator, .geometry = g, .pixels = pixels };
     }
     /// Consumes `timestamps_us`. A repeated selection is delivered once, so its
     /// later slots stay empty and leave the prompt rather than repeat a frame.
     pub fn project(self: *PortableVideoFrames, timestamps_us: []i64) !ProjectedVideo {
+        self.resize.deinit();
         const a = self.allocator;
         const cb = self.weights.cb;
         if (timestamps_us.len != self.prepared.len) return error.InvalidVideoFrame;
         var frames: std.ArrayList(PreparedImage) = .empty;
         defer frames.deinit(a);
         var kept: usize = 0;
+        var planned_rows: usize = 0;
         for (self.prepared, 0..) |item, slot| if (item) |value| {
             try frames.append(a, value);
+            planned_rows += value.geometry.tokenCount();
             timestamps_us[kept] = timestamps_us[slot];
             kept += 1;
         };
         if (kept == 0) return error.EmptyVideo;
-        const output = (try cb.allocUninitF32Shape(&.{ @intCast(kept * 70), @intCast(self.cfg.text_hidden) })) orelse return error.UnsupportedVideoBackend;
-        defer cb.free(output);
+        const output = (try cb.allocUninitF32Shape(&.{ @intCast(planned_rows), @intCast(self.cfg.text_hidden) })) orelse return error.UnsupportedVideoBackend;
+        errdefer cb.free(output);
         const counts = try a.alloc(usize, kept);
         errdefer a.free(counts);
         var rows: usize = 0;
@@ -388,8 +405,8 @@ pub const PortableVideoFrames = struct {
             rows += added;
             done += cohort.len;
         }
-        const embeddings = try ownVideoRows(cb, a, output, rows, self.cfg.text_hidden);
-        errdefer cb.free(embeddings);
+        if (rows != planned_rows) return error.InvalidVideoFrame;
+        const embeddings = output;
         const timestamps = try a.dupe(i64, timestamps_us[0..kept]);
         return .{ .images = .{ .allocator = a, .backend = cb, .embeddings = embeddings, .tokens_per_image = counts, .hidden_size = self.cfg.text_hidden, .batches_executed = (kept + 7) / 8, .max_batch_executed = @min(kept, 8) }, .timestamps_us = timestamps, .stats = .{ .decoded_frames = kept, .selected_frames = kept } };
     }
@@ -7670,6 +7687,16 @@ test "gemma4 video CUDA projects resident frames and matches native patch projec
         try std.testing.expect(video.stats.selected_frames > 0);
         try std.testing.expect(video.stats.decoded_frames > video.stats.selected_frames);
         try std.testing.expectEqual(video.stats.selected_frames, video.timestamps_us.len);
+        if (!unified) {
+            const pipeline = @import("../pipelines/gemma4_video.zig");
+            const long_clip = @embedFile("../testdata/video/h264-18001.mp4");
+            try std.testing.expectError(error.DecoderEnvelopeExceeded, encodeProjectedVideoResident(&guarded, a, projector, long_clip, false));
+            var fallback = try pipeline.encode(&cb, .{}, a, projector, long_clip);
+            defer fallback.deinit();
+            try std.testing.expectEqual(@as(usize, 32), fallback.timestamps_us.len);
+            try std.testing.expectEqual(@as(i64, 0), fallback.timestamps_us[0]);
+            try std.testing.expectEqual(@as(i64, 60000000), fallback.timestamps_us[31]);
+        }
         const cfg = try parseConfig(&projector.gguf.parsed);
         const g = targetGeometry(cfg, 160, 96);
         const pixels = try a.alloc(f32, 3 * g.width * g.height);
@@ -7716,7 +7743,7 @@ test "gemma4 video CUDA bicubic projection matches native embeddings for both pr
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bicubic.gguf", .{tmp.sub_path});
     defer a.free(path);
-    const clip = @embedFile("../testdata/video/closed.mp4");
+
     var preprocessor = try video.Preprocessor.init(a, &compute.ctx);
     defer preprocessor.deinit();
     const Oracle = struct {
@@ -7771,6 +7798,7 @@ test "gemma4 video CUDA bicubic projection matches native embeddings for both pr
         }
     };
     for ([_]bool{ false, true }) |unified| {
+        const clip: []const u8 = if (unified) @embedFile("../testdata/video/h264-two-pps.mp4") else @embedFile("../testdata/video/closed.mp4");
         try writeVideoTestProjector(a, path, unified, 16);
         const absolute = try compat.cwd().realPathFileAlloc(compat.io(), path, a);
         defer a.free(absolute);
@@ -7786,6 +7814,7 @@ test "gemma4 video CUDA bicubic projection matches native embeddings for both pr
         defer projected.deinit();
         const portable_times = try @import("../pipelines/embedding_gemma2_video.zig").selectedPresentationUs(a, clip, .{}, .gemma4, null);
         defer a.free(portable_times);
+        if (unified) try std.testing.expectEqual(@as(usize, 1), projected.timestamps_us.len);
         try std.testing.expectEqualSlices(i64, portable_times, projected.timestamps_us);
         const actual = try cb.toFloat32(projected.images.embeddings, a);
         defer a.free(actual);

@@ -156,9 +156,8 @@ pub fn encode(cb: *const ComputeBackend, admission: Admission, a: std.mem.Alloca
         if (projector_mod.encodeProjectedVideoResident(cb, a, projector, bytes, admission.explicit_scratch_limit == 0)) |projected| {
             return projected;
         } else |err| {
-            // The NVDEC duration limit is a decoder constraint. The
-            // portable route can still select 32 targets across a longer clip.
-            if (err != error.NvdecUnavailable and err != error.VideoDurationExceeded and inputError(err) != error.InvalidVideoInput) return err;
+            // Decoder envelope rejections can retry under portable admission.
+            if (err != error.NvdecUnavailable and err != error.VideoDurationExceeded and err != error.DecoderEnvelopeExceeded and inputError(err) != error.InvalidVideoInput) return err;
             std.log.info("gemma4 video falling back to portable decoding: {s}", .{@errorName(err)});
         }
         var permit = try admission.acquire(true, .{});
@@ -755,5 +754,96 @@ test "HEVC cropped reference admission is coded sized before and after inband ac
         permit.deinit();
         try std.testing.expectEqual(@as(usize, 0), budget.backend_scratch_bytes);
         try std.testing.expectEqual(initial.surface_bytes, controller.snapshot().backend_scratch_bytes);
+    }
+}
+
+test "gemma4 video plans multi-PPS AVC once and uses the current request control on cache hits" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/h264-two-pps.mp4");
+    var inspection = embedding_video.InspectionScope{ .allocator = a };
+    defer inspection.deinit();
+    const config = embedding_video.Configuration{ .inspection_scope = &inspection, .sampling = .gemma4 };
+    const times = try embedding_video.selectedConfiguredPresentationUs(a, bytes, .{}, config);
+    defer a.free(times);
+    const entry = inspection.find(bytes, null, config).?;
+    try std.testing.expect(entry.reader.track.multiple_avc_parameter_sets);
+    try std.testing.expect(entry.reader.track.edit.source_duration == null);
+    try std.testing.expectEqual(@as(i64, 0), times[0]);
+    try std.testing.expectError(error.Timeout, embedding_video.selectedConfiguredPresentationUs(a, bytes, .{ .deadline_ns = 0 }, config));
+    const direct = try embedding_video.selectedPresentationUs(a, bytes, .{}, .gemma4, null);
+    defer a.free(direct);
+    try std.testing.expectEqualSlices(i64, times, direct);
+}
+
+test "gemma4 video split picture keeps its earliest presentation time" {
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../testdata/video/h264-paff-adaptive-packets-8-1.mp4") }, .identity = "fields" };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var logical = try video.h264_pictures.planning(a, &reader, .{}, null);
+    defer logical.deinit();
+    var selected_pair = false;
+    for (logical.pictures) |picture| {
+        const last = picture.last_packet orelse continue;
+        if (last == picture.first_packet) continue;
+        reader.track.timescale = 1000;
+        reader.track.edit = .{ .source_start = 0, .source_duration = 1000 };
+        for (reader.packets) |*packet| packet.pts = -100;
+        reader.packets[picture.first_packet].pts = 500;
+        reader.packets[last].pts = 200;
+        const plan = try video.packet_sampling.gemma4PortablePlan(a, &reader, null);
+        try std.testing.expectEqualSlices(usize, &.{picture.first_packet}, plan.ids());
+        try std.testing.expectEqualSlices(i64, &.{200000}, plan.timestamps());
+        selected_pair = true;
+        break;
+    }
+    try std.testing.expect(selected_pair);
+}
+
+test "gemma4 video bicubic cache survives pixel and geometry changes" {
+    const image = @import("antfly_image");
+    const a = std.testing.allocator;
+    var cache = image.processing.PillowResizeCache{};
+    defer cache.deinit();
+    var bytes: [7 * 5 * 3]u8 = undefined;
+    const view = @import("image.zig").ImageU8{ .width = 7, .height = 5, .format = .rgb8, .data = &bytes };
+    var previous: ?[*]u8 = null;
+    for ([_]u32{ 4, 4, 8 }, 0..) |width, frame| {
+        for (&bytes, 0..) |*v, i| v.* = @truncate(i * 41 + frame * 17);
+        const expected = try image.processing.preprocessDecodedRectWithResample(a, view, width, 4, .{ 0, 0, 0 }, .{ 1, 1, 1 }, .torchvision_bicubic);
+        defer a.free(expected);
+        const actual = try image.processing.preprocessWithResizeCache(a, view, width, 4, .{ 0, 0, 0 }, .{ 1, 1, 1 }, 1.0 / 255.0, .torchvision_bicubic, &cache);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, expected, actual);
+        if (frame == 1) try std.testing.expect(previous.? == cache.plan.?.horizontal.ptr);
+        previous = cache.plan.?.horizontal.ptr;
+    }
+}
+
+test "gemma4 video portable decoder delivers the planned slots across NVDEC limits" {
+    const a = std.testing.allocator;
+    const Counter = struct {
+        slots: std.StaticBitSet(32) = .empty,
+        fn accept(raw: *anyopaque, slot: usize, _: video.preparation.BorrowedFrame, _: video.preparation.Options, _: media.source.Control) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(slot < 32 and !self.slots.isSet(slot));
+            self.slots.set(slot);
+        }
+    };
+    inline for (.{ "h264-two-pps.mp4", "h264-18001.mp4" }) |name| {
+        const bytes = @embedFile("../testdata/video/" ++ name);
+        var scope = embedding_video.InspectionScope{ .allocator = a, .limit = inspection_bytes };
+        defer scope.deinit();
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes } };
+        var count = Counter{};
+        const options = embedding_video.Configuration{ .sampling = .gemma4, .pool = &pool, .inspection_scope = &scope, .decoder = .{ .policy = .portable }, .observer = .{ .context = &count, .accept = Counter.accept } };
+        const timestamps = try embedding_video.selectedConfiguredPresentationUs(a, bytes, .{}, options);
+        defer a.free(timestamps);
+        try embedding_video.observeConfigured(a, bytes, null, .{}, options);
+        try std.testing.expectEqual(timestamps.len, count.slots.count());
+        if (comptime std.mem.eql(u8, name, "h264-18001.mp4")) {
+            try std.testing.expectEqual(@as(usize, 32), timestamps.len);
+            try std.testing.expectEqual(@as(i64, 60000000), timestamps[31]);
+        }
     }
 }

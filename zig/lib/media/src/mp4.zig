@@ -23,6 +23,7 @@ const tag = iso.fourcc;
 pub const Limits = struct {
     max_metadata_bytes: usize = 16 * 1024 * 1024,
     max_index_bytes: usize = 32 * 1024 * 1024,
+    track_limit_error: error{ ResourceLimitExceeded, DecoderEnvelopeExceeded } = error.ResourceLimitExceeded,
     max_samples: usize = 500_000,
     max_boxes: usize = 100_000,
     max_tracks: usize = 64,
@@ -36,6 +37,7 @@ pub const Codec = enum { avc, mjpeg, hevc, av1 };
 pub const Track = struct {
     codec: Codec = .avc,
     inband_parameter_sets: bool = false,
+    multiple_avc_parameter_sets: bool = false,
     /// Header inspection resolved HEVC activation and validated one static policy.
     hevc_policy_validated: bool = false,
     id: u32,
@@ -406,7 +408,7 @@ const Parser = struct {
                 const width = u16be(b.payload[24..26]);
                 const height = u16be(b.payload[26..28]);
                 if (width == 0 or height == 0) return error.MalformedMedia;
-                if (width > self.limits.max_dimension or height > self.limits.max_dimension) return error.ResourceLimitExceeded;
+                if (width > self.limits.max_dimension or height > self.limits.max_dimension) return self.limits.track_limit_error;
                 // External data references cannot safely resolve against this source.
                 if (u16be(b.payload[6..8]) != 1) return error.UnsupportedDataReference;
                 if (codec == .mjpeg and (u16be(b.payload[8..10]) != 0 or u16be(b.payload[40..42]) != 1)) return error.UnsupportedSampleDescription;
@@ -443,10 +445,11 @@ const Parser = struct {
                 }
                 var config: []const u8 = &.{};
                 var nal_len: u3 = 0;
+                var multiple_avc_sets = false;
                 switch (codec) {
                     .avc => {
                         config = configuration orelse return error.MalformedMedia;
-                        try validateAvcc(config);
+                        multiple_avc_sets = try validateAvcc(config);
                         nal_len = @as(u3, @intCast(config[4] & 3)) + 1;
                     },
                     .hevc => {
@@ -461,7 +464,7 @@ const Parser = struct {
                     .mjpeg => {},
                 }
                 if (nal_len == 3) return error.MalformedMedia;
-                t.track = .{ .inband_parameter_sets = b.typ == tag("avc3") or b.typ == tag("hev1"), .codec = codec, .id = 0, .timescale = 0, .width = width, .height = height, .avcc = if (codec == .avc) config else &.{}, .codec_config = if (codec == .hevc or codec == .av1) config else &.{}, .nal_length_bytes = nal_len, .pixel_aspect = .{ .horizontal = horizontal, .vertical = vertical }, .pixel_aspect_declared = aspect_declared, .color_info = color, .display_matrix = @splat(0) };
+                t.track = .{ .multiple_avc_parameter_sets = multiple_avc_sets, .inband_parameter_sets = b.typ == tag("avc3") or b.typ == tag("hev1"), .codec = codec, .id = 0, .timescale = 0, .width = width, .height = height, .avcc = if (codec == .avc) config else &.{}, .codec_config = if (codec == .hevc or codec == .av1) config else &.{}, .nal_length_bytes = nal_len, .pixel_aspect = .{ .horizontal = horizontal, .vertical = vertical }, .pixel_aspect_declared = aspect_declared, .color_info = color, .display_matrix = @splat(0) };
             }
             cursor = b.end;
         }
@@ -633,7 +636,7 @@ test "mp4 HEVC and AV1 sample descriptions require explicit consumer codec suppo
     }
 }
 
-fn validateAvcc(config: []const u8) !void {
+fn validateAvcc(config: []const u8) !bool {
     if (config.len < 7 or config[0] != 1) return error.MalformedMedia;
     var cursor: usize = 6;
     const sps_count = config[5] & 31;
@@ -645,6 +648,7 @@ fn validateAvcc(config: []const u8) !void {
     if (pps_count == 0) return error.MalformedMedia;
     for (0..pps_count) |_| try configNal(config, &cursor);
     // Optional high-profile extension remains borrowed for the codec backend.
+    return sps_count > 1 or pps_count > 1;
 }
 fn configNal(config: []const u8, cursor: *usize) !void {
     if (config.len - cursor.* < 2) return error.MalformedMedia;
@@ -734,7 +738,8 @@ fn buildPackets(allocator: std.mem.Allocator, t: Tables, track: Track, spans: []
     if (t.sizes[0] != 0) return error.MalformedMedia;
     const n = u32be(t.sizes[8..12]);
     if (n == 0) return error.EmptyVideoTrack;
-    if (n > limits.max_samples or @as(u64, n) * @sizeOf(Packet) > limits.max_index_bytes) return error.ResourceLimitExceeded;
+    if (n > limits.max_samples) return limits.track_limit_error;
+    if (@as(u64, n) * @sizeOf(Packet) > limits.max_index_bytes) return error.ResourceLimitExceeded;
     const fixed = if (t.compact) 0 else u32be(t.sizes[4..8]);
     const bits: u8 = if (t.compact) t.sizes[7] else 32;
     if (t.compact and bits != 4 and bits != 8 and bits != 16) return error.UnsupportedSampleSize;
@@ -908,7 +913,8 @@ fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *T
                 if (run_flags & ~@as(u32, 0xf05) != 0 or (run_flags & 4 != 0 and run_flags & 0x400 != 0)) return error.MalformedMedia;
                 const count = u32be(p[4..8]);
                 const total = try std.math.add(usize, packets.items.len, count);
-                if (total > limits.max_samples or total > limits.max_index_bytes / @sizeOf(Packet)) return error.ResourceLimitExceeded;
+                if (total > limits.max_samples) return limits.track_limit_error;
+                if (total > limits.max_index_bytes / @sizeOf(Packet)) return error.ResourceLimitExceeded;
                 var pc: usize = 8;
                 if (run_flags & 1 != 0) {
                     const delta: i32 = @bitCast(try fragmentField(p, &pc));

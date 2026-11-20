@@ -117,6 +117,8 @@ test "mp4 video malformed tables, metadata/index limits and fragment rejection r
     try std.testing.expectError(error.ResourceLimitExceeded, mp4.Reader.init(a, &src, .{ .max_metadata_bytes = 1 }));
     try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
     try std.testing.expectError(error.ResourceLimitExceeded, mp4.Reader.init(a, &src, .{ .max_samples = 1 }));
+    try std.testing.expectError(error.DecoderEnvelopeExceeded, mp4.Reader.init(a, &src, .{ .max_samples = 1, .track_limit_error = error.DecoderEnvelopeExceeded }));
+    try std.testing.expectError(error.ResourceLimitExceeded, mp4.Reader.init(a, &src, .{ .max_index_bytes = 1, .track_limit_error = error.DecoderEnvelopeExceeded }));
     try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
     try std.testing.expectError(error.ResourceLimitExceeded, mp4.Reader.init(a, &src, .{ .max_index_bytes = 1 }));
     try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
@@ -245,6 +247,8 @@ test "fragmented mp4 bad offsets missing tfdt and admission failures release met
     try std.testing.expectEqual(@as(usize, 0), bad.retained_bytes);
     var src = input(fragmented_clip);
     try std.testing.expectError(error.ResourceLimitExceeded, mp4.Reader.init(a, &src, .{ .max_samples = 1 }));
+    try std.testing.expectError(error.DecoderEnvelopeExceeded, mp4.Reader.init(a, &src, .{ .max_samples = 1, .track_limit_error = error.DecoderEnvelopeExceeded }));
+    try std.testing.expectError(error.ResourceLimitExceeded, mp4.Reader.init(a, &src, .{ .max_index_bytes = 1, .track_limit_error = error.DecoderEnvelopeExceeded }));
     try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
 }
 

@@ -23,17 +23,6 @@ const sampling_mod = @import("sampling.zig");
 pub const Sampling = union(enum) { reference, timestamps: sampling_mod.TimestampPolicy, source_timestamps: sampling_mod.TimestampPolicy, gemma4 };
 pub const gemma4_max_frames = (sampling_mod.TimestampPolicy{}).max_frames;
 
-pub fn gemma4Origin(reader: *const media.mp4.Reader) !i64 {
-    if (reader.track.edit.source_duration != null) return reader.track.edit.source_start;
-    if (reader.packets.len == 0) return error.EmptyVideo;
-    var first = reader.packets[0].pts;
-    for (reader.packets, 0..) |packet, i| {
-        if (i % 256 == 0) try reader.input.control.check();
-        first = @min(first, packet.pts);
-    }
-    return first;
-}
-
 pub fn presentationUs(pts: i64, origin: i64, scale: u32) !i64 {
     if (scale == 0) return error.InvalidTimebase;
     return std.math.cast(i64, @divFloor((@as(i128, pts) - origin) * std.time.us_per_s, scale)) orelse error.TimestampOverflow;
@@ -42,14 +31,17 @@ pub fn presentationUs(pts: i64, origin: i64, scale: u32) !i64 {
 /// Bucket pictures by their latest eligible one-second target. Filling empty
 /// buckets backwards implements first-at-or-after for VFR and B-frame order.
 /// Packet IDs break ties before conversion to microseconds at the API boundary.
-pub fn gemma4Pictures(a: std.mem.Allocator, reader: *const media.mp4.Reader, pictures: anytype) ![]usize {
+pub fn gemma4Pictures(reader: *const media.mp4.Reader, pictures: anytype, control: media.source.Control) !Gemma4Plan {
+    try control.check();
     const scale = reader.track.timescale;
     if (scale == 0 or pictures.len == 0) return error.EmptyVideo;
-    const origin = try gemma4Origin(reader);
+    var origin = reader.track.edit.source_start;
     const duration: i128 = reader.track.edit.source_duration orelse infer: {
+        origin = pictures[0].pts;
         var end: i128 = origin;
         for (pictures, 0..) |pic, i| {
-            if (i % 256 == 0) try reader.input.control.check();
+            if (i % 256 == 0) try control.check();
+            origin = @min(origin, pic.pts);
             end = @max(end, @as(i128, pic.pts) + pic.duration);
         }
         break :infer end - origin;
@@ -59,13 +51,17 @@ pub fn gemma4Pictures(a: std.mem.Allocator, reader: *const media.mp4.Reader, pic
     const count: usize = @intCast(@min(seconds, gemma4_max_frames));
     var best: [gemma4_max_frames]?usize = @splat(null);
     for (pictures, 0..) |pic, id| {
-        if (id % 256 == 0) try reader.input.control.check();
+        if (id % 256 == 0) try control.check();
         const tick = @as(i128, pic.pts) - origin;
         if (tick < 0 or tick >= duration) continue;
         const second = @divFloor(tick, scale);
         // Target j occurs at floor(j * (seconds-1) / (count-1)).
         const bucket: usize = if (seconds <= count) @intCast(second) else @intCast(@divFloor((second + 1) * (count - 1) - 1, seconds - 1));
-        if (best[bucket] == null or pic.pts < pictures[best[bucket].?].pts) best[bucket] = id;
+        if (best[bucket]) |previous| {
+            const prior = pictures[previous];
+            if (pic.pts > prior.pts or (pic.pts == prior.pts and packetId(pic, id) >= packetId(prior, previous))) continue;
+        }
+        best[bucket] = id;
     }
     var next: ?usize = null;
     var i = count;
@@ -74,13 +70,54 @@ pub fn gemma4Pictures(a: std.mem.Allocator, reader: *const media.mp4.Reader, pic
         next = best[i] orelse next;
         best[i] = next;
     }
-    var ids: std.ArrayList(usize) = .empty;
-    errdefer ids.deinit(a);
+    var plan = Gemma4Plan{};
+    var previous: ?usize = null;
     for (best[0..count]) |candidate| if (candidate) |id| {
-        if (ids.items.len == 0 or ids.items[ids.items.len - 1] != id) try ids.append(a, id);
+        if (previous == id) continue;
+        previous = id;
+        const pic = pictures[id];
+        plan.packet_ids[plan.len] = packetId(pic, id);
+        plan.timestamps_us[plan.len] = try presentationUs(pic.pts, origin, scale);
+        plan.len += 1;
     };
-    if (ids.items.len == 0) return error.EmptyVideo;
-    return ids.toOwnedSlice(a);
+    if (plan.len == 0) return error.EmptyVideo;
+    return plan;
+}
+
+fn packetId(picture: anytype, index: usize) usize {
+    return if (@hasField(@TypeOf(picture), "first_packet")) picture.first_packet else index;
+}
+
+pub const Gemma4Plan = struct {
+    packet_ids: [gemma4_max_frames]usize = undefined,
+    timestamps_us: [gemma4_max_frames]i64 = undefined,
+    len: usize = 0,
+
+    pub fn ids(self: *const Gemma4Plan) []const usize {
+        return self.packet_ids[0..self.len];
+    }
+
+    pub fn timestamps(self: *const Gemma4Plan) []const i64 {
+        return self.timestamps_us[0..self.len];
+    }
+};
+
+/// Immutable software inputs may need multiple coded members to assemble one picture.
+/// The decoder validates entropy and pixels later, under its own admission.
+pub fn gemma4PortablePlan(a: std.mem.Allocator, reader: *media.mp4.Reader, registry: ?*@import("h264_dynamic.zig").Session) !Gemma4Plan {
+    if (reader.track.codec == .avc) {
+        const complex = if (registry != null or reader.track.inband_parameter_sets or reader.track.multiple_avc_parameter_sets) true else blk: {
+            const cfg = try h264.configParse(a, reader.track.avcc);
+            defer cfg.groups.deinit(a);
+            break :blk !cfg.frame_only or cfg.profile == 88 or cfg.separate_planes or cfg.groups.count > 1 or cfg.redundant;
+        };
+        if (complex) {
+            var logical = try h264_pictures.planning(a, reader, .{}, registry);
+            defer logical.deinit();
+            return gemma4Pictures(reader, logical.pictures, reader.input.control);
+        }
+    }
+    return gemma4Pictures(reader, reader.packets, reader.input.control);
 }
 
 pub fn timestampSelect(a: std.mem.Allocator, metadata: []const sampling_mod.TimedPicture, scale: u32, sampling: Sampling, control: media.source.Control) ![]usize {
@@ -93,9 +130,8 @@ pub fn timestampSelect(a: std.mem.Allocator, metadata: []const sampling_mod.Time
 }
 pub fn selectLogical(a: std.mem.Allocator, reader: *const media.mp4.Reader, logical: h264_pictures.Index, sampling: Sampling, control: media.source.Control) ![]usize {
     if (sampling == .gemma4) {
-        const ids = try gemma4Pictures(a, reader, logical.pictures);
-        for (ids) |*id| id.* = logical.pictures[id.*].first_packet;
-        return ids;
+        const plan = try gemma4Pictures(reader, logical.pictures, control);
+        return a.dupe(usize, plan.ids());
     }
     if (sampling == .source_timestamps) if (logical.pending_pts) |pts| {
         const end = sampling.source_timestamps.end_ns orelse return error.InvalidLiveWatermark;
@@ -118,6 +154,11 @@ pub fn selectLogical(a: std.mem.Allocator, reader: *const media.mp4.Reader, logi
 }
 
 pub fn selectWithSampling(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling) ![]usize {
+    if (sampling == .gemma4) {
+        var mutable = reader.*;
+        const plan = try gemma4PortablePlan(a, &mutable, null);
+        return a.dupe(usize, plan.ids());
+    }
     if (reader.track.codec == .avc) {
         const cfg = try h264.configParse(a, reader.track.avcc);
         defer cfg.groups.deinit(a);
@@ -132,7 +173,6 @@ pub fn selectWithSampling(a: std.mem.Allocator, reader: *const media.mp4.Reader,
             return selectLogical(a, reader, logical, sampling, reader.input.control);
         }
     }
-    if (sampling == .gemma4) return gemma4Pictures(a, reader, reader.packets);
     if (sampling != .reference) {
         const metadata = try a.alloc(sampling_mod.TimedPicture, reader.packets.len);
         defer a.free(metadata);
