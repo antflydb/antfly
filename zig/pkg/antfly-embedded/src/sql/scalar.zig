@@ -36,9 +36,11 @@ pub const PatternSet = struct {
     close: *const fn (*anyopaque) void,
 };
 pub const Datum = struct {
+    pub const ExtensionKind = enum(u8) { none, patterns, temporal, range, enumeration, bytea, void };
+
     /// Immutable temporal payload owned by the pinned invocation/row region.
     /// The JSON null placeholder is never a temporal value or SQL NULL.
-    extension_kind: enum(u8) { none, patterns, temporal, range, enumeration, bytea, void } = .none,
+    extension_kind: ExtensionKind = .none,
     // One tagged, pointer-sized extension; the discriminator fits existing
     // tail padding. Constructors/accessors are the only interpretation boundary.
     extension: ?*const anyopaque = null,

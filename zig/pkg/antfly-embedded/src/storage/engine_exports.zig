@@ -991,8 +991,8 @@ fn executeNativeSchemaOwnerControl(self: *DB, command: @import("db/relational_sc
     return .{ .value = self.executeNativeSchemaOwnerControl(command, budget, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn retainRaftSchemaOwnerPreparation(self: *DB, command: @import("db/relational_schema_owner_contract.zig").Command, owner_group: u64, entry: db.OrderedApplyReceipt, context: @import("../api/operation.zig").RequestContext) engine.Outcome(session_contract.Handle) {
-    return .{ .value = self.retainRaftSchemaOwnerPreparation(command, owner_group, entry, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn retainRaftSchemaOwnerPreparation(self: *DB, command_bytes: []const u8, owner_group: u64, entry: db.OrderedApplyReceipt, context: @import("../api/operation.zig").RequestContext) engine.Outcome(session_contract.Handle) {
+    return .{ .value = self.retainRaftSchemaOwnerPreparation(command_bytes, owner_group, entry, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn sqlMaintenanceJson(self: *DB, alloc: Allocator, bytes: []const u8) engine.Outcome([]u8) {
@@ -2249,6 +2249,7 @@ const descriptor: engine.Descriptor = .{
     .read_session_release_layout = engine.read_session_release_layout,
     .read_reader_typed_cells_layout = engine.read_reader_typed_cells_layout,
     .read_reader_datum_layout = engine.read_reader_datum_layout,
+    .read_reader_datum_kind_layout = engine.read_reader_datum_kind_layout,
     .read_numeric_value_layout = engine.read_numeric_value_layout,
     .read_numeric_kind_layout = engine.read_numeric_kind_layout,
     .read_array_value_layout = engine.read_array_value_layout,

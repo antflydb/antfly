@@ -2323,7 +2323,7 @@ pub fn metadataApplyStoreProjection(
                     break :blk metadataProjectionJson(alloc, out_json, bytes);
                 },
                 .sql_type_bindings => |input| {
-                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
                     const value = handle.store.sqlTypeBindings(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -2337,7 +2337,7 @@ pub fn metadataApplyStoreProjection(
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .sql_lock_read => |input| {
-                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = input.database_work != null or input.abandoned_private != null, .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
                     const value = handle.store.sqlLockRead(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(switch (err) {
                         error.InvalidLockRecord => error.InvalidCatalogRecord,
@@ -2355,7 +2355,7 @@ pub fn metadataApplyStoreProjection(
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .sql_authorization_read => |input| {
-                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
                     const value = handle.store.sqlAuthorizationRead(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -2368,7 +2368,7 @@ pub fn metadataApplyStoreProjection(
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .sql_type_snapshot => |input| {
-                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
                     const value = handle.store.sqlTypeSnapshot(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -2381,7 +2381,7 @@ pub fn metadataApplyStoreProjection(
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .sql_cast_snapshot => |input| {
-                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
                     const value = handle.store.sqlCastSnapshot(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -2412,7 +2412,7 @@ pub fn metadataApplyStoreProjection(
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .sql_graph_preparation_read => |input| {
-                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .setting_admin = true, .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
                     const value = handle.store.sqlGraphPreparationRead(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -2425,7 +2425,7 @@ pub fn metadataApplyStoreProjection(
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .sql_trigger_snapshot => |input| {
-                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
                     const value = handle.store.sqlTriggerSnapshot(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -2452,7 +2452,7 @@ pub fn metadataApplyStoreProjection(
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .sql_extension_snapshot => |input| {
-                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
                     const value = handle.store.sqlExtensionSnapshot(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -2465,7 +2465,7 @@ pub fn metadataApplyStoreProjection(
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .sql_routine_snapshot => |input| {
-                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
                     const value = handle.store.sqlRoutineSnapshot(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -2478,13 +2478,13 @@ pub fn metadataApplyStoreProjection(
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .sql_sequence_snapshot => |input| {
-                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
                     const value = handle.store.sqlSequenceSnapshot(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .sql_sequence_retirement_snapshot => |input| {
-                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
                     // Only the trusted metadata host can select this private
                     // projection after authorizing both retirement grants.
                     // A distinct tag makes older kernels reject it explicitly.
@@ -5294,7 +5294,7 @@ pub fn storageOwnerRaftIndexObservationJson(
             return out.status;
         }
     };
-    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.query_abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
     const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
     if (request.identity_json.ptr == null or request.identity_json.len == 0 or request.identity_json.len > contract.Identity.max_json_bytes or
         request.control.has_execution_deadline > 1 or request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
@@ -5332,7 +5332,7 @@ pub fn storageOwnerRaftIndexPreparationJson(
             return out.status;
         }
     };
-    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.query_abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
     const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
     const limits = contract.AdmissionPreparation;
     if (request.admission_json.ptr == null or request.admission_json.len == 0 or request.admission_json.len > limits.max_header_json_bytes or
@@ -5375,7 +5375,7 @@ pub fn storageOwnerRaftIndexBuildJson(owner: ?*anyopaque, request: *const kernel
             output.* = response.detach(used);
         }
     };
-    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.query_abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
     if (request.prepare > 2 or request.request_json.ptr == null or request.request_json.len == 0 or request.request_json.len > contract.BuildPreparation.max_request_bytes or
         request.audit_root_json.len > @import("antfly_local_sources").storage_db_relational_index_owner_control.AuditRoot.max_wire_bytes or
         (request.prepare == 2) != (request.audit_root_json.len != 0) or (request.audit_root_json.len != 0 and request.audit_root_json.ptr == null) or
@@ -5448,7 +5448,7 @@ pub fn storageOwnerRaftIndexSourceJson(owner: ?*anyopaque, request: *const kerne
             return out.status;
         }
     };
-    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.query_abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
     if (request.consumed_only > 1 or !std.mem.allEqual(u8, &request._reserved, 0) or request.identity_json.ptr == null or request.identity_json.len == 0 or request.identity_json.len > native.Identity.max_json_bytes or
         request.control.has_execution_deadline > 1 or request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
         request.control.table_name.len != 0 or request.control.request_json.len != 0) return Failure.result(error.InvalidArgument, out_failure);
@@ -5494,7 +5494,7 @@ pub fn storageOwnerRaftIndexClaimsJson(owner: ?*anyopaque, request: *const kerne
             return out.status;
         }
     };
-    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.query_abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
     if (request.command_json.ptr == null or request.command_json.len == 0 or request.command_json.len > native.max_claim_wire_bytes or
         request.control.has_execution_deadline > 1 or request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
         request.control.table_name.len != 0 or request.control.request_json.len != 0) return Failure.result(error.InvalidArgument, out_failure);
@@ -5537,7 +5537,7 @@ pub fn storageOwnerRaftIndexLifecycleJson(owner: ?*anyopaque, request: *const ke
             return out.status;
         }
     };
-    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.query_abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
     if (request.prepare > 1 or request.request_json.ptr == null or request.request_json.len == 0 or request.request_json.len > contract.LifecyclePreparation.max_request_bytes or
         request.audit_root_json.len > native.AuditRoot.max_wire_bytes or (request.audit_root_json.len != 0 and request.audit_root_json.ptr == null) or
         request.control.has_execution_deadline > 1 or request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
@@ -5633,7 +5633,7 @@ pub fn storageOwnerRaftIndexCancellationJson(owner: ?*anyopaque, request: *const
             return out.status;
         }
     };
-    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.query_abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
     if (request.prepare > 1 or request.request_json.ptr == null or request.request_json.len == 0 or request.request_json.len > contract.CancellationPreparation.max_request_bytes or
         request.control.has_execution_deadline > 1 or request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
         request.control.table_name.len != 0 or request.control.request_json.len != 0) return Failure.result(error.InvalidArgument, out_failure);
@@ -5722,7 +5722,7 @@ const RaftSchemaPreparationRegistry = HandleRegistryOf(RaftSchemaPreparation);
 var raft_schema_preparations: RaftSchemaPreparationRegistry = .{};
 
 fn raftSchemaRequestContext(request: *const kernel_owner_abi.RaftSchemaOwnerApplyRequest) !@import("antfly_local_sources").api_operation.RequestContext {
-    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version)
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.query_abi_version)
         return error.InvalidAbiVersion;
     const contract = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
     if (request._reserved != 0 or request.table_name.len == 0 or request.table_name.ptr == null or
@@ -5749,9 +5749,8 @@ fn prepareRaftSchemaControl(owner: ?*anyopaque, request: *const kernel_owner_abi
     const physical_root = try handle.db.durableRootIncarnation();
     if (handle.storage_owner_schema_preparing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.StorageBusy;
     errdefer handle.storage_owner_schema_preparing.store(false, .release);
-    const command = try @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Command.decodeRaft(request.command.slice());
     const schema_protocol = @import("antfly_local_sources").storage_read_session_types.contract;
-    const prepared = try handle.db.retainRaftSchemaOwnerPreparation(command, handle.storage_owner_group_id, .{ .term = request.term, .index = request.index }, context);
+    const prepared = try handle.db.retainRaftSchemaOwnerPreparation(request.command.slice(), handle.storage_owner_group_id, .{ .term = request.term, .index = request.index }, context);
     errdefer schema_protocol.call("close", .schema_preparation, prepared, .{prepared}) catch @panic("incompatible schema preparation owner");
     try context.ensureActive();
     const ticket = try handle.alloc.create(RaftSchemaPreparation);
@@ -5775,7 +5774,7 @@ pub fn storageOwnerPrepareRaftSchemaControl(owner: ?*anyopaque, request: *const 
 }
 
 fn applyPreparedRaftSchemaControl(owner: ?*anyopaque, request: *const kernel_owner_abi.RaftSchemaOwnerPreparedApplyRequest) !void {
-    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return error.InvalidAbiVersion;
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.query_abi_version) return error.InvalidAbiVersion;
     if (request._reserved != 0 or request.term == 0 or request.index == 0 or request.control.has_execution_deadline > 1 or
         request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
         request.control.table_name.len != 0 or request.control.request_json.len != 0) return error.InvalidArgument;
@@ -5854,7 +5853,7 @@ pub fn storageOwnerNativeSchemaObservationJson(
     out_response.* = .{};
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     if (request.table_name.len == 0 or request.table_name.ptr == null or
-        request.control.version != kernel_owner_abi.abi_version or request.control.has_execution_deadline > 1 or
+        request.control.version != kernel_owner_abi.query_abi_version or request.control.has_execution_deadline > 1 or
         request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
         request.control.table_name.len != 0 or request.control.request_json.len != 0 or
         request.binding_json.len == 0 or request.binding_json.ptr == null or request.binding_json.len > 8192)
@@ -5889,7 +5888,7 @@ pub fn storageOwnerRaftSchemaObservationJson(owner: ?*anyopaque, request: *const
             return out.status;
         }
     };
-    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.query_abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
     if (request.table_name.len == 0 or request.table_name.ptr == null or request.control.has_execution_deadline > 1 or
         request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
         request.control.table_name.len != 0 or request.control.request_json.len != 0 or
@@ -5925,7 +5924,7 @@ pub fn storageOwnerSchemaAuditJson(owner: ?*anyopaque, request: *const kernel_ow
             return out.status;
         }
     };
-    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.query_abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
     const local = @import("antfly_local_sources");
     const contract = local.storage_db_relational_schema_owner_contract;
     const wire = local.storage_db_relational_schema_root_contract;
@@ -5971,7 +5970,7 @@ pub fn storageOwnerSchemaPreparationJson(owner: ?*anyopaque, request: *const ker
             return out.status;
         }
     };
-    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.query_abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
     const local = @import("antfly_local_sources");
     const contract = local.storage_db_relational_schema_owner_contract;
     if (request.table_name.len == 0 or request.table_name.ptr == null or request.control.has_execution_deadline > 1 or
@@ -6029,7 +6028,7 @@ pub fn storageOwnerSchemaPreparationJson(owner: ?*anyopaque, request: *const ker
 fn prepareSchemaProposal(owner: ?*anyopaque, request: *const kernel_owner_abi.SchemaOwnerProposalRequest) !kernel_owner_abi.SchemaOwnerProposalResult {
     const local = @import("antfly_local_sources");
     const contract = local.storage_db_relational_schema_owner_contract;
-    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return error.InvalidAbiVersion;
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.query_abi_version) return error.InvalidAbiVersion;
     if (request.table_name.len == 0 or request.table_name.ptr == null or request.control.has_execution_deadline > 1 or
         request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
         request.control.table_name.len != 0 or request.control.request_json.len != 0 or
@@ -6054,15 +6053,11 @@ fn prepareSchemaProposal(owner: ?*anyopaque, request: *const kernel_owner_abi.Sc
     if (descriptor.action != .page and descriptor.action != .reconcile_transactions) return error.InvalidArgument;
     if (handle.storage_owner_schema_preparing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.StorageBusy;
     defer handle.storage_owner_schema_preparing.store(false, .release);
-    const prepared = try handle.db.prepareSchemaOwnerProposalBytes(handle.alloc, descriptor, .{ .records = request.records, .time_ns = request.time_ns }, context);
-    defer if (prepared) |bytes| handle.alloc.free(bytes);
+    const prepared = try handle.db.prepareSchemaOwnerProposalBytes(std.heap.c_allocator, descriptor, .{ .records = request.records, .time_ns = request.time_ns }, context);
+    errdefer if (prepared) |bytes| std.heap.c_allocator.free(bytes);
     var result: kernel_owner_abi.SchemaOwnerProposalResult = .{ .root_generation = handle.storage_owner_root_generation };
     std.mem.writeInt(u128, &result.physical_root_incarnation_le, try handle.db.durableRootIncarnation(), .little);
-    if (prepared) |bytes| {
-        const copied = try dupBytes(bytes);
-        result.command = .{ .ptr = copied.ptr, .len = @intCast(copied.len) };
-    }
-    errdefer if (result.command.ptr) |ptr| std.heap.c_allocator.free(ptr[0..@intCast(result.command.len)]);
+    if (prepared) |bytes| result.command = .{ .ptr = bytes.ptr, .len = @intCast(bytes.len) };
     try context.ensureActive();
     return result;
 }
@@ -6088,7 +6083,7 @@ pub fn storageOwnerNativeSchemaControlJson(owner: ?*anyopaque, request: *const k
             return out.status;
         }
     };
-    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.query_abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
     const local = @import("antfly_local_sources");
     const contract = local.storage_db_relational_schema_owner_contract;
     if (request.table_name.len == 0 or request.table_name.ptr == null or request.control.has_execution_deadline > 1 or
@@ -6150,7 +6145,7 @@ pub fn storageOwnerNativeIndexControlJson(
     // remain raw borrowed bytes rather than another JSON/base64 representation.
     if (request.request_json.len == 0 or request.request_json.ptr == null or request.request_json.len > 32 * 1024) return .invalid_argument;
     if (request.operation == .consume) {
-        if (request.manifest.len != 0 or request.control.version != kernel_owner_abi.abi_version or request.control.has_execution_deadline > 1 or
+        if (request.manifest.len != 0 or request.control.version != kernel_owner_abi.query_abi_version or request.control.has_execution_deadline > 1 or
             request.control.table_name.len != 0 or request.control.request_json.len != 0) return .invalid_argument;
         const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
         const resources = @import("antfly_local_sources").storage_resource_manager;
@@ -6177,7 +6172,7 @@ pub fn storageOwnerNativeIndexControlJson(
         return status;
     }
     if (request.operation == .source) {
-        if (request.manifest.len != 0 or request.control.version != kernel_owner_abi.abi_version or request.control.has_execution_deadline > 1 or
+        if (request.manifest.len != 0 or request.control.version != kernel_owner_abi.query_abi_version or request.control.has_execution_deadline > 1 or
             request.control.table_name.len != 0 or request.control.request_json.len != 0) return .invalid_argument;
         const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
         var parsed = std.json.parseFromSlice(native.Identity, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| return storageOwnerStatusFromError(err);
@@ -6211,7 +6206,7 @@ pub fn storageOwnerNativeIndexControlJson(
     }
     if (request.operation == .build) {
         const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
-        if (request.manifest.len > native.AuditRoot.max_wire_bytes or (request.manifest.len != 0 and request.manifest.ptr == null) or request.control.version != kernel_owner_abi.abi_version or request.control.has_execution_deadline > 1 or
+        if (request.manifest.len > native.AuditRoot.max_wire_bytes or (request.manifest.len != 0 and request.manifest.ptr == null) or request.control.version != kernel_owner_abi.query_abi_version or request.control.has_execution_deadline > 1 or
             request.control.table_name.len != 0 or request.control.request_json.len != 0) return .invalid_argument;
         var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerBuildRequest, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| return switch (err) {
             error.OutOfMemory => .out_of_memory,
@@ -6254,7 +6249,7 @@ pub fn storageOwnerNativeIndexControlJson(
     if (request.operation == .install) {
         const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
         if (request.manifest.len == 0 or request.manifest.len > native.AuditRoot.max_wire_bytes or request.manifest.ptr == null or
-            request.control.version != kernel_owner_abi.abi_version or request.control.has_execution_deadline > 1 or
+            request.control.version != kernel_owner_abi.query_abi_version or request.control.has_execution_deadline > 1 or
             request.control.table_name.len != 0 or request.control.request_json.len != 0) return .invalid_argument;
         var parsed = std.json.parseFromSlice(native.InstallationRequest, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| return switch (err) {
             error.OutOfMemory => .out_of_memory,
@@ -6281,7 +6276,7 @@ pub fn storageOwnerNativeIndexControlJson(
     inline for (.{ kernel_owner_abi.NativeIndexOwnerOperation.release, kernel_owner_abi.NativeIndexOwnerOperation.cancel_release }) |operation| if (request.operation == operation) {
         const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
         if (request.manifest.len == 0 or request.manifest.len > native.AuditRoot.max_wire_bytes or request.manifest.ptr == null or
-            request.control.version != kernel_owner_abi.abi_version or request.control.has_execution_deadline > 1 or
+            request.control.version != kernel_owner_abi.query_abi_version or request.control.has_execution_deadline > 1 or
             request.control.table_name.len != 0 or request.control.request_json.len != 0) return .invalid_argument;
         const context: @import("antfly_local_sources").api_operation.RequestContext = .{
             .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
@@ -6311,7 +6306,7 @@ pub fn storageOwnerNativeIndexControlJson(
     if (request.operation == .cancel_complete) {
         const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
         if (request.manifest.len == 0 or request.manifest.len > native.AuditRoot.max_wire_bytes or request.manifest.ptr == null or
-            request.control.version != kernel_owner_abi.abi_version or request.control.has_execution_deadline > 1 or
+            request.control.version != kernel_owner_abi.query_abi_version or request.control.has_execution_deadline > 1 or
             request.control.table_name.len != 0 or request.control.request_json.len != 0) return .invalid_argument;
         const context: @import("antfly_local_sources").api_operation.RequestContext = .{
             .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,

@@ -148,21 +148,21 @@ pub const Prepared = struct {
     payload: ?Payload = null,
 
     pub fn init(a: A, core: *core_mod.DBCore, command: Command, context: operation.RequestContext) !@This() {
-        return initFor(a, core, command, context, .native, false);
+        return initFor(a, core, command, context, .native, false, null);
     }
     /// Producer preparation rejects invalid input before proposal. Positions
     /// are supplied separately by committed apply, never by command bytes.
     pub fn initRaft(a: A, core: *core_mod.DBCore, command: Command, context: operation.RequestContext) !@This() {
-        return initFor(a, core, command, context, .raft, false);
+        return initFor(a, core, command, context, .raft, false, null);
     }
     /// Original committed bytes only. Unlike producer preparation, this must
     /// preserve stale guards as candidates for an atomic durable rejection.
-    pub fn initCommittedRaft(a: A, core: *core_mod.DBCore, command: Command, context: operation.RequestContext) !@This() {
-        return initFor(a, core, command, context, .raft, true);
+    pub fn initCommittedRaft(a: A, core: *core_mod.DBCore, verified: Command.VerifiedRaft, context: operation.RequestContext) !@This() {
+        return initFor(a, core, verified.command, context, .raft, true, verified.identity);
     }
-    fn initFor(a: A, core: *core_mod.DBCore, command: Command, context: operation.RequestContext, authority: @FieldType(job.Binding, "authority"), committed: bool) !@This() {
+    fn initFor(a: A, core: *core_mod.DBCore, command: Command, context: operation.RequestContext, authority: @FieldType(job.Binding, "authority"), committed: bool, verified_identity: ?Digest) !@This() {
         try context.ensureActive();
-        const command_identity: Digest = if (authority == .raft) try command.raftIdentity() else blk: {
+        const command_identity: Digest = if (authority == .raft) verified_identity orelse try command.raftIdentity() else blk: {
             try command.validateFor(authority);
             break :blk @splat(0);
         };

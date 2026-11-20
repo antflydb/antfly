@@ -842,13 +842,19 @@ pub const Command = struct {
     /// Owned transport bytes, never a committed-entry receipt. Keeping the
     /// large immutable inputs raw avoids a JSON/base64 copy at the ABI edge.
     pub fn encodeRaft(self: @This(), a: A) ![]u8 {
+        return self.encodeRaftWithAdmission(a, null);
+    }
+
+    pub fn encodeRaftWithAdmission(self: @This(), a: A, admission: anytype) ![]u8 {
         try self.validateFor(.raft);
         var buffer: [max_header]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);
         try std.json.Stringify.value(CommandDescriptor{ .binding = self.binding, .action = self.action }, .{}, &writer);
         const metadata = writer.buffered();
         if (self.payload.len > max_input_bytes) return error.InvalidSchemaOwnerControl;
-        const bytes = try a.alloc(u8, 48 + metadata.len + self.payload.len);
+        const frame_size = 48 + metadata.len + self.payload.len;
+        if (comptime @TypeOf(admission) != @TypeOf(null)) try admission.reserve(frame_size);
+        const bytes = try a.alloc(u8, frame_size);
         @memcpy(bytes[0..8], raft_magic);
         std.mem.writeInt(u32, bytes[8..12], @intCast(metadata.len), .little);
         std.mem.writeInt(u32, bytes[12..16], @intCast(self.payload.len), .little);
@@ -861,6 +867,12 @@ pub const Command = struct {
     /// Only payload borrows input. Binding/action are owned fixed values;
     /// canonical descriptor decoding uses bounded stack scratch, not an arena.
     pub fn decodeRaft(bytes: []const u8) !@This() {
+        return (try decodeVerifiedRaft(bytes)).command;
+    }
+
+    pub const VerifiedRaft = struct { command: Command, identity: Digest };
+
+    pub fn decodeVerifiedRaft(bytes: []const u8) !VerifiedRaft {
         if (bytes.len < 48 or bytes.len > max_raft_wire_bytes or !std.mem.eql(u8, bytes[0..8], raft_magic) or
             !eq(hash(bytes[0 .. bytes.len - 32]), bytes[bytes.len - 32 ..][0..32].*)) return error.InvalidSchemaOwnerControl;
         const metadata_len: usize = std.mem.readInt(u32, bytes[8..12], .little);
@@ -876,7 +888,7 @@ pub const Command = struct {
         if (!std.mem.eql(u8, writer.buffered(), bytes[16..][0..metadata_len])) return error.InvalidSchemaOwnerControl;
         const command: @This() = .{ .binding = descriptor.binding, .action = descriptor.action, .payload = bytes[16 + metadata_len ..][0..payload_len] };
         try command.validateFor(.raft);
-        return command;
+        return .{ .command = command, .identity = bytes[bytes.len - 32 ..][0..32].* };
     }
 
     pub fn validate(self: @This()) !void {

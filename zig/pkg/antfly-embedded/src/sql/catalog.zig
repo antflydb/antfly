@@ -1926,7 +1926,6 @@ pub const Backend = struct {
     transaction_start: ?Clock.Instant = null,
     /// Capability for planning is distinct from an execution-owned stamp.
     /// A prepared plan must never retain another transaction's write version.
-    supports_write_versions: bool = false,
     write_version: ?u64 = null,
     /// Value-owned by this statement/cursor. Child adapters copy it unchanged.
     statement_clock: ?Clock.View = null,

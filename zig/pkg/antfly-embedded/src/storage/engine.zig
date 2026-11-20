@@ -302,7 +302,7 @@ pub const VTable = struct {
     verifyTransferablePrimarySnapshotWithOrigin: *const fn (self: *DB, namespace: [24]u8, receipt: ?db.OrderedApplyReceipt, origin: @import("db/native_backup.zig").Origin) Outcome(void),
     prepareSchemaOwnerProposalBytes: *const fn (self: *DB, output: Allocator, descriptor: @import("db/relational_schema_owner_contract.zig").CommandDescriptor, budget: @import("read_session_types").types.values.Budget, context: @import("../api/operation.zig").RequestContext) Outcome(?[]u8),
     executeNativeSchemaOwnerControl: *const fn (self: *DB, command: @import("db/relational_schema_owner_contract.zig").Command, budget: @import("read_session_types").types.values.Budget, context: @import("../api/operation.zig").RequestContext) Outcome(@import("db/relational_schema_owner_contract.zig").NativeOutcome),
-    retainRaftSchemaOwnerPreparation: *const fn (self: *DB, command: @import("db/relational_schema_owner_contract.zig").Command, owner_group: u64, entry: db.OrderedApplyReceipt, context: @import("../api/operation.zig").RequestContext) Outcome(@import("read_session_types").types.contract.Handle),
+    retainRaftSchemaOwnerPreparation: *const fn (self: *DB, command_bytes: []const u8, owner_group: u64, entry: db.OrderedApplyReceipt, context: @import("../api/operation.zig").RequestContext) Outcome(@import("read_session_types").types.contract.Handle),
     sqlMaintenanceJson: *const fn (self: *DB, alloc: Allocator, bytes: []const u8) Outcome([]u8),
     applyReplicatedSchemaOwnerControl: *const fn (self: *DB, record: @import("db/replication_record.zig").RecordView) Outcome(void),
     applyRaftSchemaOwnerCommand: *const fn (self: *DB, command: @import("db/relational_schema_owner_contract.zig").Command, owner_group: u64, entry: db.OrderedApplyReceipt, context: @import("../api/operation.zig").RequestContext) Outcome(void),
@@ -580,7 +580,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 // Schema-owner preparation and commit dispatch through the storage archive.
-pub const descriptor_version: u32 = 64;
+pub const descriptor_version: u32 = 65;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,
@@ -605,6 +605,7 @@ pub const Descriptor = extern struct {
     read_session_release_layout: native.TypeContract,
     read_reader_typed_cells_layout: native.TypeContract,
     read_reader_datum_layout: native.TypeContract,
+    read_reader_datum_kind_layout: native.TypeContract,
     read_numeric_value_layout: native.TypeContract,
     read_numeric_kind_layout: native.TypeContract,
     read_array_value_layout: native.TypeContract,
@@ -801,6 +802,7 @@ pub fn validateDescriptor(descriptor: *const Descriptor) !void {
         !descriptor.read_session_release_layout.matches(read_session_release_layout) or
         !descriptor.read_reader_typed_cells_layout.matches(read_reader_typed_cells_layout) or
         !descriptor.read_reader_datum_layout.matches(read_reader_datum_layout) or
+        !descriptor.read_reader_datum_kind_layout.matches(read_reader_datum_kind_layout) or
         !descriptor.read_numeric_value_layout.matches(read_numeric_value_layout) or
         !descriptor.read_numeric_kind_layout.matches(read_numeric_kind_layout) or
         !descriptor.read_array_value_layout.matches(read_array_value_layout) or
@@ -1038,6 +1040,8 @@ pub const read_reader_datum_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(@import("../sql/catalog.zig").Row.Cell);
 };
+
+pub const read_reader_datum_kind_layout = native.TypeContract.of(@import("../sql/scalar.zig").Datum.ExtensionKind);
 
 pub const read_numeric_value_layout = blk: {
     @setEvalBranchQuota(100_000);

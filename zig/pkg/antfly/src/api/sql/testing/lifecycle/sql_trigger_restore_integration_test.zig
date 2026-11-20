@@ -30,7 +30,13 @@ fn send(ctx: *fixture.Context, path: []const u8, method: http.Method, body: ?[]c
 fn sql(ctx: *fixture.Context, statement: []const u8) !std.json.Parsed(wire.SQLResponse) {
     var authorized = ctx.*;
     authorized.headers = ctx.admin_headers;
-    var response = try client.execute(&authorized, statement, if (std.mem.startsWith(u8, statement, "SELECT")) .read else .never);
+    const retry: client.Retry = if (std.mem.startsWith(u8, statement, "SELECT"))
+        .read
+    else if (std.mem.startsWith(u8, statement, "CREATE "))
+        .write_admission
+    else
+        .never;
+    var response = try client.execute(&authorized, statement, retry);
     defer response.deinit(ctx.alloc);
     errdefer std.debug.print("restore SQL statement={s} status={d} body={s}\n", .{ statement, response.status, response.body });
     try std.testing.expect(response.status == 200 or response.status == 202);
@@ -105,12 +111,15 @@ fn backup(ctx: *fixture.Context, cluster: bool, location: []const u8) !void {
     const body = if (cluster)
         try std.json.Stringify.valueAlloc(ctx.alloc, .{ .backup_id = "cohort", .location = location, .connection = "archive", .format = "native", .table_names = &.{"trigger_source"} }, .{})
     else
-        try std.json.Stringify.valueAlloc(ctx.alloc, .{ .backup_id = "independent", .location = location, .connection = "archive", .format = "portable" }, .{});
+        try std.json.Stringify.valueAlloc(ctx.alloc, .{ .backup_id = "independent", .location = location, .connection = "archive", .format = "native" }, .{});
     defer ctx.alloc.free(body);
-    var response = try send(ctx, path, .POST, body);
+    // Cluster archive creation needs cluster authority. Keep the scoped
+    // durable principal for independent backup and restore authorization.
+    const headers = if (cluster) ctx.headers else ctx.admin_headers;
+    var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, headers, ctx.base, path, .POST, body, 30_000);
     defer response.deinit(ctx.alloc);
     errdefer std.debug.print("restore campaign backup status={d} body={s}\n", .{ response.status, response.body });
-    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expectEqual(@as(u16, if (cluster) 200 else 201), response.status);
     if (cluster) {
         var completed = try std.json.parseFromSlice(struct { status: []const u8, tables: []const struct { name: []const u8, status: []const u8 } }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
         defer completed.deinit();

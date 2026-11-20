@@ -10675,8 +10675,18 @@ pub const DB = struct {
                 return err;
             };
         defer if (prepared) |*value| value.deinit();
-        if (prepared) |*value| return try value.command.encodeRaft(output);
-        return null;
+        const value = if (prepared) |*value| value else return null;
+        const FrameAdmission = struct {
+            memory: ?*resource_manager_mod.BudgetedAllocator,
+            reservation: ?resource_manager_mod.BudgetedAllocator.BorrowedScratch = null,
+
+            pub fn reserve(admission: *@This(), bytes: usize) !void {
+                if (admission.memory) |manager| admission.reservation = try manager.borrowScratch(bytes);
+            }
+        };
+        var admission: FrameAdmission = .{ .memory = if (memory) |*manager| manager else null };
+        defer if (admission.reservation) |*reservation| reservation.release();
+        return try value.command.encodeRaftWithAdmission(output, &admission);
     }
 
     pub fn executeNativeSchemaOwnerControl(self: *DB, command: @import("relational_schema_owner_contract.zig").Command, budget: @import("read_session_types").types.values.Budget, context: @import("../../api/operation.zig").RequestContext) !@import("relational_schema_owner_contract.zig").NativeOutcome {
@@ -10697,8 +10707,11 @@ pub const DB = struct {
         return self.applyPreparedNativeSchemaOwnerControl(&prepared, null);
     }
 
-    pub fn retainRaftSchemaOwnerPreparation(self: *DB, command: @import("relational_schema_owner_contract.zig").Command, owner_group: u64, entry: OrderedApplyReceipt, context: @import("../../api/operation.zig").RequestContext) !@import("read_session_types").types.contract.Handle {
-        if (comptime storage_engine.enabled) return storage_engine.call("retainRaftSchemaOwnerPreparation", .{ self, command, owner_group, entry, context });
+    pub fn retainRaftSchemaOwnerPreparation(self: *DB, command_bytes: []const u8, owner_group: u64, entry: OrderedApplyReceipt, context: @import("../../api/operation.zig").RequestContext) !@import("read_session_types").types.contract.Handle {
+        if (comptime storage_engine.enabled) return storage_engine.call("retainRaftSchemaOwnerPreparation", .{ self, command_bytes, owner_group, entry, context });
+        try context.ensureActive();
+        const verified = try SchemaOwnerControl.Command.decodeVerifiedRaft(command_bytes);
+        const command = verified.command;
         const protocol = @import("read_session_types").types.contract;
         const Purpose = struct {
             db: *DB,
@@ -10724,12 +10737,11 @@ pub const DB = struct {
                 return .{ .value = {} };
             }
         };
-        var prepared = try self.prepareCommittedRaftSchemaOwnerCommand(command, owner_group, entry, context);
+        var prepared = try self.prepareCommittedRaftSchemaOwnerCommandWithIdentity(command, verified.identity, owner_group, entry, context);
         errdefer if (prepared) |*value| value.deinit();
         if (prepared) |*value| value.context = .{};
-        const command_identity = try command.raftIdentity();
         const held = try self.alloc.create(Purpose);
-        held.* = .{ .db = self, .prepared = prepared, .binding = command.binding, .command_identity = command_identity, .owner_group = owner_group, .entry = entry };
+        held.* = .{ .db = self, .prepared = prepared, .binding = command.binding, .command_identity = verified.identity, .owner_group = owner_group, .entry = entry };
         return protocol.Handle.issue(.schema_preparation, held, &Purpose.operations, protocol.Boundary.local_dispatch, &self.alloc);
     }
 
@@ -10891,9 +10903,11 @@ pub const DB = struct {
     /// after checking the actual namespace, owner group and authority domain.
     pub fn applyRaftSchemaOwnerCommand(self: *DB, command: SchemaOwnerControl.Command, owner_group: u64, entry: OrderedApplyReceipt, context: @import("../../api/operation.zig").RequestContext) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("applyRaftSchemaOwnerCommand", .{ self, command, owner_group, entry, context });
-        var prepared = try self.prepareCommittedRaftSchemaOwnerCommand(command, owner_group, entry, context);
+        try context.ensureActive();
+        const identity = try command.raftIdentity();
+        var prepared = try self.prepareCommittedRaftSchemaOwnerCommandWithIdentity(command, identity, owner_group, entry, context);
         defer if (prepared) |*value| value.deinit();
-        try self.applyPreparedRaftSchemaOwnerCommand(if (prepared) |*value| value else null, command.binding, try command.raftIdentity(), owner_group, entry, context);
+        try self.applyPreparedRaftSchemaOwnerCommand(if (prepared) |*value| value else null, command.binding, identity, owner_group, entry, context);
     }
 
     /// Run on the owner control lane, not node progress. A null preparation
@@ -10901,9 +10915,13 @@ pub const DB = struct {
     /// The caller must keep this exact physical owner alive until destruction.
     pub fn prepareCommittedRaftSchemaOwnerCommand(self: *DB, command: SchemaOwnerControl.Command, owner_group: u64, entry: OrderedApplyReceipt, context: @import("../../api/operation.zig").RequestContext) !?SchemaOwnerControl.Prepared {
         try context.ensureActive();
-        const command_identity = try command.raftIdentity();
+        return self.prepareCommittedRaftSchemaOwnerCommandWithIdentity(command, try command.raftIdentity(), owner_group, entry, context);
+    }
+
+    fn prepareCommittedRaftSchemaOwnerCommandWithIdentity(self: *DB, command: SchemaOwnerControl.Command, command_identity: [32]u8, owner_group: u64, entry: OrderedApplyReceipt, context: @import("../../api/operation.zig").RequestContext) !?SchemaOwnerControl.Prepared {
+        try context.ensureActive();
         if (try self.raftSchemaOwnerControlAlreadyApplied(command.binding, owner_group, entry, command_identity)) return null;
-        return SchemaOwnerControl.Prepared.initCommittedRaft(self.alloc, self.core, command, context) catch |err| {
+        return SchemaOwnerControl.Prepared.initCommittedRaft(self.alloc, self.core, .{ .command = command, .identity = command_identity }, context) catch |err| {
             // Another committed apply may have finished while preparation was
             // reading a predecessor. Recovery must inspect durable truth, not
             // turn that completed command into a replayable preparation error.

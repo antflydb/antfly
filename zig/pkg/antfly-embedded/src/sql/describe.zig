@@ -923,9 +923,14 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
         // with internal scan aliases. Subqueries retain their lexical scope.
         if (!relational_returning) returning_backend.statement_ctes = null;
         returning_bound.* = try bindInternal(allocator, returning_backend, &returning_compiled, result.parameter_types);
-        // Only a native owner with a retained transaction stamp can bind new
-        // versions before commit. Never substitute the old version predicate.
-        if (table.storage_mode == .document and compiled.statement != .delete and !backend.supports_write_versions) {
+        // The primary assigns document revisions at commit. A transaction
+        // stamp or preimage cannot supply the new revision during binding.
+        // An INSERT from SELECT can return no rows or fail on a duplicate
+        // without evaluating RETURNING. Keep those results available; the
+        // row-image adapter rejects any actual unassigned version on this path.
+        const may_return_empty_insert = compiled.statement == .insert and
+            compiled.statement.insert.source != null and compiled.statement.insert.values_source_rows.len == 0;
+        if (table.storage_mode == .document and compiled.statement != .delete and !may_return_empty_insert) {
             for (selection.columns) |projection| if (!projection.wildcard and projection.expression == null and table.isDocumentVersion(projection.field)) return error.UnsupportedSqlShape;
             for (returning_bound.scalars.required) |ordinal| if (table.isDocumentVersion(returning_bound.scalars.columns[ordinal].name)) return error.UnsupportedSqlShape;
         }
