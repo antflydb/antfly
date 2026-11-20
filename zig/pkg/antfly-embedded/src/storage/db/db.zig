@@ -46899,7 +46899,7 @@ pub const DB = struct {
         }
         const lower = [_]u8{internal_keys.user_namespace};
         const upper = [_]u8{internal_keys.user_namespace + 1};
-        try self.core.store.scanDocumentRowsReadTxnWithContext(&read, &lower, &upper, &stream, Scan.checkpoint, Scan.collect);
+        try self.core.store.scanStoredDocumentRowsReadTxnWithContext(&read, &lower, &upper, false, &stream, Scan.checkpoint, Scan.collect);
         try stream.flush();
         if (duration == 0 and stream.complete_forward) {
             if (generation) |at| {
@@ -48942,8 +48942,35 @@ pub const DB = struct {
             }
             if (options.require_complete_primary_population and !options.hasCompletePrimaryKeyScope()) {
                 if (try self.scanSmallOrderedScope(options)) return;
-                if (try self.scanLargeOrderedScope(options)) return;
-                try self.scanSourcePopulation(options);
+                var remaining = options;
+                var prefix_scan: SourcePrefix = .{};
+                defer prefix_scan.last_key.deinit(alloc);
+                if (options.stop_after_accepted) |page| {
+                    const scope_size = if (options.constraints) |constraints| scope: {
+                        if (!constraints.positive_filter) break :scope 0;
+                        const count = if (constraints.primary_include_compact)
+                            constraints.primary_include.estimatedCardinality() orelse 0
+                        else
+                            constraints.filter_doc_nums.len;
+                        break :scope count +| (constraints.legacy_filter.estimatedCardinality() orelse 0);
+                    } else 0;
+                    // Probe a bounded prefix when a small page starts at a
+                    // cursor. Sparse scopes can still sort their remainder.
+                    if ((options.primary_key_start_after != null or options.primary_key_stop_before != null) and
+                        scope_size >= 1024 and page <= 256 and page *| 16 < scope_size)
+                    {
+                        prefix_scan.limit = @min(@max(page *| 8, 64), 512);
+                        if (try self.scanSourcePrefix(options, &prefix_scan)) return;
+                        if (prefix_scan.has_key) {
+                            if (options.primary_key_reverse)
+                                remaining.primary_key_stop_before = prefix_scan.last_key.items
+                            else
+                                remaining.primary_key_start_after = prefix_scan.last_key.items;
+                        }
+                    }
+                }
+                if (try self.scanLargeOrderedScope(remaining)) return;
+                try self.scanSourcePopulation(remaining);
                 return;
             }
             // Explicit historical reads still need identities deleted since
@@ -49112,7 +49139,7 @@ pub const DB = struct {
                     try db_query_search.checkSearchRequestDeadline(source_scan.req);
                 }
             };
-            var manager = try spill.admitSearchSpill(self.alloc, std.Io.Threaded.global_single_threaded.io(), self, Check.run);
+            var manager = spill.initSearchSpill(self.alloc, std.Io.Threaded.global_single_threaded.io(), self, Check.run);
             defer manager.deinit();
             var ordered = spill.Sort.init(self.alloc, &manager, &.{.{ .descending = options.primary_key_reverse }}, 512 * 1024);
             defer ordered.deinit();
@@ -49234,6 +49261,17 @@ pub const DB = struct {
         }
 
         fn scanSourcePopulation(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !void {
+            _ = try self.scanSourcePrefix(options, null);
+        }
+
+        const SourcePrefix = struct {
+            limit: usize = 0,
+            has_key: bool = false,
+            last_key: std.ArrayListUnmanaged(u8) = .empty,
+        };
+
+        /// Returns true when the source range or the visitor is exhausted.
+        fn scanSourcePrefix(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions, prefix: ?*SourcePrefix) !bool {
             const Scan = struct {
                 owner: *PrimaryMatchAllIdentityScan,
                 arena: std.heap.ArenaAllocator,
@@ -49242,11 +49280,21 @@ pub const DB = struct {
                 batch_size: usize,
                 ttl_duration: u64,
                 now: u64,
+                prefix: ?*SourcePrefix,
+                examined: usize = 0,
+                exhausted_budget: bool = false,
 
                 fn checkpoint(raw: ?*anyopaque, _: []const u8) !docstore_mod.DocStore.ScanAction {
                     const source_batch: *@This() = @ptrCast(@alignCast(raw.?));
-                    if (source_batch.owner.observed_rows) |count| count.* += 1;
                     try db_query_search.checkSearchRequestDeadline(source_batch.owner.req);
+                    if (source_batch.prefix) |bound| {
+                        if (source_batch.examined == bound.limit) {
+                            source_batch.exhausted_budget = true;
+                            return .stop;
+                        }
+                        source_batch.examined += 1;
+                    }
+                    if (source_batch.owner.observed_rows) |count| count.* += 1;
                     return .@"continue";
                 }
 
@@ -49254,6 +49302,11 @@ pub const DB = struct {
                     const source_batch: *@This() = @ptrCast(@alignCast(raw.?));
                     try db_query_search.checkSearchRequestDeadline(source_batch.owner.req);
                     const id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(source_batch.arena.allocator(), key)) orelse return .@"continue";
+                    if (source_batch.prefix) |bound| {
+                        bound.last_key.clearRetainingCapacity();
+                        try bound.last_key.appendSlice(source_batch.owner.alloc, id);
+                        bound.has_key = true;
+                    }
                     source_batch.keys[source_batch.len] = id;
                     source_batch.len += 1;
                     return if (source_batch.len == source_batch.batch_size) source_batch.flush() else .@"continue";
@@ -49300,16 +49353,16 @@ pub const DB = struct {
             const owner_range = self.db.core.byteRange();
             const after = options.primary_key_start_after;
             const start = if (after != null and owner_range.contains(after.?)) after.? else owner_range.start;
-            if (after) |key| if (owner_range.end.len != 0 and std.mem.order(u8, key, owner_range.end) != .lt) return;
+            if (after) |key| if (owner_range.end.len != 0 and std.mem.order(u8, key, owner_range.end) != .lt) return true;
             const lower = if (after != null and std.mem.eql(u8, start, after.?)) exact: {
-                const prefix = try internal_keys.documentExactPrefixAlloc(self.alloc, start);
-                prefix[prefix.len - 1] = 1;
-                break :exact prefix;
+                const encoded = try internal_keys.documentExactPrefixAlloc(self.alloc, start);
+                encoded[encoded.len - 1] = 1;
+                break :exact encoded;
             } else try internal_keys.documentRangeLowerAlloc(self.alloc, start);
             defer self.alloc.free(lower);
             const before = options.primary_key_stop_before;
             const end = if (before) |key| if (owner_range.end.len == 0 or std.mem.order(u8, key, owner_range.end) == .lt) key else owner_range.end else owner_range.end;
-            if (before) |key| if (std.mem.order(u8, key, owner_range.start) != .gt) return;
+            if (before) |key| if (std.mem.order(u8, key, owner_range.start) != .gt) return true;
             const upper = if (end.len == 0) null else try internal_keys.documentRangeLowerAlloc(self.alloc, end);
             defer if (upper) |bound| self.alloc.free(bound);
             var source_batch = Scan{
@@ -49317,6 +49370,7 @@ pub const DB = struct {
                 .arena = std.heap.ArenaAllocator.init(self.alloc),
                 .ttl_duration = ttlDurationNs(self.db),
                 .now = currentTimeNs(),
+                .prefix = prefix,
                 .batch_size = @min(@max(options.scan_batch_size orelse 256, 1), 256),
             };
             defer source_batch.arena.deinit();
@@ -49324,6 +49378,7 @@ pub const DB = struct {
             defer txn.abort();
             try self.db.core.store.scanStoredDocumentRowsReadTxnWithContext(&txn, lower, upper orelse &.{}, options.primary_key_reverse, &source_batch, Scan.checkpoint, Scan.visit);
             if (!self.stopped) _ = try source_batch.flush();
+            return self.stopped or !source_batch.exhausted_budget;
         }
 
         fn scanExactScope(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !void {
@@ -157771,6 +157826,84 @@ test "optional numeric range prefilters dense search without a text index" {
         try std.testing.expectEqual(@as(usize, 1), result.result.hits.len);
         try std.testing.expectEqualStrings("b", result.result.hits[0].id);
         try std.testing.expectEqual(@as(u64, 1), result.profile.native_filter_candidate_count);
+    }
+}
+
+test "optional numeric range cold relational scope and ordered cursor prefix handoff" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("range-relational-ordered-prefix");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchema(.{
+        .version = 1,
+        .storage_mode = .relational,
+        .relational_columns = &.{.{ .name = "rank", .path = "rank", .column_type = .integer }},
+    });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var writes: [80]types.BatchWrite = undefined;
+    for (&writes, 0..) |*write, i| write.* = .{
+        .key = try std.fmt.allocPrint(scratch, "k{d:0>3}", .{i}),
+        .value = try std.fmt.allocPrint(scratch, "{{\"rank\":{d}}}", .{i}),
+    };
+    try db.batch(.{ .writes = &writes });
+    var endpoints: [2]doc_set.DocOrdinal = undefined;
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const key = writes[0].key;
+        try std.testing.expect(!try txn.contains(try internal_keys.documentKeyAlloc(scratch, key)));
+        try std.testing.expect(try txn.contains(try internal_keys.relationalRowKeyAlloc(scratch, key)));
+        endpoints = .{
+            (try doc_identity.lookupOrdinalTxn(scratch, &txn, writes[1].key)).?,
+            (try doc_identity.lookupOrdinalTxn(scratch, &txn, writes[78].key)).?,
+        };
+    }
+    const generation = try db.currentIdentityReadGeneration();
+    for (0..2) |_| {
+        var population = (try DB.primaryResidualScopeCallback(&db, a, generation, .{})).?;
+        defer population.deinit(a);
+        try std.testing.expectEqual(@as(?usize, writes.len), population.rows.estimatedCardinality());
+    }
+    var counted = try db_query_search.searchMatchAll(a, .{
+        .limit = 0,
+        .include_stored = false,
+        .identity_read_generation = generation,
+        .filter_query_json = "{\"range\":{\"rank\":{\"gte\":73}}}",
+    }, db.matchAllExecutor());
+    defer counted.deinit();
+    try std.testing.expectEqual(@as(u32, 7), counted.total_hits);
+
+    const Record = struct {
+        expected: []const u8,
+        seen: usize = 0,
+
+        fn consume(raw: ?*anyopaque, candidate: *db_query_search.MatchAllCandidate) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqualStrings(self.expected, candidate.id);
+            self.seen += 1;
+        }
+    };
+    for ([_]bool{ false, true }) |reverse| {
+        for ([_]bool{ false, true }) |near| {
+            const endpoint = @intFromBool(reverse != near);
+            var ordinals: [1024]u32 = undefined;
+            ordinals[0] = endpoints[endpoint];
+            for (ordinals[1..], 0..) |*ordinal, i| ordinal.* = std.math.maxInt(u32) - 1024 + @as(u32, @intCast(i));
+            var record = Record{ .expected = writes[if (endpoint == 0) 1 else 78].key };
+            _ = try DB.streamSearchMatchAllCandidatesCallback(&db, a, .{}, .{
+                .constraints = &.{ .positive_filter = true, .filter_doc_nums = &ordinals },
+                .require_complete_primary_population = true,
+                .primary_key_start_after = if (reverse) null else writes[0].key,
+                .primary_key_stop_before = if (reverse) writes[79].key else null,
+                .primary_key_reverse = reverse,
+                .stop_after_accepted = 1,
+                .scan_batch_size = 1,
+            }, &record, Record.consume);
+            try std.testing.expectEqual(@as(usize, 1), record.seen);
+        }
     }
 }
 

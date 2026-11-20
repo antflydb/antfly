@@ -1451,6 +1451,16 @@ test "optional numeric range large forward-only ordinal run retains admitted nav
         try std.testing.expectEqual(pairs, projection.ordinal_cache[0].?.pairs.ptr);
     }
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.graph_predicate_cache).used_bytes);
+    {
+        var projection: IndexSnapshot.SortOrdinalBatchProjection = .{ .spill_disabled = true };
+        defer projection.deinit(a);
+        try projection.ensureSegments(a, snapshot.segments.len);
+        const large_run_rows = 1024 * 1024 + 1;
+        try std.testing.expect(projection.cacheOrdinals(a, snapshot, 0, large_run_rows));
+        try std.testing.expectEqual(@as(usize, large_run_rows), projection.ordinal_cache[0].?.pairs.len);
+        try std.testing.expectEqual(@as(u64, large_run_rows * @sizeOf(u64)), manager.sliceStats(.graph_predicate_cache).used_bytes);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.graph_predicate_cache).used_bytes);
 }
 
 test "graph predicate cache clones outside locks and pins evicted membership" {
@@ -2962,7 +2972,6 @@ pub const IndexSnapshot = struct {
     /// reuse admitted legacy ordinal navigation across candidate batches.
     pub const SortOrdinalBatchProjection = struct {
         const inline_ordinal_limit = 4096;
-        const max_cached_ordinals = 1024 * 1024;
         const CachedOrdinals = struct {
             pairs: []u64,
             used: usize = 0,
@@ -3168,7 +3177,7 @@ pub const IndexSnapshot = struct {
                         if (!self.disableSpill(err)) return err;
                     }
                 }
-                const cache_segment = try self.cacheOrdinals(alloc, snapshot, i, segment.reader.doc_count);
+                const cache_segment = self.cacheOrdinals(alloc, snapshot, i, segment.reader.doc_count);
                 const cache = if (cache_segment) &self.ordinal_cache[i].? else null;
                 if (!cache_segment and wanted.count() == 0) {
                     try wanted.ensureTotalCapacity(alloc, @intCast(sorted.len));
@@ -3209,8 +3218,7 @@ pub const IndexSnapshot = struct {
             return out;
         }
 
-        fn cacheOrdinals(self: *@This(), alloc: Allocator, snapshot: *IndexSnapshot, index: usize, rows: u32) !bool {
-            if (rows > max_cached_ordinals -| self.cached_ordinal_count) return false;
+        fn cacheOrdinals(self: *@This(), alloc: Allocator, snapshot: *IndexSnapshot, index: usize, rows: u32) bool {
             var reservation: ?resource_manager_mod.Reservation = null;
             if (rows > inline_ordinal_limit -| self.cached_ordinal_count) {
                 const manager = snapshot.graph_predicates.manager.load(.acquire) orelse return false;
@@ -3263,7 +3271,7 @@ pub const IndexSnapshot = struct {
             @memset(self.key_ranges, null);
         }
 
-        fn spillManager(self: *@This(), alloc: Allocator, snapshot: *const IndexSnapshot, control: query_mod.ExecutionControl) !*spill.Manager {
+        fn spillManager(self: *@This(), alloc: Allocator, snapshot: *const IndexSnapshot, control: query_mod.ExecutionControl) *spill.Manager {
             const Check = struct {
                 fn run(raw: *anyopaque) !void {
                     const projection: *SortOrdinalBatchProjection = @ptrCast(@alignCast(raw));
@@ -3272,7 +3280,7 @@ pub const IndexSnapshot = struct {
             };
             if (self.spill_manager == null) {
                 self.spill_control = control;
-                self.spill_manager = try spill.admitSearchSpill(
+                self.spill_manager = spill.initSearchSpill(
                     alloc,
                     snapshot.read_context_io orelse std.Io.Threaded.global_single_threaded.io(),
                     self,
@@ -3283,7 +3291,7 @@ pub const IndexSnapshot = struct {
         }
 
         fn buildOrdinalSpill(self: *@This(), alloc: Allocator, snapshot: *const IndexSnapshot, entry: *const SegmentEntry, offset: u32, control: query_mod.ExecutionControl) !SpillRange {
-            const manager = try self.spillManager(alloc, snapshot, control);
+            const manager = self.spillManager(alloc, snapshot, control);
             var sorter = spill.Sort.init(alloc, manager, &.{.{}}, 512 * 1024);
             defer sorter.deinit();
             var cursor = try segment_mod.DocOrdinalCursor.init(&entry.reader);
@@ -3346,7 +3354,7 @@ pub const IndexSnapshot = struct {
         }
 
         fn buildKeySpill(self: *@This(), alloc: Allocator, snapshot: *const IndexSnapshot, entry: *const SegmentEntry, offset: u32, control: query_mod.ExecutionControl) !KeyRun {
-            const manager = try self.spillManager(alloc, snapshot, control);
+            const manager = self.spillManager(alloc, snapshot, control);
             var sorter = spill.Sort.init(alloc, manager, &.{.{}}, 512 * 1024);
             defer sorter.deinit();
             var scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);

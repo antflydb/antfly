@@ -11086,17 +11086,7 @@ const IndexedPredicateEvaluator = struct {
                 },
                 else => return err,
             };
-            const exact = exact: {
-                if (entry.liveDocCount() == 0 or witness == null or witness == .projected) break :exact false;
-                if (witness == .empty) break :exact true;
-                if ((physical != null or self.control.cancellation != null or self.control.deadline_ns != null) and
-                    !entry.reader.hasCheapTypedNavigation(field))
-                {
-                    complete = false;
-                    break :exact false;
-                }
-                break :exact true;
-            };
+            const exact = entry.liveDocCount() != 0 and witness != null and witness != .projected;
             var pending = roaring.RoaringBitmap.init(self.alloc);
             defer pending.deinit();
             if (physical_it) |*iter| {
@@ -11107,9 +11097,16 @@ const IndexedPredicateEvaluator = struct {
                 }
             }
             if (!exact) continue;
+            const use_points = physical != null and pending.cardinality() *| 8 <= entry.reader.doc_count;
+            if (witness != .empty and (use_points or self.control.cancellation != null or self.control.deadline_ns != null) and
+                !entry.reader.hasCheapTypedNavigation(field))
+            {
+                complete = false;
+                continue;
+            }
             var matches = (if (witness == .empty)
                 roaring.RoaringBitmap.init(self.alloc)
-            else if (physical != null)
+            else if (use_points)
                 filter.executeWithinScope(self.alloc, entry, base, &pending, self.control)
             else
                 filter.executeWithOffset(self.alloc, entry, base)) catch |err| switch (err) {
@@ -11120,6 +11117,7 @@ const IndexedPredicateEvaluator = struct {
                 else => return err,
             };
             defer matches.deinit();
+            if (physical != null and !use_points) matches.andWith(&pending);
             var deleted = deleted: {
                 try entry.shared.lockDeletionSharedWithControl(self.control);
                 defer entry.shared.unlockDeletionShared();
@@ -11191,7 +11189,15 @@ const IndexedPredicateEvaluator = struct {
     }
 
     fn rangeEvidence(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap) !RangeEvidence {
-        if (self.key_domain != null) return self.collectRangeEvidence(query, null, true);
+        if (self.key_domain != null) {
+            if (self.probe_input == null) return RangeEvidence.init(self.alloc);
+            var physical = self.collectPhysicalProbeScope(scope) catch |err| switch (err) {
+                error.OutOfMemory => return RangeEvidence.init(self.alloc),
+                else => return err,
+            };
+            defer physical.deinit();
+            return self.collectRangeEvidence(query, &physical, true);
+        }
         const cache = &self.snapshot.graph_predicates;
         const coverage_key = try std.fmt.allocPrint(self.scratch, "range-field:{s}:{s}", .{ self.presence_cache_prefix orelse self.cache_prefix, query.numeric_range.field });
         const prefix = self.presence_cache_prefix orelse self.cache_prefix;
@@ -12112,7 +12118,9 @@ fn collectMixedStructuredFilterAlloc(
     var probe_input: IndexedPredicateEvaluator.FrontierProbeInput = .{};
     defer probe_input.deinit(alloc);
     // The finite domain can drive both residual reads and selective indexed probes.
-    if (finite and user_matcher.key_domain == null) {
+    if (user_matcher.key_domain != null) {
+        user_matcher.probe_input = &probe_input;
+    } else if (finite) {
         const resolve = executor.resolve_doc_set_doc_ids.?;
         const scoped = doc_set.ResolvedDocSet{ .ordinal_bitmap = domain };
         if (domain.cardinality() *| 16 <= snapshot.filterPhysicalDocCount()) {
