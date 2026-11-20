@@ -1395,6 +1395,37 @@ fn patternLegacyMembershipAlloc(
     return membership;
 }
 
+const PatternParentMemo = struct {
+    const Key = struct { hit: []const u8, document: []const u8 };
+    const Context = struct {
+        pub fn hash(_: @This(), key: Key) u64 {
+            return std.hash.Wyhash.hash(std.hash.Wyhash.hash(0, key.hit), key.document);
+        }
+        pub fn eql(_: @This(), a: Key, b: Key) bool {
+            return std.mem.eql(u8, a.hit, b.hit) and std.mem.eql(u8, a.document, b.document);
+        }
+    };
+    parents: std.HashMapUnmanaged(Key, ?[]u8, Context, 80) = .empty,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        var values = self.parents.valueIterator();
+        while (values.next()) |value| if (value.*) |parent| alloc.free(parent);
+        self.parents.deinit(alloc);
+    }
+
+    fn get(self: *@This(), alloc: Allocator, executor: StoredPatternFilterExecutor, hit: types.SearchHit) !?[]const u8 {
+        const key = Key{ .hit = hit.id, .document = if (hit.artifact_ref) |artifact| artifact.document_id else "" };
+        if (self.parents.get(key)) |value| return value;
+        const parent = executor.resolve_parent_id.?(executor.ctx, alloc, hit) catch |err| switch (err) {
+            error.InvalidChunkArtifact, error.StoredDocMissing => null,
+            else => return err,
+        };
+        errdefer if (parent) |id| alloc.free(id);
+        try self.parents.put(alloc, key, parent);
+        return parent;
+    }
+};
+
 fn resolvePatternDocIdsAlloc(
     alloc: Allocator,
     set: *const doc_set.ResolvedDocSet,
@@ -1402,14 +1433,14 @@ fn resolvePatternDocIdsAlloc(
     hits: []const types.SearchHit,
     generation: ?u64,
     executor: StoredPatternFilterExecutor,
-    parent_aware: bool,
+    parents: ?*PatternParentMemo,
     control: @import("../../../search/query.zig").ExecutionControl,
 ) !ResolvedPatternDocIds {
     return switch (set.*) {
         .all => .{ .all = true },
         .none => .{ .active = true },
         .doc_keys => |keys| .{ .ids = keys, .active = true },
-        .ordinals, .ordinal_bitmap => try resolvePatternOrdinalHitsAlloc(alloc, set, legacy, hits, generation, executor, parent_aware, control),
+        .ordinals, .ordinal_bitmap => try resolvePatternOrdinalHitsAlloc(alloc, set, legacy, hits, generation, executor, parents, control),
     };
 }
 
@@ -1420,7 +1451,7 @@ fn resolvePatternOrdinalHitsAlloc(
     hits: []const types.SearchHit,
     generation: ?u64,
     executor: StoredPatternFilterExecutor,
-    parent_aware: bool,
+    parents: ?*PatternParentMemo,
     control: @import("../../../search/query.zig").ExecutionControl,
 ) !ResolvedPatternDocIds {
     if (allHitsHaveDocOrdinals(hits)) return .{ .borrowed_ordinal_set = set, .active = true };
@@ -1437,10 +1468,7 @@ fn resolvePatternOrdinalHitsAlloc(
     for (hits) |hit| {
         try control.check();
         if (hit.doc_ordinal != null) continue;
-        const parent = if (parent_aware) executor.resolve_parent_id.?(executor.ctx, temp, hit) catch |err| switch (err) {
-            error.InvalidChunkArtifact, error.StoredDocMissing => null,
-            else => return err,
-        } else null;
+        const parent = if (parents) |memo| try memo.get(alloc, executor, hit) else null;
         const key = parent orelse hit.id;
         if (legacy.contains(key)) continue;
         if (executor.resolve_doc_ids_to_doc_set) |resolve| {
@@ -1567,7 +1595,7 @@ fn loadParentStoredForGroupedHits(
 
 // Verification over an exact, bounded key set is not table enumeration. Check
 // the actual result identities too; a bare result-size limit is not a proof.
-fn storedValueVerificationInput(req: types.SearchRequest, hits: []const types.SearchHit) graph_exec.CompiledPatternFilter.VerificationInput {
+fn storedValueVerificationInput(req: types.SearchRequest, hits: []const types.SearchHit, keep: []const bool) graph_exec.CompiledPatternFilter.VerificationInput {
     var single: [1][]const u8 = undefined;
     const keys = if (req.value_search_candidate_keys.len != 0)
         req.value_search_candidate_keys
@@ -1578,8 +1606,12 @@ fn storedValueVerificationInput(req: types.SearchRequest, hits: []const types.Se
         single[0] = children.parent_id;
         break :blk if (children.parent_ids.len != 0) children.parent_ids else &single;
     } else return .scan;
-    if (keys.len > types.max_canonical_hierarchy_groups or hits.len > keys.len) return .scan;
-    for (hits) |hit| {
+    if (keys.len > types.max_canonical_hierarchy_groups) return .scan;
+    var count: usize = 0;
+    for (hits, keep) |hit, survives| {
+        if (!survives) continue;
+        count += 1;
+        if (count > keys.len) return .scan;
         const included = for (keys) |key| {
             if (std.mem.eql(u8, hit.id, key)) break true;
         } else false;
@@ -1601,6 +1633,9 @@ pub fn applyStoredSearchPatternFilters(
 
     const member_mode = req.return_mode == .member or req.return_mode == .chunk;
     const parent_aware = member_mode and executor.resolve_parent_id != null and executor.load_parent_stored != null;
+
+    var parents: PatternParentMemo = .{};
+    defer parents.deinit(alloc);
 
     const control = @import("../../../search/query.zig").ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
     var include_keys: std.StringHashMapUnmanaged(void) = .empty;
@@ -1660,11 +1695,13 @@ pub fn applyStoredSearchPatternFilters(
                 if (candidate_len == 0) break;
                 const operand = gate.operand orelse continue;
                 const key_only = operand.* != .ordinals and operand.* != .ordinal_bitmap;
-                if (!cheap and key_only) continue;
+                if ((!cheap and key_only) or
+                    (!gate.exclude and operand.* == .all) or
+                    (gate.exclude and operand.* == .none and gate.legacy.count() == 0)) continue;
                 var resolved = if (cheap and !key_only)
                     ResolvedPatternDocIds{ .borrowed_ordinal_set = operand, .active = true }
                 else
-                    try resolvePatternDocIdsAlloc(alloc, operand, gate.legacy, candidates[0..candidate_len], req.identity_read_generation, executor, gate.shared and parent_aware, control);
+                    try resolvePatternDocIdsAlloc(alloc, operand, gate.legacy, candidates[0..candidate_len], req.identity_read_generation, executor, if (gate.shared and parent_aware) &parents else null, control);
                 defer resolved.deinit(alloc);
                 var surviving: usize = 0;
                 for (candidates[0..candidate_len], indexes[0..candidate_len]) |hit, index| {
@@ -1675,11 +1712,8 @@ pub fn applyStoredSearchPatternFilters(
                         surviving += 1;
                         continue;
                     }
-                    const parent = if (gate.shared and parent_aware) executor.resolve_parent_id.?(executor.ctx, alloc, hit) catch |err| switch (err) {
-                        error.InvalidChunkArtifact, error.StoredDocMissing => null,
-                        else => return err,
-                    } else null;
-                    defer if (parent) |key| alloc.free(key);
+                    const needs_parent = gate.shared and parent_aware and (key_only or gate.legacy.count() != 0);
+                    const parent = if (needs_parent) try parents.get(alloc, executor, hit) else null;
                     const match_id = parent orelse hit.id;
                     const matches = resolved.all or if (gate.shared)
                         gate.legacy.contains(match_id) or
@@ -1729,9 +1763,11 @@ pub fn applyStoredSearchPatternFilters(
     var local_value_work: @import("../../../search/value_query.zig").Work = .{};
     defer local_value_work.deinit(alloc);
     const value_work = req.value_search_work orelse &local_value_work;
-    const verification_input = storedValueVerificationInput(req, result.hits);
-    if (compiled_filter) |compiled| try compiled.bindValueWork(value_work, req.value_search_execution, verification_input);
-    if (compiled_exclusion) |compiled| try compiled.bindValueWork(value_work, req.value_search_execution, verification_input);
+    if (std.mem.indexOfScalar(bool, keep_hits, true) != null) {
+        const verification_input = storedValueVerificationInput(req, result.hits, keep_hits);
+        if (compiled_filter) |compiled| try compiled.bindValueWork(value_work, req.value_search_execution, verification_input);
+        if (compiled_exclusion) |compiled| try compiled.bindValueWork(value_work, req.value_search_execution, verification_input);
+    }
 
     const logical_verification = (if (compiled_filter) |compiled| compiled.hasLogicalValues() else false) or
         (if (compiled_exclusion) |compiled| compiled.hasLogicalValues() else false);
@@ -1802,11 +1838,7 @@ pub fn applyStoredSearchPatternFilters(
         } else null;
         const parsed_stored = if (needs_stored) blk: {
             const maybe_stored: ?[]u8 = if (parent_aware) pblk: {
-                const parent_id = executor.resolve_parent_id.?(executor.ctx, alloc, hit) catch |err| switch (err) {
-                    error.InvalidChunkArtifact, error.StoredDocMissing => break :pblk null,
-                    else => return err,
-                };
-                defer alloc.free(parent_id);
+                const parent_id = (try parents.get(alloc, executor, hit)) orelse break :pblk null;
                 if (parent_stored_cache.get(parent_id)) |cached| break :pblk cached;
                 const loaded = try executor.load_parent_stored.?(executor.ctx, alloc, unprojected_parent_req, parent_id);
                 errdefer if (loaded) |bytes| alloc.free(bytes);
@@ -1845,13 +1877,10 @@ pub fn applyStoredSearchPatternFilters(
         // lowerTextQueryToStoredPatternValueAlloc) must match the resolved
         // parent id, not the chunk's own hit.id, or it silently matches
         // nothing (PR #957 review blocker 6).
-        const resolved_match_parent_id: ?[]u8 = if (parent_aware) pidblk: {
-            break :pidblk executor.resolve_parent_id.?(executor.ctx, alloc, hit) catch |err| switch (err) {
-                error.InvalidChunkArtifact, error.StoredDocMissing => break :pidblk null,
-                else => return err,
-            };
-        } else null;
-        defer if (resolved_match_parent_id) |parent_id| alloc.free(parent_id);
+        const resolved_match_parent_id = if (parent_aware and (compiled_filter != null or compiled_exclusion != null))
+            try parents.get(alloc, executor, hit)
+        else
+            null;
         const match_id: []const u8 = resolved_match_parent_id orelse hit.id;
 
         var keep = true;
@@ -2541,7 +2570,7 @@ test "optional numeric range result membership keeps exceptional keys without re
         .load_stored = TestStoredLoader.loadStored,
         .resolve_doc_set_doc_ids = Harness.failReverse,
         .resolve_doc_ids_to_doc_set = Harness.resolve,
-    }, false, .{});
+    }, null, .{});
     defer resolved.deinit(alloc);
     try std.testing.expect(resolvedPatternContainsHit(resolved, hits[1]));
     try std.testing.expect(resolvedPatternContainsHit(resolved, hits[2]));
@@ -4025,10 +4054,11 @@ test "native member value verification retains scan policy and work budgets" {
             return error.TestUnexpectedLoad;
         }
     };
-    for ([_]enum { keys, provenance, parent, unbounded, outside, budget }{ .keys, .provenance, .parent, .unbounded, .outside, .budget }) |mode| {
-        const hits = try alloc.alloc(types.SearchHit, 1);
+    for ([_]enum { keys, provenance, parent, unbounded, outside, survivors, budget }{ .keys, .provenance, .parent, .unbounded, .outside, .survivors, .budget }) |mode| {
+        const hits = try alloc.alloc(types.SearchHit, if (mode == .survivors) 2 else 1);
         hits[0] = .{ .id = try alloc.dupe(u8, if (mode == .outside) "outside" else "doc"), .stored_data = try alloc.dupe(u8, "{\"source_id\":\"selected\"}") };
-        var result: types.SearchResult = .{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+        if (mode == .survivors) hits[1] = .{ .id = try alloc.dupe(u8, "outside") };
+        var result: types.SearchResult = .{ .alloc = alloc, .hits = hits, .total_hits = @intCast(hits.len) };
         defer result.deinit();
         var req: types.SearchRequest = .{ .filter_query_json = "{\"value\":{\"kind\":\"equals\",\"field\":\"source_id\",\"text\":\"selected\"}}" };
         if (mode == .provenance) {
@@ -4042,13 +4072,13 @@ test "native member value verification retains scan policy and work budgets" {
         }
         if (mode == .budget) req.value_search_execution.max_bytes = 1;
         const executor: StoredPatternFilterExecutor = .{ .ctx = null, .load_stored = Loader.unused };
-        if (mode == .unbounded or mode == .outside) {
+        if (mode == .unbounded) {
             try std.testing.expectError(error.ValueSearchRequiresScan, applyStoredSearchPatternFilters(alloc, req, result, executor));
         } else if (mode == .budget) {
             try std.testing.expectError(error.ValueSearchLimitExceeded, applyStoredSearchPatternFilters(alloc, req, result, executor));
         } else {
             result = try applyStoredSearchPatternFilters(alloc, req, result, executor);
-            try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+            try std.testing.expectEqual(@as(usize, if (mode == .outside) 0 else 1), result.hits.len);
         }
         try std.testing.expect(!req.value_search_execution.allow_scan);
     }

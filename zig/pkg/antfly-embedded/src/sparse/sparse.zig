@@ -5798,7 +5798,7 @@ pub const SparseIndex = struct {
         alloc: Allocator,
         txn: anytype,
         doc_ids: []const []const u8,
-        deferred_keys: ?*std.StringHashMapUnmanaged(void),
+        deferred_keys: ?struct { keys: *std.StringHashMapUnmanaged(void), allocator: Allocator },
         control: @import("../search/query.zig").ExecutionControl,
     ) ![]const u32 {
         if (doc_ids.len == 0) return &.{};
@@ -5814,27 +5814,14 @@ pub const SparseIndex = struct {
             try control.check();
             const gop = try wanted.getOrPut(alloc, doc_id);
             if (gop.found_existing) continue;
-            var key_buf: [256]u8 = undefined;
-            const forward_key = try fwdKeyWithScratch(alloc, &key_buf, doc_id);
-            defer if (forward_key.ptr != &key_buf) alloc.free(forward_key);
-            if (txnGet(txn, self.dbi, forward_key)) |fwd_data| {
-                const doc_num_u64 = try decodeFwdDocNum(fwd_data);
-                if (doc_num_u64 <= std.math.maxInt(u32) and !try self.docNumDeletedChecked(txn, doc_num_u64)) {
-                    const doc_num: u32 = @intCast(doc_num_u64);
-                    const seen_gop = try seen.getOrPut(alloc, doc_num);
-                    if (!seen_gop.found_existing) try out.append(alloc, doc_num);
-                }
-                _ = wanted.remove(doc_id);
-            } else |err| {
-                if (err != error.NotFound) return err;
-                if (try readLocator(alloc, txn, doc_id)) |locator| {
-                    if (!try self.docNumDeletedChecked(txn, locator.num)) {
-                        const num = std.math.cast(u32, locator.num) orelse return error.DocNumOverflow;
-                        const found = try seen.getOrPut(alloc, num);
-                        if (!found.found_existing) try out.append(alloc, num);
-                    }
+            switch (try self.lookupProjectionDocNum(alloc, txn, doc_id, complete)) {
+                .needs_scan => {},
+                .absent => _ = wanted.remove(doc_id),
+                .found => |doc_num| {
+                    const slot = try seen.getOrPut(alloc, doc_num);
+                    if (!slot.found_existing) try out.append(alloc, doc_num);
                     _ = wanted.remove(doc_id);
-                } else if (complete) _ = wanted.remove(doc_id);
+                },
             }
         }
         if (wanted.count() == 0) return try out.toOwnedSlice(alloc);
@@ -5843,15 +5830,43 @@ pub const SparseIndex = struct {
             var missing = wanted.keyIterator();
             while (missing.next()) |key| {
                 try control.check();
-                if (deferred.contains(key.*)) continue;
-                const copy = try alloc.dupe(u8, key.*);
-                errdefer alloc.free(copy);
-                try deferred.put(alloc, copy, {});
+                try deferProjectionKey(deferred.allocator, deferred.keys, key.*);
             }
         } else {
-            try self.appendUnmappedDocNums(alloc, txn, &wanted, &seen, &out, control);
+            try self.appendUnmappedDocNums(alloc, txn, &wanted, null, &seen, &out, control);
         }
         return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn deferProjectionKey(alloc: Allocator, deferred: *std.StringHashMapUnmanaged(void), key: []const u8) !void {
+        if (deferred.contains(key)) return;
+        const copy = try alloc.dupe(u8, key);
+        errdefer alloc.free(copy);
+        try deferred.put(alloc, copy, {});
+    }
+
+    pub fn projectionHasCompleteLocatorMap(txn: anytype) !bool {
+        return completeLocatorMap(txn);
+    }
+
+    pub fn lookupProjectionDocNum(self: *SparseIndex, alloc: Allocator, txn: anytype, doc_id: []const u8, complete: bool) !union(enum) {
+        found: u32,
+        absent,
+        needs_scan,
+    } {
+        var key_buf: [256]u8 = undefined;
+        const key = try fwdKeyWithScratch(alloc, &key_buf, doc_id);
+        defer if (key.ptr != &key_buf) alloc.free(key);
+        if (txnGet(txn, self.dbi, key)) |raw| {
+            const number = try decodeFwdDocNum(raw);
+            if (number > std.math.maxInt(u32) or try self.docNumDeletedChecked(txn, number)) return .absent;
+            return .{ .found = @intCast(number) };
+        } else |err| if (err != error.NotFound) return err;
+        if (try readLocator(alloc, txn, doc_id)) |locator| {
+            if (try self.docNumDeletedChecked(txn, locator.num)) return .absent;
+            return .{ .found = std.math.cast(u32, locator.num) orelse return error.DocNumOverflow };
+        }
+        return if (complete) .absent else .needs_scan;
     }
 
     pub fn appendUnmappedDocNums(
@@ -5859,6 +5874,7 @@ pub const SparseIndex = struct {
         alloc: Allocator,
         txn: anytype,
         wanted: *std.StringHashMapUnmanaged(void),
+        owned_key_allocator: ?Allocator,
         seen: *std.AutoHashMapUnmanaged(u32, void),
         out: *std.ArrayListUnmanaged(u32),
         control: @import("../search/query.zig").ExecutionControl,
@@ -5869,6 +5885,7 @@ pub const SparseIndex = struct {
             index: *SparseIndex,
             txn: @TypeOf(txn),
             wanted: *std.StringHashMapUnmanaged(void),
+            owned_key_allocator: ?Allocator,
             seen: *std.AutoHashMapUnmanaged(u32, void),
             out: *std.ArrayListUnmanaged(u32),
             control: @import("../search/query.zig").ExecutionControl,
@@ -5881,13 +5898,12 @@ pub const SparseIndex = struct {
                     const seen_gop = try ctx.seen.getOrPut(ctx.alloc, doc_num);
                     if (!seen_gop.found_existing) try ctx.out.append(ctx.alloc, doc_num);
                 }
-                _ = ctx.wanted.remove(entry.doc_id);
+                const removed = ctx.wanted.fetchRemove(entry.doc_id).?;
+                if (ctx.owned_key_allocator) |key_alloc| key_alloc.free(removed.key);
                 return ctx.wanted.count() == 0;
             }
         };
 
-        var remaining = try wanted.clone(alloc);
-        defer remaining.deinit(alloc);
         var cur = try txn.openCursor();
         defer cur.close();
         var maybe_entry = try cur.seekAtOrAfter(taggedPrefix(key_docmap_segment));
@@ -5898,7 +5914,8 @@ pub const SparseIndex = struct {
                 .alloc = alloc,
                 .index = self,
                 .txn = txn,
-                .wanted = &remaining,
+                .wanted = wanted,
+                .owned_key_allocator = owned_key_allocator,
                 .seen = seen,
                 .out = out,
                 .control = control,

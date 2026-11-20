@@ -212,6 +212,19 @@ const StoredKeyDirectory = struct {
     }
 };
 
+const StoredKeyDirectoryFlight = struct {
+    refs: std.atomic.Value(u32) = .init(1),
+    ready: std.Io.Event = .unset,
+    failure: ?anyerror = null,
+    outcome: std.atomic.Value(Outcome) = .init(.pending),
+
+    const Outcome = enum(u8) { pending, built, unavailable, interrupted, failed };
+
+    fn release(self: *@This(), alloc: Allocator) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) alloc.destroy(self);
+    }
+};
+
 pub const SegmentShared = struct {
     const deletion_writer_bit: u32 = 1 << 31;
 
@@ -224,7 +237,7 @@ pub const SegmentShared = struct {
     residency_mutex: std.atomic.Mutex = .unlocked,
     stored_key_directory_lock: std.atomic.Mutex = .unlocked,
     stored_key_directories: [2]?*StoredKeyDirectory = @splat(null),
-    stored_key_directory_building: [2]bool = @splat(false),
+    stored_key_directory_flights: [2]?*StoredKeyDirectoryFlight = @splat(null),
     stored_key_directory_manager: ?*resource_manager_mod.ResourceManager = null,
     stored_key_directory_reclaimer: u64 = 0,
     // One process-level accounting owner per physical mapping. The manager
@@ -2516,13 +2529,16 @@ pub const IndexSnapshot = struct {
         const shared = segment.shared;
         const mode = @intFromBool(match_parent);
         const slot = &shared.stored_key_directories[mode];
-        const building = &shared.stored_key_directory_building[mode];
+        const flight_slot = &shared.stored_key_directory_flights[mode];
         const room = @as(usize, segment.reader.doc_count) * @sizeOf(StoredKeyDirectory.Entry);
         const manager = self.graph_predicates.manager.load(.acquire);
         if (manager == null and room > 16 * 1024 * 1024) return null;
+        const io: ?std.Io = if (comptime @import("builtin").os.tag == .freestanding)
+            self.read_context_io
+        else
+            self.read_context_io orelse std.Io.Threaded.global_single_threaded.io();
 
-        var waited_for_builder = false;
-        while (true) {
+        const flight = while (true) {
             try control.check();
             if (!shared.stored_key_directory_lock.tryLock()) {
                 spinOrYield();
@@ -2533,15 +2549,26 @@ pub const IndexSnapshot = struct {
                 shared.stored_key_directory_lock.unlock();
                 return directory;
             }
-            if (building.*) {
-                waited_for_builder = true;
+            if (flight_slot.*) |active| {
+                _ = active.refs.fetchAdd(1, .monotonic);
                 shared.stored_key_directory_lock.unlock();
-                spinOrYield();
+                defer active.release(shared.allocator);
+                while (active.outcome.load(.acquire) == .pending) {
+                    try control.check();
+                    if (io) |runtime| {
+                        active.ready.waitTimeout(runtime, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(2) } }) catch |err| switch (err) {
+                            error.Timeout => {},
+                            else => return err,
+                        };
+                    } else spinOrYield();
+                }
+                switch (active.outcome.load(.acquire)) {
+                    .unavailable => return null,
+                    .failed => return active.failure.?,
+                    else => {},
+                }
+                // Interrupted builders leave the next live reader free to retry.
                 continue;
-            }
-            if (waited_for_builder) {
-                shared.stored_key_directory_lock.unlock();
-                return null;
             }
             if (manager) |owner| {
                 if (shared.stored_key_directory_reclaimer == 0) {
@@ -2552,18 +2579,46 @@ pub const IndexSnapshot = struct {
                     shared.stored_key_directory_manager = owner;
                 }
             }
-            building.* = true;
+            const new = shared.allocator.create(StoredKeyDirectoryFlight) catch {
+                shared.stored_key_directory_lock.unlock();
+                return null;
+            };
+            new.* = .{};
+            flight_slot.* = new;
             shared.stored_key_directory_lock.unlock();
-            break;
-        }
+            break new;
+        };
         var directory_out: ?*StoredKeyDirectory = null;
+        var failure: ?anyerror = null;
         defer {
             while (!shared.stored_key_directory_lock.tryLock()) spinOrYield();
             slot.* = directory_out;
-            building.* = false;
+            flight_slot.* = null;
+            flight.failure = failure;
+            const outcome: StoredKeyDirectoryFlight.Outcome = if (directory_out != null) .built else if (failure) |err| switch (err) {
+                error.Canceled, error.Timeout => .interrupted,
+                else => .failed,
+            } else .unavailable;
+            flight.outcome.store(outcome, .release);
             shared.stored_key_directory_lock.unlock();
+            if (io) |runtime| flight.ready.set(runtime);
+            flight.release(shared.allocator);
         }
+        directory_out = buildStoredKeyDirectory(segment, scratch, match_parent, manager, room, control) catch |err| {
+            failure = err;
+            return err;
+        };
+        return directory_out;
+    }
 
+    fn buildStoredKeyDirectory(
+        segment: *const SegmentEntry,
+        scratch: *segment_mod.SegmentReadScratch,
+        match_parent: bool,
+        manager: ?*resource_manager_mod.ResourceManager,
+        room: usize,
+        control: query_mod.ExecutionControl,
+    ) !?*StoredKeyDirectory {
         var reservation: ?resource_manager_mod.Reservation = if (manager) |owner|
             owner.reserveWithoutReclaim(.graph_predicate_cache, room + @sizeOf(StoredKeyDirectory)) catch return null
         else
@@ -2572,7 +2627,7 @@ pub const IndexSnapshot = struct {
         defer if (!published) {
             if (reservation) |*charge| charge.release();
         };
-        const alloc = shared.allocator;
+        const alloc = segment.shared.allocator;
         const entries = alloc.alloc(StoredKeyDirectory.Entry, segment.reader.doc_count) catch return null;
         defer if (!published) alloc.free(entries);
         var used: usize = 0;
@@ -2596,7 +2651,6 @@ pub const IndexSnapshot = struct {
         try control.check();
         const directory = alloc.create(StoredKeyDirectory) catch return null;
         directory.* = .{ .entries = entries, .reservation = reservation, .alloc = alloc };
-        directory_out = directory;
         published = true;
         return directory;
     }

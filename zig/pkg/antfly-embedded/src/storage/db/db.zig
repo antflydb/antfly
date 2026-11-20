@@ -48751,9 +48751,10 @@ pub const DB = struct {
         alloc: Allocator,
         index_name: []const u8,
         keys: []const []const u8,
+        control: db_query_search.QueryExecutionControl,
     ) anyerror![]const u32 {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.index_manager.lookupSparseDocNumsForParentKeysAlloc(alloc, self.core.store, index_name, keys);
+        return try self.core.index_manager.lookupSparseDocNumsForParentKeysControlledAlloc(alloc, self.core.store, index_name, keys, control);
     }
 
     fn sparseDocNumsForOrdinalSetCallback(
@@ -157392,13 +157393,27 @@ test "optional numeric range keeps mixed primary matches for native field sortin
         defer a.free(mixed);
         try text.indexSegment(mixed);
         try std.testing.expect(try text.snapshot().hasDocOrdinalCoverage());
+        const NoPrimaryScan = struct {
+            fn collect(
+                _: ?*anyopaque,
+                _: Allocator,
+                _: types.SearchRequest,
+                _: db_query_search.MatchAllCandidateCollectOptions,
+                _: ?*anyopaque,
+                _: db_query_search.MatchAllCandidateConsumer,
+            ) anyerror!db_query_search.MatchAllCandidateStreamStats {
+                return error.UnexpectedPrimaryScan;
+            }
+        };
+        var executor = db.matchAllExecutor();
+        executor.collect_candidates_stream = NoPrimaryScan.collect;
         var sorted = try db_query_search.searchMatchAll(a, .{
             .index_name = "ft",
             .limit = 2,
             .filter_doc_ids = &.{"mapped"},
             .include_stored = false,
             .order_by = &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } },
-        }, db.matchAllExecutor());
+        }, executor);
         defer sorted.deinit();
         try std.testing.expectEqual(@as(usize, 1), sorted.hits.len);
         try std.testing.expectEqualStrings("mapped", sorted.hits[0].id);

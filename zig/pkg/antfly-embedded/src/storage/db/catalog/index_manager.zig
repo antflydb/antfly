@@ -29636,6 +29636,7 @@ pub const IndexManager = struct {
         set: *const @import("../doc_set.zig").ResolvedDocSet,
         control: @import("../../../search/query.zig").ExecutionControl,
     ) ![]const u32 {
+        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedQueryRequest;
         const entry = self.findSparseIndexEntry(index_name) orelse return error.IndexNotFound;
         try control.check();
         var sparse_txn = try entry.index.beginReadTxn();
@@ -29648,12 +29649,19 @@ pub const IndexManager = struct {
         errdefer out.deinit(alloc);
         var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
         defer seen.deinit(alloc);
+        var miss_budget: ?resource_manager_mod.BudgetedAllocator = if (resource_manager_mod.BudgetedAllocator.fromAllocator(alloc) == null)
+            if (self.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.init(manager, .lsm_read_working_set, alloc, 1) else null
+        else
+            null;
+        defer if (miss_budget) |*budget| budget.deinit();
+        const miss_alloc = if (miss_budget) |*budget| budget.allocator() else alloc;
         var misses: std.StringHashMapUnmanaged(void) = .empty;
         defer {
             var keys = misses.keyIterator();
-            while (keys.next()) |key| alloc.free(key.*);
-            misses.deinit(alloc);
+            while (keys.next()) |key| miss_alloc.free(key.*);
+            misses.deinit(miss_alloc);
         }
+        const locator_complete = try sparse_mod.SparseIndex.projectionHasCompleteLocatorMap(&sparse_txn);
         var ordinal_iter = if (set.* == .ordinal_bitmap) set.ordinal_bitmap.iterator() else null;
         var offset: usize = 0;
         while (true) {
@@ -29694,7 +29702,7 @@ pub const IndexManager = struct {
                     keys[present] = key;
                     present += 1;
                 };
-                const physical = try entry.index.docNumsForDocIdsDeferredAlloc(alloc, &sparse_txn, keys[0..present], &misses, control);
+                const physical = try entry.index.docNumsForDocIdsDeferredAlloc(alloc, &sparse_txn, keys[0..present], .{ .keys = &misses, .allocator = miss_alloc }, control);
                 defer alloc.free(physical);
                 for (physical) |doc_num| {
                     const entry_num = try seen.getOrPut(alloc, doc_num);
@@ -29710,11 +29718,11 @@ pub const IndexManager = struct {
                 };
                 for (values[0..key_count]) |maybe_key| {
                     try control.check();
-                    if (maybe_key) |key| try appendSparseParentProjectionDocNums(alloc, entry, &primary_txn, &sparse_txn, key, &seen, &out);
+                    if (maybe_key) |key| try appendSparseParentProjectionDocNums(alloc, entry, &primary_txn, &sparse_txn, key, &seen, &out, &misses, miss_alloc, locator_complete, control);
                 }
             }
         }
-        try entry.index.appendUnmappedDocNums(alloc, &sparse_txn, &misses, &seen, &out, control);
+        try entry.index.appendUnmappedDocNums(alloc, &sparse_txn, &misses, miss_alloc, &seen, &out, control);
         return try out.toOwnedSlice(alloc);
     }
 
@@ -29725,11 +29733,23 @@ pub const IndexManager = struct {
         index_name: []const u8,
         keys: []const []const u8,
     ) ![]const u32 {
+        return try self.lookupSparseDocNumsForParentKeysControlledAlloc(alloc, store, index_name, keys, .{});
+    }
+
+    pub fn lookupSparseDocNumsForParentKeysControlledAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        keys: []const []const u8,
+        control: @import("../../../search/query.zig").ExecutionControl,
+    ) ![]const u32 {
+        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedQueryRequest;
         const entry = self.findSparseIndexEntry(index_name) orelse return error.IndexNotFound;
         var sparse_txn = try entry.index.beginReadTxn();
         defer sparse_txn.abort();
         if (entry.chunk_name == null and entry.embedding_names.len == 0)
-            return try entry.index.docNumsForDocIdsAlloc(alloc, &sparse_txn, keys);
+            return try entry.index.docNumsForDocIdsDeferredAlloc(alloc, &sparse_txn, keys, null, control);
 
         var primary_txn = try store.beginReadTxn();
         defer primary_txn.abort();
@@ -29737,7 +29757,21 @@ pub const IndexManager = struct {
         errdefer out.deinit(alloc);
         var seen = std.AutoHashMapUnmanaged(u32, void).empty;
         defer seen.deinit(alloc);
+        var miss_budget: ?resource_manager_mod.BudgetedAllocator = if (resource_manager_mod.BudgetedAllocator.fromAllocator(alloc) == null)
+            if (self.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.init(manager, .lsm_read_working_set, alloc, 1) else null
+        else
+            null;
+        defer if (miss_budget) |*budget| budget.deinit();
+        const miss_alloc = if (miss_budget) |*budget| budget.allocator() else alloc;
+        var misses: std.StringHashMapUnmanaged(void) = .empty;
+        defer {
+            var remaining = misses.keyIterator();
+            while (remaining.next()) |key| miss_alloc.free(key.*);
+            misses.deinit(miss_alloc);
+        }
+        const locator_complete = try sparse_mod.SparseIndex.projectionHasCompleteLocatorMap(&sparse_txn);
         for (keys) |key| {
+            try control.check();
             if (internal_keys.isChunkArtifactRecordKey(key)) {
                 if (entry.chunk_name) |name| {
                     if (!internal_keys.matchesChunkArtifactName(key, name)) continue;
@@ -29746,9 +29780,10 @@ pub const IndexManager = struct {
                     var chunks = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, &primary_txn, parent, name);
                     defer chunks.close();
                     while (try chunks.next()) |row| {
+                        try control.check();
                         const order = std.mem.order(u8, row.key, key);
                         if (order == .lt) continue;
-                        if (order == .eq) try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, key, &seen, &out);
+                        if (order == .eq) try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, key, &seen, &out, &misses, miss_alloc, locator_complete, control);
                         break;
                     }
                 }
@@ -29756,11 +29791,12 @@ pub const IndexManager = struct {
             }
             if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
                 if (sparseEmbeddingSourceMatches(entry, key) and try primary_txn.contains(key))
-                    try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, key, &seen, &out);
+                    try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, key, &seen, &out, &misses, miss_alloc, locator_complete, control);
                 continue;
             }
-            try appendSparseParentProjectionDocNums(alloc, entry, &primary_txn, &sparse_txn, key, &seen, &out);
+            try appendSparseParentProjectionDocNums(alloc, entry, &primary_txn, &sparse_txn, key, &seen, &out, &misses, miss_alloc, locator_complete, control);
         }
+        try entry.index.appendUnmappedDocNums(alloc, &sparse_txn, &misses, miss_alloc, &seen, &out, control);
         return try out.toOwnedSlice(alloc);
     }
 
@@ -29772,13 +29808,18 @@ pub const IndexManager = struct {
         parent_doc_id: []const u8,
         seen: *std.AutoHashMapUnmanaged(u32, void),
         out: *std.ArrayListUnmanaged(u32),
+        misses: *std.StringHashMapUnmanaged(void),
+        miss_alloc: Allocator,
+        locator_complete: bool,
+        control: @import("../../../search/query.zig").ExecutionControl,
     ) !void {
         if (entry.embedding_names.len == 0) {
             var chunks = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, primary_txn, parent_doc_id, entry.chunk_name.?);
             defer chunks.close();
             while (try chunks.next()) |row| {
+                try control.check();
                 if (!internal_keys.matchesChunkArtifactName(row.key, entry.chunk_name.?)) continue;
-                try appendSparseProjectionDocNum(alloc, entry, sparse_txn, row.key, seen, out);
+                try appendSparseProjectionDocNum(alloc, entry, sparse_txn, row.key, seen, out, misses, miss_alloc, locator_complete, control);
             }
             return;
         }
@@ -29788,9 +29829,10 @@ pub const IndexManager = struct {
         defer cursor.close();
         var item = try cursor.seekAtOrAfter(prefix);
         while (item) |row| : (item = try cursor.next()) {
+            try control.check();
             if (!std.mem.startsWith(u8, row.key, prefix)) break;
             if (!sparseEmbeddingSourceMatches(entry, row.key)) continue;
-            try appendSparseProjectionDocNum(alloc, entry, sparse_txn, row.key, seen, out);
+            try appendSparseProjectionDocNum(alloc, entry, sparse_txn, row.key, seen, out, misses, miss_alloc, locator_complete, control);
         }
     }
 
@@ -29802,15 +29844,30 @@ pub const IndexManager = struct {
         return false;
     }
 
-    fn appendSparseProjectionDocNum(alloc: Allocator, entry: *SparseIndex, txn: anytype, key: []const u8, seen: *std.AutoHashMapUnmanaged(u32, void), out: *std.ArrayListUnmanaged(u32)) !void {
-        // Reuse the query's sparse snapshot, rather than opening one per member
-        // and potentially mixing mappings from different index generations.
-        const doc_num = (entry.index.docNumForDocIdTxn(txn, key) catch |err| switch (err) {
+    fn appendSparseProjectionDocNum(
+        alloc: Allocator,
+        entry: *SparseIndex,
+        txn: anytype,
+        key: []const u8,
+        seen: *std.AutoHashMapUnmanaged(u32, void),
+        out: *std.ArrayListUnmanaged(u32),
+        misses: *std.StringHashMapUnmanaged(void),
+        miss_alloc: Allocator,
+        locator_complete: bool,
+        control: @import("../../../search/query.zig").ExecutionControl,
+    ) !void {
+        try control.check();
+        switch (entry.index.lookupProjectionDocNum(alloc, txn, key, locator_complete) catch |err| switch (err) {
             error.DocNumOverflow => return,
             else => return err,
-        }) orelse return;
-        const gop = try seen.getOrPut(alloc, doc_num);
-        if (!gop.found_existing) try out.append(alloc, doc_num);
+        }) {
+            .absent => {},
+            .needs_scan => try sparse_mod.SparseIndex.deferProjectionKey(miss_alloc, misses, key),
+            .found => |doc_num| {
+                const slot = try seen.getOrPut(alloc, doc_num);
+                if (!slot.found_existing) try out.append(alloc, doc_num);
+            },
+        }
     }
 
     fn deleteGraphDocsEntry(_: *IndexManager, entry: *GraphIndex, keys: []const []const u8) !void {

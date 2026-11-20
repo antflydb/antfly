@@ -527,7 +527,7 @@ pub const SparseSearchExecutor = struct {
         alloc: Allocator,
         generation: ?u64,
     ) anyerror!?doc_set.ResolvedDocSet = null,
-    lookup_doc_nums_for_parent_keys: ?*const fn (?*anyopaque, Allocator, []const u8, []const []const u8) anyerror![]const u32 = null,
+    lookup_doc_nums_for_parent_keys: ?*const fn (?*anyopaque, Allocator, []const u8, []const []const u8, QueryExecutionControl) anyerror![]const u32 = null,
     lookup_doc_nums_for_ordinal_set: ?*const fn (?*anyopaque, Allocator, []const u8, *const doc_set.ResolvedDocSet, QueryExecutionControl) anyerror![]const u32 = null,
     lookup_doc_nums_for_ordinals: ?*const fn (
         ctx: ?*anyopaque,
@@ -596,13 +596,16 @@ pub const MatchAllCandidateCollectOptions = struct {
     primary_key_stop_before: ?[]const u8 = null,
     primary_key_reverse: bool = false,
     stop_after_accepted: ?usize = null,
+    exact_primary_keys: ?[]const []const u8 = null,
 
     pub fn hasCompletePrimaryKeyScope(self: MatchAllCandidateCollectOptions) bool {
+        if (self.exact_primary_keys != null) return true;
         const constraints = self.constraints orelse return false;
         return constraints.filter_doc_ids.len != 0;
     }
 
     pub fn exceptionalPrimaryKeys(self: MatchAllCandidateCollectOptions) []const []const u8 {
+        if (self.exact_primary_keys) |keys| return keys;
         const constraints = self.constraints orelse return &.{};
         if (constraints.filter_doc_ids.len != 0) return constraints.filter_doc_ids;
         if (constraints.legacy_filter == .doc_keys) return constraints.legacy_filter.doc_keys;
@@ -1996,7 +1999,7 @@ pub const StructuredFilterResolverExecutor = struct {
         ctx: ?*anyopaque,
         generation: ?u64,
     ) anyerror!bool = null,
-    lookup_doc_nums_for_parent_keys: ?*const fn (?*anyopaque, Allocator, []const u8, []const []const u8) anyerror![]const u32 = null,
+    lookup_doc_nums_for_parent_keys: ?*const fn (?*anyopaque, Allocator, []const u8, []const []const u8, QueryExecutionControl) anyerror![]const u32 = null,
     lookup_doc_nums_for_ordinal_set: ?*const fn (?*anyopaque, Allocator, []const u8, *const doc_set.ResolvedDocSet, QueryExecutionControl) anyerror![]const u32 = null,
     lookup_doc_nums_for_ordinals: ?*const fn (
         ctx: ?*anyopaque,
@@ -3063,7 +3066,7 @@ fn applyResolvedDocFilterAlloc(
     var include_represented = include_set.* == .all;
     if (include_set.* == .doc_keys and executor.lookup_doc_nums_for_parent_keys != null) {
         const project = executor.lookup_doc_nums_for_parent_keys.?;
-        try mergeNativePositiveNumbers(alloc, out, try project(executor.ctx, alloc, executor.doc_num_index_name.?, include_set.doc_keys));
+        try mergeNativePositiveNumbers(alloc, out, try project(executor.ctx, alloc, executor.doc_num_index_name.?, include_set.doc_keys, executor.control));
         out.resolved_stored_filters = true;
         include_represented = true;
     } else if (executor.project_ordinals_to_doc_ids or resolvedSetHasDocKeys(include_set)) {
@@ -3100,7 +3103,7 @@ fn applyResolvedDocFilterAlloc(
     }
     if (exclude_set.* == .doc_keys and executor.lookup_doc_nums_for_parent_keys != null) {
         const project = executor.lookup_doc_nums_for_parent_keys.?;
-        const numbers = try project(executor.ctx, alloc, executor.doc_num_index_name.?, exclude_set.doc_keys);
+        const numbers = try project(executor.ctx, alloc, executor.doc_num_index_name.?, exclude_set.doc_keys, executor.control);
         defer alloc.free(numbers);
         try mergeResidualDocNumsAlloc(alloc, &out.exclude_doc_nums, &out.exclude_doc_nums_owned, numbers);
         out.resolved_stored_filters = true;
@@ -20523,7 +20526,7 @@ pub fn searchSparse(
         for (sides) |side| {
             if (side.keys.* != .doc_keys) continue;
             const numbers = if (project_parents) |project|
-                try project(executor.ctx, alloc, entry.config.name, side.keys.doc_keys)
+                try project(executor.ctx, alloc, entry.config.name, side.keys.doc_keys, .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns })
             else
                 try entry.index.docNumsForDocIdsAlloc(alloc, &read.?, side.keys.doc_keys);
             defer alloc.free(numbers);
@@ -21958,6 +21961,48 @@ fn buildCompleteOrPartialTextDocIdMapAlloc(
     return allow_missing or !saw_live_doc or ordinal_to_text_doc_id.count() > 0;
 }
 
+fn repairTextSortOrdinalProjection(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    snapshot: *const index_mod.IndexSnapshot,
+    ordinals: []const u32,
+    map: *std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
+    control: QueryExecutionControl,
+) !void {
+    const resolve = executor.resolve_doc_set_doc_ids orelse return;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var offset: usize = 0;
+    while (offset < ordinals.len) {
+        try control.check();
+        _ = scratch.reset(.retain_capacity);
+        const batch_alloc = scratch.allocator();
+        var missing: [256]doc_set.DocOrdinal = undefined;
+        var len: usize = 0;
+        while (offset < ordinals.len and len < missing.len) : (offset += 1) {
+            if (offset % 256 == 0) try control.check();
+            const ordinal = ordinals[offset];
+            if (map.contains(ordinal)) continue;
+            missing[len] = ordinal;
+            len += 1;
+        }
+        if (len == 0) continue;
+        const set = doc_set.ResolvedDocSet{ .ordinals = missing[0..len] };
+        const keys = (try resolve(executor.ctx, batch_alloc, &set, req.identity_read_generation)) orelse return;
+        if (keys.len != len) return error.InvalidDocIdentity;
+        var frontier: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+        for (missing[0..len], keys) |ordinal, key| try frontier.put(batch_alloc, ordinal, key);
+        var matches = try snapshot.collectGraphKeyFrontierDocNumsAlloc(batch_alloc, frontier, control);
+        defer matches.deinit();
+        var docs = matches.ordinals.iterator();
+        while (docs.next()) |doc| {
+            const slot = try map.getOrPut(alloc, doc.value_ptr.*);
+            if (!slot.found_existing or slot.value_ptr.* < doc.key_ptr.*) slot.value_ptr.* = doc.key_ptr.*;
+        }
+    }
+}
+
 fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -22716,6 +22761,9 @@ pub fn searchMatchAll(
             );
             return error.UnsupportedQueryRequest;
         }
+        if (only_ordinals.len != 0 and ordinal_to_text_doc_id.count() != only_ordinals.len) {
+            try repairTextSortOrdinalProjection(alloc, exec_req, executor, sort_snapshot, only_ordinals, &ordinal_to_text_doc_id, control);
+        }
         if (!has_legacy and ordinal_to_text_doc_id.count() == only_ordinals.len and native_constraints.positive_filter and
             native_constraints.filter_doc_nums.len > 0 and
             native_constraints.filter_doc_ids.len == 0)
@@ -22743,8 +22791,19 @@ pub fn searchMatchAll(
             .prepare_hit = prepareTextSortHit,
             .load = loadTextDocValueSortValue,
         };
+        var exact_keys_arena = std.heap.ArenaAllocator.init(alloc);
+        defer exact_keys_arena.deinit();
+        const exact_keys = if (only_ordinals.len != 0 and native_constraints.filter_doc_ids.len == 0) blk: {
+            const resolve = executor.resolve_doc_set_doc_ids orelse break :blk null;
+            const scratch = exact_keys_arena.allocator();
+            const set = doc_set.ResolvedDocSet{ .ordinals = only_ordinals };
+            const mapped = (try resolve(executor.ctx, scratch, &set, exec_req.identity_read_generation)) orelse break :blk null;
+            const exceptional = if (native_constraints.legacy_filter == .doc_keys) native_constraints.legacy_filter.doc_keys else &.{};
+            break :blk try std.mem.concat(scratch, []const u8, &.{ mapped, exceptional });
+        } else null;
         var out = try sortAndPageMatchAllCandidateStreamAlloc(alloc, postprocess_req, executor, .{
             .constraints = &native_constraints,
+            .exact_primary_keys = exact_keys,
         }, planned_sort, native_sort_loader);
         errdefer out.deinit();
         if (postprocess_req.include_stored) {
