@@ -248,7 +248,7 @@ test "ordered artifact inventory graph publication validates guards generations 
         {
             var writer = try store.beginWriteTxn();
             errdefer writer.abort();
-            try result.stageLocalDag(alloc, &writer, command);
+            try result.bindDagPublication(&writer, command);
             try writer.put(edge_key, edge);
             try writer.commit();
         }
@@ -262,9 +262,12 @@ test "ordered artifact inventory graph publication validates guards generations 
             // Replaying the same relationship afterimage has no topology effect.
             var writer = try store.beginWriteTxn();
             errdefer writer.abort();
-            try result.stageLocalDag(alloc, &writer, command);
-            try std.testing.expectEqual(@as(u64, 1), (try dag.Storage.load(&writer, request.domain)).revision);
+            try result.bindDagPublication(&writer, command);
+            try writer.put(edge_key, edge);
             try writer.commit();
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u64, 1), (try dag.Storage.load(&read, request.domain)).revision);
         }
         const reverse = try keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "owner", "g", "links", "entity", "target");
         defer alloc.free(reverse);

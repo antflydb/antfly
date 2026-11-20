@@ -28807,7 +28807,7 @@ pub const DB = struct {
                 if (guard.chunk_vector_fence) |fence| try fence.requireCurrent(txn);
                 for (guard.asset_upstream_fences) |fence| try fence.requireCurrent(txn);
                 try publication.requireUnrejectedGraphCandidate(txn, guard.command);
-                try guard.prepared.stageLocalDag(alloc, txn, guard.command);
+                try guard.prepared.bindDagPublication(txn, guard.command);
                 try publication.stageCoverage(alloc, txn, guard.command, guard.coverage);
                 try publication.stageReceipts(txn, guard.command, guard.sequence);
                 try @import("artifact_producer_provenance.zig").stageIndexed(txn, guard.command, guard.proof, guard.position, guard.document_references);

@@ -53,6 +53,7 @@ pub const Capture = struct {
     replay_next: ?u64 = null,
     replay_ambiguous: bool = false,
     dag_bindings: ?bool = null,
+    dag_publication: ?publication.Digest = null,
     dag_graph_preimages: std.StringHashMapUnmanaged(?u64) = .empty,
     dag_source_mutation: bool = false,
     dag_fence_changed: bool = false,
@@ -247,7 +248,7 @@ pub const Capture = struct {
                 else => @TypeOf(txn),
             };
             if (comptime @hasDecl(Handle, "openCursor"))
-                try dag_effects.stageLocalArtifactChanges(scratch, txn, owner.namespace, changes, &budget)
+                try dag_effects.stageLocalArtifactChanges(scratch, txn, owner.namespace, changes, self.dag_publication, &budget)
             else
                 return error.GraphConstraintNotReady;
         }

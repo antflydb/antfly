@@ -178,26 +178,6 @@ pub fn artifactGeneration(value: ?[]const u8) !?u64 {
     return generation;
 }
 
-/// Preview exact graph row transitions while the source guards are held.
-pub fn collectPublicationChanges(alloc: A, txn: anytype, mutations: []const @import("artifact_publication.zig").Mutation, budget: *validation.Budget) ![]ArtifactChange {
-    var changes: std.ArrayList(ArtifactChange) = .empty;
-    for (mutations) |mutation| {
-        if (!keys.isGraphEdgeArtifactKey(mutation.key)) continue;
-        try budget.consume(.requests, 1);
-        try budget.consume(.bytes, mutation.key.len);
-        const raw: ?[]const u8 = txn.get(mutation.key) catch |err| blk: {
-            if (err != error.NotFound) return err;
-            break :blk null;
-        };
-        try changes.append(alloc, .{
-            .key = mutation.key,
-            .before = try artifactGeneration(raw),
-            .after = try artifactGeneration(mutation.value),
-        });
-    }
-    return changes.toOwnedSlice(alloc);
-}
-
 pub const BoundReplacement = struct {
     domain: authority.Digest,
     replacement: Replacement,
@@ -257,7 +237,7 @@ pub fn collectBoundArtifactChanges(alloc: A, txn: anytype, namespace: [24]u8, ch
 
 /// Stage all co-located contributions of a physical writer in their final
 /// state. Already staged producer decisions are recognized by their manifest.
-pub fn stageLocalArtifactChanges(alloc: A, txn: anytype, namespace: [24]u8, changes: []const ArtifactChange, budget: *validation.Budget) !void {
+pub fn stageLocalArtifactChanges(alloc: A, txn: anytype, namespace: [24]u8, changes: []const ArtifactChange, publication: ?authority.Digest, budget: *validation.Budget) !void {
     const entries = try collectBoundArtifactChanges(alloc, txn, namespace, changes, budget);
     var len: usize = 0;
     for (entries) |entry| {
@@ -281,6 +261,7 @@ pub fn stageLocalArtifactChanges(alloc: A, txn: anytype, namespace: [24]u8, chan
         var revision: [8]u8 = undefined;
         std.mem.writeInt(u64, &revision, state.revision, .big);
         hash.update(&revision);
+        if (publication) |digest| hash.update(&digest);
         const version = hash.finalResult();
         const candidate = authority.Contributions.candidate(version, replacements[start..end]);
         const vote: @import("../transactions.zig").DagDomainPrepare = .{

@@ -1202,26 +1202,15 @@ pub const PreparedEffects = struct {
         };
     }
 
-    /// The writer already owns the publication source and contender guards.
-    pub fn stageLocalDag(self: *@This(), alloc: std.mem.Allocator, txn: anytype, command: Command) !void {
+    /// Bind the guarded publication to the physical writer. Authority validation
+    /// runs once, after the writer has staged all final primary effects.
+    pub fn bindDagPublication(self: *const @This(), txn: anytype, command: Command) !void {
         if (command.mode != .publish or command.producer_kind != .graph) return;
-        if (!try LocalDagBinding.hasBindings(txn)) return;
         const prepared_digest = self.graph_publication_digest orelse return error.InvalidBatchRequest;
         if (!std.mem.eql(u8, &prepared_digest, &command.publication_digest) or
             !std.mem.eql(u8, &prepared_digest, &command.digest())) return error.InvalidBatchRequest;
-
-        var scratch = std.heap.ArenaAllocator.init(alloc);
-        defer scratch.deinit();
-        const validation = @import("../../graph/dag_validation.zig");
-        const effects = @import("dag_graph_effects.zig");
-        const Clock = struct {
-            fn now(_: *anyopaque) u64 {
-                return 0;
-            }
-        };
-        var budget: validation.Budget = .{ .clock = .{ .context = self, .now = Clock.now } };
-        const changes = try effects.collectPublicationChanges(scratch.allocator(), txn, command.mutations, &budget);
-        try effects.stageLocalArtifactChanges(scratch.allocator(), txn, command.namespace, changes, &budget);
+        if (txn.artifact_inputs.dag_publication != null) return error.InvalidBatchRequest;
+        txn.artifact_inputs.dag_publication = prepared_digest;
     }
 
     pub fn deinit(self: *@This()) void {
