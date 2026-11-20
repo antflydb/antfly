@@ -23736,7 +23736,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
         if (topology_epoch != 0)
-            try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+            try table_catalog.validateTransactionEpoch(alloc, self.catalog, table_name, topology_epoch, true);
         if (self.raft_batcher) |batcher| {
             // Resolution is idempotent and may arrive through a stale hosted
             // route after leadership changes. Use the same leader-aware Raft
@@ -26952,7 +26952,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             if (context.route_fence != null or req.range_guards.len != 0) return error.CatalogRouteFenceUnsupported;
             if (topology_epoch != 0)
-                try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+                try table_catalog.validateTransactionEpoch(alloc, self.catalog, table_name, topology_epoch, req.transaction != null and req.transaction.? == .resolve);
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
             return try local_source.batchGroupLocal(alloc, group_id, table_name, req);
@@ -26972,7 +26972,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table_name, fence, self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }));
         }
         if (topology_epoch != 0)
-            try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+            try table_catalog.validateTransactionEpoch(alloc, self.catalog, table_name, topology_epoch, req.transaction != null and req.transaction.? == .resolve);
         if (!try batchUsesDurableTransactionContract(alloc, cached.db, req))
             try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
         try ensurePreDecisionContextActive(context);

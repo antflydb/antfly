@@ -22,23 +22,54 @@ const A = std.mem.Allocator;
 const Read = struct {
     handle: *anyopaque,
     arena: std.heap.ArenaAllocator,
+    refs: std.atomic.Value(usize) = .init(1),
     fn cast(ptr: *anyopaque) *Read {
         return @ptrCast(@alignCast(ptr));
     }
-    fn abort(a: A, ptr: *anyopaque) void {
-        const self = cast(ptr);
+    fn abort(_: A, ptr: *anyopaque) void {
+        cast(ptr).release();
+    }
+    fn release(self: *Read) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const a = self.arena.child_allocator;
         abi.antfly_metadata_session_read_close(self.handle);
         self.arena.deinit();
         a.destroy(self);
     }
     fn get(ptr: *anyopaque, key: []const u8) ![]const u8 {
         const self = cast(ptr);
+        return self.readValue(self.arena.allocator(), .{ .operation = .get, .key = .fromSlice(key) });
+    }
+    fn readValue(self: *Read, a: A, request: abi.MetadataSessionReadRequest) ![]const u8 {
         var response: abi.OwnedBytes = .{};
-        try status(abi.antfly_metadata_session_read_invoke(self.handle, &.{ .operation = .get, .key = .fromSlice(key) }, &response));
+        try status(abi.antfly_metadata_session_read_invoke(self.handle, &request, &response));
         defer abi.antfly_storage_owner_buffer_destroy(&response);
         if (response.len > 32 << 20) return error.TransactionTooLarge;
-        return self.arena.allocator().dupe(u8, response.slice());
+        return a.dupe(u8, response.slice());
     }
+    fn scope(a: A, ptr: *anyopaque) !erased.ReadScope {
+        const read = cast(ptr);
+        _ = read.refs.fetchAdd(1, .monotonic);
+        errdefer read.release();
+        return erased.readScopeFrom(a, Scope{ .read = read, .arena = std.heap.ArenaAllocator.init(a) });
+    }
+    const Scope = struct {
+        read: *Read,
+        arena: std.heap.ArenaAllocator,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return self.read.readValue(self.arena.allocator(), .{ .operation = .get, .key = .fromSlice(key) });
+        }
+        pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
+            if (length > 32 << 20) return error.TransactionTooLarge;
+            const value = try self.read.readValue(self.arena.allocator(), .{ .operation = .get_range, .key = .fromSlice(key), .offset = offset, .length = @intCast(length) });
+            if (value.len != length) return error.EndOfStream;
+            return value;
+        }
+        pub fn close(self: *@This()) void {
+            self.arena.deinit();
+            self.read.release();
+        }
+    };
     fn cursor(a: A, ptr: *anyopaque) !erased.Cursor {
         const self = try a.create(Cursor);
         self.* = .{ .read = cast(ptr), .arena = std.heap.ArenaAllocator.init(a) };
@@ -52,7 +83,7 @@ pub fn open(a: A, store: ?*anyopaque, group: u64) !erased.ReadTxn {
     const native = handle orelse return error.StorageKernelFailure;
     const read = try a.create(Read);
     read.* = .{ .handle = native, .arena = std.heap.ArenaAllocator.init(a) };
-    return .{ .allocator = a, .ptr = read, .vtable = &.{ .abort = Read.abort, .get = Read.get, .open_cursor = Read.cursor } };
+    return .{ .allocator = a, .ptr = read, .vtable = &.{ .abort = Read.abort, .get = Read.get, .open_cursor = Read.cursor, .open_read_scope = Read.scope } };
 }
 fn status(value: abi.Status) !void {
     return identity.statusToError(value);

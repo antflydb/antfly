@@ -2782,13 +2782,24 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
     upper[read.prefix.len - 1] += 1;
     const upper_bound = upper[0..read.prefix.len];
     const bounded = switch (request.operation) {
-        .get, .next, .prev, .seek_at_or_after, .seek_at_or_before => true,
+        .get, .get_range, .next, .prev, .seek_at_or_after, .seek_at_or_before => true,
         else => false,
     };
     const upper_seek = request.operation == .seek_at_or_before and std.mem.eql(u8, key, upper_bound);
     if (bounded and ((!std.mem.startsWith(u8, key, read.prefix) and !upper_seek) or key.len > read.prefix.len + 512)) return .invalid_argument;
-    if (request.operation == .get) {
-        const value = read.txn.get(key) catch |err| return storageOwnerStatusFromError(err);
+    if (request.operation == .get or request.operation == .get_range) {
+        var scope = if (request.operation == .get_range) read.txn.openReadScope(read.alloc) catch |err| return storageOwnerStatusFromError(err) else null;
+        defer if (scope) |*s| s.close();
+        const value = if (scope) |*s| blk: {
+            if (request.length > 32 << 20) return .invalid_argument;
+            if (s.supportsRange()) break :blk s.getRange(key, request.offset, request.length) catch |err| switch (err) {
+                error.EndOfStream => return .ok,
+                else => return storageOwnerStatusFromError(err),
+            };
+            const full = read.txn.get(key) catch |err| return storageOwnerStatusFromError(err);
+            if (request.offset > full.len or request.length > full.len - request.offset) return .ok;
+            break :blk full[@intCast(request.offset)..][0..request.length];
+        } else read.txn.get(key) catch |err| return storageOwnerStatusFromError(err);
         if (value.len > 32 << 20) return .invalid_argument;
         const copy = read.alloc.dupe(u8, value) catch return .out_of_memory;
         out_value.* = .{ .ptr = if (copy.len == 0) null else copy.ptr, .len = @intCast(copy.len) };
@@ -2797,7 +2808,7 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
     var cursor = read.txn.openCursor() catch |err| return storageOwnerStatusFromError(err);
     defer cursor.close();
     var entry = switch (request.operation) {
-        .get => unreachable,
+        .get, .get_range => unreachable,
         .first => cursor.seekAtOrAfter(read.prefix),
         .last => cursor.seekAtOrBefore(upper_bound),
         .next, .seek_at_or_after => cursor.seekAtOrAfter(key),

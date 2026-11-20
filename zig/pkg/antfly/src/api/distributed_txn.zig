@@ -1365,7 +1365,7 @@ fn executeMultiTableCommitOnce(
         participants.deinit(alloc);
     }
 
-    const admitted = try routeParticipants(alloc, catalog, tables, &participants);
+    const admitted = try routeParticipants(alloc, catalog, tables, &participants, options.retain_terminal);
 
     const participant_ids = try alloc.alloc([]const u8, participants.items.len);
     var participant_ids_initialized: usize = 0;
@@ -1592,7 +1592,7 @@ fn executeMultiTableCommitOnce(
             // Fence every first-pass resolution against the topology pinned at
             // admission. Recovery deliberately uses epoch zero: a durable
             // commit decision must remain resolvable after a topology change.
-            .topology_epoch = if (!resume_committed) participant.topology_epoch else 0,
+            .topology_epoch = if (!resume_committed) participant.decision_epoch else 0,
             // The first participant is the transaction decision record. It must
             // be committed and applied before any other participant can learn a
             // commit decision, even when the public request selected the faster
@@ -1891,6 +1891,7 @@ const ParticipantTxn = struct {
     table_name: []const u8,
     group_id: u64,
     topology_epoch: u64,
+    decision_epoch: u64 = 0,
     relational_schema_version: ?u32 = null,
     relational_integrity_generation_set: ?[32]u8 = null,
     restore_staging_scope: ?[32]u8 = null,
@@ -2100,7 +2101,7 @@ const ResolveFollowerFanoutTask = struct {
             .txn_id = txn_id,
             .status = .committed,
             .commit_version = commit_version,
-            .topology_epoch = if (resume_committed) 0 else participant.topology_epoch,
+            .topology_epoch = if (resume_committed) 0 else participant.decision_epoch,
             .sync_level = sync_level,
         }, cancellation) catch |err| {
             slot.err = err;
@@ -2207,6 +2208,7 @@ const TableRoutes = struct {
     groups: ParticipantGroups = .empty,
     guard_owners: std.AutoHashMapUnmanaged(u64, range_reads.ProofMap) = .empty,
     proof_count: usize = 0,
+    has_addressed_work: bool = false,
 
     fn mergeRequirements(self: *@This(), table: TableCommitRequest) !void {
         const prior = &self.requirements;
@@ -2283,7 +2285,7 @@ fn validateParticipantEpochs(alloc: std.mem.Allocator, catalog: table_catalog.Ca
     }
 }
 
-fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest, participants: *std.ArrayListUnmanaged(ParticipantTxn)) !?RoutingIdentity {
+fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest, participants: *std.ArrayListUnmanaged(ParticipantTxn), retain_terminal: bool) !?RoutingIdentity {
     if (tables.len == 0) return null;
     var workspace = std.heap.ArenaAllocator.init(alloc);
     defer workspace.deinit();
@@ -2294,6 +2296,10 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
         try TableRoutes.mergeRequirement(&bound_incarnation, table.bound_catalog_incarnation, error.CatalogGenerationChanged);
         const slot = try by_name.getOrPut(a, table.table_name);
         if (slot.found_existing) try slot.value_ptr.mergeRequirements(table) else slot.value_ptr.* = .{ .requirements = table };
+        slot.value_ptr.has_addressed_work = slot.value_ptr.has_addressed_work or table.range_guards.len != 0 or
+            table.writes.len != 0 or table.deletes.len != 0 or table.graph_writes.len != 0 or table.graph_deletes.len != 0 or
+            table.predicates.len != 0 or table.transforms.len != 0 or table.integrity.len != 0 or table.integrity_commands.len != 0 or
+            table.relational_activation != null or table.relational_retirement != null or table.relational_index_maintenance != null;
     }
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
@@ -2390,14 +2396,17 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
             if (participant.relational_index_maintenance != null) return error.InvalidTxnRequest;
             participant.relational_index_maintenance = command;
         }
+        // Stable IDs may already have an ordered participant list on disk
+        // from an earlier binary. Reconstruct its first-enlistment order.
+        if ((retain_terminal or !routes.has_addressed_work) and table.commit_requires == .direct_enrichments and groups.count() == 0) {
+            _ = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, "") orelse return error.UnknownGroup, topology_epoch);
+        }
     }
     for (by_name.values()) |*routes| {
         const table = routes.requirements;
         const groups = &routes.groups;
         const topology_epoch = routes.epoch;
-        if (table.commit_requires == .direct_enrichments and groups.count() == 0) {
-            _ = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, "") orelse return error.UnknownGroup, topology_epoch);
-        }
+        const decision_epoch = table_catalog.transactionDecisionEpoch(&snapshot, topology_epoch);
         // Match all enlisted owner proofs in one traversal of this table's
         // ranges. Guarded reads keep their observed fence and bound writes get
         // a fence from the same routing snapshot used to choose their group.
@@ -2429,6 +2438,7 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
         }
         for (groups.values()) |index| {
             const participant = &participants.items[index];
+            participant.decision_epoch = decision_epoch;
             participant.row_policy_principal_proof = table.row_policy_principal_proof;
             participant.row_policy_database = table.row_policy_database;
             participant.row_policy_admitted_at_seconds = table.row_policy_admitted_at_seconds;
@@ -6065,10 +6075,25 @@ fn consumerTests() type {
                 _ = try routeParticipants(std.testing.allocator, FakeCatalog.iface(), &.{
                     .{ .table_name = "docs", .commit_requires = .direct_enrichments },
                     .{ .table_name = "docs", .commit_requires = .none, .writes = &.{.{ .key = "doc:z", .value = "{}" }} },
-                }, &participants);
+                }, &participants, false);
                 try std.testing.expectEqual(@as(usize, 1), participants.items.len);
                 try std.testing.expectEqual(@as(u64, 7002), participants.items[0].group_id);
                 try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, participants.items[0].commit_requires.?);
+            }
+            {
+                var participants: std.ArrayListUnmanaged(ParticipantTxn) = .empty;
+                defer {
+                    for (participants.items) |*participant| participant.deinit(std.testing.allocator);
+                    participants.deinit(std.testing.allocator);
+                }
+                _ = try routeParticipants(std.testing.allocator, FakeCatalog.iface(), &.{
+                    .{ .table_name = "docs", .commit_requires = .direct_enrichments },
+                    .{ .table_name = "audit", .writes = &.{.{ .key = "log", .value = "{}" }} },
+                    .{ .table_name = "docs", .writes = &.{.{ .key = "doc:z", .value = "{}" }} },
+                }, &participants, true);
+                try std.testing.expectEqual(@as(usize, 3), participants.items.len);
+                try std.testing.expectEqual(@as(u64, 7001), participants.items[0].group_id);
+                try std.testing.expectEqual(@as(u64, 7002), participants.items[2].group_id);
             }
             var inconsistent = observation;
             inconsistent.proofs = &.{.{ .bucket = 100, .generation = 1 }};

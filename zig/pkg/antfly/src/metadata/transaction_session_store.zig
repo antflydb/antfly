@@ -43,7 +43,7 @@ pub const Store = struct {
     }
     fn beginRead(a: A, ptr: *anyopaque) !erased.ReadTxn {
         const read = try Read.create(a, cast(ptr));
-        return .{ .allocator = a, .ptr = read, .vtable = &.{ .abort = Read.abort, .get = Read.get, .open_cursor = Read.cursor } };
+        return .{ .allocator = a, .ptr = read, .vtable = &.{ .abort = Read.abort, .get = Read.get, .open_cursor = Read.cursor, .open_read_scope = Read.scope } };
     }
     fn beginWrite(a: A, ptr: *anyopaque) !erased.WriteTxn {
         const self = cast(ptr);
@@ -100,6 +100,34 @@ const Read = struct {
         if (std.mem.eql(u8, key, record.epoch_key)) return error.NotFound;
         return self.physical.get(try record.keyAlloc(self.arena.allocator(), self.store.group, key));
     }
+    fn scope(a: A, ptr: *anyopaque) !erased.ReadScope {
+        const self = cast(ptr);
+        var physical = try self.physical.openReadScope(a);
+        errdefer physical.close();
+        return erased.readScopeFrom(a, Scope{ .alloc = a, .group = self.store.group, .physical = physical });
+    }
+    const Scope = struct {
+        alloc: A,
+        group: u64,
+        physical: erased.ReadScope,
+        fn physicalKey(self: *@This(), key: []const u8) ![]const u8 {
+            if (std.mem.eql(u8, key, record.epoch_key)) return error.NotFound;
+            return record.keyAlloc(self.alloc, self.group, key);
+        }
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            const physical = try self.physicalKey(key);
+            defer self.alloc.free(physical);
+            return self.physical.get(physical);
+        }
+        pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
+            const physical = try self.physicalKey(key);
+            defer self.alloc.free(physical);
+            return self.physical.getRange(physical, offset, length);
+        }
+        pub fn close(self: *@This()) void {
+            self.physical.close();
+        }
+    };
     fn cursor(a: A, ptr: *anyopaque) !erased.Cursor {
         return Cursor.create(a, cast(ptr), null);
     }

@@ -177,10 +177,11 @@ fn projectLocalArtifact(a: A, snapshot: PolicySnapshot, physical: []const u8, re
     if (root) return project(a, snapshot, ref.document_id, source, read);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, source, .{ .parse_numbers = false });
     const canonical = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
-    try @import("../../privacy/local_publication.zig").require(a, read, physical, version, canonical, raw);
-    // Independently require the current root, even when the descendant's
-    // own publication is current. These bytes never grant original access.
+    const expected = try @import("../../privacy/local_publication.zig").expectedOutput(a, read, physical, version, canonical);
+    // Check both publications on this cut before fetching an external vector.
     _ = try project(a, snapshot, ref.document_id, source, read);
+    const output = if (citation_only) try read.logical(physical, raw) else raw;
+    if (!std.mem.eql(u8, &expected, &contract.fingerprint(output))) return error.PrivacyStale;
     return if (citation_only) &.{} else a.dupe(u8, raw);
 }
 
@@ -242,8 +243,7 @@ pub fn permitsVirtualPage(a: A, snapshot: PolicySnapshot, physical: []const u8, 
 
 fn validateVirtualPage(a: A, snapshot: PolicySnapshot, physical: []const u8, stored: []const u8, read: anytype) !bool {
     if (try usesLocalWitness(snapshot, read)) {
-        const raw = try read.logical(physical, stored);
-        _ = try projectLocalArtifact(a, snapshot, physical, read, raw, true);
+        _ = try projectLocalArtifact(a, snapshot, physical, read, stored, true);
         return true;
     }
     var proof = (try @import("artifact_producer_provenance.zig").readCurrentArtifactMetadata(a, read, physical)) orelse return false;

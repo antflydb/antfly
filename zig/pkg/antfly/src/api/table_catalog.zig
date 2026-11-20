@@ -1711,11 +1711,31 @@ pub fn validateTransactionTopologyEpoch(
     table_name: []const u8,
     expected_epoch: u64,
 ) !void {
+    return validateTransactionEpoch(alloc, catalog, table_name, expected_epoch, false);
+}
+
+/// Bind the first-pass decision to its catalog and ranges using the existing
+/// wire fence. Older owners reject this token when comparing their range epoch.
+/// Zero is reserved exclusively for decision recovery.
+pub fn transactionDecisionEpoch(snapshot: *const metadata_api.AdminSnapshot, topology_epoch: u64) u64 {
+    var hash = std.hash.Wyhash.init(topology_epoch);
+    hash.update("antfly/txn-decision/v1");
+    var group: [8]u8 = undefined;
+    std.mem.writeInt(u64, &group, snapshot.status.metadata_group_id, .little);
+    hash.update(&group);
+    if (snapshot.status.metadata_incarnation) |incarnation| hash.update(&incarnation);
+    return @max(1, hash.final());
+}
+
+pub fn validateTransactionEpoch(alloc: std.mem.Allocator, catalog: CatalogSource, table_name: []const u8, expected_epoch: u64, decision: bool) !void {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     try validateTransactionTopologyStableSnapshot(&snapshot, table.*);
-    if (expected_epoch != 0 and (try topologyEpochFromSnapshot(alloc, &snapshot, table.*)) != expected_epoch) return error.TopologyChanged;
+    if (expected_epoch == 0) return;
+    const topology_epoch = try topologyEpochFromSnapshot(alloc, &snapshot, table.*);
+    if (expected_epoch == topology_epoch) return; // Requests from existing coordinators.
+    if (!decision or expected_epoch != transactionDecisionEpoch(&snapshot, topology_epoch)) return error.TopologyChanged;
 }
 
 pub fn validateTopologyEpoch(
@@ -3819,6 +3839,12 @@ fn consumerTests() type {
             };
             const source: CatalogSource = .{ .ptr = &snapshot, .vtable = &.{ .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.free } };
             const epoch = try transactionTopologyEpoch(std.testing.allocator, source, "rows");
+            const decision = transactionDecisionEpoch(&snapshot, epoch);
+            try validateTransactionEpoch(std.testing.allocator, source, "rows", decision, true);
+            snapshot.status.metadata_incarnation = @splat(7);
+            try std.testing.expectError(error.TopologyChanged, validateTransactionEpoch(std.testing.allocator, source, "rows", decision, true));
+            try validateTransactionTopologyEpoch(std.testing.allocator, source, "rows", epoch);
+            snapshot.status.metadata_incarnation = null;
             inline for (std.meta.tags(@import("../metadata/online_merge.zig").Phase)) |phase| {
                 merges[0] = initial;
                 merges[0].online.?.phase = phase;

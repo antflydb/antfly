@@ -260,6 +260,7 @@ const Mock = struct {
         if (self.cursor_revoked) return error.Forbidden;
         if (self.ddl_pending or self.ddl_unknown) return .{ .columns = &.{} };
         if (self.expected_result_tag != null) return .{ .columns = &.{}, .binding_guard = "immutable-catalog-binding" };
+        if (std.ascii.eqlIgnoreCase(request.statement, "ROLLBACK") or std.ascii.eqlIgnoreCase(request.statement, "COMMIT")) return .{ .columns = &.{} };
         if (self.json_null_results) return .{ .is_select = true, .columns = &.{.{ .name = "j", .type = .json }} };
         if (self.array_results) return .{ .columns = &.{.{ .name = "a", .type = .array, .element_type = .jsonb }} };
         return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = if (self.catalog_rebind and self.describes > 1) "current-catalog-binding" else "immutable-catalog-binding", .setting_epoch = self.settingEpoch() };
@@ -335,6 +336,8 @@ const Mock = struct {
             .sql_nulls = if (self.result_cells) null else &.{ &.{false}, &.{true} },
             .cells = if (self.result_cells) .{ .context = self, .count = 2, .width = 1, .read = resultCell } else null,
             .command_tag = "SELECT 2",
+            .transaction_status = if (request.session_id != null) .in_transaction else .idle,
+            .session_id = if (request.session_id != null) "0123456789abcdef0123456789abcdef" else null,
         };
         self.saw_statement_unchanged = std.mem.eql(u8, request.statement, "SELECT $1");
         if (self.namespace_count < self.namespace_log.len) {
@@ -971,6 +974,31 @@ test "pgwire materialized cursor enforces quota and reauthorizes held fetch" {
     }
 }
 
+test "forward cursor validates empty and exhausted fetches before describing columns" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try frame(&input.writer, 'Q', "DECLARE rows CURSOR FOR SELECT n FROM t\x00");
+    try frame(&input.writer, 'Q', "FETCH 0 FROM rows\x00");
+    try frame(&input.writer, 'Q', "FETCH ALL FROM rows\x00");
+    try frame(&input.writer, 'Q', "FETCH 1 FROM rows\x00");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 1 };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const messages = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(messages);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, messages, "T"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "D"));
+    try std.testing.expectEqual(@as(usize, 2), mock.stream_validations);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_pulls);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_detaches);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+}
+
 test "pgwire failed cursor fetch marks transaction aborted and releases retained stream" {
     var input = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer input.deinit();
@@ -986,6 +1014,7 @@ test "pgwire failed cursor fetch marks transaction aborted and releases retained
     const messages = try tags(std.testing.allocator, output.written());
     defer std.testing.allocator.free(messages);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "E"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "T"));
     try std.testing.expectEqual(@as(usize, 1), mock.failed_transactions);
     try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
     try std.testing.expectEqual(@as(usize, 2), mock.executions);
@@ -1623,6 +1652,29 @@ test "pgwire simple query and SQL EXECUTE revalidate blocking results between de
             try std.testing.expect(forbidden);
         }
     }
+}
+
+test "extended rollback closes a suspended transaction portal before Sync" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try parse(&input.writer, "q", "SELECT j FROM t", false);
+    try bind(&input.writer, "p", "q", null);
+    try execute(&input.writer, "p", 1);
+    try parse(&input.writer, "end", "ROLLBACK", false);
+    try bind(&input.writer, "end", "end", null);
+    try execute(&input.writer, "end", 0);
+    try execute(&input.writer, "p", 1);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .json_null_results = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const messages = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(messages);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "D"));
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "34000") != null);
 }
 
 test "pgwire suspended materialized SELECT rechecks authority before sending more rows" {

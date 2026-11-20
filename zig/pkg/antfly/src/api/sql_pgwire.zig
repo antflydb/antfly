@@ -507,8 +507,8 @@ const OwnedRead = struct {
         defer if (transaction_lease) |lease| lease.release();
         if (self.session_id) |id_hex| {
             const id = @import("distributed_txn.zig").parseTxnIdHex(id_hex) catch return error.SqlTransactionNotActive;
-            if (try server.txn_sessions.principalAccess(server.alloc, id, credential.sessionPrincipal()) != .allowed) return error.SqlTransactionNotActive;
             transaction_lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
+            try server.txn_sessions.requireActiveSqlReader(alloc, id, credential.sessionPrincipal(), server.localSessionNodeId());
             var state = (try server.txn_sessions.getSqlState(server.alloc, id)) orelse return error.SqlTransactionNotActive;
             defer state.deinit(server.alloc);
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionAborted;
@@ -875,7 +875,7 @@ const RetainedRead = struct {
         if (self.adapter.server.cfg.user_manager != credential.manager) return error.Unauthorized;
         if (request.session_id) |encoded| {
             const id = try @import("distributed_txn.zig").parseTxnIdHex(encoded);
-            try self.adapter.server.txn_sessions.requireActiveSqlReader(id, credential.sessionPrincipal());
+            try self.adapter.server.txn_sessions.requireActiveSqlReader(a, id, credential.sessionPrincipal(), self.adapter.server.localSessionNodeId());
         }
         const revision = try self.validateAccess(a, credential);
         var context = try requestContext(credential, &request).platformDeadline();
@@ -2755,7 +2755,7 @@ test "SQL pgwire retained reads track the serving policy even without a catalog 
     retained.policies = &.{.{ .resource = "physical", .filter = null }};
     var cancel = std.atomic.Value(bool).init(false);
     const req: wire.Request = .{ .statement = "", .limit = 1, .io = std.testing.io, .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } }, .cancel_requested = &cancel };
-    const session = try api.txn_sessions.beginForPrincipal(a, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_only } }, 1, credential.sessionPrincipal());
+    const session = try api.txn_sessions.beginForPrincipal(a, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_only } }, api.localSessionNodeId(), credential.sessionPrincipal());
     const session_id = std.fmt.bytesToHex(session.txn_id, .lower);
     var attached = req;
     attached.session_id = &session_id;

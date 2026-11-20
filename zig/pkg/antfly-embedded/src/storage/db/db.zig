@@ -156169,6 +156169,24 @@ test "source semantic media input virtual PDF pages require the physical vector 
     var external = External{ .store = db.core.store, .bytes = vector, .witness_key = witness };
     db.core.store.configurePayloadPolicy(.{ .ptr = &external, .vtable = &.{ .retain = External.retain, .release = External.release, .prepare = External.prepare, .resolve = External.resolve } }, false, null);
     defer db.core.store.configurePayloadPolicy(null, false, null);
+    // The first candidate is a pre-policy external vector. Its resolver may
+    // be unavailable; it cannot authorize this page or mask the next output.
+    const orphan = try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, unit, "legacy");
+    const orphan_reference = try payloads.Reference.forArtifact(orphan, vector);
+    try db.core.store.put(witness, &local.encode(policy.prepared.version, source, vector));
+    {
+        var txn = try db.core.store.beginReadTxn();
+        defer txn.abort();
+        const privacy = @import("privacy_read.zig");
+        try std.testing.expect(!try privacy.permitsVirtualPage(scratch, policy, orphan, &orphan_reference.encode(), &txn));
+        try std.testing.expectEqual(@as(usize, 0), external.fetched_bytes);
+        try std.testing.expect(try privacy.permitsVirtualPage(scratch, policy, vector_key, &reference.encode(), &txn));
+        try std.testing.expectEqual(vector.len, external.fetched_bytes);
+    }
+    external.fetched_bytes = 0;
+    try db.core.store.delete(witness);
+    try std.testing.expect((try db.loadStoredSearchDocumentProbe(scratch, unit)) == null);
+    try std.testing.expectEqual(@as(usize, 0), external.fetched_bytes);
     for (0..3) |path| {
         try db.core.store.put(witness, &local.encode(policy.prepared.version, source, vector));
         external.replacement = local.encode(policy.prepared.version, "stale", vector);
@@ -156180,7 +156198,7 @@ test "source semantic media input virtual PDF pages require the physical vector 
         try std.testing.expect(present);
         try std.testing.expect((try db.loadStoredSearchDocumentProbe(scratch, unit)) == null);
     }
-    try std.testing.expectEqual(6 * vector.len, external.fetched_bytes);
+    try std.testing.expectEqual(3 * vector.len, external.fetched_bytes);
 
     // Ordered publications carry an output revision and causal source proof.
     // A valid citation and a superseded revision both cost zero payload reads.

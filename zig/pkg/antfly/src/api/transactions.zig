@@ -2470,30 +2470,36 @@ pub const SessionRegistry = struct {
         }
     };
 
-    /// Check an attached reader against a single session version without cloning
-    /// staged writes, savepoints or setting overlays on a cache hit.
-    pub fn requireActiveSqlReader(self: *SessionRegistry, txn_id: db_mod.types.TxnId, principal: []const u8) !void {
+    /// A shared store is authoritative even when this node has a cached session.
+    pub fn requireActiveSqlReader(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: []const u8, owner: u64) !void {
         const stripe = self.sessionLock(txn_id);
         stripe.lock();
         defer stripe.unlock();
         if (!self.durableMissIsAuthoritative()) {
             self.mutex.lock();
             if (self.sessions.getPtr(txn_id)) |session| {
-                defer self.mutex.unlock();
-                return checkSqlReader(session, principal);
+                const checked = checkSqlReader(session, principal, owner);
+                self.mutex.unlock();
+                try checked;
+                return self.validateSqlLease(alloc, txn_id, owner);
             }
             self.mutex.unlock();
         }
         const durable = self.durable orelse return error.SqlTransactionNotActive;
-        var session = (try durable.load(txn_id)) orelse return error.SqlTransactionNotActive;
-        defer session.deinit(durable.alloc);
-        return checkSqlReader(&session, principal);
-    }
-
-    fn checkSqlReader(session: *const Session, principal: []const u8) !void {
-        const sql = session.sql orelse return error.SqlTransactionNotActive;
-        if (!principalsEqual(session.principal, principal) or sql.failed or session.terminal_abort or
-            session.terminal_commit != null or session.commit_execution_started) return error.SqlTransactionNotActive;
+        const shared_lease = if (self.lease_store) |lease| std.meta.eql(lease.backend, durable.backend) else false;
+        switch (durable.backend) {
+            .docstore => |store| {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                try requireDurableReader(alloc, &read, txn_id, principal, owner, shared_lease);
+            },
+            .runtime => |store| {
+                var read = try store.beginRead();
+                defer read.abort();
+                try requireDurableReader(alloc, &read, txn_id, principal, owner, shared_lease);
+            },
+        }
+        if (!shared_lease) try self.validateSqlLease(alloc, txn_id, owner);
     }
 
     pub fn getSqlState(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SqlState {
@@ -2526,9 +2532,7 @@ pub const SessionRegistry = struct {
         const store = self.lease_store orelse return;
         var record = (try store.load(alloc, txn_id)) orelse return error.SessionLeaseLost;
         defer lease_mod.deinitRecord(alloc, &record);
-        const expected = try ownerLeaseId(alloc, owner);
-        defer alloc.free(expected);
-        if (!std.mem.eql(u8, record.owner_id, expected) or record.expires_at_ms <= nextTxnTimestamp() / std.time.ns_per_ms) return error.SessionLeaseLost;
+        try requireReaderLease(record, owner);
     }
 
     pub fn setSqlFailed(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, failed: bool) !void {
@@ -5877,6 +5881,85 @@ fn leaseRecordOwnerNodeId(owner_id: []const u8) ?u64 {
     return std.fmt.parseUnsigned(u64, owner_id["node:".len..], 10) catch null;
 }
 
+fn requireReaderLease(record: lease_mod.LeaseRecord, owner: u64) !void {
+    var buffer: [32]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&buffer, "node:{d}", .{owner});
+    if (!std.mem.eql(u8, expected, record.owner_id) or record.expires_at_ms <= nextTxnTimestamp() / std.time.ns_per_ms)
+        return error.SessionLeaseLost;
+}
+
+fn readerActive(session: *const Session) bool {
+    const sql = session.sql orelse return false;
+    return session.principal != null and !sql.failed and !session.terminal_abort and session.terminal_commit == null and !session.commit_execution_started;
+}
+
+fn checkSqlReader(session: *const Session, principal: []const u8, owner: u64) !void {
+    if (!readerActive(session) or !principalsEqual(session.principal, principal)) return error.SqlTransactionNotActive;
+    if (session.owner_node_id != owner) return error.SessionLeaseLost;
+}
+
+// A prefix of the session itself shares its CAS, deletion, and mixed-version
+// rewrite semantics. An older writer drops the field and selects legacy decode.
+const reader_field = "\"reader_v1\":\"";
+const reader_payload_len = 41;
+const reader_prefix_len = session_record.bound_session_header.len + reader_field.len + 2 * reader_payload_len + 2;
+
+fn readerPayload(session: *const Session) [reader_payload_len]u8 {
+    var payload: [reader_payload_len]u8 = undefined;
+    payload[0] = @intFromBool(readerActive(session));
+    std.mem.writeInt(u64, payload[1..9], session.owner_node_id, .little);
+    std.crypto.hash.sha2.Sha256.hash(session.principal orelse "", payload[9..41], .{});
+    return payload;
+}
+
+fn checkReaderPrefix(bytes: []const u8, principal: []const u8, owner: u64) !bool {
+    const header: []const u8 = if (std.mem.startsWith(u8, bytes, session_record.bound_session_header)) session_record.bound_session_header else "{";
+    if (!std.mem.startsWith(u8, bytes, header) or !std.mem.startsWith(u8, bytes[header.len..], reader_field)) return false;
+    const encoded = bytes[header.len + reader_field.len ..];
+    if (encoded.len < 2 * reader_payload_len + 2 or !std.mem.startsWith(u8, encoded[2 * reader_payload_len ..], "\",")) return error.InvalidTransactionSessionRecord;
+    var payload: [reader_payload_len]u8 = undefined;
+    _ = std.fmt.hexToBytes(&payload, encoded[0 .. 2 * reader_payload_len]) catch return error.InvalidTransactionSessionRecord;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(principal, &digest, .{});
+    if (payload[0] != 1 or !std.mem.eql(u8, &digest, payload[9..41])) return error.SqlTransactionNotActive;
+    if (std.mem.readInt(u64, payload[1..9], .little) != owner) return error.SessionLeaseLost;
+    return true;
+}
+
+fn requireDurableReader(alloc: std.mem.Allocator, read: anytype, id: db_mod.types.TxnId, principal: []const u8, owner: u64, check_lease: bool) !void {
+    const key = try makeSessionKey(alloc, id);
+    defer alloc.free(key);
+    checkDurableReaderSession(alloc, read, key, id, principal, owner) catch |err| switch (err) {
+        error.NotFound => return error.SqlTransactionNotActive,
+        else => return err,
+    };
+    if (!check_lease) return;
+    const lease_key = try makeSessionLeaseKey(alloc, id);
+    defer alloc.free(lease_key);
+    const raw = read.get(lease_key) catch |err| switch (err) {
+        error.NotFound => return error.SessionLeaseLost,
+        else => return err,
+    };
+    const lease = try std.json.parseFromSlice(lease_mod.LeaseRecord, alloc, raw, .{});
+    defer lease.deinit();
+    try requireReaderLease(lease.value, owner);
+}
+
+fn checkDurableReaderSession(alloc: std.mem.Allocator, read: anytype, key: []const u8, id: db_mod.types.TxnId, principal: []const u8, owner: u64) !void {
+    var scope = try read.openReadScope(alloc);
+    defer scope.close();
+    const prefix = scope.getRange(key, 0, reader_prefix_len) catch |err| switch (err) {
+        error.Unsupported, error.EndOfStream => null,
+        else => return err,
+    };
+    if (prefix) |bytes| if (try checkReaderPrefix(bytes, principal, owner)) return;
+    const full = try read.get(key);
+    if (prefix == null and try checkReaderPrefix(full, principal, owner)) return;
+    var legacy = try decodeSessionRecord(alloc, id, full);
+    defer legacy.deinit(alloc);
+    try checkSqlReader(&legacy, principal, owner);
+}
+
 fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -5886,6 +5969,9 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
         break :blk false;
     };
     try out.appendSlice(alloc, if (bound) session_record.bound_session_header else "{");
+    try out.appendSlice(alloc, reader_field);
+    try out.appendSlice(alloc, &std.fmt.bytesToHex(readerPayload(&session), .lower));
+    try out.appendSlice(alloc, "\",");
     try out.appendSlice(alloc, "\"owner_node_id\":");
     try out.print(alloc, "{d}", .{session.owner_node_id});
     try out.appendSlice(alloc, ",\"principal\":");
@@ -7178,6 +7264,65 @@ test "in-memory recovery scan rotates fairly when the first page remains pending
     }
 }
 
+test "SQL session metadata for a retained reader checks the shared session and live lease on one snapshot" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/reader-lease", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore_mod.DocStore.open(a, path, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(a, &store);
+    const leases = SessionLeaseStore.initFromDurable(&durable);
+    var registry = SessionRegistry.initWithLeaseTtl(&durable, leases, 60 * std.time.ns_per_s);
+    defer registry.deinit(a);
+    registry.durable_scope = .cluster_shared;
+    const info = try registry.beginForPrincipal(a, .{ .sql = .{ .database = "app", .namespace = "public", .isolation = .read_committed, .mode = .read_only } }, 7, "alice");
+    const id = info.txn_id;
+    try registry.requireActiveSqlReader(a, id, "alice", 7);
+    try std.testing.expectError(error.SessionLeaseLost, registry.requireActiveSqlReader(a, id, "alice", 8));
+    try std.testing.expectError(error.SqlTransactionNotActive, registry.requireActiveSqlReader(a, id, "bob", 7));
+
+    const key = try makeSessionKey(a, id);
+    defer a.free(key);
+    const raw = try store.get(a, key);
+    defer a.free(raw);
+    // Only the prefix is available to the fast path, independent of staged
+    // data, settings, and savepoints that may follow in the same value.
+    const PrefixOnly = struct {
+        prefix: []const u8,
+        fn openReadScope(self: *@This(), _: std.mem.Allocator) !*@This() {
+            return self;
+        }
+        fn getRange(self: *@This(), _: []const u8, offset: u64, length: usize) ![]const u8 {
+            try std.testing.expectEqual(@as(u64, 0), offset);
+            try std.testing.expectEqual(self.prefix.len, length);
+            return self.prefix;
+        }
+        fn get(_: *@This(), _: []const u8) ![]const u8 {
+            return error.UnexpectedFullRead;
+        }
+        fn close(_: *@This()) void {}
+    };
+    var bounded = PrefixOnly{ .prefix = raw[0..reader_prefix_len] };
+    try checkDurableReaderSession(a, &bounded, key, id, "alice", 7);
+    const old_fields = std.mem.indexOf(u8, raw, "\"owner_node_id\"").?;
+    const legacy = try std.mem.concat(a, u8, &.{ "{", raw[old_fields..] });
+    defer a.free(legacy);
+    try store.put(key, legacy);
+    try registry.requireActiveSqlReader(a, id, "alice", 7);
+    try std.testing.expectError(error.SqlTransactionNotActive, registry.requireActiveSqlReader(a, id, "bob", 7));
+    try store.put(key, raw);
+    const lease_key = try makeSessionLeaseKey(a, id);
+    defer a.free(lease_key);
+    try store.put(lease_key, "{\"owner_id\":\"node:7\",\"expires_at_ms\":1}");
+    try std.testing.expectError(error.SessionLeaseLost, registry.requireActiveSqlReader(a, id, "alice", 7));
+    try std.testing.expect(try leases.renew(id, 8, nextTxnTimestamp() / std.time.ns_per_ms, 60_000));
+    try std.testing.expectError(error.SessionLeaseLost, registry.requireActiveSqlReader(a, id, "alice", 7));
+    try store.delete(key);
+    try std.testing.expectError(error.SqlTransactionNotActive, registry.requireActiveSqlReader(a, id, "alice", 7));
+}
+
 test "background recovery adopts an expired shared-store owner lease" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7538,10 +7683,11 @@ test "SQL session metadata and schema fences survive durable records" {
     var registry = SessionRegistry.init(null);
     defer registry.deinit(alloc);
     const info = try registry.beginForPrincipal(alloc, .{ .sql = .{ .database = "app", .namespace = "public", .isolation = .read_committed, .mode = .read_only } }, 9, "alice");
-    try registry.requireActiveSqlReader(info.txn_id, "alice");
-    try std.testing.expectError(error.SqlTransactionNotActive, registry.requireActiveSqlReader(info.txn_id, "bob"));
+    try registry.requireActiveSqlReader(alloc, info.txn_id, "alice", 9);
+    try std.testing.expectError(error.SessionLeaseLost, registry.requireActiveSqlReader(alloc, info.txn_id, "alice", 10));
+    try std.testing.expectError(error.SqlTransactionNotActive, registry.requireActiveSqlReader(alloc, info.txn_id, "bob", 9));
     try registry.setSqlFailed(alloc, info.txn_id, true);
-    try std.testing.expectError(error.SqlTransactionNotActive, registry.requireActiveSqlReader(info.txn_id, "alice"));
+    try std.testing.expectError(error.SqlTransactionNotActive, registry.requireActiveSqlReader(alloc, info.txn_id, "alice", 9));
     const session = registry.sessions.get(info.txn_id).?;
     const bytes = try encodeSessionRecord(alloc, session);
     defer alloc.free(bytes);

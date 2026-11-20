@@ -75,6 +75,7 @@ const Portal = struct {
     search_path: ?commands.SearchPath = null,
     result: ?backend.Result = null,
     stream: ?backend.ReadStream = null,
+    session_id: ?[]const u8 = null,
     stream_opened: bool = false,
     stream_complete: bool = false,
     offset: usize = 0,
@@ -223,6 +224,10 @@ pub const Session = struct {
             self.setDeadline(if (timeout == 0) self.limits.statement_timeout_ms else @min(timeout, self.limits.statement_timeout_ms));
             self.diagnostic = .{};
             self.mutation_ack_pending = false;
+            const status_before_frame = self.status;
+            // The portal executing COMMIT or ROLLBACK owns its response.
+            // Release it and its siblings before reading the next frame.
+            defer if (status_before_frame != .idle and self.status == .idle) self.clearPortals();
             self.dispatch(tag, payload) catch |err| {
                 const completion_code: []const u8 = if (self.diagnostic.code) |*code| code else sqlstate(err);
                 if (std.mem.eql(u8, completion_code, "40003") and !self.mutation_ack_pending) {
@@ -1130,6 +1135,9 @@ pub const Session = struct {
                 }
                 const first_delivery = portal.result == null;
                 if (first_delivery) {
+                    if (portal.description.is_select) if (self.session_id) |id| {
+                        portal.session_id = try portal.arena.allocator().dupe(u8, id);
+                    };
                     portal.result = try self.executeCells(portal.arena.allocator(), portal.statement, portal.parameters, portal.types, portal.description.parameter_descriptors, portal.parameter_cells, portal.parameter_owner, portal.description.binding_guard, portal.description.setting_epoch, if (portal.description.is_select) .require_select else .none);
                     const result = portal.result.?;
                     if (!columnsEqual(portal.description.columns, result.columns)) return error.ResultShapeChanged;
@@ -1145,6 +1153,7 @@ pub const Session = struct {
                     var req = self.request(portal.statement, portal.parameters, portal.types);
                     req.binding_guard = portal.description.binding_guard;
                     req.setting_epoch = portal.description.setting_epoch;
+                    req.session_id = portal.session_id;
                     try self.deliverSelect(result, portal.formats, req, &portal.offset, count, first_delivery, false);
                 } else {
                     try self.dataResult(try result.view(portal.offset, count), portal.formats);
@@ -1296,7 +1305,7 @@ pub const Session = struct {
         defer if (!spool_moved) if (spool) |*owned| owned.deinit();
         if (stream) |opened| {
             if (!columnsEqual(description.columns, opened.columns)) return error.InvalidResult;
-            if (scroll or hold) if (opened.validate == null or opened.detach == null) return error.UnsupportedSqlExecution;
+            if (opened.validate == null or opened.detach == null) return error.UnsupportedSqlExecution;
         }
         if (stream == null or scroll or hold) {
             if (self.cursor_budget == null) {
@@ -1369,7 +1378,7 @@ pub const Session = struct {
                 stream.close(stream.context);
             }
         };
-        if (!fetch.move) try self.rowDescription(cursor.description.columns, &.{});
+        var pulled = false;
         var remaining: usize = if (fetch.count == std.math.maxInt(u32)) std.math.maxInt(usize) else fetch.count;
         while (!cursor.exhausted and remaining != 0) {
             try req.check();
@@ -1390,7 +1399,11 @@ pub const Session = struct {
                 if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rowCount() > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
                 if (page.result.rowCount() == 0 and !page.exhausted) return error.InvalidResult;
                 if (page.result.sql_nulls) |flags| if (flags.len != page.result.rowCount()) return error.InvalidResult;
-                if (!fetch.move) try self.dataResult(page.result, &.{});
+                if (!fetch.move) {
+                    if (!pulled) try self.rowDescription(cursor.description.columns, &.{});
+                    try self.dataResult(page.result, &.{});
+                }
+                pulled = true;
                 cursor.fetched += page.result.rowCount();
                 remaining -= page.result.rowCount();
                 cursor.exhausted = page.exhausted;
@@ -1398,10 +1411,14 @@ pub const Session = struct {
             }
             // Native pages borrow the stream's memory admission. Release the
             // page before releasing the exhausted stream and its snapshots.
-            if (cursor.exhausted) {
-                cursor.stream = null;
-                stream.close(stream.context);
-            }
+            if (cursor.exhausted) stream.detach.?(stream.context);
+        }
+        if (!pulled) {
+            const stream = cursor.stream orelse return error.InvalidCursorName;
+            var validation = std.heap.ArenaAllocator.init(self.alloc);
+            defer validation.deinit();
+            try stream.validate.?(stream.context, validation.allocator(), req);
+            if (!fetch.move) try self.rowDescription(cursor.description.columns, &.{});
         }
         var tag: [64]u8 = undefined;
         try self.command(try std.fmt.bufPrint(&tag, "{s} {d}", .{ if (fetch.move) "MOVE" else "FETCH", cursor.fetched - fetched_before }));
