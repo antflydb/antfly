@@ -1206,6 +1206,9 @@ pub const PreparedEffects = struct {
     /// runs once, after the writer has staged all final primary effects.
     pub fn bindDagPublication(self: *const @This(), txn: anytype, command: Command) !void {
         if (command.mode != .publish or command.producer_kind != .graph) return;
+        const bound = txn.artifact_inputs.dag_bindings orelse try LocalDagBinding.hasBindings(txn);
+        txn.artifact_inputs.dag_bindings = bound;
+        if (!bound) return;
         const prepared_digest = self.graph_publication_digest orelse return error.InvalidBatchRequest;
         if (!std.mem.eql(u8, &prepared_digest, &command.publication_digest) or
             !std.mem.eql(u8, &prepared_digest, &command.digest())) return error.InvalidBatchRequest;
