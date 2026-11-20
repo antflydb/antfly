@@ -55,8 +55,8 @@ namespace's read permission and existence before installing the entire path.
 An unqualified relation binds to the first matching table; authorization,
 catalog-generation, and other failures never trigger fallback. Table operations
 still authorize their own scoped resources. Lookup scope is separate from the
-immutable durable transaction-owner scope. Existing SQL prepared statements,
-Parse/Bind portals and cursors retain their original complete path. `$user`
+immutable durable transaction-owner scope. Each new Bind or SQL EXECUTE uses the
+current path. Bound portals and declared cursors retain their complete path. `$user`
 expansion remains unsupported. Other session settings are not
 acknowledged as no-ops. `SET CONSTRAINTS` is a native durable transaction command,
 not a connection setting.
@@ -120,10 +120,12 @@ proxy's login into an unbounded, cached grant or retry a canceled mutation.
   Execute suspends/resumes the same snapshot/result
   without replaying a statement or mutation. A statement can be closed
   independently of its portals. Opaque backend continuation tokens are rejected.
-- Cached statements recompile before Bind and before an unstarted Execute, using
-  their fixed parameter types and saved namespace/search path. Compatible DDL,
-  including an added unselected column or index, transparently refreshes the
-  catalog guard. Changed result types fail with `0A000` and PostgreSQL's
+- New bindings use the current ordered search path. A bound portal retains its
+  namespace, path and physical relation identities through Execute. Unchanged
+  catalog and authority generations reuse the last validated description.
+  Rebinding checks the parameter types, result types and field names. A replaced
+  table rejects an already bound portal with `40001`. Compatible DDL, including
+  an added unselected column or index, transparently refreshes the catalog guard. Changed result types fail with `0A000` and PostgreSQL's
   `cached plan must not change result type` message before reading or mutation
   admission. Rebinding also refreshes the settings epoch; execution validates
   that fresh epoch to fence concurrent setting catalog changes.

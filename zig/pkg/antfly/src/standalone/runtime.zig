@@ -3274,9 +3274,9 @@ const LocalStandaloneMetadata = struct {
             .resolve_many => |request| {
                 if (request.name_allocation and !self.standaloneRelationPublicationSupported())
                     return self.resolveAllocationNamesLocked(alloc, context, request);
-                if (request.relations.len != 0 or request.expected_relation_epoch != null) {
+                if (request.relations.len != 0 or request.expected_relation_epoch != null or request.include_source_epoch) {
                     const store = self.lifecycle_store orelse return error.CatalogPublicationProofPending;
-                    const resolved = try store.resolveSystemCatalogIdentities(alloc, group_ids.main_metadata_group_id, request);
+                    const resolved = try store.resolveSystemCatalogIdentitiesWithContext(alloc, group_ids.main_metadata_group_id, request, context);
                     defer resolved.deinit(alloc);
                     return std.json.Stringify.valueAlloc(alloc, resolved, .{});
                 }
@@ -4220,26 +4220,14 @@ const LocalStandaloneMetadata = struct {
     /// authority: restart must publish the current persisted source cut as well.
     fn awaitInitialRelationPublication(self: *LocalStandaloneMetadata, io: std.Io, cancellation: antfly.common.runtime_lifecycle.CancellationToken) !void {
         if (!self.standaloneRelationPublicationSupported()) return;
-        const store = self.lifecycle_store orelse return error.CatalogPublicationProofPending;
+        if (self.lifecycle_store == null) return error.CatalogPublicationProofPending;
         while (true) {
             try cancellation.check();
-            try self.reconcileRelations();
-            const work = try store.relationReconciliationWork(group_ids.main_metadata_group_id);
-            if (work.published_epoch) |published| {
-                if (work.root != null and work.epoch != null and published.eql(work.epoch.?)) return;
+            switch (try self.reconcileRelationsRound(.startup)) {
+                .published => return,
+                .applied, .scanning => continue,
+                .idle => try io.sleep(.fromMilliseconds(20), .awake),
             }
-            // Bounded pages and the control cadence make total publication
-            // time proportional to catalog size. Keep waiting through healthy
-            // progress and transient resource pressure; only a terminal error
-            // for this exact source epoch should fail startup.
-            if (work.current) |state| if (work.epoch) |epoch| {
-                if (state.epoch.eql(epoch)) switch (state.failure) {
-                    .none => {},
-                    .name_conflict => return error.CatalogAlreadyExists,
-                    .source_limit => return error.CatalogCommandTooLarge,
-                };
-            };
-            try io.sleep(.fromMilliseconds(20), .awake);
         }
     }
 
@@ -4274,28 +4262,36 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn reconcileRelations(self: *LocalStandaloneMetadata) !void {
+        _ = try self.reconcileRelationsRound(.background);
+    }
+
+    const RelationCoordinator = @import("../metadata/standalone_relation_reconciliation.zig");
+
+    fn reconcileRelationsRound(self: *LocalStandaloneMetadata, mode: RelationCoordinator.Mode) !RelationCoordinator.Outcome {
         // HA has a separate writer/replica authority contract. A standalone
         // coordinator cannot activate a single-owner capability for it.
-        const store = self.lifecycle_store orelse return;
-        if (!self.mutex.tryLock()) return;
+        const store = self.lifecycle_store orelse return .idle;
+        if (!self.mutex.tryLock()) return .idle;
         defer self.mutex.unlock();
-        if (!self.standaloneRelationPublicationSupported()) return;
+        if (!self.standaloneRelationPublicationSupported()) return .idle;
         const before = try store.standaloneRevision();
-        const applied = self.relation_reconciliation.step(store, self.alloc, group_ids.main_metadata_group_id, self.metadata_incarnation orelse return error.InvalidMetadataIncarnation, self.local_node_id, platform_time.monotonicNs()) catch |err| switch (err) {
-            error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.ResourceTemporarilyUnavailable, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.OutOfMemory, error.MetadataMutationOutcomeUnknown => false,
+        const outcome = self.relation_reconciliation.step(store, self.alloc, group_ids.main_metadata_group_id, self.metadata_incarnation orelse return error.InvalidMetadataIncarnation, self.local_node_id, platform_time.monotonicNs(), mode) catch |err| switch (err) {
+            error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.ResourceTemporarilyUnavailable, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.OutOfMemory, error.MetadataMutationOutcomeUnknown => return .idle,
             else => return err,
         };
+        if (outcome != .applied) return outcome;
         const after = try store.standaloneRevision();
         // Only certify an already current projection when this exact control
         // intent was the sole write. A failed refresh (revision zero), an
         // independent writer, or an uncertain apply must remain detectable by
         // the next catalog reader. No full projection scan on control rounds.
         if (self.durable_revision != 0 and self.durable_revision == before and
-            applied and before != std.math.maxInt(u64) and after == before + 1)
+            before != std.math.maxInt(u64) and after == before + 1)
         {
             self.durable_revision = after;
             self.epoch = after;
         }
+        return outcome;
     }
 
     fn provisionRestoreOwners(self: *LocalStandaloneMetadata) !void {
@@ -16437,10 +16433,13 @@ test "system catalog standalone relation coordinator startup publishes empty and
     {
         var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
         defer metadata.deinit();
+        // A deliberately delayed background round must never stall startup.
+        metadata.relation_reconciliation.next_round_at_ns = std.math.maxInt(u64);
         try metadata.awaitInitialRelationPublication(std.testing.io, cancellation.token());
         const targets = [_]system_catalog.RelationTarget{.{ .name = "startup_idx" }};
-        const resolved = try metadata.lifecycle_store.?.resolveSystemCatalogIdentities(alloc, group_ids.main_metadata_group_id, .{ .relations = &targets });
+        const resolved = try metadata.lifecycle_store.?.resolveSystemCatalogIdentities(alloc, group_ids.main_metadata_group_id, .{ .relations = &targets, .include_source_epoch = true });
         defer resolved.deinit(alloc);
+        try std.testing.expect(resolved.source_epoch.?.eql(resolved.relation_epoch.?));
         try std.testing.expect(resolved.relations[0] == null);
         const table: antfly.metadata.TableRecord = .{
             .table_id = 7,
@@ -16449,12 +16448,18 @@ test "system catalog standalone relation coordinator startup publishes empty and
             .indexes_json = "{}",
         };
         try metadata.lifecycle_store.?.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .upsert_table = table });
+        // A compact source observation invalidates the cached description before
+        // the background worker has published the new name registry.
+        const stamp = try metadata.lifecycle_store.?.resolveSystemCatalogIdentities(alloc, group_ids.main_metadata_group_id, .{ .include_source_epoch = true });
+        defer stamp.deinit(alloc);
+        try std.testing.expect(stamp.source_epoch.?.revision > resolved.source_epoch.?.revision);
+        try std.testing.expect(stamp.relation_epoch == null);
     }
     var reopened = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
     defer reopened.deinit();
     try reopened.awaitInitialRelationPublication(std.testing.io, cancellation.token());
     const targets = [_]system_catalog.RelationTarget{.{ .name = "startup_idx" }};
-    const resolved = try reopened.lifecycle_store.?.resolveSystemCatalogIdentities(alloc, group_ids.main_metadata_group_id, .{ .relations = &targets });
+    const resolved = try reopened.lifecycle_store.?.resolveSystemCatalogIdentities(alloc, group_ids.main_metadata_group_id, .{ .relations = &targets, .include_source_epoch = true });
     defer resolved.deinit(alloc);
     try std.testing.expect(resolved.relations[0] != null);
     // Cancellation remains effective even when a live root already exists.

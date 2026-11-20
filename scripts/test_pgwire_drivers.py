@@ -82,6 +82,118 @@ def exercise_cached_setting_plans(server, password):
     print("SQL and driver cached settings survive catalog changes: PASS", flush=True)
 
 
+def exercise_bound_write(server, password):
+    """Commit DDL after the client receives BindComplete and before Execute."""
+    import socket
+    import struct
+
+    import psycopg
+
+    def message(tag, data=b""):
+        return tag + struct.pack("!I", 4 + len(data)) + data
+
+    def receive(reader):
+        tag = reader.read(1)
+        size = struct.unpack("!I", reader.read(4))[0]
+        assert 4 <= size <= 65536, size
+        data = reader.read(size - 4)
+        assert len(data) == size - 4
+        return tag, data
+
+    url = f"postgres://admin:{password}@127.0.0.1:{server.pgwire_port}/default"
+    with (
+        psycopg.connect(url, autocommit=True, sslmode="disable") as session,
+        psycopg.connect(url, autocommit=True) as migrator,
+        socket.fromfd(
+            session.pgconn.socket, socket.AF_INET, socket.SOCK_STREAM
+        ) as wire,
+        wire.makefile("rb") as reader,
+    ):
+        wire.settimeout(10)
+        create = "CREATE TABLE portal_target (id TEXT, n BIGINT)"
+        insert = "INSERT INTO portal_target (id, n) VALUES ('a', 0)"
+        migrator.execute(create)
+        migrator.execute(insert)
+        sql = b"UPDATE portal_target SET n = 9 WHERE id = 'a'"
+        wire.sendall(message(b"P", b"stmt\0" + sql + b"\0\0\0") + message(b"H"))
+        assert receive(reader) == (b"1", b"")
+
+        for migration in ("alter", "replace", "reuse"):
+            wire.sendall(message(b"B", b"portal\0stmt\0" + bytes(6)) + message(b"H"))
+            assert receive(reader) == (b"2", b"")
+            if migration == "alter":
+                migrator.execute("ALTER TABLE portal_target ADD COLUMN note TEXT")
+            if migration == "replace":
+                migrator.execute("DROP TABLE portal_target")
+                migrator.execute(create)
+                migrator.execute(insert)
+            wire.sendall(message(b"E", b"portal\0" + bytes(4)) + message(b"S"))
+            errors = []
+            while True:
+                tag, data = receive(reader)
+                if tag == b"E":
+                    errors.append(data.split(b"\0"))
+                if tag == b"Z":
+                    break
+            if migration == "replace":
+                assert len(errors) == 1 and b"C40001" in errors[0], errors
+            else:
+                assert not errors, errors
+            assert migrator.execute("SELECT n FROM portal_target").fetchone() == (
+                0 if migration == "replace" else 9,
+            )
+
+    print(
+        "Bound UPDATE rejects a replaced table and a fresh Bind succeeds: PASS",
+        flush=True,
+    )
+
+
+def exercise_cached_search_path(server, password):
+    import psycopg
+
+    url = f"postgres://admin:{password}@127.0.0.1:{server.pgwire_port}/default"
+    with (
+        psycopg.connect(url, autocommit=True) as conn,
+        psycopg.ClientCursor(conn) as sql,
+    ):
+        for schema, column, value in (
+            ("path_first", "n", 1),
+            ("path_second", "n", 2),
+            ("path_renamed", "renamed", 3),
+        ):
+            sql.execute(f"CREATE SCHEMA {schema}")
+            sql.execute(f"CREATE TABLE {schema}.cached_path (id TEXT, {column} BIGINT)")
+            sql.execute(
+                f"INSERT INTO {schema}.cached_path (id, {column}) VALUES ('a', {value})"
+            )
+
+        query = "SELECT * FROM cached_path"
+        sql.execute("SET search_path TO path_first")
+        sql.execute("PREPARE path_plan AS " + query)
+        for schema, value in (("path_first", 1), ("path_second", 2)):
+            sql.execute(f"SET search_path TO {schema}")
+            sql.execute("EXECUTE path_plan")
+            assert sql.fetchone() == ("a", value)
+            assert conn.execute(query, prepare=True).fetchone() == ("a", value)
+
+        sql.execute("SET search_path TO path_renamed")
+        for execute in (
+            lambda: sql.execute("EXECUTE path_plan"),
+            lambda: conn.execute(query, prepare=True),
+        ):
+            try:
+                execute()
+            except psycopg.Error as exc:
+                assert exc.sqlstate == "0A000", exc
+            else:
+                raise AssertionError("cached result accepted a changed column label")
+    print(
+        "SQL and wire statements follow search_path and preserve column labels: PASS",
+        flush=True,
+    )
+
+
 def run_clients(url, drivers, http_url=None):
     env = {**os.environ, "ANTFLY_PGWIRE_URL": url}
     if http_url:
@@ -135,29 +247,36 @@ def main():
         run_clients(args.url, args.drivers, args.http_url)
         return
     sys.path.insert(0, str(ROOT / "zig" / "e2e" / "antfly"))
+    import psycopg
     from conftest import AUTH_BOOTSTRAP_PASSWORD, StandaloneAntflyServer
 
+    startup_ddl = iter(
+        (
+            "CREATE TABLE ready_immediately (id TEXT PRIMARY KEY)",
+            "CREATE INDEX ready_after_restart ON ready_immediately(id)",
+        )
+    )
+
+    def first_ddl(server):
+        with psycopg.connect(
+            f"postgres://admin:{AUTH_BOOTSTRAP_PASSWORD}@127.0.0.1:{server.pgwire_port}/default",
+            autocommit=True,
+        ) as conn:
+            conn.execute(next(startup_ddl))
+
     server = StandaloneAntflyServer(
-        str(args.binary.resolve()), "127.0.0.1", 0, pgwire=True
+        str(args.binary.resolve()),
+        "127.0.0.1",
+        0,
+        pgwire=True,
+        on_first_ready=first_ddl,
     )
     failed = False
     try:
-        # First SQL immediately after the fixture observes HTTP readiness: no
-        # publication retry loop may hide a cold-start readiness regression.
-        import psycopg
-
-        with psycopg.connect(
-            f"postgres://admin:{AUTH_BOOTSTRAP_PASSWORD}@127.0.0.1:{server.pgwire_port}/default",
-            autocommit=True,
-        ) as conn:
-            conn.execute("CREATE TABLE ready_immediately (id TEXT PRIMARY KEY)")
         server.restart()
-        with psycopg.connect(
-            f"postgres://admin:{AUTH_BOOTSTRAP_PASSWORD}@127.0.0.1:{server.pgwire_port}/default",
-            autocommit=True,
-        ) as conn:
-            conn.execute("CREATE INDEX ready_after_restart ON ready_immediately(id)")
         print("cold-start and restart DDL without retries: PASS", flush=True)
+        exercise_bound_write(server, AUTH_BOOTSTRAP_PASSWORD)
+        exercise_cached_search_path(server, AUTH_BOOTSTRAP_PASSWORD)
         exercise_cached_setting_plans(server, AUTH_BOOTSTRAP_PASSWORD)
         run_clients(
             f"postgres://admin:{AUTH_BOOTSTRAP_PASSWORD}@127.0.0.1:{server.pgwire_port}/default",

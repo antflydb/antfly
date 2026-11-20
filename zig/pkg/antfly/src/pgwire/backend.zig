@@ -105,7 +105,14 @@ pub const Diagnostic = struct {
 
 pub const MutationOutcome = enum { committed, committed_pending, committed_repair_required, committed_graph_metric_materialization_rejected };
 
+pub const DescriptionStamp = struct {
+    catalog_revision: u64,
+    relation_epoch: @import("antfly_local_sources").system_catalog_relation_reconciliation.Epoch,
+    authority: [32]u8,
+};
+
 pub const Description = struct {
+    stamp: ?DescriptionStamp = null,
     columns: []const Column = &.{},
     parameter_types: []const Type = &.{},
     parameter_descriptors: []const Parameter = &.{},
@@ -206,6 +213,10 @@ pub const Backend = struct {
         /// Called serially between protocol operations, after backend work joins.
         refresh: ?*const fn (*anyopaque, std.mem.Allocator, Identity, []const u8) anyerror!void = null,
         describe: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Description,
+        /// Validate the exact catalog and principal used to describe a statement.
+        description_current: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request, Description) anyerror!bool = null,
+        /// Compare resolved targets across compatible schema versions of a bound portal.
+        same_binding_targets: ?*const fn ([]const u8, []const u8) bool = null,
         execute: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Result,
         /// Authenticated catalog snapshot for typed dotted-name SET/SHOW/RESET.
         load_settings: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!@import("antfly_local_sources").sql_setting_catalog.RawSnapshot = null,

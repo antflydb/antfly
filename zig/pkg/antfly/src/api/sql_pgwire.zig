@@ -148,7 +148,17 @@ pub const Adapter = struct {
     server: *http.ApiHttpServer,
 
     pub fn backend(self: *Adapter) wire.Backend {
-        return .{ .context = self, .vtable = &.{ .native_parameters = true, .authenticate = authenticate, .refresh = refresh, .describe = describe, .execute = execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .evaluate_parameter_cells = evaluateParameterCells, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect, .completion_safe = completionSafe, .pin_completion = pinCompletion, .reserve_completion = reserveCompletion, .completion_ready = completionReady } };
+        return .{ .context = self, .vtable = &.{ .native_parameters = true, .authenticate = authenticate, .refresh = refresh, .describe = describe, .description_current = descriptionCurrent, .same_binding_targets = sameBindingTargets, .execute = execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .evaluate_parameter_cells = evaluateParameterCells, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect, .completion_safe = completionSafe, .pin_completion = pinCompletion, .reserve_completion = reserveCompletion, .completion_ready = completionReady } };
+    }
+
+    fn descriptionCurrent(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request, description: wire.Description) !bool {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        const credential: *Credential = @ptrCast(@alignCast(identity.context));
+        var authenticated: ?http.AuthenticatedIdentity = try credential.identity(self.server.alloc);
+        defer authenticated.?.deinit(self.server.alloc);
+        var authority: Authority = .{ .credential = credential, .identity = &authenticated, .request = request };
+        const stamp = try descriptionStamp(self.server, alloc, try authority.context(), authenticated.?) orelse return false;
+        return std.meta.eql(description.stamp.?, stamp);
     }
 
     fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
@@ -986,6 +996,9 @@ const Job = struct {
                 .unknown => null,
                 inline else => |tag| @field(ast.ColumnType, @tagName(tag)),
             };
+            // Sample before binding: a concurrent change makes the next probe
+            // miss. Query execution still verifies its exact admission guards.
+            const stamp = try descriptionStamp(server, self.alloc, context, identity.?);
             var describe_backend = guarded.backend();
             describe_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
             if (compiled.uses_current_setting) describe_backend.setting_capture = native_adapter.settingCapture();
@@ -996,6 +1009,7 @@ const Job = struct {
             const parameter_types = try self.alloc.alloc(wire.Type, description.binding.parameter_types.len);
             for (parameter_types, description.binding.parameter_types) |*out, kind| out.* = if (kind) |value| try wireType(value) else .unknown;
             self.description = .{
+                .stamp = stamp,
                 .columns = columns,
                 .parameter_types = parameter_types,
                 .parameter_descriptors = try self.alloc.dupe(wire.Parameter, description.binding.parameter_descriptors),
@@ -1594,6 +1608,31 @@ const GuardedCatalog = struct {
     }
 };
 
+fn descriptionStamp(server: *http.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, identity: http.AuthenticatedIdentity) !?wire.DescriptionStamp {
+    const domain = @import("antfly_local_sources").system_catalog_domain;
+    // Optional optimization: older metadata peers can reject the added field,
+    // and stores without relation tracking cannot attest the physical cut.
+    const bytes = server.source.systemCatalog(alloc, context, .{ .resolve_many = .{ .include_source_epoch = true } }) catch {
+        try context.ensureActive();
+        return null;
+    };
+    defer alloc.free(bytes);
+    var reply = try std.json.parseFromSlice(domain.ResolvedMany, alloc, bytes, .{ .ignore_unknown_fields = true });
+    defer reply.deinit();
+    const epoch = reply.value.source_epoch orelse return null;
+    if (epoch.revision == 0 or std.mem.allEqual(u8, &epoch.incarnation, 0)) return null;
+    var buffer: [512]u8 = undefined;
+    var hash: std.Io.Writer.Hashing(std.crypto.hash.Blake3) = .init(&buffer);
+    std.json.Stringify.value(.{
+        identity.username,    identity.user_instance_id, identity.credential_principal, identity.is_internal_service,
+        identity.permissions, identity.roles,            identity.row_filter,           identity.metadata_json,
+    }, .{}, &hash.writer) catch unreachable;
+    hash.writer.flush() catch unreachable;
+    var digest: [32]u8 = undefined;
+    hash.hasher.final(&digest);
+    return .{ .catalog_revision = reply.value.revision, .relation_epoch = epoch, .authority = digest };
+}
+
 fn statementBindingGuard(alloc: std.mem.Allocator, revision: ?u64, binding: describe_sql.BoundStatement) !?[]const u8 {
     var scans: [64]catalog.StatementScan = undefined;
     var count: usize = 0;
@@ -1619,6 +1658,11 @@ fn collectBindingTables(binding: describe_sql.BoundStatement, scans: *[64]catalo
     };
     if (binding.insert_source) |source| try collectBindingTables(source.*, scans, count, depth + 1);
     if (binding.joined_mutation) |joined| try collectBindingTables(joined.input.*, scans, count, depth + 1);
+    if (binding.merge_mutation) |merge| {
+        try collectBindingTable(merge.target, scans, count);
+        try collectBindingTables(merge.input.*, scans, count, depth + 1);
+    }
+    if (binding.window) |window| try collectBindingTables(window.input.*, scans, count, depth + 1);
     if (binding.returning) |returning| try collectBindingTables(returning.*, scans, count, depth + 1);
 }
 
@@ -1645,24 +1689,54 @@ fn bindingGuards(alloc: std.mem.Allocator, revision: u64, scans: []const catalog
     return bytes;
 }
 
+const GuardTargets = struct {
+    rest: []const u8,
+    count: u16,
+    const Target = struct { id: u64, version: u32, name: []const u8 };
+
+    fn init(guard: []const u8) !GuardTargets {
+        if (guard.len < 10) return error.CatalogGenerationChanged;
+        const count = std.mem.readInt(u16, guard[8..10], .little);
+        if (count == 0 or count > 64) return error.CatalogGenerationChanged;
+        return .{ .rest = guard[10..], .count = count };
+    }
+    fn next(self: *GuardTargets) !?Target {
+        if (self.count == 0) {
+            if (self.rest.len != 0) return error.CatalogGenerationChanged;
+            return null;
+        }
+        const entry = self.rest;
+        if (entry.len < 16) return error.CatalogGenerationChanged;
+        const len = std.mem.readInt(u32, entry[0..4], .little);
+        if (len > entry.len - 16) return error.CatalogGenerationChanged;
+        self.rest = entry[16 + len ..];
+        self.count -= 1;
+        return .{ .id = std.mem.readInt(u64, entry[4..12], .little), .version = std.mem.readInt(u32, entry[12..16], .little), .name = entry[16..][0..len] };
+    }
+};
+
+fn sameBindingTargets(before: []const u8, after: []const u8) bool {
+    var left = GuardTargets.init(before) catch return false;
+    var right = GuardTargets.init(after) catch return false;
+    if (left.count != right.count) return false;
+    while (left.next() catch return false) |x| {
+        const y = (right.next() catch return false) orelse return false;
+        if (x.id != y.id or !std.mem.eql(u8, x.name, y.name)) return false;
+    }
+    return right.rest.len == 0;
+}
+
 fn verifyBindingGuard(guard: []const u8, revision: u64, table: catalog.Table) !void {
-    if (guard.len < 10 or std.mem.readInt(u64, guard[0..8], .little) != revision) return error.CatalogGenerationChanged;
-    const count = std.mem.readInt(u16, guard[8..10], .little);
-    if (count == 0 or count > 64) return error.CatalogGenerationChanged;
-    var rest = guard[10..];
+    var targets = try GuardTargets.init(guard);
+    if (std.mem.readInt(u64, guard[0..8], .little) != revision) return error.CatalogGenerationChanged;
     var found = false;
-    for (0..count) |_| {
-        if (rest.len < 16) return error.CatalogGenerationChanged;
-        const length = std.mem.readInt(u32, rest[0..4], .little);
-        if (length > rest.len - 16) return error.CatalogGenerationChanged;
-        if (std.mem.eql(u8, rest[16..][0..length], table.physical_name)) {
-            if (std.mem.readInt(u64, rest[4..12], .little) != table.id or
-                std.mem.readInt(u32, rest[12..16], .little) != table.schema_version) return error.CatalogGenerationChanged;
+    while (try targets.next()) |target| {
+        if (std.mem.eql(u8, target.name, table.physical_name)) {
+            if (target.id != table.id or target.version != table.schema_version) return error.CatalogGenerationChanged;
             found = true;
         }
-        rest = rest[16 + length ..];
     }
-    if (rest.len != 0 or !found) return error.CatalogGenerationChanged;
+    if (!found) return error.CatalogGenerationChanged;
 }
 
 test "SQL pgwire prepared identity rejects same shaped table replacement before execution" {
@@ -1684,6 +1758,20 @@ test "SQL pgwire prepared identity rejects same shaped table replacement before 
         .{ .table = other, .request = .{ .fields = &.{}, .limit = 1 } },
     });
     defer std.testing.allocator.free(many);
+    const compatible = try bindingGuard(std.testing.allocator, 8, replacement);
+    defer std.testing.allocator.free(compatible);
+    try std.testing.expect(sameBindingTargets(guard, compatible));
+    try std.testing.expect(!sameBindingTargets(guard, many));
+    try std.testing.expect(sameBindingTargets(many, many));
+    for (0..many.len) |length| try std.testing.expect(!sameBindingTargets(many, many[0..length]));
+    for ([_]catalog.Table{
+        .{ .id = table.id + 1, .physical_name = table.physical_name, .schema_version = table.schema_version, .columns = &.{} },
+        .{ .id = table.id, .physical_name = "another_name", .schema_version = table.schema_version, .columns = &.{} },
+    }) |different| {
+        const changed = try bindingGuard(std.testing.allocator, 7, different);
+        defer std.testing.allocator.free(changed);
+        try std.testing.expect(!sameBindingTargets(guard, changed));
+    }
     try verifyBindingGuard(many, 7, other);
     try verifyBindingGuard(many, 7, table);
     for (0..many.len) |length| try std.testing.expectError(error.CatalogGenerationChanged, verifyBindingGuard(many[0..length], 7, other));

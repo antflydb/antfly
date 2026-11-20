@@ -14799,6 +14799,13 @@ pub const RaftApplyStore = struct {
             null;
         if (live) |value| if (!value.root.epoch.eql(try relationSourceEpochTxn(&txn, group_id))) return error.CatalogGenerationChanged;
         if (request.expected_relation_epoch) |expected| if (!live.?.root.epoch.eql(expected)) return error.CatalogGenerationChanged;
+        const source_epoch = if (request.include_source_epoch)
+            relationSourceEpochTxn(&txn, group_id) catch |err| switch (err) {
+                error.CatalogSourceUntracked, error.InvalidMetadataIncarnation => null,
+                else => return err,
+            }
+        else
+            null;
         const tables = try alloc.alloc(?system_catalog.ResolvedTable, request.targets.len);
         var initialized: usize = 0;
         errdefer {
@@ -14851,7 +14858,7 @@ pub const RaftApplyStore = struct {
             }
             slot.* = .{ .owner = owner, .table = table, .logical_table = try alloc.dupe(u8, logical_name) };
         }
-        return .{ .revision = meta.revision, .tables = tables, .logical_names = try system_catalog.logicalNamesAlloc(alloc, view, request.storage_names), .relation_epoch = if (live) |value| value.root.epoch else null, .relations = relations };
+        return .{ .revision = meta.revision, .tables = tables, .logical_names = try system_catalog.logicalNamesAlloc(alloc, view, request.storage_names), .source_epoch = source_epoch, .relation_epoch = if (live) |value| value.root.epoch else null, .relations = relations };
     }
 
     /// Name selection can precede registry adoption. Read the complete source

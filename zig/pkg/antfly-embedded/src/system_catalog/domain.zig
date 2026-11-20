@@ -1202,6 +1202,9 @@ pub const ResolveMany = struct {
     /// Captured with forward bindings in the same immutable catalog read.
     storage_names: []const []const u8 = &.{},
     include_query_definitions: bool = false,
+    /// Request the tracked physical relation source cut alongside the logical
+    /// revision. A missing epoch cannot validate a cached binding.
+    include_source_epoch: bool = false,
     expected_revision: ?u64 = null,
     relations: []const RelationTarget = &.{},
     /// Name allocation may use an authoritative metadata cut without a
@@ -1210,7 +1213,9 @@ pub const ResolveMany = struct {
     expected_relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        if (self.relations.len != 0 or self.expected_relation_epoch != null) {
+        if (self.include_source_epoch) {
+            try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .include_source_epoch = true, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch });
+        } else if (self.relations.len != 0 or self.expected_relation_epoch != null) {
             try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch });
         } else {
             // Keep ordinary table resolution compatible with strict old peers.
@@ -1223,6 +1228,8 @@ pub const ResolvedMany = struct {
     revision: u64,
     tables: []const ?ResolvedTable,
     logical_names: []const ?[]const u8 = &.{},
+    /// Source observation for descriptor invalidation, independent of publication.
+    source_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
     /// Null means the receiver did not attest authoritative relation resolution.
     /// A missing field from an older peer must never prove name absence.
     relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
@@ -1231,7 +1238,9 @@ pub const ResolvedMany = struct {
     relation_names_only: bool = false,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        if (self.relation_epoch != null or self.relations.len != 0) {
+        if (self.source_epoch != null) {
+            try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .source_epoch = self.source_epoch, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only });
+        } else if (self.relation_epoch != null or self.relations.len != 0) {
             try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only });
         } else {
             try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names });
