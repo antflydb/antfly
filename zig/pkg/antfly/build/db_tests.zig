@@ -699,6 +699,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_db_enrichment_step.dependOn(&run_lib_db_enrichment_tests.step);
 
     const lib_db_query_default_filters = [_][]const u8{
+        "optional numeric range",
         "(#1095)",
         "db query drops full text hits whose stored document row was deleted directly from the store",
         "db native document filters preserve paged totals across representations",

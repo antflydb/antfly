@@ -5640,6 +5640,31 @@ pub const ModelManager = struct {
         }, control);
     }
 
+    fn chunkPlanningGemmaIdentity(self: *ModelManager, model_dir: []const u8, man: manifest_mod.ModelManifest, io: std.Io, control: InferenceExecutionControl) ![64]u8 {
+        const identity = @import("../models/embedding_gemma2_identity.zig");
+        const snapshot = try identity.snapshotCached(self.allocator, io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights, control);
+        return identity.forBackend(snapshot.digest, embeddingPlanningBackend(self.session_manager));
+    }
+
+    /// Resolve the same identity used by chunk execution without opening a
+    /// tokenizer or reserving inference capacity.
+    pub fn chunkPlanningIdentityForDiscovery(self: *ModelManager, model_dir: []const u8, io: std.Io, control: InferenceExecutionControl) ![64]u8 {
+        var lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
+        defer lease.deinit(io);
+        const publication = try self.publicationForRequest(model_dir, control);
+        try control.check();
+        var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
+        defer man.deinit();
+        if (publication != null and !std.meta.eql(publication, man.managed_publication)) return error.ModelArtifactsChanging;
+
+        const identity = if (man.embedding_style == .embedding_gemma2)
+            try self.chunkPlanningGemmaIdentity(model_dir, man, io, control)
+        else
+            std.fmt.bytesToHex(try modelIdentity(self.allocator, io, model_dir, man), .lower);
+        _ = try self.publicationForRequest(model_dir, control);
+        return identity;
+    }
+
     pub fn modelIdentityForManifest(self: *ModelManager, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
         return modelIdentity(self.allocator, try self.componentPlanIo(), model_dir, manifest);
     }

@@ -12917,10 +12917,9 @@ pub const HBCIndex = struct {
         };
         self.legacy_lsm_detach_pending = false;
 
-        // Store handles and a retained posting Store can borrow the LSM's
-        // internally-owned NativeStorage object. Drop them before closing the
-        // LSM, then recreate the posting handle from the retained storage
-        // lease held by NativeBackend.
+        // Drop handles tied to the LSM before closing it. NativeBackend now
+        // owns the storage runtime and can open new posting handles after the
+        // LSM has shut down.
         self.closeExperimentalPostingWalWriter();
         if (self.experimental_posting_write_store) |*store| store.deinit();
         self.experimental_posting_write_store = null;
