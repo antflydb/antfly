@@ -1585,15 +1585,15 @@ pub const Contributions = struct {
 
     /// Stage the participant's vote in the reserved snapshot.
     pub fn prepare(alloc: A, txn: anytype, token: Token, versions: Digest, replacements: []const Replacement, budget: *validation.Budget, witness: *validation.Witness) !void {
-        _ = try validateReplacements(alloc, txn, token, versions, replacements, budget, witness, false);
+        _ = try validateReplacements(alloc, txn, token, versions, replacements, budget, witness, .validate_only);
     }
 
     /// Validate and install one exact delta in the same writer snapshot.
     pub fn prepareAndAccept(alloc: A, txn: anytype, token: Token, versions: Digest, replacements: []const Replacement, budget: *validation.Budget, witness: *validation.Witness) !Receipt {
-        return (try validateReplacements(alloc, txn, token, versions, replacements, budget, witness, true)).?;
+        return (try validateReplacements(alloc, txn, token, versions, replacements, budget, witness, .accept)).?;
     }
 
-    fn validateReplacements(alloc: A, txn: anytype, token: Token, versions: Digest, replacements: []const Replacement, budget: *validation.Budget, witness: *validation.Witness, comptime accept_now: bool) !?Receipt {
+    fn validateReplacements(alloc: A, txn: anytype, token: Token, versions: Digest, replacements: []const Replacement, budget: *validation.Budget, witness: *validation.Witness, comptime action: enum { validate_only, prepare_packet, accept }) !?Receipt {
         var memory: validation.Memory = .{ .parent = alloc, .budget = budget };
         const bounded = memory.allocator();
         var arena = std.heap.ArenaAllocator.init(bounded);
@@ -1613,7 +1613,16 @@ pub const Contributions = struct {
             }
             return err;
         };
-        if (!accept_now) return null;
+        if (action == .prepare_packet) {
+            TransactionParticipant.stagePacket(bounded, txn, token.domain, versions, replacements, delta, budget) catch |err| {
+                if (err == error.OutOfMemory and memory.denied) {
+                    budget.exhausted = .memory;
+                    return error.GraphConstraintCapacity;
+                }
+                return err;
+            };
+        }
+        if (action != .accept) return null;
         const receipt = try Storage.accept(alloc, txn, token, delta.adjacency, delta.membership);
         try stageManifests(alloc, txn, token.domain, replacements);
         return receipt;
@@ -1680,7 +1689,8 @@ pub const TransactionParticipant = struct {
     const validation = @import("dag_validation.zig");
     const A = std.mem.Allocator;
     const prefix = "\x00\x00__metadata__:dag-prepared:";
-    const magic = "DAGP\x01";
+    const legacy_magic = "DAGP\x01";
+    const magic = "DAGP\x02";
     const max_packet_bytes = 64 * 1024 * 1024;
 
     fn key(domain_id: Digest) [prefix.len + 32]u8 {
@@ -1697,18 +1707,13 @@ pub const TransactionParticipant = struct {
         witness: *validation.Witness,
     ) !void {
         witness.* = .{};
-        try Contributions.prepare(alloc, txn, token, versions, replacements, budget, witness);
-        var memory: validation.Memory = .{ .parent = alloc, .budget = budget };
-        const bounded = memory.allocator();
-        const packet = encode(bounded, versions, replacements, budget) catch |err| {
-            if (err == error.OutOfMemory and memory.denied) {
-                budget.exhausted = .memory;
-                return error.GraphConstraintCapacity;
-            }
-            return err;
-        };
-        defer bounded.free(packet);
-        try txn.put(&key(token.domain), packet);
+        _ = try Contributions.validateReplacements(alloc, txn, token, versions, replacements, budget, witness, .prepare_packet);
+    }
+
+    fn stagePacket(alloc: A, txn: anytype, domain_id: Digest, versions: Digest, replacements: []const Contributions.Replacement, delta: Contributions.Plan, budget: *validation.Budget) !void {
+        const packet = try encode(alloc, versions, replacements, delta, budget);
+        defer alloc.free(packet);
+        try txn.put(&key(domain_id), packet);
     }
 
     /// The caller authenticates the durable coordinator decision and attaches
@@ -1735,10 +1740,20 @@ pub const TransactionParticipant = struct {
                 defer arena.deinit();
                 const scratch = arena.allocator();
                 var packet: Packet = .{ .remaining = try scratch.dupe(u8, raw) };
-                if (!std.mem.eql(u8, try packet.take(magic.len), magic)) return error.InvalidDagAuthority;
+                const header = try packet.take(magic.len);
+                const legacy = std.mem.eql(u8, header, legacy_magic);
+                if (!legacy and !std.mem.eql(u8, header, magic)) return error.InvalidDagAuthority;
                 const versions = (try packet.take(32))[0..32].*;
                 const replacements = try packet.decode(scratch);
-                break :blk try Contributions.accept(scratch, txn, token, versions, replacements);
+                if (legacy) {
+                    if (packet.remaining.len != 0) return error.InvalidDagAuthority;
+                    break :blk try Contributions.accept(scratch, txn, token, versions, replacements);
+                }
+                const delta = try packet.decodeDelta(scratch);
+                try Contributions.requireCandidate(token, versions, replacements);
+                const accepted = try Storage.accept(scratch, txn, token, delta.adjacency, delta.membership);
+                try Contributions.stageManifests(scratch, txn, token.domain, replacements);
+                break :blk accepted;
             },
             .aborted => try Storage.reject(txn, token, .aborted),
             .semantic_rejection => try Storage.reject(txn, token, .semantic_rejection),
@@ -1763,7 +1778,7 @@ pub const TransactionParticipant = struct {
         try append(packet, alloc, bytes);
     }
 
-    fn encode(alloc: A, versions: Digest, replacements: []const Contributions.Replacement, budget: *validation.Budget) ![]u8 {
+    fn encode(alloc: A, versions: Digest, replacements: []const Contributions.Replacement, delta: Contributions.Plan, budget: *validation.Budget) ![]u8 {
         var packet: std.ArrayList(u8) = .empty;
         errdefer packet.deinit(alloc);
         try append(&packet, alloc, magic);
@@ -1779,7 +1794,26 @@ pub const TransactionParticipant = struct {
                 try appendBytes(&packet, alloc, target);
             }
         }
+        try appendCount(&packet, alloc, delta.adjacency.len);
+        for (delta.adjacency) |edge| {
+            try budget.checkpoint();
+            try appendEdge(&packet, alloc, edge);
+        }
+        try appendCount(&packet, alloc, delta.membership.len);
+        for (delta.membership) |update| {
+            try budget.checkpoint();
+            try appendEdge(&packet, alloc, update.edge);
+            var owners: [8]u8 = undefined;
+            std.mem.writeInt(u64, &owners, update.owners, .big);
+            try append(&packet, alloc, &owners);
+        }
         return packet.toOwnedSlice(alloc);
+    }
+
+    fn appendEdge(packet: *std.ArrayList(u8), alloc: A, edge: validation.Change) !void {
+        try appendBytes(packet, alloc, edge.source);
+        try appendBytes(packet, alloc, edge.target);
+        try append(packet, alloc, &.{@intFromBool(edge.present)});
     }
 
     const Packet = struct {
@@ -1814,8 +1848,33 @@ pub const TransactionParticipant = struct {
                 for (targets) |*target| target.* = try self.bytes();
                 replacement.* = .{ .owner = owner, .source = source, .targets = targets };
             }
-            if (self.remaining.len != 0) return error.InvalidDagAuthority;
             return replacements;
+        }
+
+        fn edge(self: *Packet) !validation.Change {
+            const source = try self.bytes();
+            const target = try self.bytes();
+            const present = (try self.take(1))[0];
+            if (present > 1) return error.InvalidDagAuthority;
+            return .{ .source = source, .target = target, .present = present != 0 };
+        }
+
+        fn decodeDelta(self: *Packet, alloc: A) !Contributions.Plan {
+            const adjacency_len = try self.count();
+            if (adjacency_len > self.remaining.len / 9) return error.InvalidDagAuthority;
+            const adjacency = try alloc.alloc(validation.Change, adjacency_len);
+            for (adjacency) |*change| change.* = try self.edge();
+            const membership_len = try self.count();
+            if (membership_len > self.remaining.len / 17) return error.InvalidDagAuthority;
+            const membership = try alloc.alloc(Membership.Update, membership_len);
+            for (membership) |*update| {
+                update.* = .{
+                    .edge = try self.edge(),
+                    .owners = std.mem.readInt(u64, (try self.take(8))[0..8], .big),
+                };
+            }
+            if (self.remaining.len != 0) return error.InvalidDagAuthority;
+            return .{ .adjacency = adjacency, .membership = membership };
         }
     };
 };
@@ -2031,6 +2090,19 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
             writable[0] ^= 1;
             try std.testing.expectError(error.InvalidDagAuthority, TransactionParticipant.resolve(alloc, &txn, id, epoch, attempt, .accepted));
             writable[0] ^= 1;
+            writable[writable.len - 1] ^= 1;
+            try std.testing.expectError(error.GraphConstraintAttemptConflict, TransactionParticipant.resolve(alloc, &txn, id, epoch, attempt, .accepted));
+            writable[writable.len - 1] ^= 1;
+        } else if (revision == 1) {
+            // A previously prepared v1 vote has no persisted delta.
+            const persisted = txn.rows.get(&TransactionParticipant.key(id)).?;
+            var packet: TransactionParticipant.Packet = .{ .remaining = persisted[TransactionParticipant.magic.len + 32 ..] };
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            _ = try packet.decode(scratch.allocator());
+            const legacy = try scratch.allocator().dupe(u8, persisted[0 .. persisted.len - packet.remaining.len]);
+            @memcpy(legacy[0..TransactionParticipant.legacy_magic.len], TransactionParticipant.legacy_magic);
+            try txn.put(&TransactionParticipant.key(id), legacy);
         }
         const receipt = try TransactionParticipant.resolve(alloc, &txn, id, epoch, attempt, .accepted);
         try std.testing.expectEqual(revision + 1, receipt.revision);

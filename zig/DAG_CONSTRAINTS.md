@@ -30,8 +30,10 @@ changes after source precedence, so an edge remains present when another
 effective owner survives. The contribution adapter diffs complete effective
 owner manifests against accepted storage, binds those replacements and producer
 versions to the attempt, and writes the resulting manifests with the terminal
-receipt. Committed replay recomputes the delta at the reserved accepted revision
-without a new admission deadline. The local transaction manager can prepare
+receipt. The prepared packet carries the validated adjacency and membership delta.
+Committed replay verifies that delta against the durable proof before applying
+it. Earlier prepared packets resolve by recomputing the delta at the reserved
+revision without a new admission deadline. The local transaction manager can prepare
 an ordered set of authority domains atomically with its participant vote.
 It persists a versioned candidate packet and resolves the recorded domains in
 the same batch as the participant decision, including authority-only participants
