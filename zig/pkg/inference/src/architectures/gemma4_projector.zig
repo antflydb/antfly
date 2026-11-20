@@ -284,15 +284,13 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
     defer weights.deinit();
     var cfg = try parseConfig(&projector.gguf.parsed);
     cfg.max_image_tokens = video_tokens_per_frame;
-    var preprocessor = try video.Preprocessor.init(allocator, &compute.ctx);
-    defer preprocessor.deinit();
     const max_frames = @import("antfly_video").packet_sampling.gemma4_max_frames;
     const State = struct {
         cb: *const ComputeBackend,
         allocator: std.mem.Allocator,
         weights: *ProjectorWeights,
         cfg: Config,
-        preprocess: *video.Preprocessor,
+        preprocess: ?video.Preprocessor = null,
         resample: image.Resample,
         output: ?CT = null,
         tokens: [max_frames]usize = undefined,
@@ -308,17 +306,18 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
             const display = try frame.displaySize();
             const g = targetGeometry(self.cfg, display[0], display[1]);
             const gpu_compute: *cuda.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+            if (self.preprocess == null) self.preprocess = try video.Preprocessor.init(self.allocator, &gpu_compute.ctx);
             const projected = if (self.resample == .torchvision_bicubic) bicubic: {
                 const patches = resized: {
                     const raster = frame.rasterSize();
-                    const rgb = try self.preprocess.rgb8Gemma4(gpu_compute, frame);
+                    const rgb = try self.preprocess.?.rgb8Gemma4(gpu_compute, frame);
                     defer self.cb.free(rgb);
                     break :resized try gpu_compute.preprocessResidentRgb(rgb, raster[0], raster[1], @intCast(g.width), @intCast(g.height), if (self.cfg.direct_unified) .channel_planar_unit else .channel_planar_centered);
                 };
                 defer self.cb.free(patches);
                 break :bicubic try encodeResidentProjectionInput(self.cb, self.allocator, self.weights, self.cfg, patches, g);
             } else bilinear: {
-                const patches = try self.preprocess.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
+                const patches = try self.preprocess.?.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
                 defer self.cb.free(patches);
                 break :bilinear try encodeResidentPatches(self.cb, self.allocator, self.weights, self.cfg, patches, g);
             };
@@ -340,7 +339,8 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
             self.rows += projected.tokens;
         }
     };
-    var state = State{ .cb = cb, .allocator = allocator, .weights = &weights, .cfg = cfg, .preprocess = &preprocessor, .resample = videoResample(cb, cfg) };
+    var state = State{ .cb = cb, .allocator = allocator, .weights = &weights, .cfg = cfg, .resample = videoResample(cb, cfg) };
+    defer if (state.preprocess) |*preprocess| preprocess.deinit();
     defer if (state.output) |out| cb.free(out);
     const stats = try video.decodeMp4Sampled(allocator, &compute.ctx, bytes, .{ .context = &state, .consume = State.consume, .check = State.check }, .gemma4);
     const embeddings = state.output.?;

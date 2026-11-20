@@ -59,7 +59,7 @@ pub const Encoded = struct {
 /// Sample logical presentation frames, then map them to decode packet indexes.
 /// The FPS policy matches HF; timestamp selection remains a separate video API.
 pub const Sampling = video.packet_sampling.Sampling;
-const embedding_max_input_bytes = 64 * 1024 * 1024;
+pub const embedding_max_input_bytes = 64 * 1024 * 1024;
 
 fn inputByteLimit(sampling: Sampling) usize {
     return if (sampling == .gemma4) video.packet_sampling.gemma4_max_input_bytes else embedding_max_input_bytes;
@@ -453,6 +453,19 @@ pub const ReaderSelection = struct {
         const plan = if (sampling == .gemma4) try video.packet_sampling.gemma4Pictures(reader, logical.pictures, control) else null;
         const selected = if (plan) |value| try a.dupe(usize, value.ids()) else try selectLogical(a, reader, logical.*, sampling, control);
         errdefer a.free(selected);
+        return finishImmutable(a, reader, sampling, plan, selected, &reservation, control, source_binding, packet_base);
+    }
+
+    pub fn fromPacketIds(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, ids: []const usize, pool: ?*media.admission.Pool, control: media.source.Control, source_binding: [32]u8, packet_base: usize) !ReaderSelection {
+        if (ids.len == 0 or ids.len > 32) return error.InvalidVideoReaderSelection;
+        var reservation = if (pool) |shared| try shared.acquire(.{ .host_bytes = ids.len * (@sizeOf(usize) + @sizeOf(CacheKey)) }) else media.admission.Token{};
+        errdefer reservation.deinit();
+        const selected = try a.dupe(usize, ids);
+        errdefer a.free(selected);
+        return finishImmutable(a, reader, sampling, null, selected, &reservation, control, source_binding, packet_base);
+    }
+
+    fn finishImmutable(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, plan: ?video.packet_sampling.Gemma4Plan, selected: []usize, reservation: *media.admission.Token, control: media.source.Control, source_binding: [32]u8, packet_base: usize) !ReaderSelection {
         if (selected.len == 0 or selected.len > 32) return error.InvalidVideoReaderSelection;
         const keys = try a.alloc(CacheKey, selected.len);
         errdefer a.free(keys);
@@ -461,7 +474,7 @@ pub const ReaderSelection = struct {
             key.* = .{ .clip = source_binding, .picture = try std.math.add(usize, packet_base, id) };
         }
         try reservation.resize(.{ .host_bytes = selected.len * (@sizeOf(usize) + @sizeOf(CacheKey)) });
-        return .{ .allocator = a, .gemma4_plan = plan, .selected = selected, .projection_keys = keys, .binding = try readerMetadataBinding(reader, sampling, control), .immutable = true, .reservation = reservation };
+        return .{ .allocator = a, .gemma4_plan = plan, .selected = selected, .projection_keys = keys, .binding = try readerMetadataBinding(reader, sampling, control), .immutable = true, .reservation = reservation.* };
     }
     pub fn deinit(self: *ReaderSelection) void {
         self.allocator.free(self.selected);
@@ -696,7 +709,11 @@ fn policy(track: media.mp4.Track, width: u32, height: u32) !video.preparation.Op
     return policySignal(track, width, height, .{});
 }
 fn policySignal(track: media.mp4.Track, width: u32, height: u32, signal: video.h264.Color) !video.preparation.Options {
-    return policyLayout(track, try video.display.layout(track, width, height, .presentation), width, signal);
+    var effective = track;
+    if (!track.pixel_aspect_declared) if (signal.sar) |sar| {
+        effective.pixel_aspect = .{ .horizontal = sar[0], .vertical = sar[1] };
+    };
+    return policyLayout(effective, try video.display.layout(effective, width, height, .presentation), width, signal);
 }
 fn policyLayout(track: media.mp4.Track, display: video.display.Layout, width: u32, signal: video.h264.Color) !video.preparation.Options {
     var transfer: u16 = signal.transfer orelse 2;
@@ -1392,9 +1409,8 @@ fn selectWebm(a: std.mem.Allocator, index: video.webm_pictures.Index, sampling: 
         .source_timestamps => |p| cached.select(a, index.timescale(), p, control, false),
         .reference => unreachable,
     };
-    const metadata = try a.alloc(video.sampling.TimedPicture, index.pictures.len);
+    const metadata = try index.presentationTimes(a, control);
     defer a.free(metadata);
-    for (index.pictures, metadata) |picture, *item| item.* = .{ .pts = picture.pts, .duration = picture.duration };
     return timestampSelect(a, metadata, 1_000_000_000, sampling, control);
 }
 /// A request-owned producer with up to eight queued preparations. It never touches model
@@ -5823,4 +5839,14 @@ test "video inspection shares timestamps and decode metadata and honors cancella
         return error.TestUnexpectedResult;
     } else |err| try std.testing.expect(err == error.ResourceLimitExceeded or err == error.OutOfMemory or err == error.SharedAdmissionExceeded);
     try std.testing.expectEqual(@as(usize, 0), bounded.count);
+}
+
+test "gemma4 video AVC stream aspect applies unless the container declares pasp" {
+    var track = media.mp4.Track{ .id = 1, .timescale = 1000, .width = 720, .height = 576, .avcc = &.{}, .nal_length_bytes = 4, .display_matrix = .{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 } };
+    const signal = video.h264.Color{ .sar = .{ 16, 15 } };
+    const anamorphic = try policySignal(track, 720, 576, signal);
+    try std.testing.expectEqual(@as(u32, 768), anamorphic.presentation_width);
+    track.pixel_aspect_declared = true;
+    const square = try policySignal(track, 720, 576, signal);
+    try std.testing.expectEqual(@as(u32, 720), square.presentation_width);
 }

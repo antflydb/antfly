@@ -92,6 +92,7 @@ fn segmentChild(id: u32) bool {
 const Scan = struct {
     input: *source.Source,
     limits: Limits,
+    clock: ?*@import("timeline.zig").SampleClock = null,
     elements: usize = 0,
     fn header(self: *Scan, offset: u64, parent_end: u64) !Element {
         var element = try self.rawHeader(offset, parent_end);
@@ -151,9 +152,18 @@ pub const Reader = struct {
     /// fractional precision for FPS sampling rather than infer rounded block PTS.
     duration_seconds: ?f64 = null,
     pub fn init(allocator: std.mem.Allocator, input: *source.Source, limits: Limits) !Reader {
-        var index_reservation = if (input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = limits.max_index_bytes }) else @import("admission.zig").Token{};
+        return scanSource(allocator, input, limits, null);
+    }
+    pub fn sampleClock(a: std.mem.Allocator, input: *source.Source, limits: Limits) !@import("timeline.zig").SampleClock {
+        var clock = @import("timeline.zig").SampleClock{ .scale = std.time.ns_per_s };
+        var metadata = try scanSource(a, input, limits, &clock);
+        defer metadata.deinit();
+        return clock;
+    }
+    fn scanSource(allocator: std.mem.Allocator, input: *source.Source, limits: Limits, clock: ?*@import("timeline.zig").SampleClock) !Reader {
+        var index_reservation = if (input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = if (clock == null) limits.max_index_bytes else 0 }) else @import("admission.zig").Token{};
         errdefer index_reservation.deinit();
-        var scan = Scan{ .input = input, .limits = limits };
+        var scan = Scan{ .input = input, .limits = limits, .clock = clock };
         var cursor: u64 = 0;
         const file_header = try scan.header(cursor, input.length());
         if (file_header.id != 0x1a45dfa3 or file_header.unknown) return error.MalformedMedia;
@@ -256,6 +266,10 @@ pub const Reader = struct {
                     try appendBlock(allocator, &scan, &packets, track, block orelse return error.MalformedMedia, time, scale, duration, !referenced, cluster_offset);
                 }
             }
+        }
+        if (clock) |result| {
+            if (result.count == 0) return error.EmptyVideoTrack;
+            return .{ .allocator = allocator, .input = input, .index_reservation = index_reservation, .metadata = metadata.?, .track = track, .packets = &.{}, .cues = &.{}, .timestamp_scale_ns = scale };
         }
         if (packets.items.len == 0) return error.EmptyVideoTrack;
         var cues: std.ArrayList(Cue) = .empty;
@@ -553,7 +567,9 @@ fn appendBlock(allocator: std.mem.Allocator, scan: *Scan, packets: *std.ArrayLis
     const pts = std.math.cast(i64, nanoseconds) orelse return error.TimestampOverflow;
     const offset = element.payload + number.len + 3;
     const size = std.math.cast(usize, element.end - offset) orelse return error.ResourceLimitExceeded;
-    if (size == 0 or size > scan.limits.max_packet_bytes or packets.items.len >= scan.limits.max_packets or packets.items.len + 1 > scan.limits.max_index_bytes / @sizeOf(Packet)) return error.ResourceLimitExceeded;
+    const count = if (scan.clock) |clock| clock.count else packets.items.len;
+    if (size == 0 or size > scan.limits.max_packet_bytes or count >= scan.limits.max_packets or count + 1 > scan.limits.max_index_bytes / @sizeOf(Packet)) return error.ResourceLimitExceeded;
+    if (scan.clock) |clock| return clock.include(pts);
     if (packets.items.len == packets.capacity) {
         const capacity = @min(scan.limits.max_index_bytes / @sizeOf(Packet), @min(scan.limits.max_packets, @max(@as(usize, 16), try std.math.mul(usize, packets.capacity, 2))));
         try packets.ensureTotalCapacityPrecise(allocator, capacity);

@@ -149,3 +149,16 @@ test "checked SAR geometry preserves limits and rejects approximated aspect" {
         try std.testing.expectError(error.UnsupportedVideoDisplay, sarLayout(192, 192, 1, 0, rotation));
     }
 }
+
+/// Table E-1, for aspect_ratio_idc 1 through 16.
+const sar_table = [_][2]u16{ .{ 1, 1 }, .{ 12, 11 }, .{ 10, 11 }, .{ 16, 11 }, .{ 40, 33 }, .{ 24, 11 }, .{ 20, 11 }, .{ 32, 11 }, .{ 80, 33 }, .{ 18, 11 }, .{ 15, 11 }, .{ 64, 33 }, .{ 160, 99 }, .{ 4, 3 }, .{ 3, 2 }, .{ 2, 1 } };
+
+pub fn readSampleAspect(bits: anytype) !?[2]u16 {
+    const id = try bits.read(8);
+    if (id == 255) {
+        const w: u16 = @intCast(try bits.read(16));
+        const h: u16 = @intCast(try bits.read(16));
+        return if (w != 0 and h != 0) .{ w, h } else null;
+    }
+    return if (id >= 1 and id <= sar_table.len) sar_table[id - 1] else null;
+}

@@ -56,6 +56,17 @@ pub const Session = struct {
         self.owner.sweep();
         self.allocator.destroy(self);
     }
+    pub fn configuration(self: *Session, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        if (bytes.len < 4 or bytes[0] != 0x81) return error.InvalidVideoData;
+        const Reject = struct {
+            fn picture(_: *anyopaque, _: Geometry) !void {
+                return error.InvalidVideoData;
+            }
+        };
+        if (bytes.len > 4) try self.walk(bytes[4..], self, Reject.picture);
+    }
+
     pub fn finish(self: *const Session) !void {
         if (self.pending or self.failed) return error.InvalidVideoData;
     }

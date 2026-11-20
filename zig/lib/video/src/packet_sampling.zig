@@ -33,13 +33,41 @@ pub fn presentationUs(pts: i64, origin: i64, scale: u32) !i64 {
 /// buckets backwards implements first-at-or-after for VFR and B-frame order.
 /// Packet IDs break ties before conversion to microseconds at the API boundary.
 pub fn gemma4Pictures(reader: *const media.mp4.Reader, pictures: anytype, control: media.source.Control) !Gemma4Plan {
-    return planPictures(reader.track.timescale, reader.track.edit, pictures, null, control);
+    return planPictures(reader.track.timescale, reader.track.edit, pictures, null, null, control);
+}
+
+/// NVDEC returns source packet tags. Only samples producing a visible output
+/// participate in its clock, matching the portable logical picture index.
+pub fn gemma4Av1Packets(a: std.mem.Allocator, reader: *media.mp4.Reader) !Gemma4Plan {
+    const headers = try @import("codecs/av1_headers.zig").Session.create(a, .{ .max_pixels = 4096 * 4096, .all_layers = false, .control = reader.input.control });
+    defer headers.deinit();
+    try headers.configuration(reader.track.codec_config);
+    var visible = try std.DynamicBitSetUnmanaged.initEmpty(a, reader.packets.len);
+    defer visible.deinit(a);
+    const Display = struct {
+        fn accept(raw: *anyopaque, _: @import("codecs/vp9_header.zig").Geometry) !void {
+            const seen: *bool = @ptrCast(@alignCast(raw));
+            // Several outputs sharing a parser timestamp cannot be independently
+            // identified by NVDEC. Route these to the logical decoder up front.
+            if (seen.*) return error.UnsupportedVideoFormat;
+            seen.* = true;
+        }
+    };
+    for (0..reader.packets.len) |i| {
+        var lease = try reader.readPacket(i);
+        defer lease.deinit();
+        var seen = false;
+        try headers.walk(lease.bytes, &seen, Display.accept);
+        if (seen) visible.set(i);
+    }
+    try headers.finish();
+    return planPictures(reader.track.timescale, reader.track.edit, reader.packets, null, visible, reader.input.control);
 }
 
 /// Select visible AV1 output ordinals in the original MP4 clock. Codec replay
 /// still sees every packet, including references outside the presentation edit.
 pub fn gemma4AdaptedPictures(timeline: media.webm.SourceTimeline, pictures: []const @import("webm_pictures.zig").Picture, control: media.source.Control) !Gemma4Plan {
-    return planPictures(timeline.timescale, timeline.edit, pictures, timeline.samples, control);
+    return planPictures(timeline.timescale, timeline.edit, pictures, timeline.samples, null, control);
 }
 
 fn pictureTime(pic: anytype, samples: ?[]const media.webm.SourceTimeline.Sample) !media.webm.SourceTimeline.Sample {
@@ -51,15 +79,16 @@ fn pictureTime(pic: anytype, samples: ?[]const media.webm.SourceTimeline.Sample)
     return .{ .pts = pic.pts, .duration = pic.duration };
 }
 
-fn planPictures(scale: u32, edit: media.timeline.Edit, pictures: anytype, samples: ?[]const media.webm.SourceTimeline.Sample, control: media.source.Control) !Gemma4Plan {
+fn planPictures(scale: u32, edit: media.timeline.Edit, pictures: anytype, samples: ?[]const media.webm.SourceTimeline.Sample, visible: ?std.DynamicBitSetUnmanaged, control: media.source.Control) !Gemma4Plan {
     try control.check();
     if (scale == 0 or pictures.len == 0) return error.EmptyVideo;
     var origin = edit.source_start;
     const duration: i128 = edit.source_duration orelse infer: {
-        origin = (try pictureTime(pictures[0], samples)).pts;
-        var end: i128 = origin;
+        origin = std.math.maxInt(i64);
+        var end: i128 = std.math.minInt(i64);
         for (pictures, 0..) |pic, i| {
             if (i % 256 == 0) try control.check();
+            if (visible) |mask| if (!mask.isSet(i)) continue;
             const time = try pictureTime(pic, samples);
             origin = @min(origin, time.pts);
             end = @max(end, @as(i128, time.pts) + time.duration);
@@ -72,6 +101,7 @@ fn planPictures(scale: u32, edit: media.timeline.Edit, pictures: anytype, sample
     var best: [gemma4_max_frames]?usize = @splat(null);
     for (pictures, 0..) |pic, id| {
         if (id % 256 == 0) try control.check();
+        if (visible) |mask| if (!mask.isSet(id)) continue;
         const pts = (try pictureTime(pic, samples)).pts;
         const tick = @as(i128, pts) - origin;
         if (tick < 0 or tick >= duration) continue;

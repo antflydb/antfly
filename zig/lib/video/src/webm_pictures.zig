@@ -68,9 +68,16 @@ pub const Index = struct {
     /// Picture IDs refer to the visible decoder outputs. Adapted MP4 output
     /// times come from the corresponding source sample in its original ticks.
     pub fn presentationTimeline(self: Index, a: std.mem.Allocator, control: media.source.Control) !sampling.Timeline {
-        const timed = try a.alloc(sampling.TimedPicture, self.pictures.len);
+        const timed = try self.presentationTimes(a, control);
         defer a.free(timed);
+        return sampling.Timeline.initEdited(a, timed, control, if (self.sourceTimeline()) |source| source.edit else .{});
+    }
+
+    pub fn presentationTimes(self: Index, a: std.mem.Allocator, control: media.source.Control) ![]sampling.TimedPicture {
+        const timed = try a.alloc(sampling.TimedPicture, self.pictures.len);
+        errdefer a.free(timed);
         const original = self.sourceTimeline();
+        var latest: i64 = std.math.minInt(i64);
         for (timed, self.pictures, 0..) |*dest, picture, i| {
             if (i % 256 == 0) try control.check();
             if (original) |source| {
@@ -78,9 +85,19 @@ pub const Index = struct {
                 if (id >= source.samples.len) return error.InvalidVideoIndex;
                 const sample = source.samples[id];
                 dest.* = .{ .pts = sample.pts, .duration = sample.duration };
-            } else dest.* = .{ .pts = picture.pts, .duration = picture.duration };
+            } else {
+                dest.* = .{ .pts = picture.pts, .duration = picture.duration };
+                latest = @max(latest, picture.pts);
+            }
         }
-        return sampling.Timeline.initEdited(a, timed, control, if (original) |source| source.edit else .{});
+        if (original == null and self.duration_seconds != null and timed.len != 0) {
+            const end: i64 = @intFromFloat(self.duration_seconds.? * std.time.ns_per_s);
+            for (timed, 0..) |*item, i| {
+                if (i % 256 == 0) try control.check();
+                if (item.pts == latest and item.duration == null) item.duration = @intCast(@max(0, @as(i128, end) - latest));
+            }
+        }
+        return timed;
     }
 
     pub fn select(self: Index) ![]usize {
@@ -185,19 +202,7 @@ fn indexHeaders(reader: *media.webm.Reader, options: Options, collector: *Collec
             if (!self.packet.invisible) try appendHeader(self.collector, self.packet, self.packet_id, geometry);
         }
     };
-    if (av1) |session| {
-        const config = reader.track.codec_private;
-        if (config.len != 0) {
-            if (config.len < 4 or config[0] != 0x81) return error.InvalidVideoData;
-            const Reject = struct {
-                fn picture(_: *anyopaque, _: @import("codecs/vp9_header.zig").Geometry) !void {
-                    return error.InvalidVideoData;
-                }
-            };
-            var dummy: u8 = 0;
-            if (config.len > 4) try session.walk(config[4..], &dummy, Reject.picture);
-        }
-    }
+    if (av1) |session| try session.configuration(reader.track.codec_private);
     var sequence: @FieldType(Restart, "sequence") = null;
     for (reader.packets, 0..) |packet, packet_id| {
         const logical_before = collector.pictures.items.len;
@@ -620,6 +625,11 @@ test "WebM declared duration preserves two-second FPS sampling at rounded PTS bo
         var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile(path) }, .identity = path };
         var reader = try media.webm.Reader.init(a, &source, .{});
         defer reader.deinit();
+        var tiny = media.admission.Pool{ .limits = .{ .host_bytes = 64 * 1024 } };
+        source.admission_pool = &tiny;
+        const clock = try media.webm.Reader.sampleClock(a, &source, .{});
+        try std.testing.expectEqual(reader.packets.len, clock.count);
+        source.admission_pool = null;
         try std.testing.expectEqual(@as(?f64, 2), reader.duration_seconds);
         var pictures = try index(a, &reader, .{});
         defer pictures.deinit();
@@ -1275,5 +1285,25 @@ test "WebM continuation retains VP8 VP9 AV1 references and preserves replay outp
         }
         retained.deinit();
         try std.testing.expectEqual(indexed_usage, request_pool.snapshot());
+    }
+}
+
+test "WebM declared end resolves a sparse tail and a single undurationed frame" {
+    const a = std.testing.allocator;
+    var pictures = [_]Picture{
+        .{ .pts = 0, .duration = null, .width = 48, .height = 48 },
+        .{ .pts = 10 * std.time.ns_per_s, .duration = null, .width = 48, .height = 48 },
+    };
+    for (1..3) |n| {
+        const end: i64 = if (n == 1) 1 else 11;
+        const value = Index{ .allocator = a, .pictures = pictures[0..n], .duration_seconds = @floatFromInt(end) };
+        var timeline = try value.presentationTimeline(a, .{});
+        defer timeline.deinit();
+        try std.testing.expectEqual(@as(i128, end) * std.time.ns_per_s, timeline.last);
+        const timed = try value.presentationTimes(a, .{});
+        defer a.free(timed);
+        const selected = try sampling.cappedTimestamps(a, timed, std.time.ns_per_s, .{}, .{});
+        defer a.free(selected);
+        try std.testing.expectEqual(n, selected.len);
     }
 }

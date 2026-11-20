@@ -45,7 +45,7 @@ pub const Options = struct {
     share_reference_storage: bool = true,
     reference_storage_stats: ?*ReferenceStorageStats = null,
 };
-pub const Color = struct { matrix: ?u8 = null, transfer: ?u8 = null, primaries: ?u8 = null };
+pub const Color = struct { sar: ?[2]u16 = null, matrix: ?u8 = null, transfer: ?u8 = null, primaries: ?u8 = null };
 pub const Config = struct {
     color: Color = .{},
     profile: u32,
@@ -308,7 +308,7 @@ fn hrd(bits: *Bits) !void {
 }
 fn vui(bits: *Bits, color: *Color) !bool {
     if (try bits.read(1) != 0) {
-        if (try bits.read(8) == 255) _ = try bits.read(32);
+        color.sar = try @import("display.zig").readSampleAspect(bits);
     }
     if (try bits.read(1) != 0) _ = try bits.read(1);
     var full = false;
@@ -2019,4 +2019,17 @@ fn decodeSeparatedState(comptime Sample: type, cfg: Config, config_reservation: 
     frame.payload_bytes = payload;
     frame.decode_high_water = budget.peak;
     return frame;
+}
+
+test "AVC VUI retains standard and extended sample aspect ratios" {
+    // aspect_ratio_info_present, followed by idc and the remaining zero VUI flags.
+    var table = [_]u8{ 0x81, 0x80, 0 };
+    var bits = Bits{ .allocator = std.testing.allocator, .bytes = &table, .end = table.len * 8 };
+    var signal = Color{};
+    _ = try vui(&bits, &signal);
+    try std.testing.expectEqual([2]u16{ 10, 11 }, signal.sar.?);
+    var extended = [_]u8{ 0xff, 0x80, 0x08, 0, 0x07, 0x80, 0 };
+    bits = .{ .allocator = std.testing.allocator, .bytes = &extended, .end = extended.len * 8 };
+    _ = try vui(&bits, &signal);
+    try std.testing.expectEqual([2]u16{ 16, 15 }, signal.sar.?);
 }

@@ -21,7 +21,52 @@ const h264 = @import("h264.zig");
 const Bits = @import("h264_bits.zig").Bits;
 const Budget = @import("decode_budget.zig").Budget;
 const PPS = struct { bytes: []u8, sps: usize };
-const Parameter = struct { at: ?usize, kind: u8, id: usize, bytes: []u8, original: bool };
+const Parameter = struct { at: ?usize, bytes: []u8, original: bool };
+const Versions = struct {
+    list: std.ArrayList(Parameter) = .empty,
+
+    fn install(self: *Versions, a: std.mem.Allocator, nal: []const u8, at: ?usize) !?[]u8 {
+        // The first in-band announcement becomes part of suffix bootstraps,
+        // even when it repeats the original avcC bytes.
+        if (self.list.getLastOrNull()) |last| if (last.original == (at == null) and std.mem.eql(u8, last.bytes, nal)) return null;
+        const owned = try a.dupe(u8, nal);
+        errdefer a.free(owned);
+        try self.list.append(a, .{ .at = at, .bytes = owned, .original = at == null });
+        return owned;
+    }
+
+    fn boundary(self: Versions, packet: usize) usize {
+        var lo: usize = 0;
+        var hi = self.list.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.list.items[mid].at) |at| if (at >= packet) {
+                hi = mid;
+                continue;
+            };
+            lo = mid + 1;
+        }
+        return lo;
+    }
+
+    fn before(self: Versions, packet: usize) ?Parameter {
+        const end = self.boundary(packet);
+        return if (end == 0) null else self.list.items[end - 1];
+    }
+
+    fn rebase(self: *Versions, a: std.mem.Allocator, removed: usize) void {
+        const end = self.boundary(removed);
+        const drop = end -| 1;
+        for (self.list.items[0..drop]) |p| a.free(p.bytes);
+        if (end > 0) self.list.items[end - 1].at = null;
+        for (self.list.items[end..]) |*p| p.at = p.at.? - removed;
+        self.list.replaceRangeAssumeCapacity(0, drop, &.{});
+    }
+    fn deinit(self: *Versions, a: std.mem.Allocator) void {
+        for (self.list.items) |p| a.free(p.bytes);
+        self.list.deinit(a);
+    }
+};
 pub const Entry = struct { avcc: []u8, config: h264.Config, sps_hash: [32]u8 };
 pub const Epoch = struct { start: usize, end: usize, entry: usize, independent: bool = false, max_refs: usize };
 pub const Context = struct {
@@ -126,7 +171,8 @@ pub const Session = struct {
     probe_bytes: u64 = 0,
     active: ?usize = null,
     valid: bool = true,
-    history: std.ArrayList(Parameter) = .empty,
+    sequence_versions: [32]Versions = @splat(.{}),
+    picture_versions: [256]Versions = @splat(.{}),
     pub fn init(allocator: std.mem.Allocator, reader: *media.mp4.Reader, options: h264.Options) !*Session {
         return initCached(allocator, reader, options, false);
     }
@@ -152,8 +198,8 @@ pub const Session = struct {
         self.entries.deinit(allocator);
         self.epochs.deinit(allocator);
         self.progressive_idrs.deinit(allocator);
-        for (self.history.items) |parameter| allocator.free(parameter.bytes);
-        self.history.deinit(allocator);
+        for (&self.sequence_versions) |*versions| versions.deinit(allocator);
+        for (&self.picture_versions) |*versions| versions.deinit(allocator);
         allocator.free(self.packet_configs);
         self.releasePlanningHeaders();
         var reservation = self.reservation;
@@ -177,23 +223,17 @@ pub const Session = struct {
             _ = try bits.read(24);
             const id = try bits.ue();
             if (id >= self.sequence.len) return error.MalformedVideoConfig;
-            const owned = try allocator.dupe(u8, nal);
-            errdefer allocator.free(owned);
-            try self.history.append(allocator, .{ .at = at, .kind = 7, .id = id, .bytes = owned, .original = at == null });
-            if (self.sequence[id] == null or !std.mem.eql(u8, self.sequence[id].?, owned)) {
-                for (self.picture, &self.resolved_pps) |pps, *resolved| {
-                    if (pps != null and pps.?.sps == id) resolved.* = null;
-                }
+            const owned = try self.sequence_versions[id].install(allocator, nal, at) orelse return;
+            for (self.picture, &self.resolved_pps) |pps, *resolved| {
+                if (pps != null and pps.?.sps == id) resolved.* = null;
             }
             self.sequence[id] = owned;
         } else if (nal[0] & 31 == 8) {
             const id = try bits.ue();
             const sps = try bits.ue();
             if (id >= self.picture.len or sps >= self.sequence.len) return error.MalformedVideoConfig;
-            const owned = try allocator.dupe(u8, nal);
-            errdefer allocator.free(owned);
-            try self.history.append(allocator, .{ .at = at, .kind = 8, .id = id, .bytes = owned, .original = at == null });
-            if (self.picture[id] == null or !std.mem.eql(u8, self.picture[id].?.bytes, owned)) self.resolved_pps[id] = null;
+            const owned = try self.picture_versions[id].install(allocator, nal, at) orelse return;
+            self.resolved_pps[id] = null;
             self.picture[id] = .{ .bytes = owned, .sps = sps };
         } else return error.MalformedVideoConfig;
     }
@@ -345,10 +385,8 @@ pub const Session = struct {
         if (!self.valid or index > self.packet_configs.len) return error.InvalidPacketIndex;
         var sequence: [32]?Parameter = @splat(null);
         var picture: [256]?Parameter = @splat(null);
-        for (self.history.items) |parameter| {
-            if (parameter.at) |at| if (at >= index) continue;
-            if (parameter.kind == 7) sequence[parameter.id] = parameter else picture[parameter.id] = parameter;
-        }
+        for (&sequence, &self.sequence_versions) |*slot, *versions| slot.* = versions.before(index);
+        for (&picture, &self.picture_versions) |*slot, *versions| slot.* = versions.before(index);
         var size: usize = 0;
         const length = self.length_bytes;
         for (sequence) |item| if (item) |parameter| if (!parameter.original) {
@@ -396,26 +434,9 @@ pub const Session = struct {
             retained_entries += 1;
         };
 
-        var last_sequence: [32]?usize = @splat(null);
-        var last_picture: [256]?usize = @splat(null);
-        for (self.history.items, 0..) |parameter, i| {
-            if (parameter.at) |at| if (at >= removed) continue;
-            if (parameter.kind == 7) last_sequence[parameter.id] = i else last_picture[parameter.id] = i;
-        }
+        for (&self.sequence_versions) |*versions| versions.rebase(allocator, removed);
+        for (&self.picture_versions) |*versions| versions.rebase(allocator, removed);
         var keep: usize = 0;
-        for (self.history.items, 0..) |parameter, i| {
-            const before = parameter.at == null or parameter.at.? < removed;
-            const last = if (parameter.kind == 7) last_sequence[parameter.id] else last_picture[parameter.id];
-            if (before and last != i) {
-                allocator.free(parameter.bytes);
-                continue;
-            }
-            self.history.items[keep] = parameter;
-            self.history.items[keep].at = if (before) null else parameter.at.? - removed;
-            keep += 1;
-        }
-        self.history.items.len = keep;
-        keep = 0;
         for (self.epochs.items) |epoch| {
             if (epoch.end <= removed) continue;
             var rebased = epoch;
@@ -729,4 +750,22 @@ test "dynamic AVC configuration compaction bounds 600 activations under two live
 }
 test "dynamic AVC configuration compaction allocation failures retain clean shared owners" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, configurationChurn, .{@as(usize, 6)});
+}
+
+test "dynamic AVC parameter versions retain effective changes across repeated headers and rebases" {
+    const a = std.testing.allocator;
+    var history = Versions{};
+    defer history.deinit(a);
+    _ = try history.install(a, "original", null);
+    _ = try history.install(a, "original", 0);
+    for (1..300) |i| try std.testing.expect(try history.install(a, "original", i) == null);
+    _ = try history.install(a, "first change", 300);
+    _ = try history.install(a, "second change", 301);
+    try std.testing.expectEqual(@as(usize, 4), history.list.items.len);
+    try std.testing.expect(history.before(0).?.original);
+    try std.testing.expect(!history.before(300).?.original);
+    try std.testing.expectEqualStrings("first change", history.before(301).?.bytes);
+    history.rebase(a, 301);
+    try std.testing.expectEqualStrings("first change", history.before(0).?.bytes);
+    try std.testing.expectEqualStrings("second change", history.before(1).?.bytes);
 }

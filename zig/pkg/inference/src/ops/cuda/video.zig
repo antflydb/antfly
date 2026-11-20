@@ -295,6 +295,21 @@ fn displayAspect(a: std.mem.Allocator, track: media.mp4.Track) !PixelAspect {
             vertical = signal.sar.vertical;
         }
     }
+    if (!track.pixel_aspect_declared and track.codec == .avc) {
+        // NVDEC can accept profiles outside the portable decoder. Its sequence
+        // callback independently verifies the resolved display aspect.
+        const config = @import("antfly_video").h264.configParse(a, track.avcc) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
+        if (config) |cfg| {
+            defer cfg.groups.deinit(a);
+            if (cfg.color.sar) |sar| {
+                horizontal = sar[0];
+                vertical = sar[1];
+            }
+        }
+    }
     const common = std.math.gcd(horizontal, vertical);
     return .{ .horizontal = horizontal / common, .vertical = vertical / common };
 }
@@ -514,7 +529,10 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     // before allocating surfaces. Sample the progressive access-unit timeline.
     // Validate the one-picture-per-sample contract against the display callbacks.
     if (sampling == .gemma4) {
-        state.selected_packets = .{ .plan = try packet_sampling.gemma4Pictures(&reader, reader.packets, source.control) };
+        state.selected_packets = .{ .plan = if (track.codec == .av1) packet_sampling.gemma4Av1Packets(allocator, &reader) catch |err| switch (err) {
+            error.UnsupportedVideoProfile, error.InvalidVideoData => return error.UnsupportedVideoFormat,
+            else => return err,
+        } else try packet_sampling.gemma4Pictures(&reader, reader.packets, source.control) };
         if (track.codec == .avc) state.avc_packet_count = reader.packets.len;
     }
     if (sampling == .embedding_gemma2) {

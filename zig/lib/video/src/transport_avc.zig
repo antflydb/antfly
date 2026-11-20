@@ -526,6 +526,12 @@ pub const Stream = struct {
 /// Build an immutable random-access view while keeping only one PES and AU
 /// in flight. Each completed AU transfers its payload to the segmented index.
 pub fn indexClip(a: std.mem.Allocator, identity: []const u8, bytes: []const u8, options: Options) !*@import("live_windows.zig").Builder {
+    var source = media.source.Source{ .allocator = a, .identity = identity, .storage = .{ .borrowed = bytes }, .control = options.stream.control };
+    return indexSource(a, &source, options);
+}
+
+pub fn indexSource(a: std.mem.Allocator, source: *media.source.Source, options: Options) !*@import("live_windows.zig").Builder {
+    if (source.length() > options.transport.max_bytes) return error.ResourceLimitExceeded;
     const windows = @import("live_windows.zig");
     const Collector = struct {
         allocator: std.mem.Allocator,
@@ -538,13 +544,27 @@ pub fn indexClip(a: std.mem.Allocator, identity: []const u8, bytes: []const u8, 
             try self.owner.?.append(segment, self.options);
         }
     };
-    var collector = Collector{ .allocator = a, .options = .{ .stream = options.stream, .max_packets = @min(options.transport.max_packets, options.index.max_samples), .max_units = @min(options.transport.max_packets, options.index.max_samples) } };
+    const packet_limit = @min(options.transport.max_packets, options.index.max_samples, options.index.max_index_bytes / @sizeOf(media.mp4.Packet));
+    var collector = Collector{ .allocator = a, .options = .{ .stream = options.stream, .max_packets = packet_limit, .max_units = packet_limit } };
     errdefer if (collector.owner) |owner| owner.deinit();
-    var units = try Stream.init(a, identity, .{ .video = options, .retain_initial_description = true }, &collector, Collector.accept);
+    var units = try Stream.init(a, source.identity, .{ .video = options, .retain_initial_description = true }, &collector, Collector.accept);
     defer if (!units.ended) units.deinit();
     var demux = try media.transport_stream.Stream.init(a, .{}, options.transport, options.stream.control, options.stream.admission_pool, units.consumer());
     defer if (!demux.ended) demux.deinit();
-    try demux.push(bytes);
+    switch (source.storage) {
+        .borrowed => |bytes| try demux.push(bytes),
+        .range => {
+            const chunk = @min(256 * 1024, source.limits.max_read_bytes, source.limits.max_retained_bytes);
+            if (chunk == 0) return error.ResourceLimitExceeded;
+            var offset: u64 = 0;
+            while (offset < source.length()) {
+                var lease = try source.read(offset, @intCast(@min(source.length() - offset, chunk)));
+                defer lease.deinit();
+                try demux.push(lease.bytes);
+                offset += lease.bytes.len;
+            }
+        },
+    }
     _ = try demux.finish();
     try units.finish(options.last_duration_ticks);
     return collector.owner orelse error.EmptyVideo;

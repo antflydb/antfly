@@ -79,7 +79,6 @@ const Dependencies = struct {
 /// mutable seek cache survives a request. The cache's arena owns every slice.
 pub const Snapshot = struct {
     hevc_predecessors: []usize,
-    timed: []video.sampling.TimedPicture,
     timeline: video.sampling.Timeline,
     logical: ?video.h264_pictures.Index,
     dependencies: ?Dependencies,
@@ -87,7 +86,7 @@ pub const Snapshot = struct {
     duration_ns: i64,
     pub fn copy(a: std.mem.Allocator, owner: *const Owner) !Snapshot {
         if (owner.registry != null) return error.UnsupportedVideoProfile;
-        var result: Snapshot = .{ .hevc_predecessors = try a.dupe(usize, owner.hevc_predecessors), .timed = try a.dupe(video.sampling.TimedPicture, owner.timed), .timeline = owner.timeline, .logical = owner.logical, .dependencies = owner.dependencies, .origin = owner.origin, .duration_ns = try owner.durationNs() };
+        var result: Snapshot = .{ .hevc_predecessors = try a.dupe(usize, owner.hevc_predecessors), .timeline = owner.timeline, .logical = owner.logical, .dependencies = owner.dependencies, .origin = owner.origin, .duration_ns = try owner.durationNs() };
         result.timeline.entries = try a.dupe(@typeInfo(@TypeOf(owner.timeline.entries)).pointer.child, owner.timeline.entries);
         result.timeline.maxima = try a.dupe(i128, owner.timeline.maxima);
         result.timeline.allocator = a;
@@ -115,7 +114,6 @@ pub const Owner = struct {
     source_binding: [32]u8,
     allocator: std.mem.Allocator,
     reader: *media.mp4.Reader,
-    timed: []video.sampling.TimedPicture,
     timeline: video.sampling.Timeline,
     metadata_reservation: media.admission.Token,
     seek_cache: ?video.decode_plan.SeekCache = null,
@@ -138,7 +136,7 @@ pub const Owner = struct {
         if (try video.packet_sampling.needsLogicalIndex(a, reader.track))
             logical = try video.h264_pictures.planning(a, reader, planning, registry);
         const count = if (logical) |index| index.pictures.len else reader.packets.len;
-        var metadata_bytes = try std.math.add(usize, try video.sampling.Timeline.storageBytes(count), try std.math.mul(usize, count, @sizeOf(video.sampling.TimedPicture)));
+        var metadata_bytes = try video.sampling.Timeline.storageBytes(count);
         if (reader.track.codec == .avc or reader.track.codec == .hevc) metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, reader.packets.len, @sizeOf(usize)));
         if (logical != null) {
             const base = try std.math.ceilPowerOfTwo(usize, @max(@as(usize, 1), count));
@@ -146,21 +144,22 @@ pub const Owner = struct {
         }
         var metadata_reservation = try pool.acquire(.{ .host_bytes = metadata_bytes });
         errdefer metadata_reservation.deinit();
-        const timed = try a.alloc(video.sampling.TimedPicture, count);
-        errdefer a.free(timed);
-        var origin: i64 = std.math.maxInt(i64);
-        if (logical) |index| {
-            for (timed, index.pictures) |*dest, picture| {
-                dest.* = .{ .pts = picture.pts, .duration = picture.duration };
-                origin = @min(origin, picture.pts);
+        var timeline = build: {
+            var scratch = try pool.acquire(.{ .host_bytes = try std.math.mul(usize, count, @sizeOf(video.sampling.TimedPicture)) });
+            defer scratch.deinit();
+            const timed = try a.alloc(video.sampling.TimedPicture, count);
+            defer a.free(timed);
+            if (logical) |index| {
+                for (timed, index.pictures) |*dest, picture| {
+                    dest.* = .{ .pts = picture.pts, .duration = picture.duration };
+                }
+            } else {
+                for (timed, reader.packets) |*dest, packet| {
+                    dest.* = .{ .pts = packet.pts, .duration = packet.duration };
+                }
             }
-        } else {
-            for (timed, reader.packets) |*dest, packet| {
-                dest.* = .{ .pts = packet.pts, .duration = packet.duration };
-                origin = @min(origin, packet.pts);
-            }
-        }
-        var timeline = try video.sampling.Timeline.init(a, timed, reader.input.control);
+            break :build try video.sampling.Timeline.initEdited(a, timed, reader.input.control, reader.track.edit);
+        };
         errdefer timeline.deinit();
         const hevc_predecessors = try a.alloc(usize, if (reader.track.codec == .hevc) reader.packets.len else 0);
         errdefer a.free(hevc_predecessors);
@@ -172,7 +171,7 @@ pub const Owner = struct {
         }
         var dependencies: ?Dependencies = if (logical) |index| try Dependencies.init(a, index) else null;
         errdefer if (dependencies) |*index| index.deinit();
-        return .{ .hevc_predecessors = hevc_predecessors, .metadata_reservation = metadata_reservation, .dependencies = dependencies, .timeline = timeline, .seek_cache = seek_cache, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .timed = timed, .logical = logical, .registry = registry, .origin = origin, .pool = pool, .limits = limits };
+        return .{ .hevc_predecessors = hevc_predecessors, .metadata_reservation = metadata_reservation, .dependencies = dependencies, .timeline = timeline, .seek_cache = seek_cache, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .logical = logical, .registry = registry, .origin = timeline.first, .pool = pool, .limits = limits };
     }
     pub fn fromSnapshot(a: std.mem.Allocator, reader: *media.mp4.Reader, pool: *media.admission.Pool, limits: @import("media_chunk_limits.zig").Limits, snapshot: *const Snapshot) !Owner {
         try reader.input.control.check();
@@ -180,7 +179,7 @@ pub const Owner = struct {
         if (logical) |*index| index.allocator = a;
         var reservation = try pool.acquire(.{ .host_bytes = if (reader.track.codec == .avc) try std.math.mul(usize, reader.packets.len, @sizeOf(usize)) else 0 });
         errdefer reservation.deinit();
-        return .{ .hevc_predecessors = snapshot.hevc_predecessors, .borrowed_planning = true, .duration_ns = snapshot.duration_ns, .metadata_reservation = reservation, .dependencies = snapshot.dependencies, .timeline = snapshot.timeline, .seek_cache = if (reader.track.codec == .avc) try video.decode_plan.SeekCache.init(a, reader, true) else null, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .timed = snapshot.timed, .logical = logical, .registry = null, .origin = snapshot.origin, .pool = pool, .limits = limits };
+        return .{ .hevc_predecessors = snapshot.hevc_predecessors, .borrowed_planning = true, .duration_ns = snapshot.duration_ns, .metadata_reservation = reservation, .dependencies = snapshot.dependencies, .timeline = snapshot.timeline, .seek_cache = if (reader.track.codec == .avc) try video.decode_plan.SeekCache.init(a, reader, true) else null, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .logical = logical, .registry = null, .origin = snapshot.origin, .pool = pool, .limits = limits };
     }
     pub fn deinit(self: *Owner) void {
         self.continuation.deinit();
@@ -191,22 +190,20 @@ pub const Owner = struct {
             if (self.dependencies) |*index| index.deinit();
             if (self.logical) |*index| index.deinit();
             self.allocator.free(self.hevc_predecessors);
-            self.allocator.free(self.timed);
         }
         self.metadata_reservation.deinit();
     }
     pub fn durationNs(self: *const Owner) !i64 {
         if (self.duration_ns) |value| return value;
-        var stop: i128 = self.origin;
-        for (self.timed) |picture| stop = @max(stop, @as(i128, picture.pts) + (picture.duration orelse return error.UnknownVideoDuration));
+        const stop = self.timeline.last;
         return std.math.cast(i64, @divFloor((stop - self.origin) * std.time.ns_per_s + self.reader.track.timescale - 1, self.reader.track.timescale)) orelse error.TimestampOverflow;
     }
     pub fn prepare(self: *Owner, policy: video.sampling.TimestampPolicy) !Window {
         const a = self.allocator;
         const selected = try self.timeline.select(a, self.reader.track.timescale, policy, self.reader.input.control, true);
         defer a.free(selected);
-        const packets = try a.alloc(usize, selected.len);
-        defer a.free(packets);
+        var selected_packets: [32]usize = undefined;
+        const packets = selected_packets[0..selected.len];
         var first: usize = std.math.maxInt(usize);
         var stop: usize = 0;
         for (selected, packets) |id, *packet| {
@@ -250,59 +247,25 @@ pub const Owner = struct {
         var window = try video.live_windows.borrowWithParameters(a, &view, bootstrap orelse &.{}, .{ .max_packets = self.limits.max_dependency_packets, .stream = .{ .max_bytes = self.limits.max_coded_window_bytes, .admission_pool = self.pool, .control = self.reader.input.control } });
         errdefer window.deinit();
         for (window.reader.packets) |*packet| packet.pts = try std.math.sub(i64, packet.pts, self.origin);
-        var subset: ?video.h264_pictures.Index = null;
-        errdefer if (subset) |*index| index.deinit();
-        if (self.logical) |index| {
-            var pictures = std.ArrayList(video.h264.Picture).empty;
-            errdefer pictures.deinit(a);
-            var pending_pts: ?i64 = null;
-            var pending_packet: ?usize = null;
-            const deps = &self.dependencies.?;
-            const begin = deps.lower(index, first);
-            const finish = deps.lower(index, stop);
-            const local_ids = try a.dupe(usize, deps.ids[begin..finish]);
-            defer a.free(local_ids);
-            std.mem.sort(usize, local_ids, {}, std.sort.asc(usize));
-            for (local_ids) |id| {
-                const picture = index.pictures[id];
-                const last = picture.last_packet.?;
-                if (last >= stop) {
-                    const pts = try std.math.sub(i64, picture.pts, self.origin);
-                    pending_pts = if (pending_pts) |old| @min(old, pts) else pts;
-                    pending_packet = if (pending_packet) |old| @min(old, picture.first_packet - first) else picture.first_packet - first;
-                    continue;
-                }
-                var copy = picture;
-                copy.first_packet -= first;
-                copy.last_packet = last - first;
-                copy.pts = try std.math.sub(i64, picture.pts, self.origin);
-                try pictures.append(a, copy);
-            }
-            subset = .{ .allocator = a, .pictures = try pictures.toOwnedSlice(a), .timescale = self.reader.track.timescale, .packet_count = window.reader.packets.len, .pending_pts = pending_pts, .pending_first_packet = pending_packet };
-        }
-        if (subset == null) {
-            const cfg = if (self.reader.track.codec == .avc) try video.h264.configParse(a, self.reader.track.avcc) else null;
-            defer if (cfg) |configuration| configuration.groups.deinit(a);
-            const pictures = try a.alloc(video.h264.Picture, window.reader.packets.len);
-            for (pictures, window.reader.packets, 0..) |*picture, packet, id| picture.* = .{ .first_packet = id, .last_packet = id, .pts = packet.pts, .duration = packet.duration, .width = if (cfg) |configuration| @intCast(configuration.width) else self.reader.track.width, .height = if (cfg) |configuration| @intCast(configuration.height) else self.reader.track.height, .bit_depth = if (cfg) |configuration| configuration.bit_depth else 8, .chroma_format = if (cfg) |configuration| configuration.chroma_format else 1 };
-            subset = .{ .allocator = a, .pictures = pictures, .timescale = self.reader.track.timescale, .packet_count = pictures.len };
-        }
-        return .{ .coded = window, .logical = subset, .packet_base = first, .source_binding = self.source_binding };
+        var result = Window{ .coded = window, .packet_base = first, .source_binding = self.source_binding };
+        result.packet_count = packets.len;
+        for (packets, result.packet_ids[0..packets.len]) |packet, *id| id.* = packet - first;
+        return result;
     }
 };
 pub const Window = struct {
     coded: video.live_windows.Window,
     source_binding: [32]u8,
-    logical: ?video.h264_pictures.Index = null,
+    packet_ids: [32]usize = undefined,
+    packet_count: usize = 0,
     selection: ?model_video.ReaderSelection = null,
     packet_base: usize,
     /// Bind only after the Window reaches its final address; workers borrow it.
     pub fn bind(self: *Window, policy: video.sampling.TimestampPolicy, pool: *media.admission.Pool) !void {
-        if (self.logical) |*index| self.selection = try model_video.ReaderSelection.initImmutable(self.coded.reader.allocator, &self.coded.reader, .{ .source_timestamps = policy }, index, pool, self.coded.reader.input.control, self.source_binding, self.packet_base);
+        self.selection = try model_video.ReaderSelection.fromPacketIds(self.coded.reader.allocator, &self.coded.reader, .{ .source_timestamps = policy }, self.packet_ids[0..self.packet_count], pool, self.coded.reader.input.control, self.source_binding, self.packet_base);
     }
     pub fn deinit(self: *Window) void {
         if (self.selection) |*selection| selection.deinit();
-        if (self.logical) |*index| index.deinit();
         self.coded.deinit();
     }
 };

@@ -56,25 +56,10 @@ pub fn promptAllowance(a: std.mem.Allocator, bytes: []const u8, control: Control
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = inspection_bytes } };
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-prompt-clock", .control = media_control, .admission_pool = &pool, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
     if (std.mem.startsWith(u8, bytes, "\x1a\x45\xdf\xa3")) {
-        var reader = try media.webm.Reader.init(a, &source, .{});
-        defer reader.deinit();
-        var clock = media.timeline.SampleClock{ .scale = std.time.ns_per_s };
-        for (reader.packets, 0..) |packet, i| {
-            if (i % 256 == 0) try control.check();
-            clock.include(packet.pts);
-        }
-        return clockAllowance(clock);
+        return clockAllowance(try media.webm.Reader.sampleClock(a, &source, .{}));
     }
-    if (try media.mp4.probeSampleClock(bytes, video.mp4_coded.limits, source.control)) |table| {
-        return clockAllowance(table);
-    }
-    var reader = try media.mp4.Reader.init(a, &source, video.mp4_coded.limits);
-    defer reader.deinit();
-    var clock = media.timeline.SampleClock{ .scale = reader.track.timescale, .edit = reader.track.edit };
-    for (reader.packets, 0..) |packet, i| {
-        if (i % 256 == 0) try control.check();
-        clock.include(packet.pts);
-    }
+    const clock = try media.mp4.probeSampleClock(bytes, video.mp4_coded.limits, source.control) orelse
+        try media.mp4.Reader.fragmentClock(a, &source, video.mp4_coded.limits);
     return clockAllowance(clock);
 }
 
@@ -215,12 +200,14 @@ pub fn encode(cb: *const ComputeBackend, admission: Admission, a: std.mem.Alloca
         // NVDEC takes a narrower set of clips than the catalog advertises, and
         // some rejections only surface mid-bitstream. Portable decoding decides
         // what's really invalid; either route projects on the device.
-        if (projector_mod.encodeProjectedVideoResident(cb, a, projector, bytes, admission.explicit_scratch_limit == 0)) |projected| {
-            return projected;
-        } else |err| {
-            // Decoder envelope rejections can retry under portable admission.
-            if (err != error.NvdecUnavailable and err != error.VideoDurationExceeded and err != error.DecoderEnvelopeExceeded and inputError(err) != error.InvalidVideoInput) return err;
-            std.log.info("gemma4 video falling back to portable decoding: {s}", .{@errorName(err)});
+        if (!std.mem.startsWith(u8, bytes, "\x1a\x45\xdf\xa3") and !media.transport_stream.isTransportStream(bytes)) {
+            if (projector_mod.encodeProjectedVideoResident(cb, a, projector, bytes, admission.explicit_scratch_limit == 0)) |projected| {
+                return projected;
+            } else |err| {
+                // Decoder envelope rejections can retry under portable admission.
+                if (err != error.UnsupportedVideoBackend and err != error.NvdecUnavailable and err != error.VideoDurationExceeded and err != error.DecoderEnvelopeExceeded and inputError(err) != error.InvalidVideoInput) return err;
+                std.log.info("gemma4 video falling back to portable decoding: {s}", .{@errorName(err)});
+            }
         }
         var permit = try admission.acquire(true, .{});
         defer permit.deinit();
@@ -1014,4 +1001,31 @@ test "gemma4 video admission propagates cancellation during container scanning" 
     const messages = [_]@import("generation.zig").Message{.{ .role = "user", .content = "", .video_bytes = @embedFile("../testdata/video/h264-18001.mp4") }};
     var state: State = .{};
     try std.testing.expectError(error.Timeout, @import("generation.zig").nativeGenerationMediaAdmissionControlled(std.testing.allocator, "", &messages, .{ .family = .gemma }, .generic, .{ .ptr = &state, .check_fn = State.check }));
+}
+
+test "gemma4 video NVDEC plan ignores AV1 samples without visible output" {
+    const a = std.testing.allocator;
+    const file = @embedFile("../testdata/video/codecs/av1.mp4");
+    var input = media.source.Source{ .allocator = a, .identity = "av1-header", .storage = .{ .borrowed = file } };
+    var reader = try media.mp4.Reader.init(a, &input, video.mp4_coded.limits);
+    defer reader.deinit();
+    reader.track.edit = .{};
+    const expected = try video.packet_sampling.gemma4Av1Packets(a, &reader);
+    // A temporal delimiter alone emits no picture and precedes the first
+    // displayed sample by one second.
+    const data = try std.mem.concat(a, u8, &.{ file, &.{ 0x12, 0x00 } });
+    defer a.free(data);
+    const packets = try a.alloc(media.mp4.Packet, reader.packets.len + 1);
+    defer a.free(packets);
+    @memcpy(packets[1..], reader.packets);
+    packets[0] = packets[1];
+    packets[0].offset = file.len;
+    packets[0].size = 2;
+    packets[0].pts -= reader.track.timescale;
+    var view = reader;
+    input.storage = .{ .borrowed = data };
+    view.packets = packets;
+    const actual = try video.packet_sampling.gemma4Av1Packets(a, &view);
+    try std.testing.expectEqualSlices(i64, expected.timestamps(), actual.timestamps());
+    for (expected.ids(), actual.ids()) |id, tagged| try std.testing.expectEqual(id + 1, tagged);
 }

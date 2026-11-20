@@ -82,6 +82,17 @@ pub const Demux = struct {
 pub fn isTransportStream(bytes: []const u8) bool {
     return bytes.len >= 188 and bytes.len % 188 == 0 and bytes[0] == 0x47 and (bytes.len == 188 or bytes[188] == 0x47);
 }
+pub fn isTransportSource(input: *source.Source) !bool {
+    if (input.storage == .borrowed) return isTransportStream(input.storage.borrowed);
+    if (input.length() < 188 or input.length() % 188 != 0) return false;
+    var first = try input.read(0, 1);
+    const sync = first.bytes[0] == 0x47;
+    first.deinit();
+    if (!sync or input.length() == 188) return sync;
+    var next = try input.read(188, 1);
+    defer next.deinit();
+    return next.bytes[0] == 0x47;
+}
 fn crc(bytes: []const u8) u32 {
     var value: u32 = 0xffffffff;
     for (bytes) |byte| {

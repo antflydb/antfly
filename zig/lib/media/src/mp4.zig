@@ -80,6 +80,25 @@ pub const Packet = struct {
     sync: bool,
 };
 const Span = struct { start: u64, end: u64 };
+// Top-level mdat spans are disjoint and ordered by file position. Sequential
+// samples normally use the same span, including when packets are interleaved.
+const MediaDataCursor = struct {
+    current: ?Span = null,
+
+    fn contains(self: *@This(), spans: []const Span, offset: u64, end: u64) bool {
+        if (self.current) |span| if (offset >= span.start and end <= span.end) return true;
+        var lo: usize = 0;
+        var hi = spans.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (spans[mid].end <= offset) lo = mid + 1 else hi = mid;
+        }
+        if (lo == spans.len) return false;
+        self.current = spans[lo];
+        return offset >= spans[lo].start and end <= spans[lo].end;
+    }
+};
+
 const Fragment = struct { offset: u64, size: usize };
 const Defaults = struct { description: u32 = 1, duration: u32 = 0, size: u32 = 0, flags: u32 = 0 };
 const Tables = struct {
@@ -114,13 +133,24 @@ pub const Reader = struct {
     limits: Limits,
 
     pub fn init(allocator: std.mem.Allocator, input: *source.Source, limits: Limits) !Reader {
+        return initTracked(allocator, input, limits, null);
+    }
+
+    pub fn fragmentClock(a: std.mem.Allocator, input: *source.Source, limits: Limits) !timeline.SampleClock {
+        var clock: timeline.SampleClock = undefined;
+        var metadata = try initTracked(a, input, limits, &clock);
+        defer metadata.deinit();
+        return clock;
+    }
+
+    fn initTracked(allocator: std.mem.Allocator, input: *source.Source, limits: Limits, clock: ?*timeline.SampleClock) !Reader {
         // Packet limits describe the returned index. Construction can briefly
         // own old/new growth buffers plus the bounded top-level box lists.
         const lists = try std.math.mul(usize, 3 * (1024 + 8), @sizeOf(Span) + @sizeOf(Fragment));
         const bound = try std.math.add(usize, try std.math.mul(usize, limits.max_index_bytes, 2), lists);
         var scratch = IndexAllocator{ .backing = allocator, .limit = bound, .reservation = if (input.admission_pool) |pool| try pool.acquire(.{}) else @import("admission.zig").Token{} };
         errdefer scratch.reservation.deinit();
-        var reader = initAllocated(scratch.allocator(), input, limits) catch |err| {
+        var reader = initAllocated(scratch.allocator(), input, limits, clock) catch |err| {
             std.debug.assert(scratch.live == 0);
             return if (err == error.OutOfMemory and scratch.denied != null) scratch.denied.? else err;
         };
@@ -129,7 +159,7 @@ pub const Reader = struct {
         reader.index_reservation = scratch.reservation;
         return reader;
     }
-    fn initAllocated(allocator: std.mem.Allocator, input: *source.Source, limits: Limits) !Reader {
+    fn initAllocated(allocator: std.mem.Allocator, input: *source.Source, limits: Limits, clock: ?*timeline.SampleClock) !Reader {
         var metadata: ?source.Lease = null;
         errdefer if (metadata) |*lease| lease.deinit();
         var spans: std.ArrayList(Span) = .empty;
@@ -178,10 +208,10 @@ pub const Reader = struct {
         track.decode_preroll_ticks = try decodePreroll(tables.ctts);
         const packets = if (tables.defaults) |defaults| blk: {
             if (tables.sizes.len < 12 or u32be(tables.sizes[8..12]) != 0) return error.UnsupportedHybridMp4;
-            const result = try buildFragments(allocator, input, &track, defaults, fragments.items, spans.items, limits);
+            const result = try buildFragments(allocator, input, &track, defaults, fragments.items, spans.items, limits, clock);
             break :blk result;
         } else blk: {
-            if (fragments.items.len != 0) return error.MalformedMedia;
+            if (clock != null or fragments.items.len != 0) return error.MalformedMedia;
             break :blk try buildPackets(allocator, tables, track, spans.items, limits, input.control);
         };
         return .{ .allocator = allocator, .input = input, .metadata = metadata.?, .track = track, .packets = packets, .limits = limits };
@@ -781,6 +811,7 @@ fn compositionRun(bytes: []const u8) !Run {
 }
 
 fn buildPackets(allocator: std.mem.Allocator, t: Tables, track: Track, spans: []const Span, limits: Limits, control: source.Control) ![]Packet {
+    var media_data: MediaDataCursor = .{};
     if (t.sizes.len < 12) return error.MalformedMedia;
     if (t.sizes[0] != 0) return error.MalformedMedia;
     const n = u32be(t.sizes[8..12]);
@@ -838,12 +869,7 @@ fn buildPackets(allocator: std.mem.Allocator, t: Tables, track: Track, spans: []
             if (size == 0) return error.MalformedMedia;
             if (size > limits.max_packet_bytes) return error.ResourceLimitExceeded;
             const end = std.math.add(u64, offset, size) catch return error.MalformedMedia;
-            var valid = false;
-            for (spans) |span| if (offset >= span.start and end <= span.end) {
-                valid = true;
-                break;
-            };
-            if (!valid) return error.MalformedMedia;
+            if (!media_data.contains(spans, offset, end)) return error.MalformedMedia;
             const duration = try durations.next();
             if (duration <= 0) return error.UnsupportedTimeline;
             const pts = std.math.add(i64, dts, if (t.ctts.len != 0) try composition.next() else 0) catch return error.TimestampOverflow;
@@ -876,10 +902,14 @@ fn fragmentField(bytes: []const u8, cursor: *usize) !u32 {
     cursor.* += 4;
     return value;
 }
-fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *Track, defaults: Defaults, fragments: []const Fragment, spans: []const Span, limits: Limits) ![]Packet {
+fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *Track, defaults: Defaults, fragments: []const Fragment, spans: []const Span, limits: Limits, clock: ?*timeline.SampleClock) ![]Packet {
+    var media_data: MediaDataCursor = .{};
     if (defaults.description != 1) return error.UnsupportedSampleDescription;
     var packets: std.ArrayList(Packet) = .empty;
     errdefer packets.deinit(allocator);
+    if (clock) |out| out.* = .{ .scale = track.timescale, .edit = track.edit };
+    var sample_count: usize = 0;
+    var previous_end: ?i64 = null;
     var box_count: usize = 0;
     for (fragments) |fragment| {
         try input.control.check();
@@ -937,10 +967,7 @@ fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *T
             const dt = decode_time orelse return error.UnsupportedTimeline;
             if (dt.len < 4 or dt[0] > 1 or dt.len != (if (dt[0] == 0) @as(usize, 8) else 12) or u32be(dt[0..4]) & 0xffffff != 0) return error.MalformedMedia;
             var dts = std.math.cast(i64, if (dt[0] == 0) @as(u64, u32be(dt[4..8])) else u64be(dt[4..12])) orelse return error.TimestampOverflow;
-            if (packets.items.len != 0) {
-                const previous = packets.items[packets.items.len - 1];
-                if (dts < try std.math.add(i64, previous.media_dts, previous.duration)) return error.UnsupportedTimeline;
-            }
+            if (previous_end) |end| if (dts < end) return error.UnsupportedTimeline;
             var data_offset: ?u64 = null;
             nested = 0;
             while (nested < box.payload.len) {
@@ -953,7 +980,7 @@ fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *T
                 const run_flags = u32be(p[0..4]) & 0xffffff;
                 if (run_flags & ~@as(u32, 0xf05) != 0 or (run_flags & 4 != 0 and run_flags & 0x400 != 0)) return error.MalformedMedia;
                 const count = u32be(p[4..8]);
-                const total = try std.math.add(usize, packets.items.len, count);
+                const total = try std.math.add(usize, sample_count, count);
                 if (total > limits.max_samples) return limits.track_limit_error;
                 if (total > limits.max_index_bytes / @sizeOf(Packet)) return error.ResourceLimitExceeded;
                 var pc: usize = 8;
@@ -964,7 +991,8 @@ fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *T
                 var first_flags = current.flags;
                 if (run_flags & 4 != 0) first_flags = try fragmentField(p, &pc);
                 var offset = data_offset orelse return error.UnsupportedFragmentedMp4;
-                try packets.ensureTotalCapacityPrecise(allocator, total);
+                sample_count = total;
+                if (clock == null) try packets.ensureTotalCapacityPrecise(allocator, total);
                 for (0..count) |i| {
                     try input.control.check();
                     const duration = if (run_flags & 0x100 != 0) try fragmentField(p, &pc) else current.duration;
@@ -974,16 +1002,13 @@ fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *T
                     const composition: i64 = if (p[0] == 1) @as(i32, @bitCast(raw_composition)) else raw_composition;
                     if (size == 0 or size > limits.max_packet_bytes or duration == 0) return error.ResourceLimitExceeded;
                     const end = try std.math.add(u64, offset, size);
-                    var valid = false;
-                    for (spans) |span| if (offset >= span.start and end <= span.end) {
-                        valid = true;
-                        break;
-                    };
-                    if (!valid) return error.MalformedMedia;
+                    if (!media_data.contains(spans, offset, end)) return error.MalformedMedia;
                     const pts = try std.math.add(i64, dts, composition);
                     if (composition < 0) track.decode_preroll_ticks = @max(track.decode_preroll_ticks, std.math.cast(u32, -composition) orelse return error.TimestampOverflow);
-                    packets.appendAssumeCapacity(.{ .offset = offset, .size = size, .dts = dts, .media_dts = dts, .media_pts = pts, .pts = try track.edit.present(pts), .duration = duration, .sync = sample_flags & 0x10000 == 0 });
+                    const presented = try track.edit.present(pts);
+                    if (clock) |out| out.include(presented) else packets.appendAssumeCapacity(.{ .offset = offset, .size = size, .dts = dts, .media_dts = dts, .media_pts = pts, .pts = presented, .duration = duration, .sync = sample_flags & 0x10000 == 0 });
                     dts = try std.math.add(i64, dts, duration);
+                    previous_end = dts;
                     offset = end;
                 }
                 if (pc != p.len) return error.MalformedMedia;
@@ -991,7 +1016,7 @@ fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *T
             }
         }
     }
-    if (packets.items.len == 0) return error.EmptyVideoTrack;
+    if (sample_count == 0) return error.EmptyVideoTrack;
     for (packets.items) |*packet| packet.dts = try track.edit.present(try std.math.sub(i64, packet.media_dts, track.decode_preroll_ticks));
     return packets.toOwnedSlice(allocator);
 }
@@ -1045,27 +1070,23 @@ test "MP4 metadata probe agrees with indexed track and enforces cancellation and
         var reader = try Reader.init(a, &input, .{});
         defer reader.deinit();
         const track = try probeTrack(bytes, .{}, .{});
-        const clock = try probeSampleClock(bytes, .{}, .{});
-        if (std.mem.eql(u8, name, "fragmented.mp4")) {
-            try std.testing.expect(clock == null);
-        } else {
-            const edit = reader.track.edit;
-            var count: usize = 0;
-            var first: i64 = std.math.maxInt(i64);
-            var last: i64 = std.math.minInt(i64);
-            for (reader.packets) |packet| {
-                if (edit.source_duration) |span| {
-                    const relative = @as(i128, packet.pts) - edit.source_start;
-                    if (relative < 0 or relative >= span) continue;
-                }
-                count += 1;
-                first = @min(first, packet.pts);
-                last = @max(last, packet.pts);
+        const clock = try probeSampleClock(bytes, .{}, .{}) orelse try Reader.fragmentClock(a, &input, .{});
+        const edit = reader.track.edit;
+        var count: usize = 0;
+        var first: i64 = std.math.maxInt(i64);
+        var last: i64 = std.math.minInt(i64);
+        for (reader.packets) |packet| {
+            if (edit.source_duration) |span| {
+                const relative = @as(i128, packet.pts) - edit.source_start;
+                if (relative < 0 or relative >= span) continue;
             }
-            try std.testing.expectEqual(count, clock.?.count);
-            try std.testing.expectEqual(first, clock.?.first);
-            try std.testing.expectEqual(last, clock.?.last);
+            count += 1;
+            first = @min(first, packet.pts);
+            last = @max(last, packet.pts);
         }
+        try std.testing.expectEqual(count, clock.count);
+        try std.testing.expectEqual(first, clock.first);
+        try std.testing.expectEqual(last, clock.last);
         try std.testing.expectEqualDeep(reader.track.codec, track.codec);
         try std.testing.expectEqual(reader.track.width, track.width);
         try std.testing.expectEqual(reader.track.height, track.height);
