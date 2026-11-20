@@ -29662,6 +29662,8 @@ pub const IndexManager = struct {
             misses.deinit(miss_alloc);
         }
         const locator_complete = try sparse_mod.SparseIndex.projectionHasCompleteLocatorMap(&sparse_txn);
+        var alignment_samples: usize = 0;
+        var alignment_hits: usize = 0;
         var ordinal_iter = if (set.* == .ordinal_bitmap) set.ordinal_bitmap.iterator() else null;
         var offset: usize = 0;
         while (true) {
@@ -29702,14 +29704,20 @@ pub const IndexManager = struct {
             try primary_txn.getManySortedOwnedScoped(key_arena.allocator(), keys[0..key_count], values[0..key_count]);
             if (direct) {
                 var proven: [ordinals.len]bool = @splat(false);
-                if (locator_complete) try sparse_mod.SparseIndex.proveProjectionDocNums(
-                    key_arena.allocator(),
-                    &sparse_txn,
-                    unique_ordinals[0..key_count],
-                    values[0..key_count],
-                    proven[0..key_count],
-                    control,
-                );
+                if (locator_complete and (alignment_samples < 64 or alignment_hits *| 4 >= alignment_samples)) {
+                    try sparse_mod.SparseIndex.proveProjectionDocNums(
+                        key_arena.allocator(),
+                        &sparse_txn,
+                        unique_ordinals[0..key_count],
+                        values[0..key_count],
+                        proven[0..key_count],
+                        control,
+                    );
+                    for (values[0..key_count], proven[0..key_count]) |key, hit| {
+                        if (key != null) alignment_samples += 1;
+                        if (hit) alignment_hits += 1;
+                    }
+                }
                 var present: usize = 0;
                 for (values[0..key_count], unique_ordinals[0..key_count], proven[0..key_count]) |value, ordinal, aligned| {
                     if (aligned) {
@@ -29789,8 +29797,7 @@ pub const IndexManager = struct {
                     defer alloc.free(parent);
                     var chunks = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, &primary_txn, parent, name);
                     defer chunks.close();
-                    while (try chunks.next()) |row| {
-                        try control.check();
+                    while (try chunks.nextControlled(control)) |row| {
                         const order = std.mem.order(u8, row.key, key);
                         if (order == .lt) continue;
                         if (order == .eq) try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, key, &seen, &out, &misses, miss_alloc, locator_complete, control);
@@ -29826,8 +29833,7 @@ pub const IndexManager = struct {
         if (entry.embedding_names.len == 0) {
             var chunks = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, primary_txn, parent_doc_id, entry.chunk_name.?);
             defer chunks.close();
-            while (try chunks.next()) |row| {
-                try control.check();
+            while (try chunks.nextControlled(control)) |row| {
                 if (!internal_keys.matchesChunkArtifactName(row.key, entry.chunk_name.?)) continue;
                 try appendSparseProjectionDocNum(alloc, entry, sparse_txn, row.key, seen, out, misses, miss_alloc, locator_complete, control);
             }
@@ -34925,8 +34931,7 @@ pub const IndexManager = struct {
                 } else if (entry.chunk_name) |chunk| {
                     var cursor = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, &read, key, chunk);
                     defer cursor.close();
-                    while (try cursor.next()) |row| {
-                        try control.check();
+                    while (try cursor.nextControlled(control)) |row| {
                         if (!internal_keys.matchesChunkArtifactName(row.key, chunk)) continue;
                         if (try self.lookupDenseVectorIdForDocKeyTxn(&mappings, name, row.key)) |id| {
                             try ids.put(alloc, id, {});

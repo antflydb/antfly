@@ -11207,7 +11207,8 @@ const IndexedPredicateEvaluator = struct {
             if (memo.range_projection_disabled) return RangeEvidence.init(self.alloc);
             var physical = self.collectPhysicalProbeScope(scope) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    memo.range_projection_disabled = true;
+                    memo.deinit(self.alloc);
+                    memo.* = .{ .range_projection_disabled = true };
                     return RangeEvidence.init(self.alloc);
                 },
                 else => return err,
@@ -12338,6 +12339,43 @@ test "optional numeric range frontier publication discards mappings after alloca
     try std.testing.expectError(error.OutOfMemory, memo.publishCoverage(alloc, keys, .{}));
     try std.testing.expect(memo.covered == null);
     try std.testing.expectEqual(@as(usize, 0), memo.batches.items.len);
+}
+
+test "optional numeric range releases a published frontier when candidate allocation fails" {
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var memo: IndexedPredicateEvaluator.FrontierProbeInput = .{ .covered = roaring.RoaringBitmap.init(alloc) };
+    defer memo.deinit(alloc);
+    var map: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    try map.put(alloc, 1, 1);
+    const pairs = try alloc.dupe(u64, &.{(@as(u64, 1) << 32) | 1});
+    try memo.appendBatch(alloc, .{ .pairs = pairs, .ordinals = map }, .{});
+    try memo.covered.?.add(1);
+
+    var domain = roaring.RoaringBitmap.init(alloc);
+    defer domain.deinit();
+    try domain.add(1);
+    const key_domain: std.StringHashMapUnmanaged(u32) = .empty;
+    const evaluator: IndexedPredicateEvaluator = .{
+        .snapshot = undefined,
+        .analysis = .{},
+        .schema = null,
+        .executor = undefined,
+        .control = .{},
+        .alloc = alloc,
+        .scratch = alloc,
+        .cache_prefix = "",
+        .frontier = .empty,
+        .key_domain = &key_domain,
+        .probe_input = &memo,
+    };
+    failing.fail_index = failing.alloc_index;
+    var evidence = try evaluator.rangeEvidence(.{ .numeric_range = .{ .field = "rank" } }, &domain);
+    defer evidence.covered.deinit();
+    defer evidence.matches.deinit();
+    try std.testing.expectEqual(@as(usize, 0), evidence.covered.cardinality());
+    try std.testing.expectEqual(@as(usize, 0), memo.batches.items.len);
+    try std.testing.expect(memo.range_projection_disabled);
 }
 
 const ResidualIdentityContext = struct {

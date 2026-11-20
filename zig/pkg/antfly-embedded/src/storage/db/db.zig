@@ -48930,6 +48930,7 @@ pub const DB = struct {
         reverse: bool = false,
         stopped: bool = false,
         observed_rows: ?*usize = null,
+        ordered_spill_enabled: bool = true,
 
         fn scan(raw: ?*anyopaque, alloc: Allocator, options: db_query_search.MatchAllCandidateCollectOptions, visitor_ctx: ?*anyopaque, visitor: db_query_search.PrimaryCandidateVisitor) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
@@ -49118,6 +49119,7 @@ pub const DB = struct {
 
         fn scanLargeOrderedScope(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !bool {
             if (comptime builtin.os.tag == .freestanding) return false;
+            if (!self.ordered_spill_enabled) return false;
             var delivery_started = false;
             return self.scanLargeOrderedScopeWithSpill(options, &delivery_started) catch |err| {
                 if (delivery_started) return err;
@@ -49281,6 +49283,7 @@ pub const DB = struct {
                 ttl_duration: u64,
                 now: u64,
                 prefix: ?*SourcePrefix,
+                options: db_query_search.MatchAllCandidateCollectOptions,
                 examined: usize = 0,
                 exhausted_budget: bool = false,
 
@@ -49317,11 +49320,17 @@ pub const DB = struct {
                         var txn = try owner.db.core.store.beginProbeTxn();
                         defer txn.abort();
                         const temp = source_batch.arena.allocator();
-                        const mapped = doc_identity.lookupOrdinalsTxnAlloc(temp, &txn, keys) catch |err|
-                            return source_batch.rejectSpeculativeBatch(err);
-                        for (keys, mapped, 0..) |id, forward, i| {
-                            switch (owner.resolvePreparedIdentity(temp, &txn, id, @as(??doc_set.DocOrdinal, forward)) catch |err|
-                                return source_batch.rejectSpeculativeBatch(err)) {
+                        const mapped: ?[]?doc_set.DocOrdinal = doc_identity.lookupOrdinalsTxnAlloc(temp, &txn, keys) catch |err| fallback: {
+                            if (source_batch.prefix != null or err != error.InvalidDocIdentity) return source_batch.rejectSpeculativeBatch(err);
+                            break :fallback null;
+                        };
+                        for (keys, 0..) |id, i| {
+                            const forward: ??doc_set.DocOrdinal = if (mapped) |values| @as(??doc_set.DocOrdinal, values[i]) else null;
+                            const identity = owner.resolvePreparedIdentity(temp, &txn, id, forward) catch |err| recovery: {
+                                if (source_batch.prefix != null or err != error.InvalidDocIdentity) return source_batch.rejectSpeculativeBatch(err);
+                                break :recovery try owner.recoverScopedSourceIdentity(source_batch.options, temp, &txn, id);
+                            };
+                            switch (identity) {
                                 .invisible => visible[i] = false,
                                 .unmapped => {},
                                 .visible => |ordinal| ordinals[i] = ordinal,
@@ -49380,6 +49389,7 @@ pub const DB = struct {
                 .ttl_duration = ttlDurationNs(self.db),
                 .now = currentTimeNs(),
                 .prefix = prefix,
+                .options = options,
                 .batch_size = @min(@max(options.scan_batch_size orelse 256, 1), 256),
             };
             defer source_batch.arena.deinit();
@@ -49388,6 +49398,54 @@ pub const DB = struct {
             try self.db.core.store.scanStoredDocumentRowsReadTxnWithContext(&txn, lower, upper orelse &.{}, options.primary_key_reverse, &source_batch, Scan.checkpoint, Scan.visit);
             if (!self.stopped) _ = try source_batch.flush();
             return self.stopped or !source_batch.exhausted_budget;
+        }
+
+        /// A failed forward lookup cannot prove that a row outside a finite
+        /// scope is relevant. Recover through the requested reverse keys only
+        /// on the corruption path. Ordinary source scans still fail closed.
+        fn recoverScopedSourceIdentity(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions, alloc: Allocator, txn: *docstore_mod.DocStore.Txn, id: []const u8) !PreparedIdentity {
+            const constraints = options.constraints orelse return error.InvalidDocIdentity;
+            if (!constraints.positive_filter) return error.InvalidDocIdentity;
+            const set = if (constraints.primary_include_compact) constraints.primary_include else doc_set.ResolvedDocSet{ .ordinals = constraints.filter_doc_nums };
+            if (set == .all or sourceScopeContainsKey(&set, id) or sourceScopeContainsKey(&constraints.legacy_filter, id))
+                return error.InvalidDocIdentity;
+            var bitmap = if (set == .ordinal_bitmap) set.ordinal_bitmap.iterator() else null;
+            const numbers = if (set == .ordinals) set.ordinals else &.{};
+            var offset: usize = 0;
+            if (bitmap == null and numbers.len == 0) return .invisible;
+            var read = try self.db.core.store.beginReadTxn();
+            defer read.abort();
+            var scope = try read.openReadScope(alloc);
+            defer scope.close();
+            var probes: usize = 0;
+            while (true) {
+                const ordinal = if (bitmap) |*it| it.next() orelse break else next: {
+                    if (offset == numbers.len) break;
+                    const value = numbers[offset];
+                    offset += 1;
+                    break :next value;
+                };
+                try db_query_search.checkSearchRequestDeadline(self.req);
+                if (probes == 64) {
+                    try scope.reset();
+                    probes = 0;
+                }
+                probes += 1;
+                const encoded = internal_keys.identityOrdinalToDocKey(ordinal);
+                const key = scope.get(&encoded) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                if (std.mem.eql(u8, id, key))
+                    return self.resolvePreparedIdentity(alloc, txn, id, @as(??doc_set.DocOrdinal, @as(?doc_set.DocOrdinal, ordinal)));
+            }
+            return .invisible;
+        }
+
+        fn sourceScopeContainsKey(set: *const doc_set.ResolvedDocSet, id: []const u8) bool {
+            if (set.* != .doc_keys) return false;
+            for (set.doc_keys) |key| if (std.mem.eql(u8, key, id)) return true;
+            return false;
         }
 
         fn scanExactScope(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !void {
@@ -157901,6 +157959,13 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
         expected: []const u8,
         seen: usize = 0,
 
+        fn visit(raw: ?*anyopaque, id: []const u8, _: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (!std.mem.eql(u8, self.expected, id)) return .@"continue";
+            self.seen += 1;
+            return .stop;
+        }
+
         fn consume(raw: ?*anyopaque, candidate: *db_query_search.MatchAllCandidate) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             try std.testing.expectEqualStrings(self.expected, candidate.id);
@@ -157914,7 +157979,7 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
             ordinals[0] = endpoints[endpoint];
             for (ordinals[1..], 0..) |*ordinal, i| ordinal.* = std.math.maxInt(u32) - 1024 + @as(u32, @intCast(i));
             var record = Record{ .expected = writes[if (endpoint == 0) 1 else 78].key };
-            _ = try DB.streamSearchMatchAllCandidatesCallback(&db, a, .{}, .{
+            const options: db_query_search.MatchAllCandidateCollectOptions = .{
                 .constraints = &.{ .positive_filter = true, .filter_doc_nums = &ordinals },
                 .require_complete_primary_population = true,
                 .primary_key_start_after = if (reverse) null else writes[0].key,
@@ -157922,7 +157987,12 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
                 .primary_key_reverse = reverse,
                 .stop_after_accepted = 1,
                 .scan_batch_size = 1,
-            }, &record, Record.consume);
+            };
+            _ = try DB.streamSearchMatchAllCandidatesCallback(&db, a, .{}, options, &record, Record.consume);
+            try std.testing.expectEqual(@as(usize, 1), record.seen);
+            record.seen = 0;
+            var no_spill = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = .{}, .ordered_spill_enabled = false };
+            try DB.PrimaryMatchAllIdentityScan.scan(&no_spill, a, options, &record, Record.visit);
             try std.testing.expectEqual(@as(usize, 1), record.seen);
         }
     }
