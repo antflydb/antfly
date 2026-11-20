@@ -28,6 +28,46 @@ const snappy = @import("../encoding/snappy.zig");
 const Quota = @import("antfly_platform").allocator.reclamation.Quota;
 const HostBudget = @import("../storage/resource_manager.zig").BudgetedAllocator;
 
+/// Search spills share aggregate reservations but own their files and
+/// cancellation context for the duration of a single request.
+var search_spill_mutex: std.atomic.Mutex = .unlocked;
+var search_spill_budget: ?Manager = null;
+
+pub fn admitSearchSpill(alloc: Allocator, io: std.Io, context: *anyopaque, checkpoint: *const fn (*anyopaque) anyerror!void) !Manager {
+    if (comptime !native_spill_supported) return error.SqlProgramLimitExceeded;
+    const Check = struct {
+        fn idle(_: *anyopaque) !void {}
+    };
+    try checkpoint(context);
+    while (!search_spill_mutex.tryLock()) {
+        try checkpoint(context);
+        std.atomic.spinLoopHint();
+    }
+    defer search_spill_mutex.unlock();
+    if (search_spill_budget == null) {
+        search_spill_budget = .{
+            .alloc = std.heap.page_allocator,
+            .io = std.Io.Threaded.global_single_threaded.io(),
+            .context = &search_spill_mutex,
+            .checkpoint = Check.idle,
+            .max_bytes = 4 * 1024 * 1024 * 1024,
+            .max_files = 256,
+        };
+    }
+    var child = search_spill_budget.?.admit(alloc, 1024 * 1024 * 1024) orelse return error.SqlProgramLimitExceeded;
+    child.io = io;
+    child.context = context;
+    child.checkpoint = checkpoint;
+    return child;
+}
+
+pub fn searchSpillUnavailable(err: anyerror) bool {
+    return switch (err) {
+        error.SqlProgramLimitExceeded, error.NoSpaceLeft, error.DiskQuota, error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem, error.FileNotFound, error.InputOutput, error.SystemResources, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => true,
+        else => false,
+    };
+}
+
 pub const Manager = struct {
     const BudgetLink = struct { manager: *Manager, allocator: Allocator, hook: @import("memory_budget.zig").Reclaimer };
     payload_budget_links: [32]BudgetLink = undefined,

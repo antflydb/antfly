@@ -49094,10 +49094,8 @@ pub const DB = struct {
             var delivery_started = false;
             return self.scanLargeOrderedScopeWithSpill(options, &delivery_started) catch |err| {
                 if (delivery_started) return err;
-                return switch (err) {
-                    error.SqlProgramLimitExceeded, error.NoSpaceLeft, error.DiskQuota, error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem, error.FileNotFound, error.InputOutput, error.SystemResources, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => false,
-                    else => err,
-                };
+                if (@import("../../sql/spill.zig").searchSpillUnavailable(err)) return false;
+                return err;
             };
         }
 
@@ -49114,12 +49112,7 @@ pub const DB = struct {
                     try db_query_search.checkSearchRequestDeadline(source_scan.req);
                 }
             };
-            var manager = spill.Manager{
-                .alloc = self.alloc,
-                .io = std.Io.Threaded.global_single_threaded.io(),
-                .context = self,
-                .checkpoint = Check.run,
-            };
+            var manager = try spill.admitSearchSpill(self.alloc, std.Io.Threaded.global_single_threaded.io(), self, Check.run);
             defer manager.deinit();
             var ordered = spill.Sort.init(self.alloc, &manager, &.{.{ .descending = options.primary_key_reverse }}, 512 * 1024);
             defer ordered.deinit();
@@ -49204,12 +49197,26 @@ pub const DB = struct {
         fn deliverOrderedBatch(self: *@This(), alloc: Allocator, keys: []const []const u8, ordinals: []const ?doc_set.DocOrdinal, duration: u64, now: u64, delivery_started: *bool) !docstore_mod.DocStore.ScanAction {
             const timestamps = if (duration == 0) null else try loadDocumentTimestampsManyWithIdentityShape(self.db, alloc, keys, true);
             defer if (timestamps) |values| alloc.free(values);
-            for (keys, ordinals, 0..) |id, ordinal, i| {
+            var present: [256]bool = @splat(false);
+            var resolved: [256]?doc_set.DocOrdinal = @splat(null);
+            {
+                var txn = try self.db.core.store.beginProbeTxn();
+                defer txn.abort();
+                for (keys, ordinals, 0..) |id, ordinal, i| {
+                    try db_query_search.checkSearchRequestDeadline(self.req);
+                    if (timestamps) |values| if (values[i]) |ts| {
+                        if (ttl_mod.isExpired(ts, duration, now)) continue;
+                    };
+                    if (!try sourcePresent(alloc, &txn, id)) continue;
+                    present[i] = true;
+                    resolved[i] = if (ordinal) |known| known else try self.resolvePreparedOrdinal(alloc, &txn, id);
+                }
+            }
+            for (keys, resolved[0..keys.len], present[0..keys.len]) |id, ordinal, is_present| {
+                if (!is_present) continue;
                 try db_query_search.checkSearchRequestDeadline(self.req);
-                if (timestamps) |values| if (values[i]) |ts| {
-                    if (ttl_mod.isExpired(ts, duration, now)) continue;
-                };
-                if (try self.visitPreparedId(id, ordinal, true, true, delivery_started) == .stop) return .stop;
+                delivery_started.* = true;
+                if (try self.visitor(self.visitor_ctx, id, ordinal, true, true) == .stop) return .stop;
             }
             return .@"continue";
         }
@@ -49423,22 +49430,19 @@ pub const DB = struct {
         }
 
         fn visitIdWithOrdinal(self: *@This(), id: []const u8, known_ordinal: ?doc_set.DocOrdinal, unique: bool) !docstore_mod.DocStore.ScanAction {
-            return self.visitPreparedId(id, known_ordinal, unique, false, null);
-        }
-
-        fn visitPreparedId(self: *@This(), id: []const u8, known_ordinal: ?doc_set.DocOrdinal, unique: bool, expiry_checked: bool, delivery_started: ?*bool) !docstore_mod.DocStore.ScanAction {
             const ordinal = identity: {
                 var txn = try self.db.core.store.beginProbeTxn();
                 defer txn.abort();
                 if (!try sourcePresent(self.alloc, &txn, id)) return .@"continue";
                 if (known_ordinal) |value| break :identity value;
-                const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, &txn, id)) orelse break :identity null;
-                const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse break :identity null;
-                if (!(if (self.req.identity_read_generation) |at| state.isVisibleAt(at) else state.isLive())) break :identity null;
-                break :identity ordinal;
+                break :identity try self.resolvePreparedOrdinal(self.alloc, &txn, id);
             };
-            if (delivery_started) |started| started.* = true;
-            return self.visitor(self.visitor_ctx, id, ordinal, unique, expiry_checked);
+            return self.visitor(self.visitor_ctx, id, ordinal, unique, false);
+        }
+        fn resolvePreparedOrdinal(self: *@This(), alloc: Allocator, txn: *docstore_mod.DocStore.Txn, id: []const u8) !?doc_set.DocOrdinal {
+            const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, txn, id)) orelse return null;
+            const state = (try doc_identity.lookupStateTxn(txn, ordinal)) orelse return null;
+            return if (if (self.req.identity_read_generation) |at| state.isVisibleAt(at) else state.isLive()) ordinal else null;
         }
     };
 
