@@ -815,7 +815,8 @@ pub const SegmentEntry = struct {
                         .sparse => return false,
                         .unknown => {},
                     }
-                    if (!allow_checksum and !self.reader.hasCheapTypedNavigation(field)) return false;
+                    if ((!allow_checksum or control.cancellation != null or control.deadline_ns != null) and
+                        !self.reader.hasCheapTypedNavigation(field)) return false;
                     const dense = try self.checkDenseNumericNavigation(field, control);
                     coverage.dense_numeric_navigation.store(if (dense) .dense else .sparse, .release);
                     return dense;

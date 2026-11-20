@@ -46433,11 +46433,16 @@ pub const DB = struct {
 
     fn rangeProjectionCurrentCallback(ctx: ?*anyopaque, alloc: Allocator, index_name: []const u8) anyerror!bool {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        var txn = try self.core.store.beginProbeTxn();
-        defer txn.abort();
-        const primary_sequence = try self.core.store.lastReplaySequenceFromTxn(&txn, 0);
-        if (self.executor.appliedSequence(index_name)) |applied| if (applied >= primary_sequence) return true;
-        return (try self.core.loadAppliedSequence(alloc, index_name)) >= primary_sequence;
+        const primary_sequence = seq: {
+            var txn = try self.core.store.beginProbeTxn();
+            defer txn.abort();
+            break :seq try self.core.store.lastReplaySequenceFromTxn(&txn, 0);
+        };
+        const resident = self.executor.appliedSequence(index_name) orelse 0;
+        if (resident >= primary_sequence) return true;
+        const applied = @max(resident, try self.core.loadAppliedSequence(alloc, index_name));
+        if (applied >= primary_sequence) return true;
+        return (try self.managedIndexReplayTargetSequence(alloc, index_name, .full_text, applied)) <= applied;
     }
 
     fn textIndexEntryCallback(
@@ -48966,7 +48971,6 @@ pub const DB = struct {
         try hits.ensureTotalCapacity(alloc, keys.len);
         for (keys, admission.allowed, admission.ordinals, 0..) |key, admitted, maybe_ordinal, i| {
             if (!admitted) continue;
-            const ordinal = maybe_ordinal orelse return error.InvalidGraphNodeAdmissionResult;
             var stored_data: ?[]u8 = null;
             if (admission.stored_data) |items| {
                 stored_data = items[i] orelse return error.InvalidGraphNodeAdmissionResult;
@@ -48976,7 +48980,7 @@ pub const DB = struct {
             errdefer alloc.free(id);
             hits.appendAssumeCapacity(.{
                 .id = id,
-                .doc_ordinal = ordinal,
+                .doc_ordinal = maybe_ordinal,
                 .stored_data = stored_data,
             });
         }
@@ -49380,7 +49384,7 @@ pub const DB = struct {
 
     fn graphRequestWithIndexedFilterForKeysAlloc(self: *DB, req: types.SearchRequest, keys: ?[]const []const u8, clause_cache: ?db_query_search.IndexedClauseCache) !AlgebraicDocFilterRequest {
         var needs_index = false;
-        for ([_][]const u8{ req.filter_query_json, req.exclusion_query_json }) |json| {
+        for ([_][]const u8{ req.authorization_filter_query_json, req.filter_query_json, req.exclusion_query_json }) |json| {
             if (json.len == 0) continue;
             var local_budget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(req.graph_execution_limits);
             var workspace = @import("../../graph/work_budget.zig").RetainedAllocator{ .backing = self.alloc, .budget = req.graph_work_budget orelse &local_budget };
@@ -49399,9 +49403,13 @@ pub const DB = struct {
     }
 
     const GraphPredicateFrontier = struct {
-        db: *DB,
         req: types.SearchRequest,
         keys: []const []const u8,
+        ordinals: []const ?doc_set.DocOrdinal,
+        legacy: []const bool,
+        key_domain: bool,
+        prior_legacy_include: []const []const u8,
+        prior_legacy_exclude: []const []const u8,
         include: *const doc_set.ResolvedDocSet,
         exclude: *const doc_set.ResolvedDocSet,
 
@@ -49410,8 +49418,6 @@ pub const DB = struct {
             const req = self.req;
             const control = @import("../../search/query.zig").ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
             try control.check();
-            const ordinals = try self.db.lookupLiveDocOrdinalsNoLock(alloc, self.keys, req.identity_read_generation);
-            defer alloc.free(ordinals);
             const prior: ?*const doc_set.ResolvedDocFilter = if (req.resolved_doc_filter) |raw| @ptrCast(@alignCast(raw)) else null;
             var include_keys = try graphFrontierKeySet(alloc, req.filter_doc_ids);
             defer include_keys.deinit(alloc);
@@ -49421,18 +49427,31 @@ pub const DB = struct {
             defer allowed_keys.deinit(alloc);
             var denied_keys = try graphFrontierKeySet(alloc, if (prior != null and prior.?.exclude == .doc_keys) prior.?.exclude.doc_keys else &.{});
             defer denied_keys.deinit(alloc);
+            var prior_legacy_include = try graphFrontierKeySet(alloc, self.prior_legacy_include);
+            defer prior_legacy_include.deinit(alloc);
+            var prior_legacy_exclude = try graphFrontierKeySet(alloc, self.prior_legacy_exclude);
+            defer prior_legacy_exclude.deinit(alloc);
+            var current_include = try graphFrontierKeySet(alloc, if (self.include.* == .doc_keys) self.include.doc_keys else &.{});
+            defer current_include.deinit(alloc);
+            var current_exclude = try graphFrontierKeySet(alloc, if (self.exclude.* == .doc_keys) self.exclude.doc_keys else &.{});
+            defer current_exclude.deinit(alloc);
             var result: std.AutoHashMapUnmanaged(doc_set.DocOrdinal, []const u8) = .empty;
             errdefer result.deinit(alloc);
-            for (self.keys, ordinals) |key, maybe_ordinal| {
+            for (self.keys, self.ordinals, self.legacy, 0..) |key, ordinal, legacy, slot| {
                 try control.check();
-                const ordinal = maybe_ordinal orelse continue;
-                if (!self.include.containsOrdinal(ordinal) or self.exclude.containsOrdinal(ordinal)) continue;
+                if (ordinal == null and !legacy) continue;
+                if (!containsGraphFrontierRow(self.include, &current_include, key, ordinal) or
+                    containsGraphFrontierRow(self.exclude, &current_exclude, key, ordinal)) continue;
                 if (prior) |filter| {
-                    if (!containsGraphFrontierRow(&filter.include, &allowed_keys, key, ordinal) or containsGraphFrontierRow(&filter.exclude, &denied_keys, key, ordinal)) continue;
+                    const allowed = containsGraphFrontierRow(&filter.include, &allowed_keys, key, ordinal) or
+                        (legacy and prior_legacy_include.contains(key));
+                    const denied = containsGraphFrontierRow(&filter.exclude, &denied_keys, key, ordinal) or
+                        (legacy and prior_legacy_exclude.contains(key));
+                    if (!allowed or denied) continue;
                 }
                 if ((req.filter_doc_ids_positive or req.filter_doc_ids.len != 0) and !include_keys.contains(key)) continue;
                 if (exclude_keys.contains(key)) continue;
-                try result.put(alloc, ordinal, key);
+                try result.put(alloc, if (self.key_domain) std.math.cast(u32, slot) orelse return error.InvalidData else ordinal.?, key);
             }
             return result;
         }
@@ -49445,8 +49464,12 @@ pub const DB = struct {
         return keys;
     }
 
-    fn containsGraphFrontierRow(set: *const doc_set.ResolvedDocSet, keys: *const std.StringHashMapUnmanaged(void), key: []const u8, ordinal: doc_set.DocOrdinal) bool {
-        return if (set.* == .doc_keys) keys.contains(key) else set.containsOrdinal(ordinal);
+    fn containsGraphFrontierRow(set: *const doc_set.ResolvedDocSet, keys: *const std.StringHashMapUnmanaged(void), key: []const u8, ordinal: ?doc_set.DocOrdinal) bool {
+        return switch (set.*) {
+            .all => true,
+            .doc_keys => keys.contains(key),
+            else => if (ordinal) |id| set.containsOrdinal(id) else false,
+        };
     }
 
     fn graphPriorKeyOrdinalsAlloc(self: *DB, alloc: Allocator, keys: []const []const u8, generation: ?u64) !doc_set.ResolvedDocSet {
@@ -49456,6 +49479,46 @@ pub const DB = struct {
         errdefer bitmap.deinit();
         for (ordinals) |maybe_ordinal| if (maybe_ordinal) |ordinal| try bitmap.add(ordinal);
         return .{ .ordinal_bitmap = bitmap };
+    }
+
+    fn graphLegacyVisibilityAlloc(self: *DB, alloc: Allocator, keys: []const []const u8, ordinals: []const ?doc_set.DocOrdinal, req: types.SearchRequest) ![]bool {
+        const legacy = try alloc.alloc(bool, keys.len);
+        errdefer alloc.free(legacy);
+        @memset(legacy, false);
+        if (std.mem.indexOfScalar(?doc_set.DocOrdinal, ordinals, null) == null) return legacy;
+        const control = @import("../../search/query.zig").ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
+        var candidates: std.ArrayListUnmanaged(types.SearchHit) = .empty;
+        defer candidates.deinit(alloc);
+        var positions: std.ArrayListUnmanaged(usize) = .empty;
+        defer positions.deinit(alloc);
+        {
+            var txn = try self.core.store.beginProbeTxn();
+            defer txn.abort();
+            for (keys, ordinals, 0..) |key, ordinal, slot| {
+                if (ordinal != null) continue;
+                try control.check();
+                if (try doc_identity.lookupOrdinalTxn(alloc, &txn, key)) |id| {
+                    // A mapped but invisible identity cannot become a legacy
+                    // row merely because its stored payload still exists.
+                    if (try doc_identity.lookupStateTxn(&txn, id) != null) continue;
+                }
+                try candidates.append(alloc, .{ .id = @constCast(key) });
+                try positions.append(alloc, slot);
+            }
+        }
+        if (candidates.items.len != 0) {
+            const visible = try filterStoredSearchCandidatesMany(self, alloc, candidates.items, false);
+            defer alloc.free(visible);
+            for (positions.items, visible) |slot, keep| legacy[slot] = keep;
+        }
+        return legacy;
+    }
+
+    fn graphPriorLegacyKeysAlloc(alloc: Allocator, executor: db_query_search.StructuredFilterResolverExecutor, keys: []const []const u8, set: *const doc_set.ResolvedDocSet, control: db_query_search.QueryExecutionControl) !doc_set.ResolvedDocSet {
+        return switch (set.*) {
+            .ordinals, .ordinal_bitmap => (try db_query_search.intersectOrdinalScopeWithKeysAlloc(alloc, executor, keys, set, control)) orelse return error.UnsupportedQueryRequest,
+            else => .none,
+        };
     }
 
     fn prepareGraphIndexedFilter(self: *DB, native: *AlgebraicDocFilterRequest, req: types.SearchRequest, keys: ?[]const []const u8, clause_cache: ?db_query_search.IndexedClauseCache) !void {
@@ -49473,8 +49536,37 @@ pub const DB = struct {
             .range_projection_current = rangeProjectionCurrentCallback,
             .identity_read_generation = req.identity_read_generation,
         };
-        var input = GraphPredicateFrontier{ .db = self, .req = req, .keys = keys orelse &.{}, .include = &filter.include, .exclude = &filter.exclude };
-        const frontier: ?db_query_search.GraphPredicateFrontier = if (keys != null) .{ .ptr = &input, .collect = GraphPredicateFrontier.collect } else null;
+        const ordinals = if (keys) |ids| try self.lookupLiveDocOrdinalsNoLock(a, ids, req.identity_read_generation) else null;
+        defer if (ordinals) |ids| a.free(ids);
+        const legacy = if (keys) |ids| try self.graphLegacyVisibilityAlloc(a, ids, ordinals.?, req) else null;
+        defer if (legacy) |mask| a.free(mask);
+        const key_domain = if (legacy) |mask| std.mem.indexOfScalar(bool, mask, true) != null else false;
+        var legacy_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer legacy_keys.deinit(a);
+        var legacy_include: doc_set.ResolvedDocSet = .none;
+        defer legacy_include.deinit(a);
+        var legacy_exclude: doc_set.ResolvedDocSet = .none;
+        defer legacy_exclude.deinit(a);
+        if (key_domain and req.resolved_doc_filter != null) {
+            for (keys.?, legacy.?) |key, present| if (present) try legacy_keys.append(a, key);
+            const prior: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(req.resolved_doc_filter.?));
+            const control = db_query_search.QueryExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
+            legacy_include = try graphPriorLegacyKeysAlloc(a, executor, legacy_keys.items, &prior.include, control);
+            legacy_exclude = try graphPriorLegacyKeysAlloc(a, executor, legacy_keys.items, &prior.exclude, control);
+        }
+        var input = GraphPredicateFrontier{
+            .req = req,
+            .keys = keys orelse &.{},
+            .ordinals = ordinals orelse &.{},
+            .legacy = legacy orelse &.{},
+            .key_domain = key_domain,
+            .prior_legacy_include = if (legacy_include == .doc_keys) legacy_include.doc_keys else &.{},
+            .prior_legacy_exclude = if (legacy_exclude == .doc_keys) legacy_exclude.doc_keys else &.{},
+            .include = &filter.include,
+            .exclude = &filter.exclude,
+        };
+        const frontier: ?db_query_search.GraphPredicateFrontier = if (keys != null) .{ .ptr = &input, .key_domain = key_domain, .collect = GraphPredicateFrontier.collect } else null;
+        if (key_domain) native.frontier_scoped = true;
         const budget = native.graph_memory.?.tracked.budget.?;
         // Indexed exclusions can narrow policy work. Residual exclusions
         // read stored values only after authorization and the user filter.
@@ -49497,13 +49589,31 @@ pub const DB = struct {
         if (user_filter.len > 0) {
             var user = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, user_filter, frontier, budget, &native.frontier_scoped, clause_cache, .allow_residual);
             defer user.deinit(a);
-            const include = (try doc_set.intersectAlloc(a, &filter.include, &user)) orelse return error.UnsupportedQueryRequest;
-            filter.include.deinit(a);
-            filter.include = include;
+            if (key_domain) {
+                // The key frontier already applied the policy and other gates.
+                filter.include.deinit(a);
+                filter.include = user;
+                user = .none;
+            } else {
+                const include = (try doc_set.intersectAlloc(a, &filter.include, &user)) orelse return error.UnsupportedQueryRequest;
+                filter.include.deinit(a);
+                filter.include = include;
+            }
         }
         if (residual_exclusion) filter.exclude = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json, frontier, budget, &native.frontier_scoped, clause_cache, .allow_residual);
-        if (req.resolved_doc_filter) |raw| {
-            const prior: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(raw));
+        if (key_domain and (filter.include == .all or filter.exclude != .none)) {
+            var admitted = try GraphPredicateFrontier.collect(&input, a);
+            defer admitted.deinit(a);
+            const ids = try a.alloc([]const u8, admitted.count());
+            defer a.free(ids);
+            var entries = admitted.valueIterator();
+            for (ids) |*id| id.* = entries.next().?.*;
+            const include = try doc_set.cloneDocKeysAlloc(a, ids);
+            filter.include.deinit(a);
+            filter.exclude.deinit(a);
+            filter.include = include;
+        } else if (!key_domain and req.resolved_doc_filter != null) {
+            const prior: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(req.resolved_doc_filter.?));
             var prior_include = if (prior.include == .doc_keys) try self.graphPriorKeyOrdinalsAlloc(a, prior.include.doc_keys, req.identity_read_generation) else null;
             defer if (prior_include) |*set| set.deinit(a);
             var prior_exclude = if (prior.exclude == .doc_keys) try self.graphPriorKeyOrdinalsAlloc(a, prior.exclude.doc_keys, req.identity_read_generation) else null;
@@ -49538,9 +49648,11 @@ pub const DB = struct {
         );
         errdefer alloc.free(ordinals);
 
+        const legacy = try self.graphLegacyVisibilityAlloc(alloc, keys, ordinals, req);
+        defer alloc.free(legacy);
         var live_count: usize = 0;
-        for (ordinals) |ordinal| {
-            if (ordinal != null) live_count += 1;
+        for (ordinals, legacy) |ordinal, present| {
+            if (ordinal != null or present) live_count += 1;
         }
 
         const mask = try alloc.alloc(bool, keys.len);
@@ -49566,8 +49678,8 @@ pub const DB = struct {
             for (hits[0..initialized]) |*hit| hit.deinit(alloc);
             if (hits.len > 0) alloc.free(hits);
         };
-        for (keys, ordinals, 0..) |key, maybe_ordinal, i| {
-            const ordinal = maybe_ordinal orelse continue;
+        for (keys, ordinals, legacy, 0..) |key, ordinal, present, i| {
+            if (ordinal == null and !present) continue;
             const id = try alloc.dupe(u8, key);
             errdefer alloc.free(id);
             const stored = if (preload) |items| blk: {
@@ -49615,8 +49727,8 @@ pub const DB = struct {
         errdefer if (stored_data) |items| freeOptionalOwnedBytes(alloc, items);
 
         var filtered_index: usize = 0;
-        for (keys, ordinals, 0..) |key, maybe_ordinal, i| {
-            if (maybe_ordinal == null) continue;
+        for (keys, ordinals, legacy, 0..) |key, ordinal, present, i| {
+            if (ordinal == null and !present) continue;
             const allowed = filtered_index < filtered.hits.len and
                 std.mem.eql(u8, key, filtered.hits[filtered_index].id);
             mask[i] = allowed;
@@ -49661,6 +49773,15 @@ pub const DB = struct {
         indexed_request_filter: ?AlgebraicDocFilterRequest = null,
         decisions: std.StringHashMapUnmanaged(bool) = .empty,
         clause_membership: db_query_search.IndexedClauseMembership = .{},
+
+        fn canReuseIndexedRequest(self: *GraphNodeAdmissionCache, alloc: Allocator, cached: ?*const AlgebraicDocFilterRequest, keys: []const []const u8) !bool {
+            const prepared = cached orelse return false;
+            if (prepared.graph_memory == null) return true;
+            const ordinals = try self.db.lookupLiveDocOrdinalsNoLock(alloc, keys, self.req.identity_read_generation);
+            defer alloc.free(ordinals);
+            for (ordinals) |ordinal| if (ordinal == null) return false;
+            return true;
+        }
 
         fn init(
             db: *DB,
@@ -49738,9 +49859,9 @@ pub const DB = struct {
                 const clause_cache: db_query_search.IndexedClauseCache = .{ .memory = &self.clause_membership, .alloc = self.alloc, .budget = self.req.graph_work_budget };
                 var scoped_request: ?AlgebraicDocFilterRequest = null;
                 defer if (scoped_request) |*entry| entry.deinit();
-                if (self.indexed_request_filter == null) {
+                if (!try self.canReuseIndexedRequest(result_alloc, if (self.indexed_request_filter) |*cached| cached else null, missing_keys.items)) {
                     const prepared = try self.db.graphRequestWithIndexedFilterForKeysAlloc(self.req, missing_keys.items, clause_cache);
-                    if (prepared.frontier_scoped) scoped_request = prepared else self.indexed_request_filter = prepared;
+                    if (prepared.frontier_scoped or self.indexed_request_filter != null) scoped_request = prepared else self.indexed_request_filter = prepared;
                 }
                 const request_filter = if (scoped_request) |*entry| entry else &self.indexed_request_filter.?;
                 const missing_mask = try self.db.filterGraphKeysAlloc(result_alloc, request_filter.req, missing_keys.items);
@@ -49762,14 +49883,14 @@ pub const DB = struct {
                     if (query_keys.items.len > 0) {
                         var scoped_node: ?AlgebraicDocFilterRequest = null;
                         defer if (scoped_node) |*entry| entry.deinit();
-                        if (self.indexed_node_filter == null) {
+                        if (!try self.canReuseIndexedRequest(result_alloc, if (self.indexed_node_filter) |*cached| cached else null, query_keys.items)) {
                             var filter_req = self.req;
                             filter_req.filter_query_json = filter_query_json;
                             filter_req.exclusion_query_json = "";
                             filter_req.resolved_doc_filter = null;
                             filter_req.authorization_filter_query_json = "";
                             const prepared = try self.db.graphRequestWithIndexedFilterForKeysAlloc(filter_req, query_keys.items, clause_cache);
-                            if (prepared.frontier_scoped) scoped_node = prepared else self.indexed_node_filter = prepared;
+                            if (prepared.frontier_scoped or self.indexed_node_filter != null) scoped_node = prepared else self.indexed_node_filter = prepared;
                         }
                         const node_filter = if (scoped_node) |*entry| entry else &self.indexed_node_filter.?;
                         if (node_filter.resolved_doc_filter != null) {
@@ -156642,6 +156763,28 @@ test "db optional numeric range filters lexical and dense candidates on fresh an
     }
 }
 
+test "optional numeric range freshness follows the selected text replay frontier" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("range-projection-frontier");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+    try std.testing.expect(try DB.rangeProjectionCurrentCallback(&db, a, "ft"));
+
+    const unrelated = db.core.reserveDerivedAppendSequence();
+    const graph = try change_journal_mod.encodeRecord(a, .{ .sequence = unrelated, .target_hints = &.{.graph} });
+    defer a.free(graph);
+    try db.core.store.appendReplayOpaque(a, unrelated, graph);
+    try std.testing.expect(try DB.rangeProjectionCurrentCallback(&db, a, "ft"));
+
+    const relevant = db.core.reserveDerivedAppendSequence();
+    const text = try change_journal_mod.encodeRecord(a, .{ .sequence = relevant, .changed_doc_keys = &.{"row"}, .target_hints = &.{.full_text} });
+    defer a.free(text);
+    try db.core.store.appendReplayOpaque(a, relevant, text);
+    try std.testing.expect(!try DB.rangeProjectionCurrentCallback(&db, a, "ft"));
+}
+
 test "optional numeric range reconciles witnessed text coverage with primary identities" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("range-primary-coverage");
@@ -156744,6 +156887,11 @@ test "optional numeric range reconciles witnessed text coverage with primary ide
         }
     }
 
+    const relay_ordinal = blk: {
+        var read = try db.core.store.beginProbeTxn();
+        defer read.abort();
+        break :blk (try doc_identity.lookupOrdinalTxn(a, &read, "b")).?;
+    };
     const forward = try internal_keys.identityDocToOrdinalKeyAlloc(a, "b");
     defer a.free(forward);
     {
@@ -156752,6 +156900,35 @@ test "optional numeric range reconciles witnessed text coverage with primary ide
         try txn.delete(forward);
         try txn.commit();
     }
+    const relay = "{\"match\":{\"field\":\"body\",\"text\":\"relay\"}}";
+    const relay_range = "{\"conjuncts\":[" ++ relay ++ ",{\"range\":{\"rank\":{\"gte\":1}}}]}";
+    var admission = try db.filterGraphKeysWithOrdinalsAlloc(a, .{
+        .index_name = "ft",
+        .include_stored = true,
+        .filter_query_json = relay_range,
+    }, &.{ "a", "b", "c", "missing" });
+    defer admission.deinit(a);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, false }, admission.allowed);
+    try std.testing.expect(admission.ordinals[1] == null);
+    try std.testing.expect(admission.stored_data.?[1] != null);
+
+    const prior = doc_set.ResolvedDocFilter{ .exclude = .{ .ordinals = &.{relay_ordinal} } };
+    const denied = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = relay_range,
+        .resolved_doc_filter = &prior,
+    }, &.{"b"});
+    defer a.free(denied);
+    try std.testing.expectEqualSlices(bool, &.{false}, denied);
+
+    const without_relay = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = relay_range,
+        .exclusion_query_json = relay_range,
+    }, &.{ "a", "b", "c" });
+    defer a.free(without_relay);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false }, without_relay);
+
     var excluded = try db.searchDenseProfiled(a, .{
         .index_name = "dv",
         .primary_text_index_name = "ft",
