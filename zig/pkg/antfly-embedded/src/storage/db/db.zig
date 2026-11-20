@@ -26085,19 +26085,20 @@ pub const DB = struct {
         defer graph_effects.deinit();
         const graph_alloc = graph_effects.allocator();
         const graph_contract = @import("graph_transaction_effects.zig");
+        var graph_prepare: graph_contract.Prepare = .{ .include_policy_sources = row_policy_principal != null };
         var intents = std.ArrayListUnmanaged(transactions_mod.WriteIntent).empty;
         defer intents.deinit(preparation_alloc);
         for (req.graph_writes) |edge| {
             try types.validateGraphEndpointCleanupCommand(.{ .graph_writes = &.{edge} });
-            try graph_contract.append(graph_alloc, preparation_alloc, &intents, .{ .write = edge });
+            try graph_prepare.append(graph_alloc, preparation_alloc, &intents, .{ .write = edge });
         }
         for (req.graph_deletes) |edge| {
             try types.validateGraphEndpointCleanupCommand(.{ .graph_deletes = &.{edge} });
-            try graph_contract.append(graph_alloc, preparation_alloc, &intents, .{ .delete = edge });
+            try graph_prepare.append(graph_alloc, preparation_alloc, &intents, .{ .delete = edge });
         }
-        for (effective_ops.graph_writes.items) |edge| try graph_contract.append(graph_alloc, preparation_alloc, &intents, .{ .write = edge });
-        for (effective_ops.graph_deletes.items) |edge| try graph_contract.append(graph_alloc, preparation_alloc, &intents, .{ .delete = edge });
-        const graph_sources = try graph_contract.sources(graph_alloc, intents.items, false);
+        for (effective_ops.graph_writes.items) |edge| try graph_prepare.append(graph_alloc, preparation_alloc, &intents, .{ .write = edge });
+        for (effective_ops.graph_deletes.items) |edge| try graph_prepare.append(graph_alloc, preparation_alloc, &intents, .{ .delete = edge });
+        const graph_sources = graph_prepare.owners.items;
         var predicates = std.ArrayListUnmanaged(transactions_mod.VersionPredicate).empty;
         defer predicates.deinit(preparation_alloc);
 
@@ -26273,8 +26274,7 @@ pub const DB = struct {
             const view = prepared_schema_view orelse return error.RowPolicyCatalogChanged;
             // Preserve authorization on the logical endpoint as well as the
             // document that owns the durable graph contribution.
-            const policy_sources = if (graph_sources.len != 0) try graph_contract.sources(graph_alloc, intents.items, true) else graph_sources;
-            try self.enforceRowPolicyIntentsLocked(view, intents.items, policy_sources, principal, graph_alloc, &predicates, preparation_alloc);
+            try self.enforceRowPolicyIntentsLocked(view, intents.items, graph_prepare.policy_sources.items, principal, graph_alloc, &predicates, preparation_alloc);
         }
         const integrity_mod = @import("relational_integrity.zig");
         const activation_mod = @import("relational_integrity_activation.zig");
