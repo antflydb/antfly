@@ -56,7 +56,7 @@ pub const Prefix = struct {
     fn runImpl(self: *const Prefix, decoder: ?*@import("resident_decoder.zig").Decoder, session: Session, history: []const i64, a: std.mem.Allocator, control: ?Control) ![]f32 {
         if (self.bucket_rows > 256) return error.InvalidInputShape;
         if (history.len == 0) return error.InvalidPreparedPrompt;
-        const rows = if (decoder) |cached| try @import("resident_decoder.zig").capacityFor(history.len, cached.config.max_position_embeddings) else if (self.bucket_rows == 0) history.len else bucket: {
+        const rows = if (decoder) |cached| try @import("resident_decoder.zig").prefillRowsFor(history.len, cached.config.max_position_embeddings) else if (self.bucket_rows == 0) history.len else bucket: {
             const cfg = @import("../architectures/session_factory.zig").getGptConfig(session) orelse return error.InvalidPreparedPrompt;
             const rounded = try std.math.mul(usize, try std.math.divCeil(usize, history.len, self.bucket_rows), self.bucket_rows);
             break :bucket @min(rounded, cfg.max_position_embeddings);

@@ -223,9 +223,19 @@ logits reject the generation before any prior cache buffers or cursor change.
 
 BF16 decoder branches retain their BF16 publication boundaries while CPU and
 CUDA GPT residual streams accumulate in F32. Automatic reduced-precision
-caching requires that qualified residual policy; unknown arithmetic keeps
-ordinary execution. Accuracy qualification retains its independent F32 reference,
-relative-error limit and generated-token checks.
+caching requires the qualified CPU residual policy; CUDA BF16 keeps ordinary
+execution automatically. Explicit CUDA BF16 caching remains experimental: the
+Qwen context matrix misses the unchanged relative-error gate at two contexts,
+even though sampled greedy tokens match. Accuracy qualification retains its
+independent F32 reference, relative-error limit and generated-token checks.
+
+KV capacity remains bucketed in 64-row increments. Prefill query geometry is
+separate: prompts below 64 rows use power-of-two query buckets, bounding padded
+work below twice the logical prompt without creating an unbounded shape cache.
+Text and media prefixes use the same policy. Automatic state admission declines
+quota and transient-pressure denials before execution; explicit cache requests,
+cancellation and provider failures preserve their errors. Neither path replays
+submitted numerical work.
 
 Opaque serial native calls use the same prepared Source owner as dispatched
 calls. The original scratch floor, final Tensor container, owned shape arrays

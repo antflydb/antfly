@@ -38,8 +38,10 @@ pub fn select(source: Session, requested: ?bool) !bool {
 
 /// Qualification follows immutable arithmetic policy and survives session wrappers.
 pub fn profileFor(profile: anytype) DecoderCache {
+    // CUDA BF16 retains an explicit experimental route, but matching sampled
+    // tokens does not qualify its F32-relative-error contract at all contexts.
     return .{ .automatic = profile.precision == .f32 or
-        ((profile.platform == .cpu or profile.platform == .cuda) and profile.residual_storage == .f32) };
+        (profile.platform == .cpu and profile.residual_storage == .f32) };
 }
 
 pub fn supports(cfg: Config) bool {
@@ -86,13 +88,14 @@ pub const Decoder = struct {
     pub fn initForRequest(a: std.mem.Allocator, source: Session, requested: ?bool, limit: usize, max_tokens: usize, control: ?Control) !?Decoder {
         if (requested == null and max_tokens <= 1) return null;
         if (!try select(source, requested)) return null;
-        return init(a, source, limit, control) catch |err| {
-            if (requested == null and err == error.ResourceLimitExceeded) return null;
-            return err;
-        };
+        return initWithRequest(a, source, requested, limit, control);
     }
 
     pub fn init(a: std.mem.Allocator, source: Session, limit: usize, control: ?Control) !Decoder {
+        return (try initWithRequest(a, source, true, limit, control)).?;
+    }
+
+    fn initWithRequest(a: std.mem.Allocator, source: Session, requested: ?bool, limit: usize, control: ?Control) !?Decoder {
         if (control) |active| try active.check();
         const cfg = (source.model_contract.decoder_config orelse return error.UnsupportedResidentDecode).*;
         if (!try select(source, true)) return error.UnsupportedResidentDecode;
@@ -116,7 +119,7 @@ pub const Decoder = struct {
         // state is produced on device; the host retains only buffer headers.
         const header_size = if (comptime enabled) @sizeOf(@import("pjrt").pjrt.Buffer) else @sizeOf(usize) * 4;
         const headers = try std.math.mul(usize, try std.math.add(usize, try std.math.mul(usize, banks, 3), 4), header_size);
-        const reservation = try source.withAdmissionControl(control).admitRetainedState(try std.math.add(usize, headers, 2 * @sizeOf(f32)), try std.math.add(usize, try std.math.mul(usize, bytes, 2), 2 * @sizeOf(f32)));
+        const reservation = (try reserveState(source, requested, try std.math.add(usize, headers, 2 * @sizeOf(f32)), try std.math.add(usize, try std.math.mul(usize, bytes, 2), 2 * @sizeOf(f32)), control)) orelse return null;
         return .{ .allocator = a, .source = source, .config = cfg, .capacity = capacity, .limit = limit, .bank_bytes = bytes, .reservation = reservation, .control = control };
     }
     /// Same request owner and publication protocol for learned-position
@@ -132,10 +135,7 @@ pub const Decoder = struct {
         const banks = try std.math.mul(usize, cfg.decoder_layers, 4);
         const header_size = if (comptime enabled) @sizeOf(@import("pjrt").pjrt.Buffer) else @sizeOf(usize) * 4;
         const headers = try std.math.mul(usize, try std.math.add(usize, try std.math.mul(usize, banks, 3), 4), header_size);
-        const reservation = source.withAdmissionControl(control).admitRetainedState(try std.math.add(usize, headers, 2 * @sizeOf(f32)), try std.math.add(usize, try std.math.mul(usize, bytes, 2), 2 * @sizeOf(f32))) catch |err| {
-            if (requested == null and err == error.ResourceLimitExceeded) return null;
-            return err;
-        };
+        const reservation = (try reserveState(source, requested, try std.math.add(usize, headers, 2 * @sizeOf(f32)), try std.math.add(usize, try std.math.mul(usize, bytes, 2), 2 * @sizeOf(f32)), control)) orelse return null;
         return .{ .allocator = a, .source = source, .config = .{}, .encoder_decoder_config = cfg, .encoder_rows = encoder_rows, .capacity = cfg.max_target_positions, .limit = cfg.max_target_positions, .bank_bytes = bytes, .reservation = reservation, .control = control };
     }
 
@@ -215,7 +215,7 @@ pub const Decoder = struct {
         if (history.len == 0 or history.len > self.limit or (self.position != 0 and history.len != self.position + 1)) return error.InvalidResidentDecodePosition;
         errdefer self.failed = true;
         const ids = if (self.position == 0) history else history[history.len - 1 ..];
-        const rows = if (self.position == 0) try capacityFor(ids.len, self.config.max_position_embeddings) else 1;
+        const rows = if (self.position == 0) try prefillRowsFor(ids.len, self.config.max_position_embeddings) else 1;
         // These copies precede per-step admission, so retain their real host
         // charge until the complete synchronous invocation has finished.
         var staging_bytes = try std.math.mul(usize, rows, 2 * @sizeOf(i64));
@@ -256,6 +256,62 @@ pub const Decoder = struct {
         return a.dupe(f32, outputs[0].asFloat32());
     }
 };
+
+/// Share the optional transaction between decoder families. Speculative
+/// denial details never escape a successful compatibility fallback, and the
+/// retained permit never keeps the stack-owned diagnostic capture.
+fn reserveState(source: Session, requested: ?bool, host_bytes: usize, state_bytes: usize, control: ?Control) !?@import("../backends/session.zig").RunPermit {
+    const admitted = source.withAdmissionControl(control);
+    if (requested != null) return try admitted.admitRetainedState(host_bytes, state_bytes);
+    const Memory = @import("../runtime/tier/memory.zig");
+    var capture = Memory.AdmissionFailure.Capture.init(if (admitted.run_admission) |policy| policy.failure else null);
+    var permit = admitted.withAdmissionFailure(capture.sink()).admitRetainedState(host_bytes, state_bytes) catch |err| {
+        if (declineOptionalAdmission(requested, err)) return null;
+        capture.publish(err);
+        return err;
+    };
+    permit.session = admitted;
+    return permit;
+}
+
+/// Only pre-execution quota/pressure denials can decline optional state. An
+/// explicit request, cancellation, provider failure or allocation failure keeps
+/// its original error; no submitted numerical work is replayed.
+fn declineOptionalAdmission(requested: ?bool, err: anyerror) bool {
+    if (requested != null) return false;
+    return switch (err) {
+        error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded => true,
+        else => false,
+    };
+}
+
+/// Query geometry is independent of KV capacity. Small geometric buckets bound
+/// padded work below twice the logical prompt, while the existing 64-row bank
+/// buckets continue sharing decode programs. At most six extra small prefill
+/// shapes enter the existing bounded specialization cache.
+pub fn prefillRowsFor(requested: usize, maximum: usize) !usize {
+    const capacity = try capacityFor(requested, maximum);
+    if (requested >= 64) return capacity;
+    return @min(maximum, try std.math.ceilPowerOfTwo(usize, requested));
+}
+
+test "resident decoder query buckets bound short prefill work independently of KV" {
+    for (1..130) |rows| {
+        const queries = try prefillRowsFor(rows, 1024);
+        try std.testing.expect(queries >= rows);
+        try std.testing.expect(queries < 2 * rows);
+        try std.testing.expect(queries <= try capacityFor(rows, 1024));
+        // Even a two-output request performs fewer query rows than two
+        // full-prefix forwards: padded prefill + one cached query < n + n+1.
+        try std.testing.expect(queries + 1 < 2 * rows + 1);
+    }
+    try std.testing.expectEqual(@as(usize, 1), try prefillRowsFor(1, 1024));
+    try std.testing.expectEqual(@as(usize, 4), try prefillRowsFor(3, 1024));
+    try std.testing.expectEqual(@as(usize, 33), try prefillRowsFor(33, 33));
+    try std.testing.expectEqual(@as(usize, 192), try prefillRowsFor(129, 1024));
+    try std.testing.expectError(error.InvalidResidentDecodePosition, prefillRowsFor(0, 1024));
+    try std.testing.expectError(error.InvalidResidentDecodePosition, prefillRowsFor(33, 32));
+}
 
 /// Bound padding while sharing one decode executable across nearby prompt and
 /// output limits. The logical request limit remains independent of this bank.
@@ -304,7 +360,7 @@ test "resident decoder automatic selection excludes unqualified reduced precisio
     profile.platform = .cuda;
     try std.testing.expect(!profileFor(profile).automatic);
     profile.residual_storage = .f32;
-    try std.testing.expect(profileFor(profile).automatic);
+    try std.testing.expect(!profileFor(profile).automatic);
     profile.precision = .f32;
     try std.testing.expect(profileFor(profile).automatic);
     profile.platform = .other;
@@ -350,9 +406,31 @@ test "resident encoder decoder policy preserves explicit controls actual KV admi
     try std.testing.expectEqual(@as(usize, 648), domain.snapshot().host_kv_bytes);
     decoder.deinit();
     try std.testing.expectEqual(@as(usize, 0), domain.snapshot().hostTotalBytes());
+    // The optional bank is refused before provider execution. The ordinary
+    // request remains admissible after transient pressure, and no lease leaks.
+    domain.configureForcedRunDenialsForTesting(1);
+    try std.testing.expect((try Decoder.initEncoderDecoder(a, source, 2, null, null)) == null);
+    domain.configureForcedRunDenialsForTesting(1);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, Decoder.initEncoderDecoder(a, source, 2, true, null));
+    try std.testing.expectEqual(@as(usize, 0), domain.snapshot().hostTotalBytes());
     source.run_admission.?.limits.kv_limit_bytes = 647;
+    var failure: @import("../runtime/tier/memory.zig").AdmissionFailure = .{};
+    const diagnosed = Control{ .admission_failure = &failure };
+    try std.testing.expect((try Decoder.initEncoderDecoder(a, source, 2, null, diagnosed)) == null);
+    try std.testing.expect(failure.snapshot() == null);
+    try std.testing.expectError(error.ResourceLimitExceeded, Decoder.initEncoderDecoder(a, source, 2, true, diagnosed));
+    try std.testing.expect(failure.snapshot() != null);
     try std.testing.expect((try Decoder.initEncoderDecoder(a, source, 2, null, null)) == null);
     try std.testing.expectError(error.ResourceLimitExceeded, Decoder.initEncoderDecoder(a, source, 2, true, null));
+    try std.testing.expectEqual(@as(usize, 0), domain.snapshot().hostTotalBytes());
+    source.run_admission.?.limits.kv_limit_bytes = 0;
+    const gpt = Config{ .position_encoding = .rope };
+    source.model_contract.decoder_config = &gpt;
+    domain.configureForcedRunDenialsForTesting(1);
+    try std.testing.expect((try Decoder.initForRequest(a, source, null, 16, 8, null)) == null);
+    domain.configureForcedRunDenialsForTesting(1);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, Decoder.initForRequest(a, source, true, 16, 8, null));
+    try std.testing.expectError(error.Cancelled, Decoder.initForRequest(a, source, null, 16, 8, .{ .check_fn = Probe.cancelled }));
     try std.testing.expectEqual(@as(usize, 0), domain.snapshot().hostTotalBytes());
     source.model_contract.decoder_cache.automatic = false;
     try std.testing.expect((try Decoder.initEncoderDecoder(a, source, 2, null, null)) == null);

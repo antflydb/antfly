@@ -807,7 +807,7 @@ test "model program resident decoder matches full-prefix logits without per-toke
     var f32_reference: [3]?[]f32 = @splat(null);
     defer for (f32_reference) |reference| if (reference) |values| a.free(values);
     for ([_]factory.PjrtSessionOptions.Precision{ .f32, .bf16 }) |precision| {
-        const session = try factory.createPjrtSessionWithOptions(a, path, .{ .task_override = .generic, .memory_policy = .cpu, .precision = precision });
+        const session = try factory.createPjrtSessionWithOptions(a, path, try DecoderQualification.options(precision));
         defer session.close();
         const cfg = factory.getGptConfig(session) orelse return error.WrongModelArchitecture;
         const values = try a.alloc(f32, cfg.hidden_size);
@@ -892,7 +892,7 @@ const DecoderQualification = struct {
 
     fn reference(session: Session, ids: []const i64, a: std.mem.Allocator) ![]f32 {
         const cfg = session.model_contract.decoder_config.?;
-        const rows = try @import("resident_decoder.zig").capacityFor(ids.len, cfg.max_position_embeddings);
+        const rows = try @import("resident_decoder.zig").prefillRowsFor(ids.len, cfg.max_position_embeddings);
         const padded = try a.alloc(i64, rows);
         defer a.free(padded);
         @memcpy(padded[0..ids.len], ids);
@@ -1013,6 +1013,10 @@ test "model program resident requests isolate concurrent state and refund failur
     try std.testing.expect((try DecoderQualification.Decoder.initForRequest(a, session, null, 16, 1, DecoderQualification.control)) == null);
     try std.testing.expect((try DecoderQualification.Decoder.initForRequest(a, unsupported, null, 16, 8, DecoderQualification.control)) == null);
     try std.testing.expectError(error.ResourceLimitExceeded, DecoderQualification.Decoder.initForRequest(a, denied, true, 16, 8, DecoderQualification.control));
+    accounting.configureForcedRunDenialsForTesting(1);
+    try std.testing.expect((try DecoderQualification.Decoder.initForRequest(a, session, null, 16, 8, DecoderQualification.control)) == null);
+    accounting.configureForcedRunDenialsForTesting(1);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, DecoderQualification.Decoder.initForRequest(a, session, true, 16, 8, DecoderQualification.control));
     try std.testing.expectEqualDeep(baseline, accounting.snapshot());
     {
         var bounded = session;
