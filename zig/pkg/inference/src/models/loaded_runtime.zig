@@ -319,10 +319,6 @@ pub const ArtifactDigestCache = struct {
     pub var next: usize = 0;
     pub var forbid_hashing_for_test: bool = false;
 
-    pub fn digest(io: std.Io, artifact: managed_receipt.ValidatedArtifact) ![32]u8 {
-        return digestWithControl(io, artifact, .{});
-    }
-
     pub fn digestWithControl(io: std.Io, artifact: managed_receipt.ValidatedArtifact, control: InferenceExecutionControl) ![32]u8 {
         try control.check();
         const signature = try componentDependencySignature(io, &.{artifact.canonical_path});
@@ -626,7 +622,7 @@ pub const Runtime = struct {
         errdefer if (model_storage_owned) allocator.destroy(model);
         const chunk_planning = try chunkPlanningSnapshotWithControl(allocator, assets.preparation_io orelse std.Options.debug_io, man, resolution_revision, control orelse .{});
         if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(allocator, assets.preparation_io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
-        if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(allocator, assets.preparation_io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
+        if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevisionWithControl(allocator, assets.preparation_io orelse std.Options.debug_io, man, control orelse .{}))) return error.ModelArtifactsChanging;
         var resolved_session = session;
         resolved_session.model_contract = @import("../models/session_contract.zig").resolve(session.model_contract, &man, session.backend());
         model.* = .{
@@ -2118,7 +2114,7 @@ pub fn preparePrimary(allocator: std.mem.Allocator, model_dir: []const u8, sourc
     var artifacts_owned = true;
     defer if (artifacts_owned) tokenizer_artifacts.deinit();
     tokenizer_artifacts.verification_cache = preparation.host.session_loading.verification_cache;
-    const resolution_file_revision = try resolutionModelRevision(allocator, sm.io orelse std.Options.debug_io, man);
+    const resolution_file_revision = try resolutionModelRevisionWithControl(allocator, sm.io orelse std.Options.debug_io, man, control orelse .{});
     const resolution_revision = try modelIdentityWithArtifacts(allocator, io, model_dir, man, &tokenizer_artifacts, control orelse .{});
     const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
         try eg2_identity.signature(allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)

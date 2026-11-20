@@ -262,14 +262,25 @@ provider objects, gives no future quota credit, and releases its lease before
 execution. Quota or pressure retains bounded queries without publishing a
 speculative failure; cancellation and unexpected errors propagate. The request
 can supply a different explicit query bound through the
-existing prefill-chunk setting. Every chunk publishes its valid rows before the
+existing prefill-chunk setting. The physical query shape, including padding,
+never exceeds that bound: non-aligned limits select an existing canonical
+bucket beneath the ceiling (for example 64 rows under a limit of 65), retaining
+tuned shapes and the same bounded specialization cache. Every chunk publishes its valid rows before the
 next chunk. Intermediate queries produce a checked hidden row without loading
 or executing the unused vocabulary head; only the final chunk's last-row logits
 reach sampling. The capture identity and output admission distinguish these
 variants while sharing their decoder body. Reports include the actual completed
 prefill-step and skipped-head counts. Recurrent layouts retain their
 separately qualified shape. Bidirectional media prefixes retain whole-prefix
-execution and reject an explicit chunk request rather than changing visibility.
+execution. Their frontend publishes one checked layout for host inputs, padded
+embeddings, positions, PLE, visibility and the fixed six-input packet; admission
+and materialization consume that same layout. Before selecting caching, the
+whole decoder prefill peak must fit beside retained KV state. Automatic quota
+or pressure denial releases that reservation and reuses the prepared prefix
+through ordinary execution; it never retries submitted decoder work. Explicit
+cache requests retain their original admission error. A requested query ceiling
+is accepted when it covers the complete padded prefix and otherwise rejected
+rather than changing visibility.
 CPU BF16 retains its qualified whole-prefix cached route.
 
 The opt-in full-window test exercises Qwen3-0.6B's actual 40,960-token capacity
@@ -310,6 +321,12 @@ as proof that a particular model installed the plan. Automatic decode replay
 requires that installed automatic policy, a bounded request KV reservation and
 the existing greedy/capture safety gates. Shadow checkpoint queries reject
 actual typed replay before reading or mutating source KV.
+
+Reader epoch draining has distinct compatibility and retirement owners. A queued
+incompatible head owns its compatibility drain; cancellation or timeout removes
+that hold and wakes the next FIFO waiter. An adopted final-page resource instead
+keeps the epoch in retirement until its last outstanding cleanup completes.
+Cancelling a waiter cannot reopen that retirement or weaken epoch join bounds.
 
 ## Remaining migration boundaries
 

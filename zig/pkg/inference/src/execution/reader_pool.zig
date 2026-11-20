@@ -50,8 +50,9 @@ pub const Pool = struct {
     /// Only construction owns this reservation. SDK and factory callbacks
     /// execute unlocked; no second caller can publish the same empty epoch.
     creating: bool = false,
-    /// An incompatible head request closes this epoch to further refills.
-    draining: bool = false,
+    /// Compatibility draining belongs to its queued head. Retirement draining
+    /// owns adopted resources and cannot be revoked by waiter cancellation.
+    drain: union(enum) { open, incompatible: *Waiter, retiring } = .open,
     users: usize = 0,
     retiring: usize = 0,
     joins: usize = 0,
@@ -71,6 +72,7 @@ pub const Pool = struct {
         var link = &self.waiters;
         while (link.*) |current| {
             if (current == waiter) {
+                if (self.drain == .incompatible and self.drain.incompatible == current) self.drain = .open;
                 link.* = current.next;
                 waiter.next = null;
                 return;
@@ -114,7 +116,7 @@ pub const Pool = struct {
         self.context = null;
         self.destroy_fn = null;
         self.joins = 0;
-        self.draining = false;
+        self.drain = .open;
         self.max_epoch_joins = 64;
         return destroy;
     }
@@ -147,7 +149,7 @@ pub const Pool = struct {
             } else {
                 // New refills wait for the pending final context destruction;
                 // no caller blocks waiting on an admission callback's stack.
-                owner.draining = true;
+                owner.drain = .retiring;
                 adopt_final(context, resource);
             }
             owner.wakeWaiters();
@@ -196,10 +198,10 @@ pub const Pool = struct {
                 return error.InvalidReaderCapacity;
             }
             const first = self.waiters == null or (attached and self.waiters == &waiter);
-            if (first and self.context != null and !compatible(self.context.?, factory)) self.draining = true;
+            if (first and self.drain != .retiring and self.context != null and !compatible(self.context.?, factory)) self.drain = .{ .incompatible = &waiter };
             // Bound each epoch as well as its instantaneous occupancy so a
             // permanent stream cannot monopolize the model execution lane.
-            if (first and !self.creating and !self.draining and self.users + self.retiring < capacity and (self.context == null or self.joins < self.max_epoch_joins)) {
+            if (first and !self.creating and self.drain == .open and self.users + self.retiring < capacity and (self.context == null or self.joins < self.max_epoch_joins)) {
                 const new_epoch = self.context == null;
                 if (new_epoch) {
                     self.creating = true;
@@ -904,7 +906,7 @@ test "reader pool incompatible frozen geometry drains before FIFO compatible ref
     }
     try Request.waitQueued(&pool, 2);
     platform.sync.lockYielding(&pool.mutex);
-    const drained = pool.draining and pool.users == 1 and pool.joins == 1;
+    const drained = pool.drain != .open and pool.users == 1 and pool.joins == 1;
     pool.mutex.unlock();
     try std.testing.expect(drained);
     held.release();
@@ -913,7 +915,7 @@ test "reader pool incompatible frozen geometry drains before FIFO compatible ref
     while (true) {
         platform.sync.lockYielding(&pool.mutex);
         const both_joined = pool.users == 2;
-        const correct = pool.context == @as(*anyopaque, &large) and pool.joins == 2 and !pool.draining;
+        const correct = pool.context == @as(*anyopaque, &large) and pool.joins == 2 and pool.drain == .open;
         pool.mutex.unlock();
         if (both_joined) {
             try std.testing.expect(correct);
@@ -962,7 +964,15 @@ test "reader pool concurrent final page transfers quota until the last shared re
     var first_quota = true;
     var last_quota = true;
     var retirement = first.depart(&first_quota, Fake.adopt) orelse return error.ExpectedSharedRetirement;
+    var cancelled = Pool.Waiter{ .io = null };
+    pool.waiters = &cancelled;
+    pool.drain = .{ .incompatible = &cancelled };
     try std.testing.expect(last.depart(&last_quota, Fake.adopt) == null);
+    platform.sync.lockYielding(&pool.mutex);
+    pool.detach(&cancelled);
+    pool.mutex.unlock();
+    try std.testing.expect(pool.drain == .retiring and pool.waiters == null);
+
     try std.testing.expect(!last_quota and fake.final_quota);
     try std.testing.expect(fake.backing_live and fake.destroyed == 0);
     // A quota callback can reenter pool metadata; no numerical or metadata lock
@@ -975,4 +985,43 @@ test "reader pool concurrent final page transfers quota until the last shared re
     try std.testing.expect(!first_quota and !fake.backing_live and fake.released_final);
     try std.testing.expectEqual(@as(usize, 1), fake.destroyed);
     try std.testing.expect(pool.context == null and pool.users == 0 and pool.retiring == 0);
+}
+
+test "reader pool cancelled incompatible head releases only its compatibility drain" {
+    const Request = struct {
+        rows: usize,
+        destroyed: usize = 0,
+        fn create(raw: *anyopaque) !*anyopaque {
+            return raw;
+        }
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.destroyed += 1;
+        }
+        fn compatible(raw: *const anyopaque, wanted: *const anyopaque) bool {
+            const have: *const @This() = @ptrCast(@alignCast(raw));
+            const need: *const @This() = @ptrCast(@alignCast(wanted));
+            return have.rows >= need.rows;
+        }
+        fn cancel(raw: ?*anyopaque) !void {
+            const count: *usize = @ptrCast(@alignCast(raw.?));
+            count.* += 1;
+            if (count.* >= 6) return error.Cancelled;
+        }
+    };
+    var pool = Pool{};
+    var small = Request{ .rows = 8 };
+    var large = Request{ .rows = 32 };
+    var refill = Request{ .rows = 4 };
+    var held = try pool.joinBoundedMatching(.{}, 3, 64, &small, Request.create, Request.destroy, Request.compatible);
+    defer held.release();
+    var checks: usize = 0;
+    const control = Control{ .ptr = &checks, .check_fn = Request.cancel };
+    try std.testing.expectError(error.Cancelled, pool.joinBoundedMatching(control, 3, 64, &large, Request.create, Request.destroy, Request.compatible));
+    try std.testing.expect(pool.waiters == null and pool.drain == .open and pool.users == 1);
+    checks = 0;
+    var next = try pool.joinBoundedMatching(control, 3, 64, &refill, Request.create, Request.destroy, Request.compatible);
+    try std.testing.expectEqual(held.context, next.context);
+    next.release();
+    try std.testing.expectEqual(@as(usize, 0), small.destroyed);
 }

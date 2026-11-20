@@ -102,11 +102,16 @@ pub const Decoder = struct {
     control: ?Control = null,
     reservation: @import("../backends/session.zig").RunPermit,
 
+    /// Whole-prefix semantics (for example bidirectional media) cannot use a
+    /// causal chunk fallback. The frontend supplies its complete host overlap.
+    pub const WholePrefill = struct { rows: usize, input_bytes: usize, host_staging_bytes: usize };
+
     pub const RequestGeometry = struct {
         limit: usize,
         prompt_rows: usize,
         max_tokens: usize,
         query_rows: usize = 0,
+        whole_prefill: ?WholePrefill = null,
     };
 
     /// Query bounds and actual prompt rows belong to this request. They never
@@ -114,6 +119,7 @@ pub const Decoder = struct {
     pub fn initForRequest(a: std.mem.Allocator, source: Session, requested: ?bool, request: RequestGeometry, control: ?Control) !?Decoder {
         if (control) |active| try active.check();
         if (request.prompt_rows == 0 or request.prompt_rows > request.limit) return error.InvalidResidentDecodePosition;
+        if (request.whole_prefill) |whole| if (request.query_rows != 0 and whole.rows > request.query_rows) return error.UnsupportedResidentPrefillChunking;
         var bounded = source;
         const explicit_chunks = request.query_rows != 0 and request.prompt_rows > request.query_rows;
         if (request.query_rows != 0) {
@@ -122,6 +128,7 @@ pub const Decoder = struct {
             if (explicit_chunks and cfg.qwen35_has_linear_attention) return error.UnsupportedResidentPrefillChunking;
             bounded.model_contract.decoder_cache.max_prefill_query_rows = request.query_rows;
         }
+        if (request.whole_prefill != null) bounded.model_contract.decoder_cache.max_prefill_query_rows = 0;
         const query_bound = causalQueryLimit(bounded);
         const needs_chunks = query_bound != 0 and request.prompt_rows > query_bound;
         if (!try select(bounded, requested)) {
@@ -135,6 +142,13 @@ pub const Decoder = struct {
         var decoder = (try initWithRequest(a, bounded, if (explicit_chunks) true else requested, request.limit, control)) orelse return null;
         // Construction has funded metadata only; no provider state exists.
         errdefer decoder.reservation.deinit();
+        if (request.whole_prefill) |whole| {
+            if (whole.rows < request.prompt_rows or whole.rows > decoder.capacity) return error.InvalidPrefillQueryLimit;
+            if (!try decoder.prefillAdmitted(whole, requested, control)) {
+                decoder.reservation.deinit();
+                return null;
+            }
+        }
         if (request.query_rows == 0 and needs_chunks and bounded.model_contract.decoder_cache.prefer_whole_prefill and
             try decoder.wholePrefillAdmitted(request.prompt_rows, control))
         {
@@ -156,19 +170,25 @@ pub const Decoder = struct {
         // An unmanaged source has no evidence that a larger query fits.
         if (self.source.run_admission == null) return false;
         const rows = try prefillRowsFor(prompt_rows, self.config.max_position_embeddings);
-        const stage_geometry = try @import("../architectures/frontends/decoder.zig").geometry(self.config, rows, self.capacity);
         const staging_bytes = try std.math.add(usize, try std.math.mul(usize, rows, 2 * @sizeOf(i64)), @sizeOf(i64));
+        return self.prefillAdmitted(.{ .rows = rows, .input_bytes = try std.math.add(usize, try std.math.mul(usize, rows, @sizeOf(i64)), @sizeOf(i64)), .host_staging_bytes = staging_bytes }, null, control);
+    }
+
+    fn prefillAdmitted(self: *const Decoder, whole: WholePrefill, requested: ?bool, control: ?Control) !bool {
+        if (control) |active| try active.check();
+        if (self.source.run_admission == null) return requested == true;
+        const stage_geometry = try @import("../architectures/frontends/decoder.zig").geometry(self.config, whole.rows, self.capacity);
         const admitted = self.source.withAdmissionControl(control);
         const Memory = @import("../runtime/tier/memory.zig");
         var capture = Memory.AdmissionFailure.Capture.init(if (admitted.run_admission) |policy| policy.failure else null);
         var permit = admitted.withAdmissionFailure(capture.sink()).admit(.{
-            .sequence = rows,
-            .input_bytes = try std.math.add(usize, try std.math.mul(usize, rows, @sizeOf(i64)), @sizeOf(i64)),
+            .sequence = whole.rows,
+            .input_bytes = whole.input_bytes,
             .output_bytes = stage_geometry.output_bytes,
             .workspace_bytes = stage_geometry.workspace_bytes,
-            .host_preprocess_bytes = staging_bytes,
+            .host_preprocess_bytes = whole.host_staging_bytes,
         }) catch |err| {
-            if (declineOptionalAdmission(null, err)) return false;
+            if (declineOptionalAdmission(requested, err)) return false;
             capture.publish(err);
             return err;
         };
@@ -301,7 +321,7 @@ pub const Decoder = struct {
         if (history.len == 0 or history.len > self.limit or (self.position != 0 and history.len != self.position + 1)) return error.InvalidResidentDecodePosition;
         errdefer self.failed = true;
         const initial = self.position == 0;
-        const chunk = causalQueryLimit(self.source);
+        const chunk = canonicalQueryLimit(causalQueryLimit(self.source));
         if (initial and chunk != 0) {
             var end = @min(chunk, history.len);
             while (end < history.len) {
@@ -323,7 +343,7 @@ pub const Decoder = struct {
         self.prefill_only = !publish_logits;
         defer self.prefill_only = false;
         const ids = history[self.position..];
-        const rows = @min(try prefillRowsFor(ids.len, self.config.max_position_embeddings), self.capacity - self.position);
+        const rows = try boundedPrefillRows(ids.len, self.capacity - self.position, self.config.max_position_embeddings, causalQueryLimit(self.source));
         // These copies precede per-step admission, so retain their real host
         // charge until the complete synchronous invocation has finished.
         var staging_bytes = try std.math.mul(usize, rows, 2 * @sizeOf(i64));
@@ -405,6 +425,45 @@ pub fn prefillRowsFor(requested: usize, maximum: usize) !usize {
     const capacity = try capacityFor(requested, maximum);
     if (requested >= 64) return capacity;
     return @min(maximum, try std.math.ceilPowerOfTwo(usize, requested));
+}
+
+/// Reuse the existing tuned query buckets below a physical ceiling instead of
+/// inventing a specialization for every caller limit. Zero retains whole prefill.
+fn canonicalQueryLimit(limit: usize) usize {
+    if (limit == 0) return 0;
+    return if (limit < 64) std.math.floorPowerOfTwo(usize, limit) else limit - limit % 64;
+}
+
+/// A physical query never exceeds the declared bound, even for non-aligned
+/// caller limits. Chunk scheduling selects canonical buckets beneath it.
+pub fn boundedPrefillRows(requested: usize, remaining: usize, maximum: usize, limit: usize) !usize {
+    var rows = @min(try prefillRowsFor(requested, maximum), remaining);
+    if (limit != 0) rows = @min(rows, limit);
+    if (rows < requested) return error.InvalidPrefillQueryLimit;
+    return rows;
+}
+
+test "resident decoder physical query buckets honor non aligned limits" {
+    try std.testing.expectEqual(@as(usize, 0), canonicalQueryLimit(0));
+    try std.testing.expectEqual(@as(usize, 32), canonicalQueryLimit(33));
+    try std.testing.expectEqual(@as(usize, 64), canonicalQueryLimit(65));
+    try std.testing.expectEqual(@as(usize, 960), canonicalQueryLimit(1023));
+    for (1..4097) |limit| {
+        const selected = canonicalQueryLimit(limit);
+        try std.testing.expect(selected != 0 and selected <= limit);
+        try std.testing.expect(selected < 64 or selected % 64 == 0);
+        try std.testing.expectEqual(selected, try boundedPrefillRows(selected, 8192, 8192, limit));
+    }
+
+    for (1..130) |limit| for (1..limit + 1) |requested| {
+        const rows = try boundedPrefillRows(requested, 256, 1024, limit);
+        try std.testing.expect(rows >= requested and rows <= limit);
+        try std.testing.expect(rows < 2 * requested);
+    };
+    try std.testing.expectEqual(@as(usize, 65), try boundedPrefillRows(65, 256, 1024, 65));
+    try std.testing.expectEqual(@as(usize, 33), try boundedPrefillRows(33, 256, 1024, 33));
+    try std.testing.expectEqual(@as(usize, 128), try boundedPrefillRows(65, 256, 1024, 0));
+    try std.testing.expectError(error.InvalidPrefillQueryLimit, boundedPrefillRows(66, 256, 1024, 65));
 }
 
 test "resident decoder query buckets bound short prefill work independently of KV" {
@@ -573,7 +632,42 @@ test "resident encoder decoder policy preserves explicit controls actual KV admi
         try std.testing.expectEqual(@as(usize, 2), causalQueryLimit(selected.source));
         try std.testing.expect(speculative_failure.snapshot() == null);
     }
+    // A whole-prefix stage cannot use the causal chunk fallback. Optional
+    // caching declines without quota/diagnostic leakage; explicit requests
+    // preserve the original admission error before any provider submission.
+    const whole = Decoder.WholePrefill{ .rows = 8, .input_bytes = 64, .host_staging_bytes = 128 };
+    try std.testing.expect((try Decoder.initForRequest(a, source, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8, .whole_prefill = whole }, .{ .admission_failure = &speculative_failure })) == null);
+    try std.testing.expect(speculative_failure.snapshot() == null);
+    try std.testing.expectEqual(@as(usize, 0), domain.snapshot().hostTotalBytes());
+    try std.testing.expectError(error.ResourceLimitExceeded, Decoder.initForRequest(a, source, true, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8, .whole_prefill = whole }, null));
+    try std.testing.expectEqual(@as(usize, 0), domain.snapshot().hostTotalBytes());
+    // The complete whole-prefix envelope fits without retained cache headers.
+    // Adding automatic state must decline caching rather than reject that run.
+    const shape = try @import("../architectures/frontends/decoder.zig").geometry(gpt, whole.rows, try capacityFor(16, gpt.max_position_embeddings));
+    const ordinary_request = @import("../backends/session.zig").RunRequest{ .sequence = whole.rows, .input_bytes = whole.input_bytes, .output_bytes = shape.output_bytes, .workspace_bytes = shape.workspace_bytes, .host_preprocess_bytes = whole.host_staging_bytes };
+    const required = (try source.run_admission.?.planRequest(ordinary_request, &.{})).required;
+    source.run_admission.?.limits.scratch_limit_bytes = required.host_scratch_bytes;
+    {
+        var ordinary = try source.admit(ordinary_request);
+        ordinary.deinit();
+    }
+    try std.testing.expect((try Decoder.initForRequest(a, source, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8, .whole_prefill = whole }, null)) == null);
+    try std.testing.expectEqual(@as(usize, 0), domain.snapshot().hostTotalBytes());
     source.run_admission.?.limits.scratch_limit_bytes = 0;
+    {
+        var selected = (try Decoder.initForRequest(a, source, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8, .whole_prefill = whole }, null)).?;
+        defer selected.deinit();
+        try std.testing.expectEqual(@as(usize, 0), causalQueryLimit(selected.source));
+    }
+    try std.testing.expectError(error.Cancelled, Decoder.initForRequest(a, source, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8, .whole_prefill = whole }, .{ .ptr = &domain, .check_fn = Probe.cancelFunded }));
+    try std.testing.expectEqual(@as(usize, 0), domain.snapshot().hostTotalBytes());
+    try std.testing.expectError(error.UnsupportedResidentPrefillChunking, Decoder.initForRequest(a, source, true, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8, .query_rows = 2, .whole_prefill = whole }, null));
+    {
+        var selected = (try Decoder.initForRequest(a, source, true, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8, .query_rows = 8, .whole_prefill = whole }, null)).?;
+        defer selected.deinit();
+        try std.testing.expectEqual(@as(usize, 0), causalQueryLimit(selected.source));
+    }
+
     {
         var selected = (try Decoder.initForRequest(a, source, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8, .query_rows = 2 }, null)).?;
         defer selected.deinit();
@@ -649,4 +743,57 @@ test "resident encoder decoder accepts forced prompt suffixes and rejects immuta
     try std.testing.expectError(error.ImmutableEncoderContractChanged, decoder.encoderDecoderText(&history, hidden, &.{ 1, 0 }, a, null));
     try std.testing.expectEqual(@as(usize, 3), probe.calls);
     try std.testing.expect(decoder.failed);
+}
+
+test "resident decoder submits bounded physical chunks and consumes every valid row" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const Probe = struct {
+        calls: usize = 0,
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .pjrt;
+        }
+        fn info(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+            return &.{};
+        }
+        fn close(_: *anyopaque) void {}
+        fn run(_: *anyopaque, _: []const Tensor, _: std.mem.Allocator) anyerror![]Tensor {
+            return error.UnexpectedNumericalExecution;
+        }
+        fn cached(raw: *anyopaque, state: *Decoder, inputs: []const Tensor, a: std.mem.Allocator, _: ?Control) anyerror![]Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const ids = inputs[0].asInt64();
+            try std.testing.expect(ids.len <= 65);
+            if (self.calls < 2) try std.testing.expectEqual(@as(usize, 64), ids.len);
+            var valid = ids.len;
+            for (inputs) |input| if (std.mem.eql(u8, input.name, "logits_row")) {
+                valid = @intCast(input.asInt64()[0] + 1);
+            };
+            for (ids[0..valid], 0..) |value, i| try std.testing.expectEqual(@as(i64, @intCast(state.position + i)), value);
+            self.calls += 1;
+            state.position += valid;
+            const outputs = try a.alloc(Tensor, 1);
+            errdefer a.free(outputs);
+            outputs[0] = try Tensor.initFloat32(a, "logits", &.{1}, &.{0});
+            return outputs;
+        }
+        const table = Session.VTable{ .run = run, .backend = backend, .inputInfo = info, .outputInfo = info, .close = close, .runCachedDecoder = cached };
+    };
+    const a = std.testing.allocator;
+    var probe = Probe{};
+    const cfg = Config{ .hidden_size = 4, .intermediate_size = 8, .num_attention_heads = 1, .num_key_value_heads = 1, .num_hidden_layers = 1, .vocab_size = 256, .max_position_embeddings = 256, .position_encoding = .rope };
+    const source = Session{ .ptr = &probe, .vtable = &Probe.table, .model_contract = .{ .decoder_config = &cfg } };
+    const control = Control{ .native_call_policy = .in_process };
+    var decoder = (try Decoder.initForRequest(a, source, true, .{ .limit = 200, .prompt_rows = 150, .max_tokens = 50, .query_rows = 65 }, control)).?;
+    defer decoder.deinit();
+    var ids: [151]i64 = undefined;
+    for (&ids, 0..) |*v, i| v.* = @intCast(i);
+    const prefill = try decoder.text(ids[0..150], a, control);
+    defer a.free(prefill);
+    try std.testing.expectEqual(@as(usize, 150), decoder.position);
+    try std.testing.expectEqual(@as(usize, 3), decoder.prefill_steps);
+    try std.testing.expectEqual(@as(usize, 2), decoder.prefill_head_skips);
+    const decode = try decoder.text(&ids, a, control);
+    defer a.free(decode);
+    try std.testing.expectEqual(@as(usize, 151), decoder.position);
+    try std.testing.expectEqual(@as(usize, 4), probe.calls);
 }

@@ -16,6 +16,7 @@
 //! Artifact/backend legality and component inspection, independent of serving
 //! cache entries, health, eviction, admission leases and model publication.
 const host_weights = @import("host_weights.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const metal_runtime = @import("../backends/metal_runtime.zig");
 const BackendType = backends.BackendType;
 const GgufInspectionReport = host_weights.GgufInspectionReport;
