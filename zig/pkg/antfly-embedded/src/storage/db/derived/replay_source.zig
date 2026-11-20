@@ -203,6 +203,9 @@ pub const Source = struct {
         ) anyerror!u64,
         collect_enrichment_document_groups: *const fn (ptr: *anyopaque, alloc: Allocator, from_sequence: u64) anyerror![]PendingDocumentGroup,
         is_sequence_visible: *const fn (ptr: *anyopaque, sequence: u64) anyerror!bool,
+        /// The newest sequence of any record carrying `hint` (0 for none),
+        /// or null when the source cannot say without scanning.
+        hint_latest_sequence: ?*const fn (ptr: *anyopaque, hint: TargetHint) anyerror!?u64 = null,
     };
 
     pub fn fromJournal(journal: *change_journal_mod.Journal) Source {
@@ -247,6 +250,11 @@ pub const Source = struct {
     /// a caller advancing a watermark on this answer never skips pending
     /// work.
     pub fn noMatchingRecordThrough(self: Source, alloc: Allocator, from_sequence: u64, hint: TargetHint, through: u64) !bool {
+        // The hint's newest record at or below `from_sequence` settles it in
+        // one read, however much other consumers' work lies in between.
+        if (self.vtable.hint_latest_sequence) |latest_for| if (try latest_for(self.ptr, hint)) |latest| {
+            if (latest <= from_sequence) return true;
+        };
         var cursor = try self.openMatchingCursor(alloc, from_sequence, hint);
         defer cursor.deinit(alloc);
         cursor.setUpperSequence(through);
@@ -355,7 +363,13 @@ const primary_store_vtable = Source.VTable{
     .latest_matching_sequence = primaryStoreLatestMatchingSequence,
     .collect_enrichment_document_groups = primaryStoreCollectEnrichmentDocumentGroups,
     .is_sequence_visible = primaryStoreIsSequenceVisible,
+    .hint_latest_sequence = primaryStoreHintLatestSequence,
 };
+
+fn primaryStoreHintLatestSequence(ptr: *anyopaque, hint: TargetHint) anyerror!?u64 {
+    const store: *docstore_mod.DocStore = @ptrCast(@alignCast(ptr));
+    return try store.replayHintLatestSequence(hint);
+}
 
 const JournalMatchingCursor = struct {
     alloc: Allocator,
