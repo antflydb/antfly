@@ -279,7 +279,17 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
             const self: *@This() = @ptrCast(@alignCast(user_data));
             const display = try frame.displaySize();
             const g = targetGeometry(self.cfg, display[0], display[1]);
-            const patches = try self.preprocess.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
+            const gpu_compute: *cuda.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+            const patches = if (gpu_compute.ctx.info.compute_major >= 8 and self.cfg.patch_size == 16 and
+                std.mem.eql(f32, &self.cfg.image_mean, &.{ 0, 0, 0 }) and
+                std.mem.eql(f32, &self.cfg.image_std, &.{ 1, 1, 1 }) and
+                platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC", true))
+            bicubic: {
+                const raster = frame.rasterSize();
+                const rgb = try self.preprocess.rgb8Gemma4(gpu_compute, frame);
+                defer self.cb.free(rgb);
+                break :bicubic try gpu_compute.preprocessGemma4ResidentRgb(rgb, raster[0], raster[1], @intCast(g.width), @intCast(g.height));
+            } else try self.preprocess.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
             defer self.cb.free(patches);
             const projected = try encodeResidentPatches(self.cb, self.allocator, self.weights, self.cfg, patches, g);
             defer self.cb.free(projected.embeddings);
@@ -2721,7 +2731,14 @@ fn prepareImageViewAtGeometry(allocator: std.mem.Allocator, store: *ProjectorWei
         cfg.image_mean,
         cfg.image_std,
         1.0 / 255.0,
-        if (store.gguf == null) .torchvision_bicubic else .bilinear,
+        // The upstream Gemma 4 image processor resizes RGB8 with antialiased
+        // bicubic interpolation, just like its video processor. Retain the old
+        // GGUF route for other backends/geometries and explicit rollback.
+        if (store.gguf == null or (store.cb.kind() == .cuda and cfg.patch_size == 16 and !cfg.direct_unified and
+            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_IMAGE_BICUBIC", false)))
+            .torchvision_bicubic
+        else
+            .bilinear,
     );
     return .{ .allocator = allocator, .pixels = pixel_values, .geometry = geometry };
 }
