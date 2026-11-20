@@ -52,7 +52,10 @@ pub fn validatePayload(value: ?[]const u8) !void {
         if (stub.dims == 0) return error.InvalidMergePage;
         return;
     }
-    const payload = bytes[codec.header_len..];
+    const payload = if (header.kind == .dense_embedding and header.version != codec.codec_version)
+        codec.denseEmbeddingPayload(bytes) catch return error.InvalidMergePage
+    else
+        bytes[codec.header_len..];
     const count: usize = std.mem.readInt(u32, payload[0..4], .little);
     const stride: usize = switch (header.kind) {
         .dense_embedding => 4,

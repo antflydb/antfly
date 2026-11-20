@@ -394,7 +394,7 @@ pub fn decodeDenseEmbeddingDims(data: []const u8) !u32 {
     return std.mem.readInt(u32, payload[0..4], .little);
 }
 
-fn denseEmbeddingPayload(data: []const u8) ![]const u8 {
+pub fn denseEmbeddingPayload(data: []const u8) ![]const u8 {
     const header = try decodeHeader(data);
     if (header.kind != .dense_embedding) return error.InvalidArtifactKind;
     if (header.flags.vector_elided) return error.VectorElided;
