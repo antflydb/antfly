@@ -527,15 +527,7 @@ pub const Session = struct {
         return current;
     }
 
-    fn execute(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, binding_guard: ?[]const u8, setting_epoch: ?u64) !backend.Result {
-        return self.executeTyped(alloc, statement, parameters, types, &.{}, binding_guard, setting_epoch);
-    }
-
-    fn executeTyped(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, binding_guard: ?[]const u8, setting_epoch: ?u64) !backend.Result {
-        return self.executeCells(alloc, statement, parameters, types, descriptors, null, null, binding_guard, setting_epoch, false);
-    }
-
-    fn executeCells(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, native_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum, parameter_owner: ?*@import("antfly_local_sources").sql_parameter_frame.Ingress, binding_guard: ?[]const u8, setting_epoch: ?u64, retain_select: bool) !backend.Result {
+    fn executeCells(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, native_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum, parameter_owner: ?*@import("antfly_local_sources").sql_parameter_frame.Ingress, binding_guard: ?[]const u8, setting_epoch: ?u64, capture: backend.CursorCapture) !backend.Result {
         if (self.identity) |identity| if (identity.renewable) {
             if (!commands.isRollback(statement)) {
                 if (self.source.vtable.reserve_completion) |reserve| reserve(self.source.context, &self.completion, 3) catch {
@@ -576,7 +568,7 @@ pub const Session = struct {
             req.completion = &self.completion;
             req.completion_allocator = self.alloc;
         }
-        req.capture_cursor_authority = retain_select;
+        req.capture_cursor_authority = capture;
         req.parameter_descriptors = descriptors;
         req.parameter_cells = native_cells;
         req.parameter_owner = if (parameter_owner) |owner| owner.lease() else null;
@@ -945,12 +937,9 @@ pub const Session = struct {
                         try self.ready();
                         return;
                     }
-                    var result = try self.execute(arena.allocator(), statement, &.{}, &.{}, null, null);
+                    var result = try self.executeCells(arena.allocator(), statement, &.{}, &.{}, &.{}, null, null, null, null, .if_select);
                     defer result.deinit();
-                    if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
-                    if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-                    try self.dataResult(result, &.{});
-                    try self.complete(result);
+                    try self.deliverSimpleResult(result, self.request(statement, &.{}, &.{}));
                     self.finishDiscardAll();
                 }
                 if (self.status == .idle) {
@@ -1141,7 +1130,7 @@ pub const Session = struct {
                 }
                 const first_delivery = portal.result == null;
                 if (first_delivery) {
-                    portal.result = try self.executeCells(portal.arena.allocator(), portal.statement, portal.parameters, portal.types, portal.description.parameter_descriptors, portal.parameter_cells, portal.parameter_owner, portal.description.binding_guard, portal.description.setting_epoch, portal.description.is_select);
+                    portal.result = try self.executeCells(portal.arena.allocator(), portal.statement, portal.parameters, portal.types, portal.description.parameter_descriptors, portal.parameter_cells, portal.parameter_owner, portal.description.binding_guard, portal.description.setting_epoch, if (portal.description.is_select) .require_select else .none);
                     const result = portal.result.?;
                     if (!columnsEqual(portal.description.columns, result.columns)) return error.ResultShapeChanged;
                 }
@@ -1153,27 +1142,10 @@ pub const Session = struct {
                 const count = if (requested == 0) result.rowCount() - portal.offset else @min(@as(usize, @intCast(requested)), result.rowCount() - portal.offset);
                 if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
                 if (portal.description.is_select) {
-                    const authority = result.cursor_authority orelse return error.InvalidSqlBackendResponse;
                     var req = self.request(portal.statement, portal.parameters, portal.types);
                     req.binding_guard = portal.description.binding_guard;
                     req.setting_epoch = portal.description.setting_epoch;
-                    if (!first_delivery) self.cancel_requested.store(false, .release);
-                    self.executing.store(true, .release);
-                    defer self.executing.store(false, .release);
-                    var remaining = count;
-                    var materialized = first_delivery;
-                    while (true) {
-                        var scratch = std.heap.ArenaAllocator.init(self.alloc);
-                        defer scratch.deinit();
-                        try authority.validate(authority.ptr, scratch.allocator(), self.identity orelse return error.AuthenticationFailed, req, materialized);
-                        const page = @min(remaining, 256);
-                        try self.dataResult(try result.view(portal.offset, page), portal.formats);
-                        portal.offset += page;
-                        remaining -= page;
-                        if (remaining == 0) break;
-                        try self.writer.flush();
-                        materialized = false;
-                    }
+                    try self.deliverSelect(result, portal.formats, req, &portal.offset, count, first_delivery);
                 } else {
                     try self.dataResult(try result.view(portal.offset, count), portal.formats);
                     portal.offset += count;
@@ -1262,12 +1234,12 @@ pub const Session = struct {
                 } else try (self.source.vtable.evaluate_parameters orelse return error.UnsupportedSqlExecution)(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req, execute_command.expressions);
                 if (parameters.len != description.parameter_types.len) return error.InvalidParameter;
                 if (try self.simpleStreamCells(prepared.statement, parameters, description.parameter_types, description.parameter_descriptors, native_cells, description.binding_guard, description.setting_epoch)) return true;
-                var result = try self.executeCells(alloc, prepared.statement, parameters, description.parameter_types, description.parameter_descriptors, native_cells, null, description.binding_guard, description.setting_epoch, false);
+                var result = try self.executeCells(alloc, prepared.statement, parameters, description.parameter_types, description.parameter_descriptors, native_cells, null, description.binding_guard, description.setting_epoch, if (description.is_select) .require_select else .if_select);
                 defer result.deinit();
-                if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
-                if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-                try self.dataResult(result, &.{});
-                try self.complete(result);
+                var delivery = self.request(prepared.statement, parameters, description.parameter_types);
+                delivery.binding_guard = description.binding_guard;
+                delivery.setting_epoch = description.setting_epoch;
+                try self.deliverSimpleResult(result, delivery);
                 return true;
             },
             .declare_cursor => |declaration| {
@@ -1339,7 +1311,7 @@ pub const Session = struct {
             // Blocking sorts/aggregates decline pull execution. Materialize
             // once under the statement row cap, then copy into the shared
             // cursor byte/row budget before exposing a cursor name.
-            req.capture_cursor_authority = true;
+            req.capture_cursor_authority = .require_select;
             var result = try self.source.vtable.execute(self.source.context, arena.allocator(), identity, req);
             defer result.deinit();
             const authority = result.cursor_authority orelse return error.UnsupportedSqlExecution;
@@ -1857,6 +1829,36 @@ pub const Session = struct {
         if (length > std.math.maxInt(i32)) return error.ProgramLimitExceeded;
         std.mem.writeInt(i32, bytes.writer.buffer[position..][0..4], @intCast(length), .big);
     }
+    fn deliverSelect(self: *Session, result: backend.Result, formats: []const u16, req: backend.Request, offset: *usize, count: usize, first_delivery: bool) !void {
+        const authority = result.cursor_authority orelse return error.InvalidSqlBackendResponse;
+        if (!first_delivery) self.cancel_requested.store(false, .release);
+        self.executing.store(true, .release);
+        defer self.executing.store(false, .release);
+        var remaining = count;
+        var materialized = first_delivery;
+        while (true) {
+            var scratch = std.heap.ArenaAllocator.init(self.alloc);
+            defer scratch.deinit();
+            try authority.validate(authority.ptr, scratch.allocator(), self.identity orelse return error.AuthenticationFailed, req, materialized);
+            const page = @min(remaining, 256);
+            try self.dataResult(try result.view(offset.*, page), formats);
+            offset.* += page;
+            remaining -= page;
+            if (remaining == 0) break;
+            try self.writer.flush();
+            materialized = false;
+        }
+    }
+
+    fn deliverSimpleResult(self: *Session, result: backend.Result, req: backend.Request) !void {
+        if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
+        if (result.cursor_authority != null or std.mem.eql(u8, result.command_tag, "SELECT") or std.mem.startsWith(u8, result.command_tag, "SELECT ")) {
+            var offset: usize = 0;
+            try self.deliverSelect(result, &.{}, req, &offset, result.rowCount(), true);
+        } else try self.dataResult(result, &.{});
+        try self.complete(result);
+    }
+
     fn dataResult(self: *Session, result: backend.Result, formats: []const u16) !void {
         const cells = result.cells orelse return self.dataRows(result.columns, formats, result.rows, result.sql_nulls);
         if (cells.width != result.columns.len or result.rows.len != 0 or result.sql_nulls != null) return error.InvalidResult;

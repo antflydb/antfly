@@ -1365,176 +1365,7 @@ fn executeMultiTableCommitOnce(
         participants.deinit(alloc);
     }
 
-    var table_groups: std.StringHashMapUnmanaged(ParticipantGroups) = .empty;
-    defer {
-        var it = table_groups.valueIterator();
-        while (it.next()) |groups| groups.deinit(alloc);
-        table_groups.deinit(alloc);
-    }
-    // Cascades can enlist additional tables after SQL admission. All participants
-    // in a transaction must prepare against the same metadata incarnation.
-    var bound_incarnation: ?[16]u8 = null;
-    for (tables) |table| if (table.bound_catalog_incarnation) |incarnation| {
-        if (bound_incarnation) |bound| if (!std.mem.eql(u8, &bound, &incarnation)) return error.CatalogGenerationChanged;
-        bound_incarnation = incarnation;
-    };
-    for (tables) |table| {
-        var routing = (try table_catalog.transactionRoutingSnapshot(alloc, catalog, table.table_name)) orelse return error.TableNotFound;
-        defer routing.deinit(alloc);
-        const topology_epoch = routing.topology_epoch;
-        const slot = try table_groups.getOrPut(alloc, table.table_name);
-        if (!slot.found_existing) slot.value_ptr.* = .empty;
-        const groups = slot.value_ptr;
-
-        if (bound_incarnation) |incarnation| {
-            const actual = routing.snapshot.status.metadata_incarnation orelse return error.CatalogGenerationChanged;
-            if (!std.mem.eql(u8, &actual, &std.fmt.bytesToHex(incarnation, .lower))) return error.CatalogGenerationChanged;
-        }
-        try @import("antfly_local_sources").api_range_read_guards.validate(table.range_guards);
-        for (table.range_guards) |owner| {
-            const fence = owner.fence;
-            if (routing.snapshot.status.metadata_group_id != fence.metadata_group_id or
-                !std.meta.eql(routing.snapshot.status.metadata_incarnation, fence.metadata_incarnation) or topology_epoch != fence.topology_epoch)
-                return error.TopologyChanged;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, fence.route.group_id, topology_epoch);
-            if (participant.route_fence) |*existing| {
-                if (!@import("antfly_local_sources").api_range_read_guards.sameOwner(existing.*, fence)) return error.TopologyChanged;
-                existing.catalog_revision = @max(existing.catalog_revision, fence.catalog_revision);
-            } else participant.route_fence = fence;
-            for (owner.proofs) |proof| try participant.range_guards.append(alloc, proof);
-        }
-
-        for (table.writes) |write| {
-            const group_id = routing.resolveGroupForKey(write.key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            try participant.writes.append(alloc, write);
-        }
-        for (table.deletes) |key| {
-            const group_id = routing.resolveGroupForKey(key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            try participant.deletes.append(alloc, key);
-        }
-        for (table.graph_writes) |edge| {
-            const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            try participant.graph_writes.append(alloc, edge);
-        }
-        for (table.graph_deletes) |edge| {
-            const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            try participant.graph_deletes.append(alloc, edge);
-        }
-        for (table.predicates) |predicate| {
-            const group_id = routing.resolveGroupForKey(predicate.key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            try participant.predicates.append(alloc, predicate);
-        }
-        for (table.transforms) |transform| {
-            const group_id = routing.resolveGroupForKey(transform.key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            try participant.transforms.append(alloc, transform);
-        }
-        for (table.integrity) |operation| {
-            const group_id = routing.resolveGroupForKey(operation.routing_key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            try participant.integrity.append(alloc, operation);
-        }
-        for (table.integrity_commands) |command| {
-            const group_id = routing.resolveGroupForKey(&command.address.routing) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            try participant.integrity_commands.append(alloc, command);
-        }
-        if (table.relational_activation) |command| {
-            const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            if (participant.relational_activation != null) return error.InvalidTxnRequest;
-            participant.relational_activation = command;
-        }
-        if (table.relational_retirement) |command| {
-            const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            if (participant.relational_retirement != null) return error.InvalidTxnRequest;
-            participant.relational_retirement = command;
-        }
-        if (table.relational_index_maintenance) |command| {
-            const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
-            if (group_id != command.owner_group_id) return error.PreparedGenerationChanged;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            if (participant.relational_index_maintenance != null) return error.InvalidTxnRequest;
-            participant.relational_index_maintenance = command;
-        }
-        if (table.commit_requires == .direct_enrichments and groups.count() == 0) {
-            _ = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, routing.resolveGroupForKey("") orelse return error.UnknownGroup, topology_epoch);
-        }
-        // Match all enlisted owner proofs in one traversal of this table's
-        // ranges. Guarded reads keep their observed fence and bound writes get
-        // a fence from the same routing snapshot used to choose their group.
-        if (bound_incarnation != null or table.range_guards.len != 0) {
-            var remaining = groups.count();
-            for (routing.ranges) |range| {
-                if (remaining == 0) break;
-                const index = groups.get(range.group_id) orelse continue;
-                const participant = &participants.items[index];
-                const manager = @import("../metadata/table_manager.zig");
-                const range_id = manager.rangeDocIdentityRangeId(range.*);
-                const fence: @import("../metadata/api.zig").CatalogRouteFence = .{
-                    .metadata_group_id = routing.snapshot.status.metadata_group_id,
-                    .metadata_incarnation = routing.snapshot.status.metadata_incarnation,
-                    .catalog_revision = 0,
-                    .table_id = range.table_id,
-                    .topology_epoch = topology_epoch,
-                    .route = .{ .group_id = range.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = range.table_id, .shard_id = manager.rangeDocIdentityShardId(range.*), .range_id = range_id } },
-                };
-                if (participant.route_fence) |observed| {
-                    if (observed.table_id != fence.table_id or observed.route.range_id != range_id or
-                        !std.meta.eql(observed.route.identity_namespace, fence.route.identity_namespace)) return error.TopologyChanged;
-                } else if (bound_incarnation != null) {
-                    participant.route_fence = fence;
-                }
-                remaining -= 1;
-            }
-            if (remaining != 0) return error.TopologyChanged;
-        }
-        for (groups.values()) |index| {
-            const participant = &participants.items[index];
-            if (participant.topology_epoch != topology_epoch) return error.TopologyChanged;
-            if (participant.row_policy_principal_proof.len != 0 and
-                (!std.mem.eql(u8, participant.row_policy_principal_proof, table.row_policy_principal_proof) or
-                    !std.mem.eql(u8, participant.row_policy_database, table.row_policy_database) or
-                    participant.row_policy_admitted_at_seconds != table.row_policy_admitted_at_seconds))
-                return error.InvalidTxnRequest;
-            participant.row_policy_principal_proof = table.row_policy_principal_proof;
-            participant.row_policy_database = table.row_policy_database;
-            participant.row_policy_admitted_at_seconds = table.row_policy_admitted_at_seconds;
-            participant.normalized_graph_rows = table.normalized_graph_rows;
-            if (participant.commit_requires != null and table.commit_requires != null and participant.commit_requires != table.commit_requires) return error.InvalidTxnRequest;
-            if (table.commit_requires) |requirement| participant.commit_requires = requirement;
-            if (participant.relational_schema_version) |existing| {
-                if (table.relational_schema_version) |requested| {
-                    if (existing != requested) return error.InvalidTxnRequest;
-                }
-            } else participant.relational_schema_version = table.relational_schema_version;
-            if (participant.schema_version) |existing| {
-                if (table.schema_version) |requested| if (existing != requested) return error.CatalogGenerationChanged;
-            } else participant.schema_version = table.schema_version;
-            if (participant.relational_integrity_generation_set) |existing| {
-                const requested = table.relational_integrity_generation_set orelse return error.PreparedGenerationChanged;
-                if (!std.mem.eql(u8, &existing, &requested)) return error.PreparedGenerationChanged;
-            } else participant.relational_integrity_generation_set = table.relational_integrity_generation_set;
-            participant.relational_repair = table.relational_repair;
-            const routed_restore_scope = (try catalog.restoreScopeForGroup(participant.table_name, participant.group_id)) orelse table.restore_staging_scope;
-            if (participant.restore_staging_scope) |existing| {
-                const requested = routed_restore_scope orelse return error.RestoreStagingChanged;
-                if (!std.mem.eql(u8, &existing, &requested)) return error.RestoreStagingChanged;
-            } else participant.restore_staging_scope = routed_restore_scope;
-            const routed_restore_plan = (try catalog.restorePlanForGroup(participant.table_name, participant.group_id)) orelse table.restore_staging_plan_id;
-            if (participant.restore_staging_plan_id) |existing| {
-                const requested = routed_restore_plan orelse return error.RestoreStagingChanged;
-                if (!std.mem.eql(u8, &existing, &requested)) return error.RestoreStagingChanged;
-            } else participant.restore_staging_plan_id = routed_restore_plan;
-            try validateRestorePlan(participant.restore_staging_scope, participant.restore_staging_plan_id);
-        }
-    }
+    try routeParticipants(alloc, catalog, tables, &participants);
 
     const participant_ids = try alloc.alloc([]const u8, participants.items.len);
     var participant_ids_initialized: usize = 0;
@@ -2377,17 +2208,217 @@ fn firstFanoutError(slots: []const ParticipantFanoutSlot) ?usize {
 }
 
 // Indices survive relocation of the shared list and preserve first-enlistment order.
+const TableRoutes = struct {
+    const manager = @import("../metadata/table_manager.zig");
+    requirements: TableCommitRequest,
+    descriptor: ?*const manager.TableRecord = null,
+    ranges: std.ArrayList(*const manager.RangeRecord) = .empty,
+    epoch: u64 = 0,
+    groups: ParticipantGroups = .empty,
+    guarded: bool = false,
+
+    fn mergeRequirements(self: *@This(), table: TableCommitRequest) !void {
+        const prior = &self.requirements;
+        // Never mix credential, repair or restore contexts across fragments.
+        if (!std.mem.eql(u8, prior.row_policy_principal_proof, table.row_policy_principal_proof) or
+            !std.mem.eql(u8, prior.row_policy_database, table.row_policy_database) or
+            prior.row_policy_admitted_at_seconds != table.row_policy_admitted_at_seconds or
+            prior.normalized_graph_rows != table.normalized_graph_rows or prior.relational_repair != table.relational_repair)
+            return error.InvalidTxnRequest;
+        if (!std.meta.eql(prior.restore_staging_scope, table.restore_staging_scope) or
+            !std.meta.eql(prior.restore_staging_plan_id, table.restore_staging_plan_id)) return error.RestoreStagingChanged;
+        try mergeRequirement(&prior.schema_version, table.schema_version, error.CatalogGenerationChanged);
+        try mergeRequirement(&prior.relational_schema_version, table.relational_schema_version, error.InvalidTxnRequest);
+        try mergeRequirement(&prior.relational_integrity_generation_set, table.relational_integrity_generation_set, error.PreparedGenerationChanged);
+        try mergeRequirement(&prior.commit_requires, table.commit_requires, error.InvalidTxnRequest);
+    }
+
+    fn mergeRequirement(current: anytype, incoming: @TypeOf(current.*), conflict: anyerror) !void {
+        const value = incoming orelse return;
+        if (current.*) |prior| if (!std.meta.eql(prior, value)) return conflict;
+        current.* = value;
+    }
+};
+
+fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest, participants: *std.ArrayListUnmanaged(ParticipantTxn)) !void {
+    if (tables.len == 0) return;
+    var workspace = std.heap.ArenaAllocator.init(alloc);
+    defer workspace.deinit();
+    const a = workspace.allocator();
+    var by_name: std.StringArrayHashMapUnmanaged(TableRoutes) = .empty;
+    var bound_incarnation: ?[16]u8 = null;
+    for (tables) |table| {
+        try TableRoutes.mergeRequirement(&bound_incarnation, table.bound_catalog_incarnation, error.CatalogGenerationChanged);
+        const slot = try by_name.getOrPut(a, table.table_name);
+        if (slot.found_existing) try slot.value_ptr.mergeRequirements(table) else slot.value_ptr.* = .{ .requirements = table };
+        if (table.range_guards.len != 0) slot.value_ptr.guarded = true;
+    }
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    if (bound_incarnation) |incarnation| {
+        const actual = snapshot.status.metadata_incarnation orelse return error.CatalogGenerationChanged;
+        if (!std.mem.eql(u8, &actual, &std.fmt.bytesToHex(incarnation, .lower))) return error.CatalogGenerationChanged;
+    }
+    var by_id: std.AutoHashMapUnmanaged(u64, *TableRoutes) = .empty;
+    for (snapshot.tables) |*descriptor| {
+        const routes = by_name.getPtr(descriptor.name) orelse continue;
+        try table_catalog.validateTransactionTopologyStableSnapshot(&snapshot, descriptor.*);
+        routes.descriptor = descriptor;
+        try by_id.put(a, descriptor.table_id, routes);
+    }
+    for (snapshot.ranges) |*range| {
+        const routes = by_id.get(range.table_id) orelse continue;
+        try routes.ranges.append(a, range);
+    }
+    for (by_name.values()) |*routes| {
+        if (routes.ranges.items.len == 0) return error.TableNotFound;
+        routes.epoch = table_catalog.sortedTransactionTopologyEpoch(routes.descriptor.?.*, routes.ranges.items);
+    }
+    // Enlist in original request order: the first participant is the coordinator.
+    for (tables) |table| {
+        const routes = by_name.getPtr(table.table_name).?;
+        const groups = &routes.groups;
+        const topology_epoch = routes.epoch;
+        try @import("antfly_local_sources").api_range_read_guards.validate(table.range_guards);
+        for (table.range_guards) |owner| {
+            const fence = owner.fence;
+            if (snapshot.status.metadata_group_id != fence.metadata_group_id or
+                !std.meta.eql(snapshot.status.metadata_incarnation, fence.metadata_incarnation) or topology_epoch != fence.topology_epoch)
+                return error.TopologyChanged;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, fence.route.group_id, topology_epoch);
+            if (participant.route_fence) |*existing| {
+                if (!@import("antfly_local_sources").api_range_read_guards.sameOwner(existing.*, fence)) return error.TopologyChanged;
+                existing.catalog_revision = @max(existing.catalog_revision, fence.catalog_revision);
+            } else participant.route_fence = fence;
+            for (owner.proofs) |proof| try participant.range_guards.append(alloc, proof);
+        }
+
+        for (table.writes) |write| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, write.key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.writes.append(alloc, write);
+        }
+        for (table.deletes) |key| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.deletes.append(alloc, key);
+        }
+        for (table.graph_writes) |edge| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, edge.source) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.graph_writes.append(alloc, edge);
+        }
+        for (table.graph_deletes) |edge| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, edge.source) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.graph_deletes.append(alloc, edge);
+        }
+        for (table.predicates) |predicate| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, predicate.key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.predicates.append(alloc, predicate);
+        }
+        for (table.transforms) |transform| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, transform.key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.transforms.append(alloc, transform);
+        }
+        for (table.integrity) |operation| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, operation.routing_key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.integrity.append(alloc, operation);
+        }
+        for (table.integrity_commands) |command| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, &command.address.routing) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.integrity_commands.append(alloc, command);
+        }
+        if (table.relational_activation) |command| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, command.routing_key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            if (participant.relational_activation != null) return error.InvalidTxnRequest;
+            participant.relational_activation = command;
+        }
+        if (table.relational_retirement) |command| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, command.routing_key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            if (participant.relational_retirement != null) return error.InvalidTxnRequest;
+            participant.relational_retirement = command;
+        }
+        if (table.relational_index_maintenance) |command| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, command.routing_key) orelse return error.UnknownGroup;
+            if (group_id != command.owner_group_id) return error.PreparedGenerationChanged;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            if (participant.relational_index_maintenance != null) return error.InvalidTxnRequest;
+            participant.relational_index_maintenance = command;
+        }
+        if (table.commit_requires == .direct_enrichments and groups.count() == 0) {
+            _ = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, "") orelse return error.UnknownGroup, topology_epoch);
+        }
+    }
+    for (by_name.values()) |*routes| {
+        const table = routes.requirements;
+        const groups = &routes.groups;
+        const topology_epoch = routes.epoch;
+        // Match all enlisted owner proofs in one traversal of this table's
+        // ranges. Guarded reads keep their observed fence and bound writes get
+        // a fence from the same routing snapshot used to choose their group.
+        if (bound_incarnation != null or routes.guarded) {
+            var remaining = groups.count();
+            for (routes.ranges.items) |range| {
+                if (remaining == 0) break;
+                const index = groups.get(range.group_id) orelse continue;
+                const participant = &participants.items[index];
+                const manager = @import("../metadata/table_manager.zig");
+                const range_id = manager.rangeDocIdentityRangeId(range.*);
+                const fence: @import("../metadata/api.zig").CatalogRouteFence = .{
+                    .metadata_group_id = snapshot.status.metadata_group_id,
+                    .metadata_incarnation = snapshot.status.metadata_incarnation,
+                    .catalog_revision = 0,
+                    .table_id = range.table_id,
+                    .topology_epoch = topology_epoch,
+                    .route = .{ .group_id = range.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = range.table_id, .shard_id = manager.rangeDocIdentityShardId(range.*), .range_id = range_id } },
+                };
+                if (participant.route_fence) |observed| {
+                    if (observed.table_id != fence.table_id or observed.route.range_id != range_id or
+                        !std.meta.eql(observed.route.identity_namespace, fence.route.identity_namespace)) return error.TopologyChanged;
+                } else if (bound_incarnation != null) {
+                    participant.route_fence = fence;
+                }
+                remaining -= 1;
+            }
+            if (remaining != 0) return error.TopologyChanged;
+        }
+        for (groups.values()) |index| {
+            const participant = &participants.items[index];
+            participant.row_policy_principal_proof = table.row_policy_principal_proof;
+            participant.row_policy_database = table.row_policy_database;
+            participant.row_policy_admitted_at_seconds = table.row_policy_admitted_at_seconds;
+            participant.normalized_graph_rows = table.normalized_graph_rows;
+            participant.commit_requires = table.commit_requires;
+            participant.relational_schema_version = table.relational_schema_version;
+            participant.schema_version = table.schema_version;
+            participant.relational_integrity_generation_set = table.relational_integrity_generation_set;
+            participant.relational_repair = table.relational_repair;
+            participant.restore_staging_scope = (try catalog.restoreScopeForGroup(participant.table_name, participant.group_id)) orelse table.restore_staging_scope;
+            participant.restore_staging_plan_id = (try catalog.restorePlanForGroup(participant.table_name, participant.group_id)) orelse table.restore_staging_plan_id;
+            try validateRestorePlan(participant.restore_staging_scope, participant.restore_staging_plan_id);
+        }
+    }
+}
+
 const ParticipantGroups = std.AutoArrayHashMapUnmanaged(u64, usize);
 
 fn ensureParticipantTxn(
     alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
     grouped: *std.ArrayListUnmanaged(ParticipantTxn),
     groups: *ParticipantGroups,
     table_name: []const u8,
     group_id: u64,
     topology_epoch: u64,
 ) !*ParticipantTxn {
-    const slot = try groups.getOrPut(alloc, group_id);
+    const slot = try groups.getOrPut(scratch, group_id);
     if (slot.found_existing) {
         const participant = &grouped.items[slot.value_ptr.*];
         if (participant.topology_epoch != topology_epoch) return error.TopologyChanged;
@@ -5698,6 +5729,7 @@ fn consumerTests() type {
 
         test "distributed txn coordinator groups by range and commits all participants" {
             const FakeCatalog = struct {
+                var snapshots: usize = 0;
                 fn iface() table_catalog.CatalogSource {
                     return .{
                         .ptr = undefined,
@@ -5709,6 +5741,7 @@ fn consumerTests() type {
                 }
 
                 fn adminSnapshot(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+                    snapshots += 1;
                     const metadata_table_manager = @import("../metadata/table_manager.zig");
                     const raft_reconciler = @import("../raft/reconciler.zig");
                     const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -5785,6 +5818,7 @@ fn consumerTests() type {
                         try std.testing.expectEqual(group_id, fence.route.group_id);
                         try std.testing.expectEqual(@as(u64, if (group_id == 8001) 8 else 7), fence.table_id);
                         try std.testing.expectEqual(@as([32]u8, @splat('1')), fence.metadata_incarnation.?);
+                        try std.testing.expectEqual(@as(?u32, if (group_id == 8001) null else 7), req.req.schema_version);
                         self.bound_prepares += 1;
                     }
                     try std.testing.expect(req.req.writes.len + req.req.deletes.len + req.req.predicates.len + req.req.integrity.len + req.req.range_guards.len > 0);
@@ -5968,16 +6002,22 @@ fn consumerTests() type {
             };
             recorder.coordinator_group = 7002;
             recorder.includes_audit = true;
+            const snapshots_before = FakeCatalog.snapshots;
             const guarded = try executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), try parseTxnIdHex("40112233445566778899aabbccddeeff"), 50_000, 50_001, &.{
-                .{ .table_name = "docs", .bound_catalog_incarnation = @splat(0x11), .range_guards = (&observation)[0..1] },
+                .{ .table_name = "docs", .schema_version = 7, .bound_catalog_incarnation = @splat(0x11), .range_guards = (&observation)[0..1] },
                 .{ .table_name = "audit", .writes = &.{.{ .key = "log", .value = "{}" }} },
                 .{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} },
             }, .write, null);
             try std.testing.expect(guarded == .committed);
+            try std.testing.expectEqual(snapshots_before + 1, FakeCatalog.snapshots);
             try std.testing.expectEqual(@as(usize, 3), guarded.committed.participant_count);
             try std.testing.expectEqual(@as(usize, 3), recorder.bound_prepares);
             try std.testing.expectEqual(@as(usize, 1), recorder.range_prepares);
             const prior_begins = recorder.begins.items.len;
+            try std.testing.expectError(error.CatalogGenerationChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(4), 60_000, 60_001, &.{
+                .{ .table_name = "docs", .schema_version = 7, .writes = &.{.{ .key = "doc:a", .value = "{}" }} },
+                .{ .table_name = "docs", .schema_version = 8, .writes = &.{.{ .key = "doc:z", .value = "{}" }} },
+            }, .write, null));
             var stale = observation;
             stale.fence.route.range_id +%= 1;
             try std.testing.expectError(error.TopologyChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(3), 60_000, 60_001, &.{.{ .table_name = "docs", .range_guards = &.{ stale, observation } }}, .write, null));

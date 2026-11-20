@@ -1146,15 +1146,6 @@ pub const UserManager = struct {
         return self.role_revision;
     }
 
-    /// Revision of the role authority, captured under the mutation mutex.
-    pub fn rowPolicyRoleRevision(self: *UserManager) u64 {
-        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
-        const io = receiver.io();
-        self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
-        return self.role_revision;
-    }
-
     /// Recheck the previously admitted credential and table permission under
     /// the same mutex as role mutations. The front end must additionally
     /// intersect with its request-start permission snapshot: new grants must
@@ -2267,7 +2258,12 @@ test "usermgr roles inherit permissions and row filters" {
     const first_revision = pinned.value.auth_revision;
     try std.testing.expectEqual(@as(usize, 2), pinned.value.roles.len);
     pinned.deinit();
+    const revision_before = try manager.validateRoleRevision("alice", roles, null);
+    try manager.addRoleToSubject("unrelated", "group:auditors");
+    const revision_after = try manager.validateRoleRevision("alice", roles, revision_before);
+    try std.testing.expect(revision_after > revision_before);
     try manager.removeRoleFromSubject("role:tenant_reader", "group:eng");
+    try std.testing.expectError(error.Forbidden, manager.validateRoleRevision("alice", roles, revision_after));
     const admitted_digest = try UserManager.roleDigest(alloc, roles);
     try std.testing.expectError(error.Forbidden, manager.validateRoleRevision("alice", roles, null));
     try std.testing.expectError(error.Forbidden, manager.signBoundRowPolicyRoles(alloc, "alice", "basic:alice", "docs", .read, role_key, "cluster-a", scope, 101, admitted_digest));

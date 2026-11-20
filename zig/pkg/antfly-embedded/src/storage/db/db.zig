@@ -20382,28 +20382,26 @@ pub const DB = struct {
         // Projection borrows the caller's immutable schema and primary snapshot.
         const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
         defer alloc.free(store_key);
-        var page: ?[]u8 = null;
-        defer if (page) |bytes| alloc.free(bytes);
-        const raw = primary orelse (probe.getLeased(store_key) catch |err| switch (err) {
-            error.NotFound => virtual: {
-                if (opts.include_primary_digest) return null;
-                page = try virtualPdfPageUnit(self, alloc, probe, store_key);
-                break :virtual page orelse return null;
-            },
+        const stored = primary orelse probe.getLeased(store_key) catch |err| switch (err) {
+            error.NotFound => null,
             else => return err,
-        });
+        };
+        if (stored == null and (opts.include_primary_digest or !internal_keys.isDocumentUnitArtifactRecordKey(store_key))) return null;
         var privacy_arena = std.heap.ArenaAllocator.init(alloc);
         defer privacy_arena.deinit();
         const privacy = @import("privacy_read.zig");
         const policy = if (opts.privacy_original) null else try privacy.capture(self, privacy_arena.allocator());
         if (!opts.privacy_original) try privacy.requireExpected(privacy_arena.allocator(), opts.privacy_policy_version, policy);
         const protected = policy != null and policy.?.prepared.policy.mode != .monitor;
+        const page = if (stored == null) try virtualPdfPageUnit(self, alloc, probe, store_key, if (protected) policy else null) else null;
+        defer if (page) |bytes| alloc.free(bytes);
+        const raw = stored orelse page orelse return null;
         if (protected) {
             if (opts.include_primary_digest) return error.PrivacyUnsupportedMutation;
             const special = db_query_projection.buildLookupFieldSelectionPlan(opts).special;
             if (special.all_artifacts or special.all_chunks or special.all_embeddings) return error.PrivacyUnsupportedProjection;
         }
-        const safe_raw = if (protected and internal_keys.isInternalUserKey(key)) try privacy.projectArtifact(privacy_arena.allocator(), policy.?, store_key, probe) else if (protected) privacy.project(privacy_arena.allocator(), policy.?, key, raw, probe) catch |err| {
+        const safe_raw = if (page != null) raw else if (protected and internal_keys.isInternalUserKey(key)) try privacy.projectArtifact(privacy_arena.allocator(), policy.?, store_key, probe) else if (protected) privacy.project(privacy_arena.allocator(), policy.?, key, raw, probe) catch |err| {
             if (privacy.pending(err)) return null;
             return err;
         } else raw;
@@ -50984,14 +50982,16 @@ pub const DB = struct {
         var txn = try self.core.store.beginProbeTxn();
         defer txn.abort();
         const member = try @import("artifact_chunk_generation.zig").readMember(alloc, &txn, store_key);
-        const page = if (member == null) try virtualPdfPageUnit(self, alloc, &txn, store_key) else null;
-        defer if (page) |bytes| alloc.free(bytes);
-        const raw = member orelse page orelse return null;
+        if (member == null and !internal_keys.isDocumentUnitArtifactRecordKey(store_key)) return null;
         var privacy_arena = std.heap.ArenaAllocator.init(alloc);
         defer privacy_arena.deinit();
         const privacy = @import("privacy_read.zig");
         const policy = try privacy.capture(self, privacy_arena.allocator());
-        if (policy != null and policy.?.prepared.policy.mode != .monitor) {
+        const protected = policy != null and policy.?.prepared.policy.mode != .monitor;
+        const page = if (member == null) try virtualPdfPageUnit(self, alloc, &txn, store_key, if (protected) policy else null) else null;
+        if (page) |bytes| return bytes;
+        const raw = member orelse return null;
+        if (protected) {
             if (internal_keys.isInternalUserKey(key)) {
                 const safe = try privacy.projectArtifact(privacy_arena.allocator(), policy.?, store_key, &txn);
                 return if (scalarSearchAsset(self, store_key)) try std.json.Stringify.valueAlloc(alloc, .{ .@"$" = safe }, .{}) else try alloc.dupe(u8, safe);
@@ -51329,15 +51329,15 @@ fn scalarSearchAsset(self: *DB, key: []const u8) bool {
 
 // A PDF page is stored as a generated vector under its logical unit key.
 // Read only the primary-owned artifact header, including for external payloads.
-fn virtualPdfPageUnit(self: *DB, alloc: Allocator, txn: *docstore_mod.DocStore.Txn, key: []const u8) !?[]u8 {
+fn virtualPdfPageUnit(self: *DB, alloc: Allocator, txn: *docstore_mod.DocStore.Txn, key: []const u8, policy: ?@import("privacy_read.zig").PolicySnapshot) !?[]u8 {
     var values: [1]?[]const u8 = .{null};
-    try hydrateVirtualPdfPageUnits(self, alloc, txn, &.{key}, &values);
+    try hydrateVirtualPdfPageUnits(self, alloc, txn, &.{key}, &values, policy, null);
     return if (values[0]) |page| @constCast(page) else null;
 }
 
 // Resolve one output per still-missing page per round. Read only physical headers,
 // keeping the configured output precedence and a single catalog cut for the batch.
-fn hydrateVirtualPdfPageUnits(self: *DB, output: Allocator, txn: *docstore_mod.DocStore.Txn, keys: []const []const u8, values: []?[]const u8) !void {
+fn hydrateVirtualPdfPageUnits(self: *DB, output: Allocator, txn: *docstore_mod.DocStore.Txn, keys: []const []const u8, values: []?[]const u8, policy: ?@import("privacy_read.zig").PolicySnapshot, verified: ?*std.AutoHashMapUnmanaged(usize, void)) !void {
     const Candidate = struct { index: usize, unit: []const u8, number: u32, outputs: []const []const u8 };
     const Probe = struct {
         candidate: Candidate,
@@ -51384,9 +51384,16 @@ fn hydrateVirtualPdfPageUnits(self: *DB, output: Allocator, txn: *docstore_mod.D
             count = 0;
             for (probes[0..received], headers[0..received]) |probe, header| {
                 var item = probe.candidate;
-                if (header) |bytes| {
+                if (header) |bytes| candidate: {
                     const meta = try @import("../artifact_payload.zig").Metadata.decode(bytes);
                     if (meta.sourceHash()) |source| {
+                        if (policy) |active| {
+                            var backing = inference_work.ReclaimingInvocationAllocator.init(output);
+                            var validation = std.heap.ArenaAllocator.init(backing.allocator());
+                            defer validation.deinit();
+                            if (!try @import("privacy_read.zig").permitsVirtualPage(validation.allocator(), active, probe.key, txn)) break :candidate;
+                            if (verified) |indices| try indices.put(output, item.index, {});
+                        }
                         const fingerprint = try std.fmt.allocPrint(wave.allocator(), "{s}:{x:0>16}", .{ item.outputs[0], source });
                         values[item.index] = try std.json.Stringify.valueAlloc(output, .{ .unit_id = item.unit, .unit_type = "page", .provenance = .{ .page_number = item.number }, ._artifact_unit_fingerprint = fingerprint }, .{});
                         continue;
@@ -51700,16 +51707,18 @@ fn loadStoredSearchDocumentsMany(
     const policy = try privacy.capture(self, privacy_arena.allocator());
     var virtual_pages = std.heap.ArenaAllocator.init(alloc);
     defer virtual_pages.deinit();
-    try hydrateVirtualPdfPageUnits(self, virtual_pages.allocator(), &txn, read_keys, read_values);
+    var verified_pages: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    const protected = policy != null and policy.?.prepared.policy.mode != .monitor;
+    try hydrateVirtualPdfPageUnits(self, virtual_pages.allocator(), &txn, read_keys, read_values, if (protected) policy else null, &verified_pages);
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse continue;
-        if (policy != null and policy.?.prepared.policy.mode != .monitor) {
+        if (protected) {
             var row_backing = inference_work.ReclaimingInvocationAllocator.init(alloc);
             var row_arena = std.heap.ArenaAllocator.init(row_backing.allocator());
             defer row_arena.deinit();
             const row = row_arena.allocator();
             const id = keys[item.original_index];
-            const safe = (if (internal_keys.isInternalUserKey(id))
+            const safe = if (verified_pages.contains(i)) value else (if (internal_keys.isInternalUserKey(id))
                 privacy.projectArtifact(row, policy.?, item.store_key, &txn)
             else
                 privacy.project(row, policy.?, id, value, &txn)) catch |err| {
@@ -155747,6 +155756,53 @@ test "source semantic media input rejects PDF ancestry on nonempty sources and p
         try std.testing.expectEqual(@TypeOf(request.input_kind).materialized_chunks, request.input_kind);
     };
     try std.testing.expectEqual(@as(usize, 1), dense_requests);
+}
+
+test "source semantic media input virtual PDF pages require the physical vector privacy receipt" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var producer: PrivacyAbsentFieldProducer = .{};
+    var directory = try TestDirectory.init("privacy-virtual-pdf");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = producer.interface() } });
+    defer db.close();
+    try addPrivacyAbsentFieldProducer(a, &db, "PDF citation");
+    const source = "{\"ordinal\":1}";
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = source }}, .sync_level = .write });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    const policy = (try @import("privacy_read.zig").capture(&db, scratch)).?;
+    const name = try std.fmt.allocPrint(scratch, "_privacy_{s}_visual", .{policy.prepared.version});
+    try db.addEnrichment(.{ .name = name, .kind = .embedding, .field = "url", .embedding_input = .pdf_page_images, .expected_dims = 3 });
+    const config = try std.json.Stringify.valueAlloc(scratch, .{ .field = "v", .dims = 3, .embedding_name = name }, .{});
+    try db.addIndex(.{ .name = "images", .kind = .dense_vector, .config_json = config });
+    const unit = unit: {
+        var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        var pages = plan.plan().pdf_page_outputs.keyIterator();
+        break :unit try internal_keys.documentUnitArtifactKeyAlloc(scratch, "doc", pages.next().?.*, "page:000001");
+    };
+    const vector_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, unit, name);
+    const vector = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(scratch, 19, &.{ 1, 2, 3 });
+    try db.core.store.put(vector_key, vector);
+    const local = @import("../../privacy/local_publication.zig");
+    const witness = try local.key(scratch, vector_key);
+    for ([_][]const u8{ "", source, "{\"ordinal\":2}" }, 0..) |witness_source, index| {
+        if (witness_source.len != 0) try db.core.store.put(witness, &local.encode(policy.prepared.version, witness_source, vector));
+        const lookup = try db.lookup(scratch, unit, .{});
+        const single = try db.loadStoredSearchDocumentProbe(scratch, unit);
+        const batch = try loadStoredSearchDocumentsMany(&db, scratch, &.{unit}, null);
+        if (index == 1) {
+            try std.testing.expect(lookup != null and single != null and batch[0] != null);
+            try std.testing.expectEqualStrings(single.?, batch[0].?);
+            const citation = try std.json.parseFromSliceLeaky(std.json.Value, scratch, single.?, .{});
+            try std.testing.expectEqualStrings("page:000001", citation.object.get("unit_id").?.string);
+            try std.testing.expectEqual(@as(i64, 1), citation.object.get("provenance").?.object.get("page_number").?.integer);
+        } else {
+            try std.testing.expect(lookup == null and single == null and batch[0] == null);
+        }
+    }
 }
 
 test "source semantic media input PDF cardinality changes require removing dense consumers" {

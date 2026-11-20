@@ -2229,7 +2229,7 @@ pub const Adapter = struct {
             } else false;
             if (!ordinary_scan) try prunable_tables.put(owned, table.physical_name, {});
         };
-        const role_revision = if (self.identity.*) |principal| if (principal.live_user_manager) |manager| @as(?u64, manager.rowPolicyRoleRevision()) else null else null;
+        const role_revision = try @import("graph_execution.zig").captureRoleRevision(self.identity.*);
         // Bind once before cohort planning, then reuse those exact values in
         // each graph cursor. A prepared SQL query never stores bound domains.
         const parameter_rows = try owned.alloc([]const cypher.value.Entry, requests.len);

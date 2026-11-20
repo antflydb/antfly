@@ -1340,10 +1340,30 @@ pub fn resolveGroupForKeyFromRanges(
     ranges: []const *const metadata_table_manager.RangeRecord,
     key: []const u8,
 ) ?u64 {
-    for (ranges) |range| {
-        if (rangeContainsKey(range.*, key)) return range.group_id;
+    // Ranges are sorted by start key. The predecessor is the only possible
+    // owner, including at an exact split boundary or in a keyspace gap.
+    const upper = std.sort.upperBound(*const metadata_table_manager.RangeRecord, ranges, key, struct {
+        fn compare(needle: []const u8, range: *const metadata_table_manager.RangeRecord) std.math.Order {
+            return std.mem.order(u8, needle, range.start_key);
+        }
+    }.compare);
+    if (upper == 0) return null;
+    const range = ranges[upper - 1];
+    return if (rangeContainsKey(range.*, key)) range.group_id else null;
+}
+
+test "distributed txn routes sorted boundary keys and rejects gaps" {
+    const Range = metadata_table_manager.RangeRecord;
+    const items = [_]Range{
+        .{ .group_id = 1, .table_id = 8, .start_key = "a", .end_key = "c" },
+        .{ .group_id = 2, .table_id = 8, .start_key = "d", .end_key = "f" },
+        .{ .group_id = 3, .table_id = 8, .start_key = "f", .end_key = null },
+    };
+    const ranges = [_]*const Range{ &items[0], &items[1], &items[2] };
+    for ([_][]const u8{ "", "a", "b", "c", "d", "e", "f", "z" }, [_]?u64{ null, 1, 1, null, 2, 2, 3, 3 }) |key, expected| {
+        try std.testing.expectEqual(expected, resolveGroupForKeyFromRanges(&ranges, key));
     }
-    return null;
+    try std.testing.expectEqual(@as(?u64, null), resolveGroupForKeyFromRanges(&.{}, "a"));
 }
 
 /// One authoritative, compact table projection suitable for write admission.
@@ -1544,15 +1564,20 @@ pub fn transactionRoutingSnapshot(
     const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
     defer if (!transferred) metadata_admin.freeRangeRefs(alloc, ranges);
     if (ranges.len == 0) return null;
-    sortRangeRefs(ranges);
+    const epoch = sortedTransactionTopologyEpoch(table.*, ranges);
 
     transferred = true;
     return .{
         .catalog = catalog,
         .snapshot = snapshot,
         .ranges = ranges,
-        .topology_epoch = topologyEpochFromSortedRanges(table.*, ranges),
+        .topology_epoch = epoch,
     };
+}
+
+pub fn sortedTransactionTopologyEpoch(table: metadata_table_manager.TableRecord, ranges: []const *const metadata_table_manager.RangeRecord) u64 {
+    sortRangeRefs(ranges);
+    return topologyEpochFromSortedRanges(table, ranges);
 }
 
 /// Whether a table with this name currently exists in the catalog. Used by
@@ -1810,7 +1835,7 @@ pub fn validateTransactionTopologyStable(
     return validateTransactionTopologyStableSnapshot(&snapshot, table.*);
 }
 
-fn validateTransactionTopologyStableSnapshot(
+pub fn validateTransactionTopologyStableSnapshot(
     snapshot: *const metadata_api.AdminSnapshot,
     table: metadata_table_manager.TableRecord,
 ) !void {

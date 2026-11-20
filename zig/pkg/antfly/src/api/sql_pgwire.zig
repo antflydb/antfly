@@ -1180,7 +1180,7 @@ const Job = struct {
         };
         defer lease.release(self.adapter.server.sqlPlanCacheIo());
         const compiled = lease.compiled();
-        if (self.request.capture_cursor_authority and compiled.statement != .select) return error.UnsupportedSqlExecution;
+        if (self.request.capture_cursor_authority == .require_select and compiled.statement != .select) return error.UnsupportedSqlExecution;
         const write = self.kind == .execute and switch (compiled.statement) {
             .select, .explain => false,
             .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
@@ -1191,7 +1191,7 @@ const Job = struct {
         preparation.release();
         // Sample before loading grants so a concurrent revocation can only
         // cause a cache miss, never attest a descriptor built under old grants.
-        const cursor_revision = if (self.request.capture_cursor_authority) self.credential.readRevision() else null;
+        const cursor_revision = if (self.request.capture_cursor_authority != .none and compiled.statement == .select) self.credential.readRevision() else null;
         const authority_revision = if (self.kind == .describe) try self.credential.descriptionRevision() else 0;
         var identity: ?http.AuthenticatedIdentity = try self.credential.identity(server.alloc);
         defer identity.?.deinit(server.alloc);

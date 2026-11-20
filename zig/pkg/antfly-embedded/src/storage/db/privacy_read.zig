@@ -165,6 +165,20 @@ pub fn pending(err: anyerror) bool {
 /// producer graph. Orphaned pre-policy chunks/assets remain physically present
 /// for GC but cannot be read through their old public IDs.
 pub fn projectArtifact(a: A, snapshot: PolicySnapshot, physical: []const u8, read: anytype) ![]u8 {
+    return projectArtifactMode(a, snapshot, physical, read, false);
+}
+
+/// A virtual citation may expose page metadata only when this exact vector
+/// is an authorized descendant. The redacted root alone cannot attest it.
+pub fn permitsVirtualPage(a: A, snapshot: PolicySnapshot, physical: []const u8, read: anytype) !bool {
+    _ = projectArtifactMode(a, snapshot, physical, read, true) catch |err| {
+        if (pending(err) or err == error.UnsupportedQueryRequest) return false;
+        return err;
+    };
+    return true;
+}
+
+fn projectArtifactMode(a: A, snapshot: PolicySnapshot, physical: []const u8, read: anytype, comptime citation_only: bool) ![]u8 {
     var input = try @import("artifact_extraction_generation.zig").captureInput(a, read, physical);
     defer input.deinit();
     const raw = input.value orelse return error.PrivacyPending;
@@ -176,6 +190,7 @@ pub fn projectArtifact(a: A, snapshot: PolicySnapshot, physical: []const u8, rea
         if (!root and !std.meta.eql(document.consumerPolicyVersion(ref.name), @as(?[64]u8, version))) return error.UnsupportedQueryRequest;
         const primary = try keys.documentKeyAlloc(a, ref.document_id);
         const source = read.get(primary) catch |err| if (err == error.NotFound) return error.PrivacyStale else return err;
+        if (root and citation_only) return error.UnsupportedQueryRequest;
         if (root) return project(a, snapshot, ref.document_id, source, read);
         const parsed = try std.json.parseFromSlice(std.json.Value, a, source, .{ .parse_numbers = false });
         const canonical = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
@@ -183,7 +198,7 @@ pub fn projectArtifact(a: A, snapshot: PolicySnapshot, physical: []const u8, rea
         // Independently require the current root, even when the descendant's
         // own publication is current. These bytes never grant original access.
         _ = try project(a, snapshot, ref.document_id, source, read);
-        return a.dupe(u8, raw);
+        return if (citation_only) &.{} else a.dupe(u8, raw);
     }
     var proof = (try @import("artifact_producer_provenance.zig").readCurrentForArtifact(a, read, input.proofKey(physical), input.proofValue())) orelse return error.PrivacyPublicationPending;
     defer proof.deinit();
@@ -191,6 +206,7 @@ pub fn projectArtifact(a: A, snapshot: PolicySnapshot, physical: []const u8, rea
     const version = snapshot.prepared.version;
     const prefix = try std.fmt.allocPrint(a, "_privacy_{s}_", .{version});
     if (std.mem.eql(u8, name, snapshot.artifact_name)) {
+        if (citation_only) return error.UnsupportedQueryRequest;
         if (proof.proof.sources.len != 1) return error.InvalidPrivacyReceipt;
         const key = proof.proof.sources[0].document_key;
         const primary = try keys.documentKeyAlloc(a, key);
@@ -201,7 +217,7 @@ pub fn projectArtifact(a: A, snapshot: PolicySnapshot, physical: []const u8, rea
         return project(a, snapshot, key, source, read);
     }
     if (!std.mem.startsWith(u8, name, prefix)) return error.UnsupportedQueryRequest;
-    return a.dupe(u8, raw);
+    return if (citation_only) &.{} else a.dupe(u8, raw);
 }
 
 // Resolve exactly the physical consumers used by retrieval and text filters.

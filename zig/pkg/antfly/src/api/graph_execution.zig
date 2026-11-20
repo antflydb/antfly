@@ -44,6 +44,12 @@ pub fn limits(server: *const server_mod.ApiHttpServer) cypher.runtime.Limits {
     return .{ .memory_bytes = ceilings.max_retained_state_bytes, .scanned_anchors = ceilings.max_scanned_anchors, .explored_edges = ceilings.max_explored_edges, .intermediate_states = ceilings.max_intermediate_states };
 }
 
+pub fn captureRoleRevision(identity: ?server_mod.AuthenticatedIdentity) !?u64 {
+    const principal = identity orelse return null;
+    const manager = principal.live_user_manager orelse return null;
+    return try manager.validateRoleRevision(principal.username, principal.roles, null);
+}
+
 pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity: *?server_mod.AuthenticatedIdentity, context: operation.RequestContext, name: []const u8, body: []const u8, diagnostic: *cypher.compiler.Diagnostic, write_outcome: *WriteOutcome) ![]u8 {
     try context.ensureActive();
     var arena = std.heap.ArenaAllocator.init(a);
@@ -54,7 +60,7 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     var compiled = try cypher.compiler.compile(scratch, request.query, .{}, diagnostic);
     defer compiled.deinit();
     const writes = cypher.runtime.queryHasWrites(compiled.query);
-    const role_revision = if (identity.*) |principal| if (principal.live_user_manager) |manager| @as(?u64, try manager.validateRoleRevision(principal.username, principal.roles, null)) else null else null;
+    const role_revision = try captureRoleRevision(identity.*);
     if (identity.*) |principal| {
         if (!server_mod.permissionsAllow(principal.permissions, .graph, name, .read) or (writes and !compiled.query.explain and !server_mod.permissionsAllow(principal.permissions, .graph, name, .write))) return error.Forbidden;
     }

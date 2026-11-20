@@ -4293,7 +4293,8 @@ const LocalStandaloneMetadata = struct {
         if (!self.standaloneRelationPublicationSupported()) return .idle;
         const before = try store.standaloneRevision();
         const outcome = self.relation_reconciliation.step(store, self.alloc, group_ids.main_metadata_group_id, self.metadata_incarnation orelse return error.InvalidMetadataIncarnation, self.local_node_id, platform_time.monotonicNs(), mode) catch |err| switch (err) {
-            error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.ResourceTemporarilyUnavailable, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.OutOfMemory, error.MetadataMutationOutcomeUnknown => return .idle,
+            error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.ResourceTemporarilyUnavailable, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.MetadataMutationOutcomeUnknown => return .idle,
+            error.OutOfMemory => if (mode == .startup) return error.OutOfMemory else return .idle,
             else => return err,
         };
         if (outcome != .applied) return outcome;
@@ -16456,6 +16457,12 @@ test "system catalog standalone relation coordinator startup publishes empty and
     {
         var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
         defer metadata.deinit();
+        {
+            var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+            metadata.alloc = failing.allocator();
+            defer metadata.alloc = alloc;
+            try std.testing.expectError(error.OutOfMemory, metadata.reconcileRelationsRound(.startup));
+        }
         // A deliberately delayed background round must never stall startup.
         metadata.relation_reconciliation.next_round_at_ns = std.math.maxInt(u64);
         try metadata.awaitInitialRelationPublication(std.testing.io, cancellation.token());

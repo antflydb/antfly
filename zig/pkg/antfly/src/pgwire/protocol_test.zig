@@ -266,7 +266,7 @@ const Mock = struct {
     }
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Result {
         var result = try executeStatement(raw, alloc, request);
-        if (request.capture_cursor_authority) result.cursor_authority = .{ .ptr = raw, .validate = validateBuffered };
+        if (request.capture_cursor_authority != .none and std.mem.startsWith(u8, result.command_tag, "SELECT")) result.cursor_authority = .{ .ptr = raw, .validate = validateBuffered };
         return result;
     }
     fn executeStatement(raw: *anyopaque, alloc: std.mem.Allocator, request: backend.Request) !backend.Result {
@@ -1572,6 +1572,33 @@ test "pgwire pull failure and disconnect close snapshots before releasing identi
         try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
         try std.testing.expectEqual(@as(usize, 0), mock.executions);
         try std.testing.expectEqual(@as(usize, 1), mock.releases);
+    }
+}
+
+test "pgwire simple query and SQL EXECUTE revalidate blocking results between delivery pages" {
+    const rows: [257][]const std.json.Value = @splat(&.{.{ .integer = 1 }});
+    for ([_]bool{ false, true }) |prepared| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        if (prepared) try frame(&input.writer, 'Q', "PREPARE blocking AS SELECT n FROM t ORDER BY n\x00");
+        try frame(&input.writer, 'Q', if (prepared) "EXECUTE blocking\x00" else "SELECT n FROM t ORDER BY n\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .result_override = .{ .columns = &.{.{ .name = "n", .type = .integer }}, .rows = &rows, .command_tag = "SELECT 257" }, .revoke_on_buffered_resume = true };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        var cursor: protocol.Cursor = .{ .bytes = output.written() };
+        var emitted: usize = 0;
+        var forbidden = false;
+        while (cursor.offset < cursor.bytes.len) {
+            const tag = try cursor.int(u8);
+            const length = try cursor.int(u32);
+            const payload = try cursor.take(length - 4);
+            if (tag == 'D') emitted += 1;
+            if (tag == 'E') forbidden = std.mem.indexOf(u8, payload, "42501") != null;
+        }
+        try std.testing.expectEqual(@as(usize, 256), emitted);
+        try std.testing.expect(forbidden);
     }
 }
 
