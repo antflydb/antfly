@@ -230,6 +230,12 @@ pub const Backend = struct {
     open_options: backend_types.OpenOptions,
     state: *RcState,
     mutex: std.atomic.Mutex = .unlocked,
+    /// Set when an externally committed write could not be applied to the
+    /// in-memory mirror (`invalidateMirror`): the mirror no longer matches
+    /// the durable catalog, so every later transaction fails closed instead
+    /// of reading stale state or computing writes from it. Reopening the
+    /// index rebuilds the mirror from the committed catalog.
+    mirror_invalid: std.atomic.Value(bool) = .init(false),
     /// Ride-along commits (`NamespaceTxn.commit()` with `durable = false`)
     /// staged via `sink.submitDeferred` but not yet waited on (design doc
     /// §3.2a: background work rides along and is crash-recomputable, but a
@@ -527,8 +533,15 @@ pub const Backend = struct {
     /// `NamespaceTxn.commit`'s own clone-then-swap, without re-deriving the
     /// pending-mutation bookkeeping `NamespaceTxn` needs for its own
     /// (separate) commit.
+    /// See `mirror_invalid`.
+    pub fn invalidateMirror(self: *Backend) void {
+        self.mirror_invalid.store(true, .release);
+    }
+
     pub fn applyExternallyCommittedMutations(self: *Backend, mutations: []const Mutation) !void {
         if (mutations.len == 0) return;
+        // A failure below leaves the mirror behind a durable commit.
+        errdefer self.invalidateMirror();
         lockBackend(self);
         const current = self.state;
         self.mutex.unlock();
@@ -582,6 +595,7 @@ pub const Backend = struct {
         borrowed_trees: std.ArrayListUnmanaged(ordered.Tree) = .empty,
 
         fn open(backend: *Backend, read_only: bool) !NamespaceTxn {
+            if (backend.mirror_invalid.load(.acquire)) return error.IndexMirrorInvalid;
             lockBackend(backend);
             defer backend.mutex.unlock();
             const current = backend.state;
@@ -997,6 +1011,22 @@ const TestSink = struct {
         return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc };
     }
 };
+
+// A mirror update that fails after its external commit leaves the mirror
+// behind the durable catalog: every later transaction fails closed instead
+// of reading it or computing writes from it.
+test "native catalog backend fails closed once its mirror misses a committed write" {
+    const a = std.testing.allocator;
+    var test_sink = TestSink{ .allocator = a };
+    defer test_sink.deinit();
+    var backend = try Backend.init(a, .{ .sink = test_sink.sink(), .scope = "idx1" });
+    defer backend.close();
+    var read = try backend.beginRead();
+    read.abort();
+    backend.invalidateMirror();
+    try std.testing.expectError(error.IndexMirrorInvalid, backend.beginRead());
+    try std.testing.expectError(error.IndexMirrorInvalid, backend.beginWrite());
+}
 
 test "native catalog backend supports prefix cursors over a namespace" {
     // Regression: PersistentIndex.open's loadActiveSegmentIdsFromTxn /

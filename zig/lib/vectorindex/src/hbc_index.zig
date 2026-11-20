@@ -7649,14 +7649,24 @@ fn dupeOwnedPendingMutationsAlloc(alloc: Allocator, items: []const store.Pending
     // transaction's own storage, invalid once that transaction is aborted.
     const out = try alloc.alloc(store.PendingMutation, items.len);
     var filled: usize = 0;
-    errdefer freeStagedMutations(alloc, out[0..filled]);
+    // The array is freed whole; only the first `filled` items own copies.
+    errdefer {
+        for (out[0..filled]) |m| {
+            if (m.namespace) |n| alloc.free(n);
+            alloc.free(m.key);
+            if (!m.is_delete) alloc.free(m.value);
+        }
+        alloc.free(out);
+    }
     for (items, 0..) |m, i| {
-        out[i] = .{
-            .namespace = if (m.namespace) |n| try alloc.dupe(u8, n) else null,
-            .key = try alloc.dupe(u8, m.key),
-            .value = if (m.is_delete) "" else try alloc.dupe(u8, m.value),
-            .is_delete = m.is_delete,
-        };
+        // Each field's copy is freed if a later one for this same item
+        // fails; `filled` covers only fully copied items.
+        const namespace = if (m.namespace) |n| try alloc.dupe(u8, n) else null;
+        errdefer if (namespace) |n| alloc.free(n);
+        const key = try alloc.dupe(u8, m.key);
+        errdefer alloc.free(key);
+        const value = if (m.is_delete) "" else try alloc.dupe(u8, m.value);
+        out[i] = .{ .namespace = namespace, .key = key, .value = value, .is_delete = m.is_delete };
         filled = i + 1;
     }
     return out;
@@ -7667,9 +7677,11 @@ fn dupeOwnedPendingMutationsAlloc(alloc: Allocator, items: []const store.Pending
 /// (already mutated since `insertWithMetadataStaged`/`deleteStaged`) to
 /// its own readers and releases `published_snapshot_mu`.
 pub fn installStagedWrite(self: anytype, staged: *StagedWrite) !void {
+    defer {
+        freeStagedMutations(self.alloc, staged.mutations);
+        staged.* = undefined;
+    }
     try finishPublishSearchStateIfSupported(self, staged.publishing);
-    freeStagedMutations(self.alloc, staged.mutations);
-    staged.* = undefined;
 }
 
 /// `staged.mutations` were never committed durably (the caller's own
@@ -7696,6 +7708,8 @@ pub fn deleteStaged(self: anytype, vector_id: u64) !StagedWrite {
     const harvested = (try txn.pendingMutations()) orelse return error.StagedPublicationUnsupported;
     defer self.alloc.free(harvested);
     const owned = try dupeOwnedPendingMutationsAlloc(self.alloc, harvested);
+    // Owned here until the returned `StagedWrite` takes it.
+    errdefer freeStagedMutations(self.alloc, owned);
     try markPublishSearchStateCommittingIfSupported(self, publishing);
     txn.abort();
     return .{ .publishing = publishing, .mutations = owned };
@@ -8533,6 +8547,8 @@ pub fn insertWithMetadataStaged(
     const harvested = (try txn.pendingMutations()) orelse return error.StagedPublicationUnsupported;
     defer self.alloc.free(harvested);
     const owned = try dupeOwnedPendingMutationsAlloc(self.alloc, harvested);
+    // Owned here until the returned `StagedWrite` takes it.
+    errdefer freeStagedMutations(self.alloc, owned);
     try markPublishSearchStateCommittingIfSupported(self, publishing);
     txn.abort();
     return .{ .publishing = publishing, .mutations = owned };
@@ -14117,4 +14133,20 @@ test "e-means leaf split rejects unsupported configuration" {
     mock.config.kmeans_backend = .cpu;
     mock.config.split_algo = .hilbert;
     try std.testing.expectError(error.EmeansRequiresKmeansSplit, splitLeafVectorSetEmeans(&mock, &vectors, &ids));
+}
+
+test "staged mutation copies free every partial item when an allocation fails" {
+    const items = [_]store.PendingMutation{
+        .{ .namespace = "nodes", .key = "k1", .value = "v1" },
+        .{ .namespace = "vecs", .key = "k2", .value = "v2" },
+        .{ .namespace = null, .key = "k3", .is_delete = true },
+    };
+    var fail_index: usize = 0;
+    while (fail_index < 16) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const alloc = failing.allocator();
+        if (dupeOwnedPendingMutationsAlloc(alloc, &items)) |owned| {
+            freeStagedMutations(alloc, owned);
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+    }
 }
