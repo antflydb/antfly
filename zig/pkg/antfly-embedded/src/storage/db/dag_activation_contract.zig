@@ -110,6 +110,14 @@ pub const ScanManifest = struct {
         };
     }
 
+    pub fn terminalCursor(self: ScanManifest, id: authority.Digest) ![5]u8 {
+        const roots = try self.domainRoots(id);
+        var cursor: [5]u8 = undefined;
+        std.mem.writeInt(u32, cursor[0..4], @intCast(roots.len - 1), .big);
+        cursor[4] = 1;
+        return cursor;
+    }
+
     fn domainRoots(self: ScanManifest, id: authority.Digest) ![]const ScanRoot {
         for (self.domains) |domain| {
             if (std.mem.eql(u8, &domain.id, &id)) return domain.roots;

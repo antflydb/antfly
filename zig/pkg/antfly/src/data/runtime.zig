@@ -12551,6 +12551,33 @@ pub const DataServer = struct {
         return DagEffects.advanceScan(scratch, port, manifest, command, checkpoint);
     }
 
+    const DagInventory = @import("antfly_local_sources").storage_db_artifact_inventory;
+
+    /// Publish the activated catalog on the authority while source roots are
+    /// fenced. Ordered apply certifies every domain before making it visible.
+    pub fn publishDagActivationOnRoute(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        manifest: DagEffects.ScanManifest,
+        route: DagActivationRoute,
+        catalog: DagInventory.Command,
+        targets: []const DagInventory.DagActivationTarget,
+        owner_epoch: u64,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !void {
+        if (!std.mem.eql(u8, &manifest.authority_namespace, &route.namespace))
+            return error.GraphConstraintRevisionChanged;
+        try route.validate();
+        try cancellation.check();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const command = try DagInventory.planDagActivationPublication(arena.allocator(), manifest, catalog, targets, owner_epoch);
+        return localRaftBatchGroupRoutedWithCancellation(self, alloc, route.fence, table_name, .{
+            .artifact_catalog = command,
+        }, cancellation);
+    }
+
     fn localRaftBatchGroupRoutedWithCancellation(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -42974,6 +43001,16 @@ fn consumerTests() type {
                 manifest,
                 .{ .namespace = @splat(9), .fence = undefined },
                 &.{},
+                .none,
+            ));
+            try std.testing.expectError(error.GraphConstraintRevisionChanged, server.publishDagActivationOnRoute(
+                std.testing.allocator,
+                "docs",
+                manifest,
+                .{ .namespace = @splat(9), .fence = undefined },
+                undefined,
+                &.{},
+                1,
                 .none,
             ));
             try std.testing.expectError(error.GraphConstraintRevisionChanged, server.releaseDagActivationOnRoutes(

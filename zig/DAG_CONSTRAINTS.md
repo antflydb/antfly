@@ -89,6 +89,9 @@ fence. A retry of the same attempt can reuse fences already acquired.
 After recording a terminal decision, the hosted cleanup step releases source
 fences first and the authority fence last. Cleanup records a terminal marker
 on roots an abandoned attempt never reached, fencing delayed acquisitions.
+The hosted publication step derives terminal proofs for exactly the manifest
+domains from the destination catalog generation. Ordered apply verifies each
+proof and installs the activation certificate with the catalog binding.
 An active source fence allows an ordered catalog change only when activation
 proofs match its pinned snapshot. Raft protocol version 31 gates these commands,
 DAG-bearing transaction prepare, and catalog activation proofs. The source-fence

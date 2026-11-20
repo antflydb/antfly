@@ -178,12 +178,17 @@ test "ordered artifact inventory graph publication validates guards generations 
             ;
             try std.testing.expectError(error.InvalidDagMutation, publication.LocalDagBinding.stageFromConfig(alloc, &writer, command, @splat(2), config_json, &.{}));
             try std.testing.expectEqual(.validating, (try dag.Storage.load(&writer, request.domain)).phase);
-            const fence: dag.SourceFence = .{ .activation = @splat(3), .snapshot = @splat(4) };
-            const activations: []const publication.LocalDagBinding.Activation = &.{.{
-                .edge_type = "links",
-                .owner_epoch = 1,
-                .proof = .{ .scanned = .{ .snapshot = fence.snapshot, .after = "" } },
-            }};
+            const activation = @import("dag_activation_contract.zig");
+            const manifest = try activation.ScanManifest.init(&.{.{
+                .id = request.domain,
+                .roots = &.{.{
+                    .namespace = command.namespace,
+                    .index_name = "g",
+                    .edge_type = "links",
+                    .generation = command.producer_generation,
+                }},
+            }}, command.namespace, @splat(3));
+            const fence = manifest.fence;
             var declared: std.ArrayList(u8) = .empty;
             defer declared.deinit(alloc);
             try declared.appendSlice(alloc, bytes.items[0 .. bytes.items.len - config.len - 12]);
@@ -193,12 +198,19 @@ test "ordered artifact inventory graph publication validates guards generations 
             try declared.appendSlice(alloc, config_json);
             try declared.appendSlice(alloc, bytes.items[bytes.items.len - 8 ..]);
             const declaration: inventory.Catalogs = .{ .indexes = declared.items };
-            var ordered: inventory.Command = .{
+            const candidate_catalog: inventory.Command = .{
                 .namespace = command.namespace,
                 .catalogs = declaration,
                 .binding = .{ .epoch = 1, .digest = declaration.digest(), .semantic_digest = try declaration.semanticDigest(alloc), .effect_protocol = 16 },
-                .dag_activations = &.{.{ .index_name = "g", .table_identity = @splat(2), .proofs = activations }},
             };
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            var ordered = try inventory.planDagActivationPublication(scratch.allocator(), manifest, candidate_catalog, &.{.{
+                .index_name = "g",
+                .table_identity = @splat(2),
+                .edge_types = &.{"links"},
+            }}, 1);
+            const activations = ordered.dag_activations.?[0].proofs;
             try @import("../source_authority.zig").bind(&writer, .native, command.namespace);
             var missing = ordered;
             missing.dag_activations = null;
@@ -207,7 +219,13 @@ test "ordered artifact inventory graph publication validates guards generations 
             try std.testing.expectEqual(.validating, (try dag.Storage.load(&writer, request.domain)).phase);
             try std.testing.expectError(error.InvalidArtifactCatalogCommand, inventory.stageOrdered(alloc, &writer, ordered, 1));
             try fence.acquire(&writer);
-            try dag.Contributions.beginActivation(&writer, request.domain, 1, fence.snapshot);
+            var scan = try manifest.beginScanCommand(request.domain, 1);
+            try scan.stageScan(alloc, &writer);
+            try std.testing.expectError(error.InvalidArtifactCatalogCommand, inventory.stageOrdered(alloc, &writer, ordered, 1));
+            const end = try manifest.terminalCursor(request.domain);
+            scan.scan.?.root_count = null;
+            scan.scan.?.page = .{ .next = &end, .replacements = &.{} };
+            try scan.stageScan(alloc, &writer);
             try inventory.stageOrdered(alloc, &writer, ordered, 1);
             try inventory.stageOrdered(alloc, &writer, ordered, 1);
             ordered.dag_activations = &.{.{ .index_name = "g", .table_identity = @splat(9), .proofs = activations }};

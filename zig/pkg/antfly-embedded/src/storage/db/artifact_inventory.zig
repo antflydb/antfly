@@ -167,6 +167,55 @@ pub const DagActivation = struct {
     proofs: []const @import("artifact_publication.zig").LocalDagBinding.Activation,
 };
 
+pub const DagActivationTarget = struct {
+    index_name: []const u8,
+    table_identity: [16]u8,
+    edge_types: []const []const u8,
+};
+
+/// Derive the exact terminal proofs from the pinned manifest and destination
+/// catalog. The ordered writer checks those proofs against durable progress.
+/// All generated storage belongs to the caller's scratch arena.
+pub fn planDagActivationPublication(
+    alloc: std.mem.Allocator,
+    manifest: @import("dag_activation_contract.zig").ScanManifest,
+    command: Command,
+    targets: []const DagActivationTarget,
+    owner_epoch: u64,
+) !Command {
+    if (command.dag_activations != null or owner_epoch == 0 or
+        !std.mem.eql(u8, &command.namespace, &manifest.authority_namespace))
+        return error.InvalidArtifactCatalogCommand;
+
+    var remaining: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    defer remaining.deinit(alloc);
+    for (manifest.domains) |domain| try remaining.put(alloc, domain.id, {});
+    const activations = try alloc.alloc(DagActivation, targets.len);
+    for (targets, activations) |target, *activation| {
+        var entries = try @import("artifact_catalog_view.zig").Iterator.init(command.catalogs.indexes);
+        const generation = while (try entries.next()) |entry| {
+            if (entry.kind == 3 and std.mem.eql(u8, entry.name, target.index_name)) break entry.generation;
+        } else return error.InvalidArtifactCatalogCommand;
+        const proofs = try alloc.alloc(@import("artifact_publication.zig").LocalDagBinding.Activation, target.edge_types.len);
+        for (target.edge_types, proofs) |edge_type, *proof| {
+            const id = try @import("../../graph/dag_authority.zig").domain(target.table_identity, generation, target.index_name, edge_type);
+            if (!remaining.remove(id)) return error.InvalidArtifactCatalogCommand;
+            const cursor = try manifest.terminalCursor(id);
+            proof.* = .{
+                .edge_type = edge_type,
+                .owner_epoch = owner_epoch,
+                .proof = .{ .scanned = .{ .snapshot = manifest.fence.snapshot, .after = try alloc.dupe(u8, &cursor) } },
+            };
+        }
+        activation.* = .{ .index_name = target.index_name, .table_identity = target.table_identity, .proofs = proofs };
+    }
+    if (remaining.count() != 0) return error.InvalidArtifactCatalogCommand;
+    var result = command;
+    result.dag_activations = activations;
+    try result.validate();
+    return result;
+}
+
 pub const Command = struct {
     namespace: [24]u8,
     previous: ?Binding = null,
