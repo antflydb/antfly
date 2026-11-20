@@ -3781,9 +3781,17 @@ pub const NativeGenerationPipeline = struct {
         }
         if (self.usesPjrtSession()) {
             const capacity = @min(try std.math.add(usize, seq_len, max_tokens), self.gpt_config.max_position_embeddings);
-            const whole_prefill = if (compiled_prefix) |*prefix| try prefix.cachedAdmission(seq_len, self.gpt_config.max_position_embeddings) else null;
-            if (whole_prefill) |whole| if (config.prefill_chunk_size != 0 and whole.rows > config.prefill_chunk_size) return error.UnsupportedCompiledMediaPrefillChunking;
-            compiled_decoder = try @import("../execution/resident_decoder.zig").Decoder.initForRequest(self.allocator, self.session.?, self.pjrt_decoder_cache, .{ .limit = capacity, .prompt_rows = seq_len, .max_tokens = max_tokens, .query_rows = config.prefill_chunk_size, .whole_prefill = whole_prefill }, self.execution_control);
+            const resident_decoder = @import("../execution/resident_decoder.zig");
+            const cache_candidate = try resident_decoder.select(self.session.?, self.pjrt_decoder_cache);
+            const whole_prefill = if (cache_candidate) whole: {
+                break :whole if (compiled_prefix) |*prefix| try prefix.cachedAdmission(seq_len, self.gpt_config.max_position_embeddings) else null;
+            } else null;
+            compiled_decoder = try resident_decoder.Decoder.initForRequest(self.allocator, self.session.?, self.pjrt_decoder_cache, .{ .limit = capacity, .prompt_rows = seq_len, .max_tokens = max_tokens, .query_rows = config.prefill_chunk_size, .whole_prefill = whole_prefill }, self.execution_control);
+            if (compiled_decoder == null and config.prefill_chunk_size != 0) {
+                if (compiled_prefix) |*prefix| {
+                    if (try prefix.ordinaryRows(seq_len, self.session.?) > config.prefill_chunk_size) return error.UnsupportedCompiledMediaPrefillChunking;
+                }
+            }
             if (compiled_decoder) |*decoder| {
                 self.compiled_decoder = decoder;
                 self.pjrt_decoder_cache_used = true;

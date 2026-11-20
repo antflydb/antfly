@@ -119,7 +119,6 @@ pub const Decoder = struct {
     pub fn initForRequest(a: std.mem.Allocator, source: Session, requested: ?bool, request: RequestGeometry, control: ?Control) !?Decoder {
         if (control) |active| try active.check();
         if (request.prompt_rows == 0 or request.prompt_rows > request.limit) return error.InvalidResidentDecodePosition;
-        if (request.whole_prefill) |whole| if (request.query_rows != 0 and whole.rows > request.query_rows) return error.UnsupportedResidentPrefillChunking;
         var bounded = source;
         const explicit_chunks = request.query_rows != 0 and request.prompt_rows > request.query_rows;
         if (request.query_rows != 0) {
@@ -136,6 +135,13 @@ pub const Decoder = struct {
             return null;
         }
         if (requested == null and (request.max_tokens == 0 or (request.max_tokens == 1 and !needs_chunks))) return null;
+        // Cached padding is a property of this selected path. Automatic mode
+        // may use ordinary whole-prefix execution instead; its caller validates
+        // that path's actual geometry before submitting numerical work.
+        if (request.whole_prefill) |whole| if (request.query_rows != 0 and whole.rows > request.query_rows) {
+            if (requested == true or request.prompt_rows > request.query_rows) return error.UnsupportedResidentPrefillChunking;
+            return null;
+        };
         // An explicit bound requiring state cannot fall back to a larger query.
         // Preserve the real quota/pressure error instead of relabeling it as an
         // unsupported feature or replaying a whole-prefix operation.
@@ -662,6 +668,12 @@ test "resident encoder decoder policy preserves explicit controls actual KV admi
     try std.testing.expectError(error.Cancelled, Decoder.initForRequest(a, source, null, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8, .whole_prefill = whole }, .{ .ptr = &domain, .check_fn = Probe.cancelFunded }));
     try std.testing.expectEqual(@as(usize, 0), domain.snapshot().hostTotalBytes());
     try std.testing.expectError(error.UnsupportedResidentPrefillChunking, Decoder.initForRequest(a, source, true, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8, .query_rows = 2, .whole_prefill = whole }, null));
+    const padded_whole: Decoder.WholePrefill = .{ .rows = 16, .input_bytes = whole.input_bytes, .host_staging_bytes = whole.host_staging_bytes };
+    for ([_]?bool{ false, null }) |policy| {
+        try std.testing.expect((try Decoder.initForRequest(a, source, policy, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8, .query_rows = 8, .whole_prefill = padded_whole }, null)) == null);
+        try std.testing.expectEqual(@as(usize, 0), domain.snapshot().hostTotalBytes());
+    }
+    try std.testing.expectError(error.UnsupportedResidentPrefillChunking, Decoder.initForRequest(a, source, true, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8, .query_rows = 8, .whole_prefill = padded_whole }, null));
     {
         var selected = (try Decoder.initForRequest(a, source, true, .{ .limit = 16, .prompt_rows = 8, .max_tokens = 8, .query_rows = 8, .whole_prefill = whole }, null)).?;
         defer selected.deinit();
