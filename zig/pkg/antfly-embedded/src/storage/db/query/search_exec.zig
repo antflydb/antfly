@@ -22036,6 +22036,7 @@ fn projectSortKeyDocNumsAlloc(
     legacy_keys: []const []const u8,
     out: *std.StringHashMapUnmanaged(u32),
     control: QueryExecutionControl,
+    prefer_directory: bool,
 ) !void {
     var frontier: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
     defer frontier.deinit(alloc);
@@ -22050,7 +22051,10 @@ fn projectSortKeyDocNumsAlloc(
         }
     }
     if (frontier.count() == 0) return;
-    var matches = try snapshot.collectGraphKeyFrontierDocNumsAlloc(alloc, frontier, control);
+    var matches = if (prefer_directory)
+        try snapshot.collectSortKeyFrontierDocNumsAlloc(alloc, frontier, control)
+    else
+        try snapshot.collectGraphKeyFrontierDocNumsAlloc(alloc, frontier, control);
     defer matches.deinit();
     var docs = matches.ordinals.iterator();
     while (docs.next()) |doc| {
@@ -22066,7 +22070,7 @@ fn projectAdmittedSortCandidates(
     snapshot: *const index_mod.IndexSnapshot,
     candidates: []MatchAllCandidate,
     control: QueryExecutionControl,
-    cursor_projection: ?*NativeSortCursorProjection,
+    cursor_projection: ?*index_mod.IndexSnapshot.SortOrdinalBatchProjection,
 ) !void {
     var ordinals: std.ArrayListUnmanaged(u32) = .empty;
     defer ordinals.deinit(alloc);
@@ -22077,7 +22081,7 @@ fn projectAdmittedSortCandidates(
     var projected_ordinals: std.AutoHashMapUnmanaged(u32, u32) = .empty;
     defer projected_ordinals.deinit(alloc);
     if (cursor_projection) |projection| {
-        var found = try projection.ordinals.project(alloc, snapshot, ordinals.items, control);
+        var found = try projection.project(alloc, snapshot, ordinals.items, control);
         defer found.deinit();
         var matches = found.ordinals.iterator();
         while (matches.next()) |match| {
@@ -22095,59 +22099,13 @@ fn projectAdmittedSortCandidates(
         if (candidate.native_text_doc_id == null) try keys.append(alloc, candidate.id);
     }
     if (keys.items.len == 0) return;
-    if (cursor_projection) |projection| {
-        try projection.ensureKeyFallback(alloc, snapshot, control);
-        for (candidates) |*candidate| {
-            if (candidate.native_text_doc_id == null) candidate.native_text_doc_id = projection.keys.get(candidate.id);
-        }
-        return;
-    }
     var projected_keys: std.StringHashMapUnmanaged(u32) = .empty;
     defer projected_keys.deinit(alloc);
-    try projectSortKeyDocNumsAlloc(alloc, snapshot, keys.items, &.{}, &projected_keys, control);
+    try projectSortKeyDocNumsAlloc(alloc, snapshot, keys.items, &.{}, &projected_keys, control, cursor_projection != null);
     for (candidates) |*candidate| {
         if (candidate.native_text_doc_id == null) candidate.native_text_doc_id = projected_keys.get(candidate.id);
     }
 }
-
-const NativeSortCursorProjection = struct {
-    ordinals: index_mod.IndexSnapshot.SortOrdinalBatchProjection = .{},
-    key_arena: ?std.heap.ArenaAllocator = null,
-    keys: std.StringHashMapUnmanaged(u32) = .empty,
-
-    fn deinit(self: *@This(), alloc: Allocator) void {
-        self.ordinals.deinit(alloc);
-        if (self.key_arena) |*arena| arena.deinit();
-    }
-
-    fn ensureKeyFallback(self: *@This(), alloc: Allocator, snapshot: *const index_mod.IndexSnapshot, control: QueryExecutionControl) !void {
-        if (self.key_arena != null) return;
-        self.key_arena = std.heap.ArenaAllocator.init(alloc);
-        const key_alloc = self.key_arena.?.allocator();
-        var scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
-        defer scratch.deinit();
-        var offset: u32 = 0;
-        for (snapshot.segments, 0..) |segment, i| {
-            try control.check();
-            defer offset += segment.reader.doc_count;
-            if (segment.liveDocCount() == 0) continue;
-            var lease = try snapshot.leaseSegment(i);
-            defer lease.deinit();
-            try lease.entry.shared.lockDeletionSharedWithControl(control);
-            defer lease.entry.shared.unlockDeletionShared();
-            for (0..segment.reader.doc_count) |doc| {
-                if (doc % 256 == 0) try control.check();
-                const local: u32 = @intCast(doc);
-                if (lease.entry.shared.deleted) |deleted| if (deleted.contains(local)) continue;
-                scratch.reset();
-                const key = (try lease.entry.reader.storedIdScoped(scratch.allocator(), local)) orelse continue;
-                const slot = try self.keys.getOrPut(key_alloc, key);
-                if (!slot.found_existing) slot.key_ptr.* = try key_alloc.dupe(u8, key);
-                slot.value_ptr.* = offset + local;
-            }
-        }
-    }
-};
 
 fn countNativeSortCursor(
     alloc: Allocator,
@@ -22164,7 +22122,7 @@ fn countNativeSortCursor(
         plan: SortExecutionPlan,
         snapshot: *const index_mod.IndexSnapshot,
         control: QueryExecutionControl,
-        projection: NativeSortCursorProjection = .{},
+        projection: index_mod.IndexSnapshot.SortOrdinalBatchProjection = .{},
         items: [256]MatchAllCandidate = undefined,
         len: usize = 0,
         count: usize = 0,
@@ -22980,6 +22938,7 @@ pub fn searchMatchAll(
         const stop_after: usize = @as(usize, paging.offset) +| @as(usize, paging.limit);
         const stats = try executor.collect_candidates_stream.?(executor.ctx, alloc, postprocess_req, .{
             .constraints = &native_constraints,
+            .require_complete_primary_population = !native_constraints.positive_filter,
             .stop_after_accepted = if (count_only) null else stop_after,
             .scan_batch_size = if (count_only) default_match_all_primary_key_scan_batch_size else @max(@min(stop_after, default_match_all_primary_key_scan_batch_size), 1),
         }, &page, consumeMatchAllPageCandidate);
@@ -23155,7 +23114,7 @@ pub fn searchMatchAll(
             admitted = try admitMatchAllSortCandidates(alloc, postprocess_req, executor, admission, exact_sort_budget, planned_sort);
             try projectAdmittedSortCandidates(alloc, sort_snapshot, admitted.?.items, control, null);
         } else {
-            try projectSortKeyDocNumsAlloc(alloc, sort_snapshot, filter_keys, legacy_keys, &exceptional_sort_doc_nums, control);
+            try projectSortKeyDocNumsAlloc(alloc, sort_snapshot, filter_keys, legacy_keys, &exceptional_sort_doc_nums, control, false);
         }
         var native_sort_ctx = TextDocValueSortContext{
             .snapshot = sort_snapshot,

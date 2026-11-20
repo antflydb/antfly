@@ -49025,9 +49025,11 @@ pub const DB = struct {
                 arena: std.heap.ArenaAllocator,
                 keys: [256][]const u8 = undefined,
                 len: usize = 0,
+                batch_size: usize,
 
                 fn checkpoint(raw: ?*anyopaque, _: []const u8) !docstore_mod.DocStore.ScanAction {
                     const source_batch: *@This() = @ptrCast(@alignCast(raw.?));
+                    if (source_batch.owner.observed_rows) |count| count.* += 1;
                     try db_query_search.checkSearchRequestDeadline(source_batch.owner.req);
                     return .@"continue";
                 }
@@ -49038,7 +49040,7 @@ pub const DB = struct {
                     const id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(source_batch.arena.allocator(), key)) orelse return .@"continue";
                     source_batch.keys[source_batch.len] = id;
                     source_batch.len += 1;
-                    return if (source_batch.len == source_batch.keys.len) source_batch.flush() else .@"continue";
+                    return if (source_batch.len == source_batch.batch_size) source_batch.flush() else .@"continue";
                 }
 
                 fn flush(source_batch: *@This()) !docstore_mod.DocStore.ScanAction {
@@ -49085,7 +49087,11 @@ pub const DB = struct {
             if (before) |key| if (std.mem.order(u8, key, owner_range.start) != .gt) return;
             const upper = if (end.len == 0) null else try internal_keys.documentRangeLowerAlloc(self.alloc, end);
             defer if (upper) |bound| self.alloc.free(bound);
-            var source_batch = Scan{ .owner = self, .arena = std.heap.ArenaAllocator.init(self.alloc) };
+            var source_batch = Scan{
+                .owner = self,
+                .arena = std.heap.ArenaAllocator.init(self.alloc),
+                .batch_size = @min(@max(options.scan_batch_size orelse 256, 1), 256),
+            };
             defer source_batch.arena.deinit();
             var txn = try self.db.core.store.beginCurrentScanTxn();
             defer txn.abort();
@@ -157640,6 +157646,35 @@ test "optional numeric range keeps mixed primary matches for native field sortin
             defer broad.deinit();
             try std.testing.expectEqual(@as(u32, if (with_cursor) 1 else 2), broad.total_hits);
         }
+        var unordered_executor = db.matchAllExecutor();
+        unordered_executor.bounded_unordered_page = true;
+        var unordered = try db_query_search.searchMatchAll(a, .{
+            .limit = 0,
+            .include_stored = false,
+        }, unordered_executor);
+        defer unordered.deinit();
+        try std.testing.expectEqual(@as(u32, 2), unordered.total_hits);
+
+        const StopAfterOne = struct {
+            fn visit(raw: ?*anyopaque, _: []const u8, _: ?doc_set.DocOrdinal, _: bool) !docstore_mod.DocStore.ScanAction {
+                const visited: *usize = @ptrCast(@alignCast(raw.?));
+                visited.* += 1;
+                return .stop;
+            }
+        };
+        for ([_]bool{ false, true }) |reverse| {
+            var examined: usize = 0;
+            var visited: usize = 0;
+            var source_scan = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = .{}, .observed_rows = &examined };
+            try DB.PrimaryMatchAllIdentityScan.scan(&source_scan, a, .{
+                .require_complete_primary_population = true,
+                .primary_key_reverse = reverse,
+                .scan_batch_size = 1,
+            }, &visited, StopAfterOne.visit);
+            try std.testing.expectEqual(@as(usize, 1), examined);
+            try std.testing.expectEqual(@as(usize, 1), visited);
+        }
+
         var finite_count = try db_query_search.searchMatchAll(a, .{
             .index_name = "ft",
             .limit = 0,

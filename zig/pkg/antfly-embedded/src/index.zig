@@ -2405,6 +2405,7 @@ pub const IndexSnapshot = struct {
         shared: *SegmentShared,
         offset: u32,
         control: query_mod.ExecutionControl,
+        newest_by_key: ?*std.AutoHashMapUnmanaged(u32, u32) = null,
 
         pub fn add(self: LiveGraphFrontier, doc: u32, ordinal: u32) !void {
             const deleted = blk: {
@@ -2412,7 +2413,13 @@ pub const IndexSnapshot = struct {
                 defer self.shared.unlockDeletionShared();
                 break :blk if (self.shared.deleted) |mask| mask.contains(doc - self.offset) else false;
             };
-            if (!deleted) try self.target.add(doc, ordinal);
+            if (deleted) return;
+            if (self.newest_by_key) |newest| {
+                const slot = try newest.getOrPut(self.target.alloc, ordinal);
+                if (!slot.found_existing or slot.value_ptr.* < doc) slot.value_ptr.* = doc;
+                return;
+            }
+            try self.target.add(doc, ordinal);
         }
     };
 
@@ -2488,11 +2495,15 @@ pub const IndexSnapshot = struct {
     }
 
     pub fn collectGraphKeyFrontierDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl) !GraphFrontierDocs {
-        return try self.collectKeyDocNumsAlloc(alloc, frontier, control, false);
+        return try self.collectKeyDocNumsAlloc(alloc, frontier, control, false, false);
+    }
+
+    pub fn collectSortKeyFrontierDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl) !GraphFrontierDocs {
+        return self.collectKeyDocNumsAlloc(alloc, frontier, control, false, true);
     }
 
     pub fn collectParentKeyDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl) !GraphFrontierDocs {
-        return try self.collectKeyDocNumsAlloc(alloc, frontier, control, true);
+        return try self.collectKeyDocNumsAlloc(alloc, frontier, control, true, false);
     }
 
     fn storedProjectionKey(alloc: Allocator, key: []const u8, match_parent: bool) ![]const u8 {
@@ -2525,6 +2536,7 @@ pub const IndexSnapshot = struct {
         scratch: *segment_mod.SegmentReadScratch,
         match_parent: bool,
         control: query_mod.ExecutionControl,
+        require_managed_build: bool,
     ) !?*StoredKeyDirectory {
         const shared = segment.shared;
         const mode = @intFromBool(match_parent);
@@ -2548,6 +2560,10 @@ pub const IndexSnapshot = struct {
                 _ = directory.refs.fetchAdd(1, .monotonic);
                 shared.stored_key_directory_lock.unlock();
                 return directory;
+            }
+            if (require_managed_build and manager == null) {
+                shared.stored_key_directory_lock.unlock();
+                return null;
             }
             if (flight_slot.*) |active| {
                 _ = active.refs.fetchAdd(1, .monotonic);
@@ -2655,10 +2671,12 @@ pub const IndexSnapshot = struct {
         return directory;
     }
 
-    fn collectKeyDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl, match_parent: bool) !GraphFrontierDocs {
+    fn collectKeyDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl, match_parent: bool, prefer_directory: bool) !GraphFrontierDocs {
         var docs = GraphFrontierDocs.init(alloc);
         errdefer docs.deinit();
         if (frontier.count() == 0) return docs;
+        var newest_by_key: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        defer newest_by_key.deinit(alloc);
         var keys: std.StringHashMapUnmanaged(u32) = .empty;
         defer keys.deinit(alloc);
         var scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
@@ -2670,9 +2688,15 @@ pub const IndexSnapshot = struct {
             if (segment.liveDocCount() == 0) continue;
             var lease = try self.leaseSegment(index);
             defer lease.deinit();
-            const live = LiveGraphFrontier{ .target = &docs, .shared = lease.entry.shared, .offset = offset, .control = control };
-            if (frontier.count() *| 8 < segment.reader.doc_count) {
-                if (try self.storedKeyDirectory(lease.entry, &scratch, match_parent, control)) |directory| {
+            const live = LiveGraphFrontier{
+                .target = &docs,
+                .shared = lease.entry.shared,
+                .offset = offset,
+                .control = control,
+                .newest_by_key = if (prefer_directory) &newest_by_key else null,
+            };
+            if (prefer_directory or frontier.count() *| 8 < segment.reader.doc_count) {
+                if (try self.storedKeyDirectory(lease.entry, &scratch, match_parent, control, prefer_directory)) |directory| {
                     defer directory.release();
                     var wanted = frontier.iterator();
                     while (wanted.next()) |entry| {
@@ -2718,6 +2742,8 @@ pub const IndexSnapshot = struct {
                 if (keys.get(projected)) |slot| try live.add(offset + doc, slot);
             }
         }
+        var newest = newest_by_key.iterator();
+        while (newest.next()) |match| try docs.add(match.value_ptr.*, match.key_ptr.*);
         return docs;
     }
 
@@ -2767,10 +2793,22 @@ pub const IndexSnapshot = struct {
     pub const SortOrdinalBatchProjection = struct {
         fallback: std.AutoHashMapUnmanaged(u32, u32) = .empty,
         scanned: std.DynamicBitSetUnmanaged = .{},
+        bounds: []?segment_mod.InverseDocOrdinalReader.OrdinalBounds = &.{},
+
+        fn firstAtLeast(values: []const u32, target: u64) usize {
+            var low: usize = 0;
+            var high = values.len;
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                if (values[mid] < target) low = mid + 1 else high = mid;
+            }
+            return low;
+        }
 
         pub fn deinit(self: *@This(), alloc: Allocator) void {
             self.fallback.deinit(alloc);
             self.scanned.deinit(alloc);
+            alloc.free(self.bounds);
         }
 
         pub fn project(
@@ -2783,20 +2821,27 @@ pub const IndexSnapshot = struct {
             var out = GraphFrontierDocs.init(alloc);
             errdefer out.deinit();
             if (ordinals.len == 0) return out;
-            if (self.scanned.capacity() == 0) self.scanned = try .initEmpty(alloc, snapshot.segments.len);
-            var frontier: std.AutoHashMapUnmanaged(u32, void) = .empty;
-            defer frontier.deinit(alloc);
-            for (ordinals) |ordinal| try frontier.put(alloc, ordinal, {});
+            if (self.scanned.capacity() == 0) {
+                self.scanned = try .initEmpty(alloc, snapshot.segments.len);
+                self.bounds = try alloc.alloc(?segment_mod.InverseDocOrdinalReader.OrdinalBounds, snapshot.segments.len);
+                @memset(self.bounds, null);
+            }
+            const sorted = try alloc.dupe(u32, ordinals);
+            defer alloc.free(sorted);
+            std.mem.sort(u32, sorted, {}, std.sort.asc(u32));
             var offset: u32 = 0;
             for (snapshot.segments, 0..) |segment, i| {
                 try control.check();
                 defer offset += segment.reader.doc_count;
                 if (segment.liveDocCount() == 0 or self.scanned.isSet(i)) continue;
+                if (self.bounds[i]) |bounds| {
+                    if (firstAtLeast(sorted, bounds.min) == firstAtLeast(sorted, @as(u64, bounds.max) + 1)) continue;
+                }
                 var lease = try snapshot.leaseSegment(i);
                 defer lease.deinit();
                 var found = GraphFrontierDocs.init(alloc);
                 defer found.deinit();
-                const seek = seekGraphSegmentFrontier(lease.entry, frontier, control, offset, &found) catch |err| switch (err) {
+                const seek = seekBounded(lease.entry, sorted, control, offset, &found, &self.bounds[i]) catch |err| switch (err) {
                     error.InvalidSegment, error.CrcMismatch => false,
                     else => return err,
                 };
@@ -2823,6 +2868,27 @@ pub const IndexSnapshot = struct {
                 if (self.fallback.get(ordinal)) |doc| try out.add(doc, ordinal);
             }
             return out;
+        }
+
+        fn seekBounded(
+            entry: *const SegmentEntry,
+            sorted: []const u32,
+            control: query_mod.ExecutionControl,
+            offset: u32,
+            found: *GraphFrontierDocs,
+            cached: *?segment_mod.InverseDocOrdinalReader.OrdinalBounds,
+        ) !bool {
+            const inverse = (try segment_mod.InverseDocOrdinalReader.init(&entry.reader)) orelse return false;
+            const bounds = cached.* orelse try inverse.ordinalBounds() orelse return true;
+            cached.* = bounds;
+            const start = firstAtLeast(sorted, bounds.min);
+            const end = firstAtLeast(sorted, @as(u64, bounds.max) + 1);
+            const live = LiveGraphFrontier{ .target = found, .shared = entry.shared, .offset = offset, .control = control };
+            for (sorted[start..end]) |ordinal| {
+                try control.check();
+                try inverse.addMatches(ordinal, offset, live, control);
+            }
+            return true;
         }
     };
 

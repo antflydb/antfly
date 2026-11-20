@@ -6524,6 +6524,16 @@ pub const InverseDocOrdinalReader = struct {
         return std.mem.readInt(u64, bytes[0..8], .big);
     }
 
+    pub const OrdinalBounds = struct { min: u32, max: u32 };
+
+    pub fn ordinalBounds(self: InverseDocOrdinalReader) !?OrdinalBounds {
+        if (self.count == 0) return null;
+        const first: u32 = @intCast((try self.pairAt(0)) >> 32);
+        const last: u32 = @intCast((try self.pairAt(self.count - 1)) >> 32);
+        if (first > last) return error.InvalidSegment;
+        return .{ .min = first, .max = last };
+    }
+
     pub fn addMatches(self: InverseDocOrdinalReader, ordinal: u32, offset: u32, docs: anytype, control: anytype) !void {
         const first = @as(u64, ordinal) << 32;
         var lo: u32 = 0;
