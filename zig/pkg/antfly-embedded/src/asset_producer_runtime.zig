@@ -2729,6 +2729,7 @@ pub const Runtime = struct {
         const local_capabilities = if (remote) null else (try self.extractorCapabilities(alloc, cfg)) orelse return error.BatchIncompatible;
         if (local_capabilities) |caps| try validateExtractorBatchCompatibility(alloc, caps, extractorAttachmentTransport(cfg), requests);
         var item_limit = if (local_capabilities) |caps| caps.batch.max_items else requests.len;
+        var previous_shape: ?remote_capabilities.DiscoveryShape = null;
         const outputs = try alloc.alloc([]u8, requests.len);
         var outputs_owned = true;
         errdefer if (outputs_owned) {
@@ -2740,9 +2741,12 @@ pub const Runtime = struct {
         var start: usize = 0;
         while (start < requests.len) {
             var active: inference_work.InferenceCapabilities = undefined;
+            const first_shape = if (remote) try producerDiscoveryShape(alloc, requests[start..][0..1]) else remote_capabilities.DiscoveryShape{ .items = 1 };
+            if (remote and (previous_shape == null or !sameDiscoveryModalities(previous_shape.?, first_shape))) item_limit = requests.len;
+            previous_shape = first_shape;
             var end = @min(start +| item_limit, requests.len);
             if (end <= start) return error.InvalidInferenceCapabilities;
-            var shape = if (remote) try homogeneousDiscoveryShape(alloc, requests[start..end]) else remote_capabilities.DiscoveryShape{ .items = end - start };
+            var shape = if (remote) try extendDiscoveryShape(alloc, first_shape, requests[start + 1 .. end]) else remote_capabilities.DiscoveryShape{ .items = end - start };
             end = start + shape.items;
             while (true) {
                 if (remote) {
@@ -2985,12 +2989,19 @@ pub const Runtime = struct {
         var rejected_items: usize = 0;
         var fallback_items: usize = 0;
         var discovery_item_limit: usize = std.math.maxInt(usize);
+        var previous_shape: ?remote_capabilities.DiscoveryShape = null;
         var start: usize = 0;
         while (start < requests.len) {
             try self.execution.check(platform.time.monotonicNs());
+            const first_shape = try producerDiscoveryShape(alloc, requests[start..][0..1]);
+            if (previous_shape == null or !sameDiscoveryModalities(previous_shape.?, first_shape)) {
+                capabilities = null;
+                discovery_item_limit = std.math.maxInt(usize);
+            }
+            previous_shape = first_shape;
             var end = @min(start +| @min(if (capabilities) |caps| caps.batch.max_items else requests.len, discovery_item_limit), requests.len);
             if (end <= start) return error.InvalidInferenceCapabilities;
-            var shape = try homogeneousDiscoveryShape(alloc, requests[start..end]);
+            var shape = try extendDiscoveryShape(alloc, first_shape, requests[start + 1 .. end]);
             shape.output_tokens = discoveryOutputTokens(cfg.max_tokens);
             end = start + shape.items;
             var placement: remote_capabilities.DiscoveryHeaders = .{};
@@ -4968,22 +4979,28 @@ fn inlineImagePixelsAlloc(
 }
 
 fn homogeneousDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Request) !remote_capabilities.DiscoveryShape {
-    var first = try producerDiscoveryShape(alloc, requests[0..@min(requests.len, 1)]);
-    if (requests.len <= 1) return first;
-    const mask: u8 = @bitCast(first.modalities);
-    for (requests[1..]) |request| {
+    const first = try producerDiscoveryShape(alloc, requests[0..@min(requests.len, 1)]);
+    return if (requests.len <= 1) first else try extendDiscoveryShape(alloc, first, requests[1..]);
+}
+
+fn sameDiscoveryModalities(lhs: remote_capabilities.DiscoveryShape, rhs: remote_capabilities.DiscoveryShape) bool {
+    return lhs.media == rhs.media and @as(u8, @bitCast(lhs.modalities)) == @as(u8, @bitCast(rhs.modalities));
+}
+
+fn extendDiscoveryShape(alloc: Allocator, first: remote_capabilities.DiscoveryShape, rest: []const asset_producer.Request) !remote_capabilities.DiscoveryShape {
+    var shape = first;
+    for (rest) |request| {
         const item = try producerDiscoveryShape(alloc, &.{request});
-        if (item.media != first.media or @as(u8, @bitCast(item.modalities)) != mask) break;
-        first.items += 1;
+        if (!sameDiscoveryModalities(first, item)) break;
+        shape.items += 1;
     }
-    return first;
+    return shape;
 }
 
 fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Request) !remote_capabilities.DiscoveryShape {
     var shape: remote_capabilities.DiscoveryShape = .{ .items = @max(1, requests.len), .output_tokens = 0 };
     const Part = struct { type: ?[]const u8 = null, mime_type: ?[]const u8 = null };
     for (requests) |request| {
-        shape.modalities.text = shape.modalities.text or request.source_text.len != 0;
         for (request.media) |media| {
             shape.media = true;
             if (inference_work.modalityForMimeType(media.mime_type)) |modalities|
@@ -4991,11 +5008,18 @@ fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Req
         }
         if (request.source_parts_json) |raw| {
             const parts_json = std.mem.trimStart(u8, raw, " \t\r\n");
-            if (parts_json.len == 0 or parts_json[0] != '[') continue;
+            if (parts_json.len == 0 or parts_json[0] != '[') {
+                const extraction = request.producer_type == .extractor and raw.len != 0;
+                shape.modalities.text = shape.modalities.text or
+                    (if (extraction) std.mem.startsWith(u8, parts_json, "\"") else request.source_text.len != 0);
+                continue;
+            }
             var parts = try std.json.parseFromSlice([]const Part, alloc, parts_json, .{ .ignore_unknown_fields = true });
             defer parts.deinit();
+            var has_content = request.media.len != 0;
             for (parts.value) |part| {
                 const kind = part.type orelse continue;
+                has_content = has_content or !std.mem.eql(u8, kind, "metadata");
                 if (std.mem.eql(u8, kind, "text")) {
                     shape.modalities.text = true;
                 } else if (std.mem.eql(u8, kind, "image_url")) {
@@ -5009,9 +5033,35 @@ fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Req
                     }
                 }
             }
+            if (request.producer_type == .generator and !has_content)
+                shape.modalities.text = shape.modalities.text or request.source_text.len != 0;
+        } else {
+            shape.modalities.text = shape.modalities.text or ((request.producer_type == .extractor or request.media.len == 0) and request.source_text.len != 0);
         }
     }
     return shape;
+}
+
+test "asset producer runtime discovers structured media without fallback text" {
+    const alloc = std.testing.allocator;
+    const parts = "[{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.test/image\"}}]";
+    for ([_]asset_producer.ProducerType{ .generator, .extractor }) |producer_type| {
+        const structured: asset_producer.Request = .{
+            .producer_type = producer_type,
+            .config_json = "{}",
+            .source_text = "fallback",
+            .source_parts_json = parts,
+        };
+        var plain = structured;
+        plain.source_parts_json = null;
+        const media_shape = try homogeneousDiscoveryShape(alloc, &.{ structured, plain, plain });
+        try std.testing.expectEqual(@as(usize, 1), media_shape.items);
+        try std.testing.expect(media_shape.media and media_shape.modalities.image);
+        try std.testing.expect(!media_shape.modalities.text);
+        const text_shape = try homogeneousDiscoveryShape(alloc, &.{ plain, plain });
+        try std.testing.expectEqual(@as(usize, 2), text_shape.items);
+        try std.testing.expect(text_shape.modalities.text and !text_shape.media);
+    }
 }
 
 fn discoveryOutputTokens(value: ?i64) ?usize {

@@ -26549,10 +26549,18 @@ pub const Node = struct {
                 else => return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" }),
             };
             defer parsed.deinit();
-            if (parsed.value.len == 0 or parsed.value.len > 17) return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+            if (parsed.value.len == 0 or parsed.value.len > 34) return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
             for (parsed.value) |requirement| {
                 const colon = std.mem.indexOfScalar(u8, requirement, ':') orelse return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
-                const task = requirement[0..colon];
+                const selector = requirement[0..colon];
+                const at = std.mem.indexOfScalar(u8, selector, '@') orelse selector.len;
+                const task = selector[0..at];
+                const pin = if (at == selector.len) null else selector[at + 1 ..];
+                if (pin) |expected| {
+                    if (expected.len != 64) return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                    for (expected) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f'))
+                        return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                }
                 const name = requirement[colon + 1 ..];
                 if (name.len == 0 or name.len > 4096) return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
                 if (std.mem.eql(u8, task, "diarize")) {
@@ -26560,11 +26568,26 @@ pub const Node = struct {
                         error.OutOfMemory => return err,
                         else => return ctx.status(404).json(.{ .@"error" = "SpeakerModelUnavailable" }),
                     };
-                    ctx.allocator.free(path);
+                    defer ctx.allocator.free(path);
+                    if (pin) |expected| {
+                        const identity = self.chunkSpeakerRevision(path, ctx.io, self.bindExecutionControl(ctx.io, .{})) catch |err| return requestModelResolutionError(ctx, err);
+                        if (!std.mem.eql(u8, expected, &identity)) return ctx.status(404).json(.{ .@"error" = "ChunkModelIdentityMismatch" });
+                    }
                 } else {
                     const category = if (std.mem.eql(u8, task, "embed")) "embedders" else if (std.mem.eql(u8, task, "transcribe")) "transcribers" else if (std.mem.eql(u8, task, "classify")) "classifiers" else return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
                     const selected = self.resolveRequestModelSelection(ctx.allocator, ctx.io, name, category) catch |err| return requestModelResolutionError(ctx, err);
-                    ctx.allocator.free(selected.path);
+                    defer ctx.allocator.free(selected.path);
+                    if (pin) |expected| {
+                        const control = selected.bind(self.bindExecutionControl(ctx.io, .{}));
+                        const identity = if (std.mem.eql(u8, task, "embed"))
+                            self.model_manager.chunkPlanningIdentityForDiscovery(selected.path, ctx.io, control) catch |err| return requestModelResolutionError(ctx, err)
+                        else manifest_identity: {
+                            var manifest = self.loadBoundManifest(ctx.allocator, selected.path, false, control) catch |err| return requestModelResolutionError(ctx, err);
+                            defer manifest.deinit();
+                            break :manifest_identity std.fmt.bytesToHex(self.model_manager.modelIdentityForManifest(selected.path, manifest) catch |err| return requestModelResolutionError(ctx, err), .lower);
+                        };
+                        if (!std.mem.eql(u8, expected, &identity)) return ctx.status(404).json(.{ .@"error" = "ChunkModelIdentityMismatch" });
+                    }
                 }
             }
             try ctx.setHeader("X-Antfly-Inference-Chunk-Boundary-Available", "true");

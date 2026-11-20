@@ -178,6 +178,14 @@ pub fn chunkPageWithProvider(alloc: Allocator, cfg: chunking_types.Config, input
     return page;
 }
 
+fn appendChunkRequirement(a: Allocator, entries: *std.ArrayList([]const u8), task: []const u8, model: []const u8, identity: ?[]const u8) !void {
+    const value = if (identity) |pin|
+        try std.fmt.allocPrint(a, "{s}@{s}:{s}", .{ task, pin, model })
+    else
+        try std.fmt.allocPrint(a, "{s}:{s}", .{ task, model });
+    try entries.append(a, value);
+}
+
 fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput, antfly_provider: ?chunk_provider.Provider) !(if (paged) ChunkPage else []RemoteChunk) {
     // An empty source has nothing to chunk. Short-circuit before any
     // provider or remote dispatch: the inference endpoint rejects an empty
@@ -324,23 +332,33 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     }
     var requirements: ?[]u8 = null;
     defer if (requirements) |value| alloc.free(value);
-    if (!cfg.page and !(if (cfg.embedding) |target| target.allow_partial orelse false else false)) if (resolved_outputs) |outputs| {
+    if (boundary_value != null) {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const a = scratch.allocator();
         var entries: std.ArrayList([]const u8) = .empty;
-        if (boundary_value) |value| try entries.append(a, value);
-        for (outputs.value.targets) |target| {
-            if (!target.required or std.mem.eql(u8, target.name, outputs.value.boundary_model)) continue;
-            const task = if (target.kind == .embedding) "embed" else @tagName(target.kind);
-            try entries.append(a, try std.fmt.allocPrint(a, "{s}:{s}", .{ task, target.model }));
+        const allow_partial = cfg.page or (if (cfg.embedding) |target| target.allow_partial orelse false else false);
+        if (resolved_outputs) |outputs| {
+            for (outputs.value.targets) |target| {
+                if (!std.mem.eql(u8, target.name, outputs.value.boundary_model) and (allow_partial or !target.required)) continue;
+                const task = if (target.kind == .embedding) "embed" else @tagName(target.kind);
+                const speaker_pin = target.speakerConfig().model_identity;
+                const pin = target.model_identity orelse if (target.kind == .diarize) speaker_pin else null;
+                if (target.kind == .diarize and speaker_pin != null and !std.mem.eql(u8, pin.?, speaker_pin.?))
+                    return error.EmbeddingIdentityMismatch;
+                try appendChunkRequirement(a, &entries, task, target.model, pin);
+                if (target.kind != .diarize and target.hasDiarization())
+                    try appendChunkRequirement(a, &entries, "diarize", target.speakerModel(), speaker_pin);
+            }
+        } else if (cfg.embedding) |target| {
+            try appendChunkRequirement(a, &entries, "embed", target.model, target.model_identity);
         }
-        if (entries.items.len > 1) {
+        if (entries.items.len > 1 or (entries.items.len == 1 and !std.mem.eql(u8, entries.items[0], boundary_value.?))) {
             requirements = try std.json.Stringify.valueAlloc(alloc, entries.items, .{});
             discovery_base[discovery_count] = .{ "X-Antfly-Inference-Chunk-Requirements", requirements.? };
             discovery_count += 1;
         }
-    };
+    }
     const discovery_headers = try placement.withShape(discovery_base[0..discovery_count], .{ .items = 1, .media = input != .text, .output_tokens = 0 });
     var capability_lease = dispatch: {
         const started = if (accounting) |hook| try hook.begin(hook.ptr) else 0;
