@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const in_progress_filename = ".antfly-download-in-progress";
 pub const plan_filename = ".antfly-download-plan.json";
@@ -113,32 +114,24 @@ pub const ArtifactStamp = struct {
     }
 };
 
-/// Cooperative cancellation for verification callers that own an application
-/// deadline or share an inference load flight.
-pub const VerificationControl = struct {
-    context: ?*const anyopaque = null,
-    check_fn: ?*const fn (?*const anyopaque) anyerror!void = null,
-
-    pub fn check(self: VerificationControl) !void {
-        if (self.check_fn) |callback| try callback(self.context);
+/// Coalesce checksum work while honoring execution deadlines of waiters.
+pub fn lockVerification(control: ExecutionControl, mutex: *std.Io.Mutex, io: std.Io) !void {
+    if (control.deadline_ns == null and control.cancellation == null and control.check_fn == null)
+        return mutex.lock(io);
+    while (!mutex.tryLock()) {
+        try control.check();
+        try io.sleep(.fromMilliseconds(1), .awake);
     }
-
-    pub fn lock(self: VerificationControl, mutex: *std.Io.Mutex, io: std.Io) !void {
-        if (self.check_fn == null) return mutex.lock(io);
-        while (!mutex.tryLock()) {
-            try self.check();
-            try io.sleep(.fromMilliseconds(5), .awake);
-        }
-        errdefer mutex.unlock(io);
-        try self.check();
-    }
-};
-
-pub fn verifyValidatedArtifactSha256AndStamp(io: std.Io, artifact: *const ValidatedArtifact, expected_hex: []const u8) !ArtifactStamp {
-    return verifyValidatedArtifactWithControl(io, artifact, expected_hex, .{});
+    errdefer mutex.unlock(io);
+    try control.check();
 }
 
-pub fn verifyValidatedArtifactWithControl(io: std.Io, artifact: *const ValidatedArtifact, expected_hex: []const u8, control: VerificationControl) !ArtifactStamp {
+pub fn verifyValidatedArtifactSha256AndStamp(io: std.Io, artifact: *const ValidatedArtifact, expected_hex: []const u8) !ArtifactStamp {
+    return verifyValidatedArtifactSha256AndStampWithControl(io, artifact, expected_hex, .{});
+}
+
+pub fn verifyValidatedArtifactSha256AndStampWithControl(io: std.Io, artifact: *const ValidatedArtifact, expected_hex: []const u8, control: ExecutionControl) !ArtifactStamp {
+    try control.check();
     // Keep malformed-contract errors independent of filesystem availability.
     if (expected_hex.len != 64) return error.ChecksumMismatch;
     var expected: [32]u8 = undefined;
@@ -146,16 +139,16 @@ pub fn verifyValidatedArtifactWithControl(io: std.Io, artifact: *const Validated
     try control.check();
     const file = try std.Io.Dir.cwd().openFile(io, artifact.canonical_path, .{});
     defer file.close(io);
-    return verifyOpenedArtifactWithControl(io, file, artifact, expected_hex, control);
+    return verifyOpenedArtifactSha256AndStampWithControl(io, file, artifact, expected_hex, control);
 }
 
 /// Hash the same retained file construction will read, without seeking or
 /// reopening its pathname. Positional reads permit shared tensor regions.
 pub fn verifyOpenedArtifactSha256AndStamp(io: std.Io, file: std.Io.File, artifact: *const ValidatedArtifact, expected_hex: []const u8) !ArtifactStamp {
-    return verifyOpenedArtifactWithControl(io, file, artifact, expected_hex, .{});
+    return verifyOpenedArtifactSha256AndStampWithControl(io, file, artifact, expected_hex, .{});
 }
 
-pub fn verifyOpenedArtifactWithControl(io: std.Io, file: std.Io.File, artifact: *const ValidatedArtifact, expected_hex: []const u8, control: VerificationControl) !ArtifactStamp {
+pub fn verifyOpenedArtifactSha256AndStampWithControl(io: std.Io, file: std.Io.File, artifact: *const ValidatedArtifact, expected_hex: []const u8, control: ExecutionControl) !ArtifactStamp {
     try control.check();
     if (expected_hex.len != 64) return error.ChecksumMismatch;
     var expected: [32]u8 = undefined;

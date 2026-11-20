@@ -16,6 +16,7 @@
 //! Filesystem authority for managed model construction and readers. A receipt
 //! authenticates its listed files, never arbitrary siblings in the directory.
 const std = @import("std");
+const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const managed = @import("managed_receipt.zig");
 pub const Expected = struct { publication: ?[32]u8 };
 /// Process-owned checksum outcomes. Keys own no pathname memory;
@@ -75,34 +76,37 @@ pub const VerificationCache = struct {
             if (rejected) self.rejected_count += 1 else self.rejected_count -= 1;
         }
     }
-    fn verify(self: *VerificationCache, a: std.mem.Allocator, io: std.Io, publication: [32]u8, artifact: *const managed.ValidatedArtifact, initial: managed.ArtifactStamp, control: managed.VerificationControl) !managed.ArtifactStamp {
+    fn verify(self: *VerificationCache, a: std.mem.Allocator, io: std.Io, publication: [32]u8, artifact: *const managed.ValidatedArtifact, initial: managed.ArtifactStamp, control: ExecutionControl) !managed.ArtifactStamp {
+        try control.check();
         const key = keyFor(publication, artifact);
         if (try self.hit(key, initial)) return initial;
         const builder = &self.builders[key[0] % self.builders.len];
-        try control.lock(builder, io);
+        try managed.lockVerification(control, builder, io);
         defer builder.unlock(io);
+        try control.check();
         // Another acquisition may have verified or replaced the file while
         // this request waited. Never reuse the pre-wait filesystem stamp.
         const stamp = managed.ArtifactStamp.fromStat(try std.Io.Dir.cwd().statFile(io, artifact.canonical_path, .{ .follow_symlinks = false }));
         if (stamp.kind != .file or stamp.size != artifact.size) return error.InvalidManagedDownload;
         if (try self.hit(key, stamp)) return stamp;
-        const verified = managed.verifyValidatedArtifactWithControl(io, artifact, artifact.sha256.?, control) catch |err| {
+        const verified = managed.verifyValidatedArtifactSha256AndStampWithControl(io, artifact, artifact.sha256.?, control) catch |err| {
             if (err == error.ChecksumMismatch) self.remember(a, key, stamp, true) catch {};
             return err;
         };
         self.remember(a, key, verified, false) catch {}; // Cache pressure cannot deny a valid construction.
         return verified;
     }
-    fn verifyOpened(self: *VerificationCache, a: std.mem.Allocator, io: std.Io, publication: [32]u8, artifact: *const managed.ValidatedArtifact, file: std.Io.File, initial: managed.ArtifactStamp, control: managed.VerificationControl) !managed.ArtifactStamp {
+    fn verifyOpened(self: *VerificationCache, a: std.mem.Allocator, io: std.Io, publication: [32]u8, artifact: *const managed.ValidatedArtifact, file: std.Io.File, initial: managed.ArtifactStamp, control: ExecutionControl) !managed.ArtifactStamp {
+        try control.check();
         const key = keyFor(publication, artifact);
         if (try self.hit(key, initial)) return initial;
         const builder = &self.builders[key[0] % self.builders.len];
-        try control.lock(builder, io);
+        try managed.lockVerification(control, builder, io);
         defer builder.unlock(io);
         const stamp = managed.ArtifactStamp.fromStat(try file.stat(io));
         if (stamp.kind != .file or stamp.size != artifact.size) return error.InvalidManagedDownload;
         if (try self.hit(key, stamp)) return stamp;
-        const verified = managed.verifyOpenedArtifactWithControl(io, file, artifact, artifact.sha256.?, control) catch |err| {
+        const verified = managed.verifyOpenedArtifactSha256AndStampWithControl(io, file, artifact, artifact.sha256.?, control) catch |err| {
             if (err == error.ChecksumMismatch) self.remember(a, key, stamp, true) catch {};
             return err;
         };
@@ -143,7 +147,7 @@ pub const PublishedArtifacts = struct {
     direct_path: ?[]u8 = null,
     direct_index: ?usize = null,
     verification_cache: ?*VerificationCache = null,
-    verification_control: managed.VerificationControl = .{},
+    verification_control: ExecutionControl = .{},
     receipt: ?managed.ValidatedReceipt,
     publication: ?[32]u8,
     installation: ?managed.Installation = null,
@@ -359,17 +363,17 @@ pub const PublishedArtifacts = struct {
     /// Verification belongs to one reader acquisition, not path resolution.
     /// Reuse it across graph collection, backend retries and shared external
     /// tensors only while the opened file's complete identity is unchanged.
-    fn verifyIndex(self: *PublishedArtifacts, index: usize) !void {
-        try self.verification_control.check();
+    fn verifyIndex(self: *PublishedArtifacts, index: usize, control: ExecutionControl) !void {
+        try control.check();
         const artifact = &self.receipt.?.artifacts[index];
         const stamp = managed.ArtifactStamp.fromStat(try std.Io.Dir.cwd().statFile(self.io, artifact.canonical_path, .{ .follow_symlinks = false }));
         if (stamp.kind != .file or stamp.size != artifact.size) return error.InvalidManagedDownload;
         if (self.verified_stamps[index]) |prior| if (std.meta.eql(prior, stamp)) return;
         self.verified_stamps[index] = if (artifact.sha256) |expected|
             if (self.verification_cache) |cache|
-                try cache.verify(self.allocator, self.io, self.publication.?, artifact, stamp, self.verification_control)
+                try cache.verify(self.allocator, self.io, self.publication.?, artifact, stamp, control)
             else
-                try managed.verifyValidatedArtifactWithControl(self.io, artifact, expected, self.verification_control)
+                try managed.verifyValidatedArtifactSha256AndStampWithControl(self.io, artifact, expected, control)
         else
             stamp;
     }
@@ -393,14 +397,18 @@ pub const PublishedArtifacts = struct {
     }
 
     pub fn verifyFile(self: *PublishedArtifacts, relative: []const u8) !void {
+        return self.verifyFileWithControl(relative, self.verification_control);
+    }
+
+    pub fn verifyFileWithControl(self: *PublishedArtifacts, relative: []const u8, control: ExecutionControl) !void {
         const index = (try self.canonicalFileIndex(relative)) orelse return;
-        try self.verifyIndex(index);
+        try self.verifyIndex(index, control);
     }
 
     /// Canonical aliases share the strongest verified checksum in the receipt.
     pub fn verifiedFileDigest(self: *PublishedArtifacts, relative: []const u8) !?[]const u8 {
         const index = (try self.canonicalFileIndex(relative)) orelse return null;
-        try self.verifyIndex(index);
+        try self.verifyIndex(index, self.verification_control);
         return self.receipt.?.artifacts[index].sha256;
     }
     /// ONNX external tensors are consumed by a component loader, not by
@@ -411,7 +419,7 @@ pub const PublishedArtifacts = struct {
             const canonical = try managed.resolveRegularFilePath(self.allocator, self.io, path);
             defer self.allocator.free(canonical);
             if (!std.mem.eql(u8, canonical, self.receipt.?.artifacts[index].canonical_path)) return error.ModelArtifactsChanging;
-            try self.verifyIndex(self.canonical_index.get(canonical).?);
+            try self.verifyIndex(self.canonical_index.get(canonical).?, self.verification_control);
         }
     }
     /// Authenticate the complete graph dependency set before a pathname-based
@@ -511,7 +519,7 @@ pub const PublishedArtifacts = struct {
         try self.verification_control.check();
         const digest = artifact.sha256 orelse return stamp;
         if (self.verification_cache) |cache| return cache.verifyOpened(self.allocator, self.io, self.publication.?, artifact, file, stamp, self.verification_control);
-        return managed.verifyOpenedArtifactWithControl(self.io, file, artifact, digest, self.verification_control);
+        return managed.verifyOpenedArtifactSha256AndStampWithControl(self.io, file, artifact, digest, self.verification_control);
     }
     /// Rebase metadata into the captured namespace without opening optional
     /// artifacts or granting execution permission. A backend must still call
