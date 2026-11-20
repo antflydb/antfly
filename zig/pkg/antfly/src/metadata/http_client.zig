@@ -1192,7 +1192,7 @@ pub const MetadataHttpClient = struct {
             // Older peers reject an unknown private Call tag before dispatch.
             // Only this exact response permits the authoritative legacy read;
             // permission, identity and ordinary validation failures stay errors.
-            400 => if (input == .lake_source_owner_read and std.mem.eql(u8, response.body, "invalid catalog request"))
+            400 => if ((input == .lake_source_owner_read or input == .policy_definition_read or (input == .resolve_many and input.resolve_many.include_source_epoch)) and std.mem.eql(u8, response.body, "invalid catalog request"))
                 error.UnsupportedOperation
             else if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
                 input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
@@ -1297,7 +1297,10 @@ pub const MetadataHttpClient = struct {
                 error.StoreRootEnrollmentChanged
             else
                 error.CatalogGenerationChanged,
-            413 => error.CatalogCommandTooLarge,
+            413 => if (input == .policy_definition_mutate and std.mem.eql(u8, response.body, "RowPolicyLimitExceeded"))
+                error.RowPolicyLimitExceeded
+            else
+                error.CatalogCommandTooLarge,
             426 => error.TableTopologyProtocolUpgradeRequired,
             503 => error.NotLeader,
             else => error.MetadataMutationOutcomeUnknown,

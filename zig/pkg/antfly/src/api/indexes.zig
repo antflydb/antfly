@@ -342,6 +342,37 @@ fn inheritedInlineEmbeddingProducerAlloc(alloc: std.mem.Allocator, root: std.jso
     return inherited;
 }
 
+fn isPdfPageProducer(config: std.json.Value) bool {
+    if (config != .object) return false;
+    const input = config.object.get("embedding_input") orelse return false;
+    return input == .string and std.mem.eql(u8, input.string, "pdf_page_images");
+}
+
+// The table definition CAS must reject a change that its existing shard
+// indexes cannot apply. Include declarations installed inline with an index.
+fn validateEmbeddingCardinality(root: std.json.ObjectMap, name: []const u8, replacement: std.json.Value) !void {
+    const kind = replacement.object.get("kind") orelse return;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "embedding")) return;
+    var consumed = false;
+    var previous_pdf = false;
+    var entries = root.iterator();
+    while (entries.next()) |entry| {
+        const value = entry.value_ptr.*;
+        const definitions = if (value == .object) value.object.get("enrichments") else if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) value else null;
+        if (definitions) |items| if (items == .array) {
+            for (items.array.items) |config| if (enrichmentValueNameEquals(config, name)) {
+                previous_pdf = previous_pdf or isPdfPageProducer(config);
+            };
+        };
+        if (value != .object or inferIndexType(entry.key_ptr.*, value) != .embeddings or embeddingsIsSparse(value)) continue;
+        var sources: [64][]const u8 = undefined;
+        for (configuredArtifactSourceNames(entry.key_ptr.*, value, .embeddings, &sources)) |source| {
+            if (std.mem.eql(u8, source, name)) consumed = true;
+        }
+    }
+    if (consumed and previous_pdf != isPdfPageProducer(replacement)) return error.EnrichmentInUse;
+}
+
 pub fn addEnrichmentToTableIndexesJson(
     alloc: std.mem.Allocator,
     current_indexes_json: []const u8,
@@ -361,6 +392,7 @@ pub fn addEnrichmentToTableIndexesJson(
         else => return error.InvalidTableIndexMetadata,
     };
     if (config.value != .object) return error.InvalidExtensionEnrichment;
+    try validateEmbeddingCardinality(root, enrichment_name, config.value);
     const inherited_producer = try inheritedInlineEmbeddingProducerAlloc(alloc, root, enrichment_name, config.value);
     defer if (inherited_producer) |value| alloc.free(value);
     if (inherited_producer) |value| try config.value.object.put(config.arena.allocator(), "producer_json", .{ .string = value });
