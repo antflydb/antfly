@@ -4491,6 +4491,10 @@ pub const AntflyApiHandler = struct {
             identity.* = cached.identity;
             cached.identity = null;
         } else {
+            // Time credential verification and identity resolution once, even when
+            // compressed-body middleware hands the verified identity to the route.
+            const timed = std.mem.eql(u8, ctx.header("X-Antfly-Server-Timing") orelse "", "1");
+            const start_ns = if (timed) platform_time.monotonicNs() else 0;
             identity.* = self.api_server.authenticateRequest(.{
                 .authorization = ctx.header("authorization"),
                 .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
@@ -4500,6 +4504,12 @@ pub const AntflyApiHandler = struct {
                 },
                 else => return err,
             };
+            if (timed) {
+                const elapsed_us = (platform_time.monotonicNs() -| start_ns) / std.time.ns_per_us;
+                var buf: [48]u8 = undefined;
+                const value = std.fmt.bufPrint(&buf, "auth;dur={d}.{d:0>3}", .{ elapsed_us / 1000, elapsed_us % 1000 }) catch unreachable;
+                try ctx.setHeader("Server-Timing", value);
+            }
         }
         const authenticated = identity.*.?;
         if (authenticated.is_internal_service and

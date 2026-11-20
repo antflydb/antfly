@@ -1983,7 +1983,8 @@ const FastTopK = struct {
         const get = value.materialized orelse return null;
         return get(value.ptr);
     }
-    fn nextAllowed(self: *const FastTopK, gate: *BitmapGate, first: u32) u64 {
+    fn nextAllowed(self: *const FastTopK, gate: *CandidateGate, first: u32) u64 {
+        const candidate = gate.listTarget(first) orelse return 0x1_0000_0000;
         var includes: [2]*const roaring.RoaringBitmap = undefined;
         var excludes: [2]*const roaring.RoaringBitmap = undefined;
         var ni: usize = 0;
@@ -1996,8 +1997,10 @@ const FastTopK = struct {
             excludes[ne] = bitmap;
             ne += 1;
         };
-        if (first >= gate.end) return 0x1_0000_0000;
-        const target = roaring.RoaringBitmap.candidateLowerBound(first, gate.end, includes[0..ni], excludes[0..ne]);
+        if (ni == 0 and ne == 0) return candidate;
+        // A bitmap may advance further. The posting loop seeks to that bound
+        // and consults the gate again before scoring.
+        const target = roaring.RoaringBitmap.candidateLowerBound(candidate, gate.end, includes[0..ni], excludes[0..ne]);
         return if (target == gate.end) 0x1_0000_0000 else target;
     }
 
@@ -2340,26 +2343,28 @@ fn collectOptionalScores(
     return .{ .count = count, .score = score };
 }
 
-/// A monotonic bitmap/postings intersection. Selective predicates seek postings
-/// directly to the next admitted document instead of decoding every match.
-const BitmapGate = struct {
-    iterator: ?roaring.Iterator = null,
-    next: ?u32 = null,
+/// Per-range state: segment plans can run out of document order, and parallel
+/// workers may visit disjoint ranges of the same segment.
+const CandidateGate = struct {
+    remaining: ?[]const u32,
     end: u64,
-    fn init(bitmap: ?*const roaring.RoaringBitmap, offset: u32, count: u32) BitmapGate {
-        var gate: BitmapGate = .{ .end = @as(u64, offset) + count };
-        if (bitmap) |set| {
-            gate.iterator = set.iterator();
-            gate.iterator.?.seek(offset);
-            gate.next = gate.iterator.?.next();
-        }
-        return gate;
+
+    fn init(collector: *const FastTopK, end: u64) CandidateGate {
+        return .{ .remaining = if (collector.filter_doc_nums_positive) collector.filter_doc_nums else null, .end = end };
     }
-    fn target(self: *BitmapGate, current: u32) ?u32 {
-        if (self.iterator == null) return current;
-        if (self.next != null and self.next.? < current) self.next = self.iterator.?.seekTo(current);
-        const value = self.next orelse return null;
-        return if (value < self.end) value else null;
+
+    fn listTarget(self: *CandidateGate, first: u32) ?u32 {
+        if (first >= self.end) return null;
+        var ids = self.remaining orelse return first;
+        if (ids.len != 0 and ids[0] < first) {
+            // Consecutive eligible hits cost one cursor step. Seek across a
+            // long posting gap or directly to the start of a later range.
+            ids = ids[1..];
+            if (ids.len != 0 and ids[0] < first)
+                ids = ids[std.sort.lowerBound(u32, ids, first, compareU32)..];
+            self.remaining = ids;
+        }
+        return if (ids.len != 0 and ids[0] < self.end) ids[0] else null;
     }
 };
 
@@ -2375,7 +2380,7 @@ fn collectFastShouldSegment(
     bm25_config: inverted.BM25Config,
     boost: f32,
 ) !void {
-    var gate = BitmapGate.init(collector.filter_doc_bitmap, doc_offset, seg.reader.doc_count);
+    var gate = CandidateGate.init(collector, @as(u64, doc_offset) + seg.reader.doc_count);
     while (true) {
         var min_doc: ?u32 = null;
         for (should_states) |state| {
@@ -2646,36 +2651,27 @@ fn collectFastMustSegment(
         if (state.doc_freq < must_states[lead_idx].doc_freq) lead_idx = i;
     }
 
-    var gate = BitmapGate.init(collector.filter_doc_bitmap, doc_offset, seg.reader.doc_count);
+    var gate = CandidateGate.init(collector, @as(u64, doc_offset) + seg.reader.doc_count);
     while (!must_states[lead_idx].exhausted) {
         const admitted64 = collector.nextAllowed(&gate, doc_offset + must_states[lead_idx].current.?.doc_id);
         if (admitted64 >= gate.end) return;
         const admitted: u32 = @intCast(admitted64);
         if (admitted > doc_offset + must_states[lead_idx].current.?.doc_id) {
             try must_states[lead_idx].advanceTo(admitted - doc_offset);
-            if (must_states[lead_idx].exhausted) return;
+            continue;
         }
-        var target = must_states[lead_idx].current.?.doc_id;
-        var aligned = false;
-
-        while (!aligned) {
-            aligned = true;
-            var next_target = target;
-            for (must_states, 0..) |*state, i| {
-                if (i == lead_idx) continue;
-                try state.advanceTo(target);
-                if (state.exhausted) return;
-                const cur = state.current.?.doc_id;
-                if (cur > target) {
-                    aligned = false;
-                    if (cur > next_target) next_target = cur;
-                }
-            }
-            if (!aligned) {
-                try must_states[lead_idx].advanceTo(next_target);
-                if (must_states[lead_idx].exhausted) return;
-                target = must_states[lead_idx].current.?.doc_id;
-            }
+        const target = must_states[lead_idx].current.?.doc_id;
+        var next_target = target;
+        for (must_states, 0..) |*state, i| {
+            if (i == lead_idx) continue;
+            try state.advanceTo(target);
+            if (state.exhausted) return;
+            next_target = @max(next_target, state.current.?.doc_id);
+        }
+        if (next_target > target) {
+            // Alignment may land beyond the current eligible ID.
+            try must_states[lead_idx].advanceTo(next_target);
+            continue;
         }
 
         if (allow_block_pruning and try skipNonCompetitiveConjunctionBlocks(
@@ -2710,7 +2706,7 @@ fn collectFastMustSegment(
 
 /// Feed bounded batches into membership before raising the global WAND cutoff.
 /// A pending batch only delays the cutoff; it can never prune a competitive hit.
-fn collectFilteredWandSegment(alloc: Allocator, seg: *const index_mod.SegmentEntry, inv_reader: anytype, terms: []const SimpleTextTerm, frequencies: []const u32, offset: u32, request: SearchRequest, collector: *FastTopK, doc_count: u32, avg_dl: f32, bound_table: ?*const inverted.BM25BoundTable) !void {
+fn collectFilteredWandSegment(alloc: Allocator, seg: *const index_mod.SegmentEntry, inv_reader: anytype, terms: []const SimpleTextTerm, frequencies: []const u32, offset: u32, request: SearchRequest, collector: *FastTopK, gate: CandidateGate, doc_count: u32, avg_dl: f32, bound_table: ?*const inverted.BM25BoundTable) !void {
     var wand = scorer_mod.WANDScorer.init(alloc, collector.k, doc_count, avg_dl, request.bm25_config);
     defer wand.deinit();
     if (bound_table) |table| wand.setBoundTable(table);
@@ -2729,7 +2725,7 @@ fn collectFilteredWandSegment(alloc: Allocator, seg: *const index_mod.SegmentEnt
         base: *FastTopK,
         segment: *const index_mod.SegmentEntry,
         offset: u32,
-        gate: BitmapGate,
+        gate: CandidateGate,
         pub fn nextCandidate(self: *@This(), first: u32) u64 {
             return self.base.nextAllowed(&self.gate, first);
         }
@@ -2749,7 +2745,7 @@ fn collectFilteredWandSegment(alloc: Allocator, seg: *const index_mod.SegmentEnt
             if (!isSegmentDocDeleted(self.segment, hit.doc_id - self.offset)) try self.base.collect(hit.doc_id, hit.score);
         }
     };
-    var live: Collector = .{ .base = collector, .segment = seg, .offset = offset, .gate = .init(collector.filter_doc_bitmap, offset, seg.reader.doc_count) };
+    var live: Collector = .{ .base = collector, .segment = seg, .offset = offset, .gate = gate };
     seg.shared.lockDeletionShared();
     defer seg.shared.unlockDeletionShared();
     try wand.executeInto(&live);
@@ -2783,6 +2779,8 @@ fn collectFilteredWandQuery(alloc: Allocator, snap: *const index_mod.IndexSnapsh
             if (request.diagnostics) |diag| diag.segments_pruned +|= 1;
             continue;
         }
+        var gate = CandidateGate.init(collector, @as(u64, plan.doc_offset) + snap.segments[plan.segment_idx].reader.doc_count);
+        if (gate.listTarget(plan.doc_offset) == null) continue;
         var selected_segment = try snap.leaseSegment(plan.segment_idx);
         defer selected_segment.deinit();
         const seg = selected_segment.entry;
@@ -2791,7 +2789,7 @@ fn collectFilteredWandQuery(alloc: Allocator, snap: *const index_mod.IndexSnapsh
         defer seg.endAccess();
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, field)) orelse continue;
         defer inv_reader.deinit();
-        try collectFilteredWandSegment(alloc, seg, inv_reader, terms, frequencies, plan.doc_offset, request, collector, doc_count, avg_dl, bound_table);
+        try collectFilteredWandSegment(alloc, seg, inv_reader, terms, frequencies, plan.doc_offset, request, collector, gate, doc_count, avg_dl, bound_table);
     }
 }
 
@@ -5012,6 +5010,8 @@ fn scoreStreamingBoolRangeCached(snap: *const index_mod.IndexSnapshot, bq: BoolQ
         }
     }
     const offset = plan.doc_offset;
+    var gate = CandidateGate.init(collector, @as(u64, offset) + work.end);
+    const initial = gate.listTarget(offset + work.first) orelse return;
     _ = arena.reset(.retain_capacity);
     if (snap.text_statistics) |reader| if (reader.hierarchical) if (streamingCutoff(collector, shared)) |cutoff| {
         // Coarse hierarchy bounds avoid all leaf reads in the initial prepass.
@@ -5045,9 +5045,7 @@ fn scoreStreamingBoolRangeCached(snap: *const index_mod.IndexSnapshot, bq: BoolQ
     }
     segment.shared.lockDeletionShared();
     defer segment.shared.unlockDeletionShared();
-    var gate: BitmapGate = .init(request.filter_doc_bitmap, offset, segment.reader.doc_count);
-    gate.end = @min(gate.end, @as(u64, offset) + work.end);
-    var first: u32 = work.first;
+    var first = initial - offset;
     var candidates: usize = 0;
     var ceiling_cache: ?StreamingBoolNode.Bound = null;
     while (first < work.end) {
@@ -9399,6 +9397,82 @@ test "external lake producer top k prunes common text without a complete members
     try std.testing.expectEqual(@as(usize, 64), materialized.probed);
 }
 
+test "producer top k seeks sparse positive IDs before scoring common terms" {
+    const a = std.testing.allocator;
+    var builder = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 32 });
+    defer builder.deinit();
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    const words = [_][]const u8{ "alpha", "beta", "delta", "gamma", "omega", "sigma" };
+    var terms: [words.len]inverted.InvertedIndexBuilder.TermHit = undefined;
+    var clauses: [words.len]SearchQuery = undefined;
+    for (words, &clauses) |word, *clause| clause.* = .{ .term = .{ .field = "body", .term = word } };
+    for (0..256) |i| {
+        for (words, &terms) |word, *term| term.* = .{ .term = word, .freq = if (i == 193) 5 else 1, .norm = 40 };
+        try builder.addDocument(@intCast(i), &terms);
+        var id: [16]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "row-{d}", .{i}), "{}");
+    }
+    const postings = try builder.build();
+    defer a.free(postings);
+    try segment.addSection(try segment.addField("body"), .inverted_text, postings);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    const snap = writer.snapshot();
+    const bq = BoolQuery{ .should = &clauses };
+    var diagnostics: SearchDiagnostics = .{};
+    var req: SearchRequest = .{ .query = .{ .bool_query = bq }, .k = 2, .include_stored = false };
+    var oracle = try executeBoolAllHit(a, snap, bq, req);
+    defer oracle.deinit();
+    try std.testing.expectEqual(@as(u32, 193), oracle.hits[0].doc_id);
+    try std.testing.expectEqual(@as(u32, 449), oracle.hits[1].doc_id);
+
+    var eligible: [512]u32 = undefined;
+    for (&eligible, 0..) |*id, i| id.* = @intCast(i);
+    req.filter_doc_nums_positive = true;
+    req.filter_doc_nums = &eligible;
+    req.diagnostics = &diagnostics;
+    req.k = 1;
+    var full = try execute(a, snap, req);
+    defer full.deinit();
+    const broad_work = diagnostics.wand_next_in_score;
+    try std.testing.expectEqual(oracle.hits[0].doc_id, full.hits[0].doc_id);
+
+    const winners = [_]u32{ 193, 449 };
+    for (0..3) |count| {
+        diagnostics = .{};
+        req.filter_doc_nums = winners[0..count];
+        req.k = @intCast(@max(1, count));
+        var selected = try execute(a, snap, req);
+        defer selected.deinit();
+        try std.testing.expectEqual(count, selected.hits.len);
+        for (selected.hits, oracle.hits[0..count]) |actual, expected| {
+            try std.testing.expectEqual(expected.doc_id, actual.doc_id);
+            try std.testing.expectApproxEqAbs(expected.score, actual.score, 0.000001);
+        }
+        try std.testing.expectEqual(count, diagnostics.wand_pivots_scored);
+        try std.testing.expectEqual(count * words.len, diagnostics.wand_next_in_score);
+        try std.testing.expect(broad_work > 10 * diagnostics.wand_next_in_score);
+    }
+
+    var mask = roaring.RoaringBitmap.init(a);
+    defer mask.deinit();
+    try mask.add(449);
+    req.filter_doc_bitmap = &mask;
+    var masked = try execute(a, snap, req);
+    defer masked.deinit();
+    try std.testing.expectEqual(@as(usize, 1), masked.hits.len);
+    try std.testing.expectEqual(@as(u32, 449), masked.hits[0].doc_id);
+    req.exclude_doc_nums = &.{449};
+    var excluded = try execute(a, snap, req);
+    defer excluded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), excluded.hits.len);
+}
+
 test "external lake producer top k overlapping masks bound navigation to a posting window" {
     const a = std.testing.allocator;
     var bitmap = roaring.RoaringBitmap.init(a);
@@ -9407,7 +9481,7 @@ test "external lake producer top k overlapping masks bound navigation to a posti
     try bitmap.prepareRead();
     var collector: FastTopK = .{ .alloc = a, .k = 1, .filter_doc_bitmap = &bitmap, .exclude_doc_bitmap = &bitmap };
     defer collector.deinit();
-    var gate = BitmapGate.init(&bitmap, 0, 1000000);
+    var gate = CandidateGate.init(&collector, 1000000);
     try std.testing.expectEqual(@as(u64, 4096), collector.nextAllowed(&gate, 0));
     try std.testing.expectEqual(@as(u64, 0x1_0000_0000), collector.nextAllowed(&gate, 999999));
 }
@@ -10371,6 +10445,21 @@ test "streaming boolean single large segment shares bounded ranges and live cuto
             try std.testing.expectEqual(left.doc_id, right.doc_id);
             try std.testing.expectEqual(left.score, right.score);
         }
+    }
+    // Both later ranges have eligible rows, including a boundary and a
+    // tombstone. Each worker must start its own forward-only ID cursor.
+    {
+        const bq: BoolQuery = .{ .must = &.{.{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "beta" } } }} };
+        var diagnostics: SearchDiagnostics = .{};
+        const req: SearchRequest = .{ .query = .{ .bool_query = bq }, .k = 10, .include_stored = false, .diagnostics = &diagnostics, .filter_doc_nums_positive = true, .filter_doc_nums = &.{ 4096, 4100, 8192, 12287 } };
+        var selected = try execute(a, snapshot, req);
+        defer selected.deinit();
+        try std.testing.expect(diagnostics.boolean_parallel_tasks > 0);
+        try std.testing.expectEqual(@as(u64, 3), diagnostics.phrase_candidates_verified);
+        try std.testing.expectEqual(@as(usize, 3), selected.hits.len);
+        var ids = [3]u32{ selected.hits[0].doc_id, selected.hits[1].doc_id, selected.hits[2].doc_id };
+        std.mem.sort(u32, &ids, {}, std.sort.asc(u32));
+        try std.testing.expectEqualSlices(u32, &.{ 4096, 8192, 12287 }, &ids);
     }
     // Publish from a running lane without merging its hits. This proves cutoff
     // updates need not wait for range completion/global winner admission.
