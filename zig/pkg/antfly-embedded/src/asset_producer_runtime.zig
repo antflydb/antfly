@@ -4118,7 +4118,15 @@ pub const Runtime = struct {
         return false;
     }
 
-    fn bindReaderPlacement(self: *Runtime, endpoint: []const u8, cfg: readers.Config, placement: *remote_capabilities.DiscoveryHeaders, headers: *[]const [2][]const u8, alloc: Allocator, request: anytype, measured: *?remote_capabilities.DiscoveryMediaGeometry) !remote_capabilities.CapabilityLease {
+    fn framedReaderWireFits(caps: inference_work.InferenceCapabilities, wire: readers.ReaderWireCost, items: usize) bool {
+        const limits: httpx.attachment_envelope.Limits = .{};
+        return wire.framed_bytes <= (caps.remote_framed_max_request_bytes orelse std.math.maxInt(usize)) and
+            wire.metadata_bytes <= @min(caps.remote_framed_max_metadata_bytes orelse std.math.maxInt(usize), limits.max_metadata_bytes) and
+            wire.mime_bytes <= @min(caps.remote_framed_max_mime_bytes orelse std.math.maxInt(usize), limits.max_mime_bytes) and
+            items <= @min(caps.remote_framed_max_attachments orelse std.math.maxInt(usize), limits.max_attachments);
+    }
+
+    fn bindReaderPlacement(self: *Runtime, endpoint: []const u8, cfg: readers.Config, placement: *remote_capabilities.DiscoveryHeaders, headers: *[]const [2][]const u8, alloc: Allocator, request: anytype, measured: *?remote_capabilities.DiscoveryMediaGeometry, json_size_hint: *?usize, force_json: *bool) !remote_capabilities.CapabilityLease {
         const cache = self.capabilityCache();
         const model = cfg.model orelse "";
         const wait = self.execution.waitContext();
@@ -4126,8 +4134,10 @@ pub const Runtime = struct {
         const geometry = try readerMediaGeometry(alloc, request, &complete);
         measured.* = geometry;
         const shaped = headers.*;
-        const json_only = @TypeOf(request) == readers.Request;
+        var json_only = @TypeOf(request) == readers.Request;
         const batch_wire = try readers.measureReaderWire(alloc, cfg, request);
+        json_size_hint.* = batch_wire.json_bytes;
+        var framed_failure: ?anyerror = null;
         var first_request = request;
         first_request.images = request.images[0..@min(request.images.len, 1)];
         const first_wire = if (request.images.len > 1) try readers.measureReaderWire(alloc, cfg, first_request) else batch_wire;
@@ -4145,14 +4155,30 @@ pub const Runtime = struct {
                         rounded = false;
                         continue;
                     }
+                    if (!json_only) {
+                        framed_failure = err;
+                        json_only = true;
+                        continue;
+                    }
                     if (complete and err == error.RemoteCapabilityDiscoveryTransient) {
                         complete = false;
                         continue;
                     }
-                    return err;
+                    return if (framed_failure == error.InferenceDiscoveryTooManyItems) framed_failure.? else err;
                 },
                 else => return err,
             };
+            if (!json_only) {
+                if (lease.capabilities) |caps| {
+                    if (caps.framed_attachments and !framedReaderWireFits(caps, batch_wire, request.images.len)) {
+                        framed_failure = error.InferenceDiscoveryTooManyItems;
+                        json_only = true;
+                        rounded = false;
+                        continue;
+                    }
+                }
+            }
+            force_json.* = json_only;
             return validateReaderPlacementGeometry(lease, geometry, request.images.len, !json_only);
         }
     }
@@ -4163,7 +4189,9 @@ pub const Runtime = struct {
             const wire_limit = if (framed) caps.remote_framed_max_request_bytes else caps.remote_json_max_request_bytes;
             const wire_content_bytes = if (framed) geometry.batch.framed else geometry.batch.encoded;
             const exceeds_wire_lower_bound = if (wire_limit) |limit| wire_content_bytes > limit else false;
-            if (items > 1 and (!caps.batch.acceptsItems(items) or !geometry.fits(caps) or exceeds_wire_lower_bound))
+            var transport_caps = caps;
+            transport_caps.framed_attachments = framed;
+            if (items > 1 and (!caps.batch.acceptsItems(items) or !geometry.fits(transport_caps) or exceeds_wire_lower_bound))
                 return error.InferenceDiscoveryTooManyItems;
         }
         return lease;
@@ -4204,9 +4232,11 @@ pub const Runtime = struct {
         var placement: remote_capabilities.DiscoveryHeaders = .{};
         var capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = @max(1, request.images.len), .media = request.images.len != 0, .modalities = .{ .image = request.images.len != 0 }, .output_tokens = discoveryOutputTokens(request.max_tokens orelse execution_cfg.max_tokens) });
         var remote_geometry: ?remote_capabilities.DiscoveryMediaGeometry = null;
+        var json_size_hint: ?usize = null;
+        var force_json = false;
         const discovered_capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and execution_cfg.provider == .antfly) blk: {
             const endpoint = execution_cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
-            const lease = try self.bindReaderPlacement(endpoint, execution_cfg, &placement, &capability_auth_headers, alloc, request, &remote_geometry);
+            const lease = try self.bindReaderPlacement(endpoint, execution_cfg, &placement, &capability_auth_headers, alloc, request, &remote_geometry, &json_size_hint, &force_json);
             capability_lease_fields = CapabilityLeaseFields.init(lease);
             capability_lease_fields.apply(&execution_cfg);
             try self.recordLeaseExecution(lease);
@@ -4263,13 +4293,14 @@ pub const Runtime = struct {
             return .{ .items = items, .execution = .{ .requested_items = items.len, .serial_items = items.len } };
         }
 
-        return self.dispatchReaderUris(alloc, execution_cfg, request, capability_auth_headers, discovered_capabilities);
+        return self.dispatchReaderUris(alloc, execution_cfg, request, capability_auth_headers, discovered_capabilities, json_size_hint);
     }
 
-    fn dispatchReaderUris(self: *Runtime, alloc: Allocator, execution_cfg: readers.Config, request: readers.Request, capability_auth_headers: []const [2][]const u8, caps: ?inference_work.InferenceCapabilities) !readers.BatchResult {
+    fn dispatchReaderUris(self: *Runtime, alloc: Allocator, execution_cfg: readers.Config, request: readers.Request, capability_auth_headers: []const [2][]const u8, caps: ?inference_work.InferenceCapabilities, json_size_hint: ?usize) !readers.BatchResult {
         return readers.readWithConfigReported(alloc, self.http, execution_cfg, request, .{
             .source_table = self.execution.routing.source_table,
             .max_request_bytes = if (caps) |value| value.remote_json_max_request_bytes else null,
+            .json_size_hint = json_size_hint,
             .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
             .cancellation = httpx.CancellationToken.fromCallback(
                 self.execution.cancellation.ptr,
@@ -4348,9 +4379,11 @@ pub const Runtime = struct {
         var placement: remote_capabilities.DiscoveryHeaders = .{};
         var capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = @max(1, request.images.len), .media = request.images.len != 0, .modalities = .{ .image = request.images.len != 0 }, .output_tokens = discoveryOutputTokens(request.max_tokens orelse execution_cfg.max_tokens) });
         var remote_geometry: ?remote_capabilities.DiscoveryMediaGeometry = null;
+        var json_size_hint: ?usize = null;
+        var force_json = false;
         const capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and execution_cfg.provider == .antfly) blk: {
             const endpoint = execution_cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
-            const lease = try self.bindReaderPlacement(endpoint, execution_cfg, &placement, &capability_auth_headers, alloc, request, &remote_geometry);
+            const lease = try self.bindReaderPlacement(endpoint, execution_cfg, &placement, &capability_auth_headers, alloc, request, &remote_geometry, &json_size_hint, &force_json);
             capability_lease_fields = CapabilityLeaseFields.init(lease);
             capability_lease_fields.apply(&execution_cfg);
             try self.recordLeaseExecution(lease);
@@ -4362,6 +4395,8 @@ pub const Runtime = struct {
             var decoded_pixels: u64 = 0;
             const transport: inference_work.AttachmentTransport = if (local_reader)
                 .borrowed_binary
+            else if (force_json)
+                .data_uri
             else
                 remoteAttachmentTransport(resolved, .data_uri);
             use_framed_transport = transport == .segmented_framed_binary;
@@ -4497,7 +4532,7 @@ pub const Runtime = struct {
             .max_response_bytes = request.max_response_bytes,
         };
         var adapted = if (!local_reader and execution_cfg.provider == .antfly)
-            try self.dispatchReaderUris(alloc, execution_cfg, uri_request, capability_auth_headers, capabilities)
+            try self.dispatchReaderUris(alloc, execution_cfg, uri_request, capability_auth_headers, capabilities, json_size_hint)
         else
             try self.readImagesWithConfigReported(alloc, execution_cfg, uri_request);
         errdefer adapted.deinit(alloc);
