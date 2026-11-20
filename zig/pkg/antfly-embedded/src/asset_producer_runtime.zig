@@ -2768,9 +2768,9 @@ pub const Runtime = struct {
         var start: usize = 0;
         while (start < requests.len) {
             var active: inference_work.InferenceCapabilities = undefined;
-            const first_shape = if (remote) try producerDiscoveryShape(alloc, requests[start..][0..1]) else remote_capabilities.DiscoveryShape{ .items = 1 };
-            if (remote and (previous_shape == null or !sameDiscoveryModalities(previous_shape.?, first_shape))) item_limit = requests.len;
-            previous_shape = first_shape;
+            const first_shape = if (remote) try producerItemDiscovery(alloc, requests[start]) else ProducerItemDiscovery{ .shape = .{ .items = 1 } };
+            if (remote and (previous_shape == null or !sameDiscoveryModalities(previous_shape.?, first_shape.shape))) item_limit = requests.len;
+            previous_shape = first_shape.shape;
             var end = @min(start +| item_limit, requests.len);
             if (end <= start) return error.InvalidInferenceCapabilities;
             var shape = if (remote) try extendDiscoveryShape(alloc, first_shape, requests[start + 1 .. end]) else remote_capabilities.DiscoveryShape{ .items = end - start };
@@ -2792,9 +2792,8 @@ pub const Runtime = struct {
                     continue;
                 }
                 end = fitting;
-                if (remote and active.batch.mode != .none) validateExtractorBatchCompatibility(alloc, active, transport, requests[start..end]) catch |err| {
-                    return if (err == error.BatchIncompatible and start != 0) error.InferenceCapabilitiesStale else err;
-                };
+                if (remote and active.batch.mode != .none)
+                    try validateExtractorBatchCompatibility(alloc, active, transport, requests[start..end]);
                 try validateExtractorInvocation(alloc, active, transport, requests[start..end]);
                 break;
             }
@@ -3020,12 +3019,12 @@ pub const Runtime = struct {
         var start: usize = 0;
         while (start < requests.len) {
             try self.execution.check(platform.time.monotonicNs());
-            const first_shape = try producerDiscoveryShape(alloc, requests[start..][0..1]);
-            if (previous_shape == null or !sameDiscoveryModalities(previous_shape.?, first_shape)) {
+            const first_shape = try producerItemDiscovery(alloc, requests[start]);
+            if (previous_shape == null or !sameDiscoveryModalities(previous_shape.?, first_shape.shape)) {
                 capabilities = null;
                 discovery_item_limit = std.math.maxInt(usize);
             }
-            previous_shape = first_shape;
+            previous_shape = first_shape.shape;
             var end = @min(start +| @min(if (capabilities) |caps| caps.batch.max_items else requests.len, discovery_item_limit), requests.len);
             if (end <= start) return error.InvalidInferenceCapabilities;
             var shape = try extendDiscoveryShape(alloc, first_shape, requests[start + 1 .. end]);
@@ -3396,10 +3395,11 @@ pub const Runtime = struct {
         };
         var image_offset: usize = 0;
         const local_reader = isLocalReaderProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl());
-        const reader_chunk_max_images = if (local_reader)
+        var reader_chunk_max_images = if (local_reader)
             @min(localReaderBatchMaxImages(), capabilities.batch.max_items)
         else
             capabilities.batch.max_items;
+        var reader_batch = capabilities.batch;
         while (image_offset < total_images) {
             // Encoded images carry identity per item, so compatible pages from
             // different documents may share a model batch without losing
@@ -3410,7 +3410,7 @@ pub const Runtime = struct {
                 try encodedReaderBatchEnd(
                     flat_encoded.items,
                     image_offset,
-                    capabilities.batch,
+                    reader_batch,
                     if (local_reader) .borrowed_binary else .data_uri,
                 )
             else if (local_reader)
@@ -3422,23 +3422,28 @@ pub const Runtime = struct {
                 flat_source_fingerprints.items[image_offset..image_end],
                 &chunk_fingerprint_buffer,
             );
-            const chunk_batch = if (uses_encoded_media)
-                try self.readEncodedImagesWithConfigReported(alloc, cfg_parsed.value, .{
+            const chunk_batch = (if (uses_encoded_media)
+                self.readEncodedImagesWithConfigReported(alloc, cfg_parsed.value, .{
                     .images = flat_encoded.items[image_offset..image_end],
                     .prompt = shared_prompt,
                     .max_tokens = cfg_parsed.value.max_tokens,
                     .source_fingerprint = chunk_source_fingerprint,
                     .max_response_bytes = self.responseLimitForTask(.reader, image_end - image_offset),
                 })
-            else blk: {
-                break :blk try self.readImagesWithConfigReported(alloc, cfg_parsed.value, .{
+            else
+                self.readImagesWithConfigReported(alloc, cfg_parsed.value, .{
                     .images = flat_images.items[image_offset..image_end],
                     .prompt = shared_prompt,
                     .max_tokens = cfg_parsed.value.max_tokens,
                     .inline_content_trust = if (requests[0].inline_media_trusted) .trusted_internal else .untrusted,
                     .source_fingerprint = chunk_source_fingerprint,
                     .max_response_bytes = self.responseLimitForTask(.reader, image_end - image_offset),
-                });
+                })) catch |err| {
+                const attempted = image_end - image_offset;
+                if (local_reader or err != error.InferenceDiscoveryTooManyItems or attempted <= 1) return err;
+                reader_chunk_max_images = attempted / 2;
+                reader_batch.max_items = reader_chunk_max_images;
+                continue;
             };
             const chunk_results = chunk_batch.items;
             if (chunk_results.len != image_end - image_offset) {
@@ -5005,29 +5010,53 @@ fn inlineImagePixelsAlloc(
     return try inference_work.encodedImagePixels(declared_mime_type, decoded);
 }
 
+const ExtractorPromptDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+
+const ProducerItemDiscovery = struct {
+    shape: remote_capabilities.DiscoveryShape,
+    media_prompt: ?ExtractorPromptDigest = null,
+};
+
+fn producerItemDiscovery(alloc: Allocator, request: asset_producer.Request) !ProducerItemDiscovery {
+    if (request.producer_type != .extractor)
+        return .{ .shape = try producerDiscoveryShape(alloc, &.{request}) };
+    var prompt: ExtractorPromptDigest = undefined;
+    const shape = try producerDiscoveryShapeAndPrompt(alloc, &.{request}, &prompt);
+    return .{ .shape = shape, .media_prompt = if (shape.media) prompt else null };
+}
+
 fn homogeneousDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Request) !remote_capabilities.DiscoveryShape {
-    const first = try producerDiscoveryShape(alloc, requests[0..@min(requests.len, 1)]);
-    return if (requests.len <= 1) first else try extendDiscoveryShape(alloc, first, requests[1..]);
+    if (requests.len == 0) return .{ .items = 1, .output_tokens = 0 };
+    const first = try producerItemDiscovery(alloc, requests[0]);
+    return try extendDiscoveryShape(alloc, first, requests[1..]);
 }
 
 fn sameDiscoveryModalities(lhs: remote_capabilities.DiscoveryShape, rhs: remote_capabilities.DiscoveryShape) bool {
     return lhs.media == rhs.media and @as(u8, @bitCast(lhs.modalities)) == @as(u8, @bitCast(rhs.modalities));
 }
 
-fn extendDiscoveryShape(alloc: Allocator, first: remote_capabilities.DiscoveryShape, rest: []const asset_producer.Request) !remote_capabilities.DiscoveryShape {
-    var shape = first;
+fn extendDiscoveryShape(alloc: Allocator, first: ProducerItemDiscovery, rest: []const asset_producer.Request) !remote_capabilities.DiscoveryShape {
+    var shape = first.shape;
     for (rest) |request| {
-        const item = try producerDiscoveryShape(alloc, &.{request});
-        if (!sameDiscoveryModalities(first, item)) break;
+        const item = try producerItemDiscovery(alloc, request);
+        if (!sameDiscoveryModalities(first.shape, item.shape) or !std.meta.eql(first.media_prompt, item.media_prompt)) break;
         shape.items += 1;
     }
     return shape;
 }
 
 fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Request) !remote_capabilities.DiscoveryShape {
+    return producerDiscoveryShapeAndPrompt(alloc, requests, null);
+}
+
+fn producerDiscoveryShapeAndPrompt(alloc: Allocator, requests: []const asset_producer.Request, prompt: ?*ExtractorPromptDigest) !remote_capabilities.DiscoveryShape {
+    std.debug.assert(prompt == null or requests.len == 1);
+    var prompt_hash = if (prompt != null) std.crypto.hash.sha2.Sha256.init(.{}) else undefined;
+    var has_prompt_text = false;
     var shape: remote_capabilities.DiscoveryShape = .{ .items = @max(1, requests.len), .output_tokens = 0 };
     const Part = struct {
         type: ?[]const u8 = null,
+        text: ?[]const u8 = null,
         mime_type: ?[]const u8 = null,
         url: ?[]const u8 = null,
         data: ?[]const u8 = null,
@@ -5042,6 +5071,7 @@ fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Req
             const parts_json = std.mem.trimStart(u8, raw, " \t\r\n");
             if (parts_json.len == 0 or parts_json[0] != '[') {
                 const extraction = request.producer_type == .extractor and raw.len != 0;
+                if (prompt != null) prompt_hash.update(if (extraction) raw else request.source_text);
                 shape.modalities.text = shape.modalities.text or
                     (if (extraction) true else request.source_text.len != 0);
                 continue;
@@ -5054,6 +5084,12 @@ fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Req
                 has_content = has_content or !std.mem.eql(u8, kind, "metadata");
                 if (std.mem.eql(u8, kind, "text")) {
                     shape.modalities.text = true;
+                    if (prompt != null) if (part.text) |value| {
+                        // Match the effective prompt used by extractor validation.
+                        if (has_prompt_text) prompt_hash.update("\n");
+                        prompt_hash.update(value);
+                        has_prompt_text = has_prompt_text or value.len != 0;
+                    };
                 } else if (std.mem.eql(u8, kind, "image_url")) {
                     shape.media = true;
                     shape.modalities.image = true;
@@ -5069,6 +5105,7 @@ fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Req
             if (request.producer_type == .generator and !has_content)
                 shape.modalities.text = shape.modalities.text or request.source_text.len != 0;
         } else {
+            if (prompt != null) prompt_hash.update(request.source_text);
             // OCR metadata prototypes describe an image before any bytes are rendered.
             if (request.producer_type == .extractor and request.media.len == 0 and request.source_text.len == 0) {
                 if (inference_work.modalityForMimeType(request.content_type)) |modalities| {
@@ -5079,7 +5116,26 @@ fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Req
             shape.modalities.text = shape.modalities.text or ((request.producer_type == .extractor or request.media.len == 0) and request.source_text.len != 0);
         }
     }
+    if (prompt) |digest| prompt_hash.final(digest);
     return shape;
+}
+
+test "asset producer runtime separates extractor media prompts during discovery" {
+    const alloc = std.testing.allocator;
+    const media = &.{asset_producer.EncodedMedia{ .bytes = "", .mime_type = "image/png" }};
+    const first: asset_producer.Request = .{
+        .producer_type = .extractor,
+        .config_json = "{}",
+        .source_text = "read",
+        .media = media,
+    };
+    var same = first;
+    same.source_parts_json = "[{\"type\":\"text\",\"text\":\"read\"}]";
+    var other = first;
+    other.source_text = "describe";
+    const window = try homogeneousDiscoveryShape(alloc, &.{ first, same, other });
+    try std.testing.expectEqual(@as(usize, 2), window.items);
+    try std.testing.expect(window.media and window.modalities.image);
 }
 
 test "asset producer runtime discovers inferred media and OCR prototypes" {

@@ -1514,6 +1514,33 @@ fn legacyMediaDiscoveryHeaders(response: httpx.Response, headers: []const [2][]c
     return null;
 }
 
+fn validateLegacyMediaDescriptor(capabilities: ?work.InferenceCapabilities, headers: []const [2][]const u8) !void {
+    const caps = capabilities orelse return;
+    for (headers) |header| {
+        if (!std.ascii.eqlIgnoreCase(header[0], discovery_shape_header)) continue;
+        var fields = std.mem.splitScalar(u8, header[1], ':');
+        if (!std.mem.eql(u8, fields.next() orelse return error.InvalidInferenceDiscoveryShape, "4")) return error.InvalidInferenceDiscoveryShape;
+        _ = fields.next() orelse return error.InvalidInferenceDiscoveryShape;
+        const mask = std.fmt.parseInt(u8, fields.next() orelse return error.InvalidInferenceDiscoveryShape, 10) catch return error.InvalidInferenceDiscoveryShape;
+        const supported: u8 = @bitCast(caps.input_modalities);
+        if (supported & mask != mask or supported & ~@as(u8, 1) == 0)
+            return error.RemoteCapabilityDiscoveryTransient;
+        return;
+    }
+    return error.InvalidInferenceDiscoveryShape;
+}
+
+test "remote Antfly legacy media discovery still requires the original modalities" {
+    const a = std.testing.allocator;
+    const headers = &.{.{ discovery_shape_header, "4:1:1:0:-" }};
+    const image_only = try parseModelCapabilities(a, "{\"embedders\":{\"model\":{\"inputs\":[\"image\"]}}}", "model", .embed);
+    try std.testing.expect(image_only != null);
+    try std.testing.expectError(error.RemoteCapabilityDiscoveryTransient, validateLegacyMediaDescriptor(image_only, headers));
+    const multimodal = try parseModelCapabilities(a, "{\"embedders\":{\"model\":{\"inputs\":[\"text\",\"audio\"]}}}", "model", .embed);
+    try std.testing.expect(multimodal != null);
+    try validateLegacyMediaDescriptor(multimodal, headers);
+}
+
 fn discoverOnce(
     alloc: std.mem.Allocator,
     http: *httpx.Client,
@@ -1534,7 +1561,8 @@ fn discoverOnce(
     };
     defer response.deinit();
     var fallback: DiscoveryHeaders = .{};
-    if (try legacyMediaDiscoveryHeaders(response, headers, &fallback)) |legacy| {
+    const legacy_headers = try legacyMediaDiscoveryHeaders(response, headers, &fallback);
+    if (legacy_headers) |legacy| {
         const retry = http.get(url, .{ .follow_redirects = false, .headers = legacy, .max_response_size = capability_catalog_response_bytes }) catch |err| {
             if (err == error.OutOfMemory) return err;
             return error.RemoteCapabilityDiscoveryTransient;
@@ -1543,7 +1571,9 @@ fn discoverOnce(
         response = retry;
     }
     if (!response.ok()) return discoveryResponseError(response);
-    return try parseModelCapabilities(alloc, response.body orelse return error.InvalidInferenceCapabilities, model, operation.task());
+    const caps = try parseModelCapabilities(alloc, response.body orelse return error.InvalidInferenceCapabilities, model, operation.task());
+    if (legacy_headers != null) try validateLegacyMediaDescriptor(caps, headers);
+    return caps;
 }
 
 fn discoverWithContext(
@@ -1716,7 +1746,8 @@ fn discoverWithContextOnce(
     defer response.deinit();
     var fallback: DiscoveryHeaders = .{};
     var effective_headers = headers;
-    if (try legacyMediaDiscoveryHeaders(response, headers, &fallback)) |legacy| {
+    const legacy_headers = try legacyMediaDiscoveryHeaders(response, headers, &fallback);
+    if (legacy_headers) |legacy| {
         const retry_now = monotonicNowNs(io);
         try context.check(retry_now);
         if (retry_now >= effective_deadline) return error.Timeout;
@@ -1743,13 +1774,14 @@ fn discoverWithContextOnce(
         if (failure == error.RemoteCapabilityDiscoveryTransient) recordDiscoveryRetryHint(alloc, io, response, context);
         if (allow_activation and activation_advertised and response.status.code == 503 and
             try loadMissingModelInstance(alloc, io, http, inference_url, model, operation, effective_headers, context))
-            return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, effective_headers, context, false);
+            return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, headers, context, false);
         if (!allow_activation and !context.passive_refresh and failure == error.RemoteCapabilityDiscoveryUnsupported)
             return error.RemoteCapabilitySelectorAbsent;
         return failure;
     }
     const body = response.body orelse return error.InvalidInferenceCapabilities;
     const capabilities = try parseModelCapabilities(alloc, body, model, operation.task());
+    if (legacy_headers != null) try validateLegacyMediaDescriptor(capabilities, headers);
     if (capabilities == null) {
         if (response.headers.get(capability_selector_rejected_header)) |value| {
             if (std.ascii.eqlIgnoreCase(value, "true")) return error.RemoteCapabilityDiscoveryRejected;
@@ -1767,7 +1799,7 @@ fn discoverWithContextOnce(
                 if (err == error.RemoteCapabilityDiscoveryTransient) return error.RemoteCapabilitySelectorAbsent;
                 return err;
             };
-            if (loaded) return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, effective_headers, context, false) catch |err| {
+            if (loaded) return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, headers, context, false) catch |err| {
                 if (err == error.RemoteCapabilityDiscoveryTransient) return error.RemoteCapabilitySelectorAbsent;
                 return err;
             };
