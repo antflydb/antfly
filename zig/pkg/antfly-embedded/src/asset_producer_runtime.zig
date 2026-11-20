@@ -1076,13 +1076,13 @@ pub const Runtime = struct {
                     break :blk if (binary) .borrowed_binary else .data_uri;
                 }
                 if (document_checkpoints) break :blk .borrowed_binary;
-                break :blk remoteAttachmentTransport(try self.readerCapabilities(alloc, cfg), .data_uri);
+                break :blk .data_uri;
             },
             .generator => blk: {
                 var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
                 defer parsed.deinit(alloc);
                 try self.routeGeneratorConfig(alloc, &parsed.generator);
-                if (parsed.output_schema != null) {
+                if (parsed.output_schema != null and (parsed.generator.provider != .antfly or parsed.generator.url.len == 0)) {
                     var engine = self.constrainedRuntime();
                     const caps = try engine.capabilities(alloc, &parsed.generator);
                     _ = try caps.select(parsed.output, null);
@@ -1103,12 +1103,8 @@ pub const Runtime = struct {
                         return error.InferenceInvocationMemoryUnavailable;
                     break :blk .data_uri;
                 }
-                // Use the same model/task/auth-scoped capability cache as
-                // execution. A remote node owns its model memory; this host
-                // owns only the selected transport and bounded response.
-                if (!self.canGenerateBatchWithConfig(parsed, requests)) break :blk .data_uri;
-                const caps = try self.generatorCapabilities(alloc, parsed.generator);
-                break :blk remoteAttachmentTransport(caps, if (caps == null) .data_uri else .base64_payload);
+                // Shaped placement can choose a different attachment transport.
+                break :blk .data_uri;
             },
             .extractor => blk: {
                 if (try generated_extractor.isGenerated(alloc, requests[0].config_json)) {
@@ -2948,10 +2944,7 @@ pub const Runtime = struct {
             );
         }
 
-        var capabilities = (try capabilitiesForRequests(self, alloc, requests)) orelse
-            return error.BatchIncompatible;
-        if (capabilities.task != .generate or capabilities.result_cardinality != .one_per_item)
-            return error.InvalidInferenceCapabilities;
+        var capabilities: ?inference_work.InferenceCapabilities = null;
         const batch_url = try antflyGenerateBatchUrlAlloc(alloc, cfg.url);
         defer alloc.free(batch_url);
         var secret = try common_secrets.SecretValue.initConfigOrEnv(
@@ -2996,7 +2989,7 @@ pub const Runtime = struct {
         var start: usize = 0;
         while (start < requests.len) {
             try self.execution.check(platform.time.monotonicNs());
-            var end = @min(start +| @min(capabilities.batch.max_items, discovery_item_limit), requests.len);
+            var end = @min(start +| @min(if (capabilities) |caps| caps.batch.max_items else requests.len, discovery_item_limit), requests.len);
             if (end <= start) return error.InvalidInferenceCapabilities;
             var placement: remote_capabilities.DiscoveryHeaders = .{};
             var discovery_headers: []const [2][]const u8 = undefined;
@@ -3022,8 +3015,10 @@ pub const Runtime = struct {
                     end = start + discovery_item_limit;
                     continue;
                 };
-                capabilities = capability_lease.capabilities orelse return error.InvalidInferenceCapabilities;
-                const fitting_end = try generatorBatchEnd(alloc, capabilities, remoteAttachmentTransport(capabilities, .base64_payload), requests[0..end], start);
+                const active = capability_lease.capabilities orelse return if (start == 0) error.BatchIncompatible else error.InferenceCapabilitiesStale;
+                if (active.task != .generate or active.result_cardinality != .one_per_item) return error.InvalidInferenceCapabilities;
+                capabilities = active;
+                const fitting_end = try generatorBatchEnd(alloc, active, remoteAttachmentTransport(active, .base64_payload), requests[0..end], start);
                 if (fitting_end == end) break;
                 end = fitting_end;
             }
@@ -3040,7 +3035,7 @@ pub const Runtime = struct {
             const headers = header_storage[0..execution_header_count];
             const attachment_transport = remoteAttachmentTransport(capabilities, .base64_payload);
             const chunk = requests[start..end];
-            try validateGeneratorInvocation(alloc, capabilities, attachment_transport, chunk);
+            try validateGeneratorInvocation(alloc, capabilities.?, attachment_transport, chunk);
             var body = try antflyGenerateBatchRequestAlloc(alloc, cfg, chunk, attachment_transport);
             defer body.deinit(alloc);
             var request_options = httpx.RequestOptions{
@@ -4974,6 +4969,7 @@ fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Req
     var shape: remote_capabilities.DiscoveryShape = .{ .items = @max(1, requests.len), .output_tokens = 0 };
     const Part = struct { type: ?[]const u8 = null, mime_type: ?[]const u8 = null };
     for (requests) |request| {
+        shape.modalities.text = shape.modalities.text or request.source_text.len != 0;
         for (request.media) |media| {
             shape.media = true;
             if (inference_work.modalityForMimeType(media.mime_type)) |modalities|
@@ -4986,7 +4982,9 @@ fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Req
             defer parts.deinit();
             for (parts.value) |part| {
                 const kind = part.type orelse continue;
-                if (std.mem.eql(u8, kind, "image_url")) {
+                if (std.mem.eql(u8, kind, "text")) {
+                    shape.modalities.text = true;
+                } else if (std.mem.eql(u8, kind, "image_url")) {
                     shape.media = true;
                     shape.modalities.image = true;
                 } else if (std.mem.eql(u8, kind, "media")) {
@@ -5511,7 +5509,7 @@ test "asset producer runtime media accounting follows attachment transport" {
     try std.testing.expectEqual(@as(usize, 32), extractor_encoded.encoded_media_bytes);
 }
 
-test "asset producer runtime remote planning uses resolved framed transport" {
+test "asset producer runtime reserves remote fallback transport while enabling framed execution" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -5614,13 +5612,8 @@ test "asset producer runtime remote planning uses resolved framed transport" {
             const caps = (try runtime.producer().capabilitiesForRequests(alloc, &.{request})).?;
             try std.testing.expectEqual(framed, caps.framed_attachments);
             const plan = try runtime.producer().invocationMemoryForRequests(alloc, &.{request});
-            const fallback: inference_work.AttachmentTransport = if (kind == .reader) .data_uri else .base64_payload;
-            const planned_framed = framed and kind != .extractor;
-            try std.testing.expectEqual(if (planned_framed) inference_work.AttachmentTransport.segmented_framed_binary else fallback, plan.attachment_transport);
-            if (planned_framed) {
-                try std.testing.expectEqual(png.len, try plan.attachment_transport.peakResidentSize(png.len, "image/png".len));
-                try std.testing.expectEqual(png.len, try plan.attachment_transport.wireSize(png.len, "image/png".len));
-            }
+            const fallback: inference_work.AttachmentTransport = if (kind == .extractor) .base64_payload else .data_uri;
+            try std.testing.expectEqual(fallback, plan.attachment_transport);
             if (kind == .generator) try std.testing.expect(plan.fixed_bytes < client.maxResponseSize());
             if (kind == .generator) {
                 var generated: ?[]u8 = null;
@@ -7863,7 +7856,7 @@ test "asset producer runtime batches compatible antfly generator requests" {
     const Fixture = struct {
         fn discover(req: httpx.testing_mod.RequestInfo) !void {
             if (req.header(remote_capabilities.discovery_shape_header)) |shape|
-                try std.testing.expectEqualStrings("1:2:0:24", shape);
+                try std.testing.expectEqualStrings("2:2:1:24", shape);
         }
     };
     var server = try httpx.TestServer.start(alloc, io, &.{
@@ -7923,10 +7916,9 @@ test "asset producer runtime batches compatible antfly generator requests" {
     };
 
     try group.concurrent(io, Fiber.run, .{ alloc, producer, cfg_json, &results, &run_err });
-    try server.handleOne(); // planning
     try server.handleOne(); // invocation
     try server.handleOne(); // execution
-    try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+    try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(0));
     try group.await(io);
     if (run_err) |err| return err;
     defer {
@@ -8114,7 +8106,6 @@ test "asset producer runtime preserves generator item failures" {
         }
     };
     try group.concurrent(io, Fiber.run, .{ alloc, producer, &requests, &result, &run_err });
-    try server.handleOne(); // planning
     try server.handleOne(); // invocation
     try server.handleOne(); // execution
     try group.await(io);

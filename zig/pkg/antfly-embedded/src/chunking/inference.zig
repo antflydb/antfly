@@ -292,7 +292,12 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         std.mem.eql(u8, configured_chunk_model, "fixed_bpe") or
         std.mem.eql(u8, configured_chunk_model, "fixed-bert-tokenizer")) "fixed" else configured_chunk_model;
     const boundary_model = if (boundary) |value| value.model else if (cfg.embedding) |target| target.model else null;
-    const boundary_task: inference_work.Operation = if (boundary != null and boundary.?.kind == .transcribe) .transcribe else .embed;
+    const boundary_task: []const u8 = if (boundary) |target| switch (target.kind) {
+        .transcribe => "transcribe",
+        .diarize => "diarize",
+        .embedding => "embed",
+        .classify => return error.InvalidChunkBoundaryModel,
+    } else "embed";
     // The node default credential accompanies only the node default endpoint
     // (chunkers carry no credential of their own); discovery and the chunk
     // call authenticate identically.
@@ -313,7 +318,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     @memcpy(discovery_base[0..routing_header_count], routing_headers);
     var discovery_count = routing_header_count;
     if (boundary_model) |model| {
-        boundary_value = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ boundary_task.wireName(), model });
+        boundary_value = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ boundary_task, model });
         discovery_base[discovery_count] = .{ "X-Antfly-Inference-Chunk-Boundary", boundary_value.? };
         discovery_count += 1;
     }

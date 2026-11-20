@@ -70,7 +70,7 @@ pub const Runtime = struct {
 
     pub fn capabilitiesForMedia(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig, media: bool) !constrained.Capabilities {
         self.required_media = media;
-        return self.planCapabilities(a, cfg, .{ .items = 1, .media = media, .modalities = .{ .image = media }, .output_tokens = std.math.cast(usize, cfg.max_tokens) });
+        return self.planCapabilities(a, cfg, .{ .items = 1, .media = media, .modalities = .{ .text = true, .image = media }, .output_tokens = std.math.cast(usize, cfg.max_tokens) });
     }
 
     fn planCapabilities(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig, shape: ?remote.DiscoveryShape) !constrained.Capabilities {

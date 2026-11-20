@@ -1626,7 +1626,7 @@ pub const ManagedEmbedder = struct {
         // A template may produce media. Its invocation chooses placement after
         // rendering, and its result is not published in the text query cache.
         if (placement != .after_render) {
-            const shape: ?remote_capabilities.DiscoveryShape = if (placement == .text) .{ .items = 1, .output_tokens = 0 } else null;
+            const shape: ?remote_capabilities.DiscoveryShape = if (placement == .text) .{ .items = 1, .modalities = .{ .text = true }, .output_tokens = 0 } else null;
             if (try prepareRemoteQueryEmbedding(alloc, &entry, shape)) |lease| entry.planned_embedding_lease = lease;
         }
         return .{ .entry = entry };
@@ -6469,7 +6469,7 @@ fn remoteEmbeddingHeaders(
 }
 
 fn embeddingPlacementHeaders(placement: *remote_capabilities.DiscoveryHeaders, base: []const [2][]const u8, items: usize, media: bool) ![]const [2][]const u8 {
-    return placement.withShape(base, .{ .items = @max(items, 1), .media = media, .output_tokens = 0 });
+    return placement.withShape(base, .{ .items = @max(items, 1), .media = media, .modalities = .{ .text = !media }, .output_tokens = 0 });
 }
 
 fn hasEmbeddingMedia(parts: []const template_mod.ContentPart) bool {
@@ -6492,7 +6492,7 @@ fn embeddingPartsDiscoveryShape(parts: []const template_mod.ContentPart, items: 
     return .{
         .items = @max(items, 1),
         .media = media,
-        .modalities = if (media) modalities else .{},
+        .modalities = modalities,
         .output_tokens = 0,
     };
 }
@@ -7855,7 +7855,8 @@ fn embedBatchWithEntryForTask(
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
     return withQueryEmbeddingRetry([]const []const f32, alloc, entry, embedBatchWithEntryForTaskOnce, .{ texts, dims, task_type }, task_type, .{
-        .items = texts.len,
+        .items = @max(texts.len, 1),
+        .modalities = .{ .text = true },
         .output_tokens = 0,
     });
 }

@@ -77,10 +77,13 @@ pub fn generationModalities(messages: anytype) work.Modalities {
     var mask: u8 = 0;
     for (messages) |message| {
         const content = message.content orelse continue;
-        if (content != .parts) continue;
+        if (content == .text) {
+            mask |= 1;
+            continue;
+        }
         for (content.parts) |part| {
             const modalities: work.Modalities = switch (part) {
-                .text => .{},
+                .text => .{ .text = true },
                 .image_url => .{ .image = true },
                 .media => |media| work.modalityForMimeType(media.mime_type) orelse .{},
             };

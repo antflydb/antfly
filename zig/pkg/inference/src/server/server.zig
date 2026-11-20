@@ -26542,6 +26542,17 @@ pub const Node = struct {
 
     pub fn listModels(self: *Node, ctx: *httpx.Context) !httpx.Response {
         try ctx.setHeader("X-Antfly-Generation-Placement-Version", "1");
+        if (ctx.header("X-Antfly-Inference-Chunk-Boundary")) |boundary| {
+            if (std.mem.startsWith(u8, boundary, "diarize:")) {
+                const name = boundary["diarize:".len..];
+                const path = self.resolveChunkSpeakerPath(ctx.allocator, name) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return ctx.status(404).json(.{ .@"error" = "SpeakerModelUnavailable" }),
+                };
+                ctx.allocator.free(path);
+                try ctx.setHeader("X-Antfly-Inference-Chunk-Boundary-Available", "true");
+            }
+        }
         const catalog_publication = @import("../registry/catalog_publication.zig");
         const catalog_generation = catalog_publication.read(ctx.allocator, ctx.io, self.config.models_dir) catch |err| return requestModelResolutionError(ctx, err);
         const model = try ctx.queryDecoded("model");
