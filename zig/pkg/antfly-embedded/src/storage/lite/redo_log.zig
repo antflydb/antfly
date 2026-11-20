@@ -549,17 +549,19 @@ pub fn replayBounded(
             in_superseded_run = true;
         } else if (in_superseded_run) {
             // The first genuinely new record right after a superseded
-            // run: only required to be strictly greater than whatever
-            // was last scanned, tolerating however many checkpoint-
-            // consumed-but-unlogged sequence numbers accumulated while
-            // reclaim was gated. Strict `+1` resumes from here on (the
-            // `else` branch below), since every record from here on was
-            // actually logged by a live `Writer.append`, which always
-            // enforces `+1` for anything it accepts.
-            if (last_sequence) |last| {
-                if (header.commit_sequence <= last) {
-                    return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
-                }
+            // run. Gaps among the superseded records are the checkpoints'
+            // own consumed sequences, but the baseline covers everything
+            // through itself: the first new record must follow it exactly,
+            // or jump only over sequences the checkpoint slot covers
+            // without a log record (`unlogged_through`). Anything else is a
+            // missing commit. Strict `+1` resumes from here on (the `else`
+            // branch below), since every record from here on was actually
+            // logged by a live `Writer.append`, which always enforces `+1`
+            // for anything it accepts.
+            const baseline = start_after_sequence.?;
+            const covered_jump = header.commit_sequence > baseline + 1 and unlogged_through != null and header.commit_sequence - 1 <= unlogged_through.?;
+            if (header.commit_sequence != baseline + 1 and !covered_jump) {
+                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
             }
             in_superseded_run = false;
         } else if (last_sequence) |last| {
@@ -755,6 +757,29 @@ test "replay accepts a jump over sequences the checkpoint slot covers" {
     // Coverage never excuses a gap past the slot.
     const past = try replayBounded(testing.allocator, region.file, io, 0, capacity, 9, null, 10, null, null);
     try testing.expectEqual(StopReason.corrupt_record, past.stop_reason);
+}
+
+test "replay rejects a missing commit right after a superseded run" {
+    const io = testing.io;
+    const capacity: u64 = 2048;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    // A record a pinned reader kept past the checkpoint at 10, then 12:
+    // commit 11 never reached the log.
+    var writer = Writer.init(region.file, io, 0, capacity);
+    try writer.append(9, "old");
+    writer.last_sequence = 11;
+    try writer.append(12, "new");
+    try writer.sync();
+
+    const missing = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, 10, null, null);
+    try testing.expectEqual(StopReason.corrupt_record, missing.stop_reason);
+    try testing.expectEqual(@as(u64, 0), missing.valid_count);
+    // The slot covering 11 without a record explains the jump.
+    const covered = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, 11, null, null);
+    try testing.expectEqual(StopReason.end_of_region, covered.stop_reason);
+    try testing.expectEqual(@as(u64, 1), covered.valid_count);
 }
 
 test "bounded replay stops before records past the durable ceiling" {
