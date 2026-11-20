@@ -1051,10 +1051,11 @@ fn compatibilitySummaryForBackendWithControl(allocator: std.mem.Allocator, model
     }
     try control.check();
     if (candidate == .safetensors) {
-        safetensors_mod.validateArtifactSet(
+        safetensors_mod.validateArtifactSetWithControl(
             allocator,
             man.safetensors_path,
             man.safetensors_index_path,
+            control,
         ) catch |err| {
             if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
             return .{

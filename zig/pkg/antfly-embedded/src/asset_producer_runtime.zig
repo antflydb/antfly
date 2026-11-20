@@ -219,6 +219,20 @@ test "reader split windows share bounded inline placement decoding" {
     try std.testing.expectEqual(@as(usize, png_uri.len), geom.batch.encoded);
     try std.testing.expectEqual(@as(u8, 1), mime.batch);
 }
+test "reader split windows share WebP canvas geometry from an incomplete RIFF" {
+    const header = "RIFF\x00\x00\x02\x00WEBPVP8X\x0a\x00\x00\x00\x00\x00\x00\x00\x0f\x00\x00\x1f\x00\x00";
+    const uri_prefix = "data:image/webp;base64,";
+    var uri: [uri_prefix.len + std.base64.standard.Encoder.calcSize(header.len)]u8 = undefined;
+    @memcpy(uri[0..uri_prefix.len], uri_prefix);
+    _ = std.base64.standard.Encoder.encode(uri[uri_prefix.len..], header);
+    var complete = true;
+    var mime: Runtime.ReaderMimeShape = .{};
+    const geometry = try Runtime.readerMediaGeometry(readers.Request{ .images = &.{&uri} }, &complete, &mime);
+    try std.testing.expect(complete);
+    try std.testing.expectEqual(@as(u64, 16 * 32), geometry.batch.pixels);
+    try std.testing.expectEqual(@as(u8, 16), mime.batch);
+}
+
 test "reader split windows share the proxy JPEG metadata scan boundary" {
     const frame = "\xff\xc0\x00\x08\x08\x00\x0d\x00\x0b\x01";
     try std.testing.expect(Runtime.readerGeometryVerifiable("\xff\xd8" ++ frame));
@@ -4118,7 +4132,7 @@ pub const Runtime = struct {
             complete.* = false;
             return 0;
         }
-        const pixels = inference_work.encodedImagePixels(prefix.mime_type, prefix.bytes) catch {
+        const pixels = inference_work.encodedImagePrefixPixels(prefix.mime_type, prefix.bytes) catch {
             complete.* = false;
             return 0;
         };
@@ -4136,7 +4150,7 @@ pub const Runtime = struct {
                 };
                 mime_shape.add(prefix.mime_type, index);
                 const pixels = if (readerGeometryVerifiable(prefix.bytes))
-                    inference_work.encodedImagePixels(prefix.mime_type, prefix.bytes) catch readerInlinePixels(image, complete)
+                    inference_work.encodedImagePrefixPixels(prefix.mime_type, prefix.bytes) catch readerInlinePixels(image, complete)
                 else
                     readerInlinePixels(image, complete);
                 break :blk .{ .encoded = image.len, .framed = image.len, .pixels = pixels };
@@ -4203,6 +4217,7 @@ pub const Runtime = struct {
                     json_only = true;
                     continue;
                 },
+                error.InferenceDiscoveryShapeRejected => return if (framed_failure == error.InferenceDiscoveryTooManyItems) error.InferenceDiscoveryTooManyItems else err,
                 error.InferenceDiscoveryRequiresExactGeometry, error.InferenceDiscoveryTooManyItems, error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilityDiscoveryRejected => {
                     if (rounded) {
                         rounded = false;

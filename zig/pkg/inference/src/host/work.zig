@@ -446,6 +446,17 @@ pub fn encodedImagePixels(content_type: []const u8, bytes: []const u8) !u64 {
     return info.pixels() catch return error.InferenceDecodedPixelsExceeded;
 }
 
+pub fn encodedImagePrefixPixels(content_type: []const u8, bytes: []const u8) !u64 {
+    const essence = mimeTypeEssence(content_type) catch return error.UnsupportedInferenceMimeType;
+    if (antfly_image.inferenceFormatForMimeEssence(essence) != .webp)
+        return encodedImagePixels(content_type, bytes);
+    const info = antfly_image.webp.probeDimensionsPrefix(bytes) catch return error.InvalidInferenceMedia;
+    const width = info.width orelse return error.InvalidInferenceMedia;
+    const height = info.height orelse return error.InvalidInferenceMedia;
+    if (width == 0 or height == 0) return error.InvalidInferenceMedia;
+    return @as(u64, width) * height;
+}
+
 test "inference capabilities measure physical image pixels and MIME" {
     var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
