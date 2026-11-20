@@ -2867,10 +2867,6 @@ const LegacyArtifactDigestCache = struct {
     var next: usize = 0;
     var forbid_hashing_for_test: bool = false;
 
-    fn digest(io: std.Io, artifact: managed_receipt.ValidatedArtifact) ![32]u8 {
-        return digestWithControl(io, artifact, .{});
-    }
-
     fn digestWithControl(io: std.Io, artifact: managed_receipt.ValidatedArtifact, control: InferenceExecutionControl) ![32]u8 {
         try control.check();
         const signature = try componentDependencySignature(io, &.{artifact.canonical_path});
@@ -2929,12 +2925,13 @@ const LegacyArtifactDigestCache = struct {
 /// Stable identity before loading weights. Managed receipts use relative paths
 /// and pinned content digests, so copying/restoring a model preserves reuse.
 pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
-    return modelIdentityWithArtifacts(a, io, model_dir, manifest, null);
+    return modelIdentityWithArtifacts(a, io, model_dir, manifest, null, .{});
 }
 
 /// Cold construction shares its receipt and checksum proofs with tokenizer
 /// preparation instead of hashing a large embedded-tokenizer GGUF twice.
-fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest, published: ?*PublishedArtifacts) ![32]u8 {
+fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest, published: ?*PublishedArtifacts, control: InferenceExecutionControl) ![32]u8 {
+    try control.check();
     var owned: ?managed_receipt.ValidatedReceipt = null;
     defer if (owned) |*validated| validated.deinit();
     const receipt: ?*managed_receipt.ValidatedReceipt = if (published) |source|
@@ -2956,6 +2953,7 @@ fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []con
         }.less);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         for (artifacts) |artifact| {
+            try control.check();
             var decoded: [32]u8 = undefined;
             if (published) |source| {
                 try source.verifyFile(artifact.path);
@@ -2963,8 +2961,8 @@ fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []con
                     // verifyFile authenticated this digest against the actual
                     // file and retained its complete construction stamp.
                     _ = std.fmt.hexToBytes(&decoded, digest) catch return error.InvalidManagedDownload;
-                } else decoded = try LegacyArtifactDigestCache.digest(io, artifact);
-            } else decoded = try LegacyArtifactDigestCache.digest(io, artifact);
+                } else decoded = try LegacyArtifactDigestCache.digestWithControl(io, artifact, control);
+            } else decoded = try LegacyArtifactDigestCache.digestWithControl(io, artifact, control);
             if (artifact.sha256) |digest| {
                 if (digest.len != 64) return error.InvalidManagedDownload;
                 var expected: [32]u8 = undefined;
@@ -10012,7 +10010,7 @@ pub const ModelManager = struct {
         defer proof.deinit();
         var bound = try BoundModelSource.init(&proof, model_dir, ModelSource.kindForPath(model_dir), &man, null);
         defer bound.deinit();
-        const revision = try modelIdentityWithArtifacts(self.allocator, io, model_dir, man, &artifacts);
+        const revision = try modelIdentityWithArtifacts(self.allocator, io, model_dir, man, &artifacts, control);
         const planning = try chunkPlanningSnapshotWithControl(self.allocator, io, man, revision, control);
         const gemma_compat = tokenizerGemmaCompat(man, model_dir);
         const kind = try tokenizerKindWithArtifacts(man, &artifacts, gemma_compat);
@@ -10070,7 +10068,7 @@ pub const ModelManager = struct {
         const identity = if (man.embedding_style == .embedding_gemma2)
             try self.chunkPlanningGemmaIdentity(model_dir, man, io, control)
         else
-            std.fmt.bytesToHex(try modelIdentity(self.allocator, io, model_dir, man), .lower);
+            std.fmt.bytesToHex(try modelIdentityWithArtifacts(self.allocator, io, model_dir, man, null, control), .lower);
         _ = try self.publicationForRequest(model_dir, control);
         return identity;
     }
@@ -10145,7 +10143,7 @@ pub const ModelManager = struct {
         defer tokenizer_artifacts.deinit();
         tokenizer_artifacts.verification_cache = &self.verified_artifacts;
         const resolution_file_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man);
-        const resolution_revision = try modelIdentityWithArtifacts(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man, &tokenizer_artifacts);
+        const resolution_revision = try modelIdentityWithArtifacts(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man, &tokenizer_artifacts, .{});
         const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
         const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
             try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)
@@ -18870,7 +18868,7 @@ test "model selection embedded SentencePiece accounts and verifies independent o
         var shared = try PublishedArtifacts.init(a, counted_io, root, null);
         defer shared.deinit();
         Probe.opens = 0;
-        _ = try modelIdentityWithArtifacts(a, counted_io, root, man, &shared);
+        _ = try modelIdentityWithArtifacts(a, counted_io, root, man, &shared, .{});
         _ = try tokenizerLoadAdmissionPlanWithArtifacts(a, root, &man, .sentencepiece, &shared);
         const tokenizer = try loadSentencePieceTokenizerWithArtifacts(a, &man, &shared);
         defer {

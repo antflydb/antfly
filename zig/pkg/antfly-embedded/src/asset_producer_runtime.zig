@@ -152,21 +152,46 @@ fn mergeReaderExecution(report: *inference_work.ExecutionReport, chunk: readers.
 
 test "reader split windows share the original response budget" {
     const FakeReader = struct {
+        var tail_attempts: usize = 0;
+
         fn read(_: *Runtime, alloc: Allocator, _: readers.Config, request: readers.Request) !readers.BatchResult {
             if (request.images.len > 1) return error.InferenceDiscoveryTooManyItems;
             const expected: usize = if (std.mem.eql(u8, request.images[0], "first")) 10 else 4;
             try std.testing.expectEqual(@as(?usize, expected), request.max_response_bytes);
+            if (expected == 4) {
+                tail_attempts += 1;
+                if (tail_attempts == 1) return error.InferenceCapabilitiesStale;
+            }
             const items = try alloc.alloc(readers.Result, 1);
             errdefer alloc.free(items);
             items[0] = .{ .text = try alloc.dupe(u8, "text") };
             return .{ .items = items, .execution = .{ .requested_items = 1, .serial_items = 1 }, .response_body_bytes = 6 };
         }
     };
-    var runtime: Runtime = undefined;
-    try std.testing.expectError(error.ResponseTooLarge, runtime.readImageWindows(std.testing.allocator, .{ .provider = .antfly }, readers.Request{
+    const alloc = std.testing.allocator;
+    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    defer client.deinit();
+    var runtime = Runtime.init(alloc, &client);
+    defer runtime.deinit();
+    FakeReader.tail_attempts = 0;
+    try std.testing.expectError(error.ResponseTooLarge, runtime.readImageWindows(alloc, .{ .provider = .antfly, .url = "https://reader.example" }, readers.Request{
         .images = &.{ "first", "second" },
         .max_response_bytes = 10,
     }, FakeReader.read));
+    try std.testing.expectEqual(@as(usize, 2), FakeReader.tail_attempts);
+}
+
+test "reader split windows share rounded geometry envelopes" {
+    const geometry: remote_capabilities.DiscoveryMediaGeometry = .{
+        .batch = .{ .encoded = 1031, .framed = 1000, .pixels = 251 },
+        .first = .{ .encoded = 1000, .framed = 980, .pixels = 240 },
+    };
+    const rounded = geometry.roundedUp();
+    try std.testing.expectEqual(@as(usize, 1152), rounded.batch.encoded);
+    try std.testing.expectEqual(@as(usize, 1024), rounded.batch.framed);
+    try std.testing.expectEqual(@as(u64, 256), rounded.batch.pixels);
+    try std.testing.expect(rounded.first.encoded <= rounded.batch.encoded);
+    try std.testing.expectEqual(rounded, rounded.roundedUp());
 }
 
 test "reader execution report preserves mixed native and fallback completion" {
@@ -3444,22 +3469,22 @@ pub const Runtime = struct {
                 &chunk_fingerprint_buffer,
             );
             var chunk_batch = (if (uses_encoded_media)
-                self.readEncodedImagesWithConfigReported(alloc, cfg_parsed.value, .{
+                self.readReaderWindow(alloc, cfg_parsed.value, readers.EncodedRequest{
                     .images = flat_encoded.items[image_offset..image_end],
                     .prompt = shared_prompt,
                     .max_tokens = cfg_parsed.value.max_tokens,
                     .source_fingerprint = chunk_source_fingerprint,
                     .max_response_bytes = @min(remaining_response_bytes, self.responseLimitForTask(.reader, image_end - image_offset)),
-                })
+                }, readEncodedImagesWithConfigReported)
             else
-                self.readImagesWithConfigReported(alloc, cfg_parsed.value, .{
+                self.readReaderWindow(alloc, cfg_parsed.value, readers.Request{
                     .images = flat_images.items[image_offset..image_end],
                     .prompt = shared_prompt,
                     .max_tokens = cfg_parsed.value.max_tokens,
                     .inline_content_trust = if (requests[0].inline_media_trusted) .trusted_internal else .untrusted,
                     .source_fingerprint = chunk_source_fingerprint,
                     .max_response_bytes = @min(remaining_response_bytes, self.responseLimitForTask(.reader, image_end - image_offset)),
-                })) catch |err| {
+                }, readImagesWithConfigReported)) catch |err| {
                 const attempted = image_end - image_offset;
                 if (local_reader) return err;
                 reader_chunk_max_images = smallerReaderWindow(err, attempted) orelse return err;
@@ -3943,9 +3968,19 @@ pub const Runtime = struct {
         return items / 2;
     }
 
+    fn readReaderWindow(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: anytype, comptime readOnce: anytype) !readers.BatchResult {
+        const identity_before = if (self.model_execution_identity) |identity| identity.* else null;
+        return readOnce(self, alloc, cfg, request) catch |err| {
+            if (err != error.InferenceCapabilitiesStale or cfg.provider != .antfly or isLocalReaderProvider(cfg.provider, self.routedReaderConfig(cfg).resolvedUrl())) return err;
+            if (self.model_execution_identity) |identity| identity.* = identity_before.?;
+            try self.execution.check(platform.time.monotonicNs());
+            return readOnce(self, alloc, cfg, request);
+        };
+    }
+
     fn readImageWindows(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: anytype, comptime readOnce: anytype) ![]readers.Result {
         var limit: usize = undefined;
-        if (readOnce(self, alloc, cfg, request)) |batch| {
+        if (self.readReaderWindow(alloc, cfg, request, readOnce)) |batch| {
             return batch.items;
         } else |err| {
             limit = smallerReaderWindow(err, request.images.len) orelse return err;
@@ -3962,7 +3997,7 @@ pub const Runtime = struct {
             var window = request;
             window.max_response_bytes = remaining_response_bytes;
             window.images = request.images[filled..@min(filled +| limit, request.images.len)];
-            var batch = readOnce(self, alloc, cfg, window) catch |err| {
+            var batch = self.readReaderWindow(alloc, cfg, window, readOnce) catch |err| {
                 limit = smallerReaderWindow(err, window.images.len) orelse return err;
                 continue;
             };
@@ -3993,11 +4028,14 @@ pub const Runtime = struct {
         return results;
     }
 
-    fn readerMediaGeometry(alloc: Allocator, request: anytype) !remote_capabilities.DiscoveryMediaGeometry {
+    fn readerMediaGeometry(alloc: Allocator, request: anytype, complete: *bool) !remote_capabilities.DiscoveryMediaGeometry {
         var geometry: remote_capabilities.DiscoveryMediaGeometry = .{};
         for (request.images, 0..) |image, index| {
             const item: remote_capabilities.DiscoveryMediaCost = if (@TypeOf(request) == readers.Request) blk: {
-                const parsed = (try inference_work.parseInlineDataUri(image)) orelse continue;
+                const parsed = (try inference_work.parseInlineDataUri(image)) orelse {
+                    complete.* = false;
+                    continue;
+                };
                 if (parsed.decoded_size == 0) return error.InvalidDataURI;
                 const pixels = try inlineImagePixelsAlloc(alloc, parsed.mime_type, image);
                 break :blk .{ .encoded = image.len, .framed = image.len, .pixels = pixels };
@@ -4016,26 +4054,32 @@ pub const Runtime = struct {
 
     fn bindReaderPlacement(self: *Runtime, endpoint: []const u8, model: []const u8, placement: *remote_capabilities.DiscoveryHeaders, headers: *[]const [2][]const u8, alloc: Allocator, request: anytype, measured: *?remote_capabilities.DiscoveryMediaGeometry) !remote_capabilities.CapabilityLease {
         const cache = self.capabilityCache();
-        const lease = try cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, headers.*, self.execution.waitContext());
-        if (lease.capabilities) |caps| {
-            const geometry = try readerMediaGeometry(alloc, request);
-            measured.* = geometry;
-            // Keep the common path keyed by count and modality. Refine the
-            // lookup only when the selected contract cannot fit this media.
+        const wait = self.execution.waitContext();
+        var complete = request.images.len != 0;
+        const geometry = try readerMediaGeometry(alloc, request, &complete);
+        measured.* = geometry;
+        if (!complete) {
+            return cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, headers.*, wait);
+        }
+
+        const shaped = headers.*;
+        const rounded = geometry.roundedUp();
+        headers.* = try placement.withMediaGeometry(shaped, rounded);
+        const candidate = cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, headers.*, wait) catch |err| switch (err) {
+            error.InferenceDiscoveryTooManyItems, error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilityDiscoveryRejected => {
+                if (std.meta.eql(geometry, rounded)) return err;
+                headers.* = try placement.withMediaGeometry(shaped, geometry);
+                return cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, headers.*, wait);
+            },
+            else => return err,
+        };
+        if (candidate.capabilities) |caps| {
             if (!geometry.fits(caps)) {
-                headers.* = try placement.withMediaGeometry(headers.*, geometry);
-                const first = remote_capabilities.DiscoveryMediaGeometry{ .batch = geometry.first, .first = geometry.first };
-                const refined = cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, headers.*, self.execution.waitContext()) catch |err| {
-                    if (err == error.RemoteCapabilityDiscoveryTransient and first.fits(caps))
-                        return error.InferenceDiscoveryTooManyItems;
-                    return err;
-                };
-                const selected = refined.capabilities orelse return error.InferenceCapabilitiesUnavailable;
-                if (!geometry.fits(selected) and first.fits(selected)) return error.InferenceDiscoveryTooManyItems;
-                return refined;
+                const first = remote_capabilities.DiscoveryMediaGeometry{ .batch = geometry.first };
+                if (first.fits(caps) and request.images.len > 1) return error.InferenceDiscoveryTooManyItems;
             }
         }
-        return lease;
+        return candidate;
     }
 
     fn readImagesWithConfig(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.Request) ![]readers.Result {
@@ -4132,6 +4176,10 @@ pub const Runtime = struct {
             return .{ .items = items, .execution = .{ .requested_items = items.len, .serial_items = items.len } };
         }
 
+        return self.dispatchReaderUris(alloc, execution_cfg, request, capability_auth_headers);
+    }
+
+    fn dispatchReaderUris(self: *Runtime, alloc: Allocator, execution_cfg: readers.Config, request: readers.Request, capability_auth_headers: []const [2][]const u8) !readers.BatchResult {
         return readers.readWithConfigReported(alloc, self.http, execution_cfg, request, .{
             .source_table = self.execution.routing.source_table,
             .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
@@ -4348,14 +4396,18 @@ pub const Runtime = struct {
             urls[i] = url;
             initialized += 1;
         }
-        var adapted = try self.readImagesWithConfigReported(alloc, execution_cfg, .{
+        const uri_request: readers.Request = .{
             .images = urls,
             .prompt = request.prompt,
             .max_tokens = request.max_tokens,
             .inline_content_trust = .trusted_internal,
             .source_fingerprint = request.source_fingerprint,
             .max_response_bytes = request.max_response_bytes,
-        });
+        };
+        var adapted = if (!local_reader and execution_cfg.provider == .antfly)
+            try self.dispatchReaderUris(alloc, execution_cfg, uri_request, capability_auth_headers)
+        else
+            try self.readImagesWithConfigReported(alloc, execution_cfg, uri_request);
         errdefer adapted.deinit(alloc);
         const items = adapted.items;
         if (items.len != request.images.len) return error.InvalidReaderResponse;

@@ -86,6 +86,25 @@ pub const DiscoveryMediaGeometry = struct {
     batch: DiscoveryMediaCost = .{},
     first: DiscoveryMediaCost = .{},
 
+    /// Round upward to shared cache envelopes with at most eight steps per
+    /// power of two. Exact discovery remains available at tight limits.
+    pub fn roundedUp(self: DiscoveryMediaGeometry) DiscoveryMediaGeometry {
+        const Round = struct {
+            fn upper(value: anytype) @TypeOf(value) {
+                const bits = @typeInfo(@TypeOf(value)).int.bits;
+                if (value < 8) return value;
+                const shift = bits - 1 - @clz(value) - 3;
+                const mask = (@as(@TypeOf(value), 1) << @intCast(shift)) - 1;
+                if (value > std.math.maxInt(@TypeOf(value)) - mask) return std.math.maxInt(@TypeOf(value));
+                return (value + mask) & ~mask;
+            }
+            fn cost(value: DiscoveryMediaCost) DiscoveryMediaCost {
+                return .{ .encoded = upper(value.encoded), .framed = upper(value.framed), .pixels = upper(value.pixels) };
+            }
+        };
+        return .{ .batch = Round.cost(self.batch), .first = Round.cost(self.first) };
+    }
+
     pub fn fits(self: DiscoveryMediaGeometry, caps: work.InferenceCapabilities) bool {
         const bytes = if (caps.framed_attachments) self.batch.framed else self.batch.encoded;
         if (caps.batch.max_encoded_media_bytes) |limit| if (bytes > limit) return false;
