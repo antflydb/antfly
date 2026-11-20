@@ -46723,12 +46723,47 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         if (ordinals.len != values.len) return error.InvalidArgument;
         @memset(values, null);
-        var txn = try self.core.store.beginProbeTxn();
-        defer txn.abort();
-        for (ordinals, values) |ordinal, *value| {
-            const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse continue;
-            if (!(if (generation) |at| state.isVisibleAt(at) else state.isLive())) continue;
-            value.* = (try doc_identity.lookupDocIdTxn(alloc, &txn, ordinal)) orelse return error.InvalidDocIdentity;
+        errdefer for (values) |*slot| {
+            if (slot.*) |key| alloc.free(key);
+            slot.* = null;
+        };
+        var offset: usize = 0;
+        while (offset < ordinals.len) {
+            const page = ordinals[offset..][0..@min(256, ordinals.len - offset)];
+            const output = values[offset..][0..page.len];
+            offset += page.len;
+            var positions: [256]usize = undefined;
+            for (positions[0..page.len], 0..) |*slot, slot_index| slot.* = slot_index;
+            std.mem.sort(usize, positions[0..page.len], page, struct {
+                fn less(numbers: []const doc_set.DocOrdinal, lhs: usize, rhs: usize) bool {
+                    return numbers[lhs] < numbers[rhs];
+                }
+            }.less);
+
+            var txn = try self.core.store.beginProbeTxnWithBlockCacheAdmission(.transient);
+            defer txn.abort();
+            var encoded: [256]@TypeOf(internal_keys.identityOrdinalStateKey(0)) = undefined;
+            var keys: [256][]const u8 = undefined;
+            var records: [256]?[]const u8 = undefined;
+            for (positions[0..page.len], 0..) |position, index| {
+                encoded[index] = internal_keys.identityOrdinalStateKey(page[position]);
+                keys[index] = &encoded[index];
+            }
+            try txn.getManySorted(keys[0..page.len], records[0..page.len]);
+            var visible_count: usize = 0;
+            for (positions[0..page.len], records[0..page.len]) |position, record| {
+                const state = try doc_identity.decodeOrdinalState(record orelse continue);
+                if (!(if (generation) |at| state.isVisibleAt(at) else state.isLive())) continue;
+                positions[visible_count] = position;
+                encoded[visible_count] = internal_keys.identityOrdinalToDocKey(page[position]);
+                keys[visible_count] = &encoded[visible_count];
+                visible_count += 1;
+            }
+            if (visible_count == 0) continue;
+            try txn.getManySorted(keys[0..visible_count], records[0..visible_count]);
+            for (positions[0..visible_count], records[0..visible_count]) |position, record| {
+                output[position] = try alloc.dupe(u8, record orelse return error.InvalidDocIdentity);
+            }
         }
     }
 
@@ -48754,9 +48789,9 @@ pub const DB = struct {
         return try self.core.index_manager.lookupDenseDocKey(self.core.store, index_name, vector_id);
     }
 
-    fn denseResidualVectorIdsCallback(ctx: ?*anyopaque, alloc: Allocator, name: []const u8, keys: []const []const u8) anyerror![]u64 {
+    fn denseResidualVectorIdsCallback(ctx: ?*anyopaque, alloc: Allocator, name: []const u8, keys: []const []const u8, control: db_query_search.QueryExecutionControl) anyerror![]u64 {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return self.core.index_manager.lookupDenseVectorIdsForParentKeysAlloc(alloc, self.core.store, name, keys);
+        return self.core.index_manager.lookupDenseVectorIdsForParentKeysControlledAlloc(alloc, self.core.store, name, keys, control);
     }
 
     fn denseVectorIdCallback(
@@ -48942,6 +48977,7 @@ pub const DB = struct {
         reverse: bool = false,
         stopped: bool = false,
         observed_rows: ?*usize = null,
+        ordered_spill_enabled: bool = true,
 
         fn scan(raw: ?*anyopaque, alloc: Allocator, options: db_query_search.MatchAllCandidateCollectOptions, visitor_ctx: ?*anyopaque, visitor: db_query_search.PrimaryCandidateVisitor) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
@@ -49092,9 +49128,9 @@ pub const DB = struct {
             defer scratch.deinit();
             const temp = scratch.allocator();
             var resolved: [limit]?[]const u8 = undefined;
-            resolvePrimaryOrdinalKeysCallback(self.db, temp, ordinals, self.req.identity_read_generation, resolved[0..ordinals.len]) catch |err| switch (err) {
-                error.InvalidDocIdentity => return false,
-                else => return err,
+            resolvePrimaryOrdinalKeysCallback(self.db, temp, ordinals, self.req.identity_read_generation, resolved[0..ordinals.len]) catch |err| {
+                if (recoverableSourceIdentityError(err)) return false;
+                return err;
             };
             const Candidate = struct {
                 id: []const u8,
@@ -49130,10 +49166,11 @@ pub const DB = struct {
 
         fn scanLargeOrderedScope(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !bool {
             if (comptime builtin.os.tag == .freestanding) return false;
+            if (!self.ordered_spill_enabled) return false;
             var delivery_started = false;
             return self.scanLargeOrderedScopeWithSpill(options, &delivery_started) catch |err| {
                 if (delivery_started) return err;
-                if (@import("../../sql/spill.zig").searchSpillUnavailable(err)) return false;
+                if (recoverableSourceIdentityError(err) or @import("../../sql/spill.zig").searchSpillUnavailable(err)) return false;
                 return err;
             };
         }
@@ -49187,10 +49224,7 @@ pub const DB = struct {
                     }
                 }
                 if (len == 0) break;
-                resolvePrimaryOrdinalKeysCallback(self.db, scratch.allocator(), ordinals[0..len], self.req.identity_read_generation, resolved[0..len]) catch |err| switch (err) {
-                    error.InvalidDocIdentity => return false,
-                    else => return err,
-                };
+                try resolvePrimaryOrdinalKeysCallback(self.db, scratch.allocator(), ordinals[0..len], self.req.identity_read_generation, resolved[0..len]);
                 for (ordinals[0..len], resolved[0..len]) |ordinal, value| {
                     const id = value orelse continue;
                     if (!self.orderedScopeContains(options, id)) continue;
@@ -49293,6 +49327,8 @@ pub const DB = struct {
                 ttl_duration: u64,
                 now: u64,
                 prefix: ?*SourcePrefix,
+                options: db_query_search.MatchAllCandidateCollectOptions,
+                recovery: SourceRecovery,
                 examined: usize = 0,
                 exhausted_budget: bool = false,
 
@@ -49314,11 +49350,6 @@ pub const DB = struct {
                     const source_batch: *@This() = @ptrCast(@alignCast(raw.?));
                     try db_query_search.checkSearchRequestDeadline(source_batch.owner.req);
                     const id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(source_batch.arena.allocator(), key)) orelse return .@"continue";
-                    if (source_batch.prefix) |bound| {
-                        bound.last_key.clearRetainingCapacity();
-                        try bound.last_key.appendSlice(source_batch.owner.alloc, id);
-                        bound.has_key = true;
-                    }
                     source_batch.keys[source_batch.len] = id;
                     source_batch.len += 1;
                     return if (source_batch.len == source_batch.batch_size) source_batch.flush() else .@"continue";
@@ -49328,30 +49359,83 @@ pub const DB = struct {
                     if (source_batch.len == 0) return .@"continue";
                     const owner = source_batch.owner;
                     const keys = source_batch.keys[0..source_batch.len];
+                    const needs_reverse = if (source_batch.options.constraints) |constraints|
+                        constraints.positive_filter and
+                            (if (constraints.primary_include_compact)
+                                constraints.primary_include == .ordinals or constraints.primary_include == .ordinal_bitmap
+                            else
+                                constraints.filter_doc_nums.len != 0)
+                    else
+                        false;
                     var visible: [256]bool = @splat(true);
                     var ordinals: [256]?doc_set.DocOrdinal = @splat(null);
                     {
                         var txn = try owner.db.core.store.beginProbeTxn();
                         defer txn.abort();
                         const temp = source_batch.arena.allocator();
-                        const mapped = try doc_identity.lookupOrdinalsTxnAlloc(temp, &txn, keys);
-                        for (keys, mapped, 0..) |id, forward, i| {
-                            switch (try owner.resolvePreparedIdentity(temp, &txn, id, @as(??doc_set.DocOrdinal, forward))) {
+                        const mapped: ?[]?doc_set.DocOrdinal = doc_identity.lookupOrdinalsTxnAlloc(temp, &txn, keys) catch |err| fallback: {
+                            if (source_batch.prefix != null or !recoverableSourceIdentityError(err)) return source_batch.rejectSpeculativeBatch(err);
+                            break :fallback null;
+                        };
+                        var failures: [256]?anyerror = @splat(null);
+                        var failed = false;
+                        for (keys, 0..) |id, i| {
+                            const forward: ??doc_set.DocOrdinal = if (mapped) |values| @as(??doc_set.DocOrdinal, values[i]) else null;
+                            const identity = owner.resolvePreparedIdentity(temp, &txn, id, forward) catch |err| {
+                                if (source_batch.prefix != null or !recoverableSourceIdentityError(err)) return source_batch.rejectSpeculativeBatch(err);
+                                failures[i] = err;
+                                failed = true;
+                                continue;
+                            };
+                            switch (identity) {
                                 .invisible => visible[i] = false,
-                                .unmapped => {},
+                                .unmapped => if (needs_reverse) {
+                                    if (source_batch.prefix != null) return source_batch.rejectSpeculativeBatch(error.InvalidDocIdentity);
+                                    failures[i] = error.NotFound;
+                                    failed = true;
+                                },
                                 .visible => |ordinal| ordinals[i] = ordinal,
                             }
                         }
+                        if (failed) try owner.recoverScopedSourceBatch(
+                            source_batch.options,
+                            &source_batch.recovery,
+                            temp,
+                            keys,
+                            failures[0..keys.len],
+                            visible[0..keys.len],
+                            ordinals[0..keys.len],
+                        );
                     }
-                    const timestamps = if (source_batch.ttl_duration == 0) null else try loadDocumentTimestampsManyWithIdentityShape(owner.db, source_batch.arena.allocator(), keys, true);
-                    for (keys, ordinals[0..keys.len], visible[0..keys.len], 0..) |id, ordinal, include, i| {
-                        if (timestamps) |values| if (values[i]) |ts| {
-                            if (ttl_mod.isExpired(ts, source_batch.ttl_duration, source_batch.now)) continue;
-                        };
-                        if (include and try owner.visitor(owner.visitor_ctx, id, ordinal, true, true) == .stop) {
+                    const timestamps = timestamps: {
+                        if (source_batch.ttl_duration == 0) break :timestamps null;
+                        var eligible_keys: [256][]const u8 = undefined;
+                        var eligible: usize = 0;
+                        for (keys, visible[0..keys.len]) |id, include| {
+                            if (!include) continue;
+                            eligible_keys[eligible] = id;
+                            eligible += 1;
+                        }
+                        if (eligible == 0) break :timestamps null;
+                        break :timestamps try loadDocumentTimestampsManyWithIdentityShape(owner.db, source_batch.arena.allocator(), eligible_keys[0..eligible], true);
+                    };
+                    var timestamp_slot: usize = 0;
+                    for (keys, ordinals[0..keys.len], visible[0..keys.len]) |id, ordinal, include| {
+                        if (!include) continue;
+                        if (timestamps) |values| {
+                            const timestamp = values[timestamp_slot];
+                            timestamp_slot += 1;
+                            if (timestamp) |ts| if (ttl_mod.isExpired(ts, source_batch.ttl_duration, source_batch.now)) continue;
+                        }
+                        if (try owner.visitor(owner.visitor_ctx, id, ordinal, true, true) == .stop) {
                             owner.stopped = true;
                             return .stop;
                         }
+                    }
+                    if (source_batch.prefix) |bound| {
+                        bound.last_key.clearRetainingCapacity();
+                        try bound.last_key.appendSlice(owner.alloc, keys[keys.len - 1]);
+                        bound.has_key = true;
                     }
                     // A full batch that did not fill the page encountered
                     // rejected rows. Amortize subsequent identity probes.
@@ -49360,6 +49444,13 @@ pub const DB = struct {
                     source_batch.len = 0;
                     _ = source_batch.arena.reset(.retain_capacity);
                     return .@"continue";
+                }
+
+                fn rejectSpeculativeBatch(source_batch: *@This(), err: anyerror) !docstore_mod.DocStore.ScanAction {
+                    if (source_batch.prefix == null or !recoverableSourceIdentityError(err)) return err;
+                    source_batch.exhausted_budget = true;
+                    source_batch.len = 0;
+                    return .stop;
                 }
             };
             const owner_range = self.db.core.byteRange();
@@ -49377,20 +49468,252 @@ pub const DB = struct {
             if (before) |key| if (std.mem.order(u8, key, owner_range.start) != .gt) return true;
             const upper = if (end.len == 0) null else try internal_keys.documentRangeLowerAlloc(self.alloc, end);
             defer if (upper) |bound| self.alloc.free(bound);
+            var recovery_budget: ?resource_manager_mod.BudgetedAllocator = if (resource_manager_mod.BudgetedAllocator.fromAllocator(self.alloc) == null)
+                if (self.db.core.index_manager.resource_manager) |manager|
+                    resource_manager_mod.BudgetedAllocator.init(manager, .lsm_read_working_set, self.alloc, 1)
+                else
+                    null
+            else
+                null;
+            defer if (recovery_budget) |*budget| budget.deinit();
+            const recovery_alloc = if (recovery_budget) |*budget| budget.allocator() else self.alloc;
             var source_batch = Scan{
                 .owner = self,
                 .arena = std.heap.ArenaAllocator.init(self.alloc),
                 .ttl_duration = ttlDurationNs(self.db),
                 .now = currentTimeNs(),
                 .prefix = prefix,
+                .options = options,
+                .recovery = .{ .arena = std.heap.ArenaAllocator.init(recovery_alloc) },
                 .batch_size = @min(@max(options.scan_batch_size orelse 256, 1), 256),
             };
             defer source_batch.arena.deinit();
+            defer source_batch.recovery.deinit();
             var txn = try self.db.core.store.beginCurrentScanTxn();
             defer txn.abort();
             try self.db.core.store.scanStoredDocumentRowsReadTxnWithContext(&txn, lower, upper orelse &.{}, options.primary_key_reverse, &source_batch, Scan.checkpoint, Scan.visit);
             if (!self.stopped) _ = try source_batch.flush();
             return self.stopped or !source_batch.exhausted_budget;
+        }
+
+        fn recoverableSourceIdentityError(err: anyerror) bool {
+            return err == error.InvalidDocIdentity or err == error.StorageReadTemporarilyUnavailable;
+        }
+
+        const SourceRecovery = struct {
+            const Entry = struct {
+                ordinal: doc_set.DocOrdinal,
+                visible: ?bool = null,
+            };
+            arena: std.heap.ArenaAllocator,
+            // Retain one lazily opened view for the source scan. Individual
+            // read scopes bound each page's pinned blocks and values.
+            read: ?docstore_mod.DocStore.Txn = null,
+            reverse: std.StringHashMapUnmanaged(Entry) = .empty,
+            bitmap: ?@import("../../encoding/roaring.zig").Iterator = null,
+            offset: usize = 0,
+            initialized: bool = false,
+            exhausted: bool = false,
+            incomplete: bool = false,
+            explicit_keys: ?std.StringHashMapUnmanaged(void) = null,
+
+            fn deinit(self: *SourceRecovery) void {
+                if (self.read) |*txn| txn.abort();
+                self.arena.deinit();
+            }
+        };
+
+        /// Resolve the finite ordinal scope once for all failed keys in a
+        /// source batch. No candidate is delivered until membership is known.
+        fn recoverScopedSourceBatch(
+            self: *@This(),
+            options: db_query_search.MatchAllCandidateCollectOptions,
+            recovery: *SourceRecovery,
+            alloc: Allocator,
+            keys: []const []const u8,
+            failures: []const ?anyerror,
+            visible: []bool,
+            ordinals: []?doc_set.DocOrdinal,
+        ) !void {
+            const original_error = for (failures) |failure| {
+                if (failure) |err| break if (err == error.NotFound) error.InvalidDocIdentity else err;
+            } else unreachable;
+            const constraints = options.constraints orelse return original_error;
+            if (!constraints.positive_filter) return original_error;
+            const ordinal_set: doc_set.ResolvedDocSet = .{ .ordinals = constraints.filter_doc_nums };
+            const set = if (constraints.primary_include_compact) &constraints.primary_include else &ordinal_set;
+            if (set.* == .all) return original_error;
+
+            var pending: std.StringHashMapUnmanaged(usize) = .empty;
+            defer pending.deinit(alloc);
+            for (keys, failures, 0..) |key, failure, i| {
+                if (failure == null) continue;
+                try pending.put(alloc, key, i);
+                visible[i] = false;
+            }
+
+            if (!recovery.initialized) {
+                // The iterator borrows the request-owned bitmap across batches.
+                recovery.bitmap = if (set.* == .ordinal_bitmap) set.ordinal_bitmap.iterator() else null;
+                recovery.initialized = true;
+            }
+            const numbers = if (set.* == .ordinals) set.ordinals else &.{};
+            try self.recoverKnownSourceKeys(&recovery.read, recovery, &pending, ordinals, visible);
+            // Keep the original identity error if optional recovery memory
+            // cannot be admitted. An incomplete cache cannot prove absence.
+            const cache_alloc = recovery.arena.allocator();
+            while (pending.count() != 0 and !recovery.exhausted) {
+                try db_query_search.checkSearchRequestDeadline(self.req);
+                var page: [256]doc_set.DocOrdinal = undefined;
+                var len: usize = 0;
+                while (len < page.len) : (len += 1) {
+                    if (recovery.bitmap) |*it| {
+                        page[len] = it.next() orelse break;
+                    } else {
+                        if (recovery.offset == numbers.len) break;
+                        page[len] = numbers[recovery.offset];
+                        recovery.offset += 1;
+                    }
+                }
+                recovery.exhausted = len < page.len;
+                if (len == 0) break;
+                std.mem.sort(doc_set.DocOrdinal, page[0..len], {}, std.sort.asc(doc_set.DocOrdinal));
+                var scope = try (try self.sourceRecoveryRead(&recovery.read)).openReadScope(self.alloc);
+                defer scope.close();
+                var encoded: [page.len]@TypeOf(internal_keys.identityOrdinalToDocKey(0)) = undefined;
+                var reverse_keys: [page.len][]const u8 = undefined;
+                for (page[0..len], 0..) |ordinal, i| {
+                    encoded[i] = internal_keys.identityOrdinalToDocKey(ordinal);
+                    reverse_keys[i] = &encoded[i];
+                }
+                var resolved: [page.len]?[]const u8 = undefined;
+                try scope.getManySorted(reverse_keys[0..len], resolved[0..len]);
+                var missing: [page.len]doc_set.DocOrdinal = undefined;
+                var missing_count: usize = 0;
+                for (page[0..len], resolved[0..len]) |ordinal, key| {
+                    try db_query_search.checkSearchRequestDeadline(self.req);
+                    if (key) |id| {
+                        if (recovery.reverse.contains(id)) continue;
+                        const retained = cache_alloc.dupe(u8, id) catch return original_error;
+                        recovery.reverse.put(cache_alloc, retained, .{ .ordinal = ordinal }) catch return original_error;
+                    } else if (!recovery.incomplete) {
+                        missing[missing_count] = ordinal;
+                        missing_count += 1;
+                    }
+                }
+                if (missing_count != 0) {
+                    var states: [page.len]bool = undefined;
+                    self.readSourceVisibility(&recovery.read, missing[0..missing_count], states[0..missing_count]) catch |err| {
+                        if (!recoverableSourceIdentityError(err)) return err;
+                        // A failed proof cannot establish a nonmember.
+                        recovery.incomplete = true;
+                    };
+                    if (!recovery.incomplete) recovery.incomplete = std.mem.indexOfScalar(bool, states[0..missing_count], true) != null;
+                }
+                try self.recoverKnownSourceKeys(&recovery.read, recovery, &pending, ordinals, visible);
+            }
+            if (pending.count() == 0) return;
+            if (!recovery.incomplete and recovery.explicit_keys == null) {
+                var explicit: std.StringHashMapUnmanaged(void) = .empty;
+                for ([_]*const doc_set.ResolvedDocSet{ set, &constraints.legacy_filter }) |key_set| {
+                    if (key_set.* != .doc_keys) continue;
+                    for (key_set.doc_keys) |key| {
+                        try db_query_search.checkSearchRequestDeadline(self.req);
+                        explicit.put(cache_alloc, key, {}) catch return original_error;
+                    }
+                }
+                recovery.explicit_keys = explicit;
+            }
+            var unresolved_error: ?anyerror = null;
+            var unresolved = pending.iterator();
+            while (unresolved.next()) |entry| {
+                const slot = entry.value_ptr.*;
+                const failure = failures[slot].?;
+                if (!recovery.incomplete) {
+                    if (!recovery.explicit_keys.?.contains(entry.key_ptr.*)) continue;
+                    if (failure == error.NotFound) {
+                        visible[slot] = true;
+                        continue;
+                    }
+                }
+                if (failure == error.StorageReadTemporarilyUnavailable) return failure;
+                unresolved_error = if (failure == error.NotFound) error.InvalidDocIdentity else failure;
+            }
+            if (unresolved_error) |err| return err;
+        }
+
+        fn recoverKnownSourceKeys(
+            self: *@This(),
+            read: *?docstore_mod.DocStore.Txn,
+            recovery: *SourceRecovery,
+            pending: *std.StringHashMapUnmanaged(usize),
+            ordinals: []?doc_set.DocOrdinal,
+            visible: []bool,
+        ) !void {
+            const Candidate = struct {
+                ordinal: doc_set.DocOrdinal,
+                key: []const u8,
+                slot: usize,
+                fn less(_: void, lhs: @This(), rhs: @This()) bool {
+                    return lhs.ordinal < rhs.ordinal;
+                }
+            };
+            var candidates: [256]Candidate = undefined;
+            var count: usize = 0;
+            var it = pending.iterator();
+            while (it.next()) |entry| {
+                const cached = recovery.reverse.get(entry.key_ptr.*) orelse continue;
+                if (cached.visible) |is_visible| {
+                    if (is_visible) {
+                        ordinals[entry.value_ptr.*] = cached.ordinal;
+                        visible[entry.value_ptr.*] = true;
+                    }
+                    pending.removeByPtr(entry.key_ptr);
+                    continue;
+                }
+                candidates[count] = .{ .ordinal = cached.ordinal, .key = entry.key_ptr.*, .slot = entry.value_ptr.* };
+                count += 1;
+            }
+            if (count == 0) return;
+            std.mem.sort(Candidate, candidates[0..count], {}, Candidate.less);
+            var numbers: [256]doc_set.DocOrdinal = undefined;
+            for (candidates[0..count], 0..) |candidate, i| numbers[i] = candidate.ordinal;
+            var states: [256]bool = undefined;
+            try self.readSourceVisibility(read, numbers[0..count], states[0..count]);
+            for (candidates[0..count], states[0..count]) |candidate, is_visible| {
+                recovery.reverse.getPtr(candidate.key).?.visible = is_visible;
+                if (is_visible) {
+                    ordinals[candidate.slot] = candidate.ordinal;
+                    visible[candidate.slot] = true;
+                }
+                _ = pending.remove(candidate.key);
+            }
+        }
+
+        fn sourceRecoveryRead(self: *@This(), read: *?docstore_mod.DocStore.Txn) !*docstore_mod.DocStore.Txn {
+            if (read.* == null) read.* = try self.db.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+            return &read.*.?;
+        }
+
+        fn readSourceVisibility(self: *@This(), read: *?docstore_mod.DocStore.Txn, ordinals: []const doc_set.DocOrdinal, visible: []bool) !void {
+            try db_query_search.checkSearchRequestDeadline(self.req);
+            var scope = try (try self.sourceRecoveryRead(read)).openReadScope(self.alloc);
+            defer scope.close();
+            var encoded: [256]@TypeOf(internal_keys.identityOrdinalStateKey(0)) = undefined;
+            var keys: [256][]const u8 = undefined;
+            var values: [256]?[]const u8 = undefined;
+            for (ordinals, 0..) |ordinal, i| {
+                encoded[i] = internal_keys.identityOrdinalStateKey(ordinal);
+                keys[i] = &encoded[i];
+            }
+            try scope.getManySorted(keys[0..ordinals.len], values[0..ordinals.len]);
+            for (values[0..ordinals.len], visible) |raw, *is_visible| {
+                is_visible.* = false;
+                if (raw) |bytes| {
+                    const state = try doc_identity.decodeOrdinalState(bytes);
+                    is_visible.* = if (self.req.identity_read_generation) |at| state.isVisibleAt(at) else state.isLive();
+                }
+            }
         }
 
         fn scanExactScope(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !void {
@@ -158102,6 +158425,7 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
     try db.setSchema(.{
         .version = 1,
         .storage_mode = .relational,
+        .ttl_duration_ns = std.time.ns_per_day,
         .relational_columns = &.{.{ .name = "rank", .path = "rank", .column_type = .integer }},
     });
     var arena = std.heap.ArenaAllocator.init(a);
@@ -158140,9 +158464,162 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
     defer counted.deinit();
     try std.testing.expectEqual(@as(u32, 7), counted.total_hits);
 
+    {
+        // The speculative scan encounters this unrelated row in either
+        // direction. The ordered scope can answer from valid identities.
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        for ([_]usize{ 2, 77 }) |i| {
+            const key = try internal_keys.identityDocToOrdinalKeyAlloc(scratch, writes[i].key);
+            try txn.put(key, "malformed");
+        }
+        try txn.commit();
+    }
+
+    // Exercise batch recovery with mixed error classes and overlapping
+    // legacy and ordinal membership. An absent live reverse key is ambiguous.
+    {
+        const scan_req: types.SearchRequest = .{ .identity_read_generation = generation };
+        var scan = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = scan_req, .alloc = a };
+        const options: db_query_search.MatchAllCandidateCollectOptions = .{
+            .constraints = &.{
+                .positive_filter = true,
+                .filter_doc_nums = &endpoints,
+                .legacy_filter = .{ .doc_keys = &.{writes[1].key} },
+            },
+        };
+        const failed_keys = [_][]const u8{ writes[1].key, writes[2].key, writes[3].key, writes[78].key };
+        const failures = [_]?anyerror{ error.InvalidDocIdentity, error.InvalidDocIdentity, error.StorageReadTemporarilyUnavailable, error.StorageReadTemporarilyUnavailable };
+        var visible = [_]bool{ true, true, true, true };
+        var resolved: [4]?doc_set.DocOrdinal = @splat(null);
+        var recovery: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(a) };
+        defer recovery.deinit();
+        try scan.recoverScopedSourceBatch(options, &recovery, a, &failed_keys, &failures, &visible, &resolved);
+        try std.testing.expectEqual([4]bool{ true, false, false, true }, visible);
+        try std.testing.expectEqual([4]?doc_set.DocOrdinal{ endpoints[0], null, null, endpoints[1] }, resolved);
+        const loaded_ordinals = recovery.offset;
+        visible[0] = false;
+        resolved[0] = null;
+        var cached_scan: DB.PrimaryMatchAllIdentityScan = .{ .db = undefined, .req = scan.req, .alloc = a };
+        try cached_scan.recoverScopedSourceBatch(options, &recovery, a, &.{writes[78].key}, &.{error.InvalidDocIdentity}, visible[0..1], resolved[0..1]);
+        try std.testing.expect(visible[0]);
+        try std.testing.expectEqual(@as(?doc_set.DocOrdinal, endpoints[1]), resolved[0]);
+        try std.testing.expectEqual(loaded_ordinals, recovery.offset);
+
+        // A legacy key backed by a future ordinal has a conclusive
+        // negative result even if its forward mapping cannot be decoded.
+        var historical_scan: DB.PrimaryMatchAllIdentityScan = .{ .db = &db, .req = .{ .identity_read_generation = 0 }, .alloc = a };
+        var historical: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(a) };
+        defer historical.deinit();
+        for (0..2) |_| {
+            try historical_scan.recoverScopedSourceBatch(options, &historical, a, &.{writes[1].key}, &.{error.InvalidDocIdentity}, visible[0..1], resolved[0..1]);
+            try std.testing.expect(!visible[0]);
+            try std.testing.expect(historical.reverse.get(writes[1].key).?.visible == false);
+            historical_scan.db = undefined;
+        }
+
+        // Stop inside the first bitmap page, then resume across later pages.
+        var bitmap_scope = @import("../../encoding/roaring.zig").RoaringBitmap.init(a);
+        defer bitmap_scope.deinit();
+        try bitmap_scope.add(endpoints[0]);
+        try bitmap_scope.addRange(1024, 1536);
+        const bitmap_options: db_query_search.MatchAllCandidateCollectOptions = .{
+            .constraints = &.{
+                .positive_filter = true,
+                .primary_include_compact = true,
+                .primary_include = .{ .ordinal_bitmap = bitmap_scope },
+                .legacy_filter = .{ .doc_keys = &.{writes[3].key} },
+            },
+        };
+        var bitmap_recovery: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(a) };
+        defer bitmap_recovery.deinit();
+        try scan.recoverScopedSourceBatch(bitmap_options, &bitmap_recovery, a, &.{writes[1].key}, &.{error.InvalidDocIdentity}, visible[0..1], resolved[0..1]);
+        try std.testing.expect(visible[0] and !bitmap_recovery.exhausted);
+        try std.testing.expect(bitmap_recovery.bitmap.?.bitmap == &bitmap_options.constraints.?.primary_include.ordinal_bitmap);
+        try scan.recoverScopedSourceBatch(bitmap_options, &bitmap_recovery, a, &.{writes[2].key}, &.{error.InvalidDocIdentity}, visible[0..1], resolved[0..1]);
+        try std.testing.expect(!visible[0] and bitmap_recovery.exhausted);
+        const explicit_keys = bitmap_recovery.explicit_keys.?.count();
+        try std.testing.expectEqual(@as(usize, 1), explicit_keys);
+        try std.testing.expectError(error.InvalidDocIdentity, scan.recoverScopedSourceBatch(
+            bitmap_options,
+            &bitmap_recovery,
+            a,
+            &.{writes[3].key},
+            &.{error.InvalidDocIdentity},
+            visible[0..1],
+            resolved[0..1],
+        ));
+        try std.testing.expectEqual(explicit_keys, bitmap_recovery.explicit_keys.?.count());
+
+        var denied_allocator: std.testing.FailingAllocator = .init(a, .{ .fail_index = 0 });
+        var denied: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(denied_allocator.allocator()) };
+        defer denied.deinit();
+        try std.testing.expectError(error.StorageReadTemporarilyUnavailable, scan.recoverScopedSourceBatch(
+            options,
+            &denied,
+            a,
+            &.{writes[2].key},
+            &.{error.StorageReadTemporarilyUnavailable},
+            visible[0..1],
+            resolved[0..1],
+        ));
+
+        const missing_key = internal_keys.identityOrdinalToDocKey(endpoints[0]);
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.delete(&missing_key);
+            try txn.commit();
+        }
+        var incomplete: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(a) };
+        defer incomplete.deinit();
+        try std.testing.expectError(error.StorageReadTemporarilyUnavailable, scan.recoverScopedSourceBatch(
+            options,
+            &incomplete,
+            a,
+            &.{writes[2].key},
+            &.{error.StorageReadTemporarilyUnavailable},
+            visible[0..1],
+            resolved[0..1],
+        ));
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(&missing_key, writes[1].key);
+            try txn.commit();
+        }
+    }
+
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        for ([_]usize{ 1, 78 }) |slot| {
+            const id = writes[slot].key;
+            try txn.delete(try internal_keys.identityDocToOrdinalKeyAlloc(scratch, id));
+            try txn.delete(try internal_keys.identityLiveDocToOrdinalKeyAlloc(scratch, id));
+        }
+        try txn.commit();
+
+        var resolved: [4]?[]const u8 = undefined;
+        try DB.resolvePrimaryOrdinalKeysCallback(&db, scratch, &.{ endpoints[1], std.math.maxInt(u32), endpoints[0], endpoints[1] }, generation, &resolved);
+        try std.testing.expectEqualStrings(writes[78].key, resolved[0].?);
+        try std.testing.expect(resolved[1] == null);
+        try std.testing.expectEqualStrings(writes[1].key, resolved[2].?);
+        try std.testing.expectEqualStrings(writes[78].key, resolved[3].?);
+    }
+
     const Record = struct {
         expected: []const u8,
+        ordinal: doc_set.DocOrdinal,
         seen: usize = 0,
+
+        fn visit(raw: ?*anyopaque, id: []const u8, ordinal: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (!std.mem.eql(u8, self.expected, id)) return .@"continue";
+            try std.testing.expectEqual(@as(?doc_set.DocOrdinal, self.ordinal), ordinal);
+            self.seen += 1;
+            return .stop;
+        }
 
         fn consume(raw: ?*anyopaque, candidate: *db_query_search.MatchAllCandidate) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
@@ -158156,8 +158633,8 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
             var ordinals: [1024]u32 = undefined;
             ordinals[0] = endpoints[endpoint];
             for (ordinals[1..], 0..) |*ordinal, i| ordinal.* = std.math.maxInt(u32) - 1024 + @as(u32, @intCast(i));
-            var record = Record{ .expected = writes[if (endpoint == 0) 1 else 78].key };
-            _ = try DB.streamSearchMatchAllCandidatesCallback(&db, a, .{}, .{
+            var record = Record{ .expected = writes[if (endpoint == 0) 1 else 78].key, .ordinal = endpoints[endpoint] };
+            const options: db_query_search.MatchAllCandidateCollectOptions = .{
                 .constraints = &.{ .positive_filter = true, .filter_doc_nums = &ordinals },
                 .require_complete_primary_population = true,
                 .primary_key_start_after = if (reverse) null else writes[0].key,
@@ -158165,7 +158642,12 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
                 .primary_key_reverse = reverse,
                 .stop_after_accepted = 1,
                 .scan_batch_size = 1,
-            }, &record, Record.consume);
+            };
+            _ = try DB.streamSearchMatchAllCandidatesCallback(&db, a, .{}, options, &record, Record.consume);
+            try std.testing.expectEqual(@as(usize, 1), record.seen);
+            record.seen = 0;
+            var no_spill = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = .{}, .ordered_spill_enabled = false };
+            try DB.PrimaryMatchAllIdentityScan.scan(&no_spill, a, options, &record, Record.visit);
             try std.testing.expectEqual(@as(usize, 1), record.seen);
         }
     }

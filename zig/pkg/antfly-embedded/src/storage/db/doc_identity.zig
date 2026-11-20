@@ -3092,7 +3092,7 @@ fn encodeOrdinalState(state: OrdinalState) [25]u8 {
     return out;
 }
 
-fn decodeOrdinalState(raw: []const u8) !OrdinalState {
+pub fn decodeOrdinalState(raw: []const u8) !OrdinalState {
     if (raw.len != 25) return error.InvalidDocIdentity;
     const state = OrdinalState{
         .canonical_doc_id = std.mem.readInt(u64, raw[0..8], .big),

@@ -1620,7 +1620,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "capability lease HTTP fields own storage",
         "asset producer runtime rejects empty borrowed media",
         "asset producer runtime derives coherent logical and wire result ceilings",
-        "reader split windows share the original response budget",
+        "reader split windows share",
         "asset producer runtime applies result ceilings to non-model producers",
         "remote chunk runtime services do not require a local callback provider",
         "asset producer media invocation memory fails closed",

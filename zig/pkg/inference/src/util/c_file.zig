@@ -360,6 +360,26 @@ pub fn readFileMax(allocator: std.mem.Allocator, path: []const u8, max_size: usi
     return buf;
 }
 
+/// Read a bounded metadata file with checkpoints between positional reads.
+pub fn readFileWithControl(allocator: std.mem.Allocator, io: std.Io, path: []const u8, control: anytype) ![]u8 {
+    try control.check();
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const size = std.math.cast(usize, (try file.stat(io)).size) orelse return error.FileTooLarge;
+    if (size > default_read_file_max_bytes) return error.FileTooLarge;
+    const bytes = try allocator.alloc(u8, size);
+    errdefer allocator.free(bytes);
+    var offset: usize = 0;
+    while (offset < size) {
+        try control.check();
+        const target = bytes[offset..][0..@min(size - offset, 64 * 1024)];
+        if (try file.readPositionalAll(io, target, offset) != target.len) return error.IncompleteRead;
+        offset += target.len;
+    }
+    try control.check();
+    return bytes;
+}
+
 /// Return the byte size of a file.
 pub fn fileSize(allocator: std.mem.Allocator, path: []const u8) !u64 {
     const path_z = try allocator.dupeSentinel(u8, path, 0);
