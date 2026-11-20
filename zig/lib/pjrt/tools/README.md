@@ -1,5 +1,9 @@
 # Native PJRT CUDA model experiment
 
+For GLiNER2.5 Base/Decide benchmarks and qualification, see
+[the GLiNER2.5 guide](GLINER25.md) and
+[the GLiNER2.5 results](GLINER25_RESULTS.md).
+
 This builds an Antfly Zig executable that loads GPU-resident BF16 parameters,
 compiles prepared HLO through the PJRT C API, and executes Gemma 4 cached
 generation or EmbeddingGemma2 text embedding. Python/Transformers/Torchax are

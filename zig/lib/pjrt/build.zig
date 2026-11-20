@@ -66,6 +66,15 @@ pub fn build(b: *std.Build) void {
     media_runner.root_module.link_libc = true;
     b.step("media-runner", "Build interactive native full-media CUDA HLO runner").dependOn(&b.addInstallArtifact(media_runner, .{}).step);
 
+    const gliner = b.addExecutable(.{ .name = "antfly-pjrt-gliner25", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/gliner25_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "protobuf", .module = protobuf_mod }, .{ .name = "xla_proto", .module = xla_proto_mod } },
+    }) });
+    gliner.root_module.link_libc = true;
+    b.step("gliner25-runner", "Build native GLiNER2.5 CUDA/PJRT benchmark worker").dependOn(&b.addInstallArtifact(gliner, .{}).step);
+
     // Tests
     const test_step = b.step("test", "Run unit tests");
 

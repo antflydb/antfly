@@ -1,0 +1,29 @@
+{
+  "abi_version": 1,
+  "architecture": "sm_89",
+  "artifact_sha256": "3ab618ea6bda0bb66d94f7988d55641af824e21e450cedbdb487458fc65e5de8",
+  "cutlass_archive_sha256": "36429479df2ab1cd1c7981c2d34e786106326ccfefc8846f902f76151a65e112",
+  "cutlass_commit": "ad7b2f5e84fcfa124cb02b91d5bd26d238c0459e",
+  "cutlass_tree_sha256": "992cc63a5ec8e51e391e638e88f1fe213a19eecedc23bc75d5cb5f5b8ddbb49c",
+  "flags": [
+    "-cubin",
+    "-O3",
+    "-DNDEBUG",
+    "-std=c++17",
+    "--expt-relaxed-constexpr",
+    "-arch=sm_89"
+  ],
+  "global_scratch_bytes": 0,
+  "nvcc_version": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2026 NVIDIA Corporation\nBuilt on Thu_Mar_19_11:12:51_PM_PDT_2026\nCuda compilation tools, release 13.2, V13.2.78\nBuild cuda_13.2.r13.2/compiler.37668154_0",
+  "precision": "FP32 storage and I/O; BF16x3 or TF32x3 arithmetic with FP32 accumulation",
+  "source_sha256": {
+    "gliner25_fast_f32.cu": "6abb49ecdf837a546cb7876ae4b2019a75d07346964a9576cc7831b49f078ff1",
+    "gliner25_fast_f32_mma.cuh": "60e5636e61b7102dea094df4a914323ff8d90ed69816784c448945117db08695"
+  },
+  "symbols": [
+    "antfly_gliner_tf32x3_small_v1",
+    "antfly_gliner_bf16x3_small_v1",
+    "antfly_gliner_bf16x3_medium_v1",
+    "antfly_gliner_bf16x3_large_v1"
+  ]
+}

@@ -101,6 +101,7 @@ pub const Context = struct {
     limits: Limits,
     control: ?Control = null,
     encoder_precision: device.WeightPrecision = .f32,
+    experimental_bf16_heads: bool = false,
     stats: Stats = .{},
     entries: std.ArrayList(Entry) = .empty,
     weights: std.StringHashMapUnmanaged(CT) = .{},
@@ -410,7 +411,7 @@ pub const Context = struct {
 
     pub fn linear(self: *Context, input: CT, rows: usize, in_dim: usize, out_dim: usize, prefix: []const u8) !CT {
         var name: [256]u8 = undefined;
-        const reduced = self.encoder_precision != .f32 and std.mem.startsWith(u8, prefix, "encoder.layer.");
+        const reduced = self.encoder_precision != .f32 and (std.mem.startsWith(u8, prefix, "encoder.layer.") or (self.experimental_bf16_heads and (std.mem.startsWith(u8, prefix, "boundary_head.") or std.mem.startsWith(u8, prefix, "classifier."))));
         const weight_name = try std.fmt.bufPrint(&name, "{s}.weight", .{prefix});
         const w = if (reduced) try self.encoderMatrix(weight_name, out_dim, in_dim, true) else try self.weight(weight_name, &.{ @intCast(out_dim), @intCast(in_dim) });
         const b = try self.weight(try std.fmt.bufPrint(&name, "{s}.bias", .{prefix}), &.{@intCast(out_dim)});
@@ -424,6 +425,36 @@ pub const Context = struct {
     /// One strict FP32 packed projection for an optimized resident DeBERTa
     /// layer. Unsupported backends and every reference/reduced route decline
     /// before allocating or dispatching so the caller can use three linears.
+    /// Explicit CUDA experiment: model weights are BF16 and returned attention
+    /// operands retain that storage through the paired BF16 attention callback.
+    pub fn bf16AttentionProjections(self: *Context, input: CT, rows: usize, hidden: usize, layer: usize, batch: usize, sequence: usize, projections: usize, relative_policy: ?compute.DebertaBf16RelativePolicy) !?compute.DebertaBf16ProjectionsResult {
+        if (self.encoder_precision != .bf16 or self.cb.kind() != .cuda or self.cb.vtable.debertaBf16Projections == null) return null;
+        var weights: [3]CT = undefined;
+        var biases: [3]CT = undefined;
+        const names = [_][]const u8{ "query_proj", "key_proj", "value_proj" };
+        var name: [192]u8 = undefined;
+        for (0..projections) |i| {
+            weights[i] = try self.encoderMatrix(try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.self.{s}.weight", .{ layer, names[i] }), hidden, hidden, true);
+            biases[i] = try self.weight(try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.self.{s}.bias", .{ layer, names[i] }), &.{@intCast(hidden)});
+        }
+        if (projections == 2) {
+            weights[2] = weights[0];
+            biases[2] = biases[0];
+        }
+        const per_output = try std.math.mul(usize, try count(&.{ rows, hidden }), 2);
+        const output_bytes = try std.math.mul(usize, per_output, projections);
+        // Include the shared conversion and temporary BF16 bias vectors.
+        try self.reserve(try std.math.add(usize, output_bytes, try std.math.add(usize, per_output, projections * hidden * 2)));
+        try self.entries.ensureUnusedCapacity(self.allocator, projections);
+        const result = try self.cb.debertaBf16Projections(&.{ .input = input, .relative_policy = relative_policy, .weights = weights, .biases = biases, .count = projections, .rows = rows, .hidden = hidden, .batch = batch, .sequence = sequence }) orelse return null;
+        errdefer for (result) |value| if (value) |tensor| self.cb.free(tensor);
+        try self.check();
+        for (result[0..projections]) |value| self.entries.appendAssumeCapacity(.{ .tensor = value.?, .bytes = per_output });
+        self.current_bytes += output_bytes;
+        self.stats.device_dispatches += 1 + 2 * projections;
+        return result;
+    }
+
     pub fn linearQkv(self: *Context, input: CT, rows: usize, hidden: usize, layer: usize) !?device.PackedQkvResult {
         if (!self.packed_qkv_enabled or !self.resident_weights or self.encoder_precision != .f32 or self.cb.kind() != .metal or
             self.cb.vtable.glinerBoundaryPackedQkv == null) return null;
@@ -474,20 +505,29 @@ pub const Context = struct {
     /// Optional strict FP32 Metal FFN. Its two GEMM products remain in the
     /// admitted encoder arena and only the normalized hidden state escapes.
     pub fn fusedFfn(self: *Context, input: CT, residual: CT, rows: usize, hidden: usize, intermediate: usize, layer: usize, eps: f32) !?CT {
-        if (!self.fused_ffn_enabled or !self.resident_weights or self.encoder_precision != .f32 or self.cb.kind() != .metal or
+        const bf16_cuda = self.encoder_precision == .bf16 and self.cb.kind() == .cuda and @import("../../ops/cuda/gliner25_bf16_ffn.zig").plan(rows, hidden, intermediate) != null;
+        if ((!bf16_cuda and (!self.fused_ffn_enabled or !self.resident_weights or self.encoder_precision != .f32 or self.cb.kind() != .metal)) or
             !self.cb.glinerBoundaryFusedFfnAvailable()) return null;
         if (layer > std.math.maxInt(u32) or !std.math.isFinite(eps) or eps <= 0) return error.InvalidBoundaryDeviceShape;
         var names: [6][192]u8 = undefined;
-        const first_weight = try self.weight(try std.fmt.bufPrint(&names[0], "encoder.layer.{d}.intermediate.dense.weight", .{layer}), &.{ @intCast(intermediate), @intCast(hidden) });
+        const first_name = try std.fmt.bufPrint(&names[0], "encoder.layer.{d}.intermediate.dense.weight", .{layer});
+        const first_weight = if (bf16_cuda) try self.encoderMatrix(first_name, intermediate, hidden, true) else try self.weight(first_name, &.{ @intCast(intermediate), @intCast(hidden) });
         const first_bias = try self.weight(try std.fmt.bufPrint(&names[1], "encoder.layer.{d}.intermediate.dense.bias", .{layer}), &.{@intCast(intermediate)});
-        const second_weight = try self.weight(try std.fmt.bufPrint(&names[2], "encoder.layer.{d}.output.dense.weight", .{layer}), &.{ @intCast(hidden), @intCast(intermediate) });
+        const second_name = try std.fmt.bufPrint(&names[2], "encoder.layer.{d}.output.dense.weight", .{layer});
+        const second_weight = if (bf16_cuda) try self.encoderMatrix(second_name, hidden, intermediate, true) else try self.weight(second_name, &.{ @intCast(hidden), @intCast(intermediate) });
         const second_bias = try self.weight(try std.fmt.bufPrint(&names[3], "encoder.layer.{d}.output.dense.bias", .{layer}), &.{@intCast(hidden)});
         const norm_weight = try self.weight(try std.fmt.bufPrint(&names[4], "encoder.layer.{d}.output.LayerNorm.weight", .{layer}), &.{@intCast(hidden)});
         const norm_bias = try self.weight(try std.fmt.bufPrint(&names[5], "encoder.layer.{d}.output.LayerNorm.bias", .{layer}), &.{@intCast(hidden)});
         const intermediate_elements = try count(&.{ rows, intermediate });
         const hidden_elements = try count(&.{ rows, hidden });
         const output_bytes = try bytes(hidden_elements);
-        const products_bytes = try bytes(try std.math.add(usize, intermediate_elements, hidden_elements));
+        const products_bytes = if (bf16_cuda) blk: {
+            // Full-BF16 qualification may retain an F32 first dot when the
+            // immutable bias cache is denied. Cover that wider fallback too;
+            // the shared activation staging has its own retained admission.
+            const worst = @import("../../ops/cuda/gliner25_bf16_ffn.zig").planWithFloatDot(rows, hidden, intermediate, true).?;
+            break :blk worst.temporary_bytes - worst.staged;
+        } else try bytes(try std.math.add(usize, intermediate_elements, hidden_elements));
         // Both arena products coexist until the epilogue, alongside one final
         // owned output. The arena itself is admitted separately by the model.
         try self.reserve(try std.math.add(usize, products_bytes, output_bytes));
@@ -553,8 +593,9 @@ pub const Context = struct {
     }
 
     pub fn addNormEps(self: *Context, input: CT, residual: CT, rows: usize, width: usize, prefix: []const u8, eps: f32) !CT {
-        if (self.resident_weights and self.encoder_precision == .f32 and self.cb.kind() == .metal and
-            !platform.env.getenvBool("TERMITE_METAL_DISABLE_GLINER_ADD_NORM"))
+        if ((self.resident_weights and self.encoder_precision == .f32 and self.cb.kind() == .metal and
+            !platform.env.getenvBool("TERMITE_METAL_DISABLE_GLINER_ADD_NORM")) or
+            (self.encoder_precision == .bf16 and self.cb.kind() == .cuda))
         {
             var name: [256]u8 = undefined;
             const w = try self.weight(try std.fmt.bufPrint(&name, "{s}.weight", .{prefix}), &.{@intCast(width)});

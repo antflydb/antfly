@@ -1,0 +1,21 @@
+{
+  "abi_version": 1,
+  "architecture": "sm_89",
+  "flags": [
+    "-cubin",
+    "-arch=sm_89"
+  ],
+  "symbols": [
+    "antfly_gliner_bf16_full_round_v1",
+    "antfly_gliner_bf16_full_norm_v1",
+    "antfly_gliner_bf16_full_scale_key_v1",
+    "antfly_gliner_bf16_full_views_v1",
+    "antfly_gliner_bf16_full_softmax_v1",
+    "antfly_gliner_bf16_full_gelu_v1",
+    "antfly_gliner_bf16_full_norm_dot_bias_v1",
+    "antfly_gliner_bf16_full_scale_views_v1"
+  ],
+  "source_sha256": "6f2504441ac6dd4250397c1c4f9178a4b3edeecbc3b734340ebd6c01bbd8f4bc",
+  "artifact_sha256": "eb81c9eb9650feafead4ca0c8e049e884529635bc75120ff6575635b959ef1d5",
+  "nvcc_version": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2026 NVIDIA Corporation\nBuilt on Thu_Mar_19_11:12:51_PM_PDT_2026\nCuda compilation tools, release 13.2, V13.2.78\nBuild cuda_13.2.r13.2/compiler.37668154_0"
+}

@@ -240,6 +240,7 @@ pub const ScopeAccounting = struct {
 pub const WeightPrecision = enum {
     f32,
     f16,
+    bf16,
     q8_0,
     q4_0,
     q4_k,
@@ -250,13 +251,13 @@ pub const WeightPrecision = enum {
         const values = try std.math.mul(usize, rows, columns);
         if (values > std.math.maxInt(i32)) return error.ResourceLimitExceeded;
         const block: usize = switch (self) {
-            .f32, .f16 => 1,
+            .f32, .f16, .bf16 => 1,
             .q8_0, .q4_0 => 32,
             .q4_k => 256,
         };
         const size: usize = switch (self) {
             .f32 => 4,
-            .f16 => 2,
+            .f16, .bf16 => 2,
             .q8_0 => 34,
             .q4_0 => 18,
             .q4_k => 144,

@@ -1270,7 +1270,9 @@ fn testDecideParity(directory: []const u8, backend: enum { native, metal, cuda }
     const session = switch (backend) {
         .native => try factory.createNativeSession(a, directory),
         .metal => try factory.createMetalSession(a, directory),
-        .cuda => try factory.createCudaSession(a, directory),
+        // This oracle records the original FP32 encoder, or the packed Q8
+        // checkpoint's existing route. Test automatic BF16 against its own oracle.
+        .cuda => try factory.createGlinerCudaSessionWithPrecision(a, directory, .fp32),
     };
     defer session.close();
     const session_config = try factory.getGlinerSpanConfig(session);

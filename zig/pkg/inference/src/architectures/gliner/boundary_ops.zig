@@ -196,6 +196,68 @@ const Entry = struct {
     }
 };
 
+// Keep only the requested sorted prefix. Comparators include the original
+// index/order tie break, so discarding the suffix cannot alter pool routing.
+// The same total order also permits unstable sorting without changing ties.
+fn sortedPrefix(comptime T: type, items: []T, requested: usize, comptime less: fn (void, T, T) bool) void {
+    const k = @min(requested, items.len);
+    if (k == 0) return;
+    if (k >= items.len / 2) {
+        std.mem.sortUnstable(T, items, {}, less);
+        return;
+    }
+    const Heap = struct {
+        fn down(values: []T, start: usize) void {
+            var parent = start;
+            while (parent < values.len / 2) {
+                var child = parent * 2 + 1;
+                if (child + 1 < values.len and less({}, values[child], values[child + 1])) child += 1;
+                if (!less({}, values[parent], values[child])) break;
+                std.mem.swap(T, &values[parent], &values[child]);
+                parent = child;
+            }
+        }
+    };
+    var parent = k / 2;
+    while (parent != 0) {
+        parent -= 1;
+        Heap.down(items[0..k], parent);
+    }
+    for (items[k..]) |*candidate| {
+        if (less({}, candidate.*, items[0])) {
+            std.mem.swap(T, candidate, &items[0]);
+            Heap.down(items[0..k], 0);
+        }
+    }
+    std.mem.sortUnstable(T, items[0..k], {}, less);
+}
+
+test "GLiNER shared pool sorted prefix preserves exact ranked and quota ties" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 1, 7, 33, 129, 513, 1064 }) |n| {
+        const original = try a.alloc(Ranked, n);
+        defer a.free(original);
+        for (original, 0..) |*v, i| v.* = .{ .score = if (i % 9 == 0) mask_logit else @as(f32, @floatFromInt((i * 37) % 17)) - 8, .index = (i * (n - 1) + 3) % n, .valid = i % 9 != 0 };
+        const expected = try a.dupe(Ranked, original);
+        defer a.free(expected);
+        std.mem.sort(Ranked, expected, {}, Ranked.less);
+        for ([_]usize{ 0, 1, 8, 32, 192, n, n + 1 }) |k| {
+            const actual = try a.dupe(Ranked, original);
+            defer a.free(actual);
+            sortedPrefix(Ranked, actual, k, Ranked.less);
+            try std.testing.expectEqualSlices(Ranked, expected[0..@min(k, n)], actual[0..@min(k, n)]);
+        }
+        const entries = try a.alloc(Entry, n);
+        defer a.free(entries);
+        for (entries, original, 0..) |*entry, v, i| entry.* = .{ .key = i / 3, .score = v.score, .valid = v.valid, .order = n - i };
+        const ordered = try a.dupe(Entry, entries);
+        defer a.free(ordered);
+        std.mem.sort(Entry, ordered, {}, Entry.byScore);
+        sortedPrefix(Entry, entries, 192, Entry.byScore);
+        try std.testing.expectEqualSlices(Entry, ordered[0..@min(n, 192)], entries[0..@min(n, 192)]);
+    }
+}
+
 fn mul(a: usize, b: usize) !usize {
     return std.math.mul(usize, a, b);
 }
@@ -213,10 +275,70 @@ fn compatibility(input: PoolInput, row: usize, start: usize, end: usize) !f32 {
     return finite(value / @sqrt(@as(f32, @floatFromInt(input.dim))));
 }
 
+// SIMD lanes represent independent pairs, not a reduction across dimensions.
+// Each lane retains the scalar F32 multiply/add order exactly. Transposing
+// just K selected end rows makes those independent products contiguous.
+fn selectedCompatibilities(input: PoolInput, row: usize, starts: []const Ranked, ends: []const Ranked, transposed: []f32, output: []f32) !void {
+    const k = starts.len;
+    for (0..input.dim) |d| for (ends, 0..) |end, ei| {
+        const position = if (end.valid) end.index else 0;
+        transposed[d * k + ei] = input.projected_ends[(row * input.boundaries + position) * input.dim + d];
+    };
+    const denominator = @sqrt(@as(f32, @floatFromInt(input.dim)));
+    const V = @Vector(8, f32);
+    for (starts, 0..) |start, si| {
+        const position = if (start.valid) start.index else 0;
+        const values = input.projected_starts[(row * input.boundaries + position) * input.dim ..][0..input.dim];
+        var ei: usize = 0;
+        while (ei + 8 <= k) : (ei += 8) {
+            var sums: V = @splat(0);
+            for (values, 0..) |value, d| {
+                const rhs: V = transposed[d * k + ei ..][0..8].*;
+                sums += @as(V, @splat(value)) * rhs;
+            }
+            const divided = sums / @as(V, @splat(denominator));
+            inline for (0..8) |lane| output[si * k + ei + lane] = try finite(divided[lane]);
+        }
+        while (ei < k) : (ei += 1) output[si * k + ei] = try compatibility(input, row, position, if (ends[ei].valid) ends[ei].index else 0);
+    }
+}
+
+test "GLiNER shared pool SIMD lanes preserve scalar compatibility bits" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 7, 8, 32 }) |k| for ([_]usize{ 3, 17, 128, 257 }) |d| {
+        const n = k + 3;
+        const left = try a.alloc(f32, n * d);
+        defer a.free(left);
+        const right = try a.alloc(f32, n * d);
+        defer a.free(right);
+        for (left, right, 0..) |*x, *y, i| {
+            x.* = @sin(@as(f32, @floatFromInt(i % 257)) * 0.13) * (if (i % 5 == 0) @as(f32, 1024) else 0.03125);
+            y.* = @cos(@as(f32, @floatFromInt(i % 197)) * 0.17) * (if (i % 7 == 0) @as(f32, 32) else -0.0625);
+        }
+        const selected = try a.alloc(Ranked, k);
+        defer a.free(selected);
+        for (selected, 0..) |*entry, i| entry.* = .{ .score = 0, .index = n - i - 1, .valid = i % 5 != 0 };
+        const transposed = try a.alloc(f32, k * d);
+        defer a.free(transposed);
+        const actual = try a.alloc(f32, k * k);
+        defer a.free(actual);
+        const input = PoolInput{ .batch = 1, .boundaries = n, .queries = 1, .dim = d, .lengths = &.{n - 1}, .query_mask = &.{true}, .start_logits = &.{}, .end_logits = &.{}, .projected_starts = left, .projected_ends = right };
+        try selectedCompatibilities(input, 0, selected, selected, transposed, actual);
+        for (selected, 0..) |start, si| for (selected, 0..) |end, ei| {
+            const expected = try compatibility(input, 0, if (start.valid) start.index else 0, if (end.valid) end.index else 0);
+            try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(actual[si * k + ei])));
+        };
+    };
+}
+
 /// Shared document pool, including quota priority, stable ties, duplicate
 /// suppression and padded invalid slots. Selection is nondifferentiable; the
 /// returned compatibility/proposal scores are recomputed at selected indices.
 pub fn buildSharedPool(allocator: std.mem.Allocator, input: PoolInput, config: PoolConfig) !SharedPool {
+    return buildSharedPoolImpl(allocator, input, config, false);
+}
+
+fn buildSharedPoolImpl(allocator: std.mem.Allocator, input: PoolInput, config: PoolConfig, comptime reference: bool) !SharedPool {
     if (input.control) |control| try control.check();
     if (input.batch == 0 or input.boundaries == 0 or input.queries == 0 or input.dim == 0 or
         config.boundary_top_k == 0 or config.capacity == 0) return error.InvalidInputShape;
@@ -262,6 +384,10 @@ pub fn buildSharedPool(allocator: std.mem.Allocator, input: PoolInput, config: P
     defer allocator.free(pair_entries);
     const pair_compat = try allocator.alloc(f32, pairs);
     defer allocator.free(pair_compat);
+    const selected_ends = try allocator.alloc(f32, try mul(k, input.dim));
+    defer allocator.free(selected_ends);
+    const ranks = try allocator.alloc(usize, try mul(input.boundaries, 2));
+    defer allocator.free(ranks);
     const ranked_pairs = try allocator.alloc(Ranked, pairs);
     defer allocator.free(ranked_pairs);
     const entries = try allocator.alloc(Entry, entries_len);
@@ -286,22 +412,33 @@ pub fn buildSharedPool(allocator: std.mem.Allocator, input: PoolInput, config: P
             starts[position] = .{ .score = if (enabled) s else mask_logit, .index = position, .valid = enabled };
             ends[position] = .{ .score = if (enabled) e else mask_logit, .index = position, .valid = enabled };
         }
-        std.mem.sort(Ranked, starts, {}, Ranked.less);
-        std.mem.sort(Ranked, ends, {}, Ranked.less);
+        if (reference) {
+            std.mem.sort(Ranked, starts, {}, Ranked.less);
+            std.mem.sort(Ranked, ends, {}, Ranked.less);
+        } else {
+            sortedPrefix(Ranked, starts, k, Ranked.less);
+            sortedPrefix(Ranked, ends, k, Ranked.less);
+        }
+        for (starts[0..k], ends[0..k], 0..) |start, end, rank| {
+            ranks[start.index] = rank;
+            ranks[input.boundaries + end.index] = rank;
+        }
+        try selectedCompatibilities(input, row, starts[0..k], ends[0..k], selected_ends, pair_compat);
+        var fast_dedup = !reference;
         for (0..k) |si| {
             for (0..k) |ei| {
                 const p = si * k + ei;
                 const start = if (starts[si].valid) starts[si].index else 0;
                 const end = if (ends[ei].valid) ends[ei].index else 0;
                 const enabled = starts[si].valid and ends[ei].valid and end > start;
-                const compat = try compatibility(input, row, start, end);
-                pair_compat[p] = compat;
+                const compat = pair_compat[p];
                 pair_entries[p] = .{
                     .key = start * input.boundaries + end,
                     .score = try finite(compat + union_start[start] + union_end[end]),
                     .valid = enabled,
                     .order = p,
                 };
+                if (enabled and pair_entries[p].score <= mask_logit) fast_dedup = false;
             }
         }
         var written: usize = 0;
@@ -318,8 +455,12 @@ pub fn buildSharedPool(allocator: std.mem.Allocator, input: PoolInput, config: P
                     .valid = enabled,
                 };
             }
-            std.mem.sort(Ranked, ranked_pairs, {}, Ranked.less);
+            if (reference) std.mem.sort(Ranked, ranked_pairs, {}, Ranked.less) else sortedPrefix(Ranked, ranked_pairs, quota, Ranked.less);
             for (ranked_pairs[0..quota], 0..) |ranked, rank| {
+                if (fast_dedup) {
+                    if (ranked.valid) pair_entries[ranked.index].score = @max(pair_entries[ranked.index].score, -mask_logit * 0.5 + @as(f32, @floatFromInt(quota - rank)));
+                    continue;
+                }
                 entries[written] = .{
                     .key = if (ranked.valid) pair_entries[ranked.index].key else invalid_key,
                     .score = if (ranked.valid) -mask_logit * 0.5 + @as(f32, @floatFromInt(quota - rank)) else mask_logit,
@@ -329,33 +470,51 @@ pub fn buildSharedPool(allocator: std.mem.Allocator, input: PoolInput, config: P
                 written += 1;
             }
         }
-        for (pair_entries) |pair| {
-            entries[written] = .{
-                .key = if (pair.valid) pair.key else invalid_key,
-                .score = if (pair.valid) pair.score else mask_logit,
-                .valid = pair.valid,
-                .order = written,
-            };
-            written += 1;
+        // Cartesian start/end indices are unique for valid pairs. Quotas can
+        // therefore update their best score directly, eliminating key sorting
+        // and duplicate entries. All retained scores must exceed padding;
+        // otherwise duplicate padding slots can affect their final positions,
+        // so keep the complete stable-reference algorithm for that case.
+        const selected_entries = if (fast_dedup) pair_entries else entries;
+        if (fast_dedup) {
+            for (pair_entries) |*pair| {
+                pair.order = if (pair.valid) pair.key else invalid_key;
+                if (!pair.valid) pair.score = mask_logit;
+            }
+            sortedPrefix(Entry, pair_entries, config.capacity, Entry.byScore);
+        } else {
+            for (pair_entries) |pair| {
+                entries[written] = .{
+                    .key = if (pair.valid) pair.key else invalid_key,
+                    .score = if (pair.valid) pair.score else mask_logit,
+                    .valid = pair.valid,
+                    .order = written,
+                };
+                written += 1;
+            }
+            // byKey includes score and original order: all entries have a total
+            // ordering, so PDQ sorting preserves the stable reference exactly.
+            if (reference) std.mem.sort(Entry, entries, {}, Entry.byKey) else std.mem.sortUnstable(Entry, entries, {}, Entry.byKey);
+            var previous: ?usize = null;
+            for (entries, 0..) |*entry, order| {
+                const keep = entry.valid and (previous == null or previous.? != entry.key);
+                previous = entry.key;
+                entry.valid = keep;
+                if (!keep) entry.score = mask_logit;
+                entry.order = order;
+            }
+            if (reference) std.mem.sort(Entry, entries, {}, Entry.byScore) else sortedPrefix(Entry, entries, config.capacity, Entry.byScore);
         }
-        std.mem.sort(Entry, entries, {}, Entry.byKey);
-        var previous: ?usize = null;
-        for (entries, 0..) |*entry, order| {
-            const keep = entry.valid and (previous == null or previous.? != entry.key);
-            previous = entry.key;
-            entry.valid = keep;
-            if (!keep) entry.score = mask_logit;
-            entry.order = order;
-        }
-        std.mem.sort(Entry, entries, {}, Entry.byScore);
-        for (entries[0..@min(config.capacity, entries.len)], 0..) |entry, index| {
+        for (selected_entries[0..@min(config.capacity, selected_entries.len)], 0..) |entry, index| {
             if (!entry.valid) continue;
             const start = entry.key / input.boundaries;
             const end = entry.key % input.boundaries;
             const output = row * config.capacity + index;
             indices[output] = .{ .start = start, .end = end };
             valid[output] = true;
-            compats[output] = try compatibility(input, row, start, end);
+            // Every retained span came from the selected Cartesian product.
+            // Reuse its scalar-order dot product instead of computing it twice.
+            compats[output] = if (reference) try compatibility(input, row, start, end) else pair_compat[ranks[start] * k + ranks[input.boundaries + end]];
             proposals[output] = try finite(compats[output] + union_start[start] + union_end[end]);
         }
     }
@@ -634,4 +793,45 @@ test "gliner boundary centered prefixes preserve intervals and masked gradients"
     var grad: [8]f32 = undefined;
     try centeredInsidePrefixBackward(&.{ 99, 0, 2, 3, 5, 99, 1, 2, 3, 4 }, &mask, 2, 4, &grad);
     try std.testing.expectEqualSlices(f32, &.{ 10, 10, 8, 0, 0, 0, 0, 0 }, &grad);
+}
+
+test "GLiNER shared pool cached compat and PDQ match full stable reference" {
+    const a = std.testing.allocator;
+    const b = 2;
+    const n = 47;
+    const q = 3;
+    const d = 17;
+    var left: [b * n * d]f32 = undefined;
+    var right: [b * n * d]f32 = undefined;
+    var sl: [b * q * n]f32 = undefined;
+    var el: [b * q * n]f32 = undefined;
+    for (0..8) |seed| {
+        for (&left, &right, 0..) |*x, *y, i| {
+            x.* = @sin(@as(f32, @floatFromInt((i + seed * 19) % 257)) * 0.13);
+            y.* = @cos(@as(f32, @floatFromInt((i + seed * 31) % 197)) * 0.17);
+        }
+        for (&sl, &el, 0..) |*x, *y, i| {
+            x.* = @floatFromInt((i * 7 + seed) % 9);
+            y.* = @floatFromInt((i * 3 + seed) % 11);
+            if (seed == 4) x.* += 10000;
+            if (seed >= 5) {
+                x.* -= 5000 + @as(f32, @floatFromInt(seed - 5));
+                y.* -= 5000;
+            }
+        }
+        const input = PoolInput{ .batch = b, .boundaries = n, .queries = q, .dim = d, .lengths = &.{ n - 1, if (seed == 0) 0 else 29 }, .query_mask = &.{ true, false, true, seed != 1, true, false }, .start_logits = &sl, .end_logits = &el, .projected_starts = &left, .projected_ends = &right };
+        for ([_]usize{ 1, 7, 32 }) |k| for ([_]usize{ 8, 192 }) |capacity| {
+            const config = PoolConfig{ .boundary_top_k = k, .capacity = capacity, .min_per_query = 8 };
+            var expected = try buildSharedPoolImpl(a, input, config, true);
+            defer expected.deinit();
+            var actual = try buildSharedPool(a, input, config);
+            defer actual.deinit();
+            try std.testing.expectEqualSlices(Span, expected.indices, actual.indices);
+            try std.testing.expectEqualSlices(bool, expected.valid, actual.valid);
+            for (expected.compat_logits, actual.compat_logits, expected.proposal_logits, actual.proposal_logits) |ec, ac, ep, ap| {
+                try std.testing.expectEqual(@as(u32, @bitCast(ec)), @as(u32, @bitCast(ac)));
+                try std.testing.expectEqual(@as(u32, @bitCast(ep)), @as(u32, @bitCast(ap)));
+            }
+        };
+    }
 }

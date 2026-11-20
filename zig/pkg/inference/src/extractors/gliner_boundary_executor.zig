@@ -322,11 +322,13 @@ pub fn referenceEncoderDeviceBytes(backend: compute.BackendKind, allocator: Allo
         config: *const model.Config,
         options: Options,
         precision: Precision,
+        backend: compute.BackendKind,
         peak: usize = 0,
         failure: ?anyerror = null,
         fn note(self: *@This(), prepared: *const processor.PreparedBatch) void {
             if (self.failure != null) return;
             const planned = device_engine.plan(self.config, prepared, .{
+                .backend = self.backend,
                 .precision = self.precision,
                 .execution_policy = .reference_v1,
                 .admission = self.options.engine.limits,
@@ -360,6 +362,7 @@ pub fn referenceEncoderDeviceBytes(backend: compute.BackendKind, allocator: Allo
             var pipeline_options = items[0].options.native(self.options.pipeline);
             pipeline_options.control = self.options.control;
             _ = try device_request.plan(self.config, prepared, schemas[0..items.len], .{
+                .backend = self.backend,
                 .independent_requests = self.options.row_sink != null or self.options.brokered_request,
                 .precision = self.precision,
                 .execution_policy = .reference_v1,
@@ -371,7 +374,7 @@ pub fn referenceEncoderDeviceBytes(backend: compute.BackendKind, allocator: Allo
             self.note(prepared);
         }
     };
-    var receiver = Receiver{ .config = config, .options = options, .precision = identity.precision };
+    var receiver = Receiver{ .config = config, .options = options, .precision = identity.precision, .backend = backend };
     try planRequestGeometry(backend, allocator, config, tokenizer, request, options, &receiver);
     if (receiver.failure) |err| return err;
     if (receiver.peak == 0) return error.InvalidBoundaryPipelineInput;
@@ -1682,6 +1685,13 @@ test "GPU boundary request groups distinct ragged inputs within physical limits"
     var tight = geometry_options;
     tight.device.max_encoder_device_bytes = encoder_bytes - 1;
     try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.metal, a, &config, tokenizer.tokenizer(), &request, tight));
+    const cuda_bytes = try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, geometry_options);
+    try std.testing.expect(cuda_bytes > encoder_bytes);
+    tight.device.max_encoder_device_bytes = cuda_bytes - 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, tight));
+    const cuda_plan = try device_engine.plan(&config, &group, .{ .backend = .cuda });
+    const metal_plan = try device_engine.plan(&config, &group, .{ .backend = .metal });
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), cuda_plan.activation_upper_bound_bytes - metal_plan.activation_upper_bound_bytes);
 }
 
 test "GPU boundary classification windows fit backend-specific reference reservations" {

@@ -33,6 +33,7 @@ pub const Input = struct {
     text_lengths: []const usize,
     query_mask: []const bool,
     precision: enum { f32, f16 } = .f32,
+    experimental_bf16_linears: bool = false,
     execution_policy: device_math.ExecutionPolicy = .reference_v1,
     required_outputs: RequiredHeadOutputs = .{},
     control: ?Control = null,
@@ -300,6 +301,11 @@ fn createOwner(cb: *const compute.ComputeBackend, allocator: std.mem.Allocator, 
     const math = try device_math.Context.create(allocator, cb, limits, input.control);
     errdefer math.destroy();
     math.configure(input.execution_policy);
+    if (input.experimental_bf16_linears) {
+        if (cb.kind() != .cuda or input.execution_policy != .reference_v1) return error.UnsupportedGlinerBoundaryPrecision;
+        math.encoder_precision = .bf16;
+        math.experimental_bf16_heads = true;
+    }
     const o = try allocator.create(Owner);
     errdefer allocator.destroy(o);
     const lengths = try allocator.dupe(usize, input.text_lengths);

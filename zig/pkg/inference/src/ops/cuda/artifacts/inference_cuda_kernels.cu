@@ -26679,6 +26679,7 @@ extern "C" __global__ void antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1(
 #include "../kernels/gliner25_layer_norm.cuh"
 #include "../kernels/gliner25_softmax.cuh"
 #include "../kernels/gliner25_attention.cuh"
+#include "../kernels/gliner25_attention_fp32.cuh"
 
 // Laya inference kernels. Keep outside compiler-owned generated regions.
 extern "C" __global__ void termite_laya_local_attention_f32(

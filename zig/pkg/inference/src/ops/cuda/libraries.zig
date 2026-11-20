@@ -74,12 +74,20 @@ pub const CublasLtMatmulHeuristicResult = extern struct {
     reserved: [4]c_int,
 };
 
+const SetWorkspaceFn = *const fn (CublasHandle, ?*anyopaque, usize) callconv(.c) CublasStatus;
+const SgemmBatchedFn = *const fn (CublasHandle, c_int, c_int, c_int, c_int, c_int, *const f32, *const anyopaque, c_int, *const anyopaque, c_int, *const f32, *anyopaque, c_int, c_int) callconv(.c) CublasStatus;
+const GemmBatchedExFn = *const fn (CublasHandle, c_int, c_int, c_int, c_int, c_int, *const f32, *const anyopaque, c_int, c_int, *const anyopaque, c_int, c_int, *const f32, *anyopaque, c_int, c_int, c_int, c_int, c_int) callconv(.c) CublasStatus;
+const GemmExFn = *const fn (CublasHandle, c_int, c_int, c_int, c_int, c_int, *const f32, *const anyopaque, c_int, c_int, *const anyopaque, c_int, c_int, *const f32, *anyopaque, c_int, c_int, c_int, c_int) callconv(.c) CublasStatus;
 const CublasTable = struct {
     create: *const fn (*CublasHandle) callconv(.c) CublasStatus,
     destroy: *const fn (CublasHandle) callconv(.c) CublasStatus,
     getVersion: *const fn (CublasHandle, *c_int) callconv(.c) CublasStatus,
     setStream: *const fn (CublasHandle, ?*anyopaque) callconv(.c) CublasStatus,
     setMathMode: *const fn (CublasHandle, c_int) callconv(.c) CublasStatus,
+    setWorkspace: ?SetWorkspaceFn = null,
+    sgemmBatched: ?SgemmBatchedFn = null,
+    gemmBatchedEx: ?GemmBatchedExFn = null,
+    gemmEx: ?GemmExFn = null,
     sgemm: *const fn (CublasHandle, c_int, c_int, c_int, c_int, c_int, *const f32, *const anyopaque, c_int, *const anyopaque, c_int, *const f32, *anyopaque, c_int) callconv(.c) CublasStatus,
     sgemmStridedBatched: *const fn (CublasHandle, c_int, c_int, c_int, c_int, c_int, *const f32, *const anyopaque, c_int, i64, *const anyopaque, c_int, i64, *const f32, *anyopaque, c_int, i64, c_int) callconv(.c) CublasStatus,
 };
@@ -146,6 +154,10 @@ const CublasLibrary = struct {
                 .getVersion = try lookup(&lib, @TypeOf(@as(CublasTable, undefined).getVersion), "cublasGetVersion_v2"),
                 .setStream = try lookup(&lib, @TypeOf(@as(CublasTable, undefined).setStream), "cublasSetStream_v2"),
                 .setMathMode = try lookup(&lib, @TypeOf(@as(CublasTable, undefined).setMathMode), "cublasSetMathMode"),
+                .setWorkspace = lib.lookup(SetWorkspaceFn, "cublasSetWorkspace_v2"),
+                .sgemmBatched = lib.lookup(SgemmBatchedFn, "cublasSgemmBatched"),
+                .gemmBatchedEx = lib.lookup(GemmBatchedExFn, "cublasGemmBatchedEx"),
+                .gemmEx = lib.lookup(GemmExFn, "cublasGemmEx"),
                 .sgemm = try lookup(&lib, @TypeOf(@as(CublasTable, undefined).sgemm), "cublasSgemm_v2"),
                 .sgemmStridedBatched = try lookup(&lib, @TypeOf(@as(CublasTable, undefined).sgemmStridedBatched), "cublasSgemmStridedBatched"),
             },
@@ -194,8 +206,43 @@ pub const CublasF32 = struct {
         self.* = undefined;
     }
 
+    pub fn supportsWorkspace(self: *const CublasF32) bool {
+        return self.library.fns.setWorkspace != null;
+    }
+
+    pub fn supportsBf16Linears(self: *const CublasF32) bool {
+        return self.library.fns.gemmEx != null;
+    }
+
+    pub fn supportsPointerBatches(self: *const CublasF32) bool {
+        return self.library.fns.sgemmBatched != null;
+    }
+
+    pub fn bindWorkspace(self: *CublasF32, stream: ?*anyopaque, workspace: *anyopaque, bytes: usize) !void {
+        const set = self.library.fns.setWorkspace orelse return error.UnsupportedCublasWorkspace;
+        try self.bindStream(stream);
+        try check(set(self.handle, workspace, bytes));
+    }
+
     pub fn linear(self: *CublasF32, stream: ?*anyopaque, output: *anyopaque, input: *const anyopaque, weight: *const anyopaque, rows: usize, width: usize, columns: usize, accumulate: bool) !void {
         return self.matrix(stream, output, input, weight, rows, width, columns, false, true, accumulate);
+    }
+
+    /// BF16 linear without bias. Uses the classic cuBLAS reduction employed by
+    /// Python CUDA BF16 for the DeBERTa FFN output projection. Bias is rounded
+    /// separately by the following fused residual/normalization kernel.
+    pub fn linearBf16(self: *CublasF32, stream: ?*anyopaque, output: *anyopaque, input: *const anyopaque, weight: *const anyopaque, rows: usize, width: usize, columns: usize) !void {
+        const gemm = self.library.fns.gemmEx orelse return error.UnsupportedCublasBf16;
+        const m = std.math.cast(c_int, rows) orelse return error.InvalidCublasShape;
+        const k = std.math.cast(c_int, width) orelse return error.InvalidCublasShape;
+        const n = std.math.cast(c_int, columns) orelse return error.InvalidCublasShape;
+        if (m <= 0 or k <= 0 or n <= 0) return error.InvalidCublasShape;
+        try self.bindStream(stream);
+        const alpha: f32 = 1;
+        const beta: f32 = 0;
+        // Column-major C^T = W X^T; CUBLAS_GEMM_DEFAULT_TENSOR_OP = 99.
+        try check(gemm(self.handle, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, weight, CUDA_R_16BF, k, input, CUDA_R_16BF, k, &beta, output, CUDA_R_16BF, n, CUBLAS_COMPUTE_32F, 99));
+        self.calls +|= 1;
     }
 
     /// Row-major C = op(lhs) op(rhs), without copying either transpose.
@@ -243,6 +290,70 @@ pub const CublasF32 = struct {
             @as(i64, m) * n,
             count,
         ));
+        self.calls +|= 1;
+    }
+
+    /// Row-major strided views, including interleaved [sequence,head,dim]
+    /// attention operands. The caller validates each complete buffer extent.
+    pub fn strided(self: *CublasF32, stream: ?*anyopaque, output: *anyopaque, lhs: *const anyopaque, rhs: *const anyopaque, batches: usize, rows: usize, width: usize, columns: usize, lhs_ld: usize, rhs_ld: usize, output_ld: usize, lhs_stride: usize, rhs_stride: usize, output_stride: usize, rhs_transposed: bool) !void {
+        const m = std.math.cast(c_int, rows) orelse return error.InvalidCublasShape;
+        const k = std.math.cast(c_int, width) orelse return error.InvalidCublasShape;
+        const n = std.math.cast(c_int, columns) orelse return error.InvalidCublasShape;
+        const count = std.math.cast(c_int, batches) orelse return error.InvalidCublasShape;
+        const la = std.math.cast(c_int, lhs_ld) orelse return error.InvalidCublasShape;
+        const lb = std.math.cast(c_int, rhs_ld) orelse return error.InvalidCublasShape;
+        const lc = std.math.cast(c_int, output_ld) orelse return error.InvalidCublasShape;
+        const sa = std.math.cast(i64, lhs_stride) orelse return error.InvalidCublasShape;
+        const sb = std.math.cast(i64, rhs_stride) orelse return error.InvalidCublasShape;
+        const sc = std.math.cast(i64, output_stride) orelse return error.InvalidCublasShape;
+        if (m <= 0 or k <= 0 or n <= 0 or count <= 0 or la < k or lb < (if (rhs_transposed) k else n) or lc < n) return error.InvalidCublasShape;
+        try self.bindStream(stream);
+        const alpha: f32 = 1;
+        const beta: f32 = 0;
+        try check(self.library.fns.sgemmStridedBatched(self.handle, if (rhs_transposed) CUBLAS_OP_T else CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, rhs, lb, sb, lhs, la, sa, &beta, output, lc, sc, count));
+        self.calls +|= 1;
+    }
+
+    /// GPU arrays of matrix pointers, retaining arbitrary leading dimensions.
+    pub fn pointerBatched(self: *CublasF32, stream: ?*anyopaque, output: *anyopaque, lhs: *const anyopaque, rhs: *const anyopaque, batches: usize, rows: usize, width: usize, columns: usize, lhs_ld: usize, rhs_ld: usize, output_ld: usize, rhs_transposed: bool) !void {
+        const operation = self.library.fns.sgemmBatched orelse return error.UnsupportedCublasWorkspace;
+        const m = std.math.cast(c_int, rows) orelse return error.InvalidCublasShape;
+        const k = std.math.cast(c_int, width) orelse return error.InvalidCublasShape;
+        const n = std.math.cast(c_int, columns) orelse return error.InvalidCublasShape;
+        const count = std.math.cast(c_int, batches) orelse return error.InvalidCublasShape;
+        const la = std.math.cast(c_int, lhs_ld) orelse return error.InvalidCublasShape;
+        const lb = std.math.cast(c_int, rhs_ld) orelse return error.InvalidCublasShape;
+        const lc = std.math.cast(c_int, output_ld) orelse return error.InvalidCublasShape;
+        if (m <= 0 or k <= 0 or n <= 0 or count <= 0 or la < k or lb < (if (rhs_transposed) k else n) or lc < n) return error.InvalidCublasShape;
+        try self.bindStream(stream);
+        const alpha: f32 = 1;
+        const beta: f32 = 0;
+        try check(operation(self.handle, if (rhs_transposed) CUBLAS_OP_T else CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, rhs, lb, lhs, la, &beta, output, lc, count));
+        self.calls +|= 1;
+    }
+
+    pub fn supportsBf16PointerBatches(self: *const CublasF32) bool {
+        return self.library.fns.gemmBatchedEx != null;
+    }
+
+    /// BF16 operands, strict F32 accumulation and F32 output. Leading
+    /// dimensions and input strides count BF16 elements, never bytes.
+    pub fn pointerBatchedBf16(self: *CublasF32, stream: ?*anyopaque, output: *anyopaque, lhs: *const anyopaque, rhs: *const anyopaque, batches: usize, rows: usize, width: usize, columns: usize, lhs_ld: usize, rhs_ld: usize, output_ld: usize, rhs_transposed: bool, output_bf16: bool) !void {
+        const operation = self.library.fns.gemmBatchedEx orelse return error.UnsupportedCublasWorkspace;
+        const m = std.math.cast(c_int, rows) orelse return error.InvalidCublasShape;
+        const k = std.math.cast(c_int, width) orelse return error.InvalidCublasShape;
+        const n = std.math.cast(c_int, columns) orelse return error.InvalidCublasShape;
+        const count = std.math.cast(c_int, batches) orelse return error.InvalidCublasShape;
+        const la = std.math.cast(c_int, lhs_ld) orelse return error.InvalidCublasShape;
+        const lb = std.math.cast(c_int, rhs_ld) orelse return error.InvalidCublasShape;
+        const lc = std.math.cast(c_int, output_ld) orelse return error.InvalidCublasShape;
+        if (m <= 0 or k <= 0 or n <= 0 or count <= 0 or la < k or lb < (if (rhs_transposed) k else n) or lc < n) return error.InvalidCublasShape;
+        try self.bindStream(stream);
+        const alpha: f32 = 1;
+        const beta: f32 = 0;
+        // CUDA_R_16BF=14, CUDA_R_32F=0, CUBLAS_COMPUTE_32F=68;
+        // the ordinary default algorithm selects tensor cores where supported.
+        try check(operation(self.handle, if (rhs_transposed) CUBLAS_OP_T else CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, rhs, 14, lb, lhs, 14, la, &beta, output, if (output_bf16) 14 else 0, lc, count, 68, -1));
         self.calls +|= 1;
     }
 
