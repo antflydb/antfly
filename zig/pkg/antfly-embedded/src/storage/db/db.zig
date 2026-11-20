@@ -154557,6 +154557,33 @@ test "source semantic media input rejects PDF ancestry on nonempty sources and p
     try std.testing.expectEqual(@as(usize, 1), dense_requests);
 }
 
+test "source semantic media input PDF cardinality changes require removing dense consumers" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/pages.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try @import("../lite/backend.zig").Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var opts = OpenOptions{ .start_index_workers = false, .start_optional_runtime_workers = false };
+    try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+    var db = try DB.open(a, path, opts);
+    defer db.close();
+    var config = types.EnrichmentConfig{ .name = "visual", .kind = .embedding, .field = "url", .expected_dims = 3 };
+    try db.addEnrichment(config);
+    const index = types.IndexConfig{ .name = "images", .kind = .dense_vector, .config_json = "{\"field\":\"v\",\"dims\":3,\"embedding_name\":\"visual\"}" };
+    try db.addIndex(index);
+    config.embedding_input = .pdf_page_images;
+    try std.testing.expectError(error.EnrichmentInUse, db.upsertEnrichment(config));
+    try std.testing.expect(try db.deleteIndex("images"));
+    while (try db.advanceGeneratedArtifactCleanupPage("images") != .idle) {}
+    _ = try db.upsertEnrichment(config);
+    try db.addIndex(index);
+    config.embedding_input = .text;
+    try std.testing.expectError(error.EnrichmentInUse, db.upsertEnrichment(config));
+    try std.testing.expect(db.core.index_manager.denseIndex("images").?.memberBacked());
+}
+
 test "source semantic media input PDF producers cannot be bound to sparse consumers" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("source-pdf-sparse");

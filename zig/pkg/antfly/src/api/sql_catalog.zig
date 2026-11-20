@@ -611,7 +611,10 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
 pub fn bindsExisting(statement: ast.Statement) bool {
     return switch (statement) {
         .drop_table, .policy_ddl => true,
-        .catalog_ddl => |ddl| ddl.action != .create or ddl.kind == .index,
+        .create_table => |create| create.tablespace != null or for (create.constraints) |constraint| {
+            if (constraint == .add_foreign_key and !std.mem.eql(u8, constraint.add_foreign_key.parent, create.table.table)) break true;
+        } else false,
+        .catalog_ddl => |ddl| ddl.action != .create or ddl.kind == .index or ddl.tablespace != null,
         else => false,
     };
 }
@@ -631,7 +634,7 @@ const TableCut = struct {
 };
 
 // Resolve only remaining names at each search-path position. All point reads
-// share a revision and authorization is checked before looking in each scope.
+// share a revision. Authorize the selected owner before returning its identity.
 fn resolveTables(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, a: std.mem.Allocator, database: []const u8, namespace: []const u8, names: []const ast.Name, path: ?*const SearchPath, definitions: bool, expected_revision: ?u64) !TableCut {
     if (names.len == 0 or names.len > 128) return error.InvalidSqlSyntax;
     const objects = try a.alloc(DdlGuard.Table, names.len);
@@ -650,7 +653,7 @@ fn resolveTables(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authen
             if (depth == 0) objects[i] = .{ .namespace = ns, .id = 0 };
             targets[count] = .{ .database = name.database orelse database, .namespace = ns, .table = name.table };
             try targets[count].validate();
-            try authorizeTableAdmin(identity, a, targets[count]);
+            if (!on_path or path.?.len == 1) try authorizeTableAdmin(identity, a, targets[count]);
             positions[count] = i;
             count += 1;
         }
@@ -661,16 +664,21 @@ fn resolveTables(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authen
         if (revision) |r| if (cut.revision != r) return error.CatalogGenerationChanged;
         revision = cut.revision;
         for (cut.tables, positions[0..count], targets[0..count]) |table, i, target| if (table) |t| {
+            if (path != null and path.?.len > 1 and names[i].namespace == null and names[i].database == null)
+                try authorizeTableAdmin(identity, a, target);
             objects[i] = .{ .namespace = target.namespace, .id = t.table_id };
             rows[i] = t;
         };
     }
+    if (path != null and path.?.len > 1) for (names, rows, objects) |name, row, object| {
+        if (row == null and name.namespace == null and name.database == null)
+            try authorizeTableAdmin(identity, a, .{ .database = database, .namespace = object.namespace, .table = name.table });
+    };
     return .{ .objects = objects, .definitions = rows, .revision = revision orelse return error.InvalidParameter };
 }
 
-fn tablespaceId(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, a: std.mem.Allocator, ddl: ast.CatalogDdl) !?u64 {
-    if (ddl.action != .set_tablespace) return null;
-    const name = ddl.tablespace orelse return null;
+fn tablespaceId(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, a: std.mem.Allocator, tablespace: ?[]const u8) !?u64 {
+    const name = tablespace orelse return null;
     if (identity) |user| if (!server_mod.permissionsAllow(user.permissions, .tablespace, name, .read)) return error.Forbidden;
     const bytes = server.source.systemCatalog(a, context, .{ .read = .{ .kind = .tablespace, .name = name } }) catch |err| switch (err) {
         error.CatalogNotFound => return 0,
@@ -684,8 +692,28 @@ pub fn describeGuard(server: *server_mod.ApiHttpServer, identity: ?server_mod.Au
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
+    if (statement == .create_table) {
+        const create = statement.create_table;
+        var names: std.ArrayList(ast.Name) = .empty;
+        var constraints: std.ArrayList([]const u8) = .empty;
+        for (create.constraints) |change| {
+            if (change != .add_foreign_key) continue;
+            const fk = change.add_foreign_key;
+            if (std.mem.eql(u8, fk.parent, create.table.table)) continue;
+            try names.append(a, .{ .table = fk.parent });
+            try constraints.append(a, fk.name);
+        }
+        const parents = try a.alloc(DdlGuard.ForeignKeyParent, names.items.len);
+        if (parents.len != 0) {
+            const cut = try resolveTables(server, identity, context, a, create.table.database orelse database, create.table.namespace orelse namespace, names.items, null, false, null);
+            for (parents, constraints.items, cut.objects) |*parent, constraint, object| parent.* = .{ .constraint = constraint, .id = object.id };
+        }
+        return DdlGuard.encode(alloc, .{ .fk_parents = parents, .tablespace_id = try tablespaceId(server, identity, context, a, create.tablespace) });
+    }
     if (statement == .catalog_ddl) {
         const ddl = statement.catalog_ddl;
+        if (ddl.action == .create and ddl.kind != .index)
+            return DdlGuard.encode(alloc, .{ .tablespace_id = try tablespaceId(server, identity, context, a, ddl.tablespace) });
         if (ddl.kind == .index) {
             const result = try resolveIndex(server, identity, context, database, namespace, a, ddl, path, ddl.action == .drop);
             return indexGuard(alloc, result, ddl.action == .create);
@@ -708,13 +736,13 @@ pub fn describeGuard(server: *server_mod.ApiHttpServer, identity: ?server_mod.Au
             };
             if (identity) |user| if (!server_mod.permissionsAllow(user.permissions, permission, resource, .admin)) return error.Forbidden;
             const bytes = server.source.systemCatalog(a, context, .{ .read = .{ .kind = kind, .database = db, .name = ddl.name.table } }) catch |err| switch (err) {
-                error.CatalogNotFound => return DdlGuard.encode(alloc, .{ .resource_id = 0, .tablespace_id = try tablespaceId(server, identity, context, a, ddl) }),
+                error.CatalogNotFound => return DdlGuard.encode(alloc, .{ .resource_id = 0, .tablespace_id = try tablespaceId(server, identity, context, a, ddl.tablespace) }),
                 else => return err,
             };
             const state = try std.json.parseFromSliceLeaky(domain.State, a, bytes, .{});
             const parent = if (kind == .namespace) (state.find(.database, 0, db) orelse return error.InvalidSqlBackendResponse).id else 0;
             const record = state.find(kind, parent, ddl.name.table) orelse return error.InvalidSqlBackendResponse;
-            return DdlGuard.encode(alloc, .{ .resource_id = record.id, .tablespace_id = try tablespaceId(server, identity, context, a, ddl) });
+            return DdlGuard.encode(alloc, .{ .resource_id = record.id, .tablespace_id = try tablespaceId(server, identity, context, a, ddl.tablespace) });
         }
     }
     const names: []const ast.Name = switch (statement) {
@@ -735,7 +763,7 @@ pub fn describeGuard(server: *server_mod.ApiHttpServer, identity: ?server_mod.Au
     }
     if (statement == .catalog_ddl) {
         const ddl = statement.catalog_ddl;
-        objects.tablespace_id = try tablespaceId(server, identity, context, a, ddl);
+        objects.tablespace_id = try tablespaceId(server, identity, context, a, ddl.tablespace);
         if (ddl.schema_change) |change| if (change == .add_foreign_key) {
             const parent = try resolveTables(server, identity, context, a, ddl.name.database orelse database, cut.objects[0].namespace, &.{.{ .table = change.add_foreign_key.parent }}, null, false, cut.revision);
             objects.parent_id = parent.objects[0].id;
@@ -846,6 +874,7 @@ pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.Aut
                     error.CatalogAlreadyExists, error.TableAlreadyExists => return createConflict(server, context, a, target, generated_names, create.if_not_exists, err, allocators.scratch),
                     else => return err,
                 };
+                if (bound) |objects| try objects.validateCreatePlan(a, plan);
                 var receipt = try newReceipt(alloc, target, plan.child.table_id, 0);
                 errdefer {
                     alloc.free(receipt.database);

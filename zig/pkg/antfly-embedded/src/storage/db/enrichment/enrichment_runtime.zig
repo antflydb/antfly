@@ -34156,9 +34156,6 @@ fn processPdfPageImageEmbeddingWithAllocator(
     prepared_sources: *PreparedDocumentSourceCache,
     window: *GeneratedReplayWindow,
 ) !void {
-    if (!document_extraction_mod.pdf_runtime_available) return error.PdfRuntimeUnavailable;
-    if (!dense_embedder.supportsPartItems() and !dense_embedder.supportsRasterItems())
-        return error.UnsupportedEmbeddingProvider;
     // Rendering and a remote/local multimodal invocation can each exceed the
     // ordinary enrichment lease TTL. Renew the exact tenure concurrently for
     // the complete operation; transaction fences remain the publication
@@ -34167,6 +34164,24 @@ fn processPdfPageImageEmbeddingWithAllocator(
     try embedding_lease_guard.start();
     defer embedding_lease_guard.stop();
     try embedding_lease_guard.check();
+    const doc_store_key = try documentSourceStoreKeyWithAllocator(runtime, metadata_alloc, request.doc_key);
+    defer metadata_alloc.free(doc_store_key);
+    var source_reader = AllocatedStoreReader{ .runtime = runtime, .alloc = metadata_alloc };
+    const raw = readAllocWithRetry(&source_reader, doc_store_key, AllocatedStoreReader.readDocument) catch |err| switch (err) {
+        error.NotFound => return,
+        else => return err,
+    };
+    defer metadata_alloc.free(raw);
+    errdefer if (runtime.retry_scheduler) |scheduler| scheduler.rememberSource(runtime, requestFailureFingerprint(request), sourceRecordDigest(raw));
+    const source_url = try extractSourceText(metadata_alloc, runtime.config, raw, request) orelse {
+        try retirePdfPageEmbeddings(runtime, metadata_alloc, window, request, consumer_indexes, doc_store_key, sourceRecordDigest(raw));
+        return;
+    };
+    defer metadata_alloc.free(source_url);
+
+    if (!document_extraction_mod.pdf_runtime_available) return error.PdfRuntimeUnavailable;
+    if (!dense_embedder.supportsPartItems() and !dense_embedder.supportsRasterItems())
+        return error.UnsupportedEmbeddingProvider;
     const embedding_name = requestEmbeddingName(request);
     const execution_lease = try dense_embedder.resolvePartLease(metadata_alloc, embedding_name);
     const capabilities = execution_lease.capabilities.?;
@@ -34193,21 +34208,6 @@ fn processPdfPageImageEmbeddingWithAllocator(
     else
         policy.batch_bytes orelse return error.InferenceCapabilitiesUnavailable;
     if (batch_bytes == 0) return error.InvalidInferenceCapabilities;
-
-    const doc_store_key = try documentSourceStoreKeyWithAllocator(runtime, metadata_alloc, request.doc_key);
-    defer metadata_alloc.free(doc_store_key);
-    var source_reader = AllocatedStoreReader{ .runtime = runtime, .alloc = metadata_alloc };
-    const raw = readAllocWithRetry(&source_reader, doc_store_key, AllocatedStoreReader.readDocument) catch |err| switch (err) {
-        error.NotFound => return,
-        else => return err,
-    };
-    defer metadata_alloc.free(raw);
-    errdefer if (runtime.retry_scheduler) |scheduler| scheduler.rememberSource(runtime, requestFailureFingerprint(request), sourceRecordDigest(raw));
-    const source_url = try extractSourceText(metadata_alloc, runtime.config, raw, request) orelse {
-        try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
-        return;
-    };
-    defer metadata_alloc.free(source_url);
 
     var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
     defer resource_tracker.deinit();
@@ -34263,7 +34263,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
     coordinator.beginOperation(runtime.config.sync_wait_timeout_ms);
     const page_count = try coordinator.session.pageCount();
     if (page_count == 0) {
-        try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
+        try retirePdfPageEmbeddings(runtime, metadata_alloc, window, request, consumer_indexes, doc_store_key, sourceRecordDigest(raw));
         return;
     }
 
@@ -34580,10 +34580,6 @@ fn processPdfPageImageEmbeddingWithAllocator(
         generated_pdf_absolute_max_document_pages,
     );
     defer stale.deinit(metadata_alloc);
-    if (base_embeddings.items.len == 0) {
-        try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
-        return;
-    }
     // Discover abandoned attempts without mutating storage. Their deletion is
     // transferred through lease-fenced bounded publication windows. A
     // superseded worker therefore cannot delete stages written by its
@@ -34620,6 +34616,44 @@ fn processPdfPageImageEmbeddingWithAllocator(
     stale.artifact_delete_keys = &.{};
 }
 
+// A terminal empty input retires each previously published page. Each bounded
+// commit checks the same document and producer generation, including retries.
+fn retirePdfPageEmbeddings(runtime: *EnrichmentRuntime, alloc: Allocator, window: *GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, consumers: []const []const u8, source_key: []const u8, digest: [32]u8) !void {
+    var stale = try deleteStalePageEmbeddingArtifactsWithLimit(runtime, alloc, request.doc_key, requestArtifactName(request), requestEmbeddingName(request), &.{}, generated_pdf_absolute_max_document_pages);
+    defer stale.deinit(alloc);
+    if (!window.isEmpty()) try flushGeneratedReplayWindow(runtime, window);
+    const capacity = generatedReplayWindowItems();
+    // The last commit includes a source guard, the document retirement and
+    // its replay notifications, and one terminal outcome per consumer.
+    const terminal_items = 3 + consumers.len;
+    if (1 + terminal_items > capacity) return error.GeneratedReplayWindowTooLarge;
+    try appendEmbeddingSourceGuard(runtime, window, request, source_key, digest);
+    for (stale.artifact_delete_keys) |key| {
+        if (window.itemCount() + 2 > capacity) {
+            try flushGeneratedReplayWindow(runtime, window);
+            try appendEmbeddingSourceGuard(runtime, window, request, source_key, digest);
+        }
+        try appendOwnedPdfPageDelete(runtime, window, key);
+    }
+    if (window.itemCount() + terminal_items > capacity) {
+        try flushGeneratedReplayWindow(runtime, window);
+        try appendEmbeddingSourceGuard(runtime, window, request, source_key, digest);
+    }
+    try markDerivedCoverageSkipped(runtime, window, request, consumers);
+    try flushGeneratedReplayWindow(runtime, window);
+}
+
+fn appendOwnedPdfPageDelete(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, key: []const u8) !void {
+    const artifact = try runtime.alloc.dupe(u8, key);
+    errdefer runtime.alloc.free(artifact);
+    const replay = try runtime.alloc.dupe(u8, key);
+    errdefer runtime.alloc.free(replay);
+    try window.artifact_delete_keys.ensureUnusedCapacity(runtime.alloc, 1);
+    try window.deleted_keys.ensureUnusedCapacity(runtime.alloc, 1);
+    window.artifact_delete_keys.appendAssumeCapacity(artifact);
+    window.deleted_keys.appendAssumeCapacity(replay);
+}
+
 fn appendPdfPageEmbeddingPromotion(
     runtime: *EnrichmentRuntime,
     window: *GeneratedReplayWindow,
@@ -34643,18 +34677,23 @@ fn flushOwnedPdfArtifactDeletesBounded(
     window: *GeneratedReplayWindow,
     owned_keys: *[][]u8,
     max_window_items: usize,
+    replay_deletes: bool,
 ) !void {
-    if (max_window_items == 0) return error.GeneratedReplayWindowTooLarge;
+    if (owned_keys.*.len == 0) return;
+    const cost: usize = if (replay_deletes) 2 else 1;
+    if (max_window_items < cost) return error.GeneratedReplayWindowTooLarge;
     var next: usize = 0;
     while (next < owned_keys.*.len) {
-        if (window.itemCount() >= max_window_items) try flushGeneratedReplayWindow(runtime, window);
-        if (window.itemCount() >= max_window_items) return error.GeneratedReplayWindowTooLarge;
-        const available = max_window_items - window.itemCount();
+        if (max_window_items -| window.itemCount() < cost) try flushGeneratedReplayWindow(runtime, window);
+        const available = (max_window_items - window.itemCount()) / cost;
         const end = @min(owned_keys.*.len, next + available);
         try window.artifact_delete_keys.ensureUnusedCapacity(runtime.alloc, end - next);
         for (owned_keys.*[next..end]) |*key| {
-            const owned_key = try runtime.alloc.dupe(u8, key.*);
-            window.artifact_delete_keys.appendAssumeCapacity(owned_key);
+            if (replay_deletes) {
+                try appendOwnedPdfPageDelete(runtime, window, key.*);
+            } else {
+                window.artifact_delete_keys.appendAssumeCapacity(try runtime.alloc.dupe(u8, key.*));
+            }
             owned_alloc.free(key.*);
             key.* = &.{};
         }
@@ -34757,8 +34796,8 @@ fn publishPdfPageEmbeddingBatches(
             try appendPdfPageEmbeddingConsumer(runtime, window, base_embedding, index_name);
         }
     }
-    try flushOwnedPdfArtifactDeletesBounded(runtime, metadata_alloc, window, stale_artifact_keys, derived_window_items);
-    try flushOwnedPdfArtifactDeletesBounded(runtime, metadata_alloc, window, obsolete_stage_keys, derived_window_items);
+    try flushOwnedPdfArtifactDeletesBounded(runtime, metadata_alloc, window, stale_artifact_keys, derived_window_items, true);
+    try flushOwnedPdfArtifactDeletesBounded(runtime, metadata_alloc, window, obsolete_stage_keys, derived_window_items, false);
 
     for (consumer_indexes) |index_name| {
         try queueDerivedCoverageOutcomeForIndex(runtime, window, index_name, request, .produced);

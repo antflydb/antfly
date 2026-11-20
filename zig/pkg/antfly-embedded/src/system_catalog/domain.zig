@@ -896,7 +896,8 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
         if (request.action == .create) return error.InvalidCatalogMutation;
         if ((if (found) |resource| resource.id else 0) != expected) return error.CatalogGenerationChanged;
     }
-    if (request.expected_tablespace_id != null and (request.action != .set_tablespace or request.tablespace == null or request.expected_resource_id == null)) return error.InvalidCatalogMutation;
+    if (request.expected_tablespace_id != null and (request.tablespace == null or
+        (request.action != .create and (request.action != .set_tablespace or request.expected_resource_id == null)))) return error.InvalidCatalogMutation;
     var upserts = std.ArrayListUnmanaged(Resource).empty;
     defer upserts.deinit(alloc);
     var removes = std.ArrayListUnmanaged(Resource).empty;
@@ -915,7 +916,11 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                 if (existing.graph_revision != request.expected_graph_revision.?) return error.CatalogGenerationChanged;
             }
             if (request.new_name != null) return error.InvalidCatalogMutation;
-            const binding = if (request.tablespace) |name| ((try reader.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound).id else 0;
+            const binding = if (request.tablespace) |name| blk: {
+                const space = try reader.lookup(.tablespace, 0, name);
+                if (request.expected_tablespace_id) |id| if ((if (space) |destination| destination.id else 0) != id) return error.CatalogGenerationChanged;
+                break :blk (space orelse return error.TablespaceNotFound).id;
+            } else 0;
             if (request.kind == .tablespace and binding != 0) return error.InvalidCatalogMutation;
             var resource: Resource = if (replacing) found.? else .{ .native_service = request.native_service, .kind = request.kind, .id = next_id, .parent_id = parent_id, .name = request.name, .tablespace_id = binding, .placement_policy = request.placement_policy, .location_json = request.location_json, .source_json = request.source_json };
             if (replacing) {

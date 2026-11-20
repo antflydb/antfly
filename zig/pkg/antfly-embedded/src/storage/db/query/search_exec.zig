@@ -15710,9 +15710,17 @@ fn searchDenseInternal(
                 stored_data_owned = stored_data != null;
                 profile.load_projected_document_ns += projected_source_profile.total_ns - load_profile_total_before;
             }
+            // Page-image embeddings may have no standalone unit row. Ancestor
+            // projection is independent of the top-level stored-field mask.
+            const unit_data = if (entry.has_pdf_page_members and raw_member_mode and postprocess_req.hierarchy_include_unit)
+                try pdfPageHitProjection(alloc, source_artifact_ref)
+            else
+                null;
+            errdefer if (unit_data) |data| alloc.free(data);
             try hit_vector_ids.append(alloc, hit.vector_id);
             try hits.append(alloc, .{
                 .id = doc_key,
+                .ancestor_unit_data = unit_data,
                 .doc_ordinal = null,
                 .score = vector_mod.similarityFromDistance(hit.distance, entry.metric),
                 .distance = hit.distance,

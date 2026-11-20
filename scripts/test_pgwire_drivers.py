@@ -229,6 +229,19 @@ def exercise_bound_portals(server, password):
         migrator.execute("CREATE TABLE fk_destination (id TEXT PRIMARY KEY)")
         execute(b"C40001")
 
+        parse(
+            "create_fk",
+            "CREATE TABLE bound_child (a TEXT REFERENCES fk_original(id), "
+            "b TEXT REFERENCES fk_destination(id))",
+        )
+        bind("create_fk")
+        migrator.execute("ALTER TABLE fk_destination RENAME TO fk_replaced")
+        migrator.execute("CREATE TABLE fk_destination (id TEXT PRIMARY KEY)")
+        execute(b"C40001")
+        # The failed portal must leave the child name available.
+        migrator.execute("CREATE TABLE bound_child (id TEXT)")
+        migrator.execute("DROP TABLE bound_child")
+
         migrator.execute("CREATE DATABASE bound_placement")
         space = "CREATE TABLESPACE portal_space LOCATION 's3://bucket/path'"
         migrator.execute(space)
@@ -237,7 +250,15 @@ def exercise_bound_portals(server, password):
         migrator.execute("DROP TABLESPACE portal_space")
         migrator.execute(space)
         execute(b"C40001")
-        # Removing it also proves that the replacement never acquired the database.
+        parse(
+            "create_placement",
+            "CREATE TABLE bound_child (id TEXT) TABLESPACE portal_space",
+        )
+        bind("create_placement")
+        migrator.execute("DROP TABLESPACE portal_space")
+        migrator.execute(space)
+        execute(b"C40001")
+        # Removing it also proves that the replacement never acquired either object.
         migrator.execute("DROP TABLESPACE portal_space")
 
         create_index = "CREATE INDEX portal_n ON portal_target (n)"
@@ -292,6 +313,7 @@ def exercise_bound_portals(server, password):
 
 def exercise_cached_search_path(server, password):
     import psycopg
+    import requests
 
     url = f"postgres://admin:{password}@127.0.0.1:{server.pgwire_port}/default"
     with (
@@ -341,6 +363,48 @@ def exercise_cached_search_path(server, password):
             pass
         else:
             raise AssertionError("DROP TABLE skipped the second search_path entry")
+
+        sql.execute("CREATE TABLE path_second.scoped_ddl (n BIGINT)")
+        scoped_password = secrets.token_hex(16)
+        response = requests.post(
+            server.url + "/auth/v1/users/path_editor",
+            auth=("admin", password),
+            json={
+                "password": scoped_password,
+                "initial_policies": [
+                    {"resource_type": "namespace", "resource": "*", "type": "read"},
+                    {
+                        "resource_type": "table",
+                        "type": "admin",
+                        "table_target": {
+                            "database": "default",
+                            "namespace": "path_second",
+                            "table": "scoped_ddl",
+                        },
+                    },
+                ],
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        with psycopg.connect(
+            url, user="path_editor", password=scoped_password, autocommit=True
+        ) as scoped:
+            scoped.execute("SET search_path TO path_first, path_second")
+            scoped.execute(
+                "ALTER TABLE scoped_ddl ADD COLUMN allowed TEXT", prepare=True
+            )
+            sql.execute("CREATE TABLE path_first.scoped_ddl (n BIGINT)")
+            try:
+                scoped.execute(
+                    "ALTER TABLE scoped_ddl ADD COLUMN denied TEXT", prepare=True
+                )
+            except psycopg.errors.InsufficientPrivilege:
+                pass
+            else:
+                raise AssertionError(
+                    "unqualified ALTER skipped its unauthorized shadowing table"
+                )
     print(
         "SQL and wire statements follow search_path and preserve column labels: PASS",
         flush=True,

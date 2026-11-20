@@ -18999,6 +18999,7 @@ pub const ApiHttpServer = struct {
         const assembled_indexes_json = indexes_api.addEnrichmentToTableIndexesJson(alloc, table_before.indexes_json, artifact_name, enrichment_json) catch |err| {
             std.log.warn("artifact enrichment validation failed stage=assemble_table table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
             switch (err) {
+                error.EnrichmentInUse => return error.Conflict,
                 error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return error.InvalidEnrichmentRequest,
                 else => return error.InternalFailure,
             }

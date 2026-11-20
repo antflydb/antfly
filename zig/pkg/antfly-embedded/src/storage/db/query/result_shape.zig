@@ -1024,13 +1024,13 @@ fn hydrateDirectChunkAncestors(
     for (owned.hits, 0..) |hit, i| {
         const chunk_key = (try chunkStorageKeyForHitAlloc(alloc, hit)) orelse continue;
         defer alloc.free(chunk_key);
-        const payload = chunk_payloads[i] orelse hit.stored_data orelse continue;
+        const payload = chunk_payloads[i] orelse hit.stored_data;
         const info = parseChunkAncestorInfoAlloc(alloc, chunk_key, payload) catch |err| switch (err) {
             error.InvalidChunkArtifact, error.InvalidInternalUserKey => continue,
             else => return err,
         };
         if (req.hierarchy_include_source) source_count += 1;
-        if (req.hierarchy_include_unit and info.unit_key != null) unit_count += 1;
+        if (req.hierarchy_include_unit and info.unit_key != null and hit.ancestor_unit_data == null) unit_count += 1;
         infos[i] = info;
     }
 
@@ -1180,7 +1180,7 @@ fn loadDirectChunkPayloads(
     return loaded;
 }
 
-fn parseChunkAncestorInfoAlloc(alloc: Allocator, chunk_key: []const u8, payload: []const u8) !ChunkAncestorInfo {
+fn parseChunkAncestorInfoAlloc(alloc: Allocator, chunk_key: []const u8, payload: ?[]const u8) !ChunkAncestorInfo {
     var decoded = (try artifact_ids.decodeArtifactRefAlloc(alloc, chunk_key)) orelse return error.InvalidChunkArtifact;
     defer decoded.deinit(alloc);
     // Native keys own source identity. Generic asset payloads are application
@@ -1191,7 +1191,7 @@ fn parseChunkAncestorInfoAlloc(alloc: Allocator, chunk_key: []const u8, payload:
         .parent_doc_key = parent_doc_key,
         .unit_key = if (decoded.unit_id) |unit| try internal_keys.documentUnitArtifactKeyAlloc(alloc, parent_doc_key, decoded.name, unit) else null,
     };
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload orelse return error.InvalidChunkArtifact, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidChunkArtifact;
     const object = parsed.value.object;
@@ -1277,7 +1277,8 @@ fn hydrateDirectChunkUnitAncestors(
     const unit_keys = try alloc.alloc([]const u8, unit_count);
     defer alloc.free(unit_keys);
     var index: usize = 0;
-    for (infos) |maybe_info| {
+    for (infos, result.hits) |maybe_info, hit| {
+        if (hit.ancestor_unit_data != null) continue;
         const info = maybe_info orelse continue;
         const unit_key = info.unit_key orelse continue;
         unit_keys[index] = unit_key;
@@ -1300,7 +1301,7 @@ fn hydrateDirectChunkUnitAncestors(
     index = 0;
     for (result.hits, infos) |*hit, maybe_info| {
         const info = maybe_info orelse continue;
-        if (info.unit_key == null) continue;
+        if (info.unit_key == null or hit.ancestor_unit_data != null) continue;
         if (loaded[index]) |bytes| {
             hit.ancestor_unit_data = bytes;
             loaded[index] = null;

@@ -222,17 +222,33 @@ def test_published_pdf_page_image_hits(embeddinggemma2_model_available):
                 ],
             },
         )
+        cardinality_change = requests.put(
+            root + "/artifacts/visual/enrichment",
+            json={
+                "kind": "embedding",
+                "field": "url",
+                "embedding_input": "text",
+                "expected_dims": 768,
+            },
+            timeout=30,
+        )
+        assert cardinality_change.status_code == 409, cardinality_change.text
+
         fixtures = Path(__file__).resolve().parents[2] / "lib/pdf/testdata"
         for filename, pages in (
             ("simple_text_fixture.pdf", 1),
             ("two_page_text_fixture.pdf", 2),
+            ("simple_text_fixture.pdf", 1),
         ):
             pdf = (fixtures / filename).read_bytes()
             url = "data:application/pdf;base64," + base64.b64encode(pdf).decode()
             api(
                 "POST",
                 "/batch",
-                {"inserts": {"one": {"url": url}}, "sync_level": "write"},
+                {
+                    "inserts": {"one": {"url": url, "filename": filename}},
+                    "sync_level": "write",
+                },
             )
 
             def published():
@@ -246,7 +262,17 @@ def test_published_pdf_page_image_hits(embeddinggemma2_model_available):
                 server.debug_logs()
             )
             page_ids = {f"page:{page:06d}" for page in range(1, pages + 1)}
-            for extra in ({}, {"hierarchy": {}}):
+            for extra in (
+                {},
+                {
+                    "hierarchy": {
+                        "ancestors": {
+                            "source": {"fields": ["filename"]},
+                            "unit": {"fields": ["unit_id"]},
+                        }
+                    }
+                },
+            ):
                 result = api(
                     "POST",
                     "/query",
@@ -264,6 +290,12 @@ def test_published_pdf_page_image_hits(embeddinggemma2_model_available):
                 hits = result["hits"]["hits"]
                 if extra:
                     assert len(hits) == pages, result
+                    for hit in hits:
+                        ancestors = hit["hierarchy"]["ancestors"]
+                        assert ancestors["source"]["document"] == {"filename": filename}
+                        assert ancestors["unit"]["document"] == {
+                            "unit_id": hit["hierarchy"]["artifact"]["unit_id"]
+                        }
                     assert {hit["hierarchy"]["parent_doc_key"] for hit in hits} == {
                         "one"
                     }
@@ -275,6 +307,33 @@ def test_published_pdf_page_image_hits(embeddinggemma2_model_available):
                     assert (
                         hits[0]["hierarchy"]["matched_artifact"]["unit_id"] in page_ids
                     )
+
+        api(
+            "POST",
+            "/batch",
+            {"inserts": {"one": {"filename": "no-url"}}, "sync_level": "write"},
+        )
+
+        def retired():
+            status = api("GET", "/indexes/images")["status"]
+            return (
+                status.get("publication", {}).get("complete")
+                and status.get("searchable_vectors", 0) == 0
+            )
+
+        assert wait_until(retired, timeout_s=90, interval_s=0.25), server.debug_logs()
+        for extra in ({}, {"hierarchy": {}}):
+            result = api(
+                "POST",
+                "/query",
+                {
+                    "indexes": ["images"],
+                    "semantic_search": "brass lantern",
+                    "fields": [],
+                    **extra,
+                },
+            )["responses"][0]
+            assert result["status"] == 200 and result["hits"]["hits"] == [], result
         failed = False
     finally:
         server.stop(test_failed=failed)

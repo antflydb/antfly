@@ -3138,6 +3138,7 @@ const LocalStandaloneMetadata = struct {
             },
             .policy_definition_read => |request| {
                 if (!context.setting_admin) return error.Forbidden;
+                if (self.lifecycle_store) |store| return store.policyDefinitionRead(alloc, group_ids.main_metadata_group_id, request);
                 return std.json.Stringify.valueAlloc(alloc, request.select(self.systemCatalogState()), .{});
             },
             .policy_snapshot => |request| {

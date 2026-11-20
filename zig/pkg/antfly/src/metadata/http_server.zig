@@ -4000,6 +4000,7 @@ pub const MetadataHttpServer = struct {
             error.TableTransitionActive => ctx.status(409).text("table transition active"),
             error.ExtensionOwnedObject => ctx.status(405).text("method not allowed"),
             error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
+            error.EnrichmentInUse => ctx.status(409).text("remove dependent dense indexes before changing embedding cardinality"),
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => ctx.status(400).text("unsupported artifact enrichment configuration"),
             else => metadataReadError(ctx, err),
         };

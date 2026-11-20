@@ -239,32 +239,48 @@ pub fn loadPolicyPublications(alloc: std.mem.Allocator, txn: *docstore.DocStore.
     return out;
 }
 
-/// The durable key is the policy ID. Bound Execute can point-read it. For a
-/// first binding, walk only the bounded policy prefix and decode the matching
-/// program once. All fields in the response belong to this transaction.
+fn policyNameKeyAlloc(a: std.mem.Allocator, group: u64, table: u64, name: []const u8) ![]u8 {
+    const key = try std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:policy:{d}:{s}", .{ group, table, name });
+    for (key[key.len - name.len ..]) |*byte| byte.* = std.ascii.toLower(byte.*);
+    return key;
+}
+
+fn writePolicyName(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, record: policies.Record) !void {
+    const key = try policyNameKeyAlloc(a, group, record.table_id, record.name);
+    defer a.free(key);
+    var id: [8]u8 = undefined;
+    std.mem.writeInt(u64, &id, record.id, .little);
+    try txn.put(key, &id);
+}
+
+fn lookupPolicyName(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: u64, name: []const u8) !?u64 {
+    const key = try policyNameKeyAlloc(a, group, table, name);
+    defer a.free(key);
+    const raw = txn.get(key) catch |err| return if (err == error.NotFound) null else err;
+    if (raw.len != 8) return error.InvalidRowPolicyRecord;
+    return std.mem.readInt(u64, raw[0..8], .little);
+}
+
 pub fn readPolicyDefinition(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, request: domain.PolicyRead) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
     const meta = try readMeta(scratch, txn, group);
     var state: domain.State = .{ .revision = meta.revision, .next_id = meta.next_id };
-    const prefix = try keyAlloc(scratch, group, "policy:");
-    const seek = if (request.id) |id| try policyKeyAlloc(scratch, group, id) else prefix;
-    var cursor = try txn.openCursor();
-    defer cursor.close();
-    var entry = try cursor.seekAtOrAfter(seek);
-    while (entry) |kv| : (entry = try cursor.next()) {
-        if (!std.mem.startsWith(u8, kv.key, prefix) or (request.id != null and !std.mem.eql(u8, kv.key, seek))) break;
-        const Header = struct { name: []const u8, table_id: u64 };
-        var head = try std.json.parseFromSlice(Header, a, kv.value, .{ .ignore_unknown_fields = true });
-        defer head.deinit();
-        if (head.value.table_id != request.table_id or !std.ascii.eqlIgnoreCase(head.value.name, request.name)) continue;
-        const record = try std.json.parseFromSliceLeaky(policies.Record, scratch, kv.value, .{});
-        try record.validateShape();
-        if (!std.mem.eql(u8, kv.key, try policyKeyAlloc(scratch, group, record.id))) return error.InvalidRowPolicyRecord;
+    const id = request.id orelse (try lookupPolicyName(scratch, txn, group, request.table_id, request.name)) orelse return std.json.Stringify.valueAlloc(a, state, .{});
+    const raw = txn.get(try policyKeyAlloc(scratch, group, id)) catch |err| {
+        if (err != error.NotFound) return err;
+        if (request.id == null) return error.InvalidRowPolicyRecord;
+        return std.json.Stringify.valueAlloc(a, state, .{});
+    };
+    const record = try std.json.parseFromSliceLeaky(policies.Record, scratch, raw, .{});
+    try record.validateShape();
+    if (record.id != id) return error.InvalidRowPolicyRecord;
+    if (record.table_id == request.table_id and std.ascii.eqlIgnoreCase(record.name, request.name)) {
         state.policies = &.{record};
         return std.json.Stringify.valueAlloc(a, state, .{});
     }
+    if (request.id == null) return error.InvalidRowPolicyRecord;
     return std.json.Stringify.valueAlloc(a, state, .{});
 }
 
@@ -326,6 +342,7 @@ pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
                 if (record.id != meta.next_id or record.generation != 1) return error.RowPolicyCatalogChanged;
                 next_id = try std.math.add(u64, next_id, 1);
             }
+            try writePolicyName(a, txn, group_id, record);
             const key = try policyKeyAlloc(a, group_id, record.id);
             const encoded = try std.json.Stringify.valueAlloc(a, record, .{});
             try txn.put(key, encoded);
@@ -338,6 +355,7 @@ pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
                 if (record.id == identity.id) break record;
             } else return error.RowPolicyCatalogChanged;
             if (prior.generation != identity.generation or prior.table_id != identity.table_id) return error.RowPolicyCatalogChanged;
+            try txn.delete(try policyNameKeyAlloc(a, group_id, prior.table_id, prior.name));
             const key = try policyKeyAlloc(a, group_id, identity.id);
             try txn.delete(key);
         },
@@ -773,6 +791,7 @@ pub fn rebuildNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, g
         alloc.free(rows);
     }
     for (rows) |row| try txn.delete(row.key);
+    for (state.value.policies) |record| try writePolicyName(alloc, txn, group_id, record);
     for (state.value.resources) |resource| {
         const key = try nameKeyAlloc(alloc, group_id, resource.kind, resource.parent_id, resource.name);
         defer alloc.free(key);
@@ -788,6 +807,9 @@ pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, 
     defer state.deinit();
     var index = try domain.StateIndex.init(alloc, state.value);
     defer index.deinit(alloc);
+    for (state.value.policies) |record| {
+        if ((try lookupPolicyName(alloc, txn, group_id, record.table_id, record.name)) != record.id) return error.InvalidCatalogRecord;
+    }
     for (state.value.resources) |resource| {
         var found = (try find(alloc, txn, group_id, resource.kind, resource.parent_id, resource.name)) orelse return error.InvalidCatalogRecord;
         defer found.deinit();
@@ -972,6 +994,7 @@ pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
             for (policy_records) |record| if (record.table_id == resource.id) {
                 const policy_key = try policyKeyAlloc(a, group_id, record.id);
                 try txn.delete(policy_key);
+                try txn.delete(try policyNameKeyAlloc(a, group_id, record.table_id, record.name));
             };
             const publication_key = try policyPublicationKeyAlloc(a, group_id, resource.id);
             try txn.delete(publication_key);
@@ -1024,6 +1047,7 @@ pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
         const encoded = try std.json.Stringify.valueAlloc(alloc, record, .{});
         defer alloc.free(encoded);
         try txn.put(policy_key, encoded);
+        try writePolicyName(alloc, txn, group_id, record);
     }
     for (state.policy_publications, 0..) |publication, index| {
         try publication.validateShape();

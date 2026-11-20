@@ -5828,7 +5828,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "15";
+const derived_catalog_index_version = "16";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -39677,7 +39677,7 @@ test "SQL settings apply through Raft and survive catalog restart" {
     }
 }
 
-test "inert SQL policy definitions survive standalone replay, snapshot, and restart" {
+test "system catalog inert SQL policy definitions survive standalone replay, snapshot, and restart" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -39735,6 +39735,16 @@ test "inert SQL policy definitions survive standalone replay, snapshot, and rest
         var portable = try std.json.parseFromSlice(@import("../../system_catalog/projection.zig").Export, alloc, portable_bytes, .{});
         defer portable.deinit();
         try std.testing.expectEqual(@as(usize, 1), portable.value.system_catalog.policies.len);
+
+        // A version 15 store has the policy record but no derived policy names.
+        const prefix = try system_catalog_storage.namePrefixAlloc(alloc, group);
+        defer alloc.free(prefix);
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try store.deleteDerivedPrefixTxn(&txn, prefix);
+        var version_buf: [160]u8 = undefined;
+        try txn.put(try derivedCatalogIndexVersionKey(&version_buf, group), "15");
+        try txn.commit();
     }
     {
         var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = root });
@@ -39744,6 +39754,18 @@ test "inert SQL policy definitions survive standalone replay, snapshot, and rest
         try std.testing.expectEqual(@as(usize, 1), state.value.policies.len);
         try std.testing.expectEqualStrings("owner_filter", state.value.policies[0].name);
         try std.testing.expectEqual(@as(u64, 1), state.value.policies[0].generation);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const lookup: system_catalog.PolicyRead = .{ .table_id = 7, .name = "OWNER_FILTER" };
+        const response = try reopened.policyDefinitionRead(a, group, lookup);
+        const named = try std.json.parseFromSliceLeaky(system_catalog.State, a, response, .{});
+        try std.testing.expectEqual(@as(usize, 1), named.policies.len);
+        try std.testing.expectEqual(record.id, named.policies[0].id);
+        const drop: sql_policies.Command = .{ .expected_revision = named.revision, .change = .{ .drop = .{ .id = record.id, .generation = record.generation, .table_id = record.table_id } } };
+        try reopened.applyStandaloneCommand(group, .{ .apply_sql_policies = try std.json.Stringify.valueAlloc(a, drop, .{}) });
+        const missing = try reopened.policyDefinitionRead(a, group, lookup);
+        try std.testing.expectEqual(@as(usize, 0), (try std.json.parseFromSliceLeaky(system_catalog.State, a, missing, .{})).policies.len);
     }
 }
 
@@ -40571,6 +40593,7 @@ test "system catalog normalized store reports preserve clocks duplicates migrati
     }
     const payload_page_key = try RaftApplyStore.reportPageKey(a, 21, 20, 0, false);
     const payload = try store.store.get(a, payload_page_key);
+    const expected_report_ref = try store.store.get(a, payload_key);
     const before = store.snapshotWriteStats().wal_append_bytes;
     {
         var txn = try store.store.beginWriteTxn();
@@ -40620,8 +40643,8 @@ test "system catalog normalized store reports preserve clocks duplicates migrati
         try txn.commit();
     }
     try std.testing.expect(try store.snapshotBuilder().installSnapshot(a, 21, 1, snapshot));
-    try std.testing.expectError(error.NotFound, store.store.get(a, payload_key));
-    try store.ensureDerivedCatalogIndexes(21);
+    // Installation atomically rebuilds the report index and its payload pages.
+    try std.testing.expectEqualSlices(u8, expected_report_ref, try store.store.get(a, payload_key));
     const restored = try store.listStores(a, 21);
     try std.testing.expectEqual(@as(u64, 30), restored[0].node_id);
     try std.testing.expectEqual(@as(u64, 50), restored[0].reporter_incarnation);
