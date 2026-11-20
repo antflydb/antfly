@@ -1070,6 +1070,7 @@ pub const InferenceCapabilities = struct {
     remote_framed_max_request_bytes: ?usize = null,
     remote_framed_max_attachments: ?usize = null,
     remote_framed_max_metadata_bytes: ?usize = null,
+    remote_framed_max_mime_bytes: ?usize = null,
     attachment_metadata_max_bytes: ?usize = null,
     /// Complete linked-worker envelope, including metadata, framing and payload.
     /// Applies even to text-only invocations with no physical attachments.

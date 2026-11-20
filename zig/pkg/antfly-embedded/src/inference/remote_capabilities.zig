@@ -90,16 +90,8 @@ pub const DiscoveryMediaGeometry = struct {
     /// power of two. Exact discovery remains available at tight limits.
     pub fn roundedUp(self: DiscoveryMediaGeometry) DiscoveryMediaGeometry {
         const Round = struct {
-            fn upper(value: anytype) @TypeOf(value) {
-                const bits = @typeInfo(@TypeOf(value)).int.bits;
-                if (value < 8) return value;
-                const shift = bits - 1 - @clz(value) - 3;
-                const mask = (@as(@TypeOf(value), 1) << @intCast(shift)) - 1;
-                if (value > std.math.maxInt(@TypeOf(value)) - mask) return std.math.maxInt(@TypeOf(value));
-                return (value + mask) & ~mask;
-            }
             fn cost(value: DiscoveryMediaCost) DiscoveryMediaCost {
-                return .{ .encoded = upper(value.encoded), .framed = upper(value.framed), .pixels = upper(value.pixels) };
+                return .{ .encoded = roundDiscoveryUpperBound(value.encoded), .framed = roundDiscoveryUpperBound(value.framed), .pixels = roundDiscoveryUpperBound(value.pixels) };
             }
         };
         return .{ .batch = Round.cost(self.batch), .first = Round.cost(self.first) };
@@ -113,6 +105,14 @@ pub const DiscoveryMediaGeometry = struct {
     }
 };
 
+pub fn roundDiscoveryUpperBound(value: anytype) @TypeOf(value) {
+    if (value < 8) return value;
+    const shift = @bitSizeOf(@TypeOf(value)) - 1 - @clz(value) - 3;
+    const mask = (@as(@TypeOf(value), 1) << @intCast(shift)) - 1;
+    if (value > std.math.maxInt(@TypeOf(value)) - mask) return std.math.maxInt(@TypeOf(value));
+    return (value + mask) & ~mask;
+}
+
 pub const discovery_media_header = "X-Antfly-Inference-Discovery-Media";
 pub const discovery_rounded_media_header = "X-Antfly-Inference-Discovery-Media-Rounded";
 
@@ -121,6 +121,7 @@ pub const DiscoveryHeaders = struct {
     entries: [16][2][]const u8 = undefined,
     value: [64]u8 = undefined,
     media_value: [125]u8 = undefined,
+    reader_wire_value: [176]u8 = undefined,
 
     pub fn withShape(self: *DiscoveryHeaders, base: []const [2][]const u8, shape: DiscoveryShape) ![]const [2][]const u8 {
         if (base.len >= self.entries.len) return error.TooManyInferenceHeaders;
@@ -135,6 +136,17 @@ pub const DiscoveryHeaders = struct {
         self.entries[shaped.len] = .{ discovery_media_header, try std.fmt.bufPrint(&self.media_value, "{d}:{d}:{d}:{d}:{d}:{d}", .{ batch.encoded, batch.framed, batch.pixels, first.encoded, first.framed, first.pixels }) };
         return self.entries[0 .. shaped.len + 1];
     }
+    pub fn withReaderWire(self: *DiscoveryHeaders, shaped: []const [2][]const u8, json_only: bool, batch: anytype, first: @TypeOf(batch), rounded: bool) ![]const [2][]const u8 {
+        if (shaped.len >= self.entries.len or shaped.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
+        const mode = if (json_only) "json" else "auto";
+        var costs = [8]usize{ batch.json_bytes, batch.framed_bytes, batch.metadata_bytes, batch.mime_bytes, first.json_bytes, first.framed_bytes, first.metadata_bytes, first.mime_bytes };
+        if (rounded) for (&costs, 0..) |*cost, index| {
+            if (index % 4 != 3) cost.* = roundDiscoveryUpperBound(cost.*);
+        };
+        self.entries[shaped.len] = .{ "X-Antfly-Inference-Discovery-Reader-Transport", try std.fmt.bufPrint(&self.reader_wire_value, "{s}:{d}:{d}:{d}:{d}:{d}:{d}:{d}:{d}", .{ mode, costs[0], costs[1], costs[2], costs[3], costs[4], costs[5], costs[6], costs[7] }) };
+        return self.entries[0 .. shaped.len + 1];
+    }
+
     pub fn withRoundedMediaMarker(self: *DiscoveryHeaders, geometry: []const [2][]const u8) ![]const [2][]const u8 {
         if (geometry.len >= self.entries.len or geometry.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
         self.entries[geometry.len] = .{ discovery_rounded_media_header, "true" };
@@ -1490,6 +1502,7 @@ pub fn parseModelCapabilities(
                     result.remote_framed_max_request_bytes = try optionalReaderWireLimit(framed, "max_request_bytes");
                     result.remote_framed_max_attachments = try optionalReaderWireLimit(framed, "max_attachments");
                     result.remote_framed_max_metadata_bytes = try optionalReaderWireLimit(framed, "max_metadata_bytes");
+                    result.remote_framed_max_mime_bytes = try optionalReaderWireLimit(framed, "max_mime_bytes");
                 };
             };
         };

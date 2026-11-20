@@ -4111,37 +4111,50 @@ pub const Runtime = struct {
         return geometry;
     }
 
-    fn bindReaderPlacement(self: *Runtime, endpoint: []const u8, model: []const u8, placement: *remote_capabilities.DiscoveryHeaders, headers: *[]const [2][]const u8, alloc: Allocator, request: anytype, measured: *?remote_capabilities.DiscoveryMediaGeometry) !remote_capabilities.CapabilityLease {
+    fn readerWireNeedsRounding(cost: readers.ReaderWireCost) bool {
+        inline for (.{ cost.json_bytes, cost.framed_bytes, cost.metadata_bytes }) |value| {
+            if (value != remote_capabilities.roundDiscoveryUpperBound(value)) return true;
+        }
+        return false;
+    }
+
+    fn bindReaderPlacement(self: *Runtime, endpoint: []const u8, cfg: readers.Config, placement: *remote_capabilities.DiscoveryHeaders, headers: *[]const [2][]const u8, alloc: Allocator, request: anytype, measured: *?remote_capabilities.DiscoveryMediaGeometry) !remote_capabilities.CapabilityLease {
         const cache = self.capabilityCache();
+        const model = cfg.model orelse "";
         const wait = self.execution.waitContext();
         var complete = request.images.len != 0;
         const geometry = try readerMediaGeometry(alloc, request, &complete);
         measured.* = geometry;
         const shaped = headers.*;
-        if (complete) {
-            const rounded = geometry.roundedUp();
-            const has_rounding = !std.meta.eql(geometry, rounded);
-            headers.* = try placement.withMediaGeometry(shaped, rounded);
-            if (has_rounding) headers.* = try placement.withRoundedMediaMarker(headers.*);
-            const candidate: ?remote_capabilities.CapabilityLease = cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, headers.*, wait) catch |err| switch (err) {
-                error.InferenceDiscoveryRequiresExactGeometry, error.InferenceDiscoveryTooManyItems, error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilityDiscoveryRejected => exact: {
-                    if (has_rounding) {
-                        headers.* = try placement.withMediaGeometry(shaped, geometry);
-                        break :exact cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, headers.*, wait) catch |exact_err| switch (exact_err) {
-                            error.RemoteCapabilityDiscoveryTransient => null,
-                            else => return exact_err,
-                        };
+        const json_only = @TypeOf(request) == readers.Request;
+        const batch_wire = try readers.measureReaderWire(alloc, cfg, request);
+        var first_request = request;
+        first_request.images = request.images[0..@min(request.images.len, 1)];
+        const first_wire = if (request.images.len > 1) try readers.measureReaderWire(alloc, cfg, first_request) else batch_wire;
+        const rounded_geometry = geometry.roundedUp();
+        const round_wire = readerWireNeedsRounding(batch_wire) or readerWireNeedsRounding(first_wire);
+        var rounded = round_wire or (complete and !std.meta.eql(geometry, rounded_geometry));
+        while (true) {
+            headers.* = shaped;
+            if (complete) headers.* = try placement.withMediaGeometry(headers.*, if (rounded) rounded_geometry else geometry);
+            headers.* = try placement.withReaderWire(headers.*, json_only, batch_wire, first_wire, rounded);
+            if (rounded) headers.* = try placement.withRoundedMediaMarker(headers.*);
+            const lease = cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, headers.*, wait) catch |err| switch (err) {
+                error.InferenceDiscoveryRequiresExactGeometry, error.InferenceDiscoveryTooManyItems, error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilityDiscoveryRejected => {
+                    if (rounded) {
+                        rounded = false;
+                        continue;
                     }
-                    if (err != error.RemoteCapabilityDiscoveryTransient) return err;
-                    break :exact null;
+                    if (complete and err == error.RemoteCapabilityDiscoveryTransient) {
+                        complete = false;
+                        continue;
+                    }
+                    return err;
                 },
                 else => return err,
             };
-            if (candidate) |lease| return try validateReaderPlacementGeometry(lease, geometry, request.images.len, @TypeOf(request) == readers.EncodedRequest);
+            return validateReaderPlacementGeometry(lease, geometry, request.images.len, !json_only);
         }
-        headers.* = shaped;
-        const fallback = try cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, shaped, wait);
-        return validateReaderPlacementGeometry(fallback, geometry, request.images.len, @TypeOf(request) == readers.EncodedRequest);
     }
 
     fn validateReaderPlacementGeometry(lease: remote_capabilities.CapabilityLease, geometry: remote_capabilities.DiscoveryMediaGeometry, items: usize, framed_supported: bool) !remote_capabilities.CapabilityLease {
@@ -4193,7 +4206,7 @@ pub const Runtime = struct {
         var remote_geometry: ?remote_capabilities.DiscoveryMediaGeometry = null;
         const discovered_capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and execution_cfg.provider == .antfly) blk: {
             const endpoint = execution_cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
-            const lease = try self.bindReaderPlacement(endpoint, execution_cfg.model orelse "", &placement, &capability_auth_headers, alloc, request, &remote_geometry);
+            const lease = try self.bindReaderPlacement(endpoint, execution_cfg, &placement, &capability_auth_headers, alloc, request, &remote_geometry);
             capability_lease_fields = CapabilityLeaseFields.init(lease);
             capability_lease_fields.apply(&execution_cfg);
             try self.recordLeaseExecution(lease);
@@ -4337,7 +4350,7 @@ pub const Runtime = struct {
         var remote_geometry: ?remote_capabilities.DiscoveryMediaGeometry = null;
         const capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and execution_cfg.provider == .antfly) blk: {
             const endpoint = execution_cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
-            const lease = try self.bindReaderPlacement(endpoint, execution_cfg.model orelse "", &placement, &capability_auth_headers, alloc, request, &remote_geometry);
+            const lease = try self.bindReaderPlacement(endpoint, execution_cfg, &placement, &capability_auth_headers, alloc, request, &remote_geometry);
             capability_lease_fields = CapabilityLeaseFields.init(lease);
             capability_lease_fields.apply(&execution_cfg);
             try self.recordLeaseExecution(lease);
@@ -4440,6 +4453,7 @@ pub const Runtime = struct {
                 .max_request_bytes = capabilities.?.remote_framed_max_request_bytes,
                 .max_attachments = capabilities.?.remote_framed_max_attachments,
                 .max_metadata_bytes = capabilities.?.remote_framed_max_metadata_bytes,
+                .max_mime_bytes = capabilities.?.remote_framed_max_mime_bytes,
                 .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
                 .cancellation = httpx.CancellationToken.fromCallback(
                     self.execution.cancellation.ptr,

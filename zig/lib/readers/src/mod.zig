@@ -519,6 +519,7 @@ pub const RemoteOptions = struct {
     max_request_bytes: ?usize = null,
     max_attachments: ?usize = null,
     max_metadata_bytes: ?usize = null,
+    max_mime_bytes: ?usize = null,
     source_table: []const u8 = "",
     timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
@@ -604,13 +605,79 @@ const AppleReaderState = struct {
     }
 };
 
-fn encodeReadRequestAlloc(alloc: Allocator, request: inference_api.ReadRequest) ![]u8 {
-    // Data URI bodies need one exact allocation: allocating-writer growth can
-    // exceed the invocation budget even when the complete request fits.
+pub const ReaderWireCost = struct {
+    json_bytes: usize = 0,
+    framed_bytes: usize = 0,
+    metadata_bytes: usize = 0,
+    mime_bytes: usize = 0,
+};
+
+pub fn measureReaderWire(alloc: Allocator, cfg: Config, request: anytype) !ReaderWireCost {
+    const encoded = @TypeOf(request) == EncodedRequest;
+    const images = try alloc.alloc(inference_api.ImageURL, request.images.len);
+    defer alloc.free(images);
+    var result: ReaderWireCost = .{};
+    var envelope: httpx.attachment_envelope.SizeAccumulator = .{};
+    var inline_json_bytes: usize = 0;
+    for (request.images, images) |image, *url| {
+        if (encoded) {
+            url.* = .{ .url = "" };
+            const mime_json_bytes = try readerJsonSize(image.mime_type);
+            inline_json_bytes +|= "data:;base64,".len +| (mime_json_bytes - 2) +| std.base64.standard.Encoder.calcSize(image.bytes.len);
+            try envelope.addAttachment(image.mime_type.len, image.bytes.len);
+            result.mime_bytes = @max(result.mime_bytes, image.mime_type.len);
+        } else {
+            url.* = .{ .url = image };
+        }
+    }
+    const query: inference_api.ReadRequest = .{
+        .model = cfg.model orelse "",
+        .images = images,
+        .prompt = request.prompt orelse cfg.prompt,
+        .max_tokens = request.max_tokens orelse cfg.max_tokens,
+    };
+    result.json_bytes = (try readerJsonSize(query)) +| inline_json_bytes;
+    if (encoded) {
+        const urls = try alloc.alloc([32]u8, images.len);
+        defer alloc.free(urls);
+        for (images, urls, 0..) |*url, *storage, index| {
+            url.url = try std.fmt.bufPrint(storage, "attachment:{d}", .{index});
+        }
+        result.metadata_bytes = try readerJsonSize(query);
+        result.framed_bytes = try envelope.total(result.metadata_bytes);
+    }
+    return result;
+}
+
+test "reader discovery wire cost includes JSON escapes and full framed metadata" {
+    const a = std.testing.allocator;
+    const cfg: Config = .{ .provider = .antfly, .model = "reader", .prompt = "describe\npage" };
+    const mime = "image/png";
+    const media = "abc";
+    const encoded: EncodedRequest = .{ .images = &.{.{ .mime_type = mime, .bytes = media }} };
+    const costs = try measureReaderWire(a, cfg, encoded);
+    const uri = "data:" ++ mime ++ ";base64,YWJj";
+    const json = try encodeReadRequestAlloc(a, .{ .model = "reader", .prompt = cfg.prompt, .images = &.{.{ .url = uri }} });
+    defer a.free(json);
+    try std.testing.expectEqual(json.len, costs.json_bytes);
+    const metadata = try httpx.json.Json.stringify(a, inference_api.ReadRequest{ .model = "reader", .prompt = cfg.prompt, .images = &.{.{ .url = "attachment:0" }} });
+    defer a.free(metadata);
+    try std.testing.expectEqual(metadata.len, costs.metadata_bytes);
+    try std.testing.expectEqual(try httpx.attachment_envelope.encodedSize(metadata, &.{.{ .mime_type = mime, .data = media }}), costs.framed_bytes);
+    try std.testing.expectEqual(mime.len, costs.mime_bytes);
+}
+
+fn readerJsonSize(request: anytype) !usize {
     var buffer: [256]u8 = undefined;
     var counter = std.Io.Writer.Discarding.init(&buffer);
     try std.json.Stringify.value(request, .{}, &counter.writer);
-    const size = std.math.cast(usize, counter.fullCount()) orelse return error.OutOfMemory;
+    return std.math.cast(usize, counter.fullCount()) orelse error.OutOfMemory;
+}
+
+fn encodeReadRequestAlloc(alloc: Allocator, request: inference_api.ReadRequest) ![]u8 {
+    // Data URI bodies need one exact allocation: allocating-writer growth can
+    // exceed the invocation budget even when the complete request fits.
+    const size = try readerJsonSize(request);
     const body = try alloc.alloc(u8, size);
     errdefer alloc.free(body);
     var writer: std.Io.Writer = .fixed(body);
@@ -634,6 +701,7 @@ const AntflyReaderState = struct {
     max_request_bytes: ?usize = null,
     max_attachments: ?usize = null,
     max_metadata_bytes: ?usize = null,
+    max_mime_bytes: ?usize = null,
     cancellation: ?httpx.CancellationToken = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Reader {
@@ -668,6 +736,7 @@ const AntflyReaderState = struct {
             .max_request_bytes = options.max_request_bytes,
             .max_attachments = options.max_attachments,
             .max_metadata_bytes = options.max_metadata_bytes,
+            .max_mime_bytes = options.max_mime_bytes,
             .cancellation = options.cancellation,
         };
         if (cfg.bearer_token orelse cfg.api_key) |token| {
@@ -797,6 +866,10 @@ const AntflyReaderState = struct {
         try validateEncodedRequest(req);
         if (req.images.len > @min(self.max_attachments orelse std.math.maxInt(usize), (httpx.attachment_envelope.Limits{}).max_attachments))
             return error.ReaderRequestTooLarge;
+        const mime_limit = @min(self.max_mime_bytes orelse std.math.maxInt(usize), (httpx.attachment_envelope.Limits{}).max_mime_bytes);
+        for (req.images) |image| {
+            if (image.mime_type.len > mime_limit) return error.ReaderAttachmentMimeTooLarge;
+        }
         const images = try alloc.alloc(inference_api.ImageURL, req.images.len);
         defer alloc.free(images);
         const attachment_urls = try alloc.alloc([]u8, req.images.len);
