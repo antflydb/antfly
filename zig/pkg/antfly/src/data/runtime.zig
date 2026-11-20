@@ -5573,6 +5573,7 @@ pub const DataServer = struct {
     initial_fk_retirement_running: std.atomic.Value(bool) = .init(false),
     graph_cleanup_running: std.atomic.Value(bool) = .init(false),
     graph_cleanup_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
+    dag_activation_cursors: std.AutoHashMapUnmanaged(u64, [32]u8) = .empty,
     leann_replication_running: std.atomic.Value(bool) = .init(false),
     leann_replication_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
     group_source_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
@@ -6741,11 +6742,38 @@ pub const DataServer = struct {
         if (server.background_jobs_shutdown.load(.acquire)) return error.Canceled;
         if (server.hotStandbyWriteGate()) |gate| try gate.check();
         if (server.group_leadership_source) |leadership| if (!leadership.isLocalLeader(job.group_id)) return error.NotLeader;
+        server.runDiscoveredDagActivation(job.table, job.group_id) catch |err| {
+            std.log.debug("DAG activation deferred group={d} err={s}", .{ job.group_id, @errorName(err) });
+        };
         var response = (try server.read_source.source().lookupGroupLocal(server.alloc, job.group_id, job.table, "", .{ .relational_topology_json = "{\"mode\":\"graph_endpoint_cleanup\"}", .execution_deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s, .cancellation = .fromAtomic(&server.background_jobs_shutdown) }, .leader_lease)) orelse return;
         defer response.deinit(server.alloc);
         var status = try std.json.parseFromSlice(antfly.db.types.GraphEndpointCleanupStatus, server.alloc, response.json, .{});
         defer status.deinit();
         if (status.value.pending) try server.proposeRaftBatchGroupWithLeaderWait(server.alloc, job.group_id, job.table, status.value.request(), .{ .discovery = .cached, .allow_remote_forward = false, .visibility_cancellation = .fromAtomic(&server.background_jobs_shutdown), .admission_deadline_ns = server.dataRaftMonotonicNs() +| 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
+    }
+
+    fn runDiscoveredDagActivation(self: *DataServer, table_name: []const u8, group_id: u64) !void {
+        const cancellation: antfly.db.types.CancellationToken = .fromAtomic(&self.background_jobs_shutdown);
+        try cancellation.check();
+        const catalog = self.write_source.catalog;
+        const deadline = catalog.budget(null).nowNs() +| 5 * std.time.ns_per_s;
+        const snapshot = try @import("../api/table_catalog.zig").routedGroupIdSnapshotUntil(self.alloc, catalog, table_name, group_id, catalog.deadlineFrom(.{ .deadline_ns = deadline }));
+        const fence = snapshot.fence() orelse return error.TopologyChanged;
+        const identity = fence.route.identity_namespace;
+        var namespace: [24]u8 = undefined;
+        std.mem.writeInt(u64, namespace[0..8], identity.table_id, .big);
+        std.mem.writeInt(u64, namespace[8..16], identity.shard_id, .big);
+        std.mem.writeInt(u64, namespace[16..24], identity.range_id, .big);
+        const route: DagActivationRoute = .{ .namespace = namespace, .fence = fence };
+        const attempts = try self.pendingDagActivationJobsOnRoute(self.alloc, table_name, route, self.dag_activation_cursors.get(group_id), cancellation);
+        defer self.alloc.free(attempts);
+        if (attempts.len == 0) {
+            _ = self.dag_activation_cursors.remove(group_id);
+            return;
+        }
+        // Advance the enumeration even when a job must retry.
+        try self.dag_activation_cursors.put(self.alloc, group_id, attempts[0]);
+        _ = try self.resumeDagActivationJob(self.alloc, table_name, route, attempts[0], cancellation);
     }
 
     const LeannReplicationJob = struct {
@@ -9986,6 +10014,7 @@ pub const DataServer = struct {
         self.group_source_sweep.deinit();
         if (self.group_source_worker) |*worker| worker.deinit();
         self.graph_cleanup_sweep.deinit();
+        self.dag_activation_cursors.deinit(self.alloc);
         self.leann_replication_sweep.deinit();
         self.initial_fk_retirement_recovery_cursor.deinit();
         self.initial_fk_retirement_gc_cursor.deinit();
@@ -12643,7 +12672,13 @@ pub const DataServer = struct {
             .dag_job = scope,
         })) orelse return error.GraphConstraintNotReady;
         const manifest = try DagEffects.ScanManifest.init(plan.domains, route.namespace, attempt);
-        return self.advanceDagActivationJob(alloc, table_name, manifest, route, plan.source_routes, plan.catalog, plan.targets, progress, cancellation);
+        const pinned = plan.authority_route.fence;
+        if (route.fence.topology_epoch != pinned.topology_epoch or route.fence.table_id != pinned.table_id or
+            route.fence.metadata_group_id != pinned.metadata_group_id or !std.meta.eql(route.fence.metadata_incarnation, pinned.metadata_incarnation))
+            return error.TopologyChanged;
+        const sources = try scratch.dupe(DagActivationRoute, plan.source_routes);
+        for (sources) |*source| source.fence.catalog_revision = route.fence.catalog_revision;
+        return self.advanceDagActivationJob(alloc, table_name, manifest, route, sources, plan.catalog, plan.targets, progress, cancellation);
     }
 
     /// Resume from the authority's ordered job record. The caller provides the
