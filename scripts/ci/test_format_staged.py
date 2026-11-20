@@ -93,23 +93,42 @@ class StagedFormattingTests(unittest.TestCase):
         self.assertEqual(self.git("show", ":example.py"), unformatted)
         self.assertFalse((self.root / ".git" / "index.lock").exists())
 
-    def test_rollback_leaves_a_file_an_editor_changed(self):
+    def test_edit_after_staging_is_never_overwritten(self):
+        # An editor saves over the formatted hunk after the hook staged it
+        # but before the worktree is formatted.
         self.base()
         unformatted = b"value=1\n" + b"# context\n" * 12 + b"other = 0\n"
         self.write("example.py", unformatted)
         self.git("add", "--", "example.py")
-        edited = b"value = 1\n" + b"# context\n" * 12 + b"other = 9\n"
+        edited = b"value=2\n" + b"# context\n" * 12 + b"other = 9\n"
+        real_update = format_staged.update_index_under_lock
 
-        def edit_then_fail(*args):
-            # An editor saves over the formatted hunk before the index update fails.
+        def update_then_edit(*args):
+            real_update(*args)
             self.write("example.py", edited)
-            raise format_staged.HookError("index update failed")
 
-        with patch.object(format_staged, "update_index_under_lock", edit_then_fail):
-            with self.assertRaisesRegex(format_staged.HookError, "example.py"):
-                format_staged.format_staged(self.root, self.format)
+        with patch.object(format_staged, "update_index_under_lock", update_then_edit):
+            format_staged.format_staged(self.root, self.format)
         self.assertEqual((self.root / "example.py").read_bytes(), edited)
-        self.assertEqual(self.git("show", ":example.py"), unformatted)
+        self.assertEqual(self.git("show", ":example.py"), self.format("", unformatted))
+
+    def test_edit_elsewhere_after_staging_keeps_both(self):
+        self.base()
+        unformatted = b"value=1\n" + b"# context\n" * 12 + b"other = 0\n"
+        self.write("example.py", unformatted)
+        self.git("add", "--", "example.py")
+        real_update = format_staged.update_index_under_lock
+
+        def update_then_edit(*args):
+            real_update(*args)
+            self.write("example.py", unformatted.replace(b"other = 0", b"other = 9"))
+
+        with patch.object(format_staged, "update_index_under_lock", update_then_edit):
+            format_staged.format_staged(self.root, self.format)
+        self.assertEqual(
+            (self.root / "example.py").read_bytes(),
+            self.format("", unformatted).replace(b"other = 0", b"other = 9"),
+        )
 
     def test_index_changed_while_formatting_applies_nothing(self):
         self.base()

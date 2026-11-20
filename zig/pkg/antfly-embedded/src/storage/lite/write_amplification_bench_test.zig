@@ -439,7 +439,9 @@ fn insertOneMixedTextSparse(alloc: std.mem.Allocator, handle: *anyopaque, key: [
     defer alloc.free(body);
     var output: capi_types.Buffer = .{};
     defer api.antfly_buffer_free(&output);
-    try std.testing.expectEqual(capi_types.ErrorCode.ok, api.antfly_db_batch_json(handle, .fromSlice(body), &output));
+    const code = api.antfly_db_batch_json(handle, .fromSlice(body), &output);
+    if (code != .ok) std.debug.print("mixed text+sparse batch for {s} failed: {s}\n", .{ key, std.mem.span(api.antfly_last_error_detail()) });
+    try std.testing.expectEqual(capi_types.ErrorCode.ok, code);
 }
 
 // ---------------------------------------------------------------------------
