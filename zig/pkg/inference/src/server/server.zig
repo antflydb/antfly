@@ -26890,13 +26890,22 @@ pub const Node = struct {
         var openai_data_count: usize = 0;
         const list_created = completionCreatedTimestamp();
 
-        var inventory = if (self.selector_cache) |cache|
+        const borrowed: ?selection_mod.Cache.Lease = if (scoped_embedding) |name|
+            if (self.selector_cache) |cache| try cache.borrowForSelector(io, self.config.models_dir, name, "embedders") else null
+        else
+            null;
+        defer if (borrowed) |lease| lease.release();
+        var owned_inventory: ?selection_mod.Inventory = if (borrowed != null) null else if (self.selector_cache) |cache|
             try cache.snapshot(a, io, self.config.models_dir)
         else
             try selection_mod.Inventory.loadStable(a, io, self.config.models_dir);
-        defer inventory.deinit();
+        defer if (owned_inventory) |*owned| owned.deinit();
+        const inventory = if (borrowed) |lease| lease.inventory() else &owned_inventory.?;
         const discovered = inventory.discovered;
-        const selected_path = if (scoped_embedding) |name| inventory.lookup(name, "embedders") catch null else null;
+        const scoped_owner = if (scoped_embedding) |name| inventory.lookupIndex(name, "embedders") else null;
+        const scoped_index = scoped_owner catch null;
+        const selected_start = scoped_index orelse 0;
+        const selected_end = if (scoped_embedding == null) discovered.len else if (scoped_index != null) selected_start + 1 else 0;
 
         var discovered_listings = std.ArrayListUnmanaged(DiscoveredModelListing).empty;
         defer {
@@ -26908,8 +26917,8 @@ pub const Node = struct {
         // error, so one malformed directory never hides a model silently.
         var rejected_listings = std.ArrayListUnmanaged(RejectedModelListing).empty;
         defer rejected_listings.deinit(a);
-        for (discovered, 0..) |entry, entry_index| {
-            if (scoped_embedding != null and (selected_path == null or !std.mem.eql(u8, selected_path.?, entry.path))) continue;
+        for (selected_start..selected_end) |entry_index| {
+            const entry = discovered[entry_index];
             // A directory spelling is not proof of a format or immutable pin.
             // Unmanaged installations may advertise only literal legacy names.
             if (inventory.names[entry_index].len == 0) continue;
@@ -26950,8 +26959,10 @@ pub const Node = struct {
         };
         // Keep models alive through unlocked listing work without counting
         // observation as inference use or extending their idle residency.
-        var loaded_model_snapshot = try self.model_manager.acquireLoadedModelSnapshot(a);
-        defer loaded_model_snapshot.deinit();
+        var loaded_model_snapshot = if (scoped_embedding == null) try self.model_manager.acquireLoadedModelSnapshot(a) else null;
+        defer if (loaded_model_snapshot) |*snapshot| snapshot.deinit();
+        var scoped_loaded: ?model_manager_mod.ModelHandle = null;
+        defer if (scoped_loaded) |*handle| handle.releaseObservation();
 
         const LoadedListing = struct {
             model: *model_manager_mod.LoadedModel,
@@ -26972,7 +26983,7 @@ pub const Node = struct {
             canonical_discovered_dirs.deinit(a);
         }
 
-        const scan_loaded = scoped_embedding == null or selected_path == null;
+        const scan_loaded = scoped_embedding == null;
         for (if (scan_loaded) discovered else &.{}) |entry| {
             const canonical_path = realPathExistingAlloc(a, io, entry.path) catch |err| {
                 if (err == error.OutOfMemory) return err;
@@ -26994,8 +27005,30 @@ pub const Node = struct {
         };
         defer if (canonical_models_dir) |path| a.free(path);
 
+        if (scoped_embedding) |name| scoped: {
+            if ((scoped_owner catch break :scoped) != null) break :scoped;
+            const selected = self.resolveRequestModelSelection(a, io, name, "embedders") catch |err| {
+                if (err == error.OutOfMemory or isModelPublicationError(err)) return err;
+                break :scoped;
+            };
+            defer a.free(selected.path);
+            const root = try realPathExistingAlloc(a, io, self.config.models_dir);
+            defer a.free(root);
+            const identifier = (try loadedModelRequestIdentifierAlloc(a, io, root, selected.path)) orelse break :scoped;
+            defer a.free(identifier);
+            if (!std.mem.eql(u8, identifier, name)) break :scoped;
+            scoped_loaded = try self.model_manager.acquireLoadedModelWithControl(selected.path, self.bindModelSelection(selected, null));
+            if (scoped_loaded) |handle| {
+                const path = try a.dupe(u8, selected.path);
+                errdefer a.free(path);
+                const owned_name = try a.dupe(u8, name);
+                errdefer a.free(owned_name);
+                try loaded_listings.append(a, .{ .model = handle.get(), .canonical_model_dir = path, .identifier = owned_name });
+            }
+        }
+
         if (canonical_models_dir) |models_root| {
-            for (loaded_model_snapshot.handles) |*model_handle| {
+            for (loaded_model_snapshot.?.handles) |*model_handle| {
                 const model = model_handle.get();
                 if (discoveredContainsModelDir(discovered, model.model_dir)) continue;
 
@@ -27314,26 +27347,33 @@ pub const Node = struct {
                 }
             }
         }
-        // Descriptors retain installation identity until ownership is finalized.
-        // A same-named installation in another scope cannot supply its contract.
-        for (task_names) |task| {
-            const models = catalog.value.object.getPtr(task).?;
-            for (discovered, inventory.names) |entry, names| {
-                const descriptor = models.object.get(entry.path) orelse continue;
-                for (names) |selector| {
-                    if (scoped_embedding) |name| if (!std.mem.eql(u8, name, selector)) continue;
-                    const owner = (inventory.lookup(selector, task) catch continue) orelse continue;
-                    if (std.mem.eql(u8, owner, entry.path)) try models.object.put(ca, selector, descriptor);
-                }
+        if (scoped_embedding) |name| {
+            const models = catalog.value.object.getPtr("embedders").?;
+            if (scoped_index) |index| {
+                const path = discovered[index].path;
+                if (models.object.fetchSwapRemove(path)) |descriptor| try models.object.put(ca, name, descriptor.value);
             }
-            // Paths are private descriptor keys, never public model IDs.
-            for (discovered) |entry| _ = models.object.swapRemove(entry.path);
-            for (selection_mod.tasks, inventory.owners) |scope, owners| {
-                if (!std.mem.eql(u8, task, scope)) continue;
-                var iterator = owners.iterator();
-                while (iterator.next()) |owner| if (owner.value_ptr.path == null) {
-                    _ = models.object.swapRemove(owner.key_ptr.*);
-                };
+        } else {
+            // Descriptors retain installation identity until ownership is finalized.
+            // A same-named installation in another scope cannot supply its contract.
+            for (task_names) |task| {
+                const models = catalog.value.object.getPtr(task).?;
+                for (discovered, inventory.names) |entry, names| {
+                    const descriptor = models.object.get(entry.path) orelse continue;
+                    for (names) |selector| {
+                        const owner = (inventory.lookup(selector, task) catch continue) orelse continue;
+                        if (std.mem.eql(u8, owner, entry.path)) try models.object.put(ca, selector, descriptor);
+                    }
+                }
+                // Paths are private descriptor keys, never public model IDs.
+                for (discovered) |entry| _ = models.object.swapRemove(entry.path);
+                for (selection_mod.tasks, inventory.owners) |scope, owners| {
+                    if (!std.mem.eql(u8, task, scope)) continue;
+                    var iterator = owners.iterator();
+                    while (iterator.next()) |owner| if (owner.value_ptr.index == null) {
+                        _ = models.object.swapRemove(owner.key_ptr.*);
+                    };
+                }
             }
         }
         filterOpenAiCatalogSelectors(&catalog.value);

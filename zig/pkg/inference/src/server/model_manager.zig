@@ -517,6 +517,18 @@ fn nativeBackendsAvailable() bool {
     return build_options.enable_native or build_options.enable_metal or build_options.enable_cuda;
 }
 
+fn modelBackendPolicyError(manifest: manifest_mod.ModelManifest, backend: backends.BackendType, a4b: ?backend_contracts.A4bInferenceRequest) ?anyerror {
+    if (a4b != null and !backend.supportsA4bSession()) return error.A4bRequiresGpu;
+    if (manifest.glide_declared and manifest.glide_backbone == .decoder and !backend.usesGpuHostedSession())
+        return error.GlideDecoderRequiresGpu;
+    return null;
+}
+
+fn modelBackendMeetsJitPolicy(manager: *const backends.SessionManager, manifest: manifest_mod.ModelManifest, backend: backends.BackendType) bool {
+    return !manager.kernel_jit.mode.failClosed() or
+        (backend.supportsKernelJitSession() and manifestHasNativeAssets(manifest));
+}
+
 fn manifestHasNativeAssets(man: manifest_mod.ModelManifest) bool {
     return man.nativeWeightArtifactKind() != null;
 }
@@ -10262,12 +10274,22 @@ pub const ModelManager = struct {
         if (manager.required_backend_invalid) return result;
         var required: [1]backends.BackendType = undefined;
         const load_policy = self.defaultModelLoadPolicy(model_dir);
-        const candidates = manager.requiredBackendCandidates(load_policy.preferred_backends, &required) catch return result;
+        var order: backends.BackendOrderBuffer = undefined;
+        const available = manager.declaredExecutionBackendOrder(&order, load_policy.preferred_backends);
+        const effective = manager.requiredBackendCandidates(available, &required) catch return result;
         const fail_closed_cuda_a4b = load_policy.cache_policy.a4b_request == null and
-            backends.backendOrderSelectsCudaBeforeCpu(candidates) and
+            backends.backendOrderSelectsCudaBeforeCpu(effective) and
             (try session_factory.resolveCudaA4bInferenceConfigForModelListing(self.allocator, model_dir, manifest, null)) != null;
+        // Acquisition still recognizes a device that disappeared after a lease
+        // was issued, so the caller can fail over on a backend refusal.
+        const candidates = if (include_unavailable)
+            manager.requiredBackendCandidates(load_policy.preferred_backends, &required) catch return result
+        else
+            effective;
         for (candidates) |backend| {
-            if (!backend.available()) continue;
+            if (!backend.available() or !backend.supportsDirectSessionLoad()) continue;
+            if (modelBackendPolicyError(manifest, backend, load_policy.cache_policy.a4b_request) != null) continue;
+            if (!modelBackendMeetsJitPolicy(manager, manifest, backend)) continue;
             if (!include_unavailable and self.pinnedBackendIsUnavailable(model_dir, backend)) continue;
             if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) continue;
             if (!manager.uninterruptibleBackendsAllowed() and backend.executionInterruption() == .uninterruptible) continue;
@@ -13012,20 +13034,11 @@ fn loadSessionForPreferredBackendsWithArtifactsImpl(
             return first_err orelse error.A4bCudaAutoFallbackForbidden;
         }
         if (!backend.available() or !backend.supportsDirectSessionLoad()) continue;
-        if (source_session_manager.a4b_inference_request != null and
-            backend != .metal and backend != .cuda)
-        {
-            rememberPreferredLoadError(&first_err, error.A4bRequiresGpu);
+        if (modelBackendPolicyError(man, backend, source_session_manager.a4b_inference_request)) |err| {
+            rememberPreferredLoadError(&first_err, err);
             continue;
         }
-        // GLiDE decoders require Metal or CUDA. Skip CPU backends before artifact
-        // verification and load admission reserve their weights.
-        if (man.glide_declared and man.glide_backbone == .decoder and backend != .metal and backend != .cuda) {
-            rememberPreferredLoadError(&first_err, error.GlideDecoderRequiresGpu);
-            continue;
-        }
-        if (source_session_manager.kernel_jit.mode.failClosed() and
-            !backend.supportsKernelJitSession()) continue;
+        if (!modelBackendMeetsJitPolicy(source_session_manager, man, backend)) continue;
         const source = (try bound.forBackend(&proof, backend)) orelse continue;
         const selected_man = source.manifest orelse &man;
         // Reuse the manifest and checksum proofs already acquired by the
@@ -17650,6 +17663,8 @@ test "durable embedding revision fences the selected receipt members across relo
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
+    defer manager.deinit();
     var first_revision: ?[32]u8 = null;
     for ([_][]const u8{ "original", "relocated" }) |directory| {
         try tmp.dir.createDirPath(io, directory);
@@ -17665,7 +17680,7 @@ test "durable embedding revision fences the selected receipt members across relo
             defer a.free(path);
             var artifacts = try PublishedArtifacts.init(a, io, path, null);
             defer artifacts.deinit();
-            const manifest: manifest_mod.ModelManifest = .{ .allocator = a, .gguf_path = path };
+            const manifest: manifest_mod.ModelManifest = .{ .allocator = a, .gguf_path = path, .managed_publication = artifacts.publication };
             const declared = try receiptedModelRevision(a, io, &artifacts.receipt.?, null, .{}, false);
             const verified = try modelIdentityWithArtifacts(a, io, path, manifest, &artifacts, .{});
             const discovery_revision = durableEmbeddingRevision(manifest, try embeddingArtifactRevision(manifest, imagePreprocessingRevision(manifest, declared), &artifacts), .native);
@@ -17675,6 +17690,13 @@ test "durable embedding revision fences the selected receipt members across relo
                 try std.testing.expectEqual(index == 0, std.mem.eql(u8, &first, &serving_revision));
             } else {
                 first_revision = serving_revision;
+                // Compiled support alone does not qualify direct embedding
+                // loads, and CPU fallback is forbidden when JIT is required.
+                manager.session_manager.required_backend = .pjrt;
+                try std.testing.expectEqual(@as(usize, 0), (try manager.declaredEmbeddingRevisions(path, manifest, .{ .io = io })).len);
+                manager.session_manager.required_backend = .native;
+                manager.session_manager.kernel_jit.mode = .required;
+                try std.testing.expectEqual(@as(usize, 0), (try manager.declaredEmbeddingRevisions(path, manifest, .{ .io = io })).len);
             }
         }
     }
@@ -20858,13 +20880,22 @@ test "model selection chunk planning rejects root replacement during constructio
         var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
         defer manager.deinit();
         manager.admission_enabled = true;
-        // Trace the final callback on a successful load, then replace at that
-        // same checkpoint after parsing and retaining tokenizer admission.
+        // Trace and inject against the same checksum-cache state. A cold
+        // verification walks more cancellation checkpoints than a cache hit.
+        var warmup = try manager.loadChunkPlanningAssets(root, io, .{});
+        warmup.deinit();
+        // Replace after parsing and retaining tokenizer admission.
         var baseline = try manager.loadChunkPlanningAssets(root, io, .{ .ptr = &probe, .check_fn = Probe.check });
         baseline.deinit();
         probe.switch_at = if (late_replacement) probe.checks else 3;
         probe.checks = 0;
-        try std.testing.expectError(error.ModelArtifactsChanging, manager.loadChunkPlanningAssets(root, io, .{ .ptr = &probe, .check_fn = Probe.check }));
+        if (manager.loadChunkPlanningAssets(root, io, .{ .ptr = &probe, .check_fn = Probe.check })) |loaded| {
+            var unexpected = loaded;
+            unexpected.deinit();
+            return error.TestExpectedError;
+        } else |err| {
+            try std.testing.expectEqual(error.ModelArtifactsChanging, err);
+        }
         try std.testing.expect(probe.checks >= probe.switch_at.?);
         try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
     };
@@ -21094,7 +21125,9 @@ test "model selection retained ONNX handles defeat external leaf and parent ABA 
         {
             var loaded = try manager.loadManagedSessionWithAdmission(path, &.{.native}, null, .{ .io = counted, .ptr = &probe, .check_fn = Probe.check }, selected, null);
             defer loaded.deinit();
-            try std.testing.expectEqual(@as(usize, 3), probe.checks);
+            // Checksum verification can add cancellation polls after both
+            // switches. Verify the switches ran and compare execution output.
+            try std.testing.expect(probe.checks >= 3);
             // Construction's publication fence and all retained descriptors are
             // gone here. Execution owns decoded tensors, not borrowed readers.
             const zeros: [32]f32 = @splat(0);

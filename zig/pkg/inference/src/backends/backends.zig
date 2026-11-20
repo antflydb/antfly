@@ -620,6 +620,15 @@ pub const SessionManager = struct {
         return backendOrderWithCudaAvailability(scratch, preferred, try probeCudaDeviceWithControl(control));
     }
 
+    /// Discovery uses known CUDA availability without starting a driver probe.
+    pub fn declaredExecutionBackendOrder(self: *const SessionManager, scratch: *BackendOrderBuffer, preferred: []const BackendType) []const BackendType {
+        if (self.required_backend != null or preferred.len <= 1 or
+            std.mem.indexOfScalar(BackendType, preferred, .cuda) == null)
+            return preferred;
+        const available = self.uninterruptibleBackendsAllowed() and build_options.enable_cuda and knownCudaDeviceAvailability() != false;
+        return backendOrderWithCudaAvailability(scratch, preferred, available);
+    }
+
     pub fn bestAvailable(self: *const SessionManager) ?BackendType {
         if (self.required_backend_invalid) return null;
         if (self.required_backend) |backend| {

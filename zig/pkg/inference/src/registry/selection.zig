@@ -32,7 +32,7 @@ pub fn firstScopeWins(task: []const u8) bool {
     return std.mem.eql(u8, task, "deciders");
 }
 
-const Owner = struct { path: ?[]const u8, priority: u2 = 0 };
+const Owner = struct { index: ?usize, priority: u2 = 0 };
 const Stamp = struct { inode: u64, size: u64, modified: i128 };
 const Watch = struct { path: []const u8, stamp: ?Stamp };
 
@@ -173,7 +173,7 @@ pub const Inventory = struct {
             const physical: []const []const u8 = if (aliases.len > 0) aliases else &.{task};
             for (physical) |scope| {
                 var local = std.StringHashMapUnmanaged(Owner).empty;
-                for (self.discovered, self.names) |entry, selectors| {
+                for (self.discovered, self.names, 0..) |entry, selectors, index| {
                     if (!registry.modelInTaskScope(self.models_dir, entry.path, scope)) continue;
                     for (selectors) |selector| {
                         const bare = std.mem.indexOfAny(u8, selector, ":@") == null;
@@ -182,27 +182,32 @@ pub const Inventory = struct {
                         const priority: u2 = if (bare and std.mem.eql(u8, root, entry.path)) 2 else if (bare and std.mem.eql(u8, legacy, entry.path)) 1 else 0;
                         const owner = try local.getOrPut(a, selector);
                         if (!owner.found_existing or priority > owner.value_ptr.priority) {
-                            owner.value_ptr.* = .{ .path = entry.path, .priority = priority };
-                        } else if (priority == 0 and (owner.value_ptr.path == null or !std.mem.eql(u8, owner.value_ptr.path.?, entry.path))) owner.value_ptr.path = null;
+                            owner.value_ptr.* = .{ .index = index, .priority = priority };
+                        } else if (priority == 0 and (owner.value_ptr.index == null or !std.mem.eql(u8, self.discovered[owner.value_ptr.index.?].path, entry.path))) owner.value_ptr.index = null;
                     }
                 }
                 var iterator = local.iterator();
                 while (iterator.next()) |candidate| {
                     const owner = try owners.getOrPut(a, candidate.key_ptr.*);
                     if (owner.found_existing and firstScopeWins(task)) continue;
-                    if (!owner.found_existing) owner.value_ptr.* = candidate.value_ptr.* else if (owner.value_ptr.path == null or candidate.value_ptr.path == null or !std.mem.eql(u8, owner.value_ptr.path.?, candidate.value_ptr.path.?)) owner.value_ptr.path = null;
+                    if (!owner.found_existing) owner.value_ptr.* = candidate.value_ptr.* else if (owner.value_ptr.index == null or candidate.value_ptr.index == null or !std.mem.eql(u8, self.discovered[owner.value_ptr.index.?].path, self.discovered[candidate.value_ptr.index.?].path)) owner.value_ptr.index = null;
                 }
             }
         }
     }
 
+    pub fn lookupIndex(self: *const Inventory, selector: []const u8, task: []const u8) !?usize {
+        for (tasks, self.owners) |name, owners| if (std.mem.eql(u8, name, task)) {
+            const found = owners.get(selector) orelse return null;
+            return found.index orelse error.AmbiguousModelIdentifier;
+        };
+        return null;
+    }
+
     pub fn lookup(self: *const Inventory, selector: []const u8, task: ?[]const u8) !?[]const u8 {
         if (task) |scope| {
-            for (tasks, self.owners) |name, owners| if (std.mem.eql(u8, name, scope)) {
-                const found = owners.get(selector) orelse return null;
-                return found.path orelse error.AmbiguousModelIdentifier;
-            };
-            return null;
+            const index = (try self.lookupIndex(selector, scope)) orelse return null;
+            return self.discovered[index].path;
         }
         var selected: ?[]const u8 = null;
         for (self.discovered, self.names) |entry, selectors| for (selectors) |name| {
@@ -267,11 +272,14 @@ pub const Cache = struct {
         epoch: usize,
         rebuilt_at: std.Io.Timestamp,
     };
-    const Lease = struct {
+    pub const Lease = struct {
         cache: *Cache,
         slot: *Slot,
         io: std.Io,
-        fn release(self: Lease) void {
+        pub fn inventory(self: Lease) *const Inventory {
+            return &self.slot.inventory;
+        }
+        pub fn release(self: Lease) void {
             self.cache.mutex.lockUncancelable(self.io);
             self.slot.refs -= 1;
             const destroy = self.slot.refs == 0;
@@ -350,6 +358,18 @@ pub const Cache = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.epoch +%= 1;
+    }
+
+    pub fn borrowForSelector(self: *Cache, io: std.Io, root: []const u8, selector: []const u8, task: []const u8) !Lease {
+        const lease = try self.acquire(io, root, false);
+        errdefer lease.release();
+        // Preserve the bounded raw-filesystem import backstop on misses only.
+        if ((lease.inventory().lookupIndex(selector, task) catch return lease) != null) return lease;
+        const age = std.Io.Timestamp.now(io, .awake).nanoseconds - lease.slot.rebuilt_at.nanoseconds;
+        if (age < 5 * std.time.ns_per_s) return lease;
+        const refreshed = try self.acquire(io, root, true);
+        lease.release();
+        return refreshed;
     }
 
     pub fn snapshot(self: *Cache, allocator: std.mem.Allocator, io: std.Io, root: []const u8) !Inventory {
