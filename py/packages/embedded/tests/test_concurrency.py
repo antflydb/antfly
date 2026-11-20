@@ -692,10 +692,13 @@ def test_busy_index_in_another_process_does_not_starve_maintenance(tmp_path: Pat
             "import antfly_embedded as af, os, sys\n"
             "db = af.open(sys.argv[1], no_sync=True, busy_timeout=30.0)\n"
             + ("busy = db\n" if same_table else "busy = db.open_table('busy')\n")
-            + "n = 0\n"
+            + "n = folds = last = 0\n"
             "while not os.path.exists(sys.argv[2]):\n"
-            "    busy.batch_json({'inserts': {f'a{n % 4}': {'a': f'busydoc{n} ' + 'filler ' * 1500}}, 'sync_level': 'full_index'}); n += 1\n"
-            "    folds = db.status()['storage']['reclamation']['allocator_work']['redo_checkpoint_folds']\n"
+            "    busy.batch_json({'inserts': {f'a{n % 4}': {'a': f'busydoc{n} ' + 'filler ' * 4000}}, 'sync_level': 'full_index'}); n += 1\n"
+            # The counter belongs to the serving runtime and restarts when
+            # it is replaced; accumulate it into a monotonic total.
+            "    now = db.status()['storage']['reclamation']['allocator_work']['redo_checkpoint_folds']\n"
+            "    folds += now - last if now >= last else now; last = now\n"
             "    open(sys.argv[3] + '.tmp', 'w').write(f'{n} {folds}'); os.replace(sys.argv[3] + '.tmp', sys.argv[3])\n"
             "db.close()"
         )
@@ -706,17 +709,24 @@ def test_busy_index_in_another_process_does_not_starve_maintenance(tmp_path: Pat
             started = time.monotonic() + 60
             while time.monotonic() < started and peer_progress()[0] < 20:
                 time.sleep(0.05)
-            writes_before, folds_before = peer_progress()
-            # Sample while the backlog builds and drains: it must be seen
-            # pending, and a peer fold must land while it is.
+            writes_before = peer_progress()[0]
+            # Sample while the backlog builds and drains. The peer's fold
+            # count is taken once the backlog is first seen pending, and must
+            # advance at a later sample where it still is.
             backlog = 0
+            folds_at_backlog = None
             overlapped = False
 
             def sample():
-                nonlocal backlog, overlapped
+                nonlocal backlog, folds_at_backlog, overlapped
                 pending = quiet_segments(db)
+                folds = peer_progress()[1]
                 backlog = max(backlog, pending)
-                overlapped = overlapped or (pending > 4 and peer_progress()[1] > folds_before)
+                if pending > 4:
+                    if folds_at_backlog is None:
+                        folds_at_backlog = folds
+                    elif folds > folds_at_backlog:
+                        overlapped = True
                 return pending
 
             for i in range(120):
@@ -736,7 +746,7 @@ def test_busy_index_in_another_process_does_not_starve_maintenance(tmp_path: Pat
             peer.wait(timeout=60)
     assert peer.returncode == 0
     assert backlog > 4, backlog
-    assert overlapped, (backlog, folds_before, peer_progress())
+    assert overlapped, (backlog, folds_at_backlog, peer_progress())
     assert still_busy and writes_after > writes_before >= 20, (writes_before, writes_after)
     assert segments <= 4, (backlog, segments)
 
