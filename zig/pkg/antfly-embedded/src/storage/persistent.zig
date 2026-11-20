@@ -1612,7 +1612,9 @@ pub const PersistentIndex = struct {
                     else => return err,
                 };
                 if (deletion_bytes) |bytes| {
-                    var bitmap = try roaring.RoaringBitmap.fromPersistedDeletionBytes(alloc, bytes);
+                    const segments = writer.snapshot().segments;
+                    const doc_count = segments[segments.len - 1].reader.doc_count;
+                    var bitmap = try roaring.RoaringBitmap.fromPersistedDeletionBytes(alloc, bytes, doc_count);
                     if (!bitmap.isEmpty()) {
                         writer.setDeletionBitmap(seg_id, bitmap);
                     } else {
@@ -2633,19 +2635,21 @@ pub const PersistentIndex = struct {
                 else => return err,
             };
 
-            if (collect_doc_keys) {
+            const already_copied = existing_dest.contains(entry.seg_id);
+            const doc_count = if (collect_doc_keys or (!already_copied and deletion_bytes != null)) count: {
                 var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
                 defer reader.deinit();
-                for (0..reader.doc_count) |doc_idx| {
+                if (collect_doc_keys) for (0..reader.doc_count) |doc_idx| {
                     const stored = (try reader.storedDoc(@intCast(doc_idx))) orelse continue;
                     try doc_keys.append(alloc, try alloc.dupe(u8, stored.id));
-                }
-            }
+                };
+                break :count reader.doc_count;
+            } else null;
 
-            if (existing_dest.contains(entry.seg_id)) continue;
+            if (already_copied) continue;
 
             if (deletion_bytes) |bytes| {
-                var bitmap = try roaring.RoaringBitmap.fromPersistedDeletionBytes(alloc, bytes);
+                var bitmap = try roaring.RoaringBitmap.fromPersistedDeletionBytes(alloc, bytes, doc_count.?);
                 if (!bitmap.isEmpty()) {
                     replacement_deleted[replacements_initialized] = bitmap;
                 } else {
@@ -4964,12 +4968,23 @@ test "persistent index reopens legacy low-cardinality dense deletion records" {
         try txn.commit();
     }
 
-    var pi = try PersistentIndex.open(alloc, .{ .path = path });
-    defer pi.close();
-    const deleted = pi.snapshot().segments[0].shared.deleted.?;
-    try std.testing.expectEqual(@as(usize, 1), deleted.cardinality());
-    try std.testing.expect(!deleted.contains(0));
-    try std.testing.expect(deleted.contains(1));
+    {
+        var pi = try PersistentIndex.open(alloc, .{ .path = path });
+        defer pi.close();
+        const deleted = pi.snapshot().segments[0].shared.deleted.?;
+        try std.testing.expectEqual(@as(usize, 1), deleted.cardinality());
+        try std.testing.expect(!deleted.contains(0));
+        try std.testing.expect(deleted.contains(1));
+
+        // A canonical bitmap is still invalid for a two-document segment
+        // if its deletion ordinal points past the last document.
+        var txn = try pi.beginWriteMainTxn();
+        errdefer txn.abort();
+        const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1)));
+        try txn.put(.deletions, &seg_key, &.{ 1, 0, 0, 0, 0, 0, 2, 0 });
+        try txn.commit();
+    }
+    try std.testing.expectError(error.InvalidRoaringBitmap, PersistentIndex.open(alloc, .{ .path = path }));
 }
 
 test "persistent index classifies active segments for split" {
