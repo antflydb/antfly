@@ -560,8 +560,8 @@ journals during recovery, but cannot create a new release candidate.
 
 `scripts/release/release-lines.json` is the default-branch controller's map
 from a tag's `X.Y` version line to its trusted source branch. It maps `0.2` to
-`v0.2.x` and `0.3` to `main`. The branches share the `v0.2.1` release commit,
-`e5261e9e2937d03943b518974bf8063351ad1449`. Release tags are
+`v0.2.x`, `0.3` to `v0.3.x`, and `0.4` to `main`. The 0.3 maintenance
+branch starts at `v0.3.2` (`367419e1c48c942ba5b624c27436af40f4a76e1d`). Release tags are
 still created and pushed manually. A non-nightly tag is accepted when its
 commit belongs to the selected branch when the controller validates it. This
 keeps a tag request replayable after the branch advances. The request cannot
@@ -579,7 +579,12 @@ For the active release lines:
 - Backport later 0.2 fixes through PRs into `v0.2.x`, and create canonical
   `v0.2.*` tags only from commits in that branch. Do not merge 0.3-era `main`
   back into the maintenance branch.
-- Develop 0.3 on `main` and create canonical `v0.3.*` tags from its commits.
+- Backport later 0.3 fixes through PRs into `v0.3.x`, and create canonical
+  `v0.3.*` tags only from commits in that branch. Do not merge 0.4-era `main`
+  back into the maintenance branch.
+- Develop 0.4 on `main` and create canonical `v0.4.*` tags from its commits.
+- Keep both `refs/heads/main` and `refs/heads/v0.3.x` in the 0.3 line's
+  `trusted_source_refs` so releases through v0.3.2 remain verifiable.
 - Keep both `refs/heads/main` and `refs/heads/v0.2.x` in the 0.2 line's
   `trusted_source_refs` so releases built before the handoff remain verifiable.
 

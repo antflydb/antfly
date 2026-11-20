@@ -45,13 +45,23 @@ class ReleaseLinePolicyTests(unittest.TestCase):
             with self.subTest(tag=tag):
                 line = release_lines.resolve_tag(tag, self.policy)
                 self.assertEqual(
-                    (line.name, line.source_ref), ("0.3", "refs/heads/main")
+                    (line.name, line.source_ref), ("0.3", "refs/heads/v0.3.x")
+                )
+                self.assertEqual(
+                    line.trusted_source_refs,
+                    ("refs/heads/main", "refs/heads/v0.3.x"),
+                )
+        for tag in ("v0.4.0", "v0.4.0-rc.1"):
+            with self.subTest(tag=tag):
+                line = release_lines.resolve_tag(tag, self.policy)
+                self.assertEqual(
+                    (line.name, line.source_ref), ("0.4", "refs/heads/main")
                 )
                 self.assertEqual(line.trusted_source_refs, ("refs/heads/main",))
 
     def test_tag_cannot_select_a_different_release_line(self) -> None:
         with self.assertRaisesRegex(SystemExit, "no trusted release line"):
-            release_lines.resolve_tag("v0.4.0-rc.1", self.policy)
+            release_lines.resolve_tag("v0.5.0-rc.1", self.policy)
 
     def test_noncanonical_and_nightly_tags_cannot_select_release_lines(self) -> None:
         for tag in ("v0.2.1-rc4", "v0.0.0-dev.12"):
@@ -83,6 +93,18 @@ class ReleaseLinePolicyTests(unittest.TestCase):
         )
         release_lines.validate_provenance(
             "v0.2.2", "0.2", "refs/heads/v0.2.x", self.policy
+        )
+
+    def test_v03_handoff_preserves_released_main_provenance(self) -> None:
+        self.assertEqual(
+            release_lines.resolve_tag("v0.3.3", self.policy).source_ref,
+            "refs/heads/v0.3.x",
+        )
+        release_lines.validate_provenance(
+            "v0.3.2", "0.3", "refs/heads/main", self.policy
+        )
+        release_lines.validate_provenance(
+            "v0.3.3", "0.3", "refs/heads/v0.3.x", self.policy
         )
 
     def test_provenance_rejects_wrong_line_or_untrusted_source(self) -> None:
