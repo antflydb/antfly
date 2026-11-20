@@ -772,19 +772,23 @@ fn isWebm(bytes: []const u8) bool {
 }
 // Open and validate the container once. Adapt AV1 only after the bounded MP4
 // reader has selected the track, transferring its metadata to the WebM owner.
-const ContainerInput = union(enum) {
+pub const ContainerInput = union(enum) {
     packets: PacketInput,
     webm: media.webm.Reader,
 
     fn open(a: std.mem.Allocator, source: *media.source.Source, bytes: []const u8, sampling: Sampling) !ContainerInput {
-        if (isWebm(bytes)) return .{ .webm = try media.webm.Reader.init(a, source, .{}) };
-        var packet = try PacketInput.initSampled(a, source, bytes, sampling);
+        return openLimited(a, source, bytes, isWebm(bytes), sampling, video.mp4_coded.limits, .{});
+    }
+
+    pub fn openLimited(a: std.mem.Allocator, source: *media.source.Source, bytes: []const u8, webm: bool, sampling: Sampling, mp4_limits: media.mp4.Limits, webm_limits: media.webm.Limits) !ContainerInput {
+        if (webm) return .{ .webm = try media.webm.Reader.init(a, source, webm_limits) };
+        var packet = try PacketInput.initSampled(a, source, bytes, sampling, mp4_limits);
         errdefer packet.deinit();
         if (packet.reader.track.codec == .av1) return .{ .webm = try video.mp4_coded.intoWebm(a, &packet.reader) };
         return .{ .packets = packet };
     }
 
-    fn deinit(self: *ContainerInput) void {
+    pub fn deinit(self: *ContainerInput) void {
         switch (self.*) {
             inline else => |*owner| owner.deinit(),
         }
@@ -825,17 +829,18 @@ pub const PacketInput = struct {
     inband_config: ?[]u8 = null,
     allocator: ?std.mem.Allocator = null,
     pub fn init(a: std.mem.Allocator, source: *media.source.Source, bytes: []const u8) !PacketInput {
-        return initSampled(a, source, bytes, .reference);
+        return initSampled(a, source, bytes, .reference, video.mp4_coded.limits);
     }
-    fn initSampled(a: std.mem.Allocator, source: *media.source.Source, bytes: []const u8, sampling: Sampling) !PacketInput {
+    fn initSampled(a: std.mem.Allocator, source: *media.source.Source, bytes: []const u8, sampling: Sampling, limits: media.mp4.Limits) !PacketInput {
         if (media.transport_stream.isTransportStream(bytes)) {
             const normalized = try video.transport_avc.Reader.init(a, source.identity, bytes, .{}, .{
+                .index = limits,
                 .transport = .{ .max_bytes = inputByteLimit(sampling) },
                 .stream = .{ .max_bytes = inputByteLimit(sampling), .control = source.control, .admission_pool = source.admission_pool },
             });
             return .{ .reader = normalized.reader, .snapshot = normalized.snapshot };
         }
-        var input = PacketInput{ .reader = try media.mp4.Reader.init(a, source, video.mp4_coded.limits), .allocator = a };
+        var input = PacketInput{ .reader = try media.mp4.Reader.init(a, source, limits), .allocator = a };
         errdefer input.deinit();
         input.inband_config = try normalizeHevc(a, &input.reader);
         return input;
@@ -1374,10 +1379,11 @@ fn adaptedPlan(index: video.webm_pictures.Index, sampling: Sampling, control: me
 fn selectWebm(a: std.mem.Allocator, index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control, timeline: ?*const video.sampling.Timeline) ![]usize {
     if (try adaptedPlan(index, sampling, control)) |plan| return a.dupe(usize, plan.ids());
     if (sampling == .reference) return index.select();
+    const scale = if (index.reader) |r| if (r.source_timeline) |source| source.timescale else std.time.ns_per_s else std.time.ns_per_s;
     if (timeline) |cached| return switch (sampling) {
-        .gemma4 => cached.select(a, 1_000_000_000, .{}, control, true),
-        .timestamps => |p| cached.select(a, 1_000_000_000, p, control, true),
-        .source_timestamps => |p| cached.select(a, 1_000_000_000, p, control, false),
+        .gemma4 => cached.select(a, scale, .{}, control, true),
+        .timestamps => |p| cached.select(a, scale, p, control, true),
+        .source_timestamps => |p| cached.select(a, scale, p, control, false),
         .reference => unreachable,
     };
     const metadata = try a.alloc(video.sampling.TimedPicture, index.pictures.len);

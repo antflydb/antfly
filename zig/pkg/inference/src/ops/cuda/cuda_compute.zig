@@ -14090,18 +14090,40 @@ fn allocFreshTempBufferUnlocked(self: *CudaCompute, len: usize, policy: TempAllo
     return buffer_mod.DeviceBuffer.alloc(&self.ctx, len) catch |err| {
         if (policy == .optional or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return err;
         if (err != error.CudaMemoryLimitExceeded and self.deferred_device_frees.items.len == 0) return err;
-        try forceDrainDeferredDeviceFreesUnlocked(self);
-        while (true) {
-            return buffer_mod.DeviceBuffer.alloc(&self.ctx, len) catch |retry_err| {
-                if (retry_err != error.CudaMemoryLimitExceeded) return retry_err;
-                var idle = self.temp_buffers.pop() orelse return retry_err;
-                self.stats.temp_buffer_evictions += 1;
-                self.stats.device_free_calls += 1;
-                idle.free(&self.ctx);
-                continue;
-            };
+        const owner = self.ctx.device_allocations.snapshot();
+        const process = @import("allocation_budget.zig").process_device_allocations.snapshot();
+        if (len > @min(owner.limit, process.limit)) return err;
+        if (self.deferred_device_frees.items.len != 0) {
+            try forceDrainDeferredDeviceFreesUnlocked(self);
+            if (buffer_mod.DeviceBuffer.alloc(&self.ctx, len)) |buffer| return buffer else |after_drain| {
+                if (after_drain != error.CudaMemoryLimitExceeded) return after_drain;
+            }
         }
+        const current = self.ctx.device_allocations.snapshot();
+        const global = @import("allocation_budget.zig").process_device_allocations.snapshot();
+        const deficit = len -| @min(current.limit - current.live, global.limit - global.live);
+        if (self.temp_buffers.bytes == 0 or deficit > self.temp_buffers.bytes) return error.CudaMemoryLimitExceeded;
+        // For a physical OOM the driver supplies no deficit. Reclaim one
+        // allocation's worth, then try once with the whole idle cache if
+        // fragmentation still prevents a contiguous allocation.
+        const target = if (deficit != 0) deficit else len;
+        evictIdleTempBytes(self, target);
+        return buffer_mod.DeviceBuffer.alloc(&self.ctx, len) catch |retry_err| {
+            if (retry_err != error.CudaMemoryLimitExceeded or self.temp_buffers.bytes == 0) return retry_err;
+            evictIdleTempBytes(self, self.temp_buffers.bytes);
+            return buffer_mod.DeviceBuffer.alloc(&self.ctx, len);
+        };
     };
+}
+
+fn evictIdleTempBytes(self: *CudaCompute, bytes: usize) void {
+    const keep = self.temp_buffers.bytes -| bytes;
+    while (self.temp_buffers.bytes > keep) {
+        var idle = self.temp_buffers.pop() orelse break;
+        self.stats.temp_buffer_evictions += 1;
+        self.stats.device_free_calls += 1;
+        idle.free(&self.ctx);
+    }
 }
 
 /// Persistent state uses only exact ordinary-cache allocations. It must never
@@ -39725,6 +39747,30 @@ test "Gemma4 CUDA temporary LRU bounds bytes and entries while preserving live t
     const actual = try cb.toFloat32(live, a);
     defer a.free(actual);
     try std.testing.expectEqualSlices(f32, &values, actual);
+}
+test "Gemma4 CUDA projector required scratch reclaims the quota deficit and preserves impossible allocations" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.initWithKernelJitForProfile(std.testing.allocator, .{}, .gemma4);
+    defer compute.deinit();
+    var buffers: [8]buffer_mod.DeviceBuffer = undefined;
+    var initialized: usize = 0;
+    defer for (buffers[0..initialized]) |*buffer| buffer.free(&compute.ctx);
+    for (&buffers) |*buffer| {
+        buffer.* = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 4096);
+        initialized += 1;
+    }
+    for (&buffers) |*buffer| releaseDeviceBuffer(&compute, buffer);
+    initialized = 0;
+    const budget = &compute.ctx.device_allocations;
+    const initial = budget.snapshot();
+    try budget.setLimit(initial.live);
+    defer budget.setLimit(initial.limit) catch unreachable;
+    const evictions = compute.stats.temp_buffer_evictions;
+    try std.testing.expectError(error.CudaMemoryLimitExceeded, allocFreshTempBufferUnlocked(&compute, initial.live + 1, .required));
+    try std.testing.expectEqual(evictions, compute.stats.temp_buffer_evictions);
+    var large = try allocFreshTempBufferUnlocked(&compute, 3 * 4096, .required);
+    defer large.free(&compute.ctx);
+    try std.testing.expectEqual(evictions + 3, compute.stats.temp_buffer_evictions);
 }
 test "Gemma4 CUDA projector optional scratch leaves graph slots available after admission and denial" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;

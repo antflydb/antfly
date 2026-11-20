@@ -45,18 +45,24 @@ fn clockAllowance(clock: media.timeline.SampleClock) !usize {
 
 /// Size the reservation from container clocks without acquiring a decoder or
 /// projector. Final context validation tokenizes the actual projected spans.
-pub fn promptAllowance(a: std.mem.Allocator, bytes: []const u8) !usize {
+pub fn promptAllowance(a: std.mem.Allocator, bytes: []const u8, control: Control) !usize {
+    try control.check();
+    const adapter = control.imageWorkControl();
+    const media_control = media.source.Control{ .context = adapter.context, .check_fn = adapter.check_fn };
     if (bytes.len > video.packet_sampling.gemma4_max_input_bytes) return error.VideoInputTooLarge;
     if (media.transport_stream.isTransportStream(bytes)) {
-        return clockAllowance(try media.transport_stream.probeSampleClock(a, bytes, .{ .max_bytes = video.packet_sampling.gemma4_max_input_bytes }, .{}));
+        return clockAllowance(try media.transport_stream.probeSampleClock(a, bytes, .{ .max_bytes = video.packet_sampling.gemma4_max_input_bytes }, media_control));
     }
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = inspection_bytes } };
-    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-prompt-clock", .admission_pool = &pool, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-prompt-clock", .control = media_control, .admission_pool = &pool, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
     if (std.mem.startsWith(u8, bytes, "\x1a\x45\xdf\xa3")) {
         var reader = try media.webm.Reader.init(a, &source, .{});
         defer reader.deinit();
         var clock = media.timeline.SampleClock{ .scale = std.time.ns_per_s };
-        for (reader.packets) |packet| clock.include(packet.pts);
+        for (reader.packets, 0..) |packet, i| {
+            if (i % 256 == 0) try control.check();
+            clock.include(packet.pts);
+        }
         return clockAllowance(clock);
     }
     if (try media.mp4.probeSampleClock(bytes, video.mp4_coded.limits, source.control)) |table| {
@@ -65,7 +71,10 @@ pub fn promptAllowance(a: std.mem.Allocator, bytes: []const u8) !usize {
     var reader = try media.mp4.Reader.init(a, &source, video.mp4_coded.limits);
     defer reader.deinit();
     var clock = media.timeline.SampleClock{ .scale = reader.track.timescale, .edit = reader.track.edit };
-    for (reader.packets) |packet| clock.include(packet.pts);
+    for (reader.packets, 0..) |packet, i| {
+        if (i % 256 == 0) try control.check();
+        clock.include(packet.pts);
+    }
     return clockAllowance(clock);
 }
 
@@ -75,7 +84,8 @@ const sampling: embedding_video.Sampling = .gemma4;
 const portable_pool_bytes: u64 = 512 * 1024 * 1024;
 const inspection_bytes: usize = 64 * 1024 * 1024;
 /// Prepared model-sized frames, plus one displayed frame at the source pixel limit.
-const portable_frame_bytes: usize = 96 * 1024 * 1024 + 48 * 1024 * 1024;
+const prepaid_model_pixels: usize = 96 * 1024 * 1024;
+const portable_frame_bytes: usize = prepaid_model_pixels + 48 * 1024 * 1024;
 /// Reserved through generation admission before any portable video work starts.
 pub const portable_host_bytes: usize = portable_pool_bytes + portable_frame_bytes;
 
@@ -119,36 +129,40 @@ const Permit = struct {
     shared: ?@import("../backends/session.zig").RunPermit = null,
     surface_shared: ?@import("../backends/session.zig").RunPermit = null,
 
-    /// Admit an in-band SPS's additional device envelope after activation,
-    /// before opening a decoder. Both ledgers roll back on shared denial.
+    frame_shared: ?@import("../backends/session.zig").RunPermit = null,
+
     fn ensureSurfaces(self: *Permit, admission: Admission, required: usize) !void {
-        if (required <= self.reservation.surface_bytes) return;
-        if (self.surface_shared != null) return error.InvalidVideoCacheReservation;
-        const growth = required - self.reservation.surface_bytes;
+        try self.ensureCapacity(admission, .backend, required);
+    }
+
+    fn ensureCapacity(self: *Permit, admission: Admission, tier: memory.ResidencyTier, required: usize) !void {
+        const reserved = if (tier == .host) &self.reservation.host_bytes else &self.reservation.surface_bytes;
+        if (required <= reserved.*) return;
+        const shared_permit = if (tier == .host) &self.frame_shared else &self.surface_shared;
+        if (shared_permit.* != null) return error.InvalidVideoCacheReservation;
+        const growth = required - reserved.*;
         const previous_limit = if (self.budget) |budget| budget.limits.scratch_limit_bytes else 0;
-        if (self.budget) |budget| {
-            if (budget.limits.scratch_limit_bytes != 0) budget.limits = try memory.withAutomaticScratchFloor(budget.limits, admission.explicit_scratch_limit, budget.scratchTotalBytes(), growth);
-            budget.reserveEstimate(scratchEstimate(growth, .backend)) catch |err| {
-                budget.limits.scratch_limit_bytes = previous_limit;
-                return err;
-            };
-        }
         errdefer if (self.budget) |budget| {
-            budget.releaseEstimate(scratchEstimate(growth, .backend));
             budget.limits.scratch_limit_bytes = previous_limit;
         };
+        if (self.budget) |budget| {
+            if (budget.limits.scratch_limit_bytes != 0) budget.limits = try memory.withAutomaticScratchFloor(budget.limits, admission.explicit_scratch_limit, budget.scratchTotalBytes(), growth);
+            try budget.reserveEstimate(scratchEstimate(growth, tier));
+        }
+        errdefer if (self.budget) |budget| budget.releaseEstimate(scratchEstimate(growth, tier));
         if (admission.session) |original| {
             var session = original;
             if (session.run_admission) |*shared| {
                 shared.limits = try memory.withAutomaticScratchFloor(shared.limits, admission.explicit_scratch_limit, shared.controller.snapshot().scratchTotalBytes(), growth);
             }
-            self.surface_shared = try session.admitRetainedMedia(0, growth);
+            shared_permit.* = try session.admitRetainedMedia(if (tier == .host) growth else 0, if (tier == .backend) growth else 0);
         }
-        self.reservation.surface_bytes = required;
-        self.reserved_surfaces = self.budget != null;
+        reserved.* = required;
+        if (tier == .host) self.reserved_host = self.budget != null else self.reserved_surfaces = self.budget != null;
     }
 
     fn deinit(self: *Permit) void {
+        if (self.frame_shared) |*held| held.deinit();
         if (self.surface_shared) |*held| held.deinit();
         if (self.shared) |*held| held.deinit();
         if (self.budget) |budget| {
@@ -177,13 +191,17 @@ pub const Reservation = struct {
 /// What this clip's route will hold on a host without NVDEC. Unreadable clips keep
 /// the portable reservation; decoding reports what's wrong with them.
 pub fn reservation(_: std.mem.Allocator, bytes: []const u8) Reservation {
-    return reservationControlled(bytes, .{});
+    return reservationControlled(bytes, .{}) catch .{};
 }
 
-fn reservationControlled(bytes: []const u8, control: Control) Reservation {
+pub fn reservationControlled(bytes: []const u8, control: Control) !Reservation {
+    try control.check();
     if (@import("builtin").os.tag != .macos) return .{};
     const adapter = control.imageWorkControl();
-    const track = media.mp4.probeTrack(bytes, video.mp4_coded.limits, .{ .context = adapter.context, .check_fn = adapter.check_fn }) catch return .{};
+    const track = media.mp4.probeTrack(bytes, video.mp4_coded.limits, .{ .context = adapter.context, .check_fn = adapter.check_fn }) catch |err| switch (err) {
+        error.Cancelled, error.Canceled, error.Timeout, error.DeadlineExceeded => return err,
+        else => return .{},
+    };
     if (track.codec != .hevc) return .{};
     // Do not guess activation from hvcC array order or inspect packet data here.
     // The execution scope resolves the active SPS under this host reservation,
@@ -209,7 +227,7 @@ pub fn encode(cb: *const ComputeBackend, admission: Admission, a: std.mem.Alloca
         return encodePortable(cb, a, projector, bytes, admission, &permit);
     }
     try cb.checkExecutionControl();
-    var permit = try admission.acquire(false, reservationControlled(bytes, cb.execution_control orelse .{}));
+    var permit = try admission.acquire(false, try reservationControlled(bytes, cb.execution_control orelse .{}));
     defer permit.deinit();
     return encodePortable(cb, a, projector, bytes, admission, &permit);
 }
@@ -375,6 +393,8 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
     }
     var frames = try projector_mod.PortableVideoFrames.init(cb, a, projector, timestamps.len);
     defer frames.deinit();
+    const extra = (try frames.pixelWorkingBytes()) -| prepaid_model_pixels;
+    try permit.ensureCapacity(admission, .host, try std.math.add(usize, permit.reservation.host_bytes, extra));
     var observer: Observer = .{ .a = a, .cb = cb, .frames = &frames };
     const replay_bytes = embedding_video.observeConfiguredSourceBytes(a, bytes, reader, control, .{
         .observer = .{ .context = &observer, .accept = Observer.accept },
@@ -980,4 +1000,18 @@ test "gemma4 video multi-PPS supports embedding sampling and sparse long-clip de
     try std.testing.expectEqual(stats.decoded_packets, source.reads - before_reads);
     try std.testing.expectEqual(stats.payload_bytes, source.total_bytes - before_bytes);
     try std.testing.expect(stats.decoded_packets <= 32 * original.packets.len);
+}
+
+test "gemma4 video admission propagates cancellation during container scanning" {
+    const State = struct {
+        calls: u32 = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 6) return error.Timeout;
+        }
+    };
+    const messages = [_]@import("generation.zig").Message{.{ .role = "user", .content = "", .video_bytes = @embedFile("../testdata/video/h264-18001.mp4") }};
+    var state: State = .{};
+    try std.testing.expectError(error.Timeout, @import("generation.zig").nativeGenerationMediaAdmissionControlled(std.testing.allocator, "", &messages, .{ .family = .gemma }, .generic, .{ .ptr = &state, .check_fn = State.check }));
 }

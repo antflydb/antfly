@@ -123,6 +123,34 @@ fn mp4Limits(extended: bool) media.mp4.Limits {
     return .{ .max_samples = nvdec_max_samples, .max_dimension = 4096, .codecs = if (extended) std.EnumSet(media.mp4.Codec).initMany(&.{ .avc, .hevc, .av1 }) else std.EnumSet(media.mp4.Codec).initOne(.avc) };
 }
 
+fn decodeLimits(sampling: Sampling) media.mp4.Limits {
+    var limits = mp4Limits(true);
+    if (sampling == .gemma4) {
+        // Track choice belongs to the model. NVDEC capability is checked on
+        // that track, so a fallback cannot change the content of the prompt.
+        limits.codecs = @import("antfly_video").mp4_coded.limits.codecs;
+        limits.track_limit_error = error.DecoderEnvelopeExceeded;
+    }
+    return limits;
+}
+
+test "gemma4 video NVDEC selects the admission track before checking codec support" {
+    const a = std.testing.allocator;
+    const bytes = try a.dupe(u8, @embedFile("../../testdata/video/codecs/hevc-avc-tracks.mp4"));
+    defer a.free(bytes);
+    // Only sample descriptions are probed. Make the first video track MJPEG,
+    // leaving the second AVC description eligible for a narrower filter.
+    const entry = std.mem.indexOf(u8, bytes, "hev1") orelse return error.InvalidTestFixture;
+    const config = std.mem.indexOfPos(u8, bytes, entry, "hvcC") orelse return error.InvalidTestFixture;
+    @memcpy(bytes[entry..][0..4], "jpeg");
+    @memcpy(bytes[config..][0..4], "free");
+    const expected = try media.mp4.probeTrack(bytes, @import("antfly_video").mp4_coded.limits, .{});
+    const chosen = try media.mp4.probeTrack(bytes, decodeLimits(.gemma4), .{});
+    try std.testing.expectEqual(media.mp4.Codec.mjpeg, expected.codec);
+    try std.testing.expectEqual(expected.id, chosen.id);
+    try std.testing.expectError(error.UnsupportedVideoFormat, validateTrack(chosen));
+}
+
 test "embeddinggemma2 video HEVC AV1 and AVC NVDEC pixels match independent FFmpeg samples across codec changes" {
     if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -467,8 +495,7 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     ctx.video_cache_budget.failure = null;
     var state = DecodeState{ .ctx = ctx, .consumer = consumer };
     var source = media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = .{ .context = &state, .check_fn = sourceCheck } };
-    var limits = mp4Limits(true);
-    if (sampling == .gemma4) limits.track_limit_error = error.DecoderEnvelopeExceeded;
+    const limits = decodeLimits(sampling);
     var reader = try media.mp4.Reader.init(allocator, &source, limits);
     defer reader.deinit();
     try validateTrack(reader.track);

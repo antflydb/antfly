@@ -6226,6 +6226,7 @@ pub const Node = struct {
         max_tokens: i32,
         enable_thinking: ?bool,
         has_grammar: bool,
+        control: InferenceExecutionControl,
     ) !NativePromptTokenCount {
         var prompt = if (model.chat_tmpl) |ct|
             try ct.applyWithOptions(allocator, messages, .{ .enable_thinking = enable_thinking })
@@ -6238,12 +6239,13 @@ pub const Node = struct {
             prompt = expanded;
         }
 
-        const media_admission = try generation.nativeGenerationMediaAdmissionForBackend(
+        const media_admission = try generation.nativeGenerationMediaAdmissionControlled(
             allocator,
             model_dir,
             messages,
             gpt_config,
             if (model.session.backend() == .cuda) .cuda else .generic,
+            control,
         );
         const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(messages, gpt_config);
         const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
@@ -6352,12 +6354,12 @@ pub const Node = struct {
 
     /// Planning runs before the execution lease, including on independent
     /// cohort/continuous workers. Its temporary allocations need their own owner.
-    fn countAdmittedPromptTokens(self: *Node, model_dir: []const u8, model: *model_manager_mod.LoadedModel, cfg: gpt_model_mod.Config, messages: []const generation.Message, max_tokens: i32) !NativePromptTokenCount {
+    fn countAdmittedPromptTokens(self: *Node, model_dir: []const u8, model: *model_manager_mod.LoadedModel, cfg: gpt_model_mod.Config, messages: []const generation.Message, max_tokens: i32, control: InferenceExecutionControl) !NativePromptTokenCount {
         var preparation = try self.inferencePreparation();
         defer preparation.deinit();
         var binding = try bindPreparationModelResidency(&preparation, model);
         defer if (binding) |*held| held.deinit();
-        return countPromptTokens(preparation.allocator(), model_dir, model, cfg, messages, max_tokens, false, false) catch |err|
+        return countPromptTokens(preparation.allocator(), model_dir, model, cfg, messages, max_tokens, false, false, control) catch |err|
             if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
     }
 
@@ -6521,7 +6523,7 @@ pub const Node = struct {
             self.defaultGenerationLimits(budget_backend_class),
         ));
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-        const prompt_estimate = countPromptTokens(preparation_allocator, model_path, model, gpt_config, messages, max_tokens, preflight.enable_thinking, preflight.grammar != null) catch |err|
+        const prompt_estimate = countPromptTokens(preparation_allocator, model_path, model, gpt_config, messages, max_tokens, preflight.enable_thinking, preflight.grammar != null, execution_control) catch |err|
             return if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
         const prompt_tokens = prompt_estimate.token_count;
         try validateGenerateExecutorInvocation(executor_contract, .{
@@ -9491,7 +9493,7 @@ pub const Node = struct {
             qwen3vl_projector.supportsResidentVisionBudget(cfg) and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_RESIDENT_VISION_BUDGET");
         const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend);
         const messages = [_]generation.Message{.{ .role = "user", .content = prompt, .image_bytes = &.{image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = prompt } } }};
-        const estimate = try self.countAdmittedPromptTokens(model_path, model, cfg, &messages, max_tokens);
+        const estimate = try self.countAdmittedPromptTokens(model_path, model, cfg, &messages, max_tokens, control);
         try validateMeasuredReadPrompt(try resolvedInferenceExecutorContract(self, "read", &model.manifest), estimate.token_count, @intCast(max_tokens));
         const limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(model.session, self.defaultGenerationLimits(.gpu)));
         var local_budget = runtime.tier.memory.RunBudget.init(limits);
@@ -9974,7 +9976,7 @@ pub const Node = struct {
         for (items, tasks) |item, *task| {
             const payload = item.payloadAs(LightOnReadPayload);
             const messages = [_]generation.Message{.{ .role = "user", .content = payload.prompt, .image_bytes = &.{payload.image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = payload.prompt } } }};
-            const estimate = try self.countAdmittedPromptTokens(payload.model_path, model, cfg, &messages, payload.max_tokens);
+            const estimate = try self.countAdmittedPromptTokens(payload.model_path, model, cfg, &messages, payload.max_tokens, control);
             try validateMeasuredReadPrompt(try resolvedInferenceExecutorContract(self, "read", &model.manifest), estimate.token_count, @intCast(payload.max_tokens));
             // countPromptTokens owns no retained encode; it only returns shape.
             const components = [_]runtime.tier.memory.GptGenerationBudgetComponent{.{ .backend = backend, .kv_dtype = kv_dtype, .config = cfg, .workspace_capacity = model.session.generationWorkspaceCapacity() }};
@@ -14379,6 +14381,7 @@ pub const Node = struct {
         enable_thinking: ?bool,
         has_grammar: bool,
         out_estimate: ?*?NativePromptEstimate,
+        control: InferenceExecutionControl,
     ) !usize {
         _ = self;
         var prompt = if (model.chat_tmpl) |ct|
@@ -14392,12 +14395,13 @@ pub const Node = struct {
             allocator.free(prompt);
             prompt = expanded;
         }
-        const media_admission = try generation.nativeGenerationMediaAdmissionForBackend(
+        const media_admission = try generation.nativeGenerationMediaAdmissionControlled(
             allocator,
             model_dir,
             messages,
             gpt_config,
             if (model.session.backend() == .cuda) .cuda else .generic,
+            control,
         );
         const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(messages, gpt_config);
         const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
@@ -17122,7 +17126,9 @@ pub const Node = struct {
             config.enable_thinking,
             config.grammar != null,
             &prompt_estimate,
+            execution_control,
         ) catch |err| {
+            if (err == error.Cancelled or err == error.Canceled or err == error.Timeout or err == error.DeadlineExceeded) return inferenceFailureResponse(ctx, err);
             if (err == error.PromptTooLong) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
@@ -19698,7 +19704,9 @@ pub const Node = struct {
                         configs[pos].enable_thinking,
                         configs[pos].grammar != null,
                         &prompt_estimates[idx],
+                        execution_control,
                     ) catch |err| {
+                        if (err == error.Cancelled or err == error.Canceled or err == error.Timeout or err == error.DeadlineExceeded) return inferenceFailureResponse(ctx, err);
                         results[idx].@"error" = if (err == error.PromptTooLong)
                             .{
                                 .code = "INVALID_REQUEST",
@@ -26405,7 +26413,7 @@ pub const Node = struct {
         defer owned.deinit();
         var estimate: ?NativePromptEstimate = null;
         defer if (estimate) |*value| value.deinit();
-        const tokens = try self.estimateNativePromptTokens(ctx.allocator, path, model, cfg, owned.messages, numeric.max_tokens, 0, if (body.chat_template_kwargs) |kwargs| kwargs.enable_thinking else null, false, &estimate);
+        const tokens = try self.estimateNativePromptTokens(ctx.allocator, path, model, cfg, owned.messages, numeric.max_tokens, 0, if (body.chat_template_kwargs) |kwargs| kwargs.enable_thinking else null, false, &estimate, control);
         try control.check();
         const dtype = if (body.cache_dtype) |name| runtime.kv.pool.parseKvDType(name) orelse return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" }) else session_factory.recommendedKvDTypeForSession(model.session, .cuda);
         const cached = if (self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and body.prompt_cache_key != null and body.prompt_cache_key.?.len > 0)
@@ -53408,7 +53416,7 @@ test "reader worker prompt planning admits before execution and refunds denials"
     var model: model_manager_mod.LoadedModel = undefined;
     model.chat_tmpl = null;
     model.session = .{ .ptr = undefined, .vtable = undefined };
-    try std.testing.expectError(error.ResourceLimitExceeded, node.countAdmittedPromptTokens("unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1));
+    try std.testing.expectError(error.ResourceLimitExceeded, node.countAdmittedPromptTokens("unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1, .{}));
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.resource_domain.?.admission.snapshot().hostTotalBytes());
 }
 
@@ -53482,7 +53490,7 @@ test "reader prompt planning includes pinned model residency before formatting" 
         const content = try a.alloc(u8, 16 * 1024);
         defer a.free(content);
         @memset(content, 'x');
-        try std.testing.expectError(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, node.countAdmittedPromptTokens("unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1));
+        try std.testing.expectError(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, node.countAdmittedPromptTokens("unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1, .{}));
     }
 }
 

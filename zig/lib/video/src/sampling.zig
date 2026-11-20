@@ -114,18 +114,36 @@ pub const Timeline = struct {
         return std.math.add(usize, try std.math.mul(usize, count, @sizeOf(Entry)), try std.math.mul(usize, base, 2 * @sizeOf(i128)));
     }
     pub fn init(a: std.mem.Allocator, pictures: []const TimedPicture, control: media.source.Control) !Timeline {
-        if (pictures.len == 0) return error.EmptyVideo;
-        const entries = try a.alloc(Entry, pictures.len);
+        return initEdited(a, pictures, control, .{});
+    }
+
+    /// Preserve original logical picture IDs for decoding preroll while indexing
+    /// only presentation timestamps inside the container's edit.
+    pub fn initEdited(a: std.mem.Allocator, pictures: []const TimedPicture, control: media.source.Control, edit: media.timeline.Edit) !Timeline {
+        const stop: ?i128 = if (edit.source_duration) |d| @as(i128, edit.source_start) + d else null;
+        const count = if (stop) |bound| blk: {
+            var n: usize = 0;
+            for (pictures, 0..) |pic, i| {
+                if (i % 256 == 0) try control.check();
+                if (pic.pts >= edit.source_start and pic.pts < bound) n += 1;
+            }
+            break :blk n;
+        } else pictures.len;
+        if (count == 0) return error.EmptyVideo;
+        const entries = try a.alloc(Entry, count);
         errdefer a.free(entries);
-        var first = pictures[0].pts;
-        var latest = first;
-        var last: i128 = first;
-        for (pictures, entries, 0..) |picture, *entry, id| {
+        var first: i64 = std.math.maxInt(i64);
+        var latest: i64 = std.math.minInt(i64);
+        var last: i128 = std.math.minInt(i64);
+        var i: usize = 0;
+        for (pictures, 0..) |picture, id| {
             if (id % 256 == 0) try control.check();
+            if (stop) |bound| if (picture.pts < edit.source_start or picture.pts >= bound) continue;
             first = @min(first, picture.pts);
             latest = @max(latest, picture.pts);
             last = @max(last, @as(i128, picture.pts) + (picture.duration orelse 0));
-            entry.* = .{ .id = id, .pts = picture.pts, .stop = if (picture.duration) |d| @as(i128, picture.pts) + d else std.math.maxInt(i128) };
+            entries[i] = .{ .id = id, .pts = picture.pts, .stop = @min(stop orelse std.math.maxInt(i128), if (picture.duration) |d| @as(i128, picture.pts) + d else std.math.maxInt(i128)) };
+            i += 1;
         }
         var previous: ?i64 = null;
         var unknown_tail = false;
@@ -143,13 +161,13 @@ pub const Timeline = struct {
         const base = try std.math.ceilPowerOfTwo(usize, entries.len);
         const maxima = try a.alloc(i128, try std.math.mul(usize, base, 2));
         @memset(maxima, std.math.minInt(i128));
-        for (entries, 0..) |entry, i| maxima[base + i] = entry.stop;
+        for (entries, 0..) |entry, index| maxima[base + index] = entry.stop;
         var node = base;
         while (node > 1) {
             node -= 1;
             maxima[node] = @max(maxima[node * 2], maxima[node * 2 + 1]);
         }
-        return .{ .allocator = a, .entries = entries, .maxima = maxima, .base = base, .first = first, .last = last };
+        return .{ .allocator = a, .entries = entries, .maxima = maxima, .base = base, .first = if (stop != null) edit.source_start else first, .last = stop orelse last };
     }
     pub fn deinit(self: *Timeline) void {
         self.allocator.free(self.entries);
@@ -464,4 +482,15 @@ fn timelineAllocationCheck(a: std.mem.Allocator) !void {
 }
 test "indexed timestamp ownership releases every partial allocation" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, timelineAllocationCheck, .{});
+}
+
+test "source timestamp sampling preserves edit origin and visible logical IDs" {
+    const a = std.testing.allocator;
+    var timeline = try Timeline.initEdited(a, &.{ .{ .pts = 0, .duration = 12 }, .{ .pts = 20, .duration = 4 }, .{ .pts = 12, .duration = 4 }, .{ .pts = 25, .duration = 10 } }, .{}, .{ .source_start = 10, .source_duration = 15 });
+    defer timeline.deinit();
+    try std.testing.expectEqual(@as(i64, 10), timeline.first);
+    try std.testing.expectEqual(@as(i128, 25), timeline.last);
+    const ids = try timeline.select(a, 10, .{ .step_ns = std.time.ns_per_s, .hold = true }, .{}, true);
+    defer a.free(ids);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 1 }, ids);
 }

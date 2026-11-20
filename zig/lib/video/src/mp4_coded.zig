@@ -43,7 +43,7 @@ pub fn intoWebm(a: std.mem.Allocator, reader: *media.mp4.Reader) !media.webm.Rea
     if (reader.track.codec != .av1) return error.UnsupportedVideoCodec;
     if (reader.track.timescale == 0) return error.InvalidTimebase;
     const track = try webmTrack(reader.track);
-    if (reader.packets.len > limits.max_index_bytes / adapted_sample_bytes) return error.ResourceLimitExceeded;
+    if (reader.packets.len > reader.limits.max_index_bytes / adapted_sample_bytes) return error.ResourceLimitExceeded;
     const index_bytes = reader.packets.len * adapted_sample_bytes;
     // The old index remains live throughout translation. Admit this moving
     // overlap before allocation, and retain the replacement's exact charge.

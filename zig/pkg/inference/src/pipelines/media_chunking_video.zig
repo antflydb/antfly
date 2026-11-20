@@ -125,6 +125,7 @@ pub const Owner = struct {
     limits: @import("media_chunk_limits.zig").Limits,
     pub fn init(a: std.mem.Allocator, reader: *media.mp4.Reader, pool: *media.admission.Pool, limits: @import("media_chunk_limits.zig").Limits) !Owner {
         if (reader.packets.len == 0) return error.EmptyVideo;
+        if (reader.packets.len > limits.max_index_packets) return error.ResourceLimitExceeded;
         if (reader.input.identity.len == 0) return error.InvalidVideoReaderSelection;
         var planning = video.h264_pictures.Options.forTrack(reader.packets.len);
         planning.decode.max_dependency_packets = limits.max_dependency_packets;

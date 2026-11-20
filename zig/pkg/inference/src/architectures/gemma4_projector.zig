@@ -370,6 +370,14 @@ pub const PortableVideoFrames = struct {
         @memset(prepared, null);
         return .{ .allocator = allocator, .weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector), .cfg = cfg, .resample = videoResample(cb, cfg), .prepared = prepared };
     }
+    /// Retained CHW frames plus the largest projection batch and patch staging.
+    /// The token bound covers variable presentation geometry within a clip.
+    pub fn pixelWorkingBytes(self: *const PortableVideoFrames) !usize {
+        const patch_area = try std.math.mul(usize, self.cfg.patch_size, self.cfg.patch_size);
+        const frame = try std.math.mul(usize, try std.math.mul(usize, self.cfg.maxPatchCount(), patch_area), 3 * @sizeOf(f32));
+        const batch: usize = @min(self.prepared.len, (ImageBatchOptions{}).max_batch);
+        return std.math.mul(usize, frame, self.prepared.len + 2 * batch);
+    }
     pub fn deinit(self: *PortableVideoFrames) void {
         self.resize.deinit();
         for (self.prepared) |item| if (item) |value| value.deinit();
@@ -406,6 +414,20 @@ pub const PortableVideoFrames = struct {
         return .{ .images = images, .timestamps_us = timestamps, .stats = .{ .decoder_source_bytes = decoder_source_bytes, .selected_frames = kept } };
     }
 };
+test "gemma4 video pixel working set follows projector patch dimensions and frame count" {
+    var frames: PortableVideoFrames = undefined;
+    frames.cfg = embeddingGemma2ImageConfig();
+    frames.cfg.max_image_tokens = video_tokens_per_frame;
+    frames.cfg.patch_size = 64;
+    frames.cfg.spatial_merge_size = 3;
+    var slots: [32]?PreparedImage = @splat(null);
+    frames.prepared = &slots;
+    const per_frame: usize = 70 * 3 * 3 * 64 * 64 * 3 * @sizeOf(f32);
+    try std.testing.expectEqual(40 * per_frame, try frames.pixelWorkingBytes());
+    frames.prepared = slots[0..1];
+    try std.testing.expectEqual(3 * per_frame, try frames.pixelWorkingBytes());
+}
+
 fn portableFrameGeometry(cfg: Config, frame: image.ImageU8, presentation_width: u32, presentation_height: u32) Geometry {
     if (presentation_width == 0 or presentation_height == 0) return targetGeometry(cfg, frame.width, frame.height);
     return targetGeometry(cfg, presentation_width, presentation_height);

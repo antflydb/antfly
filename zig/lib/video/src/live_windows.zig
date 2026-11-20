@@ -177,7 +177,7 @@ fn sameTrack(left: media.mp4.Track, right: media.mp4.Track) bool {
     r.avcc = &.{};
     l.color_info = &.{};
     r.color_info = &.{};
-    return std.meta.eql(l, r) and std.mem.eql(u8, left.avcc, right.avcc) and std.mem.eql(u8, left.color_info, right.color_info);
+    return std.meta.eql(l, r) and ((left.avcc.ptr == right.avcc.ptr and left.avcc.len == right.avcc.len) or std.mem.eql(u8, left.avcc, right.avcc)) and std.mem.eql(u8, left.color_info, right.color_info);
 }
 /// An independently owned source view; payload storage stays in retained immutable
 /// snapshots. Source counters and packet metadata are private to each consumer.

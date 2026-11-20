@@ -248,6 +248,18 @@ pub fn nativeGenerationMediaAdmissionForBackend(
     config: gpt_mod.Config,
     backend: qwen3vl_projector.AdmissionBackend,
 ) !NativeGenerationMediaAdmission {
+    return nativeGenerationMediaAdmissionControlled(allocator, model_dir, messages, config, backend, .{});
+}
+
+pub fn nativeGenerationMediaAdmissionControlled(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    messages: []const Message,
+    config: gpt_mod.Config,
+    backend: qwen3vl_projector.AdmissionBackend,
+    control: InferenceExecutionControl,
+) !NativeGenerationMediaAdmission {
+    try control.check();
     if (config.family == .qwen3_vl or config.hasQwen35VisionArchitectureContract()) {
         const images = try collectImagesInPromptOrder(allocator, messages);
         defer allocator.free(images);
@@ -280,12 +292,12 @@ pub fn nativeGenerationMediaAdmissionForBackend(
         admission.deferred_video = true;
         // Malformed inputs retain the decoder's detailed diagnostic. The
         // scheduling estimate is permitted to be conservative in that case.
-        admission.token_allowance +|= gemma4_video.promptAllowance(allocator, bytes) catch |err| switch (err) {
-            error.OutOfMemory, error.VideoInputTooLarge => return err,
+        admission.token_allowance +|= gemma4_video.promptAllowance(allocator, bytes, control) catch |err| switch (err) {
+            error.OutOfMemory, error.VideoInputTooLarge, error.Cancelled, error.Canceled, error.Timeout, error.DeadlineExceeded => return err,
             else => gemma4_video.token_allowance,
         };
         if (backend == .cuda) continue;
-        const reserved = gemma4_video.reservation(allocator, bytes);
+        const reserved = try gemma4_video.reservationControlled(bytes, control);
         admission.host_scratch_bytes = reserved.host_bytes;
         admission.backend_scratch_bytes = reserved.surface_bytes;
     };
