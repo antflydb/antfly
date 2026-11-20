@@ -3774,7 +3774,7 @@ test "index alias decoder floor composes with table features and preserves CAS h
     const plain: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs" };
     const floor = metadata_topology_protocol.index_aliases_version;
     try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = aliases })));
-    const envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .topology = .{ .create = .{ .table = aliases } } }, .{});
+    const envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .mutation = .{ .kind = "table" }, .topology = .{ .create = .{ .table = aliases } } }, .{});
     defer std.testing.allocator.free(envelope);
     try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = envelope })));
     try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = aliases, .replacement = plain } })));
@@ -3803,10 +3803,10 @@ test "index alias and pinned embedding metadata changes enforce their own decode
     const pin_floor = metadata_topology_protocol.pinned_embedding_revision_version;
     try std.testing.expectEqual(pin_floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = pinned }));
     try std.testing.expectEqual(pin_floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = pinned, .replacement = plain } }));
-    const pin_envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .topology = .{ .create = .{ .table = pinned } } }, .{});
+    const pin_envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .mutation = .{ .kind = "table" }, .topology = .{ .create = .{ .table = pinned } } }, .{});
     defer std.testing.allocator.free(pin_envelope);
     try std.testing.expectEqual(pin_floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = pin_envelope }));
-    const plan = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .targets = .{.{ .table = pinned }} });
+    const plan = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .targets = .{.{ .table = pinned }} }, .{});
     defer std.testing.allocator.free(plan);
     try std.testing.expectEqual(pin_floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .create_restore_job_with_staging = .{ .key = "job", .value = "{}", .plan_json = plan } }));
 }

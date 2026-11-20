@@ -23714,7 +23714,8 @@ pub const RaftApplyStore = struct {
                 var added_range_group_ids = std.ArrayListUnmanaged(u64).empty;
                 defer added_range_group_ids.deinit(self.alloc);
                 if (encoded_table == null) {
-                    try self.putTableRecordTxnModeRaw(txn, group_id, table_key, admitted, false);
+                    if (!try admitIndexAliasTableTxn(self, txn, group_id, admitted)) return;
+                    if (!try self.writeAdmittedTableRecordTxn(txn, group_id, table_key, admitted, false)) return;
                     changed = true;
                 }
                 // Atomic topology commands publish one table-scoped catalog
@@ -28775,13 +28776,37 @@ test "index alias Raft admission permits rollout and fences returning legacy sto
         \\{"vector":{"type":"embeddings","embedder":{"provider":"antfly","model":"embed","model_revision":"1111111111111111111111111111111111111111111111111111111111111111"}}}
     ;
     try std.testing.expect(!try admitIndexAliasTableTxn(&store, &txn, group, pinned));
+    const initial_range: metadata.RangeRecord = .{
+        .table_id = pinned.table_id,
+        .group_id = 301,
+        .range_id = 301,
+        .doc_identity_shard_id = 301,
+        .doc_identity_range_id = 301,
+        .start_key = "",
+    };
+    try store.applyTableTopologyMutationTxn(&txn, group, .{ .create = .{
+        .table = pinned,
+        .expected_transition_generation = 0,
+        .ranges = &.{initial_range},
+    } });
+    try std.testing.expect((try RaftApplyStore.stagingGet(&txn, try tableKeyForGroup(&buf, group, pinned.table_id))) == null);
+    try std.testing.expect((try RaftApplyStore.stagingGet(&txn, try rangeKeyForGroup(&buf, group, initial_range.group_id))) == null);
+    try std.testing.expect((try RaftApplyStore.stagingGet(&txn, try tableNameIndexKey(&buf, group, pinned.name))) == null);
+    const rejected_fence = try store.loadTableTransitionFenceTxn(&txn, group, pinned.table_id);
+    try std.testing.expectEqual(0, rejected_fence.generation);
+    try std.testing.expectEqual(0, rejected_fence.range_membership.count);
     var pin_capable = modern;
     pin_capable.artifact_sources_protocol_version = metadata_table_manager.pinned_embedding_store_protocol;
     const pin_capable_bytes = try encodeStoreRecord(a, pin_capable);
     defer a.free(pin_capable_bytes);
     try txn.put(try storeKeyForGroup(&buf, group, pin_capable.store_id), pin_capable_bytes);
     try std.testing.expect(try admitIndexAliasTableTxn(&store, &txn, group, pinned));
-    try store.putTableRecordTxnModeRaw(&txn, group, try tableKeyForGroup(&buf, group, pinned.table_id), pinned, false);
+    try store.applyTableTopologyMutationTxn(&txn, group, .{ .create = .{
+        .table = pinned,
+        .expected_transition_generation = 0,
+        .ranges = &.{initial_range},
+    } });
+    try std.testing.expect((try RaftApplyStore.stagingGet(&txn, try rangeKeyForGroup(&buf, group, initial_range.group_id))) != null);
     try std.testing.expect(!try admitIndexAliasStoreTxn(&store, &txn, group, modern));
     try std.testing.expect(try admitIndexAliasStoreTxn(&store, &txn, group, pin_capable));
     var changed = pinned;

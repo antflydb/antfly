@@ -36290,27 +36290,12 @@ pub fn onlineBaseGeneratedVectorConfig(alloc: Allocator, cfg: types.IndexConfig,
         try parseSparseGeneratorConfig(alloc, cfg.config_json);
     defer if (generator) |value| value.deinit(alloc);
     if (generator) |value| {
-        if (generatorHasChunking(value) or value.embedding_input != .text or
-            (value.source_field.len == 0 and value.source_template.len == 0)) return false;
+        if (!supportsOnlineBaseGenerator(value)) return false;
     }
     if (cfg.kind == .dense_vector) {
         const config = try parseDenseConfig(alloc, cfg.config_json);
         defer config.deinit(alloc);
-        if (config.external) return false;
-        if (generator) |value| {
-            // Managed translation also names the generator's own output at
-            // index scope. That selector is redundant, not another producer.
-            const output = value.embedding_name orelse cfg.name;
-            return config.embedding_names.len == 0 and (if (config.embedding_name) |name| std.mem.eql(u8, name, output) else true);
-        }
-        const names: []const []const u8 = if (config.embedding_names.len != 0) config.embedding_names else if (config.embedding_name) |name| &.{name} else return false;
-        for (names) |name| {
-            const found = for (producers) |producer| {
-                if (std.mem.eql(u8, producer.name, name)) break onlineBaseEmbeddingProducer(producer) and producer.expected_dims == config.dims;
-            } else false;
-            if (!found) return false;
-        }
-        return true;
+        return onlineBaseDenseVectorConfig(cfg.name, config, generator, producers);
     }
     const config = try parseSparseConfig(alloc, cfg.config_json);
     defer config.deinit(alloc);
@@ -36329,6 +36314,63 @@ pub fn onlineBaseGeneratedVectorConfig(alloc: Allocator, cfg: types.IndexConfig,
         if (!found) return false;
     }
     return true;
+}
+
+fn onlineBaseDenseVectorConfig(index_name: []const u8, config: DenseConfig, generator: ?GeneratorConfig, producers: []const enrichment_catalog.EnrichmentConfig) bool {
+    if (config.external) return false;
+    if (generator) |value| {
+        // Managed translation also names the generator's own output at
+        // index scope. That selector is redundant, not another producer.
+        const output = value.embedding_name orelse index_name;
+        return config.embedding_names.len == 0 and (if (config.embedding_name) |name| std.mem.eql(u8, name, output) else true);
+    }
+    const names: []const []const u8 = if (config.embedding_names.len != 0) config.embedding_names else if (config.embedding_name) |name| &.{name} else return false;
+    for (names) |name| {
+        const found = for (producers) |producer| {
+            if (std.mem.eql(u8, producer.name, name)) break onlineBaseEmbeddingProducer(producer) and producer.expected_dims == config.dims;
+        } else false;
+        if (!found) return false;
+    }
+    return true;
+}
+
+pub const DenseBaseVectorPublicationConfig = struct {
+    dims: u32,
+    model_revision: ?[32]u8,
+    artifact_names: [][]u8,
+};
+
+pub fn denseBaseVectorPublicationConfig(
+    alloc: Allocator,
+    cfg: types.IndexConfig,
+    expected_dims: ?u32,
+    producer_catalog: ?[]const enrichment_catalog.EnrichmentConfig,
+) !?DenseBaseVectorPublicationConfig {
+    if (cfg.kind != .dense_vector) return error.InvalidIndexConfiguration;
+    const dense = try parseDenseConfig(alloc, cfg.config_json);
+    defer dense.deinit(alloc);
+    if (expected_dims) |dims| if (dense.dims != dims) return null;
+    if (producer_catalog != null and dense.external) return error.OnlineMergeArtifactTailsUnsupported;
+    const generator = try parseDenseGeneratorConfig(alloc, cfg.config_json);
+    defer if (generator) |value| value.deinit(alloc);
+    if (producer_catalog) |producers| {
+        if (generator) |value| {
+            if (!supportsOnlineBaseGenerator(value)) return error.OnlineMergeArtifactTailsUnsupported;
+        }
+        if (!onlineBaseDenseVectorConfig(cfg.name, dense, generator, producers)) return error.OnlineMergeArtifactTailsUnsupported;
+    }
+    const default_name = denseBaseVectorArtifactName(cfg.name, dense, generator);
+    const names: []const []const u8 = if (dense.embedding_names.len != 0) dense.embedding_names else &.{default_name};
+    return .{
+        .dims = dense.dims,
+        .model_revision = dense.model_revision,
+        .artifact_names = try cloneOwnedStrings(alloc, names),
+    };
+}
+
+fn supportsOnlineBaseGenerator(generator: GeneratorConfig) bool {
+    return !generatorHasChunking(generator) and generator.embedding_input == .text and
+        (generator.source_field.len != 0 or generator.source_template.len != 0);
 }
 
 /// Match a chunk vector's semantic source against immutable catalog bytes.
@@ -36471,13 +36513,14 @@ pub fn denseConfigArtifactNamesAlloc(alloc: Allocator, cfg: types.IndexConfig) !
     defer dense_cfg.deinit(alloc);
     const generator = try parseDenseGeneratorConfig(alloc, cfg.config_json);
     defer if (generator) |value| value.deinit(alloc);
-    const source_names: []const []const u8 = if (dense_cfg.embedding_names.len > 0)
-        dense_cfg.embedding_names
-    else if (generator) |value|
-        &.{value.embedding_name orelse cfg.name}
-    else
-        &.{dense_cfg.embedding_name orelse cfg.name};
+    const default_name = denseBaseVectorArtifactName(cfg.name, dense_cfg, generator);
+    const source_names: []const []const u8 = if (dense_cfg.embedding_names.len != 0) dense_cfg.embedding_names else &.{default_name};
     return try cloneOwnedStrings(alloc, source_names);
+}
+
+fn denseBaseVectorArtifactName(index_name: []const u8, dense: DenseConfig, generator: ?GeneratorConfig) []const u8 {
+    if (generator) |value| return value.embedding_name orelse index_name;
+    return dense.embedding_name orelse index_name;
 }
 
 const TextConfig = struct {

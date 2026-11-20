@@ -10494,7 +10494,7 @@ pub const ModelManager = struct {
         try control.check();
         if (!std.meta.eql(manifest.managed_publication, artifacts.publication)) return error.ModelArtifactsChanging;
         if (!hasCompleteChecksums(artifacts)) return result;
-        if (try artifacts.hasRejectedChecksum(&self.verified_artifacts)) return error.ChecksumMismatch;
+        if (try artifacts.hasRejectedChecksum(&self.verified_artifacts, control)) return error.ChecksumMismatch;
         const receipt = &artifacts.receipt.?;
         const slot = &self.declared_receipt_revisions[receipt.publication_generation[0] % self.declared_receipt_revisions.len];
         const declared = try slot.get(self.allocator, artifacts.io, receipt, control);

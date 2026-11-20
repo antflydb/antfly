@@ -1139,26 +1139,37 @@ pub fn prepareBaseVectors(alloc: std.mem.Allocator, command: Command, catalogs: 
     const configs = try manager.deserializeCatalog(scratch, catalogs.indexes);
     const producer_catalog = @import("catalog/enrichment_catalog.zig");
     const producers = if (catalogs.enrichments.len == 0) try scratch.alloc(producer_catalog.EnrichmentConfig, 0) else try producer_catalog.deserializeCatalog(scratch, catalogs.enrichments);
-    const producer = for (configs) |config| {
-        if (std.mem.eql(u8, config.name, command.producer_name)) break config;
+    const producer_index = for (configs, 0..) |config, i| {
+        if (std.mem.eql(u8, config.name, command.producer_name)) break i;
     } else return error.EnrichmentSourceChanged;
+    const producer = configs[producer_index];
     if (keys.derivedCoverageGenerationForConfig(producer.coverage_generation, producer.config_json) != command.producer_generation or
         (producer.kind != .dense_vector and producer.kind != .sparse_vector)) return error.EnrichmentSourceChanged;
-    if (!try manager.onlineBaseGeneratedVectorConfig(scratch, producer, producers)) return error.OnlineMergeArtifactTailsUnsupported;
-    const producer_names = try manager.baseVectorArtifactNamesAlloc(scratch, producer);
+    const dense_producer = if (producer.kind == .dense_vector)
+        (try manager.denseBaseVectorPublicationConfig(scratch, producer, null, producers)).?
+    else
+        null;
+    const producer_names = if (dense_producer) |dense| dense.artifact_names else blk: {
+        if (!try manager.onlineBaseGeneratedVectorConfig(scratch, producer, producers)) return error.OnlineMergeArtifactTailsUnsupported;
+        break :blk try manager.baseVectorArtifactNamesAlloc(scratch, producer);
+    };
     const name = command.producer_artifact_name;
     const authorized = for (producer_names) |candidate| {
         if (std.mem.eql(u8, candidate, name)) break true;
     } else false;
     if (!authorized) return error.InvalidBatchRequest;
-    const dims = if (producer.kind == .dense_vector) try manager.denseConfigDimensions(scratch, producer) else 0;
-    const required_revision = if (producer.kind == .dense_vector) try manager.denseConfigModelRevision(scratch, producer) else null;
+    const dims = if (dense_producer) |dense| dense.dims else 0;
+    const required_revision = if (dense_producer) |dense| dense.model_revision else null;
     const Consumer = struct { name: []const u8, generation: u64, artifact_names: []const []const u8 };
     var consumers: std.ArrayList(Consumer) = .empty;
-    for (configs) |config| {
+    for (configs, 0..) |config, i| {
         if (config.kind != producer.kind) continue;
-        if (config.kind == .dense_vector and try manager.denseConfigDimensions(scratch, config) != dims) continue;
-        const names = try manager.baseVectorArtifactNamesAlloc(scratch, config);
+        const names = if (i == producer_index)
+            producer_names
+        else if (config.kind == .dense_vector) blk: {
+            const dense = (try manager.denseBaseVectorPublicationConfig(scratch, config, dims, null)) orelse continue;
+            break :blk dense.artifact_names;
+        } else try manager.baseVectorArtifactNamesAlloc(scratch, config);
         const consumes = for (names) |candidate| {
             if (std.mem.eql(u8, candidate, name)) break true;
         } else false;
