@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -126,31 +125,41 @@ def format_staged(root, format_blob=None):
     def git(*args, data=None, env=None):
         return run(["git", "--literal-pathspecs", *args], cwd=root, data=data, env=env)
 
-    paths = git(
-        "diff", "--cached", "--no-color", "--name-only", "--diff-filter=ACMR", "-z"
-    ).split(b"\0")
-    paths = [os.fsdecode(path) for path in paths if path]
-    selected = [(path, formatter(root, path)) for path in paths]
-    selected = [(path, command) for path, command in selected if command]
-    if not selected:
-        return
-
     # Work only against a private index until every formatter has succeeded.
     # Git generates the patch, so renames, quoting, file modes, and new files
     # keep their normal Git semantics. Never restage the working-tree file.
     with tempfile.TemporaryDirectory(prefix="antfly-format-") as temp:
         temporary_index = Path(temp) / "index"
         env = {**os.environ, "GIT_INDEX_FILE": str(temporary_index)}
-        # `write-tree` refreshes the index it reads, which takes the real
-        # index's lock; reading a private copy of it never contends.
+        # One snapshot of the staged state: the path list, the input blobs
+        # and the patch baseline all come from this private copy, so a
+        # concurrent `git add` cannot mix two versions of the index. Reading
+        # a copy also never takes the real index's lock (`write-tree`
+        # refreshes the index it reads).
         real_index = Path(os.fsdecode(git("rev-parse", "--git-path", "index").strip()))
         if not real_index.is_absolute():
             real_index = Path(root) / real_index
-        shutil.copyfile(real_index, temporary_index)
+        snapshot = real_index.read_bytes()
+        temporary_index.write_bytes(snapshot)
+        paths = git(
+            "diff",
+            "--cached",
+            "--no-color",
+            "--name-only",
+            "--diff-filter=ACMR",
+            "-z",
+            env=env,
+        ).split(b"\0")
+        paths = [os.fsdecode(path) for path in paths if path]
+        selected = [(path, formatter(root, path)) for path in paths]
+        selected = [(path, command) for path, command in selected if command]
+        if not selected:
+            return
         before = git("write-tree", env=env).strip().decode()
-        git("read-tree", before, env=env)
         for path, (cwd, command) in selected:
-            entry = git("ls-files", "--stage", "-z", "--", path).split(b"\0")[0]
+            entry = git("ls-files", "--stage", "-z", "--", path, env=env).split(b"\0")[
+                0
+            ]
             mode, blob, stage = entry.split(b"\t", 1)[0].split()
             if stage != b"0" or mode not in (b"100644", b"100755"):
                 raise HookError(f"Cannot format non-regular or unmerged file: {path}")
@@ -182,6 +191,11 @@ def format_staged(root, format_blob=None):
         )
         if not patch:
             return
+        if real_index.read_bytes() != snapshot:
+            raise HookError(
+                "The index changed while formatting. No edits were applied; "
+                "commit again."
+            )
         # A formatting hunk that overlaps an unstaged edit needs manual
         # resolution. Reject it before changing either the index or files.
         try:

@@ -1631,6 +1631,11 @@ pub const DocStore = struct {
         return self.runtime_store.capabilities();
     }
 
+    /// See `backend_types.Capabilities.shared_replay_lane`.
+    pub fn sharedReplayLane(self: *DocStore) bool {
+        return self.backendCapabilities().shared_replay_lane;
+    }
+
     /// Preserve transaction coordination when this document facade wraps an
     /// existing runtime store, including stores whose callbacks hold a gate.
     pub fn writeSerialization(self: *const DocStore) backend_erased.WriteSerialization {
@@ -3094,6 +3099,11 @@ pub const DocStore = struct {
 
     pub fn latestReplaySequenceForOrdinal(self: *DocStore, kind_ordinal: u8, fallback_last: u64) !u64 {
         if (!(try self.hasReplayEntries())) return fallback_last;
+        // A shared-lane journal's producer head is the only live answer: a
+        // per-hint marker there is a leftover of the layout before the
+        // upgrade, frozen at whatever it last held, and would report a
+        // target behind the hint's newer writes.
+        if (self.sharedReplayLane()) return @max(self.lastReplaySequence(fallback_last), fallback_last);
 
         var txn = try self.beginProbeTxn();
         defer txn.abort();

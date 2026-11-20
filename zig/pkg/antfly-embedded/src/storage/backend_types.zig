@@ -250,6 +250,11 @@ pub const Capabilities = struct {
     write_batches: WriteBatchMode = .atomic,
     single_writer: bool = true,
     read_snapshots: ReadVisibility = .snapshot,
+    /// The replay journal keeps one shared lane: per-hint lanes and their
+    /// latest-sequence markers are filtered views of it (or, after an
+    /// upgrade, stale leftovers of an older layout), never the source of
+    /// truth. Consumers read the shared lane and the producer head.
+    shared_replay_lane: bool = false,
 };
 
 /// Transitional alias while higher-level code migrates terminology away from

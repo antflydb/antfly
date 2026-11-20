@@ -77,6 +77,22 @@ class StagedFormattingTests(unittest.TestCase):
         staged = self.git("show", ":example.py")
         self.assertTrue(staged.startswith(b"value = 1\n"))
 
+    def test_index_changed_while_formatting_applies_nothing(self):
+        self.base()
+        self.write("example.py", b"value=1\n" + b"# context\n" * 12 + b"other = 0\n")
+        self.git("add", "--", "example.py")
+        staged_before = self.git("show", ":example.py")
+
+        def format_and_race(path, data):
+            # Another process stages a different file meanwhile.
+            self.write("other.py", b"x = 1\n")
+            self.git("add", "--", "other.py")
+            return self.format(path, data)
+
+        with self.assertRaises(format_staged.HookError):
+            format_staged.format_staged(self.root, format_and_race)
+        self.assertEqual(staged_before, self.git("show", ":example.py"))
+
     def test_partial_staging_preserves_unstaged_hunk(self):
         original = self.base()
         staged = original.replace(b"value = 0", b"value=1")
