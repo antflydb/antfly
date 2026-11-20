@@ -8614,6 +8614,12 @@ pub const NativeFile = struct {
             if (catch_up.outcome.valid_count != 0) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
             shared.noteApplied(catch_up.outcome.last_sequence orelse 0);
         }
+        // An unbounded scan read whatever the log holds, including a record
+        // a previous writer appended and then failed to sync (its rollback
+        // can leave the bytes). The fence (or the absence of any writer)
+        // means nothing appends now, so make what was read durable before
+        // serving it: this completes the recovery barrier a writer would.
+        if (replay_ceiling == null and !holds_authority and !self.no_sync) try self.file.sync(io);
         // Only an opener with writer authority publishes the watermark. A
         // read-only scan can finish behind a live writer and would move it
         // backwards. The scan may also have accepted records a writer

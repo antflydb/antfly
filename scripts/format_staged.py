@@ -208,11 +208,60 @@ def format_staged(root, format_blob=None):
             ) from error
         git("apply", "--whitespace=nowarn", data=patch)
         try:
-            git("apply", "--cached", "--whitespace=nowarn", data=patch)
+            update_index_under_lock(git, real_index, snapshot, patch)
         except HookError:
             git("apply", "--reverse", "--whitespace=nowarn", data=patch)
             raise
         print("Formatted staged files; unstaged edits remain unstaged.")
+
+
+def update_index_under_lock(git, real_index, snapshot, patch):
+    """Stage the formatting patch with Git's own index lock held throughout.
+
+    The comparison against the snapshot and the staged update share one
+    `index.lock`, Git's update protocol: build the new index inside the lock
+    file and rename it into place. No concurrent `git add` can land between
+    the check and the update, as one could between separate Git commands.
+    """
+    lock_path = real_index.with_name(real_index.name + ".lock")
+    deadline = time.monotonic() + INDEX_LOCK_RETRY_SECONDS
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise HookError(
+                    "The index is locked by another Git process. No edits were applied."
+                )
+            time.sleep(INDEX_LOCK_RETRY_INTERVAL)
+    try:
+        if real_index.read_bytes() != snapshot:
+            raise HookError(
+                "The index changed while formatting. No edits were applied; "
+                "commit again."
+            )
+        with os.fdopen(fd, "wb") as lock_file:
+            fd = None
+            lock_file.write(snapshot)
+        # The lock file is the index being built; Git locks it as its own
+        # `<lock>.lock`, which nothing else contends for.
+        git(
+            "apply",
+            "--cached",
+            "--whitespace=nowarn",
+            data=patch,
+            env={**os.environ, "GIT_INDEX_FILE": str(lock_path)},
+        )
+        os.replace(lock_path, real_index)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(lock_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def main():

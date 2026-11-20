@@ -740,7 +740,10 @@ fn primaryStoreForEachMatchingRecord(
     // A batch that ran out of scan budget before any match still made
     // progress: report where it stopped instead of rescanning the same
     // window through the fallback.
-    if (replay_stats.matched_entries == 0 and !replay_stats.scan_budget_exhausted) {
+    // A shared-lane backend's hint lane already is the shared lane,
+    // filtered: an empty batch is the answer, not a reason to scan the same
+    // journal range again.
+    if (replay_stats.matched_entries == 0 and !replay_stats.scan_budget_exhausted and !store.sharedReplayLane()) {
         return try primaryStoreForEachMatchingRecordFallbackAll(
             store,
             from_sequence,
