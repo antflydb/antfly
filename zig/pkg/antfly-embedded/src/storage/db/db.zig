@@ -147895,7 +147895,7 @@ test "db graph endpoint cleanup graph-only prepares reserve producing document r
         defer db.close();
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
         try db.batch(.{ .activate_range_tracking = true });
-        try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{}" }, .{ .key = "b", .value = "{}" } } });
+        try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{}" }, .{ .key = "b", .value = "{}" }, .{ .key = "fact", .value = "{}" } } });
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
         generation = (try tracking.generation(&read, tracking.bucket("fact"))).?;
