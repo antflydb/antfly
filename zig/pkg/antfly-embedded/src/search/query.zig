@@ -1822,6 +1822,7 @@ pub const RangeFilter = struct {
     min_val: ?f64 = null,
     max_val: ?f64 = null,
     exact_bounds: ?ExactBounds = null,
+    require_numeric_column: bool = false,
     inclusive_min: bool = true,
     inclusive_max: bool = false,
     boost: f32 = 1.0,
@@ -1829,7 +1830,10 @@ pub const RangeFilter = struct {
 
     pub fn execute(self: RangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
         try self.control.check();
-        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return roaring.RoaringBitmap.init(alloc);
+        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse {
+            if (self.require_numeric_column) return error.InvalidSegment;
+            return roaring.RoaringBitmap.init(alloc);
+        };
         defer reader.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
@@ -1837,7 +1841,10 @@ pub const RangeFilter = struct {
 
         switch (reader.value_type) {
             .u64_val, .i64_val, .f64_val, .numeric_val => {},
-            else => return result,
+            else => {
+                if (self.require_numeric_column) return error.InvalidSegment;
+                return result;
+            },
         }
         var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
         defer cursor.deinit();
@@ -1860,7 +1867,10 @@ pub const RangeFilter = struct {
     fn executeWithScope(self: RangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, scope: *const roaring.RoaringBitmap) FilterError!roaring.RoaringBitmap {
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
-        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return result;
+        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse {
+            if (self.require_numeric_column) return error.InvalidSegment;
+            return result;
+        };
         defer reader.deinit();
         if (scope.cardinality() > 1) reader.enableOptionalPointCache(64 * 1024);
         var docs = scope.iterator();
@@ -1877,7 +1887,10 @@ pub const RangeFilter = struct {
             .i64_val => .{ .i64_val = (try reader.getI64(doc)) orelse return false },
             .u64_val => .{ .u64_val = (try reader.getU64(doc)) orelse return false },
             .numeric_val => (try reader.getNumeric(doc)) orelse return false,
-            else => return false,
+            else => {
+                if (self.require_numeric_column) return error.InvalidSegment;
+                return false;
+            },
         };
         return self.matchesNumeric(value);
     }

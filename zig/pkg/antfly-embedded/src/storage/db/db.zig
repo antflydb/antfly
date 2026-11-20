@@ -48876,12 +48876,12 @@ pub const DB = struct {
     ) anyerror!db_query_search.MatchAllCandidates {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         var identity_scan = PrimaryMatchAllIdentityScan{ .db = self, .req = req };
-        const exact_scope = options.exact_primary_keys != null or options.exact_primary_ordinals != null;
+        const identity_scope = options.exact_primary_keys != null or options.exact_primary_ordinals != null;
         return try db_query_search.collectMatchAllCandidatesWithOptions(alloc, req, .{
             .ctx = self,
             .primary_key_range = self.core.byteRange(),
-            .scan_ids_ctx = if (exact_scope) &identity_scan else null,
-            .scan_ids = if (exact_scope) PrimaryMatchAllIdentityScan.scan else null,
+            .scan_ids_ctx = if (identity_scope) &identity_scan else null,
+            .scan_primary_ids = if (identity_scope) PrimaryMatchAllIdentityScan.scan else null,
             .scan_store_range = scanStoreRangeCallback,
             .scan_store_range_with_context = scanStoreRangeWithContextCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
@@ -48906,7 +48906,7 @@ pub const DB = struct {
             .ctx = self,
             .primary_key_range = self.core.byteRange(),
             .scan_ids_ctx = &identity_scan,
-            .scan_ids = PrimaryMatchAllIdentityScan.scan,
+            .scan_primary_ids = PrimaryMatchAllIdentityScan.scan,
             .scan_store_range = scanStoreRangeCallback,
             .scan_store_range_with_context = scanStoreRangeWithContextCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
@@ -48923,7 +48923,7 @@ pub const DB = struct {
         db: *DB,
         req: types.SearchRequest,
         visitor_ctx: ?*anyopaque = null,
-        visitor: *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction = undefined,
+        visitor: db_query_search.PrimaryCandidateVisitor = undefined,
         alloc: Allocator = undefined,
         exceptional: []const []const u8 = &.{},
         exceptional_index: usize = 0,
@@ -48931,7 +48931,7 @@ pub const DB = struct {
         stopped: bool = false,
         observed_rows: ?*usize = null,
 
-        fn scan(raw: ?*anyopaque, alloc: Allocator, options: db_query_search.MatchAllCandidateCollectOptions, visitor_ctx: ?*anyopaque, visitor: *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction) !void {
+        fn scan(raw: ?*anyopaque, alloc: Allocator, options: db_query_search.MatchAllCandidateCollectOptions, visitor_ctx: ?*anyopaque, visitor: db_query_search.PrimaryCandidateVisitor) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.alloc = alloc;
             self.visitor = visitor;
@@ -49018,9 +49018,9 @@ pub const DB = struct {
         fn scanExactScope(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !void {
             const owner_range = self.db.core.byteRange();
             for (options.exceptionalPrimaryKeys()) |id| {
-                if (!owner_range.contains(id)) continue;
                 try db_query_search.checkSearchRequestDeadline(self.req);
-                if (try self.visitId(id) == .stop) return;
+                if (!owner_range.contains(id)) continue;
+                if (try self.visitId(id, null, false) == .stop) return;
             }
             const ordinals = options.exact_primary_ordinals orelse return;
             var scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -49031,11 +49031,22 @@ pub const DB = struct {
                 _ = scratch.reset(.retain_capacity);
                 var values: [256]?[]const u8 = undefined;
                 const ordinal_batch = ordinals[offset..][0..@min(values.len, ordinals.len - offset)];
-                try resolvePrimaryOrdinalKeysCallback(self.db, scratch.allocator(), ordinal_batch, self.req.identity_read_generation, values[0..ordinal_batch.len]);
-                for (values[0..ordinal_batch.len]) |value| {
-                    const id = value orelse continue;
-                    if (!owner_range.contains(id)) continue;
-                    if (try self.visitId(id) == .stop) return;
+                {
+                    var txn = try self.db.core.store.beginProbeTxn();
+                    defer txn.abort();
+                    const temp = scratch.allocator();
+                    for (ordinal_batch, values[0..ordinal_batch.len]) |ordinal, *value| {
+                        value.* = null;
+                        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse continue;
+                        if (!(if (self.req.identity_read_generation) |at| state.isVisibleAt(at) else state.isLive())) continue;
+                        const id = (try doc_identity.lookupDocIdTxn(temp, &txn, ordinal)) orelse return error.InvalidDocIdentity;
+                        if (!owner_range.contains(id) or !try sourcePresent(temp, &txn, id)) continue;
+                        value.* = id;
+                    }
+                }
+                const unique = options.exceptionalPrimaryKeys().len == 0;
+                for (ordinal_batch, values[0..ordinal_batch.len]) |ordinal, value| {
+                    if (value) |id| if (try self.visitor(self.visitor_ctx, id, ordinal, unique) == .stop) return;
                 }
                 offset += ordinal_batch.len;
             }
@@ -49064,10 +49075,10 @@ pub const DB = struct {
                 if (!state.isVisibleAt(generation)) return .@"continue";
             } else if (!state.isLive()) return error.InvalidDocIdentity;
             const body = key[2 .. key.len - 2];
-            if (try internal_keys.decodeBodyView(body)) |id| return self.visitOrderedId(id);
+            if (try internal_keys.decodeBodyView(body)) |id| return self.visitOrderedId(id, ordinal);
             const id = try internal_keys.decodeBodyAlloc(self.alloc, body);
             defer self.alloc.free(id);
-            return self.visitOrderedId(id);
+            return self.visitOrderedId(id, ordinal);
         }
 
         fn drainExceptionalBefore(self: *@This(), bound: ?[]const u8) !docstore_mod.DocStore.ScanAction {
@@ -49078,8 +49089,10 @@ pub const DB = struct {
                     if (order == .eq or order == (if (self.reverse) std.math.Order.lt else .gt)) break;
                 }
                 self.exceptional_index += 1;
+                while (self.exceptional_index < self.exceptional.len and
+                    std.mem.eql(u8, self.exceptional[self.exceptional_index], id)) self.exceptional_index += 1;
                 try db_query_search.checkSearchRequestDeadline(self.req);
-                if (try self.visitId(id) == .stop) {
+                if (try self.visitId(id, null, true) == .stop) {
                     self.stopped = true;
                     return .stop;
                 }
@@ -49087,31 +49100,36 @@ pub const DB = struct {
             return .@"continue";
         }
 
-        fn visitOrderedId(self: *@This(), id: []const u8) !docstore_mod.DocStore.ScanAction {
+        fn visitOrderedId(self: *@This(), id: []const u8, ordinal: doc_set.DocOrdinal) !docstore_mod.DocStore.ScanAction {
             if (try self.drainExceptionalBefore(id) == .stop) return .stop;
             while (self.exceptional_index < self.exceptional.len and
                 std.mem.eql(u8, self.exceptional[self.exceptional_index], id)) self.exceptional_index += 1;
-            const action = try self.visitId(id);
+            const action = try self.visitId(id, ordinal, true);
             self.stopped = action == .stop;
             return action;
         }
 
-        fn visitId(self: *@This(), id: []const u8) !docstore_mod.DocStore.ScanAction {
-            // Identity rows can outlive their source during cleanup. Probe
-            // keys without hydrating source bodies, so counts and identity-only
-            // pages retain the same presence proof as primary-store scans.
-            const primary_key = try internal_keys.documentKeyAlloc(self.alloc, id);
-            defer self.alloc.free(primary_key);
-            const present = present: {
+        fn sourcePresent(alloc: Allocator, txn: *docstore_mod.DocStore.Txn, id: []const u8) !bool {
+            const primary_key = try internal_keys.documentKeyAlloc(alloc, id);
+            defer alloc.free(primary_key);
+            if (try txn.contains(primary_key)) return true;
+            const relational_key = try internal_keys.relationalRowKeyAlloc(alloc, id);
+            defer alloc.free(relational_key);
+            return txn.contains(relational_key);
+        }
+
+        fn visitId(self: *@This(), id: []const u8, known_ordinal: ?doc_set.DocOrdinal, unique: bool) !docstore_mod.DocStore.ScanAction {
+            const ordinal = identity: {
                 var txn = try self.db.core.store.beginProbeTxn();
                 defer txn.abort();
-                if (try txn.contains(primary_key)) break :present true;
-                const relational_key = try internal_keys.relationalRowKeyAlloc(self.alloc, id);
-                defer self.alloc.free(relational_key);
-                break :present try txn.contains(relational_key);
+                if (!try sourcePresent(self.alloc, &txn, id)) return .@"continue";
+                if (known_ordinal) |ordinal| break :identity ordinal;
+                const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, &txn, id)) orelse break :identity null;
+                const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse break :identity null;
+                if (!(if (self.req.identity_read_generation) |at| state.isVisibleAt(at) else state.isLive())) break :identity null;
+                break :identity ordinal;
             };
-            if (!present) return .@"continue";
-            return self.visitor(self.visitor_ctx, id);
+            return self.visitor(self.visitor_ctx, id, ordinal, unique);
         }
     };
 
@@ -100257,7 +100275,7 @@ test "db default full text index searches template chunk text when chunker full 
     var range_hits: usize = 0;
     var range_scan = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = .{}, .observed_rows = &range_rows };
     const RangeVisitor = struct {
-        fn visit(raw: ?*anyopaque, id: []const u8) !docstore_mod.DocStore.ScanAction {
+        fn visit(raw: ?*anyopaque, id: []const u8, _: ?doc_set.DocOrdinal, _: bool) !docstore_mod.DocStore.ScanAction {
             const count: *usize = @ptrCast(@alignCast(raw.?));
             count.* += 1;
             try std.testing.expectEqualStrings("doc:a\x00tail", id);
@@ -148863,7 +148881,7 @@ test "db live primary directory bounds reads after deletion and survives reopen 
     try db.batch(.{ .writes = &writes, .sync_level = .full_index });
     try db.batch(.{ .deletes = &deleted, .sync_level = .full_index });
     const Visitor = struct {
-        fn visit(raw: ?*anyopaque, id: []const u8) !docstore_mod.DocStore.ScanAction {
+        fn visit(raw: ?*anyopaque, id: []const u8, _: ?doc_set.DocOrdinal, _: bool) !docstore_mod.DocStore.ScanAction {
             const count: *usize = @ptrCast(@alignCast(raw.?));
             count.* += 1;
             try std.testing.expectEqualStrings("z", id);
@@ -148927,7 +148945,7 @@ test "db primary scan retains historical identity visibility (#1095)" {
     var seen: usize = 0;
     var historical = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = .{ .identity_read_generation = created } };
     const Visitor = struct {
-        fn visit(raw: ?*anyopaque, id: []const u8) !docstore_mod.DocStore.ScanAction {
+        fn visit(raw: ?*anyopaque, id: []const u8, _: ?doc_set.DocOrdinal, _: bool) !docstore_mod.DocStore.ScanAction {
             const count: *usize = @ptrCast(@alignCast(raw.?));
             count.* += 1;
             try std.testing.expectEqualStrings("a", id);

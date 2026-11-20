@@ -711,12 +711,15 @@ pub const MatchAllExecutor = struct {
     ) anyerror!bool = null,
 };
 
+pub const PrimaryCandidateVisitor = *const fn (?*anyopaque, []const u8, ?doc_set.DocOrdinal, bool) anyerror!docstore_mod.DocStore.ScanAction;
+
 pub const MatchAllCandidateCollector = struct {
     ctx: ?*anyopaque,
     // Point enumeration must retain the physical owner range of an identity scan.
     primary_key_range: types.ByteRange = .{ .start = "", .end = "" },
     /// Snapshot-pinned row providers stream public identities directly.
     scan_ids_ctx: ?*anyopaque = null,
+    scan_primary_ids: ?*const fn (?*anyopaque, Allocator, MatchAllCandidateCollectOptions, ?*anyopaque, PrimaryCandidateVisitor) anyerror!void = null,
     scan_ids: ?*const fn (?*anyopaque, Allocator, MatchAllCandidateCollectOptions, ?*anyopaque, *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction) anyerror!void = null,
     scan_store_range: *const fn (
         ctx: ?*anyopaque,
@@ -8147,6 +8150,40 @@ fn sortAndPageSearchResultInPlace(
     }
 }
 
+fn admitMatchAllSortCandidates(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    options: MatchAllCandidateCollectOptions,
+    budget: u32,
+    plan: SortExecutionPlan,
+) !MatchAllCandidates {
+    const Admission = struct {
+        alloc: Allocator,
+        budget: u32,
+        items: std.ArrayListUnmanaged(MatchAllCandidate) = .empty,
+
+        fn accept(raw: ?*anyopaque, candidate: *MatchAllCandidate) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.items.items.len >= self.budget) return error.QueryCandidateBudgetExceeded;
+            try self.items.ensureUnusedCapacity(self.alloc, 1);
+            self.items.appendAssumeCapacity(candidate.take());
+        }
+    };
+    var admission = Admission{ .alloc = alloc, .budget = budget };
+    errdefer {
+        for (admission.items.items) |*candidate| candidate.deinit(alloc);
+        admission.items.deinit(alloc);
+    }
+    const stream = executor.collect_candidates_stream orelse return rejectSortCandidateStreamUnavailable(plan);
+    _ = stream(executor.ctx, alloc, req, options, &admission, Admission.accept) catch |err| {
+        if (err == error.QueryCandidateBudgetExceeded)
+            logExactSortBudgetRejection("match_all", .match_all_exact_candidate_window, req.index_name, budget +| 1, budget, plan);
+        return err;
+    };
+    return .{ .items = try admission.items.toOwnedSlice(alloc) };
+}
+
 fn sortAndPageMatchAllCandidatesAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -11009,7 +11046,8 @@ const IndexedPredicateEvaluator = struct {
 
     fn collectRangeEvidence(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, physical: ?*const roaring.RoaringBitmap, capture_coverage: bool) !RangeEvidence {
         const field = query.numeric_range.field;
-        const filter = (try search_mod.searchQueryToFilterArena(self.scratch, query)).withControl(self.control);
+        var filter = (try search_mod.searchQueryToFilterArena(self.scratch, query)).withControl(self.control);
+        filter.range.require_numeric_column = true;
         var covered_docs = roaring.RoaringBitmap.init(self.alloc);
         defer covered_docs.deinit();
         var matched_docs = roaring.RoaringBitmap.init(self.alloc);
@@ -12128,6 +12166,15 @@ test "optional numeric range keeps typed evidence in mixed segment generations" 
         .{ .key = "rounded", .doc_ordinal = 9, .value = "{\"body\":\"beacon\",\"rank\":1.99999999999999999}" },
     }, .{}, schema)).?;
     defer alloc.free(rounded);
+    const mismatched = try introducer_mod.buildSegmentFromTextWithAnalysis(alloc, &.{.{
+        .id = "mismatched",
+        .doc_ordinal = 10,
+        .stored_data = "{\"rank\":2}",
+        .text_fields = &.{},
+        .complete_numeric_fields = &.{"rank"},
+        .typed_fields = &.{.{ .field_name = "rank", .value_type = .bytes_val, .value = .{ .bytes_val = "2" } }},
+    }}, &analysis_mod.default_analyzer, .{});
+    defer alloc.free(mismatched);
     var manager = @import("../../resource_manager.zig").ResourceManager.init(.{});
     defer manager.deinit(alloc);
     var writer = try index_mod.IndexWriter.init(alloc);
@@ -12207,6 +12254,15 @@ test "optional numeric range keeps typed evidence in mixed segment generations" 
     defer second_range.matches.deinit();
     try std.testing.expect(second_range.matches.contains(5));
     try std.testing.expectEqual(misses, evaluator.snapshot.graph_predicates.misses);
+
+    try writer.addSegment(mismatched);
+    var mixed_evaluator = evaluator;
+    mixed_evaluator.snapshot = writer.snapshot();
+    var fallback = try mixed_evaluator.collectRangeEvidence(query, null, true);
+    defer fallback.covered.deinit();
+    defer fallback.matches.deinit();
+    try std.testing.expect(!fallback.covered.contains(10));
+    try std.testing.expect(!fallback.matches.contains(10));
 }
 
 test "optional numeric range frontier memo coalesces small extensions" {
@@ -22831,7 +22887,7 @@ pub fn searchMatchAll(
         const legacy_keys = if (native_constraints.legacy_filter == .doc_keys) native_constraints.legacy_filter.doc_keys else &.{};
         const filter_keys = native_constraints.filter_doc_ids;
         const finite_count = @max(only_ordinals.len, filter_keys.len) +| legacy_keys.len;
-        const defer_projection = postprocess_req.limit != 0 and native_constraints.positive_filter and finite_count > exact_sort_budget;
+        const defer_projection = postprocess_req.limit != 0 and (!native_constraints.positive_filter or finite_count > exact_sort_budget);
         var exact_keys_arena = std.heap.ArenaAllocator.init(alloc);
         defer exact_keys_arena.deinit();
         const exact_key_alloc = exact_keys_arena.allocator();
@@ -22897,8 +22953,7 @@ pub fn searchMatchAll(
         var admitted: ?MatchAllCandidates = null;
         defer if (admitted) |*candidates| candidates.deinit(alloc);
         if (defer_projection) {
-            admission.candidate_limit = exact_sort_budget;
-            admitted = try executor.collect_candidates(executor.ctx, alloc, postprocess_req, admission);
+            admitted = try admitMatchAllSortCandidates(alloc, postprocess_req, executor, admission, exact_sort_budget, planned_sort);
             const keys = try alloc.alloc([]const u8, admitted.?.items.len);
             defer alloc.free(keys);
             for (admitted.?.items, keys) |candidate, *key| key.* = candidate.id;
@@ -23368,7 +23423,21 @@ fn collectMatchAllCandidateStateWithOptions(
         return state;
     }
 
-    if (collector.scan_ids) |scan| {
+    if (collector.scan_primary_ids) |scan| {
+        const Visitor = struct {
+            fn visit(raw: ?*anyopaque, id: []const u8, ordinal: ?doc_set.DocOrdinal, unique: bool) anyerror!docstore_mod.DocStore.ScanAction {
+                const target: *MatchAllCandidateCollectState = @ptrCast(@alignCast(raw.?));
+                try checkSearchRequestDeadline(target.req);
+                try target.consumeKey(try target.alloc.dupe(u8, id), @as(?doc_set.DocOrdinal, ordinal), unique);
+                if (target.shouldStopAfterAccepted()) {
+                    target.stopped_early = true;
+                    return .stop;
+                }
+                return .@"continue";
+            }
+        };
+        try scan(collector.scan_ids_ctx orelse collector.ctx, alloc, options, &state, Visitor.visit);
+    } else if (collector.scan_ids) |scan| {
         const Visitor = struct {
             fn visit(raw: ?*anyopaque, id: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
                 const target: *MatchAllCandidateCollectState = @ptrCast(@alignCast(raw.?));
@@ -23552,6 +23621,10 @@ const MatchAllCandidateCollectState = struct {
     }
 
     fn consumeRawKey(self: *@This(), raw_key_owned: []u8) !void {
+        return self.consumeKey(raw_key_owned, null, false);
+    }
+
+    fn consumeKey(self: *@This(), raw_key_owned: []u8, resolved: ??doc_set.DocOrdinal, unique: bool) !void {
         var raw_key = raw_key_owned;
         errdefer self.alloc.free(raw_key);
 
@@ -23560,7 +23633,7 @@ const MatchAllCandidateCollectState = struct {
             return;
         }
 
-        if (self.seen.contains(raw_key)) {
+        if (!unique and self.seen.contains(raw_key)) {
             self.alloc.free(raw_key);
             return;
         }
@@ -23569,7 +23642,7 @@ const MatchAllCandidateCollectState = struct {
             return;
         };
 
-        const ordinal = if (self.collector.lookup_doc_ordinal) |lookup|
+        const ordinal = if (resolved) |known| known else if (self.collector.lookup_doc_ordinal) |lookup|
             try lookup(self.collector.ctx, self.alloc, raw_key, self.req.identity_read_generation)
         else
             null;
@@ -23596,7 +23669,7 @@ const MatchAllCandidateCollectState = struct {
 
         errdefer candidate.deinit(self.alloc);
         if (self.consumer) |consumer| {
-            {
+            if (!unique) {
                 const seen_key = try self.alloc.dupe(u8, candidate.id);
                 errdefer self.alloc.free(seen_key);
                 try self.seen.put(self.alloc, seen_key, {});
@@ -23608,7 +23681,7 @@ const MatchAllCandidateCollectState = struct {
             candidate.deinit(self.alloc);
             self.accepted_count += 1;
         } else {
-            try self.seen.put(self.alloc, candidate.id, {});
+            if (!unique) try self.seen.put(self.alloc, candidate.id, {});
             try self.candidates.append(self.alloc, candidate);
             candidate.id = @constCast(&[_]u8{});
             self.accepted_count += 1;
