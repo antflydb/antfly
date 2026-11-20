@@ -409,13 +409,18 @@ pub fn replay(
     on_record: ?Callback,
     ctx: ?*anyopaque,
 ) anyerror!ReplayOutcome {
-    return replayBounded(allocator, file, io, base_offset, capacity, start_after_sequence, null, on_record, ctx);
+    return replayBounded(allocator, file, io, base_offset, capacity, start_after_sequence, null, null, on_record, ctx);
 }
 
 /// `replay`, stopping (`durable_ceiling`) before any new record whose
 /// sequence exceeds `max_sequence`. A reader that is not the writer bounds
 /// its scan by the writer's published durable sequence: records past it may
 /// still be unsynced, and a crash can lose them.
+///
+/// `unlogged_through` is the checkpoint slot's own commit sequence: a slot
+/// can publish commits that never reach the log (a ledger-only reclaim, a
+/// capacity shrink), so a jump between logged records over sequences no
+/// later than it is not a gap. Continuity past it stays strict.
 pub fn replayBounded(
     allocator: Allocator,
     file: File,
@@ -424,6 +429,7 @@ pub fn replayBounded(
     capacity: u64,
     start_after_sequence: ?u64,
     max_sequence: ?u64,
+    unlogged_through: ?u64,
     on_record: ?Callback,
     ctx: ?*anyopaque,
 ) anyerror!ReplayOutcome {
@@ -557,7 +563,8 @@ pub fn replayBounded(
             }
             in_superseded_run = false;
         } else if (last_sequence) |last| {
-            if (header.commit_sequence != last + 1) {
+            const covered_jump = header.commit_sequence > last + 1 and unlogged_through != null and header.commit_sequence - 1 <= unlogged_through.?;
+            if (header.commit_sequence != last + 1 and !covered_jump) {
                 return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
             }
         }
@@ -726,6 +733,30 @@ test "an append ends the log even over a failed longer append's payload" {
     try testing.expectEqual(StopReason.end_of_region, outcome.stop_reason);
 }
 
+test "replay accepts a jump over sequences the checkpoint slot covers" {
+    const io = testing.io;
+    const capacity: u64 = 2048;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    // The slot published 11 without logging it; the log resumes at 12.
+    var writer = Writer.initAt(region.file, io, 0, capacity, 0, 11);
+    try writer.append(12, "x");
+    try writer.append(13, "y");
+    try writer.sync();
+
+    const covered = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, 11, null, null);
+    try testing.expectEqual(@as(u64, 2), covered.valid_count);
+    try testing.expectEqual(StopReason.end_of_region, covered.stop_reason);
+
+    // Without the slot's coverage it is a gap.
+    const uncovered = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.corrupt_record, uncovered.stop_reason);
+    // Coverage never excuses a gap past the slot.
+    const past = try replayBounded(testing.allocator, region.file, io, 0, capacity, 9, null, 10, null, null);
+    try testing.expectEqual(StopReason.corrupt_record, past.stop_reason);
+}
+
 test "bounded replay stops before records past the durable ceiling" {
     const io = testing.io;
     const capacity: u64 = 2048;
@@ -738,18 +769,18 @@ test "bounded replay stops before records past the durable ceiling" {
     try writer.append(13, "z");
     try writer.sync();
 
-    const bounded = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, 12, null, null);
+    const bounded = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, 12, null, null, null);
     try testing.expectEqual(@as(u64, 2), bounded.valid_count);
     try testing.expectEqual(@as(?u64, 12), bounded.last_sequence);
     try testing.expectEqual(StopReason.durable_ceiling, bounded.stop_reason);
 
     // Superseded records past the ceiling never stop the scan early.
-    const past = try replayBounded(testing.allocator, region.file, io, 0, capacity, 12, 12, null, null);
+    const past = try replayBounded(testing.allocator, region.file, io, 0, capacity, 12, 12, null, null, null);
     try testing.expectEqual(@as(u64, 0), past.valid_count);
     try testing.expectEqual(StopReason.durable_ceiling, past.stop_reason);
     try testing.expectEqual(@as(?u64, 12), past.last_sequence);
 
-    const unbounded = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null);
+    const unbounded = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
     try testing.expectEqual(@as(u64, 3), unbounded.valid_count);
 }
 
