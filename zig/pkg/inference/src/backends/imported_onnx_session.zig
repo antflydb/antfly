@@ -852,6 +852,11 @@ pub fn inspectArtifactSetWithBase(allocator: std.mem.Allocator, onnx_path: []con
 }
 
 pub fn inspectArtifactSetWithReader(allocator: std.mem.Allocator, onnx_path: []const u8, external_base_dir: ?[]const u8, reader: ?onnx_graph.tensor.ExternalDataReader) !OnnxArtifactSet {
+    return inspectArtifactSetWithControl(allocator, onnx_path, external_base_dir, reader, .{});
+}
+
+pub fn inspectArtifactSetWithControl(allocator: std.mem.Allocator, onnx_path: []const u8, external_base_dir: ?[]const u8, reader: ?onnx_graph.tensor.ExternalDataReader, control: InferenceExecutionControl) !OnnxArtifactSet {
+    try control.check();
     const opened = if (reader) |source| try source.open(onnx_path) else null;
     defer if (opened) |file| file.deinit();
     var mapped = if (opened) |file|
@@ -865,6 +870,7 @@ pub fn inspectArtifactSetWithReader(allocator: std.mem.Allocator, onnx_path: []c
     const model_dir = external_base_dir orelse std.fs.path.dirname(onnx_path) orelse ".";
     var model = try onnx_graph.parseLazyAsModelWithBaseDir(allocator, mapped.data, model_dir);
     defer model.deinit();
+    try control.check();
 
     var paths = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
@@ -875,6 +881,7 @@ pub fn inspectArtifactSetWithReader(allocator: std.mem.Allocator, onnx_path: []c
 
     var initializer_it = model.initializer_map.iterator();
     while (initializer_it.next()) |entry| {
+        try control.check();
         const tensor = try model.initializerAt(entry.value_ptr.*);
         if (!tensor.isExternal()) continue;
         const external = tensor.externalDataInfo();

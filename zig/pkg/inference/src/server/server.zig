@@ -26660,9 +26660,15 @@ pub const Node = struct {
         }
         const model = try ctx.queryDecoded("model");
         const task = ctx.query("task");
-        const scoped_embedding = if (task != null and std.mem.eql(u8, task.?, "embed")) model else null;
+        const scope: ?CatalogListingScope = if (model) |name| scope: {
+            const operation = task orelse break :scope null;
+            if (std.mem.eql(u8, operation, "embed")) break :scope .{ .name = name, .category = "embedders" };
+            if (std.mem.eql(u8, operation, "generate")) break :scope .{ .name = name, .category = "generators" };
+            break :scope null;
+        } else null;
         const publication = if (catalog_generation.kind == .legacy) null else std.fmt.bytesToHex(catalog_generation.digest, .lower);
-        const json_body = self.listModelsJsonAllocScoped(ctx.allocator, ctx.io, scoped_embedding, if (publication) |*hex| hex else null) catch |err| {
+        const json_body = self.listModelsJsonAllocScoped(ctx.allocator, ctx.io, scope, if (publication) |*hex| hex else null, catalog_control) catch |err| {
+            if (err == error.Timeout or err == error.Canceled or err == error.Cancelled) return inferenceFailureResponse(ctx, err);
             if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
             return err;
         };
@@ -26728,10 +26734,13 @@ pub const Node = struct {
     /// (e.g. the antfly server's /connections endpoint) can list the embedded
     /// node's models without going through HTTP. Caller owns the result.
     pub fn listModelsJsonAlloc(self: *Node, a: std.mem.Allocator, io: std.Io) ![]u8 {
-        return self.listModelsJsonAllocScoped(a, io, null, null);
+        return self.listModelsJsonAllocScoped(a, io, null, null, .{});
     }
 
-    fn listModelsJsonAllocScoped(self: *Node, a: std.mem.Allocator, io: std.Io, scoped_embedding: ?[]const u8, publication: ?[]const u8) ![]u8 {
+    const CatalogListingScope = struct { name: []const u8, category: []const u8 };
+
+    fn listModelsJsonAllocScoped(self: *Node, a: std.mem.Allocator, io: std.Io, listing_scope: ?CatalogListingScope, publication: ?[]const u8, control: InferenceExecutionControl) ![]u8 {
+        try control.check();
         var buf = std.ArrayListUnmanaged(u8).empty;
         defer buf.deinit(a);
         var body = std.ArrayListUnmanaged(u8).empty;
@@ -26743,26 +26752,34 @@ pub const Node = struct {
         var openai_data_count: usize = 0;
         const list_created = completionCreatedTimestamp();
 
-        var inventory = if (self.selector_cache) |cache|
-            try cache.snapshot(a, io, self.config.models_dir)
+        const borrowed = if (self.selector_cache) |cache|
+            try cache.borrowInventory(io, self.config.models_dir, control)
         else
-            try selection_mod.Inventory.loadStable(a, io, self.config.models_dir);
-        defer inventory.deinit();
+            null;
+        defer if (borrowed) |lease| lease.release();
+        var owned = if (borrowed == null)
+            try selection_mod.Inventory.loadStableWithControl(a, io, self.config.models_dir, control)
+        else
+            null;
+        defer if (owned) |*inventory| inventory.deinit();
+        const inventory = if (borrowed) |lease| lease.inventory() else &owned.?;
+        try control.check();
         const discovered = inventory.discovered;
-        const selected_path = if (scoped_embedding) |name| inventory.lookup(name, "embedders") catch null else null;
+        const selected_path = if (listing_scope) |name| inventory.lookup(name.name, name.category) catch null else null;
 
         var discovered_listings = std.ArrayListUnmanaged(DiscoveredModelListing).empty;
         defer {
             for (discovered_listings.items) |*listing| listing.deinit();
             discovered_listings.deinit(a);
         }
-        try discovered_listings.ensureTotalCapacity(a, if (scoped_embedding == null) discovered.len else 1);
+        try discovered_listings.ensureTotalCapacity(a, if (listing_scope == null) discovered.len else 1);
         // Candidates whose manifest cannot be read stay visible with their
         // error, so one malformed directory never hides a model silently.
         var rejected_listings = std.ArrayListUnmanaged(RejectedModelListing).empty;
         defer rejected_listings.deinit(a);
         for (discovered, 0..) |entry, entry_index| {
-            if (scoped_embedding != null and (selected_path == null or !std.mem.eql(u8, selected_path.?, entry.path))) continue;
+            try control.check();
+            if (listing_scope != null and (selected_path == null or !std.mem.eql(u8, selected_path.?, entry.path))) continue;
             // A directory spelling is not proof of a format or immutable pin.
             // Unmanaged installations may advertise only literal legacy names.
             if (inventory.names[entry_index].len == 0) continue;
@@ -26825,8 +26842,9 @@ pub const Node = struct {
             canonical_discovered_dirs.deinit(a);
         }
 
-        const scan_loaded = scoped_embedding == null or selected_path == null;
+        const scan_loaded = listing_scope == null or selected_path == null;
         for (if (scan_loaded) discovered else &.{}) |entry| {
+            try control.check();
             const canonical_path = realPathExistingAlloc(a, io, entry.path) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 continue;
@@ -26872,7 +26890,7 @@ pub const Node = struct {
                     a.free(canonical_model_dir);
                     continue;
                 };
-                if (scoped_embedding) |name| if (!std.mem.eql(u8, name, identifier)) {
+                if (listing_scope) |name| if (!std.mem.eql(u8, name.name, identifier)) {
                     a.free(identifier);
                     a.free(canonical_model_dir);
                     continue;
@@ -26902,12 +26920,13 @@ pub const Node = struct {
         }
 
         for (task_names, 0..) |task, task_idx| {
+            try control.check();
             if (task_idx > 0) try body.append(a, ',');
             try body.append(a, '"');
             try body.appendSlice(a, task);
             try body.appendSlice(a, "\":{");
 
-            if (scoped_embedding != null and !std.mem.eql(u8, task, "embedders")) {
+            if (listing_scope != null and !std.mem.eql(u8, task, listing_scope.?.category)) {
                 try body.append(a, '}');
                 continue;
             }
@@ -26949,6 +26968,7 @@ pub const Node = struct {
 
             // Add discovered models matching this task
             for (discovered_listings.items) |*listing| {
+                try control.check();
                 // The public chunk executor currently implements only the
                 // built-in fixed multimodal chunker above. A manifest task is
                 // not proof that a model-backed chunk execution path exists.
@@ -27016,6 +27036,7 @@ pub const Node = struct {
             // Unreadable candidates appear under the task their path implies,
             // marked incompatible with the reason the manifest was rejected.
             for (rejected_listings.items) |rejected| {
+                try control.check();
                 const entry = discovered[rejected.entry_index];
                 if (!std.mem.eql(u8, rejectedListingTask(entry), task)) continue;
                 const listed = try listed_model_names.getOrPut(a, entry.path);
@@ -27034,6 +27055,7 @@ pub const Node = struct {
             // snapshot keeps them alive, and each listing has already been
             // canonicalized to a safe request identifier outside the lock.
             for (loaded_listings.items) |listing| {
+                try control.check();
                 if (std.mem.eql(u8, task, "chunkers")) continue;
                 const model = listing.model;
                 const model_task = @tagName(model.manifest.model_type);
@@ -27110,7 +27132,7 @@ pub const Node = struct {
         // Keep ML schemas in their own group while allowing task-aware pool
         // discovery to find predictors through the same bounded catalog.
         try buf.appendSlice(a, ",\"predictors\":{");
-        if (scoped_embedding == null) {
+        if (listing_scope == null) {
             _ = tabular_mod.discovery.discover(io, a, &self.tabular_registry, self.config.ml_dir) catch {};
             const predictors = try self.tabular_registry.list(a);
             defer a.free(predictors);
@@ -27143,7 +27165,7 @@ pub const Node = struct {
         // Composite discovery reads only bounded declarative metadata. It
         // never loads model weights or exposes private provider bindings.
         const ca = catalog.arena.allocator();
-        if (scoped_embedding == null) {
+        if (listing_scope == null) {
             const native_info = try self.documentCatalogInfo(ca, null, "read");
             try catalog.value.object.getPtr("readers").?.object.put(ca, "antfly/native-document", native_info);
             for (discovered) |entry| {
@@ -27170,11 +27192,13 @@ pub const Node = struct {
         // Descriptors retain installation identity until ownership is finalized.
         // A same-named installation in another scope cannot supply its contract.
         for (task_names) |task| {
+            try control.check();
             const models = catalog.value.object.getPtr(task).?;
             for (discovered, inventory.names) |entry, names| {
+                try control.check();
                 const descriptor = models.object.get(entry.path) orelse continue;
                 for (names) |selector| {
-                    if (scoped_embedding) |name| if (!std.mem.eql(u8, name, selector)) continue;
+                    if (listing_scope) |name| if (!std.mem.eql(u8, name.name, selector)) continue;
                     const owner = (inventory.lookup(selector, task) catch continue) orelse continue;
                     if (std.mem.eql(u8, owner, entry.path)) try models.object.put(ca, selector, descriptor);
                 }
@@ -27190,7 +27214,7 @@ pub const Node = struct {
             }
         }
         filterOpenAiCatalogSelectors(&catalog.value);
-        try inventory.requireCurrentGeneration(io);
+        try inventory.requireCurrentGenerationWithControl(io, control);
         return std.json.Stringify.valueAlloc(a, catalog.value, .{});
     }
 
@@ -38167,6 +38191,42 @@ test "catalog model resolution preserves timeout during managed checksums" {
         "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
         (InferenceExecutionControl{}).withCheckpoint(&checkpoints, Cancel.check),
     ));
+}
+
+test "catalog model resolution preserves timeout and scopes generation listing" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tensor_header = "{\"probe\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    const header_size = comptime std.mem.alignForward(usize, tensor_header.len, 8);
+    var weights: [8 + header_size + 4]u8 = @splat(0);
+    std.mem.writeInt(u64, weights[0..8], header_size, .little);
+    @memset(weights[8..][0..header_size], ' ');
+    @memcpy(weights[8..][0..tensor_header.len], tensor_header);
+    inline for (.{ "selected", "other" }) |name| {
+        try tmp.dir.createDirPath(io, "generators/" ++ name);
+        try tmp.dir.writeFile(io, .{ .sub_path = "generators/" ++ name ++ "/config.json", .data = "{\"model_type\":\"llama\"}" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "generators/" ++ name ++ "/model.safetensors", .data = &weights });
+    }
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true });
+    defer node.deinit();
+    try node.attachIo(io);
+    var request = try httpx.Request.init(a, .GET, "/ai/v1/models?model=selected&task=generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.listModels(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer parsed.deinit();
+    const generators = parsed.value.object.get("generators").?.object;
+    try std.testing.expectEqual(@as(usize, 1), generators.count());
+    const selected = generators.get("selected") orelse return error.MissingGenerator;
+    try std.testing.expectEqual(@as(usize, 64), selected.object.get("model_revision").?.string.len);
 }
 
 test "decide maps model resolution errors to client responses" {

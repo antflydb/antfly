@@ -1406,8 +1406,13 @@ fn componentDependencySignature(
     io: std.Io,
     dependencies: []const []const u8,
 ) !ComponentPlanKey {
+    return componentDependencySignatureWithControl(io, dependencies, .{});
+}
+
+fn componentDependencySignatureWithControl(io: std.Io, dependencies: []const []const u8, control: InferenceExecutionControl) !ComponentPlanKey {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     for (dependencies) |path| {
+        try control.check();
         updateComponentPlanKeySlice(&hash, path);
         const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
             hash.update("missing");
@@ -2819,6 +2824,11 @@ fn ownSelectedFirstBackendPreference(
 }
 
 fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest) ![32]u8 {
+    return resolutionModelRevisionWithControl(a, io, manifest, .{});
+}
+
+fn resolutionModelRevisionWithControl(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest, control: InferenceExecutionControl) ![32]u8 {
+    try control.check();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -2829,12 +2839,25 @@ fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_
         }
     }
     if (manifest.safetensors_index_path) |path| {
-        const raw = try @import("../util/c_file.zig").readFile(alloc, path);
+        const index_file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer index_file.close(io);
+        const size = std.math.cast(usize, (try index_file.stat(io)).size) orelse return error.FileTooLarge;
+        if (size > @import("../util/c_file.zig").default_read_file_max_bytes) return error.FileTooLarge;
+        const raw = try alloc.alloc(u8, size);
+        var offset: usize = 0;
+        while (offset < size) {
+            try control.check();
+            const target = raw[offset..][0..@min(size - offset, 64 * 1024)];
+            if (try index_file.readPositionalAll(io, target, offset) != target.len) return error.IncompleteRead;
+            offset += target.len;
+        }
+        try control.check();
         const index = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
         if (index == .object) if (index.object.get("weight_map")) |weights| {
             if (weights != .object) return error.InvalidModelLayout;
             var seen: std.StringHashMapUnmanaged(void) = .empty;
             for (weights.object.values()) |file| {
+                try control.check();
                 if (file != .string) return error.InvalidModelLayout;
                 const slot = try seen.getOrPut(alloc, file.string);
                 if (!slot.found_existing) try paths.append(alloc, try std.fs.path.join(alloc, &.{ std.fs.path.dirname(path).?, file.string }));
@@ -2844,18 +2867,19 @@ fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_
     var external: std.ArrayList([]const u8) = .empty;
     var inspected_primary = false;
     for (paths.items) |path| {
+        try control.check();
         const primary = (manifest.onnx_path != null and std.mem.eql(u8, path, manifest.onnx_path.?)) or
             (manifest.onnx_logical_path != null and std.mem.eql(u8, path, manifest.onnx_logical_path.?));
         if (primary and inspected_primary) continue;
         if (!primary and !std.mem.endsWith(u8, path, ".onnx")) continue;
         const base = if (primary and manifest.onnx_logical_path != null) std.fs.path.dirname(manifest.onnx_logical_path.?) else null;
-        var artifacts = try backends.imported_onnx_session.inspectArtifactSetWithBase(alloc, if (primary) manifest.onnx_path.? else path, base);
+        var artifacts = try backends.imported_onnx_session.inspectArtifactSetWithControl(alloc, if (primary) manifest.onnx_path.? else path, base, null, control);
         defer artifacts.deinit();
         if (primary) inspected_primary = true;
         for (artifacts.external_paths) |tensor_path| try external.append(alloc, try alloc.dupe(u8, tensor_path));
     }
     try paths.appendSlice(alloc, external.items);
-    return componentDependencySignature(io, paths.items);
+    return componentDependencySignatureWithControl(io, paths.items, control);
 }
 
 // Legacy managed receipts may lack a digest. Hash those files once per local
@@ -2977,7 +3001,7 @@ fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []con
         hash.final(&result);
         return imagePreprocessingRevision(manifest, result);
     }
-    return imagePreprocessingRevision(manifest, try resolutionModelRevision(a, io, manifest));
+    return imagePreprocessingRevision(manifest, try resolutionModelRevisionWithControl(a, io, manifest, control));
 }
 
 fn imagePreprocessingRevision(manifest: manifest_mod.ModelManifest, artifacts: [32]u8) [32]u8 {
