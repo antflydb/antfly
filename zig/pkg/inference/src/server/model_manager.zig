@@ -2864,24 +2864,42 @@ fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_
 
 // Legacy managed receipts may lack a digest. Hash those files once per local
 // file generation, keeping the resulting identity content-based across copies.
+fn artifactVerificationControl(control: *const InferenceExecutionControl) managed_receipt.VerificationControl {
+    const Adapter = struct {
+        fn check(raw: ?*const anyopaque) !void {
+            const active: *const InferenceExecutionControl = @ptrCast(@alignCast(raw.?));
+            try active.check();
+        }
+    };
+    return .{ .context = control, .check_fn = Adapter.check };
+}
+
 const LegacyArtifactDigestCache = struct {
     const Entry = struct { signature: [32]u8, digest: [32]u8 };
     var mutex: std.atomic.Mutex = .unlocked;
+    var builders: [16]std.Io.Mutex = @splat(.init);
     var entries: [256]?Entry = @splat(null);
     var next: usize = 0;
     var forbid_hashing_for_test: bool = false;
 
+    fn lookup(signature: [32]u8) ?[32]u8 {
+        spinLock(&mutex);
+        defer mutex.unlock();
+        for (entries) |item| if (item) |entry| {
+            if (std.mem.eql(u8, &entry.signature, &signature)) return entry.digest;
+        };
+        return null;
+    }
+
     fn digestWithControl(io: std.Io, artifact: managed_receipt.ValidatedArtifact, control: InferenceExecutionControl) ![32]u8 {
         try control.check();
         const signature = try componentDependencySignature(io, &.{artifact.canonical_path});
-        spinLock(&mutex);
-        for (entries) |item| if (item) |entry| {
-            if (std.mem.eql(u8, &entry.signature, &signature)) {
-                mutex.unlock();
-                return entry.digest;
-            }
-        };
-        mutex.unlock();
+        if (lookup(signature)) |digest| return digest;
+        const builder = &builders[signature[0] % builders.len];
+        try artifactVerificationControl(&control).lock(builder, io);
+        defer builder.unlock(io);
+        if (!std.mem.eql(u8, &signature, &try componentDependencySignature(io, &.{artifact.canonical_path}))) return error.ModelArtifactsChanging;
+        if (lookup(signature)) |digest| return digest;
         const memo_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.antfly-sha256-cache", .{artifact.canonical_path});
         defer std.heap.page_allocator.free(memo_path);
         const memo_bytes = std.Io.Dir.cwd().readFileAlloc(io, memo_path, std.heap.page_allocator, .limited(1024)) catch null;
@@ -2959,13 +2977,9 @@ fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []con
         for (artifacts) |artifact| {
             try control.check();
             var decoded: [32]u8 = undefined;
-            if (published) |source| {
-                try source.verifyFile(artifact.path);
-                if (artifact.sha256) |digest| {
-                    // verifyFile authenticated this digest against the actual
-                    // file and retained its complete construction stamp.
-                    _ = std.fmt.hexToBytes(&decoded, digest) catch return error.InvalidManagedDownload;
-                } else decoded = try LegacyArtifactDigestCache.digestWithControl(io, artifact, control);
+            const verified_digest = if (published) |source| try source.verifiedFileDigest(artifact.path) else null;
+            if (verified_digest) |digest| {
+                _ = std.fmt.hexToBytes(&decoded, digest) catch return error.InvalidManagedDownload;
             } else decoded = try LegacyArtifactDigestCache.digestWithControl(io, artifact, control);
             if (artifact.sha256) |digest| {
                 if (digest.len != 64) return error.InvalidManagedDownload;
@@ -7797,7 +7811,10 @@ pub const ModelManager = struct {
         const io = if (control) |active| active.io orelse source_session_manager.io orelse std.Options.debug_io else source_session_manager.io orelse std.Options.debug_io;
         var construction_proof = try ComponentConstruction.init(self.allocator, io, selected, control, borrowed);
         defer construction_proof.deinit();
-        if (construction_proof.owned != null) construction_proof.artifacts().verification_cache = &self.verified_artifacts;
+        if (construction_proof.owned != null) {
+            construction_proof.artifacts().verification_cache = &self.verified_artifacts;
+            if (control) |*active| construction_proof.artifacts().verification_control = artifactVerificationControl(active);
+        }
         var bound = try BoundModelSource.init(&construction_proof, model_path, ModelSource.kindForPath(model_path), null, null);
         defer bound.deinit();
         var device_order_scratch: backends.BackendOrderBuffer = undefined;
@@ -10032,6 +10049,7 @@ pub const ModelManager = struct {
         var artifacts = try PublishedArtifacts.init(self.allocator, io, model_dir, .{ .publication = man.managed_publication });
         defer artifacts.deinit();
         artifacts.verification_cache = &self.verified_artifacts;
+        artifacts.verification_control = artifactVerificationControl(&control);
         var proof = ComponentConstruction.borrowingUnderLease(io, &artifacts);
         defer proof.deinit();
         var bound = try BoundModelSource.init(&proof, model_dir, ModelSource.kindForPath(model_dir), &man, null);
@@ -10078,7 +10096,7 @@ pub const ModelManager = struct {
     }
 
     pub fn modelIdentityForManifest(self: *ModelManager, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
-        return modelIdentity(self.allocator, try self.componentPlanIo(), model_dir, manifest);
+        return self.modelIdentityForManifestWithControl(model_dir, manifest, .{});
     }
 
     pub fn modelIdentityForManifestWithControl(
@@ -10087,7 +10105,15 @@ pub const ModelManager = struct {
         manifest: manifest_mod.ModelManifest,
         control: InferenceExecutionControl,
     ) ![32]u8 {
-        return modelIdentityWithArtifacts(self.allocator, control.io orelse try self.componentPlanIo(), model_dir, manifest, null, control);
+        try control.check();
+        const io = control.io orelse try self.componentPlanIo();
+        var lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
+        defer lease.deinit(io);
+        var artifacts = try PublishedArtifacts.init(self.allocator, io, model_dir, .{ .publication = manifest.managed_publication });
+        defer artifacts.deinit();
+        artifacts.verification_cache = &self.verified_artifacts;
+        artifacts.verification_control = artifactVerificationControl(&control);
+        return modelIdentityWithArtifacts(self.allocator, io, model_dir, manifest, &artifacts, control);
     }
 
     fn loadFromDirUncached(
@@ -10155,6 +10181,7 @@ pub const ModelManager = struct {
         var tokenizer_artifacts = try PublishedArtifacts.init(self.allocator, publication_io, model_dir, .{ .publication = man.managed_publication });
         defer tokenizer_artifacts.deinit();
         tokenizer_artifacts.verification_cache = &self.verified_artifacts;
+        if (control) |*active| tokenizer_artifacts.verification_control = artifactVerificationControl(active);
         const resolution_file_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man, control orelse .{});
         const resolution_revision = try modelIdentityWithArtifacts(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man, &tokenizer_artifacts, control orelse .{});
         const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
@@ -18743,42 +18770,82 @@ test "model selection native directory proof authenticates single and sharded sa
     }
 }
 
-test "pinned model identity cancels during a cold artifact digest" {
+test "pinned model identity shares cancellable artifact verification with construction" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "weights.safetensors", .data = "weights" });
+    const weights = try a.alloc(u8, 128 * 1024);
+    defer a.free(weights);
+    @memset(weights, 0x15);
+    try tmp.dir.writeFile(io, .{ .sub_path = "weights.safetensors", .data = weights });
     try writeArtifactIdentityTestReceipt(tmp.dir, &.{"weights.safetensors"});
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     const Probe = struct {
-        var hashing = false;
-        var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+        var artifact_handle: ?@FieldType(std.Io.File, "handle") = null;
+        var artifact_opens: usize = 0;
+        var artifact_reads: usize = 0;
+        var original_open: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+        var original_read: @FieldType(std.Io.VTable, "fileReadPositional") = undefined;
         fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
-            const file = try original(raw, dir, path, options);
-            if (std.mem.endsWith(u8, path, "weights.safetensors")) hashing = true;
+            const file = try original_open(raw, dir, path, options);
+            if (std.mem.endsWith(u8, path, "weights.safetensors")) {
+                artifact_handle = file.handle;
+                artifact_opens += 1;
+            } else if (artifact_handle == file.handle) artifact_handle = null;
             return file;
         }
+        fn read(raw: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            if (artifact_handle == file.handle) artifact_reads += 1;
+            return original_read(raw, file, data, offset);
+        }
         fn check(_: ?*anyopaque) !void {
-            if (hashing) return error.Canceled;
+            if (artifact_reads != 0) return error.Canceled;
         }
     };
     var table = io.vtable.*;
-    Probe.original = table.dirOpenFile;
-    Probe.hashing = false;
+    Probe.original_open = table.dirOpenFile;
+    Probe.original_read = table.fileReadPositional;
+    Probe.artifact_handle = null;
+    Probe.artifact_opens = 0;
+    Probe.artifact_reads = 0;
     table.dirOpenFile = Probe.open;
+    table.fileReadPositional = Probe.read;
     const observed_io = std.Io{ .userdata = io.userdata, .vtable = &table };
     var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
     defer manager.deinit();
-    const manifest: manifest_mod.ModelManifest = .{ .allocator = a };
-    try std.testing.expectError(error.Canceled, manager.modelIdentityForManifestWithControl(root, manifest, .{
-        .io = observed_io,
-        .check_fn = Probe.check,
-    }));
-    try std.testing.expect(Probe.hashing);
-    const revision = try manager.modelIdentityForManifest(root, manifest);
-    try std.testing.expectEqual(revision, try manager.modelIdentityForManifestWithControl(root, manifest, .{ .io = io }));
+    const manifest: manifest_mod.ModelManifest = .{
+        .allocator = a,
+        .managed_publication = try managed_receipt.publicationGeneration(a, io, root),
+    };
+
+    // Construction owns a flight control independently of any preflight.
+    const cancelled: InferenceExecutionControl = .{ .io = observed_io, .check_fn = Probe.check };
+    {
+        var construction = try PublishedArtifacts.init(a, observed_io, root, .{ .publication = manifest.managed_publication });
+        defer construction.deinit();
+        construction.verification_cache = &manager.verified_artifacts;
+        construction.verification_control = artifactVerificationControl(&cancelled);
+        try std.testing.expectError(error.Canceled, modelIdentityWithArtifacts(a, observed_io, root, manifest, &construction, cancelled));
+        try std.testing.expectEqual(@as(usize, 1), Probe.artifact_reads);
+    }
+
+    Probe.artifact_opens = 0;
+    Probe.artifact_reads = 0;
+    const active: InferenceExecutionControl = .{ .io = observed_io };
+    const revision = try manager.modelIdentityForManifestWithControl(root, manifest, active);
+    try std.testing.expectEqual(@as(usize, 1), Probe.artifact_opens);
+    try std.testing.expect(Probe.artifact_reads > 1);
+    {
+        var construction = try PublishedArtifacts.init(a, observed_io, root, .{ .publication = manifest.managed_publication });
+        defer construction.deinit();
+        construction.verification_cache = &manager.verified_artifacts;
+        construction.verification_control = artifactVerificationControl(&active);
+        try std.testing.expectEqual(revision, try modelIdentityWithArtifacts(a, observed_io, root, manifest, &construction, active));
+        try std.testing.expectEqual(@as(usize, 1), Probe.artifact_opens);
+    }
+    try std.testing.expectEqual(revision, try modelIdentity(a, io, root, manifest));
 }
 
 test "model selection tokenizer-only preparation authenticates consumed JSON" {

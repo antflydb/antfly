@@ -30265,18 +30265,21 @@ pub const IndexManager = struct {
         });
     }
 
+    // A pinned index always projects the authoritative artifact. The caller's
+    // inline vector cannot establish its model revision.
+    fn denseReplayInlineVector(model_revision: ?[32]u8, write: mapper.DenseEmbeddingWrite) []const f32 {
+        return if (model_revision == null) write.vector else &.{};
+    }
+
     fn applyDenseEmbeddingWritesEntry(
         self: *IndexManager,
         store: *docstore_mod.DocStore,
         entry: *DenseIndex,
-        supplied_writes: []const mapper.DenseEmbeddingWrite,
+        writes: []const mapper.DenseEmbeddingWrite,
         batch_options: StoreBatchOptions,
         recovery_session: ?*LeannRecoverySession,
     ) !void {
-        try validateDenseEmbeddingWriteSources(entry, supplied_writes);
-        const revision_writes = if (entry.model_revision != null) try self.alloc.dupe(mapper.DenseEmbeddingWrite, supplied_writes) else null;
-        defer if (revision_writes) |owned| self.alloc.free(owned);
-        const writes = revision_writes orelse supplied_writes;
+        try validateDenseEmbeddingWriteSources(entry, writes);
         const keep_write = try self.alloc.alloc(bool, writes.len);
         defer self.alloc.free(keep_write);
         try computeDenseReplayKeepMask(self.alloc, writes, keep_write, entry.embedding_names.len > 0);
@@ -30295,13 +30298,6 @@ pub const IndexManager = struct {
         var store_batch = try store.beginWriteBatchWithOptions(store_batch_options);
         errdefer store_batch.abort();
         const store_txn = store_batch.asTxn();
-        if (revision_writes) |owned| {
-            for (owned, keep_write) |*write, keep| {
-                if (!keep or !std.mem.eql(u8, write.index_name, entry.config.name)) continue;
-                // Use the persisted vector and its revision during replay.
-                write.vector = &.{};
-            }
-        }
         const previous_load_session = active_dense_vector_load_session;
         const previous_vector_cache_bypass = entry.index.bypassExternalVectorCache();
         var vector_load_session: ?DenseVectorLoadSession = null;
@@ -30550,9 +30546,10 @@ pub const IndexManager = struct {
                 if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
                 const member_key = if (entry.embedding_names.len > 0) write.artifact_key.? else write.doc_key;
 
-                if (write.vector.len > 0) {
-                    if (entry.dims != write.vector.len) return error.InvalidVectorDimensions;
-                    const vector_fingerprint = denseVectorFingerprint(write.vector);
+                const inline_vector = denseReplayInlineVector(entry.model_revision, write);
+                if (inline_vector.len > 0) {
+                    if (entry.dims != inline_vector.len) return error.InvalidVectorDimensions;
+                    const vector_fingerprint = denseVectorFingerprint(inline_vector);
                     const assignment = try self.replaceDenseVectorIdFromPrefetchedState(
                         store_txn,
                         entry,
@@ -30565,19 +30562,19 @@ pub const IndexManager = struct {
                     );
                     if (entry.embedding_names.len == 0) {
                         const artifact_name = entry.embedding_name orelse entry.config.name;
-                        try self.writeDenseEmbeddingArtifactTxn(store_txn, write.doc_key, write.doc_key, artifact_name, "_embeddings", null, write.vector);
+                        try self.writeDenseEmbeddingArtifactTxn(store_txn, write.doc_key, write.doc_key, artifact_name, "_embeddings", null, inline_vector);
                     }
                     if (prefetched_mappings[write_index]) |mapping| {
                         if (!assignment.can_assume_absent and mapping.vector_fingerprint != null and std.mem.eql(u8, &mapping.vector_fingerprint.?, &vector_fingerprint)) continue;
                     }
                     all_vector_ids_new = all_vector_ids_new and assignment.can_assume_absent;
-                    try items.appendBorrowed(self.alloc, assignment.vector_id, write.vector, member_key);
+                    try items.appendBorrowed(self.alloc, assignment.vector_id, inline_vector, member_key);
                     if (assignment.can_assume_absent) {
                         try new_items.append(self.alloc, items.items.items[items.items.items.len - 1]);
                     } else {
                         try existing_items.append(self.alloc, items.items.items[items.items.items.len - 1]);
                     }
-                    item_vector_bytes += @as(u64, @intCast(write.vector.len * @sizeOf(f32)));
+                    item_vector_bytes += @as(u64, @intCast(inline_vector.len * @sizeOf(f32)));
                     item_metadata_bytes += @intCast(write.doc_key.len);
                     self.observeDenseApplyWorkingBytes(&dense_apply_working_bytes, preloaded_vector_bytes + item_vector_bytes + item_metadata_bytes);
                     try pending_mappings.append(self.alloc, .{
@@ -30748,6 +30745,7 @@ pub const IndexManager = struct {
         unreadable_artifact_keys: *std.ArrayListUnmanaged([]const u8),
         elided: ?*std.ArrayListUnmanaged(ElidedDenseArtifact),
     ) !bool {
+        const model_revision = if (self.denseIndex(index_name)) |entry| entry.model_revision else null;
         const dims_usize: usize = @intCast(dims);
         var pending = std.ArrayListUnmanaged(PendingDenseArtifactLoad).empty;
         defer pending.deinit(self.alloc);
@@ -30755,7 +30753,7 @@ pub const IndexManager = struct {
         for (writes, 0..) |write, write_index| {
             if (!keep_write[write_index]) continue;
             if (!std.mem.eql(u8, write.index_name, index_name)) continue;
-            if (write.vector.len > 0) continue;
+            if (denseReplayInlineVector(model_revision, write).len > 0) continue;
             const artifact_key = write.artifact_key orelse continue;
             try pending.append(self.alloc, .{
                 .write_index = write_index,
@@ -30778,7 +30776,6 @@ pub const IndexManager = struct {
         for (pending.items, 0..) |item, i| read_keys[i] = item.artifact_key;
         try session.getManySorted(store, read_keys, read_values);
 
-        const model_revision = if (self.denseIndex(index_name)) |entry| entry.model_revision else null;
         var fallback_count: usize = 0;
         for (pending.items, 0..) |item, i| {
             const raw = read_values[i] orelse {
@@ -30883,6 +30880,7 @@ pub const IndexManager = struct {
         unreadable_artifact_keys: *std.ArrayListUnmanaged([]const u8),
         elided: ?*std.ArrayListUnmanaged(ElidedDenseArtifact),
     ) !bool {
+        const model_revision = if (self.denseIndex(index_name)) |entry| entry.model_revision else null;
         const dims_usize: usize = @intCast(dims);
         var pending = std.ArrayListUnmanaged(PendingDenseArtifactLoad).empty;
         defer pending.deinit(self.alloc);
@@ -30890,7 +30888,7 @@ pub const IndexManager = struct {
         for (writes, 0..) |write, write_index| {
             if (!keep_write[write_index]) continue;
             if (!std.mem.eql(u8, write.index_name, index_name)) continue;
-            if (write.vector.len > 0) continue;
+            if (denseReplayInlineVector(model_revision, write).len > 0) continue;
             const artifact_key = write.artifact_key orelse continue;
             try pending.append(self.alloc, .{
                 .write_index = write_index,
@@ -30913,7 +30911,6 @@ pub const IndexManager = struct {
         for (pending.items, 0..) |item, i| read_keys[i] = item.artifact_key;
         try txn.getManySorted(read_keys, read_values);
 
-        const model_revision = if (self.denseIndex(index_name)) |entry| entry.model_revision else null;
         var fallback_count: usize = 0;
         for (pending.items, 0..) |item, i| {
             const raw = read_values[i] orelse {
@@ -39612,6 +39609,26 @@ test "ordered artifact inventory native backfill reconstructs pinned vectors fro
     try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
     try std.testing.expect((try manager.lookupDenseVectorId(&store, "semantic", "with-artifact")) != null);
     try std.testing.expect((try manager.lookupDenseVectorId(&store, "semantic", "without-artifact")) == null);
+
+    var index_name = "semantic".*;
+    var doc_key = "with-artifact".*;
+    var inline_vector = [_]f32{ 99, 99, 99 };
+    const replay = [_]mapper.DenseEmbeddingWrite{.{
+        .index_name = &index_name,
+        .doc_key = &doc_key,
+        .artifact_key = artifact_key,
+        .vector = &inline_vector,
+    }};
+    try manager.validateDenseEmbeddingArtifactsByName(&store, "semantic", &replay);
+    try entry.index.beginExperimentalPostingMutationCapture();
+    defer entry.index.cancelExperimentalPostingMutationCapture();
+    try manager.applyDenseEmbeddingWritesWithOptions(&store, &replay, .{});
+    try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
+    const wrong_revision = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAtRevisionAlloc(alloc, 1, true, @splat(0xbb), &.{ 1, 2 });
+    defer alloc.free(wrong_revision);
+    try store.put(artifact_key, wrong_revision);
+    try std.testing.expectError(error.ArtifactRepairRequired, manager.validateDenseEmbeddingArtifactsByName(&store, "semantic", &replay));
+    try std.testing.expectError(error.ArtifactRepairRequired, manager.applyDenseEmbeddingWritesWithOptions(&store, &replay, .{}));
 }
 
 test "fresh native dense backfill extends a shared vector generation without a source rescan" {

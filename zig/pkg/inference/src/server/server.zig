@@ -26613,16 +26613,20 @@ pub const Node = struct {
                 const path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, name, category) catch |err| return requestModelResolutionError(ctx, err);
                 const path = path_selection.path;
                 defer ctx.allocator.free(path);
-                var manifest = self.loadBoundManifest(ctx.allocator, path, false, self.bindModelSelection(path_selection, null)) catch |err| return modelLoadFailureResponse(ctx, err);
+                const control = self.bindModelSelection(path_selection, httpInferenceExecutionControl(self, ctx));
+                var manifest = self.loadBoundManifest(ctx.allocator, path, false, control) catch |err| return modelLoadFailureResponse(ctx, err);
                 defer manifest.deinit();
                 var dense_output = manifest.denseEmbeddingOutput();
-                const revision = if (try self.model_manager.acquireLoadedModelWithControl(path, self.bindModelSelection(path_selection, null))) |cached| loaded: {
+                const cached_model = self.model_manager.acquireLoadedModelWithControl(path, control) catch |err| return modelLoadFailureResponse(ctx, err);
+                const revision = if (cached_model) |cached| loaded: {
                     var handle = cached;
                     defer handle.release();
                     // Geometry and revision must describe the same serving generation.
                     dense_output = handle.get().manifest.denseEmbeddingOutput();
-                    break :loaded handle.get().resolution_revision orelse if (std.mem.eql(u8, operation, "embed")) return error.InvalidEmbeddingIdentity else try self.model_manager.modelIdentityForManifest(path, manifest);
-                } else try self.model_manager.modelIdentityForManifest(path, manifest);
+                    if (handle.get().resolution_revision) |loaded_revision| break :loaded loaded_revision;
+                    if (std.mem.eql(u8, operation, "embed")) return error.InvalidEmbeddingIdentity;
+                    break :loaded self.model_manager.modelIdentityForManifestWithControl(path, manifest, control) catch |err| return modelLoadFailureResponse(ctx, err);
+                } else self.model_manager.modelIdentityForManifestWithControl(path, manifest, control) catch |err| return modelLoadFailureResponse(ctx, err);
                 const hex = std.fmt.bytesToHex(revision, .lower);
                 const catalog_allocator = catalog.arena.allocator();
                 try info.object.put(catalog_allocator, "model_revision", .{ .string = &hex });
