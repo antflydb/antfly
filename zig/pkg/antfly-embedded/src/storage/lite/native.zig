@@ -8251,6 +8251,12 @@ pub const NativeFile = struct {
         var observed_checkpoint: u64 = 0;
         var cold_attempts: u32 = 0;
         var publish_waits: u32 = 0;
+        // See `holdSidecarReadFence`; held until this open returns.
+        var sidecar_fence: ?std.Io.File = null;
+        defer if (sidecar_fence) |fence| {
+            fence.unlock(io);
+            fence.close(io);
+        };
         // Holding the sidecar writer lock (or an external writer lease) is
         // writer authority: nothing else appends while this open scans.
         const holds_authority = self.holdsWriterAuthority();
@@ -8292,12 +8298,21 @@ pub const NativeFile = struct {
             // Without a usable region there is no publication to bound by at
             // all: the same sidecar fence applies, and the reader waits for
             // that writer to finish instead.
-            if (replay_ceiling == null and !holds_authority) {
-                if (self.foreignSidecarWriterHeld(io)) {
-                    publish_waits += 1;
-                    if (publish_waits >= cold_publish_wait_polls) return error.FileBusy;
-                    try io.sleep(.fromMilliseconds(cold_publish_wait_poll_ms), .awake);
-                    continue :cold_scan;
+            //
+            // Sampling the sidecar before and after the scan is not enough: a
+            // writer could take it, append, fail its sync (its rollback
+            // leaves the bytes) and release it in between. Hold it shared for
+            // the rest of this open instead, so no writer can.
+            if (replay_ceiling == null and !holds_authority and sidecar_fence == null) {
+                switch (self.holdSidecarReadFence(io)) {
+                    .held => |fence| sidecar_fence = fence,
+                    .absent, .own => {},
+                    .busy => {
+                        publish_waits += 1;
+                        if (publish_waits >= cold_publish_wait_polls) return error.FileBusy;
+                        try io.sleep(.fromMilliseconds(cold_publish_wait_poll_ms), .awake);
+                        continue :cold_scan;
+                    },
                 }
             }
             // This process's own commits are already visible here through the
@@ -8362,73 +8377,74 @@ pub const NativeFile = struct {
                 const have_through = @max(existing_overlay.appliedThrough(), existing_overlay.decodedThrough());
                 // Copies of the records the overlay lacks, kept during the one
                 // unlocked read so installing them never rereads the log.
-                // Bounded: past `cold_catch_up_stage_limit` (or on an
-                // allocation failure) the rest is replayed from the log
-                // under the lock instead.
+                // Installed in batches: whenever the copies reach
+                // `cold_catch_up_stage_limit` (or a record alone exceeds it,
+                // installed from the replay's own buffer), the batch goes in
+                // under the overlay lock and the scan continues. Each lock
+                // hold decodes from memory only, never reads the file.
                 const Visit = struct {
+                    const VisitSelf = @This();
                     meta: *MetaCtx,
                     have_through: u64,
                     allocator: Allocator,
-                    staged: std.ArrayListUnmanaged(struct { sequence: u64, payload: []u8 }) = .empty,
+                    entry: *inode_lock.Entry,
+                    io: std.Io,
+                    staged: std.ArrayListUnmanaged(StagedRecord) = .empty,
                     staged_bytes: usize = 0,
-                    overflow_offset: ?u64 = null,
+                    decoded: u64 = 0,
+                    const StagedRecord = struct { sequence: u64, payload: []u8 };
                     fn onRecord(ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
                         const visit: *@This() = @ptrCast(@alignCast(ptr.?));
                         try MetaCtx.onRecord(visit.meta, record);
-                        if (record.commit_sequence <= visit.have_through or visit.overflow_offset != null) return;
-                        if (visit.staged_bytes + record.payload.len > cold_catch_up_stage_limit) {
-                            visit.overflow_offset = record.offset;
+                        if (record.commit_sequence <= visit.have_through) return;
+                        if (visit.staged_bytes + record.payload.len > cold_catch_up_stage_limit) try visit.flush(null);
+                        if (record.payload.len > cold_catch_up_stage_limit) {
+                            try visit.flush(.{ .sequence = record.commit_sequence, .payload = @constCast(record.payload) });
                             return;
                         }
-                        visit.staged.ensureUnusedCapacity(visit.allocator, 1) catch {
-                            visit.overflow_offset = record.offset;
-                            return;
-                        };
-                        const copy = visit.allocator.dupe(u8, record.payload) catch {
-                            visit.overflow_offset = record.offset;
-                            return;
-                        };
+                        try visit.staged.ensureUnusedCapacity(visit.allocator, 1);
+                        const copy = try visit.allocator.dupe(u8, record.payload);
                         visit.staged.appendAssumeCapacity(.{ .sequence = record.commit_sequence, .payload = copy });
                         visit.staged_bytes += copy.len;
+                    }
+                    /// Installs the staged batch, then `extra` (a record too
+                    /// large to copy), under the overlay lock.
+                    fn flush(visit: *@This(), extra: ?StagedRecord) anyerror!void {
+                        if (visit.staged.items.len == 0 and extra == null) return;
+                        const Install = struct {
+                            visit: *VisitSelf,
+                            extra: ?StagedRecord,
+                            fn run(ctx: *@This(), overlay: *redo_overlay.SharedRedoOverlay) anyerror!void {
+                                var through = @max(overlay.appliedThrough(), overlay.decodedThrough());
+                                for (ctx.visit.staged.items) |item| try ctx.apply(overlay, item, &through);
+                                if (ctx.extra) |item| try ctx.apply(overlay, item, &through);
+                                if (ctx.visit.decoded != 0) _ = overlay.replay_epoch.fetchAdd(1, .acq_rel);
+                            }
+                            fn apply(ctx: *@This(), overlay: *redo_overlay.SharedRedoOverlay, item: StagedRecord, through: *u64) !void {
+                                if (item.sequence <= through.*) return;
+                                try applyRedoRecordToOverlay(overlay, item.sequence, item.payload);
+                                overlay.noteDecoded(item.sequence);
+                                through.* = item.sequence;
+                                ctx.visit.decoded += 1;
+                            }
+                        };
+                        var install: Install = .{ .visit = visit, .extra = extra };
+                        try inode_lock.withRedoOverlayLock(visit.entry, visit.io, &install, Install.run);
+                        for (visit.staged.items) |item| visit.allocator.free(item.payload);
+                        visit.staged.clearRetainingCapacity();
+                        visit.staged_bytes = 0;
                     }
                     fn deinit(visit: *@This()) void {
                         for (visit.staged.items) |item| visit.allocator.free(item.payload);
                         visit.staged.deinit(visit.allocator);
                     }
                 };
-                var visit: Visit = .{ .meta = &meta_ctx, .have_through = have_through, .allocator = allocator };
+                var visit: Visit = .{ .meta = &meta_ctx, .have_through = have_through, .allocator = allocator, .entry = entry, .io = io };
                 defer visit.deinit();
                 meta_outcome = try redo_log.replayBounded(allocator, self.file, io, self.header.redo_log_offset + fold_start, self.header.redo_log_capacity - fold_start, folded_through, ceiling, scan_check.covered, Visit.onRecord, &visit);
                 meta_outcome.valid_bytes += fold_start;
-                if (visit.staged.items.len != 0 or visit.overflow_offset != null) {
-                    const Install = struct {
-                        file: *NativeFile,
-                        io: std.Io,
-                        visit: *Visit,
-                        fold_start: u64,
-                        floor: u64,
-                        ceiling: u64,
-                        covered: u64,
-                        decoded: u64 = 0,
-                        fn run(ctx: *@This(), overlay: *redo_overlay.SharedRedoOverlay) anyerror!void {
-                            var through = @max(ctx.floor, overlay.appliedThrough(), overlay.decodedThrough());
-                            for (ctx.visit.staged.items) |item| {
-                                if (item.sequence <= through) continue;
-                                try applyRedoRecordToOverlay(overlay, item.sequence, item.payload);
-                                overlay.noteDecoded(item.sequence);
-                                through = item.sequence;
-                                ctx.decoded += 1;
-                            }
-                            if (ctx.visit.overflow_offset) |offset| {
-                                const outcome = try replayIntoSharedOverlayFrom(ctx.file, ctx.io, overlay, ctx.fold_start + offset, through, ctx.ceiling, ctx.covered);
-                                ctx.decoded += outcome.valid_count;
-                            } else if (ctx.decoded != 0) _ = overlay.replay_epoch.fetchAdd(1, .acq_rel);
-                        }
-                    };
-                    var install: Install = .{ .file = self, .io = io, .visit = &visit, .fold_start = fold_start, .floor = @max(folded_through, have_through), .ceiling = ceiling, .covered = scan_check.covered };
-                    try inode_lock.withRedoOverlayLock(entry, io, &install, Install.run);
-                    if (install.decoded != 0) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
-                }
+                try visit.flush(null);
+                if (visit.decoded != 0) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
                 overlay_caught_up = true;
             } else {
                 meta_outcome = try redo_log.replayBounded(allocator, self.file, io, self.header.redo_log_offset + fold_start, self.header.redo_log_capacity - fold_start, folded_through, replay_ceiling, scan_check.covered, MetaCtx.onRecord, &meta_ctx);
@@ -10215,6 +10231,28 @@ pub const NativeFile = struct {
         });
     }
 
+    /// A shared hold on the sidecar writer lock: while held, no writer can
+    /// take the lease (it locks exclusively), so nothing can append, or
+    /// leave the bytes of a failed append, under an unbounded scan. `.own`
+    /// when this process holds the lock itself (its commits are visible
+    /// through the overlay anyway), `.absent` with no sidecar at all (no
+    /// writer has installed one; readers hold the data inode instead).
+    fn holdSidecarReadFence(self: *NativeFile, io: std.Io) union(enum) { held: std.Io.File, own, absent, busy } {
+        const lock_path = writerLockPathAlloc(self.allocator, io, self.path) catch return .busy;
+        defer self.allocator.free(lock_path);
+        const file = std.Io.Dir.cwd().openFile(io, lock_path, .{ .mode = .read_only }) catch |err| return if (err == error.FileNotFound) .absent else .busy;
+        if (ownSidecarLockHeld(io, file)) {
+            file.close(io);
+            return .own;
+        }
+        const locked = file.tryLock(io, .shared) catch false;
+        if (!locked) {
+            file.close(io);
+            return .busy;
+        }
+        return .{ .held = file };
+    }
+
     /// Whether another process holds the sidecar writer lock.
     fn foreignSidecarWriterHeld(self: *NativeFile, io: std.Io) bool {
         return sidecarWriterHeld(self.allocator, io, self.path);
@@ -10357,13 +10395,19 @@ pub const NativeFile = struct {
             floor: u64,
             unlogged_through: u64,
             outcome: redo_log.ReplayOutcome = undefined,
+            /// The last recovered record's checkpoint (roots, free map,
+            /// page count) the tip advanced to.
+            compact: ?CompactCheckpoint = null,
             fn run(ctx: *@This(), overlay: *redo_overlay.SharedRedoOverlay) anyerror!void {
                 const Visit = struct {
                     overlay: *redo_overlay.SharedRedoOverlay,
                     have_through: u64,
                     decoded: u64 = 0,
+                    compact: ?CompactCheckpoint = null,
                     fn onRecord(ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
                         const visit: *@This() = @ptrCast(@alignCast(ptr.?));
+                        if (record.payload.len < CompactCheckpoint.encoded_size) return error.InvalidNativeRedoRecord;
+                        visit.compact = CompactCheckpoint.decode(record.payload[0..CompactCheckpoint.encoded_size]);
                         if (record.commit_sequence <= visit.have_through) return;
                         try applyRedoRecordToOverlay(visit.overlay, record.commit_sequence, record.payload);
                         visit.overlay.noteDecoded(record.commit_sequence);
@@ -10375,6 +10419,7 @@ pub const NativeFile = struct {
                 if (ctx.start_offset > file.header.redo_log_capacity) return error.NativeRedoLogCorrupt;
                 ctx.outcome = try redo_log.replayBounded(file.allocator, file.file, ctx.io, file.header.redo_log_offset + ctx.start_offset, file.header.redo_log_capacity - ctx.start_offset, ctx.floor, null, ctx.unlogged_through, Visit.onRecord, &visit);
                 ctx.outcome.valid_bytes += ctx.start_offset;
+                ctx.compact = visit.compact;
                 if (visit.decoded != 0) _ = overlay.replay_epoch.fetchAdd(1, .acq_rel);
             }
         };
@@ -10402,6 +10447,20 @@ pub const NativeFile = struct {
             try self.file.sync(io);
         }
 
+        // The recovered records moved the tip: adopt the last one's roots,
+        // free map and page count with its sequence, as cold recovery does,
+        // keeping the physical fold boundary. Without them the next
+        // transaction would build on older roots and allocator bounds while
+        // claiming the recovered sequence.
+        if (scan.valid_count != 0) if (scan_ctx.compact) |compact| {
+            const active = self.header.active_checkpoint;
+            if (compact.commit_sequence > self.header.checkpoints[active].commit_sequence) {
+                var recovered_header = self.header;
+                recovered_header.checkpoints[active] = compact.toCheckpointSlot();
+                recovered_header.checkpoints[active].redo_folded_through = self.header.checkpoints[active].redo_folded_through;
+                try self.adoptIndexPublicationHeader(recovered_header);
+            }
+        };
         const last = @max(scan.last_sequence orelse 0, floor, redo.writer.last_sequence orelse 0);
         redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, capacity, scan.valid_bytes, if (last == 0) null else last);
         if (scan.valid_count != 0) {
@@ -39433,6 +39492,12 @@ test "lite redo log a region-less reset retry rebuilds the tail before appending
         try std.testing.expectEqual(RedoTailSource.own, first.redo.?.tail_source);
         try first.putDocument("gamma", "three");
         try first.commitTransaction();
+    }
+    // Region-less, nothing was published; the reader scans the log itself.
+    {
+        var region = try shared_lock_region.Region.open(std.heap.page_allocator, io, path);
+        defer region.close();
+        region.resetLogStateForTest();
     }
     var reopened = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
     defer reopened.close();

@@ -605,6 +605,18 @@ fn primaryStoreOpenMatchingCursor(
         },
     };
     const cursor = &out.state.primary_store;
+    // A shared-lane journal's per-hint lane holds only rows from the layout
+    // before the upgrade (every one also in the shared lane), never the newer
+    // writes: read the shared lane, filtered, from the start.
+    if (store.sharedReplayLane() and kind_ordinal != internal_keys.replay_all_kind) {
+        cursor.fallback_all = true;
+        cursor.openLane(internal_keys.replay_all_kind) catch |err| switch (err) {
+            error.ReplayIndexUnavailable => cursor.hint_exhausted = true,
+            else => return err,
+        };
+        if (cursor.entry == null) cursor.hint_exhausted = true;
+        return out;
+    }
     cursor.openLane(kind_ordinal) catch |err| switch (err) {
         error.ReplayIndexUnavailable => {
             cursor.hint_exhausted = true;

@@ -27,6 +27,7 @@ const apply_state = @import("../db/derived/apply_state.zig");
 const replay_reference = @import("../db/derived/replay_reference.zig");
 const internal_keys = @import("../internal_keys.zig");
 const replay_journal_format = @import("../replay_journal_format.zig");
+const docstore_root = @import("../docstore.zig");
 const native = @import("native.zig");
 const inode_lock = @import("inode_lock.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
@@ -6986,6 +6987,7 @@ pub const Store = struct {
             .write_batches = .atomic,
             .single_writer = true,
             .read_snapshots = .snapshot,
+            .shared_replay_lane = true,
         };
     }
 
@@ -19272,4 +19274,51 @@ test "lite native docstore sparse hint lane batches are bounded by scanned entri
     }
     try std.testing.expectEqual(total, seen.last);
     try std.testing.expectEqual(@as(usize, 2), batches);
+}
+
+// An upgraded journal keeps the base layout's per-hint latest marker and its
+// hint-lane rows, frozen: Lite writes only the shared lane now. The hint's
+// target must come from the producer head, or a consumer at the old marker
+// is told it has nothing newer to read.
+test "lite native docstore replay targets ignore a base-revision hint marker after an upgrade" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-replay-legacy-marker.aflite");
+    defer allocator.free(path);
+
+    const first = try encodeTestReplayRecord(allocator, 1, .full_text);
+    defer allocator.free(first);
+    const second = try encodeTestReplayRecord(allocator, 2, .full_text);
+    defer allocator.free(second);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    {
+        // The base layout: shared and per-hint copies of record 1, and the
+        // per-hint latest-sequence marker at 1.
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(internal_keys.replay_meta_init_key[0..], "");
+        var next_raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &next_raw, 2, .little);
+        try txn.put(replay_journal_format.legacy_next_sequence_key[0..], next_raw[0..]);
+        const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+        try txn.put(all_key[0..], first);
+        const lane_key = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 1);
+        try txn.put(lane_key[0..], first);
+        const marker_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(.full_text));
+        var marker_raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &marker_raw, 1, .little);
+        try txn.put(marker_key[0..], marker_raw[0..]);
+        try txn.commit();
+    }
+    var runtime = try store.runtimeStore(allocator);
+    defer runtime.deinit();
+    // A new write lands in the shared lane only.
+    try runtime.appendReplayOpaque(allocator, 2, second);
+
+    var docstore = try docstore_root.DocStore.openRuntime(allocator, &runtime);
+    defer docstore.close();
+    try std.testing.expectEqual(@as(u64, 2), try docstore.latestReplaySequenceForHint(.full_text, 1));
 }
