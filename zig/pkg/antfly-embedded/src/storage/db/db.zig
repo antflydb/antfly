@@ -49189,21 +49189,19 @@ pub const DB = struct {
                 ordinals[len] = std.math.cast(doc_set.DocOrdinal, row.row.ordinal);
                 len += 1;
                 if (len == batch_size) {
-                    delivery_started.* = true;
-                    if (try self.deliverOrderedBatch(delivery.allocator(), keys[0..len], ordinals[0..len], duration, now) == .stop) return true;
+                    if (try self.deliverOrderedBatch(delivery.allocator(), keys[0..len], ordinals[0..len], duration, now, delivery_started) == .stop) return true;
                     len = 0;
                     _ = delivery.reset(.retain_capacity);
                     batch_size = @min(keys.len, batch_size * 2);
                 }
             }
             if (len != 0) {
-                delivery_started.* = true;
-                _ = try self.deliverOrderedBatch(delivery.allocator(), keys[0..len], ordinals[0..len], duration, now);
+                _ = try self.deliverOrderedBatch(delivery.allocator(), keys[0..len], ordinals[0..len], duration, now, delivery_started);
             }
             return true;
         }
 
-        fn deliverOrderedBatch(self: *@This(), alloc: Allocator, keys: []const []const u8, ordinals: []const ?doc_set.DocOrdinal, duration: u64, now: u64) !docstore_mod.DocStore.ScanAction {
+        fn deliverOrderedBatch(self: *@This(), alloc: Allocator, keys: []const []const u8, ordinals: []const ?doc_set.DocOrdinal, duration: u64, now: u64, delivery_started: *bool) !docstore_mod.DocStore.ScanAction {
             const timestamps = if (duration == 0) null else try loadDocumentTimestampsManyWithIdentityShape(self.db, alloc, keys, true);
             defer if (timestamps) |values| alloc.free(values);
             for (keys, ordinals, 0..) |id, ordinal, i| {
@@ -49211,7 +49209,7 @@ pub const DB = struct {
                 if (timestamps) |values| if (values[i]) |ts| {
                     if (ttl_mod.isExpired(ts, duration, now)) continue;
                 };
-                if (try self.visitPreparedId(id, ordinal, true, true) == .stop) return .stop;
+                if (try self.visitPreparedId(id, ordinal, true, true, delivery_started) == .stop) return .stop;
             }
             return .@"continue";
         }
@@ -49425,10 +49423,10 @@ pub const DB = struct {
         }
 
         fn visitIdWithOrdinal(self: *@This(), id: []const u8, known_ordinal: ?doc_set.DocOrdinal, unique: bool) !docstore_mod.DocStore.ScanAction {
-            return self.visitPreparedId(id, known_ordinal, unique, false);
+            return self.visitPreparedId(id, known_ordinal, unique, false, null);
         }
 
-        fn visitPreparedId(self: *@This(), id: []const u8, known_ordinal: ?doc_set.DocOrdinal, unique: bool, expiry_checked: bool) !docstore_mod.DocStore.ScanAction {
+        fn visitPreparedId(self: *@This(), id: []const u8, known_ordinal: ?doc_set.DocOrdinal, unique: bool, expiry_checked: bool, delivery_started: ?*bool) !docstore_mod.DocStore.ScanAction {
             const ordinal = identity: {
                 var txn = try self.db.core.store.beginProbeTxn();
                 defer txn.abort();
@@ -49439,6 +49437,7 @@ pub const DB = struct {
                 if (!(if (self.req.identity_read_generation) |at| state.isVisibleAt(at) else state.isLive())) break :identity null;
                 break :identity ordinal;
             };
+            if (delivery_started) |started| started.* = true;
             return self.visitor(self.visitor_ctx, id, ordinal, unique, expiry_checked);
         }
     };

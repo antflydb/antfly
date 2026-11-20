@@ -1342,7 +1342,7 @@ test "optional numeric range cursor ordinal spill preserves newest mappings acro
     const a = std.testing.allocator;
     var segment = segment_mod.SegmentWriter.init(a);
     defer segment.deinit();
-    for ([_][]const u8{ "a", "b", "c", "d" }) |id| try segment.addStoredDoc(id, "{}");
+    for ([_][]const u8{ "a", "b", "a", "d" }) |id| try segment.addStoredDoc(id, "{}");
     try segment.addDocOrdinals(&.{ 9, 3, 9, 1 });
     const bytes = try segment.build();
     defer a.free(bytes);
@@ -1369,12 +1369,29 @@ test "optional numeric range cursor ordinal spill preserves newest mappings acro
 
     var frontier: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
     defer frontier.deinit(a);
-    try frontier.put(a, 0, "d");
+    try frontier.put(a, 0, "a");
     try frontier.put(a, 1, "absent");
     var key_matches = try snapshot.collectSortKeyFrontierDocNumsAlloc(a, frontier, .{}, &projection);
     defer key_matches.deinit();
     try std.testing.expectEqual(@as(usize, 1), key_matches.ordinals.count());
-    try std.testing.expectEqual(@as(?u32, 0), key_matches.ordinals.get(3));
+    try std.testing.expectEqual(@as(?u32, 0), key_matches.ordinals.get(2));
+
+    const shared = lease.entry.shared;
+    {
+        shared.lockDeletionExclusive();
+        defer shared.unlockDeletionExclusive();
+        if (shared.deleted == null) shared.deleted = roaring.RoaringBitmap.init(shared.allocator);
+        try shared.deleted.?.add(2);
+        shared.deleted_count.store(1, .release);
+    }
+    var ordinal_after = try projection.project(a, snapshot, &.{9}, .{});
+    defer ordinal_after.deinit();
+    try std.testing.expectEqual(@as(?u32, 9), ordinal_after.ordinals.get(0));
+    try std.testing.expectEqual(@as(?u32, null), ordinal_after.ordinals.get(2));
+    var key_after = try snapshot.collectSortKeyFrontierDocNumsAlloc(a, frontier, .{}, &projection);
+    defer key_after.deinit();
+    try std.testing.expectEqual(@as(?u32, 0), key_after.ordinals.get(0));
+    try std.testing.expectEqual(@as(?u32, null), key_after.ordinals.get(2));
 }
 
 test "graph predicate cache clones outside locks and pins evicted membership" {
@@ -2446,13 +2463,21 @@ pub const IndexSnapshot = struct {
         control: query_mod.ExecutionControl,
         newest_by_key: ?*std.AutoHashMapUnmanaged(u32, u32) = null,
 
-        pub fn add(self: LiveGraphFrontier, doc: u32, ordinal: u32) !void {
+        fn isLive(self: LiveGraphFrontier, doc: u32) !bool {
             const deleted = blk: {
                 try self.shared.lockDeletionSharedWithControl(self.control);
                 defer self.shared.unlockDeletionShared();
                 break :blk if (self.shared.deleted) |mask| mask.contains(doc - self.offset) else false;
             };
-            if (deleted) return;
+            return !deleted;
+        }
+
+        pub fn add(self: LiveGraphFrontier, doc: u32, ordinal: u32) !void {
+            if (!try self.isLive(doc)) return;
+            try self.record(doc, ordinal);
+        }
+
+        fn record(self: LiveGraphFrontier, doc: u32, ordinal: u32) !void {
             if (self.newest_by_key) |newest| {
                 const slot = try newest.getOrPut(self.target.alloc, ordinal);
                 if (!slot.found_existing or slot.value_ptr.* < doc) slot.value_ptr.* = doc;
@@ -2539,21 +2564,8 @@ pub const IndexSnapshot = struct {
 
     pub fn collectSortKeyFrontierDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl, projection: *SortOrdinalBatchProjection) !GraphFrontierDocs {
         projection.key_batches +|= 1;
-        if (projection.key_index == null) {
-            if (self.collectKeyDocNumsAlloc(alloc, frontier, control, false, projection)) |result| {
-                return result;
-            } else |err| {
-                if (err != error.QueryCandidateBudgetExceeded) return err;
-            }
-            try projection.buildKeySpill(alloc, self, control);
-        }
-        var result = GraphFrontierDocs.init(alloc);
-        errdefer result.deinit();
-        var keys = frontier.iterator();
-        while (keys.next()) |key| {
-            if (try projection.findKeySpill(key.value_ptr.*)) |doc| try result.add(doc, key.key_ptr.*);
-        }
-        return result;
+        try projection.ensureSegments(alloc, self.segments.len);
+        return self.collectKeyDocNumsAlloc(alloc, frontier, control, false, projection);
     }
 
     pub fn collectParentKeyDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl) !GraphFrontierDocs {
@@ -2756,8 +2768,18 @@ pub const IndexSnapshot = struct {
                 .control = control,
                 .newest_by_key = if (prefer_directory) &newest_by_key else null,
             };
+            if (sort_projection) |projection| {
+                if (projection.key_ranges[index]) |range| {
+                    try projection.readKeySpill(range, frontier, live);
+                    continue;
+                }
+            }
             if (prefer_directory or frontier.count() *| 8 < segment.reader.doc_count) {
-                if (try self.storedKeyDirectory(lease.entry, &scratch, match_parent, control, sort_projection)) |directory| {
+                const cached = self.storedKeyDirectory(lease.entry, &scratch, match_parent, control, sort_projection) catch |err| switch (err) {
+                    error.QueryCandidateBudgetExceeded => null,
+                    else => return err,
+                };
+                if (cached) |directory| {
                     defer directory.release();
                     var wanted = frontier.iterator();
                     while (wanted.next()) |entry| {
@@ -2789,7 +2811,15 @@ pub const IndexSnapshot = struct {
                     try keys.put(alloc, entry.value_ptr.*, entry.key_ptr.*);
                 }
             }
-            if (sort_projection) |projection| try projection.chargeScan(segment.reader.doc_count);
+            if (sort_projection) |projection| {
+                if (segment.reader.doc_count > projection.remaining_scan_rows) {
+                    const range = try projection.buildKeySpill(alloc, self, lease.entry, offset, control);
+                    projection.key_ranges[index] = range;
+                    try projection.readKeySpill(range, frontier, live);
+                    continue;
+                }
+                try projection.chargeScan(segment.reader.doc_count);
+            }
             for (0..segment.reader.doc_count) |i| {
                 if (i % 256 == 0) try control.check();
                 const doc: u32 = @intCast(i);
@@ -2857,7 +2887,11 @@ pub const IndexSnapshot = struct {
         const spill = @import("sql/spill.zig");
         const Datum = @import("sql/scalar.zig").Datum;
 
-        const SpillRange = struct { start: u64, end: u64 };
+        const SpillRange = struct {
+            start: u64,
+            end: u64,
+            bounds: ?segment_mod.InverseDocOrdinalReader.OrdinalBounds = null,
+        };
 
         spill_control: query_mod.ExecutionControl = .{},
         spill_manager: ?spill.Manager = null,
@@ -2866,11 +2900,12 @@ pub const IndexSnapshot = struct {
         ordinal_ranges: []?SpillRange = &.{},
         key_file: ?spill.File = null,
         key_index: ?spill.File = null,
+        key_ranges: []?SpillRange = &.{},
         remaining_scan_rows: u64 = 0,
         key_batches: u64 = 0,
         attempted_navigation: bool = false,
         navigation: ?*GraphOrdinalNavigation = null,
-        fallback: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+        fallback: std.ArrayListUnmanaged(u64) = .empty,
         scanned: std.DynamicBitSetUnmanaged = .{},
         bounds: []?segment_mod.InverseDocOrdinalReader.OrdinalBounds = &.{},
 
@@ -2894,6 +2929,7 @@ pub const IndexSnapshot = struct {
             if (self.key_file) |*file| file.close();
             if (self.key_index) |*file| file.close();
             alloc.free(self.ordinal_ranges);
+            alloc.free(self.key_ranges);
             if (self.spill_manager) |*manager| manager.deinit();
             if (self.navigation) |navigation| navigation.release();
             self.fallback.deinit(alloc);
@@ -2925,7 +2961,8 @@ pub const IndexSnapshot = struct {
                 defer offset += segment.reader.doc_count;
                 if (segment.liveDocCount() == 0 or self.scanned.isSet(i)) continue;
                 if (self.ordinal_ranges[i]) |range| {
-                    try readOrdinalSpill(&self.ordinal_file.?, range, ordinals, &out);
+                    const live = LiveGraphFrontier{ .target = &out, .shared = segment.shared, .offset = offset, .control = control };
+                    try readOrdinalSpill(&self.ordinal_file.?, range, sorted, live);
                     continue;
                 }
                 if (self.bounds[i]) |bounds| {
@@ -2944,7 +2981,7 @@ pub const IndexSnapshot = struct {
                     while (matches.next()) |match| try out.add(match.key_ptr.*, match.value_ptr.*);
                     continue;
                 }
-                const retain_segment = segment.reader.doc_count <= fallback_ordinal_limit -| self.fallback.count();
+                const retain_segment = segment.reader.doc_count <= fallback_ordinal_limit -| self.fallback.items.len;
                 if (!retain_segment and !self.attempted_navigation) {
                     self.attempted_navigation = true;
                     self.navigation = snapshot.graph_predicates.acquireOrdinalNavigation();
@@ -2956,26 +2993,35 @@ pub const IndexSnapshot = struct {
                 if (!retain_segment) {
                     const range = try self.buildOrdinalSpill(alloc, snapshot, lease.entry, offset, control);
                     self.ordinal_ranges[i] = range;
-                    try readOrdinalSpill(&self.ordinal_file.?, range, ordinals, &out);
+                    const live = LiveGraphFrontier{ .target = &out, .shared = segment.shared, .offset = offset, .control = control };
+                    try readOrdinalSpill(&self.ordinal_file.?, range, sorted, live);
                     continue;
                 }
                 try self.chargeScan(segment.reader.doc_count);
-                try lease.entry.shared.lockDeletionSharedWithControl(control);
-                defer lease.entry.shared.unlockDeletionShared();
                 var cursor = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
                 for (0..segment.reader.doc_count) |doc| {
                     if (doc % 256 == 0) try control.check();
                     const local: u32 = @intCast(doc);
-                    if (lease.entry.shared.deleted) |deleted| if (deleted.contains(local)) continue;
                     const ordinal = (try cursor.get(local)) orelse continue;
                     const global = offset + local;
-                    const slot = try self.fallback.getOrPut(alloc, ordinal);
-                    if (!slot.found_existing or slot.value_ptr.* < global) slot.value_ptr.* = global;
+                    try self.fallback.append(alloc, (@as(u64, ordinal) << 32) | global);
                 }
                 self.scanned.set(i);
             }
-            for (ordinals) |ordinal| {
-                if (self.fallback.get(ordinal)) |doc| try out.add(doc, ordinal);
+            for (self.fallback.items) |pair| {
+                try control.check();
+                const ordinal: u32 = @intCast(pair >> 32);
+                const pos = firstAtLeast(sorted, ordinal);
+                if (pos == sorted.len or sorted[pos] != ordinal) continue;
+                const doc: u32 = @truncate(pair);
+                const resolved = snapshot.resolveDocId(doc) orelse return error.InvalidSegment;
+                const live = LiveGraphFrontier{
+                    .target = &out,
+                    .shared = snapshot.segments[resolved.seg_idx].shared,
+                    .offset = doc - resolved.local_id,
+                    .control = control,
+                };
+                try live.add(doc, ordinal);
             }
             return out;
         }
@@ -2987,6 +3033,8 @@ pub const IndexSnapshot = struct {
             @memset(self.bounds, null);
             self.ordinal_ranges = try alloc.alloc(?SpillRange, len);
             @memset(self.ordinal_ranges, null);
+            self.key_ranges = try alloc.alloc(?SpillRange, len);
+            @memset(self.key_ranges, null);
         }
 
         fn spillManager(self: *@This(), alloc: Allocator, snapshot: *const IndexSnapshot, control: query_mod.ExecutionControl) *spill.Manager {
@@ -3013,132 +3061,88 @@ pub const IndexSnapshot = struct {
             var sorter = spill.Sort.init(alloc, manager, &.{.{}}, 512 * 1024);
             defer sorter.deinit();
             var cursor = try segment_mod.DocOrdinalCursor.init(&entry.reader);
-            var start: u32 = 0;
-            while (start < entry.reader.doc_count) {
-                try control.check();
-                var rows: [256]struct { ordinal: u32, doc: u32 } = undefined;
-                var len: usize = 0;
-                const end = @min(entry.reader.doc_count, start +| rows.len);
-                {
-                    try entry.shared.lockDeletionSharedWithControl(control);
-                    defer entry.shared.unlockDeletionShared();
-                    for (start..end) |doc| {
-                        const local: u32 = @intCast(doc);
-                        if (entry.shared.deleted) |deleted| if (deleted.contains(local)) continue;
-                        const ordinal = (try cursor.get(local)) orelse continue;
-                        rows[len] = .{ .ordinal = ordinal, .doc = offset + local };
-                        len += 1;
-                    }
-                }
-                for (rows[0..len]) |row| {
-                    try sorter.add(.{ .keys = &.{Datum.fromJson(.{ .integer = row.ordinal })}, .values = &.{}, .ordinal = row.doc });
-                }
-                start = end;
+            // Keep every physical mapping. Deletion visibility is
+            // checked when a batch uses the spill, including after rollback.
+            for (0..entry.reader.doc_count) |doc| {
+                if (doc % 256 == 0) try control.check();
+                const local: u32 = @intCast(doc);
+                const ordinal = (try cursor.get(local)) orelse continue;
+                try sorter.add(.{ .keys = &.{Datum.fromJson(.{ .integer = ordinal })}, .values = &.{}, .ordinal = offset + local });
             }
             try sorter.finish();
             if (self.ordinal_file == null) self.ordinal_file = try manager.create();
             const file = &self.ordinal_file.?;
             const run_start = file.size;
-            var pending: ?u64 = null;
+            var bounds: ?segment_mod.InverseDocOrdinalReader.OrdinalBounds = null;
             var buffer: [4096]u8 = undefined;
             var len: usize = 0;
             while (try sorter.nextLeased()) |row| {
                 defer row.release();
                 const ordinal: u32 = @intCast((try row.keyCell(0)).value.integer);
+                if (bounds) |*current| current.max = ordinal else bounds = .{ .min = ordinal, .max = ordinal };
                 const pair = (@as(u64, ordinal) << 32) | row.row.ordinal;
-                if (pending) |previous| {
-                    if (previous >> 32 == ordinal) {
-                        pending = @max(previous, pair);
-                        continue;
-                    }
-                    std.mem.writeInt(u64, buffer[len..][0..8], previous, .big);
-                    len += 8;
-                    if (len == buffer.len) {
-                        try file.writeRaw(file.size, &buffer);
-                        len = 0;
-                    }
-                }
-                pending = pair;
-            }
-            if (pending) |pair| {
                 std.mem.writeInt(u64, buffer[len..][0..8], pair, .big);
                 len += 8;
+                if (len == buffer.len) {
+                    try file.writeRaw(file.size, &buffer);
+                    len = 0;
+                }
             }
             if (len != 0) try file.writeRaw(file.size, buffer[0..len]);
-            return .{ .start = run_start / 8, .end = file.size / 8 };
+            return .{ .start = run_start / 8, .end = file.size / 8, .bounds = bounds };
         }
 
-        fn readOrdinalSpill(file: *spill.File, range: SpillRange, ordinals: []const u32, out: *GraphFrontierDocs) !void {
-            for (ordinals) |ordinal| {
+        fn readOrdinalSpill(file: *spill.File, range: SpillRange, sorted: []const u32, live: LiveGraphFrontier) !void {
+            const bounds = range.bounds orelse return;
+            const start = firstAtLeast(sorted, bounds.min);
+            const end = firstAtLeast(sorted, @as(u64, bounds.max) + 1);
+            for (sorted[start..end]) |ordinal| {
                 var lo = range.start;
                 var hi = range.end;
                 var bytes: [8]u8 = undefined;
                 while (lo < hi) {
                     const mid = lo + (hi - lo) / 2;
                     try file.readRaw(mid * 8, &bytes);
+                    if (std.mem.readInt(u64, &bytes, .big) >> 32 <= ordinal) lo = mid + 1 else hi = mid;
+                }
+                while (lo > range.start) {
+                    lo -= 1;
+                    try file.readRaw(lo * 8, &bytes);
                     const pair = std.mem.readInt(u64, &bytes, .big);
-                    const key: u32 = @intCast(pair >> 32);
-                    if (key == ordinal) {
-                        try out.add(@truncate(pair), ordinal);
+                    if (pair >> 32 != ordinal) break;
+                    const doc: u32 = @truncate(pair);
+                    if (try live.isLive(doc)) {
+                        try live.target.add(doc, ordinal);
                         break;
                     }
-                    if (key < ordinal) lo = mid + 1 else hi = mid;
                 }
             }
         }
 
-        fn buildKeySpill(self: *@This(), alloc: Allocator, snapshot: *const IndexSnapshot, control: query_mod.ExecutionControl) !void {
+        fn buildKeySpill(self: *@This(), alloc: Allocator, snapshot: *const IndexSnapshot, entry: *const SegmentEntry, offset: u32, control: query_mod.ExecutionControl) !SpillRange {
             const manager = self.spillManager(alloc, snapshot, control);
             var sorter = spill.Sort.init(alloc, manager, &.{.{}}, 512 * 1024);
             defer sorter.deinit();
             var scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
             defer scratch.deinit();
-            var offset: u32 = 0;
-            for (snapshot.segments, 0..) |segment, i| {
-                try control.check();
-                defer offset += segment.reader.doc_count;
-                if (segment.liveDocCount() == 0) continue;
-                var lease = try snapshot.leaseSegment(i);
-                defer lease.deinit();
-                for (0..segment.reader.doc_count) |doc| {
-                    if (doc % 256 == 0) try control.check();
-                    const local: u32 = @intCast(doc);
-                    {
-                        try lease.entry.shared.lockDeletionSharedWithControl(control);
-                        defer lease.entry.shared.unlockDeletionShared();
-                        if (lease.entry.shared.deleted) |deleted| if (deleted.contains(local)) continue;
-                    }
-                    scratch.reset();
-                    const key = (try lease.entry.reader.storedIdScoped(scratch.allocator(), local)) orelse continue;
-                    try sorter.add(.{ .keys = &.{Datum.fromJson(.{ .string = key })}, .values = &.{}, .ordinal = offset + local });
-                }
+            for (0..entry.reader.doc_count) |doc| {
+                if (doc % 256 == 0) try control.check();
+                const local: u32 = @intCast(doc);
+                scratch.reset();
+                const key = (try entry.reader.storedIdScoped(scratch.allocator(), local)) orelse continue;
+                try sorter.add(.{ .keys = &.{Datum.fromJson(.{ .string = key })}, .values = &.{}, .ordinal = offset + local });
             }
             try sorter.finish();
-            var keys = try manager.create();
-            errdefer keys.close();
-            var index = try manager.create();
-            errdefer index.close();
-            var last: std.ArrayListUnmanaged(u8) = .empty;
-            defer last.deinit(alloc);
-            var newest: ?u32 = null;
+            if (self.key_file == null) self.key_file = try manager.create();
+            if (self.key_index == null) self.key_index = try manager.create();
+            const index = &self.key_index.?;
+            const start = index.size / 16;
             while (try sorter.nextLeased()) |row| {
                 defer row.release();
                 const key = (try row.keyCell(0)).value.string;
-                const doc: u32 = @intCast(row.row.ordinal);
-                if (newest) |prior| {
-                    if (std.mem.eql(u8, last.items, key)) {
-                        newest = @max(prior, doc);
-                        continue;
-                    }
-                    try appendKeySpill(&keys, &index, last.items, prior);
-                }
-                last.clearRetainingCapacity();
-                try last.appendSlice(alloc, key);
-                newest = doc;
+                try appendKeySpill(&self.key_file.?, index, key, @intCast(row.row.ordinal));
             }
-            if (newest) |doc| try appendKeySpill(&keys, &index, last.items, doc);
-            self.key_file = keys;
-            self.key_index = index;
+            return .{ .start = start, .end = index.size / 16 };
         }
 
         fn appendKeySpill(keys: *spill.File, index: *spill.File, key: []const u8, doc: u32) !void {
@@ -3164,23 +3168,34 @@ pub const IndexSnapshot = struct {
             return std.math.order(length, key.len);
         }
 
-        fn findKeySpill(self: *@This(), key: []const u8) !?u32 {
+        fn readKeySpill(self: *@This(), range: SpillRange, frontier: std.AutoHashMapUnmanaged(u32, []const u8), live: LiveGraphFrontier) !void {
             const index = &self.key_index.?;
-            var low: u64 = 0;
-            var high = index.size / 16;
-            while (low < high) {
-                const mid = low + (high - low) / 2;
+            var keys = frontier.iterator();
+            while (keys.next()) |wanted| {
+                const key = wanted.value_ptr.*;
+                var low = range.start;
+                var high = range.end;
                 var record: [16]u8 = undefined;
-                try index.readRaw(mid * 16, &record);
-                const offset = std.mem.readInt(u64, record[0..8], .big);
-                const length = std.mem.readInt(u32, record[8..12], .big);
-                switch (try compareKeySpill(&self.key_file.?, offset, length, key)) {
-                    .lt => low = mid + 1,
-                    .gt => high = mid,
-                    .eq => return std.mem.readInt(u32, record[12..16], .big),
+                while (low < high) {
+                    const mid = low + (high - low) / 2;
+                    try index.readRaw(mid * 16, &record);
+                    const offset = std.mem.readInt(u64, record[0..8], .big);
+                    const length = std.mem.readInt(u32, record[8..12], .big);
+                    if (try compareKeySpill(&self.key_file.?, offset, length, key) == .gt) high = mid else low = mid + 1;
+                }
+                while (low > range.start) {
+                    low -= 1;
+                    try index.readRaw(low * 16, &record);
+                    const offset = std.mem.readInt(u64, record[0..8], .big);
+                    const length = std.mem.readInt(u32, record[8..12], .big);
+                    if (try compareKeySpill(&self.key_file.?, offset, length, key) != .eq) break;
+                    const doc = std.mem.readInt(u32, record[12..16], .big);
+                    if (try live.isLive(doc)) {
+                        try live.record(doc, wanted.key_ptr.*);
+                        break;
+                    }
                 }
             }
-            return null;
         }
 
         fn addNavigation(
