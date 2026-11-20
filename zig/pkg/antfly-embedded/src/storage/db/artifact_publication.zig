@@ -1278,17 +1278,22 @@ pub const LocalDagBinding = struct {
     pub fn requireDeclared(alloc: std.mem.Allocator, txn: anytype, command: Command, config_json: []const u8) !void {
         const syntax = try std.json.parseFromSlice(std.json.Value, alloc, config_json, .{ .parse_numbers = false });
         defer syntax.deinit();
-        if (syntax.value != .object) return;
-        const edges = syntax.value.object.get("edge_types") orelse return;
-        if (edges != .array) return;
         var constrained: usize = 0;
-        for (edges.array.items) |edge| {
-            if (edge != .object) continue;
-            const topology = edge.object.get("topology") orelse continue;
-            if (topology == .string and std.mem.eql(u8, topology.string, "dag")) constrained += 1;
+        const edges = if (syntax.value == .object) syntax.value.object.get("edge_types") else null;
+        if (edges) |edge_types| {
+            if (edge_types == .array) for (edge_types.array.items) |edge| {
+                if (edge != .object) continue;
+                const topology = edge.object.get("topology") orelse continue;
+                if (topology == .string and std.mem.eql(u8, topology.string, "dag")) constrained += 1;
+            };
         }
-        if (constrained == 0) return;
-        const parsed = (try read(alloc, txn, command)) orelse return error.GraphConstraintNotReady;
+        if (constrained == 0 and !try hasBindings(txn)) return;
+        const parsed = (try read(alloc, txn, command)) orelse {
+            if (constrained == 0) return;
+            return error.GraphConstraintNotReady;
+        };
+        // A certified generation keeps its original domain membership.
+        // Publishing a replacement configuration requires a new generation.
         defer parsed.deinit();
         if (constrained != parsed.value.edge_types.len) return error.InvalidDagDomain;
         var config = try @import("catalog/index_manager.zig").parseGraphActivationConfig(alloc, config_json);

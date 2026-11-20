@@ -235,6 +235,13 @@ test "ordered artifact inventory graph publication validates guards generations 
             try std.testing.expectError(error.GraphConstraintBusy, inventory.stageOrdered(alloc, &writer, missing, 2));
             try fence.release(&writer);
             try inventory.stageOrdered(alloc, &writer, missing, 2);
+            try publication.LocalDagBinding.requireDeclared(alloc, &writer, command, config_json);
+            try std.testing.expectError(error.InvalidDagDomain, publication.LocalDagBinding.requireDeclared(alloc, &writer, command,
+                \\{"edge_types":[{"name":"links","topology":"graph"}]}
+            ));
+            var new_generation = command;
+            new_generation.producer_generation += 1;
+            try publication.LocalDagBinding.requireDeclared(alloc, &writer, new_generation, "{}");
             try binding.stage(alloc, &writer, command);
             try writer.commit();
         }
