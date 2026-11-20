@@ -49508,7 +49508,7 @@ pub const DB = struct {
             offset: usize = 0,
             initialized: bool = false,
             exhausted: bool = false,
-            incomplete: bool = false,
+            proof_failure: ?anyerror = null,
             explicit_keys: ?std.StringHashMapUnmanaged(void) = null,
 
             fn deinit(self: *SourceRecovery) void {
@@ -49590,7 +49590,7 @@ pub const DB = struct {
                         if (recovery.reverse.contains(id)) continue;
                         const retained = cache_alloc.dupe(u8, id) catch return original_error;
                         recovery.reverse.put(cache_alloc, retained, .{ .ordinal = ordinal }) catch return original_error;
-                    } else if (!recovery.incomplete) {
+                    } else if (recovery.proof_failure == null) {
                         missing[missing_count] = ordinal;
                         missing_count += 1;
                     }
@@ -49600,14 +49600,18 @@ pub const DB = struct {
                     self.readSourceVisibility(&recovery.read, missing[0..missing_count], states[0..missing_count]) catch |err| {
                         if (!recoverableSourceIdentityError(err)) return err;
                         // A failed proof cannot establish a nonmember.
-                        recovery.incomplete = true;
+                        recovery.proof_failure = err;
                     };
-                    if (!recovery.incomplete) recovery.incomplete = std.mem.indexOfScalar(bool, states[0..missing_count], true) != null;
+                    if (recovery.proof_failure == null and std.mem.indexOfScalar(bool, states[0..missing_count], true) != null) {
+                        recovery.proof_failure = error.InvalidDocIdentity;
+                    }
                 }
                 try self.recoverKnownSourceKeys(&recovery.read, recovery, &pending, ordinals, visible);
             }
             if (pending.count() == 0) return;
-            if (!recovery.incomplete and recovery.explicit_keys == null) {
+            const proof_failure = recovery.proof_failure;
+            if (proof_failure == error.StorageReadTemporarilyUnavailable) return error.StorageReadTemporarilyUnavailable;
+            if (proof_failure == null and recovery.explicit_keys == null) {
                 var explicit: std.StringHashMapUnmanaged(void) = .empty;
                 for ([_]*const doc_set.ResolvedDocSet{ set, &constraints.legacy_filter }) |key_set| {
                     if (key_set.* != .doc_keys) continue;
@@ -49623,7 +49627,7 @@ pub const DB = struct {
             while (unresolved.next()) |entry| {
                 const slot = entry.value_ptr.*;
                 const failure = failures[slot].?;
-                if (!recovery.incomplete) {
+                if (recovery.proof_failure == null) {
                     if (!recovery.explicit_keys.?.contains(entry.key_ptr.*)) continue;
                     if (failure == error.NotFound) {
                         visible[slot] = true;
@@ -158368,6 +158372,27 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
             try std.testing.expect(historical.reverse.get(writes[1].key).?.visible == false);
             historical_scan.db = undefined;
         }
+
+        var interrupted: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{
+            .arena = std.heap.ArenaAllocator.init(a),
+            .initialized = true,
+            .exhausted = true,
+            .proof_failure = error.StorageReadTemporarilyUnavailable,
+        };
+        defer interrupted.deinit();
+        try std.testing.expectError(error.StorageReadTemporarilyUnavailable, cached_scan.recoverScopedSourceBatch(
+            options,
+            &interrupted,
+            a,
+            &.{writes[2].key},
+            &.{error.NotFound},
+            visible[0..1],
+            resolved[0..1],
+        ));
+        try interrupted.reverse.put(interrupted.arena.allocator(), writes[1].key, .{ .ordinal = endpoints[0], .visible = true });
+        try cached_scan.recoverScopedSourceBatch(options, &interrupted, a, &.{writes[1].key}, &.{error.NotFound}, visible[0..1], resolved[0..1]);
+        try std.testing.expect(visible[0]);
+        try std.testing.expectEqual(@as(?doc_set.DocOrdinal, endpoints[0]), resolved[0]);
 
         // Stop inside the first bitmap page, then resume across later pages.
         var bitmap_scope = @import("../../encoding/roaring.zig").RoaringBitmap.init(a);
