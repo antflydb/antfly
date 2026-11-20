@@ -26329,6 +26329,37 @@ pub const Node = struct {
         return try allocator.dupe(u8, stripRuntimeTaskPrefix(relative));
     }
 
+    fn runtimeModelAlloc(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        canonical_models_dir: []const u8,
+        entry: model_manager_mod.RuntimeSnapshotEntry,
+        preferred_task: ?api.ModelKind,
+    ) !?api.ModelInstance {
+        var task_mask = entry.task_mask;
+        var listing_manifest: ?manifest_mod.ModelManifest = null;
+        defer if (listing_manifest) |*manifest| manifest.deinit();
+        if (task_mask == 0 and entry.model_type == null) {
+            listing_manifest = (manifest_mod.loadListingCandidateFromDir(allocator, entry.model_dir) catch null);
+            if (listing_manifest) |*manifest| task_mask = runtimeManifestTaskMask(manifest);
+        }
+        var tasks = std.ArrayList(api.ModelKind).empty;
+        defer tasks.deinit(allocator);
+        for (runtime_model_tasks) |task| {
+            if (task_mask != 0) {
+                if (task_mask & runtimeTaskBit(task) == 0) continue;
+            } else if (entry.model_type) |kind| {
+                if (runtimeModelKind(kind) != task) continue;
+            } else {
+                if (preferred_task == null or preferred_task.? != task) continue;
+            }
+            try tasks.append(allocator, task);
+        }
+        const model = (try self.runtimeIdentifier(allocator, io, canonical_models_dir, entry)) orelse return null;
+        return try apiRuntime(allocator, entry, model, try tasks.toOwnedSlice(allocator));
+    }
+
     /// Build one resource per incarnation, independent of task catalog aliases.
     fn runtimeModelsAlloc(
         self: *Node,
@@ -26346,27 +26377,8 @@ pub const Node = struct {
         defer allocator.free(canonical_models_dir);
         for (snapshot.entries) |entry| {
             if (only_runtime_id) |wanted| if (entry.runtime_id != wanted) continue;
-            var task_mask = entry.task_mask;
-            var listing_manifest: ?manifest_mod.ModelManifest = null;
-            defer if (listing_manifest) |*manifest| manifest.deinit();
-            if (task_mask == 0 and entry.model_type == null) {
-                listing_manifest = (manifest_mod.loadListingCandidateFromDir(allocator, entry.model_dir) catch null);
-                if (listing_manifest) |*manifest| task_mask = runtimeManifestTaskMask(manifest);
-            }
-            var tasks = std.ArrayList(api.ModelKind).empty;
-            defer tasks.deinit(allocator);
-            for (runtime_model_tasks) |task| {
-                if (task_mask != 0) {
-                    if (task_mask & runtimeTaskBit(task) == 0) continue;
-                } else if (entry.model_type) |kind| {
-                    if (runtimeModelKind(kind) != task) continue;
-                } else {
-                    if (preferred_task == null or preferred_task.? != task) continue;
-                }
-                try tasks.append(allocator, task);
-            }
-            const model = (try self.runtimeIdentifier(allocator, io, canonical_models_dir, entry)) orelse continue;
-            try instances.append(allocator, try apiRuntime(allocator, entry, model, try tasks.toOwnedSlice(allocator)));
+            if (try self.runtimeModelAlloc(allocator, io, canonical_models_dir, entry, preferred_task)) |instance|
+                try instances.append(allocator, instance);
         }
         return try instances.toOwnedSlice(allocator);
     }
@@ -26483,7 +26495,7 @@ pub const Node = struct {
         }
 
         if (expected_revision) |required| {
-            const manifest_revision = self.model_manager.modelIdentityForManifest(resolved_path, manifest) catch |err|
+            const manifest_revision = self.model_manager.modelIdentityForManifestWithControl(resolved_path, manifest, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             requireLoadedEmbeddingRevision(required, manifest_revision) catch return embeddingRevisionFailureResponse(ctx);
         }
@@ -26533,16 +26545,38 @@ pub const Node = struct {
             var handle = self.model_manager.acquireFromDirWithControl(resolved_path, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             defer handle.release();
-            requireLoadedEmbeddingRevision(expected_revision, handle.get().resolution_revision) catch return embeddingRevisionFailureResponse(ctx);
-            runtime_id = handle.get().runtime_id;
+            return try self.acknowledgeModelActivation(ctx, &handle, request.task, expected_revision, execution_control);
         }
 
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
         const models = try self.runtimeModelsAlloc(arena.allocator(), ctx.io, runtime_id, request.task);
-        if (models.len == 0) return ctx.status(409).json(.{ .@"error" = "INSTANCE_EVICTED", .message = "instance was evicted after loading; retry", .retryable = true });
-        try acknowledgeEmbeddingRevision(ctx, expected_revision);
+        if (models.len == 0) return activationInstanceEvicted(ctx);
         return ctx.json(models[0]);
+    }
+
+    fn acknowledgeModelActivation(
+        self: *Node,
+        ctx: *httpx.Context,
+        handle: *const model_manager_mod.ModelHandle,
+        task: api.ModelKind,
+        expected_revision: ?[32]u8,
+        execution_control: InferenceExecutionControl,
+    ) !httpx.Response {
+        requireLoadedEmbeddingRevision(expected_revision, handle.get().resolution_revision) catch return embeddingRevisionFailureResponse(ctx);
+        const entry = handle.activationSnapshot(runtimeManifestTaskMask) orelse return activationInstanceEvicted(ctx);
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const canonical_models_dir = try realPathExistingAlloc(a, ctx.io, self.config.models_dir);
+        const instance = (try self.runtimeModelAlloc(a, ctx.io, canonical_models_dir, entry, task)) orelse return activationInstanceEvicted(ctx);
+        execution_control.check() catch |err| return modelLoadFailureResponse(ctx, err);
+        try acknowledgeEmbeddingRevision(ctx, expected_revision);
+        return ctx.json(instance);
+    }
+
+    fn activationInstanceEvicted(ctx: *httpx.Context) !httpx.Response {
+        return ctx.status(409).json(.{ .@"error" = "INSTANCE_EVICTED", .message = "instance was evicted after loading; retry", .retryable = true });
     }
 
     pub fn unloadModelInstance(self: *Node, ctx: *httpx.Context, instance_id: []const u8) !httpx.Response {
@@ -35756,6 +35790,30 @@ test "runtime model instances preserve shared task identity and survive missing 
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
+    // The acknowledgement borrows the exact runtime while its handle keeps
+    // eviction blocked, but reports the residency after activation returns.
+    {
+        model.active_handles = 1;
+        var handle: model_manager_mod.ModelHandle = .{ .manager = &node.model_manager, .model = model };
+        defer handle.release();
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/models/instances");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        const revision: [32]u8 = @splat(0x17);
+        model.resolution_revision = revision;
+        try std.testing.expectEqualDeep(model_manager_mod.UnloadRuntimeResult{ .in_use = 1 }, node.model_manager.unloadRuntime(model.runtime_id));
+        var response = try node.acknowledgeModelActivation(&ctx, &handle, .generator, revision, .{});
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expectEqualStrings(&std.fmt.bytesToHex(revision, .lower), response.headers.get(embedding_revision.response_header).?);
+        const body = try std.json.parseFromSlice(std.json.Value, allocator, response.body.?, .{});
+        defer body.deinit();
+        try std.testing.expectEqualStrings("00000000000000000000000000001234", body.value.object.get("id").?.string);
+        try std.testing.expectEqual(@as(i64, 0), body.value.object.get("active_handles").?.integer);
+        try std.testing.expect(body.value.object.get("unloadable").?.bool);
+        try std.testing.expectEqual(@as(usize, 1), handle.get().active_handles);
+    }
     const models = try node.runtimeModelsAlloc(arena.allocator(), std.testing.io, null, null);
     try std.testing.expectEqual(@as(usize, 1), models.len);
     try std.testing.expectEqualSlices(api.ModelKind, &.{ .generator, .reader }, models[0].tasks);

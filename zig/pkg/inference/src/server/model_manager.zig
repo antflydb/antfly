@@ -2818,7 +2818,8 @@ fn ownSelectedFirstBackendPreference(
     return result;
 }
 
-fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest) ![32]u8 {
+fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest, control: InferenceExecutionControl) ![32]u8 {
+    try control.check();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -2844,6 +2845,7 @@ fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_
     var external: std.ArrayList([]const u8) = .empty;
     var inspected_primary = false;
     for (paths.items) |path| {
+        try control.check();
         const primary = (manifest.onnx_path != null and std.mem.eql(u8, path, manifest.onnx_path.?)) or
             (manifest.onnx_logical_path != null and std.mem.eql(u8, path, manifest.onnx_logical_path.?));
         if (primary and inspected_primary) continue;
@@ -2855,7 +2857,9 @@ fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_
         for (artifacts.external_paths) |tensor_path| try external.append(alloc, try alloc.dupe(u8, tensor_path));
     }
     try paths.appendSlice(alloc, external.items);
-    return componentDependencySignature(io, paths.items);
+    const revision = try componentDependencySignature(io, paths.items);
+    try control.check();
+    return revision;
 }
 
 // Legacy managed receipts may lack a digest. Hash those files once per local
@@ -2866,10 +2870,6 @@ const LegacyArtifactDigestCache = struct {
     var entries: [256]?Entry = @splat(null);
     var next: usize = 0;
     var forbid_hashing_for_test: bool = false;
-
-    fn digest(io: std.Io, artifact: managed_receipt.ValidatedArtifact) ![32]u8 {
-        return digestWithControl(io, artifact, .{});
-    }
 
     fn digestWithControl(io: std.Io, artifact: managed_receipt.ValidatedArtifact, control: InferenceExecutionControl) ![32]u8 {
         try control.check();
@@ -2929,12 +2929,13 @@ const LegacyArtifactDigestCache = struct {
 /// Stable identity before loading weights. Managed receipts use relative paths
 /// and pinned content digests, so copying/restoring a model preserves reuse.
 pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
-    return modelIdentityWithArtifacts(a, io, model_dir, manifest, null);
+    return modelIdentityWithArtifacts(a, io, model_dir, manifest, null, .{});
 }
 
 /// Cold construction shares its receipt and checksum proofs with tokenizer
 /// preparation instead of hashing a large embedded-tokenizer GGUF twice.
-fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest, published: ?*PublishedArtifacts) ![32]u8 {
+fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest, published: ?*PublishedArtifacts, control: InferenceExecutionControl) ![32]u8 {
+    try control.check();
     var owned: ?managed_receipt.ValidatedReceipt = null;
     defer if (owned) |*validated| validated.deinit();
     const receipt: ?*managed_receipt.ValidatedReceipt = if (published) |source|
@@ -2956,6 +2957,7 @@ fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []con
         }.less);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         for (artifacts) |artifact| {
+            try control.check();
             var decoded: [32]u8 = undefined;
             if (published) |source| {
                 try source.verifyFile(artifact.path);
@@ -2963,8 +2965,8 @@ fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []con
                     // verifyFile authenticated this digest against the actual
                     // file and retained its complete construction stamp.
                     _ = std.fmt.hexToBytes(&decoded, digest) catch return error.InvalidManagedDownload;
-                } else decoded = try LegacyArtifactDigestCache.digest(io, artifact);
-            } else decoded = try LegacyArtifactDigestCache.digest(io, artifact);
+                } else decoded = try LegacyArtifactDigestCache.digestWithControl(io, artifact, control);
+            } else decoded = try LegacyArtifactDigestCache.digestWithControl(io, artifact, control);
             if (artifact.sha256) |digest| {
                 if (digest.len != 64) return error.InvalidManagedDownload;
                 var expected: [32]u8 = undefined;
@@ -2977,9 +2979,10 @@ fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []con
         }
         var result: [32]u8 = undefined;
         hash.final(&result);
+        try control.check();
         return imagePreprocessingRevision(manifest, result);
     }
-    return imagePreprocessingRevision(manifest, try resolutionModelRevision(a, io, manifest));
+    return imagePreprocessingRevision(manifest, try resolutionModelRevision(a, io, manifest, control));
 }
 
 fn imagePreprocessingRevision(manifest: manifest_mod.ModelManifest, artifacts: [32]u8) [32]u8 {
@@ -3047,7 +3050,7 @@ pub const RuntimeSnapshotEntry = struct {
     managed_publication: ?[32]u8 = null,
     runtime_id: RuntimeId,
     unloadable: bool = false,
-    model_dir: []u8,
+    model_dir: []const u8,
     state: RuntimeState,
     runtime_kind: RuntimeKind,
     model_type: ?manifest_mod.ModelType,
@@ -4959,6 +4962,18 @@ pub const ModelHandle = struct {
         model.active_handles += 1;
         self.manager.unlockLoadedModels();
         return .{ .manager = self.manager, .model = model };
+    }
+
+    /// Borrow the exact runtime's path through this handle. Report residency
+    /// and handle count as they will be after the activation handle releases.
+    pub fn activationSnapshot(self: *const ModelHandle, classify: RuntimeManifestTaskMaskFn) ?RuntimeSnapshotEntry {
+        const model = self.get();
+        self.manager.lockLoadedModels();
+        defer self.manager.unlockLoadedModels();
+        if (model.retired) return null;
+        var entry = self.manager.loadedRuntimeSnapshotLocked(model, model.active_handles - 1, platform.time.monotonicNs(), classify);
+        entry.last_used_ms = 0;
+        return entry;
     }
 
     pub fn pin(self: *ModelHandle) void {
@@ -8212,6 +8227,30 @@ pub const ModelManager = struct {
         return false;
     }
 
+    fn loadedRuntimeSnapshotLocked(
+        self: *ModelManager,
+        model: *LoadedModel,
+        active_handles: usize,
+        now_ns: u64,
+        manifest_task_mask: ?RuntimeManifestTaskMaskFn,
+    ) RuntimeSnapshotEntry {
+        return .{
+            .runtime_id = model.runtime_id,
+            .managed_publication = model.managed_publication,
+            .unloadable = !model.pinned and active_handles == 0 and !self.modelIsInFlightLocked(model),
+            .model_dir = model.model_dir,
+            .state = if (active_handles == 0) .loaded else .in_use,
+            .runtime_kind = .primary,
+            .model_type = model.manifest.model_type,
+            .task_mask = if (manifest_task_mask) |classify| classify(&model.manifest) else 0,
+            .active_handles = active_handles,
+            .startup_managed = model.pinned,
+            .backend = model.session.backend(),
+            .residency_mode = model.residency_mode,
+            .last_used_ms = (now_ns -| model.last_used_ns) / std.time.ns_per_ms,
+        };
+    }
+
     /// Copy runtime state without acquiring model handles or renewing idle TTL.
     /// Filesystem paths are internal join keys; callers must map them to safe
     /// advertised identifiers before serializing a response.
@@ -8235,24 +8274,9 @@ pub const ModelManager = struct {
             const model = model_ptr.*;
             const owned_model_dir = try allocator.dupe(u8, model.model_dir);
             errdefer allocator.free(owned_model_dir);
-            try entries.append(allocator, .{
-                .runtime_id = model.runtime_id,
-                .managed_publication = model.managed_publication,
-                .unloadable = !model.pinned and model.active_handles == 0 and !self.modelIsInFlightLocked(model),
-                .model_dir = owned_model_dir,
-                .state = if (model.active_handles == 0) .loaded else .in_use,
-                .runtime_kind = .primary,
-                .model_type = model.manifest.model_type,
-                .task_mask = if (manifest_task_mask) |classify| classify(&model.manifest) else 0,
-                .active_handles = model.active_handles,
-                .startup_managed = model.pinned,
-                .backend = model.session.backend(),
-                .residency_mode = model.residency_mode,
-                .last_used_ms = if (now_ns >= model.last_used_ns)
-                    (now_ns - model.last_used_ns) / std.time.ns_per_ms
-                else
-                    0,
-            });
+            var entry = self.loadedRuntimeSnapshotLocked(model, model.active_handles, now_ns, manifest_task_mask);
+            entry.model_dir = owned_model_dir;
+            try entries.append(allocator, entry);
         }
 
         var composite_it = self.composite_assets.valueIterator();
@@ -10012,7 +10036,7 @@ pub const ModelManager = struct {
         defer proof.deinit();
         var bound = try BoundModelSource.init(&proof, model_dir, ModelSource.kindForPath(model_dir), &man, null);
         defer bound.deinit();
-        const revision = try modelIdentityWithArtifacts(self.allocator, io, model_dir, man, &artifacts);
+        const revision = try modelIdentityWithArtifacts(self.allocator, io, model_dir, man, &artifacts, control);
         const planning = try chunkPlanningSnapshotWithControl(self.allocator, io, man, revision, control);
         const gemma_compat = tokenizerGemmaCompat(man, model_dir);
         const kind = try tokenizerKindWithArtifacts(man, &artifacts, gemma_compat);
@@ -10055,6 +10079,15 @@ pub const ModelManager = struct {
 
     pub fn modelIdentityForManifest(self: *ModelManager, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
         return modelIdentity(self.allocator, try self.componentPlanIo(), model_dir, manifest);
+    }
+
+    pub fn modelIdentityForManifestWithControl(
+        self: *ModelManager,
+        model_dir: []const u8,
+        manifest: manifest_mod.ModelManifest,
+        control: InferenceExecutionControl,
+    ) ![32]u8 {
+        return modelIdentityWithArtifacts(self.allocator, control.io orelse try self.componentPlanIo(), model_dir, manifest, null, control);
     }
 
     fn loadFromDirUncached(
@@ -10122,8 +10155,8 @@ pub const ModelManager = struct {
         var tokenizer_artifacts = try PublishedArtifacts.init(self.allocator, publication_io, model_dir, .{ .publication = man.managed_publication });
         defer tokenizer_artifacts.deinit();
         tokenizer_artifacts.verification_cache = &self.verified_artifacts;
-        const resolution_file_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man);
-        const resolution_revision = try modelIdentityWithArtifacts(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man, &tokenizer_artifacts);
+        const resolution_file_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man, control orelse .{});
+        const resolution_revision = try modelIdentityWithArtifacts(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man, &tokenizer_artifacts, control orelse .{});
         const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
         const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
             try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)
@@ -10361,7 +10394,7 @@ pub const ModelManager = struct {
         errdefer if (model_storage_owned) self.allocator.destroy(model);
         const chunk_planning = try chunkPlanningSnapshotWithControl(self.allocator, sm.io orelse std.Options.debug_io, man, resolution_revision, control orelse .{});
         if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
-        if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
+        if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man, control orelse .{}))) return error.ModelArtifactsChanging;
         model.* = .{
             .managed_publication = managed_publication,
             .chunk_planning = chunk_planning,
@@ -18710,6 +18743,44 @@ test "model selection native directory proof authenticates single and sharded sa
     }
 }
 
+test "pinned model identity cancels during a cold artifact digest" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "weights.safetensors", .data = "weights" });
+    try writeArtifactIdentityTestReceipt(tmp.dir, &.{"weights.safetensors"});
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const Probe = struct {
+        var hashing = false;
+        var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+        fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            const file = try original(raw, dir, path, options);
+            if (std.mem.endsWith(u8, path, "weights.safetensors")) hashing = true;
+            return file;
+        }
+        fn check(_: ?*anyopaque) !void {
+            if (hashing) return error.Canceled;
+        }
+    };
+    var table = io.vtable.*;
+    Probe.original = table.dirOpenFile;
+    Probe.hashing = false;
+    table.dirOpenFile = Probe.open;
+    const observed_io = std.Io{ .userdata = io.userdata, .vtable = &table };
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
+    defer manager.deinit();
+    const manifest: manifest_mod.ModelManifest = .{ .allocator = a };
+    try std.testing.expectError(error.Canceled, manager.modelIdentityForManifestWithControl(root, manifest, .{
+        .io = observed_io,
+        .check_fn = Probe.check,
+    }));
+    try std.testing.expect(Probe.hashing);
+    const revision = try manager.modelIdentityForManifest(root, manifest);
+    try std.testing.expectEqual(revision, try manager.modelIdentityForManifestWithControl(root, manifest, .{ .io = io }));
+}
+
 test "model selection tokenizer-only preparation authenticates consumed JSON" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -18848,7 +18919,7 @@ test "model selection embedded SentencePiece accounts and verifies independent o
         var shared = try PublishedArtifacts.init(a, counted_io, root, null);
         defer shared.deinit();
         Probe.opens = 0;
-        _ = try modelIdentityWithArtifacts(a, counted_io, root, man, &shared);
+        _ = try modelIdentityWithArtifacts(a, counted_io, root, man, &shared, .{});
         _ = try tokenizerLoadAdmissionPlanWithArtifacts(a, root, &man, .sentencepiece, &shared);
         const tokenizer = try loadSentencePieceTokenizerWithArtifacts(a, &man, &shared);
         defer {
