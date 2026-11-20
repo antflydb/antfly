@@ -5338,24 +5338,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn noPendingEnrichmentReplayThrough(self: anytype, applied_sequence: u64, sequence: u64) !bool {
-            var cursor = try S.ownerField(self, "core").*.replaySource().openMatchingCursor(S.ownerField(self, "alloc").*, applied_sequence, .enrichment);
-            defer cursor.deinit(S.ownerField(self, "alloc").*);
-            const Probe = struct {
-                through: u64,
-                pending: bool = false,
-                fn consume(ptr: *anyopaque, at: u64, _: []const u8) !void {
-                    const probe: *@This() = @ptrCast(@alignCast(ptr));
-                    probe.pending = at <= probe.through;
-                }
-            };
-            var probe = Probe{ .through = sequence };
-            while (true) {
-                const scan = try cursor.forEachNext(1, &probe, Probe.consume);
-                if (scan.matched_entries != 0) return !probe.pending;
-                // A batch capped by scanned work examined only a prefix; keep
-                // scanning until a match, the end, or past `sequence`.
-                if (!scan.scan_budget_exhausted or scan.last_sequence >= sequence) return true;
-            }
+            return try S.ownerField(self, "core").*.replaySource().noMatchingRecordThrough(S.ownerField(self, "alloc").*, applied_sequence, .enrichment, sequence);
         }
 
         pub fn notifyQueryVisibilityEvent(ctx: *AsyncContext, event: QueryVisibilityEvent) void {
